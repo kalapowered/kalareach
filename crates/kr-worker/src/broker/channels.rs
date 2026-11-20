@@ -18,23 +18,26 @@
 //!    instance holds a binding of the connector's package trusted to decode the request, the broker
 //!    interprets it from the table's own decision destination; without one it stays recorded,
 //!    visible and unanswerable here.
-//! 4. **Answer.** An admitted answer is written on the channel by the channel's own writer, in the
-//!    order admitted, and recorded as the response of an installed bridge: the verdict goes to the
-//!    bridge's forwarder, and nothing in the application acknowledges it. A message into the
-//!    session, a steer, a cancellation and a package's action are refused: nothing establishes
-//!    that the application received a message and no sender stands behind one, and the table names
-//!    no method for the others.
+//! 4. **Answer and message.** An admitted answer is written on the channel by the channel's own
+//!    writer, in the order admitted, and recorded as the response of an installed bridge: the
+//!    verdict goes to the bridge's forwarder, and nothing in the application acknowledges it. A
+//!    queued message into the session goes the same way, through the same writer and in the same
+//!    order, in the shape the package declares for one and naming the sender the host verified;
+//!    it ends as an outcome nobody can establish, because the application acknowledges no message
+//!    either. A submit, a steer, a cancellation and a package's action are refused: the table
+//!    names no method for them.
 //! 5. **Close.** However it ends (the channel closing, a frame it should not have sent, the backend
 //!    retiring), it is closed through [`Broker::close_bridge_channel`], which settles what it
 //!    relayed and discharges what a recovery owes for it.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use kr_protocol::broker::{
-    DecodedProjection, InstanceCapabilityIdentity, InstanceCapabilityRecord,
+    ActionProvenance, DecodedProjection, InstanceCapabilityIdentity, InstanceCapabilityRecord,
     InstanceCapabilityState, InstanceEvidenceSource, InstanceInvalidation, MethodTableVersionText,
 };
-use kr_protocol::gateway::{GatewayMode, PendingResource};
+use kr_protocol::gateway::{GatewayMode, PendingResource, RichOperation};
 use kr_protocol::ids::{
     ApplicationInstanceId, CapabilityId, CapabilityRevision, EnvironmentId, GatewayConnectionId,
     PendingResourceId, PublisherId, SessionId,
@@ -44,7 +47,7 @@ use kr_protocol::scalars::{Nullable, TimestampMs};
 use crate::broker::bridge::{
     AdmittedBridge, BRIDGE_FRAME_DEADLINE, BridgeProcess, BridgeReader, BridgeSurface, BridgeWriter,
 };
-use crate::broker::channel_prompt::ChannelEventShape;
+use crate::broker::channel_prompt::{ChannelEventShape, NO_SENDER, PromptSender};
 use crate::broker::connectors::{DECISION_SCHEMA, InstalledConnector};
 use crate::broker::duplex::{Counted, detached};
 use crate::broker::error::{BrokerError, Result};
@@ -62,14 +65,43 @@ pub const ANSWER_NOT_CONFIRMED: &str = "The host cannot tell whether Claude Code
      answer. Claude Code does not confirm answers. If the request still waits in its terminal, \
      answer it there.";
 
-/// How many admitted answers one channel holds before its writer takes them.
+/// What the receipt of a message a channel took says, and so what an inspection of it reads.
 ///
-/// The application holds one approval dialog open at a time, so the bound is generous; an answer
-/// past it is refused before its marker rather than queued without end.
+/// It claims no write either, for the same reason as [`ANSWER_NOT_CONFIRMED`].
+pub const MESSAGE_NOT_CONFIRMED: &str = "The host cannot tell whether Claude Code took this \
+     message. Claude Code does not confirm messages on this channel.";
+
+/// How many admitted answers and messages one channel holds before its writer takes them.
+///
+/// The application holds one approval dialog open at a time, so the bound is generous for
+/// answers; messages are held below it by [`MAX_QUEUED_PROMPTS`], so they never take the room an
+/// answer needs. One past either bound is refused before its marker rather than queued without
+/// end.
 pub const MAX_QUEUED_ANSWERS: usize = 64;
+
+/// How many messages one channel holds, from the queue taking one until its write is over.
+pub const MAX_QUEUED_PROMPTS: usize = 8;
+
+/// What a person is told when a message is refused for the queue's bound: nothing was sent.
+const QUEUE_FULL: &str = "The message queue is full. Nothing was sent. Try again later.";
+
+/// What a person is told when a message meets a channel that has closed: nothing was sent.
+const CHANNEL_CLOSED: &str = "The channel is closed. Nothing was sent.";
+
+/// What a person is told when a message is not the queued kind.
+const QUEUE_ONLY: &str = "Use Queue to send a message through this channel.";
+
+/// What a person is told when a message names a draft.
+const TEXT_ONLY: &str = "This channel accepts text only. It cannot send a draft or attachments.";
+
+/// Why the queue capability is unavailable once the channel has closed.
+const QUEUE_CLOSED: &str = "The application's channel closed.";
 
 /// The capability a channel's relayed approval is evidence of.
 const APPROVAL_CAPABILITY: &str = "agent.approval";
+
+/// The capability the same evidence gives a channel that carries messages.
+const QUEUE_CAPABILITY: &str = "agent.prompt.queue";
 
 /// What one channel is served with: the launch it belongs to and where its transitions go.
 #[derive(Clone)]
@@ -166,6 +198,8 @@ pub async fn serve(
         connection,
         queue: Mutex::new(Some(queue)),
         counted: Counted::of_package(&broker, launch.connector.plugin_id().as_str()),
+        shape: shape.map(Arc::new),
+        prompts: Arc::new(AtomicUsize::new(0)),
     });
     let carrying: Arc<dyn UpstreamDispatch> = channel.clone();
     // The channel's own transport, for the answers to what it relayed, and the instance's, so a
@@ -258,37 +292,97 @@ async fn read_until_ended(
     }
 }
 
-/// One answer the channel's writer takes, and where it says what became of it.
+/// What one queued frame is, which the words of its failures say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Carried {
+    /// The verdict on a request the channel relayed.
+    Answer,
+    /// A message into the session.
+    Message,
+}
+
+impl Carried {
+    /// What it is called after an article.
+    const fn a_noun(self) -> &'static str {
+        match self {
+            Self::Answer => "an answer",
+            Self::Message => "a message",
+        }
+    }
+
+    /// What it is called after "the".
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Message => "message",
+        }
+    }
+
+    /// What the receipt of one the channel took says.
+    const fn not_confirmed(self) -> &'static str {
+        match self {
+            Self::Answer => ANSWER_NOT_CONFIRMED,
+            Self::Message => MESSAGE_NOT_CONFIRMED,
+        }
+    }
+}
+
+/// One of the places a channel keeps for messages. It is held from the moment the queue takes a
+/// message until the writer has done with it, and released when it drops.
+#[derive(Debug)]
+struct PromptSlot(Arc<AtomicUsize>);
+
+impl Drop for PromptSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One frame the channel's writer takes, and where it says what became of it.
 struct Outgoing {
     frame: Vec<u8>,
     written: tokio::sync::oneshot::Sender<Result<()>>,
+    carried: Carried,
+    /// The message's place, kept until the write is over.
+    slot: Option<PromptSlot>,
 }
 
-/// Writes admitted answers on the channel, one at a time, until the channel is shut or a write
-/// fails, and says which.
+/// Writes admitted answers and messages on the channel, one at a time, until the channel is shut
+/// or a write fails, and says which.
 async fn write_answers(
     broker: Arc<Broker>,
     mut writer: BridgeWriter,
     mut outgoing: tokio::sync::mpsc::Receiver<Outgoing>,
 ) -> String {
     let mut why = "the channel was shut".to_owned();
-    while let Some(Outgoing { frame, written }) = outgoing.recv().await {
+    while let Some(Outgoing {
+        frame,
+        written,
+        carried,
+        slot,
+    }) = outgoing.recv().await
+    {
         broker.at_channel_write_pause().await;
         let result = tokio::time::timeout(BRIDGE_FRAME_DEADLINE, writer.write_frame(&frame))
             .await
             .unwrap_or_else(|_| {
                 Err(BrokerError::UpstreamUnavailable {
                     detail: format!(
-                        "the channel did not take an answer within {} seconds",
+                        "the channel did not take {} within {} seconds",
+                        carried.a_noun(),
                         BRIDGE_FRAME_DEADLINE.as_secs()
                     ),
                 })
             });
-        let failed = result
-            .as_ref()
-            .err()
-            .map(|error| format!("the channel's writer could not write an answer: {error}"));
+        let failed = result.as_ref().err().map(|error| {
+            format!(
+                "the channel's writer could not write {}: {error}",
+                carried.a_noun()
+            )
+        });
         let _ = written.send(result);
+        // The message's place is kept until its write is over and its end has been said.
+        drop(slot);
         // A write that failed leaves the connection unusable, and the answers behind it are told.
         if let Some(failed) = failed {
             why = failed;
@@ -299,9 +393,10 @@ async fn write_answers(
     why
 }
 
-/// What carries answers out on one channel.
+/// What carries answers and messages out on one channel.
 ///
-/// Only an answer to a request this channel relayed goes: the table names no way to carry
+/// Only an answer to a request this channel relayed goes, and a queued message that the package's
+/// declared shape can carry from a sender the host can name: the table names no way to carry
 /// anything else that this host can stand behind.
 #[derive(Debug)]
 pub struct ChannelDispatch {
@@ -310,6 +405,10 @@ pub struct ChannelDispatch {
     queue: Mutex<Option<tokio::sync::mpsc::Sender<Outgoing>>>,
     /// Where the failures of the channel's adapter are counted, when its package is a bundled one.
     counted: Option<Counted>,
+    /// How a message is written, where the package declares a whole shape for one.
+    shape: Option<Arc<ChannelEventShape>>,
+    /// How many messages the queue has taken whose writes are not over.
+    prompts: Arc<AtomicUsize>,
 }
 
 impl ChannelDispatch {
@@ -332,6 +431,52 @@ impl std::fmt::Debug for Outgoing {
     }
 }
 
+impl ChannelDispatch {
+    /// Takes one of the places for messages, or says none is free.
+    fn take_prompt_slot(&self) -> Option<PromptSlot> {
+        self.prompts
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < MAX_QUEUED_PROMPTS).then_some(held + 1)
+            })
+            .ok()
+            .map(|_| PromptSlot(Arc::clone(&self.prompts)))
+    }
+
+    /// Whether this channel can carry this message at all, before anything is marked: queued, text
+    /// only, from a sender the host can name, and text within the package's declared length that
+    /// is neither shaped like an answer to an approval nor like the channel's own tag.
+    fn admit_message(
+        &self,
+        operation: RichOperation,
+        draft: bool,
+        text: Option<&str>,
+        sender: &PromptSender,
+    ) -> Result<()> {
+        if !matches!(operation, RichOperation::PromptQueue) {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: QUEUE_ONLY.to_owned(),
+            });
+        }
+        let Some(shape) = &self.shape else {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: "the connector's table names no method on this channel that carries a \
+                         message"
+                    .to_owned(),
+            });
+        };
+        if draft {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: TEXT_ONLY.to_owned(),
+            });
+        }
+        if sender.kind().is_none() {
+            return Err(BrokerError::denied(NO_SENDER));
+        }
+        let text = text.ok_or_else(|| BrokerError::invalid("a message carries text"))?;
+        shape.check_text(text)
+    }
+}
+
 impl UpstreamDispatch for ChannelDispatch {
     fn admit(&self, request: &UpstreamRequest) -> Result<()> {
         match &request.body {
@@ -346,12 +491,16 @@ impl UpstreamDispatch for ChannelDispatch {
                     )))
                 }
             }
-            UpstreamBody::Prompt { .. } => Err(BrokerError::UnsupportedCapability {
-                detail: "a message into the session is not delivered on this channel: the \
-                         application acknowledges nothing, so nothing establishes that it \
-                         received one, and the package names no sender to stand behind it"
-                    .to_owned(),
-            }),
+            UpstreamBody::Prompt {
+                draft_id,
+                text,
+                sender,
+            } => self.admit_message(
+                request.operation,
+                draft_id.is_some(),
+                text.as_deref(),
+                sender,
+            ),
             UpstreamBody::Steer { .. } => Err(BrokerError::UnsupportedCapability {
                 detail: "the connector's table names no method on this channel that steers a turn"
                     .to_owned(),
@@ -373,24 +522,41 @@ impl UpstreamDispatch for ChannelDispatch {
         self.submit_gated(request, &SubmitGate::default())
     }
 
+    fn provenance(&self) -> ActionProvenance {
+        // What a channel carries is written on the application's own channel, and recorded as a
+        // bridge's response, whatever the application does with it.
+        ActionProvenance::AuthenticatedHookResponse
+    }
+
     fn submit_gated(
         &self,
         request: &UpstreamRequest,
         gate: &SubmitGate,
     ) -> Result<PendingTransmission> {
         self.admit(request)?;
-        let UpstreamBody::Approval { response, .. } = &request.body else {
-            return Err(BrokerError::invalid(
-                "only an answer is carried on a channel",
-            ));
-        };
         let count = |refusal: BrokerError| {
             if let Some(counted) = &self.counted {
                 counted.refused(&refusal);
             }
             refusal
         };
-        // Both refusals below come before a byte enters the queue: nothing was sent, which is
+        let (frame, carried) = match &request.body {
+            UpstreamBody::Approval { response, .. } => (response.frame().to_vec(), Carried::Answer),
+            UpstreamBody::Prompt { text, sender, .. } => {
+                let (Some(shape), Some(text)) = (&self.shape, text) else {
+                    return Err(BrokerError::invalid(
+                        "only an answer or a message is carried on a channel",
+                    ));
+                };
+                (shape.frame(text, sender)?, Carried::Message)
+            }
+            _ => {
+                return Err(BrokerError::invalid(
+                    "only an answer or a message is carried on a channel",
+                ));
+            }
+        };
+        // Every refusal below comes before a byte enters the queue: nothing was sent, which is
         // established and not uncertain.
         let queue = self
             .queue
@@ -399,24 +565,48 @@ impl UpstreamDispatch for ChannelDispatch {
             .clone()
             .ok_or_else(|| {
                 BrokerError::NotTransmitted(Box::new(count(BrokerError::UpstreamUnavailable {
-                    detail: "the channel has closed".to_owned(),
+                    detail: match carried {
+                        Carried::Answer => "the channel has closed".to_owned(),
+                        Carried::Message => CHANNEL_CLOSED.to_owned(),
+                    },
                 })))
             })?;
+        // The bound on messages is this channel's own and not a failure of the application's
+        // adapter, so its refusal is not counted.
+        let slot = match carried {
+            Carried::Answer => None,
+            Carried::Message => Some(self.take_prompt_slot().ok_or_else(|| {
+                BrokerError::NotTransmitted(Box::new(BrokerError::UpstreamUnavailable {
+                    detail: QUEUE_FULL.to_owned(),
+                }))
+            })?),
+        };
         let (written, outcome) = tokio::sync::oneshot::channel();
         // Through the gate: the caller that stops waiting for this call decides under the same
-        // lock, so a queue that took the answer is a fact it reads, and one that has not taken it
+        // lock, so a queue that took the frame is a fact it reads, and one that has not taken it
         // by then never does.
-        gate.queue(ANSWER_NOT_CONFIRMED, || {
+        gate.queue(carried.not_confirmed(), carried.noun(), || {
             queue
                 .try_send(Outgoing {
-                    frame: response.frame().to_vec(),
+                    frame,
                     written,
+                    carried,
+                    slot,
                 })
-                .map_err(|_| {
-                    BrokerError::NotTransmitted(Box::new(count(BrokerError::UpstreamUnavailable {
-                        detail: "the channel's writer has closed or holds as many answers as \
-                                     it takes"
+                .map_err(|error| {
+                    let detail = match (carried, &error) {
+                        (Carried::Answer, _) => "the channel's writer has closed or holds as many \
+                                                 answers as it takes"
                             .to_owned(),
+                        (Carried::Message, tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            QUEUE_FULL.to_owned()
+                        }
+                        (Carried::Message, tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            CHANNEL_CLOSED.to_owned()
+                        }
+                    };
+                    BrokerError::NotTransmitted(Box::new(count(BrokerError::UpstreamUnavailable {
+                        detail,
                     })))
                 })
         })?;
@@ -427,7 +617,7 @@ impl UpstreamDispatch for ChannelDispatch {
         // Every end past the queue is a channel end. A completed write is the host's own fact and
         // not the application's acknowledgement, which a channel never gives, so it ends unknown;
         // a failed write, or a channel that closed first, ends the same way, because the frame may
-        // have gone in part. The worker's own bound on the wait ends the same way: an answer the
+        // have gone in part. The worker's own bound on the wait ends the same way: a frame the
         // queue took, whether or not this call has returned and whether or not the writer has
         // reached it, is still a channel's, and the caller is not told it was a typed upstream
         // that never answered. The gate holds that fact.
@@ -435,12 +625,15 @@ impl UpstreamDispatch for ChannelDispatch {
             let refusal = match outcome.await {
                 Ok(Ok(())) => {
                     return Err(BrokerError::ChannelEnd {
-                        detail: ANSWER_NOT_CONFIRMED.to_owned(),
+                        detail: carried.not_confirmed().to_owned(),
                     });
                 }
                 Ok(Err(error)) => error,
                 Err(_) => BrokerError::UpstreamUnavailable {
-                    detail: "the channel closed before the answer was written".to_owned(),
+                    detail: format!(
+                        "the channel closed before the {} was written",
+                        carried.noun()
+                    ),
                 },
             };
             if let Some(counted) = &counted {
@@ -593,18 +786,26 @@ impl Broker {
                 .volatile
                 .reconciled(application_instance_id, connection);
         }
-        state.channel_evidence(
-            application_instance_id,
-            Evidence::Withdrawn(
+        for (capability, reason) in [
+            (
+                APPROVAL_CAPABILITY,
                 "the application's channel closed, so nothing relays an answer to it",
             ),
-            now,
-        );
+            (QUEUE_CAPABILITY, QUEUE_CLOSED),
+        ] {
+            state.channel_evidence(
+                application_instance_id,
+                capability,
+                Evidence::Withdrawn(reason),
+                now,
+            );
+        }
         Some(settled)
     }
 
     /// Records that a channel relayed an approval: the application relays only to a channel it
-    /// registered, so the instance's approval capability is available from a live binding.
+    /// registered, so the instance's approval capability is available from a live binding, and so
+    /// is its queue capability when the channel's package declares a shape for a message.
     ///
     /// The record names what established it: the executable the launch hashed, the version a
     /// signed record names for it, the connector package by its identifier, hash and publisher,
@@ -615,6 +816,7 @@ impl Broker {
             return;
         };
         let application_instance_id = channel.application_instance_id;
+        let carries_messages = channel.carries_messages;
         let mut identity = InstanceCapabilityIdentity {
             schema_version: Nullable::some(MethodTableVersionText(channel.version.clone())),
             plugin_id: Nullable::some(channel.plugin_id.clone()),
@@ -631,8 +833,17 @@ impl Broker {
             );
             identity.profile_id = Nullable::from(instance.profile_id.clone());
         }
+        if carries_messages {
+            state.channel_evidence(
+                application_instance_id,
+                QUEUE_CAPABILITY,
+                Evidence::Available(Box::new(identity.clone())),
+                now,
+            );
+        }
         state.channel_evidence(
             application_instance_id,
+            APPROVAL_CAPABILITY,
             Evidence::Available(Box::new(identity)),
             now,
         );
@@ -743,7 +954,7 @@ impl Broker {
     async fn at_channel_write_pause(&self) {}
 }
 
-/// What a channel says about its instance's approval capability.
+/// What a channel says about one of its instance's capabilities.
 enum Evidence<'a> {
     /// Available from the live channel, established by this identity.
     Available(Box<InstanceCapabilityIdentity>),
@@ -752,7 +963,7 @@ enum Evidence<'a> {
 }
 
 impl BrokerState {
-    /// Records what a channel says about the instance's approval capability.
+    /// Records what a channel says about one capability of the instance.
     ///
     /// Only a change is recorded, as the next revision of the capability's record, so a stream of
     /// relayed approvals does not move the revision a client read. A withdrawal keeps the identity
@@ -760,10 +971,11 @@ impl BrokerState {
     fn channel_evidence(
         &mut self,
         application_instance_id: ApplicationInstanceId,
+        capability: &str,
         evidence: Evidence<'_>,
         now: TimestampMs,
     ) {
-        let Ok(capability_id) = CapabilityId::new(APPROVAL_CAPABILITY) else {
+        let Ok(capability_id) = CapabilityId::new(capability) else {
             return;
         };
         let held = self
@@ -840,15 +1052,17 @@ mod tests {
         }
     }
 
-    /// A message into the session, a steer, a cancellation and a package's action are refused on
+    /// A submit into the session, a steer, a cancellation and a package's action are refused on
     /// a channel, each with its own reason, and nothing is queued for any of them.
     #[test]
-    fn a_message_a_steer_a_cancellation_and_an_action_are_refused_with_their_reasons() {
+    fn a_submit_a_steer_a_cancellation_and_an_action_are_refused_with_their_reasons() {
         let (queue, mut outgoing) = tokio::sync::mpsc::channel(MAX_QUEUED_ANSWERS);
         let channel = ChannelDispatch {
             connection: GatewayConnectionId::new(7),
             queue: Mutex::new(Some(queue)),
             counted: None,
+            shape: None,
+            prompts: Arc::new(AtomicUsize::new(0)),
         };
         let refused = [
             (
@@ -864,7 +1078,7 @@ mod tests {
                         grant_id: None,
                     },
                 },
-                "acknowledges nothing",
+                "Use Queue to send a message through this channel.",
             ),
             (
                 RichOperation::TurnSteer,

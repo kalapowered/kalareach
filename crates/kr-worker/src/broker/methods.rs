@@ -299,6 +299,13 @@ pub trait UpstreamDispatch: Send + Sync + core::fmt::Debug {
         let _ = gate;
         self.submit(request)
     }
+
+    /// How an operation this transport carries is recorded as having reached the application: a
+    /// typed request is one the application answers, and a transport that writes on a bridge's
+    /// channel says so.
+    fn provenance(&self) -> ActionProvenance {
+        ActionProvenance::UpstreamTypedRpc
+    }
 }
 
 /// What the caller of a transport's call and the transport agree on about one operation: whether
@@ -334,13 +341,19 @@ enum GateState {
 impl SubmitGate {
     /// Queues one operation with `queue`, which must not wait for anything, unless the caller has
     /// stopped waiting; a queue that takes it is a channel's, so the operation ends as a channel's
-    /// end, with `detail`, whenever the caller stops waiting for it.
+    /// end, with `detail`, whenever the caller stops waiting for it. `taking` names what the queue
+    /// would have taken, for the words of the refusal when the caller stopped first.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::NotTransmitted`] when the caller stopped waiting first, and what
     /// `queue` returns.
-    pub fn queue<T>(&self, detail: &str, queue: impl FnOnce() -> Result<T>) -> Result<T> {
+    pub fn queue<T>(
+        &self,
+        detail: &str,
+        taking: &str,
+        queue: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         let mut state = self
             .state
             .lock()
@@ -348,8 +361,9 @@ impl SubmitGate {
         if matches!(*state, GateState::GivenUp) {
             return Err(BrokerError::NotTransmitted(Box::new(
                 BrokerError::UpstreamUnavailable {
-                    detail: "the worker stopped waiting before the channel's queue took the answer"
-                        .to_owned(),
+                    detail: format!(
+                        "the worker stopped waiting before the channel's queue took the {taking}"
+                    ),
                 },
             )));
         }
@@ -732,7 +746,7 @@ impl MutationAdmission {
             responsible,
             capability,
             admitted_at,
-            provenance: ActionProvenance::UpstreamTypedRpc,
+            provenance: dispatch.provenance(),
             resource_id: None,
             action: None,
             turn_id: request.turn_id.clone(),
