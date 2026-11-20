@@ -6228,6 +6228,9 @@ struct Answered {
     marker_written: bool,
     /// Whether the pending request is still waiting for an answer.
     still_pending: bool,
+    /// What a new answer action to the same request came to, where one was made: after a refusal
+    /// at the submission hop that gives the claim back, to a request whose accepted deadline passed.
+    renewed: Option<Outcome>,
 }
 
 async fn answer_whose_deadline(deadline: Deadline, wait: Wait, passes: bool) -> Answered {
@@ -6253,7 +6256,10 @@ async fn answer_whose_deadline(deadline: Deadline, wait: Wait, passes: bool) -> 
     };
     let waiting =
         (wait == Wait::WhileTheWriterLockIsHeld).then(|| broker.signal_next_ledger_lock_wait());
-    let sending = tokio::spawn(async move { send(&mut client, mutation).await });
+    let sending = tokio::spawn(async move {
+        let outcome = send(&mut client, mutation).await;
+        (outcome, client)
+    });
     tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
         .await
         .expect("the wait ends")
@@ -6290,7 +6296,7 @@ async fn answer_whose_deadline(deadline: Deadline, wait: Wait, passes: bool) -> 
         passing(&clock);
         release.send(()).expect("the answer is let go");
     }
-    let outcome = sending.await.expect("the mutation is answered");
+    let (outcome, mut client) = sending.await.expect("the mutation is answered");
 
     let marker_written = rusqlite::Connection::open_with_flags(
         &host.journal_path,
@@ -6304,15 +6310,25 @@ async fn answer_whose_deadline(deadline: Deadline, wait: Wait, passes: bool) -> 
     )
     .expect("the broker's row is readable")
         == 1;
+    let carried = upstream.carried.load(std::sync::atomic::Ordering::SeqCst);
+    let still_pending = host
+        .service
+        .broker()
+        .pending(resource_id)
+        .is_some_and(|pending| pending.state == kr_protocol::gateway::PendingState::Pending);
+    // Read after what the first answer left, and before anything else is sent.
+    let renewed = if passes && wait == Wait::BeforeTheSubmission && deadline == Deadline::Accepted {
+        let again = approval_mutation(&client, &host, 32, resource_id);
+        Some(send(&mut client, again).await)
+    } else {
+        None
+    };
     Answered {
         outcome,
-        carried: upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        carried,
         marker_written,
-        still_pending: host
-            .service
-            .broker()
-            .pending(resource_id)
-            .is_some_and(|pending| pending.state == kr_protocol::gateway::PendingState::Pending),
+        still_pending,
+        renewed,
     }
 }
 
@@ -6385,8 +6401,11 @@ async fn kr_req_09_16_an_answer_whose_deadline_passes_while_its_marker_waits_for
 }
 
 /// KR-REQ-09.16 and section 9: an answer whose deadline passes in the hop to the thread that makes
-/// the transport's call is refused there. The marker is already written, so the request is left
-/// uncertain as every failure after the marker leaves it, and the transport is never asked. The
+/// the transport's call is refused there, and the refusal is `NotTransmitted`: nothing was handed
+/// to the transport, so it proves that nothing was sent. The marker the answer wrote is cleared
+/// with the claim, which is given back, and the transport is never asked; the request is not left
+/// uncertain, which would hold every new answer to it for good. A request whose accepted deadline
+/// passed takes a NEW answer action with a new window, and no answer is retried by itself. The
 /// control carries the answer once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_09_16_an_answer_whose_deadline_passes_before_its_submission_is_refused_there() {
@@ -6400,10 +6419,21 @@ async fn kr_req_09_16_an_answer_whose_deadline_passes_before_its_submission_is_r
         };
         assert_eq!(error.code, code, "{deadline:?}");
         assert!(
-            passed.marker_written,
-            "{deadline:?}: the marker was before the wait"
+            !passed.marker_written,
+            "{deadline:?}: the claim was not given back with its marker"
         );
         assert_eq!(passed.carried, 0, "{deadline:?}: the transport was asked");
+        assert!(
+            passed.still_pending,
+            "{deadline:?}: the request is not answerable again"
+        );
+        if deadline == Deadline::Accepted {
+            assert!(
+                matches!(passed.renewed, Some(Outcome::Ok(_))),
+                "{deadline:?}: the request takes no new answer action: {:?}",
+                passed.renewed
+            );
+        }
 
         let control = answer_whose_deadline(deadline, Wait::BeforeTheSubmission, false).await;
         assert!(matches!(control.outcome, Outcome::Ok(_)), "{deadline:?}");
