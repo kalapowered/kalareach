@@ -1463,7 +1463,12 @@ export function fakeHost(
     host: 'reach.kala.to',
     is_default: true
   }
-  let recovery: Omit<RecoveryView, 'sync_service'> = { state: 'off', kept_at: null, blocker: null }
+  let recovery: Omit<RecoveryView, 'sync_service'> = {
+    state: 'off',
+    kept_at: null,
+    blocker: null,
+    platform: 'macos'
+  }
   let recoveryTurnOns = 0
   let recoverySettles = 0
   let recoverySignIns = 0

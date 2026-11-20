@@ -138,6 +138,42 @@ pub struct RecoveryView {
     pub kept_at: Option<String>,
     /// What stops the next step now.
     pub blocker: Option<Blocker>,
+    /// The system this computer runs, which the page reads to say where the seed is kept.
+    pub platform: Platform,
+}
+
+/// The system a build runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    /// macOS.
+    Macos,
+    /// Windows.
+    Windows,
+    /// Linux and the other Unix systems that are none of the rest.
+    Linux,
+    /// iOS.
+    Ios,
+    /// Android.
+    Android,
+}
+
+impl Platform {
+    /// The system this build runs on.
+    #[must_use]
+    pub const fn this() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(target_os = "ios") {
+            Self::Ios
+        } else if cfg!(target_os = "android") {
+            Self::Android
+        } else {
+            Self::Linux
+        }
+    }
 }
 
 /// What the page is told once a kit has been written.
@@ -494,6 +530,7 @@ impl Recovery {
             state,
             kept_at,
             blocker: blocker(account, &used),
+            platform: Platform::this(),
         })
     }
 

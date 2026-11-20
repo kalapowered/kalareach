@@ -65,6 +65,16 @@ mod closing;
 
 const SYNC_PATH: &str = "/api/sync/exchange";
 
+/// What the view names as the system this computer runs, which the page reads to say where the
+/// seed is kept.
+const PLATFORM: &str = if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "macos") {
+    "macos"
+} else {
+    "linux"
+};
+
 /// Where the bundle's pages are served from, which is where the page's calls come from.
 #[cfg(windows)]
 const BUNDLE: &str = "http://tauri.localhost";
@@ -739,12 +749,12 @@ async fn turning_recovery_on_puts_the_bundle_at_the_service_and_hands_over_a_kit
 
     assert_eq!(
         page.view(),
-        json!({ "sync_service": service, "state": "off", "kept_at": null, "blocker": null })
+        json!({ "sync_service": service, "state": "off", "kept_at": null, "blocker": null, "platform": PLATFORM })
     );
     assert_eq!(
         page.call("recovery_turn_on", json!({}))
             .expect("recovery is turned on"),
-        json!({ "sync_service": service, "state": "on", "kept_at": host, "blocker": null })
+        json!({ "sync_service": service, "state": "on", "kept_at": host, "blocker": null, "platform": PLATFORM })
     );
 
     // The seed is in this computer's secure store, which is where the kit's seed comes from.

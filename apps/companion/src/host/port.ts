@@ -371,6 +371,8 @@ export interface RecoveryView {
   /** The host of the service the record names, once recovery has been started. */
   readonly kept_at: string | null
   readonly blocker: RecoveryBlocker | null
+  /** The system this computer runs, which decides what the card says about where the seed is kept. */
+  readonly platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
 }
 
 /** Where a recovery kit was written. */
