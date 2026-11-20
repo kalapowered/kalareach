@@ -82,8 +82,6 @@ impl LocalWrite {
             | Method::DeliveryDestinationConfigure
             | Method::DeliveryDestinationRemove
             | Method::DeliveryDestinationSecretSet
-            | Method::NetworkProxyLoginSet
-            | Method::NetworkProxyLoginClear
             | Method::OrganisationEnrol
             | Method::OrganisationExclusiveSet
             | Method::OrganisationWithdraw => Self::Authority,
@@ -113,6 +111,10 @@ impl LocalWrite {
             ),
             Method::BackupBundleWrite => Self::Unrecorded(
                 "a call carries a new identity each time, and the bundle write reads no record",
+            ),
+            Method::NetworkProxyLoginSet | Method::NetworkProxyLoginClear => Self::Unrecorded(
+                "asked again it writes or removes the same item and answers the same, and it reads \
+                 no record of the action",
             ),
             Method::HostPolicyConfirm => Self::Unrecorded(
                 "asked again it answers that it lifted nothing, and it reads no record of the \

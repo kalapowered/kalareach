@@ -388,3 +388,53 @@ async fn a_repeated_set_and_a_repeated_clear_leave_the_state_the_first_one_made(
         );
     }
 }
+
+/// KR-REQ-10.02, KR-REQ-26.10: a set and a clear of the proxy login leave no row in the registry's
+/// receipts. The answer is one fixed word and the repeat of either change writes or removes the same
+/// item, so the host keeps no record of the action; a record of it in the registry would be a change
+/// to a stored format that the level does not allow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxy_login_set_and_clear_leave_no_receipt_in_the_registry() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let mut control = host.client().await;
+    let receipts = || -> i64 {
+        rusqlite::Connection::open(host.registry_database())
+            .expect("opens the registry")
+            .query_row("SELECT COUNT(*) FROM authority_receipts", [], |row| {
+                row.get(0)
+            })
+            .expect("counts the receipts")
+    };
+    let before = receipts();
+
+    set(
+        &mut control,
+        &host,
+        &params("http://proxy.example.com:3128", &format!("user:{PASSWORD}")),
+    )
+    .await
+    .expect("the owner stores the login");
+    control
+        .mutate(
+            Method::NetworkProxyLoginClear,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &NetworkProxyLoginClearParams::default(),
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the owner clears the login");
+
+    assert_eq!(
+        receipts(),
+        before,
+        "a set and a clear of the login each claimed a receipt in the registry"
+    );
+    assert!(
+        !kr_controller::service::RETAINED_AUTHORITY_ANSWERS.contains(&Method::NetworkProxyLoginSet)
+            && !kr_controller::service::RETAINED_AUTHORITY_ANSWERS
+                .contains(&Method::NetworkProxyLoginClear),
+        "the registry keeps no answer of either method"
+    );
+}

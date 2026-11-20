@@ -452,7 +452,9 @@ methods! {
     NetworkProxyLoginSet = "network.proxy_login.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
-    confirmation: None, idempotency: ACTION,
+    confirmation: None, idempotency: keyed("The daemon keeps no record of the request. Asked \
+                                            again, it keeps the same login and gives the same \
+                                            answer."),
     doc: "Keep a login for the given proxy in this host's secret store. No method answers it \
           back or reads it. The daemon sends it from its next start, and only while \
           network.proxy_url names that proxy.";
@@ -460,7 +462,9 @@ methods! {
     NetworkProxyLoginClear = "network.proxy_login.clear", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
-    confirmation: None, idempotency: ACTION,
+    confirmation: None, idempotency: keyed("The daemon keeps no record of the request. Asked \
+                                            again, it finds nothing to remove and gives the \
+                                            same answer."),
     doc: "Remove the proxy login kept in this host's secret store. The daemon that is running \
           keeps the login it started with, and sends none from its next start.";
 

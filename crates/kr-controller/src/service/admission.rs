@@ -1408,8 +1408,8 @@ impl Controller {
                     .map_err(ControllerError::InvalidArgument)?;
             }
             // The login a proxy asks for belongs to this host's environment. The parameters are
-            // read here, before the action is claimed, so a login of the wrong shape is refused
-            // without holding its action identifier.
+            // read here, before the change is made, so a login of the wrong shape is refused with
+            // nothing written.
             Method::NetworkProxyLoginSet | Method::NetworkProxyLoginClear => {
                 if mutation.target.session_id.as_ref().is_some()
                     || mutation.target.application_instance_id.is_present()

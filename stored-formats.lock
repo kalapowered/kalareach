@@ -561,11 +561,11 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 16,
+        "version": 15,
         "migrates_from": 1,
-        "reads_through": 17
+        "reads_through": 16
       },
-      "digest": "b28467128a6635fd42da3fc024ba88595b6fcf8cd8e2acfaba8dddd2d3cbc77d",
+      "digest": "f8de9f5850a777557cabce2cdf924857af45baeca98b6affcf1f23d78507cf9a",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -589,7 +589,6 @@
         "SessionRenameResult",
         "DescriptionSetup",
         "DeliveryDestinationSecretSetResult",
-        "NetworkProxyLoginResult",
         "EnvironmentEnrolResult",
         "EnvironmentForgetResult",
         "EnvironmentRefreshResult",

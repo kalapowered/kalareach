@@ -350,7 +350,11 @@
       "freshness": "action_window",
       "group": "host_and_environment",
       "history_filter": "not_applicable",
-      "idempotency": "action_deduplicated",
+      "idempotency": {
+        "keyed": {
+          "key": "The daemon keeps no record of the request. Asked again, it keeps the same login and gives the same answer."
+        }
+      },
       "ingress": [
         "local_ipc"
       ],
@@ -379,7 +383,11 @@
       "freshness": "action_window",
       "group": "host_and_environment",
       "history_filter": "not_applicable",
-      "idempotency": "action_deduplicated",
+      "idempotency": {
+        "keyed": {
+          "key": "The daemon keeps no record of the request. Asked again, it finds nothing to remove and gives the same answer."
+        }
+      },
       "ingress": [
         "local_ipc"
       ],

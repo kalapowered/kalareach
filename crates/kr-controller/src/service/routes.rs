@@ -991,6 +991,29 @@ impl Controller {
                     None => refused(window_passed()),
                 }
             }
+            // The owner at this machine keeps or clears the login the host's proxy asks for, in
+            // the host's secret store. The answer is one fixed word, and asked again the host keeps
+            // the same login or finds nothing to remove, so no action is claimed and no answer is
+            // kept: neither the login nor a digest of the request is written to the registry. The
+            // admission is asked again under the registry lock, where the item is written.
+            (LocalWrite::Unrecorded(_), Method::NetworkProxyLoginSet) => {
+                match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
+                    Some(_) => unrecorded_write(
+                        request_id,
+                        self.network_proxy_login_set(mutation, carried).await,
+                    ),
+                    None => refused(window_passed()),
+                }
+            }
+            (LocalWrite::Unrecorded(_), Method::NetworkProxyLoginClear) => {
+                match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
+                    Some(_) => unrecorded_write(
+                        request_id,
+                        self.network_proxy_login_clear(mutation, carried).await,
+                    ),
+                    None => refused(window_passed()),
+                }
+            }
             // The person at this machine confirms the policy this host found restored, which ends
             // the wait that refuses every other grant. It changes no policy and no grant, so it
             // takes no admission, and the daemon keeps no record of the action: asked again it
