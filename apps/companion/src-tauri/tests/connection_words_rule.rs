@@ -162,7 +162,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 66] = [
+const EXCEPTIONS: [Exception; 68] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -613,6 +613,13 @@ const EXCEPTIONS: [Exception; 66] = [
     },
     Exception {
         file: "voice/owner.rs",
+        function: "is_hold_refusal",
+        needle: COMPARED,
+        lines: 1,
+        reason: "reads the code of the host's refusal of a voice start that the call's session, already open, sent: the host's hold on this device's earlier start, which is the start's own answer; it is no cause of a connection that was not opened",
+    },
+    Exception {
+        file: "voice/owner.rs",
         function: "plain_words",
         needle: AS_TEXT,
         lines: 1,
@@ -624,6 +631,13 @@ const EXCEPTIONS: [Exception; 66] = [
         needle: COMPARED,
         lines: 1,
         reason: "the refusal of the voice pre-check, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "voice/owner.rs",
+        function: "reconcile",
+        needle: COMPARED,
+        lines: 1,
+        reason: "reads the code of the host's refusal of the repeat of a voice start, sent on a session that is already open: the host's hold on this device's earlier start, which is the start's own answer; it is no cause of a connection that was not opened, and a session that could not be taken is skipped and read for nothing",
     },
 ];
 
