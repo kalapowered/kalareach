@@ -30,6 +30,13 @@
 //! the command's failure with the last line of that log. The command does not end it: a daemon still starting, such as one waiting on a person
 //! to allow access to a credential store, may yet come up, and the singleton lock already keeps a
 //! second one from serving beside it.
+//!
+//! A daemon that could not bind one of its endpoints writes one line of a fixed grammar to that log
+//! and ends. When the last line since the start began is exactly that line, for an endpoint this
+//! command computes for the same environment and written by the process it started, the wait stops
+//! at once and the failure says why in this command's words, from the line's fields. Every other
+//! end waits out the bound, so commands that start a daemon at once converge on the one that holds
+//! the environment.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -38,7 +45,8 @@ use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::client::{Listed, LocalClient};
 use kr_ipc::install::Permit;
-use kr_ipc::paths::{EnvironmentPaths, HostPaths};
+use kr_ipc::listen::{ListenLine, ListenRefusal, ListenRole};
+use kr_ipc::paths::{Endpoint, EnvironmentPaths, HostPaths};
 use kr_protocol::hostinfo::configuration::{Change, ControllerStartup, DocumentState};
 use kr_protocol::local::LocalClientKind;
 
@@ -55,6 +63,15 @@ pub const ANSWER_BOUND: Duration = Duration::from_secs(10);
 
 /// How often the endpoint is tried while the command waits.
 const RETRY: Duration = Duration::from_millis(50);
+
+/// How often a wait for a daemon's answer asks whether the start should stop waiting.
+const TICK: Duration = Duration::from_millis(200);
+
+/// How long the last look for a daemon another command started is given, once a start stopped.
+const LAST_LOOK: Duration = Duration::from_secs(1);
+
+/// The words that end an instruction to try again.
+const TRY_AGAIN: &str = "run the command again";
 
 /// The file in an environment's state directory that a daemon the standalone start runs writes to.
 pub const LOG_FILE: &str = "controller.log";
@@ -712,34 +729,181 @@ pub(crate) fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
     )
 }
 
-/// Tries the daemon at `endpoint` until one answers or `deadline` passes, each attempt bounded by
-/// what is left of the deadline, and runs `between` after every attempt that failed.
+/// What the check between a wait's attempts decides.
+enum Step<S> {
+    /// Go on waiting.
+    Continue,
+    /// Stop waiting now, for the reason it holds.
+    Stop(S),
+}
+
+/// How a wait for a daemon's answer ended without one.
+enum Waited<S> {
+    /// The deadline passed; this is what the last attempt found.
+    Deadline(Shown),
+    /// The check between attempts stopped the wait.
+    Stopped(S),
+}
+
+/// Waits for `attempt` and asks `between` every `tick` while it is still pending.
 ///
-/// Returns the connection, or what the last attempt found.
-async fn answered_by(
-    endpoint: &kr_ipc::paths::Endpoint,
+/// `Stop` ends the wait with the attempt left unfinished, so something that accepts a connection
+/// and never answers cannot hide that the start has ended. `Continue` leaves the one attempt where
+/// it is: a tick never starts another.
+async fn until_stopped<T, S>(
+    tick: Duration,
+    attempt: impl std::future::Future<Output = T>,
+    between: &mut impl FnMut() -> Step<S>,
+) -> std::result::Result<T, S> {
+    let mut attempt = std::pin::pin!(attempt);
+    let mut ticks = tokio::time::interval(tick);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // An interval's first tick is at once; the check is for an attempt that stays pending.
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            found = &mut attempt => return Ok(found),
+            _ = ticks.tick() => {
+                if let Step::Stop(why) = between() {
+                    return Err(why);
+                }
+            }
+        }
+    }
+}
+
+/// Tries the daemon at `endpoint` until one answers or `deadline` passes, each attempt bounded by
+/// what is left of the deadline, and runs `between` while an attempt is pending and after every
+/// attempt that failed.
+///
+/// Returns the connection, or why the wait ended without one: what the last attempt found at the
+/// deadline, or what `between` stopped it for.
+async fn answered_by<S>(
+    endpoint: &Endpoint,
     deadline: tokio::time::Instant,
     majors: &[u16],
-    mut between: impl FnMut(),
-) -> std::result::Result<Listed, Shown> {
+    mut between: impl FnMut() -> Step<S>,
+) -> std::result::Result<Listed, Waited<S>> {
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let last = match reach(endpoint, left, majors).await {
+        let attempt = reach(endpoint, left, majors);
+        let found = until_stopped(TICK, attempt, &mut between)
+            .await
+            .map_err(Waited::Stopped)?;
+        let last = match found {
             Reached::Answered(client) => return Ok(*client),
             Reached::Silent => {
                 Shown::said("the endpoint accepted the connection and did not answer")
             }
             Reached::Refused(error) => Shown::ipc(&error),
         };
-        between();
+        if let Step::Stop(why) = between() {
+            return Err(Waited::Stopped(why));
+        }
         if tokio::time::Instant::now() >= deadline {
-            return Err(last);
+            return Err(Waited::Deadline(last));
         }
         tokio::time::sleep(
             RETRY.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
         )
         .await;
     }
+}
+
+/// One last look for a daemon, after a start stopped waiting: another command's daemon may have
+/// answered while the one this start ran ended.
+async fn last_look(endpoint: &Endpoint, majors: &[u16]) -> Option<Listed> {
+    match reach(endpoint, LAST_LOOK, majors).await {
+        Reached::Answered(client) => Some(*client),
+        Reached::Silent | Reached::Refused(_) => None,
+    }
+}
+
+/// What a line of the daemon's log is checked against before this command repeats what it
+/// reports.
+#[derive(Clone, Copy)]
+struct Expect<'a> {
+    /// The environment the start is for: a listen line names one of its endpoints.
+    environment: &'a EnvironmentPaths,
+    /// The process this command started, where it holds one: the line's writer is that process.
+    daemon: Option<u32>,
+}
+
+impl Expect<'_> {
+    /// The record `line` holds when it is a listen line exactly, for the endpoint this command
+    /// computes for its role in this environment and, where there is a process, written by it.
+    ///
+    /// The log is shared by every start of the environment, so a line is not taken for this
+    /// start's daemon's because it is the last.
+    fn listen_line(self, line: &str) -> Option<ListenLine> {
+        let listen = ListenLine::parse(line)?;
+        let endpoint = endpoint_of(self.environment, listen.role)?;
+        (listen.path == endpoint.as_text()
+            && self.daemon.is_none_or(|daemon| daemon == listen.daemon))
+        .then_some(listen)
+    }
+}
+
+/// The endpoint this command computes for one of the daemon's three.
+fn endpoint_of(environment: &EnvironmentPaths, role: ListenRole) -> Option<Endpoint> {
+    match role {
+        ListenRole::Rendezvous => environment.rendezvous_endpoint(),
+        ListenRole::Control => environment.controller_endpoint(),
+        ListenRole::Transfer => environment.attachment_chunk_endpoint(),
+    }
+    .ok()
+}
+
+/// Stops a wait when the log's last line since the start began is a listen line `expect` takes:
+/// a daemon that gets that far has ended, and another start's daemon would end the same way.
+fn stop_on_listen_line(log: &Log, expect: Expect<'_>) -> Step<ListenLine> {
+    log.listen_line(expect).map_or(Step::Continue, Step::Stop)
+}
+
+/// What a refused bind says, in this command's words, from the evidence the daemon's line gave.
+///
+/// A refusal that cannot show who holds the endpoint, `unanswered`, adds the endpoints the daemon
+/// binds after it: nothing has looked at those, and each can be in the same state. The ones it
+/// bound before were let go again with the failure, so they are not named.
+fn listen_said(line: &ListenLine, environment: &EnvironmentPaths) -> Shown {
+    let later: Vec<(&'static str, Endpoint)> = ListenRole::ALL
+        .into_iter()
+        .skip_while(|role| *role != line.role)
+        .skip(1)
+        .filter_map(|role| Some((role.word(), endpoint_of(environment, role)?)))
+        .collect();
+    if !matches!(line.refusal, ListenRefusal::Unanswered) || later.is_empty() {
+        return Shown::listen(&line.path, &line.refusal, Some(TRY_AGAIN));
+    }
+    let said = Shown::listen(&line.path, &line.refusal, None);
+    let others = Shown::joined(
+        later.iter().map(|(role, endpoint)| {
+            shown!(
+                "its {} endpoint {}",
+                *role,
+                Shown::host_path(endpoint.as_path())
+            )
+        }),
+        " and ",
+    );
+    let them = if later.len() == 1 { "it" } else { "them" };
+    shown!(
+        "{}; {} can be in the same state; look at {} the same way before you {}",
+        said,
+        others,
+        them,
+        TRY_AGAIN
+    )
+}
+
+/// What a daemon's log says when its last line is a refused bind this command can vouch for.
+fn listen_report(line: &ListenLine, environment: &EnvironmentPaths) -> Shown {
+    shown!(
+        "its log reports that it could not listen on its {} endpoint {}",
+        line.role.word(),
+        listen_said(line, environment)
+    )
 }
 
 /// The control daemon the standalone start runs, and the service definition names: the one of the
@@ -874,23 +1038,46 @@ async fn standalone(
         manager: None,
     };
     let deadline = tokio::time::Instant::now() + bounds.start;
+    let expect = Expect {
+        environment,
+        daemon: Some(child.id()),
+    };
     // The daemon this command started, or the one another command started first: either way the
     // environment has its daemon, and it is the one the lock let through. The one started here is
     // collected as soon as it ends, so a daemon that could not take the environment is not left
-    // waiting on this command.
+    // waiting on this command. Once it has ended, and its log's last line says which endpoint it
+    // could not listen on, the wait stops: nothing more will come of it. Any other end waits out
+    // the bound, so commands that start a daemon at once converge on the one that holds the
+    // environment.
     let last = match answered_by(endpoint, deadline, &[], || {
-        let _ = child.try_wait();
+        if child.try_wait().ok().flatten().is_none() {
+            return Step::Continue;
+        }
+        stop_on_listen_line(&log, expect)
     })
     .await
     {
         Ok(client) => return Ok((ours(client)?, Some(started))),
-        Err(last) => last,
+        Err(Waited::Deadline(last)) => last,
+        Err(Waited::Stopped(line)) => {
+            if let Some(listed) = last_look(endpoint, &[]).await {
+                return Ok((ours(listed)?, Some(started)));
+            }
+            return Err(unanswered(shown!(
+                "the control daemon this command started for environment {} (process {}) ended; \
+                 {}; what it writes is in {}",
+                environment.environment_id(),
+                child.id(),
+                listen_report(&line, environment),
+                Shown::root(&log.path)
+            )));
+        }
     };
     let state = child.try_wait().ok().flatten().map_or_else(
         || Shown::said("it is still running"),
         |status| shown!("it has ended ({})", status),
     );
-    let said = log.said("its log holds nothing since it started");
+    let said = log.said("its log holds nothing since it started", expect);
     Err(unanswered(shown!(
         "the control daemon this command started for environment {} (process {}) did not \
              answer within {} seconds: {}; {}, and {}; what it writes is in {}",
@@ -953,12 +1140,17 @@ pub(crate) fn start_as_before(
 
 /// What a failure says of the last line a daemon's log holds.
 ///
-/// The daemon's refusal of an environment another daemon already holds is said, because it is the
-/// daemon's own sentence and names the environment by its identifier. Any other line is whatever
-/// the daemon, or a library it uses, wrote, so the failure says that the log holds one and names
-/// the log, rather than repeating it.
-fn last_line_said(line: &str) -> Shown {
+/// The daemon's refusal of an endpoint it could not bind is said from its fields, in this command's
+/// words, when the line is exactly the grammar and names an endpoint of this environment
+/// ([`Expect`]). Its refusal of an environment another daemon already holds is said, because it is
+/// the daemon's own sentence and names the environment by its identifier. Any other line is
+/// whatever the daemon, or a library it uses, wrote, so the failure says that the log holds one and
+/// names the log, rather than repeating it.
+fn last_line_said(line: &str, expect: Expect<'_>) -> Shown {
     const HELD: &str = "kr-controller: another control daemon already owns environment ";
+    if let Some(listen) = expect.listen_line(line) {
+        return listen_report(&listen, expect.environment);
+    }
     match line
         .strip_prefix(HELD)
         .and_then(|environment| environment.parse::<kr_protocol::ids::EnvironmentId>().ok())
@@ -1023,14 +1215,38 @@ async fn managed(
         manager: Some(asked.manager),
     };
     let deadline = tokio::time::Instant::now() + bounds.start;
-    let last = match answered_by(endpoint, deadline, majors, || {}).await {
-        Ok(client) => return Ok((client, Some(started))),
-        Err(last) => last,
+    let expect = Expect {
+        environment,
+        daemon: asked.pid,
     };
-    let said = log.said("its log holds nothing since it started");
     let process = asked
         .pid
         .map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
+    // The manager gives no handle on the daemon it started, so the wait stops on the log's last
+    // line alone: a daemon that wrote a refused bind has no endpoint to answer on.
+    let last = match answered_by(endpoint, deadline, majors, || {
+        stop_on_listen_line(&log, expect)
+    })
+    .await
+    {
+        Ok(client) => return Ok((client, Some(started))),
+        Err(Waited::Deadline(last)) => last,
+        Err(Waited::Stopped(line)) => {
+            if let Some(listed) = last_look(endpoint, majors).await {
+                return Ok((listed, Some(started)));
+            }
+            return Err(unanswered(shown!(
+                "the control daemon {} started for environment {}{} did not answer; {}; what it \
+                 writes is in {}",
+                asked.manager.as_str(),
+                environment.environment_id(),
+                process,
+                listen_report(&line, environment),
+                Shown::root(&log.path)
+            )));
+        }
+    };
+    let said = log.said("its log holds nothing since it started", expect);
     Err(unanswered(shown!(
         "the control daemon {} started for environment {}{} did not answer within {} seconds: \
          {}; {}; what it writes is in {}",
@@ -1132,7 +1348,17 @@ async fn start_by_task(
         start: ControllerStartup::Standalone,
         manager: None,
     };
-    let last = match answered_by(endpoint, deadline, majors, || {}).await {
+    let expect = Expect {
+        environment,
+        daemon: None,
+    };
+    // The task's starter gives no handle on the daemon, so the wait stops on the log's last line
+    // alone, and the request is withdrawn before the failure says anything of it.
+    let last = match answered_by(endpoint, deadline, majors, || {
+        stop_on_listen_line(&log, expect)
+    })
+    .await
+    {
         Ok(client) => {
             // A daemon answered, whichever start it came from. The request is withdrawn, so no
             // starter the Task Scheduler runs later acts on it; one that took it already is past
@@ -1140,7 +1366,14 @@ async fn start_by_task(
             let _ = kr_ipc::starter::withdraw_claim(environment, asked.request);
             return Ok((client, Some(started)));
         }
-        Err(last) => last,
+        Err(Waited::Deadline(last)) => last,
+        Err(Waited::Stopped(line)) => {
+            if let Some(listed) = last_look(endpoint, majors).await {
+                let _ = kr_ipc::starter::withdraw_claim(environment, asked.request);
+                return Ok((listed, Some(started)));
+            }
+            return Err(windows::stopped(environment, &asked, &line, &log));
+        }
     };
     Err(windows::unanswered(
         environment,
@@ -1178,12 +1411,20 @@ impl Log {
     /// What a failure says of this start's part of the log: its last line where that is the
     /// daemon's own refusal, that it holds a line, `nothing`, the sentence for a log that holds
     /// nothing since the start began, or that it could not be read.
-    fn said(&self, nothing: &'static str) -> Shown {
+    fn said(&self, nothing: &'static str, expect: Expect<'_>) -> Shown {
         match self.last_line() {
-            Ok(Some(line)) => last_line_said(&line),
+            Ok(Some(line)) => last_line_said(&line, expect),
             Ok(None) => Shown::said(nothing),
             Err(error) => shown!("its log could not be read: {}", Shown::io(&error)),
         }
+    }
+
+    /// The listen line this start's part of the log ends with, when `expect` takes it.
+    fn listen_line(&self, expect: Expect<'_>) -> Option<ListenLine> {
+        self.last_line()
+            .ok()
+            .flatten()
+            .and_then(|line| expect.listen_line(&line))
     }
 
     /// The last line written since this start began, read through the handle that was checked.
@@ -2082,7 +2323,13 @@ mod windows {
     ) -> CliError {
         let environment_id = environment.environment_id();
         let name = task::name(environment_id);
-        let said = log.said("its log holds nothing since the request was left");
+        let said = log.said(
+            "its log holds nothing since the request was left",
+            super::Expect {
+                environment,
+                daemon: None,
+            },
+        );
         match kr_ipc::starter::withdraw_claim(environment, asked.request) {
             Ok(Withdrawal::Withdrawn) => not_taken(environment, bound, asked),
             Ok(Withdrawal::Taken) => super::unanswered(shown!(
@@ -2104,6 +2351,48 @@ mod windows {
                 *last,
                 Shown::ipc(&error),
                 said,
+                Shown::root(&log.path)
+            )),
+        }
+    }
+
+    /// The failure of a start that stopped waiting because the log's last line is a refused bind.
+    ///
+    /// The request is withdrawn first, so what the failure says of it holds, and no bound is in the
+    /// words: the start did not wait one out.
+    pub fn stopped(
+        environment: &EnvironmentPaths,
+        asked: &Asked,
+        line: &kr_ipc::listen::ListenLine,
+        log: &super::Log,
+    ) -> CliError {
+        let environment_id = environment.environment_id();
+        let reports = super::listen_report(line, environment);
+        match kr_ipc::starter::withdraw_claim(environment, asked.request) {
+            Ok(Withdrawal::Withdrawn) => super::unanswered(shown!(
+                "{}, and its starter did not take the request to start the control daemon, so the \
+                 request was withdrawn; the log reports that a daemon for this environment could \
+                 not listen on its {} endpoint {}; what the daemon writes is in {}",
+                run_said(asked.run, environment_id),
+                line.role.word(),
+                super::listen_said(line, environment),
+                Shown::root(&log.path)
+            )),
+            Ok(Withdrawal::Taken) => super::unanswered(shown!(
+                "the starter of this user's scheduled task {} took the request to start the \
+                 control daemon for environment {}, and the daemon did not answer; {}; what the \
+                 daemon writes is in {}",
+                task::name(environment_id),
+                environment_id,
+                reports,
+                Shown::root(&log.path)
+            )),
+            Err(error) => super::unanswered(shown!(
+                "{}, and no control daemon answered: {}; whether its starter took the request \
+                 cannot be told: {}; what the daemon writes is in {}",
+                run_said(asked.run, environment_id),
+                reports,
+                Shown::ipc(&error),
                 Shown::root(&log.path)
             )),
         }
@@ -2354,10 +2643,16 @@ mod tests {
         ));
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut attempts = 0;
-        let last = answered_by(&endpoint, deadline, &[], || attempts += 1)
-            .await
-            .map(|_| ())
-            .expect_err("nothing answers");
+        let waited = answered_by(&endpoint, deadline, &[], || {
+            attempts += 1;
+            Step::<()>::Continue
+        })
+        .await
+        .map(|_| ())
+        .expect_err("nothing answers");
+        let Waited::Deadline(last) = waited else {
+            panic!("the deadline ended the wait");
+        };
         assert!(last.as_str().contains("did not answer"), "{last}");
         assert!(attempts >= 1);
         assert!(
@@ -2434,7 +2729,15 @@ mod tests {
             path: path.clone(),
             from: 0,
         };
-        let said = log.said("its log holds nothing since it started");
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let said = log.said(
+            "its log holds nothing since it started",
+            Expect {
+                environment: &environment,
+                daemon: None,
+            },
+        );
         assert!(said.as_str().contains("could not be read"), "{said}");
         assert!(!said.as_str().contains("holds nothing"), "{said}");
     }
@@ -2500,10 +2803,16 @@ mod tests {
         use crate::shown::marker::{MARKER, assert_unmarked};
 
         let environment = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.environment();
+        let expect = Expect {
+            environment: &paths,
+            daemon: Some(4242),
+        };
         let held =
             format!("kr-controller: another control daemon already owns environment {environment}");
         assert_eq!(
-            last_line_said(&held).as_str(),
+            last_line_said(&held, expect).as_str(),
             format!("the last line its log holds since it started is: {held}")
         );
         for line in [
@@ -2512,7 +2821,7 @@ mod tests {
             format!("kr-controller: another control daemon already owns environment {MARKER}"),
             format!("{held} {MARKER}"),
         ] {
-            let said = last_line_said(&line);
+            let said = last_line_said(&line, expect);
             assert_eq!(
                 said.as_str(),
                 "its log holds a line since it started, which is not repeated here",
@@ -2520,6 +2829,341 @@ mod tests {
             );
             assert_unmarked("a daemon's last line", &[said.into_string()]);
         }
+    }
+
+    /// KR-REQ-07.12: a listen line the daemon wrote for one of this environment's endpoints is said
+    /// in this command's words, for every endpoint and every class, and only when it is exactly
+    /// the grammar, names this environment's endpoint for its role and was written by the process
+    /// this command started. The words of each class are the class's own: only a thing that is not
+    /// a socket is told to be moved away without a check, a refusal that names a running listener
+    /// never says to remove anything, and the endpoints that were still to be bound are named
+    /// only after a refusal that shows nobody holds the one that failed.
+    #[test]
+    fn a_listen_line_for_this_environments_endpoint_is_said_in_the_clis_words() {
+        use kr_ipc::listen::{ListenStep, ObjectKind};
+
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let expect = Expect {
+            environment: &environment,
+            daemon: Some(4242),
+        };
+        let path = |role| {
+            endpoint_of(&environment, role)
+                .expect("an endpoint")
+                .as_text()
+        };
+        // The words name a path as `Shown` says it: only the names it knows.
+        let said_path = |role| Shown::host_path(std::path::Path::new(&path(role))).into_string();
+        let refused_now = "its log holds a line since it started, which is not repeated here";
+        let mut classes = vec![
+            ListenRefusal::Held { pid: Some(4242) },
+            ListenRefusal::Held { pid: None },
+            ListenRefusal::LockHeld,
+            ListenRefusal::Unanswered,
+            ListenRefusal::NotRemoved { os: 13 },
+            ListenRefusal::NameTaken,
+            ListenRefusal::Other {
+                operation: ListenStep::Bind,
+                os: Some(13),
+            },
+            ListenRefusal::Other {
+                operation: ListenStep::Probe,
+                os: None,
+            },
+        ];
+        for object in [
+            ObjectKind::File,
+            ObjectKind::Directory,
+            ObjectKind::Link,
+            ObjectKind::Other,
+        ] {
+            classes.push(ListenRefusal::NotASocket { object });
+        }
+        let written = |role, refusal: &ListenRefusal, path: String, daemon| {
+            ListenLine {
+                role,
+                refusal: refusal.clone(),
+                path,
+                daemon,
+            }
+            .written("the daemon's own tail")
+            .expect("a class the daemon writes")
+        };
+
+        for role in ListenRole::ALL {
+            for refusal in &classes {
+                let line = written(role, refusal, path(role), 4242);
+                let said = last_line_said(&line, expect);
+                let words = said.as_str();
+                let begin = format!(
+                    "its log reports that it could not listen on its {} endpoint {}: ",
+                    role.word(),
+                    said_path(role)
+                );
+                assert!(words.starts_with(&begin), "{role:?} {refusal:?}: {words}");
+                assert!(
+                    !words.contains("the daemon's own tail"),
+                    "the daemon's tail is never repeated: {words}"
+                );
+                assert_eq!(
+                    words.contains(TRY_AGAIN),
+                    refusal.words().joiner.is_some(),
+                    "{role:?} {refusal:?}: {words}"
+                );
+                assert_eq!(
+                    words.contains("move it away") && !words.contains("move it away only"),
+                    matches!(refusal, ListenRefusal::NotASocket { .. }),
+                    "{role:?} {refusal:?}: {words}"
+                );
+                if matches!(
+                    refusal,
+                    ListenRefusal::Held { .. } | ListenRefusal::LockHeld | ListenRefusal::NameTaken
+                ) {
+                    assert!(!words.contains("remove"), "{refusal:?}: {words}");
+                }
+                assert_eq!(
+                    words.contains("can be in the same state"),
+                    matches!(refusal, ListenRefusal::Unanswered) && role != ListenRole::Transfer,
+                    "{role:?} {refusal:?}: {words}"
+                );
+            }
+        }
+
+        // The clause names the endpoints bound after the failed one, and no other.
+        let (rendezvous, control, transfer) = (
+            path(ListenRole::Rendezvous),
+            path(ListenRole::Control),
+            path(ListenRole::Transfer),
+        );
+        let (shown_rendezvous, shown_control, shown_transfer) = (
+            said_path(ListenRole::Rendezvous),
+            said_path(ListenRole::Control),
+            said_path(ListenRole::Transfer),
+        );
+        let unanswered = ListenRefusal::Unanswered;
+        let after_the_first = last_line_said(
+            &written(
+                ListenRole::Rendezvous,
+                &unanswered,
+                rendezvous.clone(),
+                4242,
+            ),
+            expect,
+        );
+        assert!(
+            after_the_first.as_str().ends_with(&format!(
+                "; its control endpoint {shown_control} and its transfer endpoint {shown_transfer} \
+                 can be in the same state; look at them the same way before you run the command \
+                 again"
+            )),
+            "{after_the_first}"
+        );
+        assert_eq!(
+            after_the_first.as_str().matches(&shown_rendezvous).count(),
+            1
+        );
+        let after_the_second = last_line_said(
+            &written(ListenRole::Control, &unanswered, control.clone(), 4242),
+            expect,
+        );
+        assert!(
+            after_the_second.as_str().ends_with(&format!(
+                "; its transfer endpoint {shown_transfer} can be in the same state; look at it the \
+                 same way before you run the command again"
+            )),
+            "{after_the_second}"
+        );
+        assert!(!after_the_second.as_str().contains(&shown_rendezvous));
+        let after_the_last = last_line_said(
+            &written(ListenRole::Transfer, &unanswered, transfer.clone(), 4242),
+            expect,
+        );
+        assert!(
+            after_the_last
+                .as_str()
+                .ends_with("move it away only if none does; then run the command again"),
+            "{after_the_last}"
+        );
+
+        // A line that is not for this environment's endpoint, written by this command's process, is
+        // not repeated, whatever else it says.
+        let held = ListenRefusal::Held { pid: Some(7) };
+        for line in [
+            written(ListenRole::Control, &held, rendezvous.clone(), 4242),
+            written(ListenRole::Rendezvous, &held, control.clone(), 4242),
+            written(
+                ListenRole::Control,
+                &held,
+                "/elsewhere/another/c.sock".to_owned(),
+                4242,
+            ),
+            written(ListenRole::Control, &held, control.clone(), 4243),
+            written(ListenRole::Control, &held, control.clone(), 4242)
+                .replace("class=held", "class=held2"),
+            written(ListenRole::Control, &held, control.clone(), 4242).replace("os=-", "os=5"),
+        ] {
+            assert_eq!(
+                last_line_said(&line, expect).as_str(),
+                refused_now,
+                "{line}"
+            );
+        }
+        // Where this command holds no process, the process is not compared.
+        let anyone = Expect {
+            environment: &environment,
+            daemon: None,
+        };
+        let line = written(ListenRole::Control, &held, control.clone(), 4243);
+        assert!(
+            last_line_said(&line, anyone)
+                .as_str()
+                .starts_with("its log reports that it could not listen on its control endpoint"),
+        );
+        assert_eq!(last_line_said(&line, expect).as_str(), refused_now);
+    }
+
+    /// KR-REQ-07.12: the line the daemon's own bind function writes for a file where its control
+    /// endpoint belongs is the one this command reads back, whatever the path's text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_line_the_daemons_bind_writes_is_read_back_for_the_same_endpoint() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let control = environment.controller_endpoint().expect("an endpoint");
+        std::fs::write(control.as_path(), b"").expect("a file where the endpoint belongs");
+        let failure = match kr_controller::local_endpoints::bind_local_endpoints(&environment) {
+            Err(failure) => failure,
+            Ok(_) => panic!("a file at the control endpoint is not bound over"),
+        };
+        let line = failure.line(4242);
+        let expect = Expect {
+            environment: &environment,
+            daemon: Some(4242),
+        };
+        let listen = expect
+            .listen_line(&line)
+            .unwrap_or_else(|| panic!("the daemon's own line is taken: {line}"));
+        assert_eq!(listen.role, ListenRole::Control);
+        let said = last_line_said(&line, expect);
+        assert!(
+            said.as_str().starts_with(&format!(
+                "its log reports that it could not listen on its control endpoint {}: it holds a file",
+                Shown::host_path(control.as_path())
+            )),
+            "{said}"
+        );
+    }
+
+    /// KR-REQ-07.12: the wait stops on the log's last line when it is a listen line this start can
+    /// vouch for, for the process it started where it holds one, and on nothing else: a line another
+    /// start's daemon wrote, a daemon's refusal of an environment another one holds and any other
+    /// line keep it waiting, and the last line decides.
+    #[cfg(unix)]
+    #[test]
+    fn the_wait_stops_at_a_verified_line_and_keeps_waiting_on_any_other() {
+        use std::io::Write as _;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let path = environment.state_dir().join(LOG_FILE);
+        let log = Log::open(&path).expect("opens the log");
+        let append = |line: &str| {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("opens the log to append");
+            writeln!(file, "{line}").expect("appends a line");
+        };
+        let listen = |daemon| {
+            ListenLine {
+                role: ListenRole::Control,
+                refusal: ListenRefusal::Held { pid: Some(7) },
+                path: environment
+                    .controller_endpoint()
+                    .expect("an endpoint")
+                    .as_text(),
+                daemon,
+            }
+            .written("a tail")
+            .expect("a line the daemon writes")
+        };
+        let mine = Expect {
+            environment: &environment,
+            daemon: Some(4242),
+        };
+        let anyones = Expect {
+            environment: &environment,
+            daemon: None,
+        };
+
+        assert!(matches!(stop_on_listen_line(&log, mine), Step::Continue));
+        append("kr-controller: another control daemon already owns environment somewhere");
+        assert!(matches!(stop_on_listen_line(&log, mine), Step::Continue));
+        append("a line a library wrote");
+        assert!(matches!(stop_on_listen_line(&log, anyones), Step::Continue));
+        append(&listen(4243));
+        assert!(
+            matches!(stop_on_listen_line(&log, mine), Step::Continue),
+            "another process's line does not end this start's wait"
+        );
+        assert!(
+            matches!(stop_on_listen_line(&log, anyones), Step::Stop(line) if line.daemon == 4243),
+            "where there is no process to compare, the line does"
+        );
+        append(&listen(4242));
+        assert!(matches!(
+            stop_on_listen_line(&log, mine),
+            Step::Stop(line) if line.daemon == 4242
+        ));
+        append("a line a library wrote after it");
+        assert!(
+            matches!(stop_on_listen_line(&log, mine), Step::Continue),
+            "the last line decides"
+        );
+    }
+
+    /// KR-REQ-07.12: a wait's one attempt is kept across the ticks that ask whether to go on: a
+    /// pending attempt is ended by the tick that says stop and left unfinished, an attempt that
+    /// finishes between ticks gives its answer, and no tick starts a second one.
+    #[tokio::test]
+    async fn a_pending_attempt_is_ended_by_the_tick_and_kept_when_the_tick_continues() {
+        let tick = Duration::from_millis(20);
+
+        let mut asked = 0;
+        let started = tokio::time::Instant::now();
+        let ended = until_stopped(tick, std::future::pending::<()>(), &mut || {
+            asked += 1;
+            if asked < 3 {
+                Step::Continue
+            } else {
+                Step::Stop("third")
+            }
+        })
+        .await;
+        assert_eq!(ended, Err("third"));
+        assert_eq!(asked, 3, "asked at each tick the attempt stayed pending");
+        assert!(
+            started.elapsed() >= tick * 3,
+            "the third tick ended it, not an earlier one: {:?}",
+            started.elapsed()
+        );
+
+        let mut asked = 0;
+        let mut begun = 0;
+        let attempt = async {
+            begun += 1;
+            tokio::time::sleep(tick * 7 / 2).await;
+            "answer"
+        };
+        let found = until_stopped(tick, attempt, &mut || {
+            asked += 1;
+            Step::<()>::Continue
+        })
+        .await;
+        assert_eq!(found, Ok("answer"));
+        assert_eq!(begun, 1, "the attempt was started once and kept");
+        assert_eq!(asked, 3, "and asked at each tick it stayed pending");
     }
 
     /// Every finding about a task that was read from the Task Scheduler or from the task itself,
