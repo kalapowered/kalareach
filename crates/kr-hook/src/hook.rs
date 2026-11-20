@@ -1929,8 +1929,9 @@ mod tests {
         /// call pending, reports that a turn ended in its thread, with no detail, whatever else
         /// the payload carries. Its reference does not say whether `Stop` runs when the person
         /// interrupts. No released package registers `Stop` yet. On `Stop` exit code 2 makes the
-        /// agent go on, so the forwarder never exits 2: it answers `{}` and exits 0, and a failure
-        /// it could not help exits 1 or 64.
+        /// agent go on, and the forwarder never exits 2: a valid run answers `{}` and exits 0,
+        /// after an operational error or a timeout too, a command line it refuses exits 64 and a
+        /// forwarder that cannot hold its release exits 1.
         #[test]
         fn a_stop_event_reports_that_a_turn_ended() {
             let payload = serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",
