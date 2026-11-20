@@ -1395,11 +1395,13 @@ fn start_each_once(directory: &Path) {
 /* A host                                                                                        */
 /* -------------------------------------------------------------------------------------------- */
 
-/// How many cases that install and start releases run at once, where the operating system checks
-/// a program the first time it starts: on macOS. Nothing else checks one, so nothing else bounds
-/// the cases.
+/// How many hosts a test program has at once, where the releases they write keep each other's
+/// daemons waiting: on macOS and on Linux. Nothing else is known to, so nothing else bounds the
+/// cases.
 const HOST_CASES_AT_ONCE: Option<usize> = if cfg!(target_os = "macos") {
     Some(2)
+} else if cfg!(target_os = "linux") {
+    Some(4)
 } else {
     None
 };
@@ -1414,39 +1416,79 @@ const HOST_CASES_AT_ONCE: Option<usize> = if cfg!(target_os = "macos") {
 /// holds says anything about the case. With a few places the queue holds a few programs, and a
 /// case's wait is its own program's check and what the rest of the machine adds, however many
 /// cases the test run would otherwise start at once.
-struct Place;
+///
+/// Linux keeps the changes of a file system in one journal, and a daemon's flush of each store it
+/// creates waits for the journal's commit, which first writes out the programs of every release
+/// written before it. A host's release is hundreds of megabytes of programs and its daemon creates
+/// some twenty stores, so with the cases of a test run all at once a daemon's start outlasted the
+/// 30 seconds the command that started it waits, while with four at once it took a fraction of a
+/// second.
+struct Place<'a> {
+    places: &'a Places,
+}
 
-impl Place {
-    fn take() -> Self {
-        let (taken, freed) = places();
-        let mut taken = taken
+/// The places a test program gives its hosts, the number taken, and the signal that one was given
+/// back.
+struct Places {
+    limit: Option<usize>,
+    taken: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+impl Places {
+    const fn new(limit: Option<usize>) -> Self {
+        Self {
+            limit,
+            taken: Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    fn is_full(&self, taken: usize) -> bool {
+        self.limit.is_some_and(|limit| taken >= limit)
+    }
+
+    /// Takes a place, waiting for one to be given back when none is free.
+    fn take(&self) -> Place<'_> {
+        let taken = self
+            .taken
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while HOST_CASES_AT_ONCE.is_some_and(|limit| *taken >= limit) {
-            taken = freed
-                .wait(taken)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut taken = self
+            .freed
+            .wait_while(taken, |taken| self.is_full(*taken))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *taken += 1;
+        Place { places: self }
+    }
+
+    /// Takes a place if one is free.
+    fn try_take(&self) -> Option<Place<'_>> {
+        let mut taken = self
+            .taken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.is_full(*taken) {
+            return None;
         }
         *taken += 1;
-        Self
+        Some(Place { places: self })
     }
 }
 
-impl Drop for Place {
+impl Drop for Place<'_> {
     fn drop(&mut self) {
-        let (taken, freed) = places();
-        *taken
+        *self
+            .places
+            .taken
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
-        freed.notify_one();
+        self.places.freed.notify_one();
     }
 }
 
-/// The places taken, and the signal that one was given back.
-fn places() -> &'static (Mutex<usize>, std::sync::Condvar) {
-    static PLACES: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
-    &PLACES
-}
+/// The places of this test program.
+static PLACES: Places = Places::new(HOST_CASES_AT_ONCE);
 
 /// The locks an update holds when it switches, held by a test that stands in for the update.
 struct StandingIn<'a> {
@@ -1501,7 +1543,7 @@ struct Host {
     store: Store,
     tree: teardown::Tree,
     // Last, so that it is given back once the tree is gone.
-    _place: Place,
+    _place: Place<'static>,
 }
 
 /// Prints what the daemons of a case that failed wrote, and how long before it was read each log was
@@ -2040,7 +2082,7 @@ impl Host {
     }
 
     fn bare_in(tree: teardown::Tree) -> Self {
-        let place = Place::take();
+        let place = PLACES.take();
         let store = Store::at(tree.root().join("host"));
         Self {
             daemons: Vec::new(),
