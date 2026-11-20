@@ -2415,6 +2415,14 @@ mod windows {
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         )
         .and_then(|descriptor| read_descriptor(&descriptor));
+        #[cfg(test)]
+        let read = if matches!(seen, Some(tests::Seen::Unreadable)) {
+            Err(AccessListRefusal::Unreadable(
+                "a seam made the read fail".to_owned(),
+            ))
+        } else {
+            read
+        };
         let as_set = match read {
             Ok(read) => read.discretionary.is_the_owner_only_list(user),
             Err(AccessListRefusal::Unreadable(detail)) => {
@@ -2524,6 +2532,8 @@ mod windows {
             NoLists,
             /// The list reads back as another than the one set.
             OtherList,
+            /// The list cannot be read back.
+            Unreadable,
         }
 
         /// Run with the new file as the check of its list begins, before any content is written
@@ -2587,15 +2597,9 @@ mod windows {
             assert_eq!(folder.names(), Vec::<String>::new(), "nothing is left");
         }
 
-        /// A check that refuses the new file refuses both writers before any content is written,
-        /// removes the file it made, and touches nothing else: a file already at the destination
-        /// keeps its bytes and its list, and the folder holds nothing new.
-        fn refused_before_any_content(seen: Seen, words: &str) {
-            let folder = Folder::new("refused");
-            let destination = folder.0.join("setting");
-            crate::paths::write_owner_only_file(&destination, b"kept").expect("a file to keep");
-            let before = FileAccess::of(&destination).expect("reads who can reach the file");
-
+        /// Makes the check of a list see `seen`, and records the length of each file as its check
+        /// begins. The hook is taken away when the returned guard is dropped, however the case ends.
+        fn sees(seen: Seen) -> (std::rc::Rc<std::cell::RefCell<Vec<u64>>>, impl Drop) {
             let lengths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let recorded = std::rc::Rc::clone(&lengths);
             BEFORE_THE_CHECK.with(|hook| {
@@ -2613,7 +2617,19 @@ mod windows {
                     BEFORE_THE_CHECK.with(|hook| *hook.borrow_mut() = None);
                 }
             }
-            let _cleared = Cleared;
+            (lengths, Cleared)
+        }
+
+        /// A check that refuses the new file refuses both writers before any content is written,
+        /// removes the file it made, and touches nothing else: a file already at the destination
+        /// keeps its bytes and its list, and the folder holds nothing new.
+        fn refused_before_any_content(seen: Seen, words: &str) {
+            let folder = Folder::new("refused");
+            let destination = folder.0.join("setting");
+            crate::paths::write_owner_only_file(&destination, b"kept").expect("a file to keep");
+            let before = FileAccess::of(&destination).expect("reads who can reach the file");
+
+            let (lengths, _cleared) = sees(seen);
 
             for (writer, outcome) in [
                 (
@@ -2669,6 +2685,65 @@ mod windows {
                 Seen::OtherList,
                 "the access list of the new file reads back other than as set, so it cannot be made \
                  readable by its owner alone",
+            );
+        }
+
+        /// A list that cannot be read back refuses both writers before any content is written. The
+        /// read is replaced here; no volume makes a list that cannot be read.
+        #[test]
+        fn a_list_that_cannot_be_read_back_refuses_both_writers_before_any_content() {
+            refused_before_any_content(
+                Seen::Unreadable,
+                "the access list of the new file could not be read back: a seam made the read fail",
+            );
+        }
+
+        /// A check that refuses a file that already stood at the name leaves its bytes as they were:
+        /// the check runs on the file with its content still in it, before the caller empties it.
+        fn refused_existing_file(seen: Seen, words: &str) {
+            let folder = Folder::new("refused-existing");
+            let path = folder.0.join("kit");
+            create_file_with_descriptor(
+                &path,
+                &format!("D:P(A;;GA;;;OW)(A;;GA;;;{})(A;;GR;;;AU)", user_text()),
+            )
+            .expect("a file that grants Authenticated Users");
+            std::fs::write(&path, b"what was there").expect("content");
+
+            let (lengths, _cleared) = sees(seen);
+            let error = crate::paths::open_owner_only_in_place(&path)
+                .expect_err("the list does not read back, so the file is not opened");
+
+            assert!(error.to_string().contains(words), "{error}");
+            assert_eq!(
+                *lengths.borrow(),
+                vec![14],
+                "the check ran on the file with its content in it"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("reads"),
+                b"what was there",
+                "the file keeps its bytes"
+            );
+            assert_eq!(folder.names(), vec!["kit".to_owned()]);
+        }
+
+        /// A list that reads back other than as set refuses an existing file and leaves its bytes.
+        #[test]
+        fn a_list_that_reads_back_other_than_set_refuses_an_existing_file_and_keeps_its_bytes() {
+            refused_existing_file(
+                Seen::OtherList,
+                "the access list of the file reads back other than as set, so it cannot be made \
+                 readable by its owner alone",
+            );
+        }
+
+        /// A list that cannot be read back refuses an existing file and leaves its bytes.
+        #[test]
+        fn a_list_that_cannot_be_read_back_refuses_an_existing_file_and_keeps_its_bytes() {
+            refused_existing_file(
+                Seen::Unreadable,
+                "the access list of the file could not be read back: a seam made the read fail",
             );
         }
 
