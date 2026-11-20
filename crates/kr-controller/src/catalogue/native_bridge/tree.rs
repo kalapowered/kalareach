@@ -65,6 +65,18 @@ pub(super) enum Child {
     NotADirectory,
 }
 
+/// What making a private folder gave.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(super) enum Made {
+    /// The folder, opened, closed to every user but the acting one, and empty.
+    Private(Dir),
+    /// What is at the name can be entered by another user: it is not the acting user's, its mode
+    /// gives the group or others a bit, or its access list lets someone in.
+    OpenToOthers,
+    /// What is at the name holds an entry, which this call did not put there.
+    Occupied,
+}
+
 /// What reading one name found.
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(super) enum Fetched {
@@ -122,7 +134,7 @@ mod platform {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
     use rustix::io::Errno;
 
-    use super::{Child, Entry, Fetched, Identity, Owners, Read, Unstaged};
+    use super::{Child, Entry, Fetched, Identity, Made, Owners, Read, Unstaged};
 
     /// An open directory, its identity, and the path it was reached by, for messages and for the
     /// checks that only take a path.
@@ -261,11 +273,17 @@ mod platform {
         }
 
         /// Makes a folder in this one that only its owner can enter, and opens it. It fails where
-        /// the name is taken, so the folder is one this call made.
+        /// the name is taken, so the folder is one this call made, unless another process put a
+        /// folder of its own at the name between the making and the opening. What was opened is
+        /// therefore read through its handle, and anything but a folder that is the acting user's,
+        /// gives the group and others no bit, carries no access-list entry of its own on macOS (one
+        /// its parent passes on) and holds nothing is refused. A folder refused for its owner, its
+        /// mode or its contents stays where it is, since nothing proves this call made it; one
+        /// refused for its access list is this call's own and empty, so it goes again.
         pub(in crate::catalogue::native_bridge) fn make_private(
             &self,
             name: &str,
-        ) -> std::io::Result<Self> {
+        ) -> std::io::Result<Made> {
             rustix::fs::mkdirat(self.handle.as_fd(), name, Mode::RWXU)?;
             #[cfg(test)]
             crate::catalogue::native_bridge::anchor::private_pause::run(&self.join(name));
@@ -277,11 +295,46 @@ mod platform {
             )
             .map_err(std::io::Error::from)
             .and_then(|handle| Self::held(handle, self.join(name)));
-            if opened.is_err() {
-                // Nothing was put in it yet, so the folder this call made goes again.
-                let _ = rustix::fs::unlinkat(self.handle.as_fd(), name, AtFlags::REMOVEDIR);
+            let folder = match opened {
+                Ok(folder) => folder,
+                Err(error) => {
+                    // Nothing was put in it yet, so the folder this call made goes again.
+                    let _ = self.remove_directory(name);
+                    return Err(error);
+                }
+            };
+            if !folder.closed_to_others()? {
+                return Ok(Made::OpenToOthers);
             }
-            opened
+            #[cfg(target_os = "macos")]
+            match access_list(&folder) {
+                Ok(AccessList::Closed) => {}
+                Ok(AccessList::Open) => {
+                    let _ = self.remove_directory(name);
+                    return Ok(Made::OpenToOthers);
+                }
+                Ok(AccessList::Elsewhere) => return Ok(Made::OpenToOthers),
+                Err(error) => {
+                    let _ = self.remove_directory(name);
+                    return Err(error);
+                }
+            }
+            if !folder.names()?.is_empty() {
+                return Ok(Made::Occupied);
+            }
+            Ok(Made::Private(folder))
+        }
+
+        /// True when this directory, read through its handle, is the acting user's and gives
+        /// neither the group nor others any permission bit.
+        fn closed_to_others(&self) -> std::io::Result<bool> {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::File::from(self.handle.try_clone()?).metadata()?;
+            Ok(closed_to_others(
+                metadata.uid(),
+                acting_user(),
+                metadata.mode(),
+            ))
         }
 
         /// Says what is at one name, without following a link.
@@ -496,6 +549,53 @@ mod platform {
         rustix::process::geteuid().as_raw()
     }
 
+    /// True when a directory of `owner` with `mode` is closed to everybody but `acting`: the owner
+    /// is that user, and the group and others hold no permission bit.
+    const fn closed_to_others(owner: u32, acting: u32, mode: u32) -> bool {
+        owner == acting && mode & 0o077 == 0
+    }
+
+    /// What the access list of an opened folder says about who can enter it.
+    #[cfg(target_os = "macos")]
+    enum AccessList {
+        /// No entry applies to the folder itself.
+        Closed,
+        /// An entry applies to the folder itself, and so lets someone in beyond its mode bits.
+        Open,
+        /// The path the system reported for the folder no longer leads to it, so the list read by
+        /// that path is not the list of this folder.
+        Elsewhere,
+    }
+
+    /// Reads the access list of `folder`. The platform's call takes a path, so it is the path the
+    /// system reports for the open folder, which follows the folder wherever it has been moved,
+    /// and the answer counts only where that path still leads to the folder that is held.
+    #[cfg(target_os = "macos")]
+    fn access_list(folder: &Dir) -> std::io::Result<AccessList> {
+        use std::os::unix::ffi::OsStringExt as _;
+        let reached = PathBuf::from(std::ffi::OsString::from_vec(
+            rustix::fs::getpath(&folder.handle)?.into_bytes(),
+        ));
+        let entries = exacl::getfacl(&reached, None)?;
+        if !leads_to(&reached, &folder.identity) {
+            return Ok(AccessList::Elsewhere);
+        }
+        Ok(if lets_in(&entries) {
+            AccessList::Open
+        } else {
+            AccessList::Closed
+        })
+    }
+
+    /// True when one of `entries` applies to the folder it is on: an entry that is only passed on
+    /// to what is made in the folder gives the folder itself nothing.
+    #[cfg(target_os = "macos")]
+    fn lets_in(entries: &[exacl::AclEntry]) -> bool {
+        entries
+            .iter()
+            .any(|entry| !entry.flags.contains(exacl::Flag::ONLY_INHERIT))
+    }
+
     /// The error of a rename that takes a flag. A file system that does not take the flag says so
     /// with a different number on each system (`ENOTSUP` on macOS, `EINVAL` on Linux, `ENOSYS`
     /// where the flags do not exist); each is `Unsupported`, and any other failure keeps its kind.
@@ -551,7 +651,7 @@ mod platform {
 
         use rustix::io::Errno;
 
-        use super::rename_failure;
+        use super::{closed_to_others, rename_failure};
 
         /// A file system that does not take a rename flag is `Unsupported`, whichever number the
         /// system answers with; every other failure keeps its kind.
@@ -570,6 +670,41 @@ mod platform {
             );
             assert_eq!(rename_failure(Errno::NOENT).kind(), ErrorKind::NotFound);
         }
+
+        /// A folder is closed to other users only where its owner is the acting user and neither
+        /// the group nor others hold a permission bit.
+        #[test]
+        fn a_folder_is_closed_to_others_by_its_owner_and_its_mode() {
+            assert!(closed_to_others(501, 501, 0o040_700));
+            assert!(closed_to_others(501, 501, 0o040_500));
+            assert!(!closed_to_others(0, 501, 0o040_700), "another owner");
+            for mode in [0o040_750, 0o040_705, 0o040_770, 0o040_701, 0o040_007] {
+                assert!(!closed_to_others(501, 501, mode), "{mode:o}");
+            }
+        }
+
+        /// An entry of a folder's access list lets others in unless it is only passed on to what is
+        /// made in the folder.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn an_access_entry_that_is_not_inherit_only_lets_others_in() {
+            use exacl::{AclEntry, Flag, Perm};
+
+            use super::lets_in;
+
+            let allow = |flags| AclEntry::allow_group("everyone", Perm::READ, Some(flags));
+            assert!(!lets_in(&[]));
+            assert!(!lets_in(&[allow(
+                Flag::DIRECTORY_INHERIT | Flag::ONLY_INHERIT
+            )]));
+            assert!(lets_in(&[allow(Flag::DIRECTORY_INHERIT)]));
+            assert!(lets_in(&[allow(Flag::INHERITED | Flag::DIRECTORY_INHERIT)]));
+            assert!(lets_in(&[AclEntry::deny_group(
+                "everyone",
+                Perm::DELETE,
+                None
+            )]));
+        }
     }
 }
 
@@ -579,7 +714,7 @@ mod platform {
 mod platform {
     use std::path::{Path, PathBuf};
 
-    use super::{Child, Entry, Fetched, Identity, Owners, Unstaged};
+    use super::{Child, Entry, Fetched, Identity, Made, Owners, Unstaged};
 
     fn unsupported() -> std::io::Error {
         std::io::Error::new(
@@ -657,7 +792,7 @@ mod platform {
         pub(in crate::catalogue::native_bridge) fn make_private(
             &self,
             _name: &str,
-        ) -> std::io::Result<Self> {
+        ) -> std::io::Result<Made> {
             Err(unsupported())
         }
 

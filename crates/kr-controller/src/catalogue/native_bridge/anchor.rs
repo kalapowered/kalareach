@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 use kr_protocol::scalars::Digest256;
 
-use super::tree::{Child, Dir, Entry, Fetched, Identity, temporary_name};
+use super::tree::{Child, Dir, Entry, Fetched, Identity, Made, temporary_name};
 use crate::catalogue::files::{digest_of, storage};
 use crate::error::{ControllerError, Result};
 
@@ -330,15 +330,18 @@ impl Anchor {
     /// checked contents. Anything else, a file another process put there after the last read, a
     /// link or a folder, is traded back and the write is refused.
     ///
-    /// The private folder is made by this write, opened once, and closed to every user but this
-    /// one. Every step on the staged file goes through the handle this write holds on that folder,
-    /// never through a name another process can reach, so the staged file and the file a trade
-    /// displaces are removed from there and a file another process puts under the folder's own name
-    /// is never removed. The folder is removed by its name when the write ends. The kernel refuses
-    /// to remove a folder that holds anything, so a file kept in it stays. Between the two trades
-    /// the place holds the new contents and the displaced file is in the folder; it is removed only
-    /// where it is the checked file. Where it cannot be put back it is kept there, and the refusal
-    /// names where.
+    /// The private folder is made by this write and opened once. What was opened is read through
+    /// its handle: it must be this user's, give the group and others no permission bit, carry no
+    /// access-list entry of its own on macOS and hold nothing, or the write is refused before
+    /// anything is staged. A folder that fails the owner, mode or contents check stays where it is,
+    /// since nothing proves this write made it. Every step on the staged file goes through the
+    /// handle this write holds on that folder, never through a name in the shared folder, so the
+    /// staged file and the file a trade displaces are removed from there and a file another process
+    /// puts under the folder's own name is never removed. The folder is removed by its name when the
+    /// write ends. The kernel refuses to remove a folder that holds anything, so a file kept in it
+    /// stays. Between the two trades the place holds the new contents and the displaced file is in
+    /// the folder; it is removed only where it is the checked file. Where it cannot be put back it
+    /// is kept there, and the refusal names where.
     pub(crate) fn write(
         &self,
         path: &Path,
@@ -365,7 +368,11 @@ impl Anchor {
             }
         };
         let folder = temporary_name(place.name);
-        let staging = parent.make_private(&folder).map_err(storage)?;
+        let staging = match parent.make_private(&folder).map_err(storage)? {
+            Made::Private(staging) => staging,
+            Made::OpenToOthers => return Err(open_to_others(path)),
+            Made::Occupied => return Err(occupied(path)),
+        };
         let published = publish(&parent, &staging, place.name, path, bytes, mode, replaces);
         // Removed by its name: a folder that holds anything stays, and so does a file another
         // process put under that name.
@@ -425,6 +432,25 @@ fn no_add(path: &Path) -> ControllerError {
     refused(format!(
         "{} is on a file system that cannot add a file without the risk of replacing another one, \
          so nothing is written there",
+        path.display()
+    ))
+}
+
+/// The refusal where the temporary folder a write needs beside its place can be entered by another
+/// user.
+fn open_to_others(path: &Path) -> ControllerError {
+    refused(format!(
+        "{} cannot be written safely, because the temporary folder beside it is open to other \
+         users, so nothing is written there",
+        path.display()
+    ))
+}
+
+/// The refusal where the temporary folder a write needs beside its place already holds something.
+fn occupied(path: &Path) -> ControllerError {
+    refused(format!(
+        "{} cannot be written safely, because another program put something in the temporary \
+         folder beside it, so nothing is written there",
         path.display()
     ))
 }
@@ -732,5 +758,25 @@ mod tests {
                 "a name that is taken or a file that is gone is a changed file"
             );
         }
+    }
+
+    /// A temporary folder that another user can enter is refused in the words a person is shown.
+    #[test]
+    fn a_temporary_folder_other_users_can_enter_is_refused_in_the_words_a_person_is_shown() {
+        assert_eq!(
+            detail(open_to_others(Path::new("/home/p/.amp/mcp.json"))),
+            "/home/p/.amp/mcp.json cannot be written safely, because the temporary folder beside \
+             it is open to other users, so nothing is written there"
+        );
+    }
+
+    /// A temporary folder that already holds something is refused in the words a person is shown.
+    #[test]
+    fn a_temporary_folder_that_holds_something_is_refused_in_the_words_a_person_is_shown() {
+        assert_eq!(
+            detail(occupied(Path::new("/home/p/.amp/mcp.json"))),
+            "/home/p/.amp/mcp.json cannot be written safely, because another program put \
+             something in the temporary folder beside it, so nothing is written there"
+        );
     }
 }
