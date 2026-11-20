@@ -318,6 +318,16 @@ struct Backend {
 #[cfg(unix)]
 const GATEWAY_SOCKET: &str = "gw.sock";
 
+/// How long a launcher waits for the answer to the launch it said it is going with, counted from
+/// the moment it says so.
+#[cfg(unix)]
+const COMMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What is kept back from [`COMMIT_WINDOW`] when a refusal is written: the launcher counts its
+/// window from before it writes that it is going, and this host reads that a moment later.
+#[cfg(unix)]
+const REFUSAL_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// What a backend that runs an application server for its program holds besides a bridge's
 /// endpoint: where the program is to connect, how the server is started, and the server once it
 /// is.
@@ -2288,13 +2298,20 @@ async fn continue_launch(
             "the admitted launch did not say it is going",
         ));
     }
+    #[cfg(unix)]
+    let going_at = tokio::time::Instant::now();
     // A backend that runs a server starts it now, records it as a root of what the session owns,
     // and binds the socket the program connects to; it commits only with all three done, and a
-    // launch that fails here is given back with its server ended.
+    // launch that fails here is given back with its server ended. The launcher is waiting for the
+    // commit, so it is told why there is none, as far as what is left of its window allows; the
+    // reason is in the backend's record whether or not it could be written.
     #[cfg(unix)]
     if backend.gateway_run.is_some()
         && let Err(error) = gateway_run::start(backend, identity, environment).await
     {
+        let why = gateway_failure_said(&error);
+        record_failure(backend, why.clone());
+        refuse(&mut stream, &why, going_at).await;
         drop(guard);
         backend.roll_back();
         return Err(error);
@@ -3058,6 +3075,66 @@ fn admission() -> Vec<u8> {
         .into_bytes()
 }
 
+/// The frame a launch that was admitted and could not go on is answered with in place of the
+/// confirmation: the launch is not committed, and the frame says why.
+#[cfg(unix)]
+fn refusal_frame(why: &str) -> Vec<u8> {
+    serde_json::json!({ "kr_launch": { "committed": false, "failed": why } })
+        .to_string()
+        .into_bytes()
+}
+
+/// What a gateway that did not start says to the launcher and to the backend's record: the words
+/// of the refused bind, from the evidence it gave, or that the gateway did not start and why. Its
+/// control characters are replaced and it is cut to [`MAX_REFUSAL_BYTES`].
+#[cfg(unix)]
+fn gateway_failure_said(error: &BrokerError) -> String {
+    let text = match error {
+        BrokerError::Listen { endpoint, refusal } => format!(
+            "the gateway could not listen on {}",
+            refusal.said_then(endpoint, "run the command again")
+        ),
+        other => format!("the gateway did not start: {other}"),
+    };
+    let cleaned: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    bounded_refusal(&cleaned).to_owned()
+}
+
+/// Writes the refusal frame whole within `budget`, and says whether it did. A write that waits
+/// longer, or fails, or takes only part of the frame is not claimed: the connection is let go by
+/// the caller, and the launcher reads what it reads of a connection that ends.
+#[cfg(unix)]
+async fn write_refusal(stream: &mut BridgeStream, why: &str, budget: std::time::Duration) -> bool {
+    matches!(
+        tokio::time::timeout(budget, stream.write_frame(&refusal_frame(why))).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Tells the launcher why its launch is not committed, within what is left of the window it gave,
+/// which it counted from the moment it said it is going: none left is no write. Says whether the
+/// refusal was written whole.
+#[cfg(unix)]
+async fn refuse(stream: &mut BridgeStream, why: &str, going_at: tokio::time::Instant) -> bool {
+    let Some(budget) = COMMIT_WINDOW
+        .saturating_sub(REFUSAL_MARGIN)
+        .checked_sub(going_at.elapsed())
+        .filter(|left| !left.is_zero())
+    else {
+        return false;
+    };
+    write_refusal(stream, why, budget).await
+}
+
 /// The frame a launch that was committed is answered with; the launcher execs on it.
 fn confirmation() -> Vec<u8> {
     serde_json::json!({ "kr_launch": { "committed": true } })
@@ -3438,6 +3515,121 @@ const fn forward_now() -> std::result::Result<Option<u64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-12.07: the frame a launch that could not go on is answered with is never taken for a
+    /// commit, and carries its reason as the launcher reads it.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_frame_is_never_a_commit() {
+        let frame = refusal_frame("the gateway \"did not\" start");
+        let value: serde_json::Value = serde_json::from_slice(&frame).expect("a JSON frame");
+        assert_eq!(value["kr_launch"]["committed"], false, "{value}");
+        assert_eq!(
+            value["kr_launch"]["failed"], "the gateway \"did not\" start",
+            "{value}"
+        );
+        assert_ne!(frame, confirmation());
+        assert!(!is_going(&frame));
+        let committed = serde_json::from_slice::<serde_json::Value>(&confirmation())
+            .expect("a JSON frame")["kr_launch"]["committed"]
+            .as_bool();
+        assert_eq!(committed, Some(true), "the confirmation is the commit");
+    }
+
+    /// KR-REQ-12.07: a gateway that could not bind its socket says where, and why, from the
+    /// evidence the bind gave; any other failure says the gateway did not start and what stopped
+    /// it; and both are one line, cut to the bound.
+    #[cfg(unix)]
+    #[test]
+    fn a_gateway_that_did_not_start_says_why_in_one_bounded_line() {
+        use kr_ipc::listen::{ListenRefusal, ObjectKind};
+
+        let bind = BrokerError::Listen {
+            endpoint: "/run/kr/gw.sock".to_owned(),
+            refusal: ListenRefusal::NotASocket {
+                object: ObjectKind::File,
+            },
+        };
+        assert_eq!(
+            gateway_failure_said(&bind),
+            "the gateway could not listen on /run/kr/gw.sock: it holds a file; kr does not remove \
+             what it did not make; if you do not need it, move it away, then run the command again"
+        );
+        let held = BrokerError::Listen {
+            endpoint: "/run/kr/gw.sock".to_owned(),
+            refusal: ListenRefusal::Occupied,
+        };
+        assert_eq!(
+            gateway_failure_said(&held),
+            "the gateway could not listen on /run/kr/gw.sock: a socket already occupies it; run \
+             the command again"
+        );
+        let other = gateway_failure_said(&BrokerError::UpstreamUnavailable {
+            detail: "the server\nwas \u{1b}[31mnot started".to_owned(),
+        });
+        assert!(other.starts_with("the gateway did not start: "), "{other}");
+        assert!(!other.contains("could not listen"), "{other}");
+        assert!(
+            other.chars().all(|character| !character.is_control()),
+            "{other:?}"
+        );
+        let long = gateway_failure_said(&BrokerError::UpstreamUnavailable {
+            detail: "\u{e9}".repeat(600),
+        });
+        assert!(long.len() <= MAX_REFUSAL_BYTES, "{}", long.len());
+        assert!(long.starts_with("the gateway did not start: "), "{long}");
+    }
+
+    /// KR-REQ-12.07: a refusal that the connection takes whole is written whole, and one that it
+    /// cannot take in the time given, or that has no time left, is not claimed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refusal_that_cannot_be_written_in_time_is_not_claimed() {
+        use kr_protocol::gateway::NativeFraming;
+        use tokio::io::AsyncReadExt as _;
+
+        let stream_of = |capacity| {
+            let (here, there) = tokio::io::duplex(capacity);
+            let (reader, writer) = tokio::io::split(here);
+            (
+                BridgeStream::new(
+                    Box::new(reader),
+                    Box::new(writer),
+                    Vec::new(),
+                    Framing::new(NativeFraming::JsonLines),
+                ),
+                there,
+            )
+        };
+
+        let (mut roomy, mut there) = stream_of(1 << 16);
+        assert!(write_refusal(&mut roomy, "why", std::time::Duration::from_secs(5)).await);
+        let mut written = vec![0_u8; refusal_frame("why").len() + 1];
+        there.read_exact(&mut written).await.expect("the frame");
+        assert_eq!(&written[..written.len() - 1], &refusal_frame("why")[..]);
+        assert_eq!(written.last(), Some(&b'\n'), "one line");
+
+        // A connection that takes eight bytes and is never read from: the write stays pending.
+        let (mut full, _unread) = stream_of(8);
+        assert!(
+            !write_refusal(&mut full, "why", std::time::Duration::from_millis(100)).await,
+            "a write that waits past its budget is not claimed"
+        );
+
+        // A window already used up leaves no budget, and nothing is written.
+        let (mut late, mut there) = stream_of(1 << 16);
+        let long_ago = tokio::time::Instant::now()
+            .checked_sub(COMMIT_WINDOW)
+            .expect("the clock has run for the window");
+        assert!(!refuse(&mut late, "why", long_ago).await);
+        drop(late);
+        let mut rest = Vec::new();
+        there
+            .read_to_end(&mut rest)
+            .await
+            .expect("reads to its end");
+        assert!(rest.is_empty(), "nothing was written: {rest:?}");
+    }
 
     /// A file is runnable only where this account may execute it: a mode that lets only another
     /// account execute it, or nobody, is not, and neither is a directory.

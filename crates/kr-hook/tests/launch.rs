@@ -2091,6 +2091,145 @@ fn kr_req_12_07_an_admission_that_trickles_in_cannot_hold_the_launcher() {
     let _ = serving.join();
 }
 
+/// Runs a launch against a backend made by hand that admits it, reads that the launcher is going and
+/// answers with exactly `answer`, then lets the connection go. Returns what the launcher said; the
+/// program ran as typed.
+fn launch_answered_going_with(name: &str, answer: Vec<u8>) -> String {
+    use std::io::{Read as _, Write as _};
+
+    fn line(stream: &mut std::os::unix::net::UnixStream) {
+        let mut byte = [0_u8; 1];
+        while matches!(stream.read(&mut byte), Ok(1)) && byte[0] != b'\n' {}
+    }
+
+    let shell = Shell::new();
+    let directory = private(&shell, "c");
+    let endpoint = directory.join("e.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&endpoint).expect("an endpoint");
+    let serving = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        line(&mut stream);
+        if stream
+            .write_all(b"{\"kr_launch\":{\"admitted\":true}}\n")
+            .is_err()
+        {
+            return;
+        }
+        line(&mut stream);
+        let _ = stream.write_all(&answer);
+    });
+    let backend = hand_made_backend(&shell, &directory, &endpoint);
+    let (_, said) = finish(shell.launch(&backend, name, &[]));
+    assert_typed(&shell.report(name), "a launch the backend refused");
+    let _ = serving.join();
+    said
+}
+
+/// What the launcher says of a launch that was not committed, from what it said, or none.
+fn refusal_said(said: &str) -> Option<&str> {
+    let begin = "kr-hook: the backend did not commit this launch (";
+    let end = "), so the program runs as typed";
+    let from = said.find(begin)? + begin.len();
+    let to = said[from..].find(end)? + from;
+    Some(&said[from..to])
+}
+
+/// KR-REQ-12.07: a backend that answers a launch that said it is going with a refusal and its
+/// reason has the reason said, as the launcher says why a launch did not commit, and the program
+/// runs as typed. The answer is a frame that is not a commit; one that has no reason is not one
+/// the launcher can say.
+#[test]
+fn kr_req_12_07_a_launcher_reads_the_refusal_frame_and_shows_its_text() {
+    let reason = "the gateway could not listen on /run/gw.sock: it holds a file; kr does not remove \
+                  what it did not make; if you do not need it, move it away, then run the command \
+                  again";
+    let said = launch_answered_going_with(
+        "r",
+        serde_json::json!({ "kr_launch": { "committed": false, "failed": reason } })
+            .to_string()
+            .into_bytes()
+            .into_iter()
+            .chain(*b"\n")
+            .collect(),
+    );
+    assert_eq!(refusal_said(&said), Some(reason), "{said}");
+
+    for (case, answer) in [
+        (
+            "a refusal with no reason",
+            r#"{"kr_launch":{"committed":false}}"#,
+        ),
+        (
+            "a reason that is not text",
+            r#"{"kr_launch":{"committed":false,"failed":7}}"#,
+        ),
+        (
+            "a reason that is only controls",
+            r#"{"kr_launch":{"committed":false,"failed":"\n\t"}}"#,
+        ),
+        (
+            "a frame that is not a commit",
+            r#"{"kr_launch":{"admitted":true}}"#,
+        ),
+    ] {
+        let said = launch_answered_going_with("o", format!("{answer}\n").into_bytes());
+        assert_eq!(
+            refusal_said(&said),
+            Some("the backend answered something other than a commit"),
+            "{case}: {said}"
+        );
+    }
+}
+
+/// KR-REQ-12.07: the reason a backend gives is cleaned before the launcher says it: its control
+/// characters are replaced and at most 512 bytes of it are kept, cut at a character boundary, so
+/// what a backend sends cannot move a person's terminal or fill it.
+#[test]
+fn kr_req_12_07_a_launcher_cleans_and_cuts_a_refusal_text() {
+    let reason = format!("\u{1b}[31mred\u{7}\nnext\r{}", "\u{e9}".repeat(600));
+    let said = launch_answered_going_with(
+        "c",
+        format!(
+            "{}\n",
+            serde_json::json!({ "kr_launch": { "committed": false, "failed": reason } })
+        )
+        .into_bytes(),
+    );
+    let shown = refusal_said(&said).unwrap_or_else(|| panic!("a refusal was said: {said:?}"));
+    assert!(
+        shown.starts_with(" [31mred  next "),
+        "its controls were replaced: {shown:?}"
+    );
+    assert!(
+        shown.chars().all(|character| !character.is_control()),
+        "{shown:?}"
+    );
+    assert!(shown.len() <= 512, "{}", shown.len());
+    assert!(shown.len() > 500, "{}", shown.len());
+    assert!(
+        said.matches('\u{1b}').count() == 0,
+        "no escape reached the terminal: {said:?}"
+    );
+}
+
+/// KR-REQ-12.07: a connection that ends in the middle of the backend's answer to a launch that said
+/// it is going is said to have ended in the middle of an answer, and the program runs as typed: a
+/// refusal that was only partly written is not read as one.
+#[test]
+fn kr_req_12_07_a_refusal_cut_in_the_middle_is_not_read_as_one() {
+    let said = launch_answered_going_with(
+        "p",
+        br#"{"kr_launch":{"committed":false,"failed":"the gateway could"#.to_vec(),
+    );
+    assert_eq!(
+        refusal_said(&said),
+        Some("the endpoint closed in the middle of an answer"),
+        "{said}"
+    );
+}
+
 /// KR-REQ-12.07: a launcher stopped before it looked, whose session then closed, runs what was
 /// typed when it is resumed: nothing of the backend is left, and the variable's file name says what
 /// was typed.

@@ -67,6 +67,10 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 #[cfg(unix)]
 const MAX_ANSWER_BYTES: usize = 4096;
 
+/// The most bytes of a backend's reason for a launch it did not commit that the launcher repeats.
+#[cfg(unix)]
+const MAX_REFUSAL_BYTES: usize = 512;
+
 /// The flag element an integration writes where the gateway's address goes, as the package
 /// contract defines it.
 #[cfg(unix)]
@@ -558,11 +562,70 @@ fn go(stream: &mut std::os::unix::net::UnixStream) -> Result<(), String> {
     let deadline = Instant::now() + COMMIT_DEADLINE;
     write_all_by(stream, b"{\"kr_launch\":{\"going\":true}}\n", deadline)?;
     let answer = read_line_by(stream, deadline)?;
-    if answers(&answer, "committed") {
-        Ok(())
-    } else {
-        Err("the backend answered something other than a commit".to_owned())
+    match committed(&answer) {
+        Committed::Yes => Ok(()),
+        Committed::Refused(why) => Err(why),
+        Committed::Other => Err("the backend answered something other than a commit".to_owned()),
     }
+}
+
+/// What the backend's answer to a launch that said it is going says of the commit.
+#[cfg(unix)]
+enum Committed {
+    /// The launch is committed.
+    Yes,
+    /// The launch is not committed, and the backend says why.
+    Refused(String),
+    /// Anything else.
+    Other,
+}
+
+/// Reads the backend's answer to a launch that said it is going: `{"kr_launch":{"committed":true}}`,
+/// or `{"kr_launch":{"committed":false,"failed":"<why>"}}`.
+#[cfg(unix)]
+fn committed(line: &str) -> Committed {
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(_) => return Committed::Other,
+    };
+    let Some(launch) = value.get("kr_launch") else {
+        return Committed::Other;
+    };
+    match launch.get("committed").and_then(serde_json::Value::as_bool) {
+        Some(true) => Committed::Yes,
+        Some(false) => launch
+            .get("failed")
+            .and_then(serde_json::Value::as_str)
+            .map(refusal_text)
+            .filter(|why| !why.trim().is_empty())
+            .map_or(Committed::Other, Committed::Refused),
+        None => Committed::Other,
+    }
+}
+
+/// A reason a backend gave, as the launcher repeats it: its control characters replaced by spaces
+/// and at most [`MAX_REFUSAL_BYTES`] bytes of it, cut at a character boundary. What a backend
+/// sends is text a person reads on a terminal, so it is never written as it arrived.
+#[cfg(unix)]
+fn refusal_text(why: &str) -> String {
+    let mut text: String = why
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if text.len() > MAX_REFUSAL_BYTES {
+        let mut end = MAX_REFUSAL_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 #[cfg(not(any(unix, windows)))]

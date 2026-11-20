@@ -1065,6 +1065,81 @@ fn kr_req_07_60_a_server_whose_record_cannot_be_written_is_not_left_running() {
     });
 }
 
+/// KR-REQ-12.07: a gateway that cannot bind its socket tells the launcher where and why, from the
+/// evidence the bind gave, and the backend's record keeps the same words; the program runs as typed,
+/// its server is ended, and the file that stood where the socket belongs is left as it was.
+///
+/// The bind is the last step of a start that has the launcher's window to itself, so a start that
+/// uses the window up leaves no time to write the refusal; this case fails then, by its own words.
+#[test]
+fn kr_req_12_07_a_gateway_that_cannot_bind_tells_the_launcher_why() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let socket = directory_of(&answer).join("gw.sock");
+    std::fs::write(&socket, b"").expect("a file where the gateway's socket belongs");
+    let mut launched = shell.launch(&answer, "a-file-at-the-socket", &[]);
+    let status = launched.ends();
+    let said = launched.said();
+    assert_eq!(status.code(), Some(2), "{said}");
+    assert!(
+        said.contains("the backend did not commit this launch (the gateway could not listen on /"),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "gw.sock: it holds a file; kr does not remove what it did not make; if you do not need \
+             it, move it away, then run the command again), so the program runs as typed"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("serves `app-server"),
+        "it ran with the arguments it was typed with: {said}"
+    );
+    let recorded = shell
+        .last_launch_failure()
+        .expect("the backend's record says why");
+    assert!(
+        recorded.starts_with("the gateway could not listen on /")
+            && recorded.contains("gw.sock: it holds a file"),
+        "{recorded}"
+    );
+    eventually("no server is left running", || {
+        shell.servers().iter().all(|server| {
+            kr_ipc::identity::process_state(server) == kr_ipc::identity::ProcessState::Ended
+        })
+    });
+}
+
+/// KR-REQ-12.07: a gateway that did not start for a reason that is not a bind says the gateway did
+/// not start, and not that it could not listen.
+#[test]
+fn kr_req_12_07_a_gateway_that_fails_after_its_server_started_says_it_did_not_start() {
+    let shell = Gateway::new();
+    shell.view.runtime.session().refuse_owned_writes();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(&answer, "unrecorded-and-told", &[]);
+    let status = launched.ends();
+    let said = launched.said();
+    assert_eq!(status.code(), Some(2), "{said}");
+    assert!(
+        said.contains("the backend did not commit this launch (the gateway did not start: "),
+        "{said}"
+    );
+    assert!(!said.contains("could not listen"), "{said}");
+    assert!(
+        shell
+            .last_launch_failure()
+            .is_some_and(|recorded| recorded.starts_with("the gateway did not start: ")),
+        "{:?}",
+        shell.last_launch_failure()
+    );
+}
+
 /// KR-REQ-12.13, KR-REQ-11.27 and KR-REQ-11.33: an approval the server asks the terminal for is an
 /// opaque pending resource of the program's instance before the terminal answers it, and the
 /// terminal's answer resolves it once, whether the server's request carries an identifier of its
