@@ -10,7 +10,7 @@
 //! A test that none of the selected groups runs on this platform is reported as not run, with the
 //! reason the plan file gives, and never as passed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The platforms the report knows how to run on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
@@ -186,6 +186,27 @@ pub fn quote(word: &str) -> String {
 /// package, which on a platform that has it is most of the plan's time and cannot be cut by count.
 fn runs_the_workspace(step: &Step) -> bool {
     step.reading == Reading::Cargo && step.command.iter().any(|word| word == "--workspace")
+}
+
+/// The first budget, in the order of the parts and of the steps in each, whose steps [`part_of`] puts
+/// in more than one of `parts` parts: a budget is spent over the steps that name it in the order they
+/// run, and the parts are run one at a time, each by a run of its own, so a budget cannot be spent
+/// over steps that run in different runs. A build that opens the plan is in every part, and so is
+/// a set-up step in each part that holds a step naming it.
+#[must_use]
+pub fn budget_across_parts(steps: &[Step], parts: usize) -> Option<String> {
+    let mut first_part: BTreeMap<String, usize> = BTreeMap::new();
+    for number in 1..=parts.max(1) {
+        for step in part_of(steps.to_vec(), (number, parts)) {
+            let Some((id, _)) = step.budget else {
+                continue;
+            };
+            if *first_part.entry(id.clone()).or_insert(number) != number {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 /// The steps of one part of a platform's plan, for a plan that one job cannot hold and separate runs

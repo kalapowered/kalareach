@@ -403,6 +403,9 @@ pub enum Stopped {
     /// The run's scratch directory could not be made, or would lie in the evidence directory. No
     /// step has run.
     Scratch(String),
+    /// The plan cannot be cut into the parts the run is asked for: a budget's steps fall in more than
+    /// one. No step has run.
+    Plan(String),
 }
 
 /// The directories a step of `options` builds in that are known from the options, the steps and the
@@ -552,7 +555,14 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
         applications_plan.as_ref(),
     );
     let steps = match options.part {
-        Some(part) => plan::part_of(steps, part),
+        Some(part) => {
+            if let Some(id) = plan::budget_across_parts(&steps, part.1) {
+                return Err(Stopped::Plan(format!(
+                    "the steps of budget `{id}` fall in more than one part: a budget's steps run in one part"
+                )));
+            }
+            plan::part_of(steps, part)
+        }
         None => steps,
     };
     let runner = runner_copy::private_copy(
