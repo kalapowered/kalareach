@@ -4865,6 +4865,273 @@ mod session_work {
         host.stop().await;
     }
 
+    /// The thread a hook of the native bridge reports for, which is also the name of the turns it
+    /// ends.
+    const HOOK_THREAD: &str = "4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11";
+
+    /// The frame the forwarder sends for Claude Code's `SessionStart` of the first thread.
+    const SESSION_STARTED: &str = r#"{"kr_observation":{"event":"thread_started","thread":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11","detail":"startup"}}"#;
+
+    /// The frame the forwarder sends for Claude Code's `Stop` of the first thread.
+    const TURN_ENDED: &str = r#"{"kr_observation":{"event":"turn_ended","thread":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11"}}"#;
+
+    /// The turn a hook of the native bridge ends in the first thread, as a review subject.
+    fn the_hook_turn(worker: &Worker) -> ReviewSubject {
+        ReviewSubject::CompletedTurn {
+            session_id: worker.session_id,
+            turn_id: AgentTurnId::new(HOOK_THREAD).expect("an identifier"),
+        }
+    }
+
+    /// An application of the native bridge, held by the worker's own broker as a launch registers
+    /// one, whose hooks report to that broker. The application is this process, which the broker
+    /// can name; each hook is started by it, at a tick of the kernel's clock the case chooses.
+    struct HookRoute {
+        broker: Arc<kr_worker::broker::Broker>,
+        id: kr_protocol::ids::ApplicationInstanceId,
+        application: kr_protocol::identity::ProcessStartIdentity,
+    }
+
+    impl HookRoute {
+        fn over(worker: &Worker) -> Self {
+            use kr_worker::broker::{BrokerTransport, Credential, ManagedProcess, TransportHandle};
+
+            let id = kr_protocol::ids::ApplicationInstanceId::new(kr_ipc::new_uuid());
+            let application =
+                kr_ipc::identity::current_process_start_identity().expect("this process");
+            let process = ManagedProcess::new(
+                id,
+                application.clone(),
+                TransportHandle {
+                    transport: BrokerTransport::PrivateSocket,
+                    application_instance_id: id,
+                    executable_digest: kr_protocol::scalars::Digest256::from_bytes([3; 32]),
+                    process: application.clone(),
+                },
+                Credential::generate().expect("a credential"),
+                kr_ipc::now_ms(),
+            );
+            let broker = Arc::clone(worker.service.broker());
+            broker
+                .register_instance(
+                    id,
+                    kr_protocol::broker::IntegrationMode::NativeBridge,
+                    None,
+                    Some(process),
+                )
+                .expect("the application is registered");
+            Self {
+                broker,
+                id,
+                application,
+            }
+        }
+
+        /// What the worker does with the frame a hook the application started at `tick` sends.
+        fn hook(&self, tick: u64, frame: &str) -> kr_worker::broker::ThreadChange {
+            use kr_worker::broker::{BridgeProcess, Observation};
+
+            let read = Observation::from_frame(frame.as_bytes());
+            assert!(read.is_ok(), "{read:?}");
+            let reporter = BridgeProcess {
+                identity: kr_protocol::identity::ProcessStartIdentity::new(
+                    10_000 + tick,
+                    kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                    tick,
+                ),
+                starter: Some(self.application.clone()),
+                started: Some(tick),
+            };
+            self.broker
+                .observe_bridge(
+                    self.id,
+                    &reporter,
+                    &read.expect("an observation"),
+                    kr_ipc::now_ms(),
+                    kr_worker::broker::observation::PrivacyMark::default(),
+                )
+                .expect("the observation is applied")
+                .0
+        }
+    }
+
+    /// KR-REQ-14.35, KR-REQ-25.04 and KR-REQ-18.01: a turn that a hook of the native bridge reports
+    /// ended is review work at a version of its own, one item the owner is served and one change
+    /// since the last visit, read from the worker's journal by the daemon and with nothing handed
+    /// to the store, and a session starting is none of them. The case starts at the frame the
+    /// worker reads from a hook (the forwarder's translation is held by its own cases), for an
+    /// application whose hook the worker's own broker applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_turn_that_a_hook_reports_ended_is_review_work_an_item_and_a_change_since_the_visit()
+    {
+        let worker = lasting_worker().await;
+        let (host, mut control, _reach) = daemon_over(&worker).await;
+        let route = HookRoute::over(&worker);
+        assert!(matches!(
+            route.hook(10, SESSION_STARTED),
+            kr_worker::broker::ThreadChange::Selected(_)
+        ));
+        assert!(
+            owner_reviews(&mut control, worker.session_id)
+                .await
+                .is_empty(),
+            "a thread that started has no turn to review"
+        );
+
+        route.hook(20, TURN_ENDED);
+        let subject = the_hook_turn(&worker);
+        let deadline = Instant::now() + PATIENCE;
+        let state = loop {
+            let reviews = owner_reviews(&mut control, worker.session_id).await;
+            if let Some(state) = reviews.iter().find(|state| state.subject == subject) {
+                break state.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "one item for the turn the hook reported: {reviews:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(state.current_version, U64::new(newest_event(&worker)));
+        assert!(state.outstanding, "nobody has reviewed it");
+
+        let items = owner_inbox(&mut control).await;
+        let ready = of_rule(&items, AttentionRule::ReviewReady);
+        assert_eq!(ready.len(), 1, "one item for the turn: {items:?}");
+        assert_eq!(ready[0].session_id.0, Some(worker.session_id));
+        let changed = owner_changes(&mut control, worker.session_id).await;
+        let turns = changed
+            .changes
+            .iter()
+            .filter(|change| change.kind == SemanticChangeKind::TurnCompleted)
+            .count();
+        assert_eq!(turns, 1, "one change since the visit: {changed:?}");
+        host.stop().await;
+    }
+
+    /// KR-REQ-14.35: a review acknowledgement binds the version it was made against, and a later end
+    /// of a turn the hook reports in the same thread is a later version of the same subject: new
+    /// review work, one item still, with what was acknowledged still the earlier version.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_later_turn_a_hook_reports_ended_reopens_the_acknowledged_review() {
+        let worker = lasting_worker().await;
+        let (host, mut control, _reach) = daemon_over(&worker).await;
+        let route = HookRoute::over(&worker);
+        route.hook(10, SESSION_STARTED);
+        route.hook(20, TURN_ENDED);
+        let subject = the_hook_turn(&worker);
+        let deadline = Instant::now() + PATIENCE;
+        let before = loop {
+            let reviews = owner_reviews(&mut control, worker.session_id).await;
+            if let Some(state) = reviews.iter().find(|state| state.subject == subject) {
+                break state.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no review for the first turn: {reviews:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _: ReviewAcknowledgeResult = owner_mutation(
+            &mut control,
+            &host,
+            Method::ReviewAcknowledge,
+            &ReviewAcknowledgeParams {
+                session_id: worker.session_id,
+                subject: subject.clone(),
+                version: before.current_version,
+            },
+        )
+        .await;
+        let acknowledged = review_when(&mut control, &subject, |state| !state.outstanding).await;
+        assert_eq!(
+            acknowledged.acknowledged_version,
+            Nullable::some(before.current_version)
+        );
+
+        route.hook(30, TURN_ENDED);
+        let reopened = review_when(&mut control, &subject, |state| {
+            state.current_version > before.current_version
+        })
+        .await;
+        assert!(reopened.outstanding, "a later version is new review work");
+        assert_eq!(
+            reopened.acknowledged_version,
+            Nullable::some(before.current_version),
+            "and what was acknowledged is still the earlier version"
+        );
+        let items = owner_inbox(&mut control).await;
+        assert_eq!(
+            of_rule(&items, AttentionRule::ReviewReady).len(),
+            1,
+            "one item for the subject: {items:?}"
+        );
+        host.stop().await;
+    }
+
+    /// KR-REQ-14.35: a worker started again over the journal gives the daemon the end of the turn
+    /// at the version it had, so the review a person acknowledged stays acknowledged: replaying the
+    /// journal's record of a turn the hook reported is not a later end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_journal_of_a_turn_a_hook_reported_replays_as_the_version_it_was() {
+        let first = lasting_worker().await;
+        let (host, mut control, reach) = daemon_over(&first).await;
+        let route = HookRoute::over(&first);
+        route.hook(10, SESSION_STARTED);
+        route.hook(20, TURN_ENDED);
+        let subject = the_hook_turn(&first);
+        let deadline = Instant::now() + PATIENCE;
+        let before = loop {
+            let reviews = owner_reviews(&mut control, first.session_id).await;
+            if let Some(state) = reviews.iter().find(|state| state.subject == subject) {
+                break state.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no review for the turn: {reviews:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let _: ReviewAcknowledgeResult = owner_mutation(
+            &mut control,
+            &host,
+            Method::ReviewAcknowledge,
+            &ReviewAcknowledgeParams {
+                session_id: first.session_id,
+                subject: subject.clone(),
+                version: before.current_version,
+            },
+        )
+        .await;
+        review_when(&mut control, &subject, |state| !state.outstanding).await;
+
+        // The worker is started again over the journal, and the daemon reaches it there. A command
+        // that fails afterwards is a record past the turn's, so its item says the daemon has read
+        // the journal through the turn again.
+        let second = first.restarted().await;
+        reach.add(&second);
+        host.controller()
+            .attention()
+            .watch(Arc::clone(&reach) as Arc<dyn Reach>, second.known.clone());
+        report(&second, 1, "make", 1);
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let items = owner_inbox(&mut control).await;
+            if !of_rule(&items, AttentionRule::CommandFailed).is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the journal was not read again");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let replayed = review_when(&mut control, &subject, |_| true).await;
+        assert_eq!(replayed.current_version, before.current_version);
+        assert!(
+            !replayed.outstanding,
+            "the replay of the same record is no later end: {replayed:?}"
+        );
+        host.stop().await;
+    }
+
     /// KR-REQ-18.01: a command that finishes with a status other than nought raises
     /// `attention.command_failed`, one that finishes well raises nothing, and a command is told
     /// from another by the record of its ending and not by its words: the same line failing twice
