@@ -229,10 +229,17 @@ fn product_tokens(source: &str) -> Result<Vec<Token>, String> {
 
 /// What in `source` removes, replaces, signals or starts a program that does, each with its line.
 fn found(source: &str) -> Result<Vec<String>, String> {
-    let tokens = product_tokens(source)?;
-    let in_attribute = inside_attributes(&tokens);
+    Ok(found_in(&product_tokens(source)?, None))
+}
+
+/// What in `tokens` does, each with its line, except the token at `excused`.
+fn found_in(tokens: &[Token], excused: Option<usize>) -> Vec<String> {
+    let in_attribute = inside_attributes(tokens);
     let mut found = Vec::new();
     for (at, token) in tokens.iter().enumerate() {
+        if excused == Some(at) {
+            continue;
+        }
         let what = match &token.tok {
             Tok::Str(text, _) if runs_one(text) || (text.contains(['/', '\\']) && named(text)) => {
                 format!("the text {text:?}")
@@ -252,7 +259,67 @@ fn found(source: &str) -> Result<Vec<String>, String> {
         };
         found.push(format!("line {}: {what}", token.line));
     }
-    Ok(found)
+    found
+}
+
+/// The words of the one removal the report makes, in the order they are written: the directory of
+/// the run's own scratch, which `Scratch` removes when it is dropped.
+const SCRATCH_REMOVAL: [&str; 13] = [
+    "std",
+    ":",
+    ":",
+    "fs",
+    ":",
+    ":",
+    "remove_dir_all",
+    "(",
+    "&",
+    "self",
+    ".",
+    "path",
+    ")",
+];
+
+/// The position of the `remove_dir_all` of [`SCRATCH_REMOVAL`] that is inside the block of
+/// `impl Drop for Scratch`, the first such: no other call, operand or place is the one.
+fn scratch_removal(tokens: &[Token]) -> Option<usize> {
+    let word = |at: usize| match tokens.get(at).map(|token| &token.tok) {
+        Some(Tok::Ident(name)) => Some(name.as_str()),
+        _ => None,
+    };
+    let opens = (0..tokens.len()).find(|&at| {
+        ["impl", "Drop", "for", "Scratch"]
+            .iter()
+            .enumerate()
+            .all(|(offset, name)| word(at + offset) == Some(*name))
+            && tokens.get(at + 4).is_some_and(|token| token.is_punct('{'))
+    })? + 4;
+    let closes = end_of_item(tokens, opens);
+    (opens..closes).find_map(|at| {
+        let written = SCRATCH_REMOVAL.iter().enumerate().all(|(offset, text)| {
+            tokens
+                .get(at + offset)
+                .is_some_and(|token| match &token.tok {
+                    Tok::Ident(name) => name == text,
+                    Tok::Punct(c) => text.len() == 1 && text.starts_with(*c),
+                    _ => false,
+                })
+        });
+        (written && at + SCRATCH_REMOVAL.len() <= closes).then_some(at + 6)
+    })
+}
+
+/// What in the source of the file `path` (below the sources' directory) the check refuses. The
+/// report removes one thing, its run's scratch directory, and that call is allowed in `scratch.rs`
+/// at the sources' top and nowhere else.
+fn refused(path: &Path, source: &str) -> Result<Vec<String>, String> {
+    let tokens = product_tokens(source)?;
+    let excused = if path == Path::new("scratch.rs") {
+        scratch_removal(&tokens)
+    } else {
+        None
+    };
+    Ok(found_in(&tokens, excused))
 }
 
 /// The Rust sources in `directory` and in each directory below it.
@@ -272,23 +339,84 @@ fn rust_files(directory: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn the_report_s_sources_remove_nothing_and_signal_and_read_no_one() {
-    let files = rust_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let files = rust_files(&sources);
     assert!(files.len() > 10, "the sources were not found");
     for path in files {
         let source = std::fs::read_to_string(&path).expect("a source");
-        match found(&source) {
-            // The scratch directory is the one place the report removes anything: the directory it
-            // made for the run, which no step shares with the evidence or the tested tree.
-            Ok(hits) if path.ends_with("scratch.rs") => {
-                let others: Vec<&String> = hits
-                    .iter()
-                    .filter(|hit| !hit.ends_with("`remove_dir_all`"))
-                    .collect();
-                assert!(others.is_empty(), "{}: {others:#?}", path.display());
-            }
+        let below = path.strip_prefix(&sources).expect("below the sources");
+        match refused(below, &source) {
             Ok(hits) => assert!(hits.is_empty(), "{}: {hits:#?}", path.display()),
             Err(problem) => panic!("{}: {problem}", path.display()),
         }
+    }
+}
+
+/// The scratch directory's removal is the one the check lets through: the call in `Drop for
+/// Scratch` in `scratch.rs`, and no other call, operand, form or place.
+#[test]
+fn the_check_lets_through_the_scratch_removal_and_no_other() {
+    let drop_with = |call: &str| {
+        format!(
+            "impl Drop for Scratch {{\n    fn drop(&mut self) {{\n        let _ = {call};\n    }}\n}}\n"
+        )
+    };
+    let the_call = "std::fs::remove_dir_all(&self.path)";
+    let allowed = |path: &str, source: &str| {
+        refused(Path::new(path), source)
+            .expect("a source")
+            .is_empty()
+    };
+    assert!(allowed("scratch.rs", &drop_with(the_call)));
+    for (what, path, source) in [
+        (
+            "the same text in another file",
+            "other.rs",
+            drop_with(the_call),
+        ),
+        (
+            "the same text in a scratch.rs below the top",
+            "nested/scratch.rs",
+            drop_with(the_call),
+        ),
+        (
+            "a second call",
+            "scratch.rs",
+            drop_with(&format!("{the_call}; std::fs::remove_dir_all(&self.path)")),
+        ),
+        (
+            "another operand",
+            "scratch.rs",
+            drop_with("std::fs::remove_dir_all(&self.other)"),
+        ),
+        (
+            "another operand, the evidence",
+            "scratch.rs",
+            drop_with("std::fs::remove_dir_all(evidence)"),
+        ),
+        (
+            "an import",
+            "scratch.rs",
+            format!("use std::fs::remove_dir_all;\n{}", drop_with(the_call)),
+        ),
+        (
+            "a function value",
+            "scratch.rs",
+            format!(
+                "fn clean() {{ let remove = std::fs::remove_dir_all; }}\n{}",
+                drop_with(the_call)
+            ),
+        ),
+        (
+            "the call in another place",
+            "scratch.rs",
+            format!(
+                "impl Scratch {{ fn clean(&self) {{ {the_call}; }} }}\n{}",
+                drop_with("()")
+            ),
+        ),
+    ] {
+        assert!(!allowed(path, &source), "{what}: let through");
     }
 }
 
