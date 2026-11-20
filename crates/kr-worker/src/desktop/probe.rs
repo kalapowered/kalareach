@@ -1894,6 +1894,85 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("this test's own directory");
     }
 
+    /// KR-REQ-11.16: a probe declares how long it may take before it runs, and a facility that
+    /// keeps running past that bound is ended at it.
+    ///
+    /// Each check that runs a program is given a facility that does not finish: a shell that
+    /// writes its own process number and then becomes a `sleep` far longer than any bound. The
+    /// case reads the bound from the check's own declaration, so a bound that moved is the bound
+    /// it holds the check to, and it asks the system and not the answer whether the facility is
+    /// gone. The four run together, so the case takes as long as the longest bound.
+    #[cfg(unix)]
+    #[test]
+    fn a_facility_that_outlasts_its_checks_declared_bound_is_ended_at_it() {
+        // A loaded machine starts and stops processes late, so the upper limit allows for it. A
+        // bound that was doubled would still be far outside it.
+        const SLACK: Duration = Duration::from_secs(10);
+        const LONGER_THAN_ANY_BOUND: &str = "echo $$ > \"$1\"; exec /bin/sleep 120";
+
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let checks = [
+            Check::ScreenImage,
+            Check::AccessibleElement,
+            Check::ApplicationLaunch,
+            Check::SyntheticInput,
+        ];
+        let runs: Vec<_> = checks
+            .into_iter()
+            .map(|check| {
+                let scratch = root.path().join(name(check));
+                let pid_file = scratch.join("facility.pid");
+                std::thread::spawn(move || {
+                    std::fs::create_dir_all(&scratch).expect("a directory for this check");
+                    let plan = Plan::in_directory(&scratch);
+                    let run = bounded(
+                        check,
+                        "/bin/sh",
+                        &[
+                            "-c",
+                            LONGER_THAN_ANY_BOUND,
+                            "sh",
+                            pid_file.to_str().expect("a path that is text"),
+                        ],
+                        &plan,
+                    );
+                    (check, run, pid_file)
+                })
+            })
+            .collect();
+
+        for run in runs {
+            let (check, run, pid_file) = run.join().expect("the check's thread finished");
+            let bound = check.effects().bound;
+            let Exit::Unfinished(Outcome::NotAnswered { waited, stopped }) = run.exit else {
+                panic!("{check:?} did not answer that it ran out of its bound");
+            };
+            assert!(
+                waited >= bound,
+                "{check:?} gave up after {waited:?}, before its bound of {bound:?}"
+            );
+            assert!(
+                waited < bound + COLLECT + SLACK,
+                "{check:?} waited {waited:?} for a facility, past its bound of {bound:?}"
+            );
+            assert!(
+                stopped,
+                "{check:?} answered with its facility still running"
+            );
+            let number = std::fs::read_to_string(&pid_file)
+                .expect("the facility wrote its process number")
+                .trim()
+                .parse::<i32>()
+                .expect("a process number");
+            let pid = rustix::process::Pid::from_raw(number).expect("a process number above zero");
+            assert_eq!(
+                rustix::process::test_kill_process(pid),
+                Err(rustix::io::Errno::SRCH),
+                "the {check:?} facility, process {number}, is still there after the check answered"
+            );
+        }
+    }
+
     #[test]
     fn a_facility_that_failed_is_said_as_the_failure_and_the_measure_of_what_it_printed() {
         let said = "kr-marker-7c1e: no such thing";
