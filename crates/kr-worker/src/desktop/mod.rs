@@ -51,7 +51,6 @@
 
 pub mod capability;
 pub mod checks;
-pub mod persistence;
 pub mod platform;
 pub mod probe;
 
