@@ -23,7 +23,7 @@ use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
 use super::condition::Condition;
-use super::walker::{is_own_prefix, normalised, path_before, transcribers};
+use super::walker::{VARIANTS, is_own_prefix, normalised, path_before, transcribers};
 
 /// The macros of other crates that product code may call at item position and in a transcriber, each
 /// with the paths that name its provider (`""` is a bare call) and why none of them can make a module
@@ -276,6 +276,7 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
     // For each file the files whose module declarations reach it.
     let mut parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut method_uses = Vec::new();
+    let mut defines_method = false;
     while let Some(visit) = todo.pop() {
         if !seen.insert(visit.clone()) {
             continue;
@@ -327,6 +328,8 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
             imports: Vec::new(),
             module_names: Vec::new(),
             method_use: false,
+            defines_method: false,
+            in_method_impl: false,
             error: None,
         };
         reader.visit_file(&parsed);
@@ -351,6 +354,7 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
         if reader.method_use {
             method_uses.push(at.clone());
         }
+        defines_method |= reader.defines_method;
         for declared in reader.declared {
             let mut found: Vec<&PathBuf> = Vec::new();
             for candidate in &declared.candidates {
@@ -458,7 +462,13 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
             .collect(),
         defined: defined.into_keys().collect(),
         exported,
-        method_uses,
+        // The crate that defines `Method` names its own variants (`Self::Variant`, a glob of them,
+        // an alias) and matches them: it is the definition and is not read as a sender.
+        method_uses: if defines_method {
+            Vec::new()
+        } else {
+            method_uses
+        },
         unaccepted: unaccepted
             .into_iter()
             .map(|(name, at)| (at, name))
@@ -491,6 +501,10 @@ struct Reader<'a> {
     /// The modules declared.
     module_names: Vec<String>,
     method_use: bool,
+    /// Whether an `enum Method` is defined.
+    defines_method: bool,
+    /// Whether the visit is inside an `impl` for `Method`.
+    in_method_impl: bool,
     error: Option<String>,
 }
 
@@ -590,16 +604,13 @@ macro_rules! gated {
 impl<'ast> Visit<'ast> for Reader<'_> {
     gated! {
         visit_item_const => visit_item_const(syn::ItemConst);
-        visit_item_enum => visit_item_enum(syn::ItemEnum);
         visit_item_extern_crate => visit_item_extern_crate(syn::ItemExternCrate);
         visit_item_fn => visit_item_fn(syn::ItemFn);
         visit_item_foreign_mod => visit_item_foreign_mod(syn::ItemForeignMod);
-        visit_item_impl => visit_item_impl(syn::ItemImpl);
         visit_item_static => visit_item_static(syn::ItemStatic);
         visit_item_struct => visit_item_struct(syn::ItemStruct);
         visit_item_trait => visit_item_trait(syn::ItemTrait);
         visit_item_trait_alias => visit_item_trait_alias(syn::ItemTraitAlias);
-        visit_item_type => visit_item_type(syn::ItemType);
         visit_item_union => visit_item_union(syn::ItemUnion);
         visit_impl_item_const => visit_impl_item_const(syn::ImplItemConst);
         visit_impl_item_fn => visit_impl_item_fn(syn::ImplItemFn);
@@ -607,6 +618,44 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         visit_trait_item_const => visit_trait_item_const(syn::TraitItemConst);
         visit_trait_item_fn => visit_trait_item_fn(syn::TraitItemFn);
         visit_trait_item_type => visit_trait_item_type(syn::TraitItemType);
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        if self.enter(&node.attrs) {
+            self.defines_method |= node.ident == "Method";
+            syn::visit::visit_item_enum(self, node);
+            self.leave();
+        }
+    }
+
+    /// An alias of `Method` names its variants under another name.
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        if self.enter(&node.attrs) {
+            self.method_use |= ends_in_method(&node.ty);
+            syn::visit::visit_item_type(self, node);
+            self.leave();
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if self.enter(&node.attrs) {
+            let outer = std::mem::replace(&mut self.in_method_impl, ends_in_method(&node.self_ty));
+            syn::visit::visit_item_impl(self, node);
+            self.in_method_impl = outer;
+            self.leave();
+        }
+    }
+
+    /// `Self::<Variant>` in an impl for `Method` is the variant by another name.
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        if self.in_method_impl
+            && let [first, second, ..] = node.segments.iter().collect::<Vec<_>>().as_slice()
+            && first.ident == "Self"
+            && VARIANTS.contains(&second.ident.to_string().as_str())
+        {
+            self.method_use = true;
+        }
+        syn::visit::visit_path(self, node);
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
@@ -767,6 +816,12 @@ fn path_attribute(attrs: &[syn::Attribute]) -> Result<Option<String>, ()> {
         };
     }
     Ok(None)
+}
+
+/// Whether a type is a path that ends in `Method`.
+fn ends_in_method(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Path(path) if path.qself.is_none()
+        && path.path.segments.last().is_some_and(|segment| segment.ident == "Method"))
 }
 
 /// What the inventory does not read, written in the tokens of a macro.
