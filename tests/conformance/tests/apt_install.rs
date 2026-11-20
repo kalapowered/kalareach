@@ -365,9 +365,9 @@ impl Rig {
     }
 
     /// Holds each bound and each wait to the time left when it was made. A bound is at least 2 s
-    /// (a grace of at least 1 and a term of at least 1), is not over the time left, and has a grace
-    /// of 10 s, or of its length less 1 s where that is 10 s or less. A wait does not reach the
-    /// deadline.
+    /// (a grace of at least 1 and a term of at least 1), is not over the time left within
+    /// CLOCK_SLACK, and has a grace of 10 s, or of its length less 1 s where that is 10 s or less.
+    /// A wait does not reach the deadline, and is not over the time left within CLOCK_SLACK.
     fn assert_inside_the_time_left(&self, deadline: u32, context: &str) {
         let events = self.events();
         for event in &events {
@@ -686,6 +686,12 @@ fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
         if deadline > 2 {
             assert!(!rig.bounds().is_empty(), "{deadline}: no call was bounded");
         }
+        for (grace, seconds) in rig.bounds() {
+            assert!(
+                grace + seconds <= deadline,
+                "{deadline}: a bound of {grace} and {seconds}"
+            );
+        }
         rig.assert_inside_the_time_left(deadline, &deadline.to_string());
     }
     for deadline in [10_u32, 11, 12, 30, 180, 181, 1800] {
@@ -698,6 +704,12 @@ fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
         );
         let bounds = rig.bounds();
         assert_eq!(bounds.len(), 3, "{deadline}: {bounds:?}");
+        for (grace, seconds) in &bounds {
+            assert!(
+                grace + seconds <= deadline,
+                "{deadline}: a bound of {grace} and {seconds}"
+            );
+        }
         rig.assert_inside_the_time_left(deadline, &deadline.to_string());
     }
     let rig = Rig::new();
@@ -772,9 +784,8 @@ fn an_archive_that_goes_missing_between_the_phases_fails_the_install_and_is_not_
     );
 }
 
-/// A wait never passes the deadline: it is cut to what is left less a second, so that the script
-/// ends at its deadline and not after it. With a deadline of 12 s the first wait is the whole 10 s
-/// and the later ones are cut; with 5 s every wait is cut.
+/// Every wait is shorter than the deadline, and shorter than the time left within CLOCK_SLACK.
+/// At least one wait is cut below 10 s times its number. At 5 s, every wait is cut.
 #[test]
 fn the_waits_never_pass_the_deadline() {
     for deadline in [5_u32, 12] {
