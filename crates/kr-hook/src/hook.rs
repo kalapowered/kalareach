@@ -134,6 +134,10 @@ pub enum Report {
     ToolFailed,
     /// A notification, with its kind as its detail and its message as its text.
     Notification,
+    /// The agent finishing a turn it ran, which has no detail. A later hook of the person's own
+    /// may still block the end and let the agent go on, so a thread's later end is a later turn
+    /// end, not a repeat.
+    TurnEnded,
 }
 
 /// Runs one hook of `application`, which started at `started`, and answers neutrally.
@@ -487,8 +491,8 @@ pub fn read_input(input: impl std::io::Read) -> Result<HookInput, String> {
 /// application's registration does not name, or input that names no thread.
 ///
 /// A session starting or ending selects or ends the thread, and a start the application marks as
-/// a continuation goes on in it; a tool finishing or failing and a notification are recorded as
-/// observed history. A finished call of the contact skill's `ask_user` also names the request it
+/// a continuation goes on in it; a tool finishing or failing, a notification and the end of a
+/// turn are recorded as observed history. A finished call of the contact skill's `ask_user` also names the request it
 /// asked, so the worker learns which thread the question was asked in.
 #[must_use]
 pub fn observation(application: &Application, input: &HookInput) -> Option<serde_json::Value> {
@@ -505,6 +509,7 @@ pub fn observation(application: &Application, input: &HookInput) -> Option<serde
         Report::ToolFinished => ("tool_finished", input.tool_name.as_deref()),
         Report::ToolFailed => ("tool_failed", input.tool_name.as_deref()),
         Report::Notification => ("notification", input.notification_type.as_deref()),
+        Report::TurnEnded => ("turn_ended", None),
     };
     let mut reported = serde_json::Map::new();
     reported.insert("event".to_owned(), serde_json::json!(event));

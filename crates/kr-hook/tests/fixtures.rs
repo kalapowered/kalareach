@@ -108,7 +108,8 @@ fn the_bridge_files_are_the_bytes_the_package_publishes() {
 }
 
 /// KR-REQ-12.18: the hooks file registers the forwarder's hook invocation for exactly the five
-/// events whose exit codes refuse nothing, for every tool and notification (no matcher), each with
+/// events the released package registers, which the forwarder answers with exit 0 and never exit 2
+/// and so refuses nothing, for every tool and notification (no matcher), each with
 /// a timeout the forwarder's own deadline fits inside. Each is in exec form and runs in the
 /// foreground: Claude Code starts the forwarder itself, with no shell between them, which is what
 /// lets the worker order the hooks by when Claude Code started each one.
@@ -211,9 +212,9 @@ fn the_qoder_cli_flags_are_the_pinned_bytes() {
 
 /// KR-REQ-12.22, KR-REQ-12.27: a Qoder CLI launch adds exactly two elements, `--settings` and the
 /// inline JSON after it, and that JSON holds hooks and nothing else: the forwarder's `qoder-cli
-/// hook` invocation, in exec form, for exactly the events the forwarder reports for Qoder CLI, for
-/// every tool, notification and source (no matcher), in the foreground, each with a timeout in
-/// seconds that the forwarder's deadline fits inside.
+/// hook` invocation, in exec form, for events the forwarder reports for Qoder CLI, for every tool,
+/// notification and source (no matcher), in the foreground, each with a timeout in seconds that the
+/// forwarder's deadline fits inside.
 #[test]
 fn the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else() {
     let flags: Vec<String> =
@@ -225,18 +226,17 @@ fn the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else() {
     assert_eq!(members(&settings), ["hooks"], "hooks and nothing else");
 
     let events = &settings["hooks"];
-    let mut registered = members(events);
-    let mut reported: Vec<&str> = kr_hook::qoder_cli::HOOKS
+    let reported: Vec<&str> = kr_hook::qoder_cli::HOOKS
         .events
         .iter()
         .map(|(event, _)| *event)
         .collect();
-    registered.sort_unstable();
-    reported.sort_unstable();
-    assert_eq!(
-        registered, reported,
-        "the launch registers exactly the events the forwarder reports for Qoder CLI"
-    );
+    for registered in members(events) {
+        assert!(
+            reported.contains(&registered),
+            "{registered}: the launch registers only events the forwarder reports for Qoder CLI"
+        );
+    }
     for (event, groups) in events.as_object().expect("events") {
         let groups = groups.as_array().expect("matcher groups");
         assert_eq!(groups.len(), 1, "{event}");
@@ -507,5 +507,54 @@ fn the_released_gemini_cli_package_is_not_offered_on_windows_and_the_others_are(
     assert_eq!(platforms("gemini-cli"), [Linux, MacOs]);
     for package in ["claude-code", "qoder-cli"] {
         assert!(platforms(package).contains(&Windows), "{package}");
+    }
+}
+
+/// The events a released package registers for one application, read from the fixture its
+/// installation records.
+fn released_events(application: &str) -> Vec<String> {
+    let events = match application {
+        "claude-code" => json("claude-code", "hooks.json")["hooks"].clone(),
+        _ => {
+            let flags: Vec<String> = serde_json::from_slice(&fixture(application, "flags.json"))
+                .expect("the two elements");
+            serde_json::from_str::<serde_json::Value>(&flags[1]).expect("inline settings")["hooks"]
+                .clone()
+        }
+    };
+    let mut names: Vec<String> = events
+        .as_object()
+        .expect("events")
+        .keys()
+        .cloned()
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// The forwarder reports an event for each application that no released package registers yet:
+/// the end of a turn, `Stop`. Every released event is one the forwarder reports, and a later event
+/// the forwarder reports and no package selects is a decision this case holds.
+#[test]
+fn the_events_no_released_package_selects_are_exactly_stop() {
+    for (application, hooks) in [
+        ("claude-code", &kr_hook::claude_code::HOOKS),
+        ("qoder-cli", &kr_hook::qoder_cli::HOOKS),
+    ] {
+        let released = released_events(application);
+        let reported: Vec<&str> = hooks.events.iter().map(|(event, _)| *event).collect();
+        for event in &released {
+            assert!(
+                reported.contains(&event.as_str()),
+                "{application}: {event} is released and not reported"
+            );
+        }
+        let mut unselected: Vec<&str> = reported
+            .iter()
+            .copied()
+            .filter(|event| !released.iter().any(|released| released == event))
+            .collect();
+        unselected.sort_unstable();
+        assert_eq!(unselected, ["Stop"], "{application}");
     }
 }

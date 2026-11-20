@@ -12,14 +12,23 @@
 //! only from a hook that exits 0. The forwarder exits 0 with exactly `{}`, and a failure it could
 //! not help, a forwarder that is missing or that refuses its command line, is logged by Qoder CLI
 //! and changes nothing else.
+//!
+//! [`HOOKS`] also reports `Stop`, which Qoder CLI runs when the main agent has finished responding
+//! with no tool call pending. Its reference does not say whether `Stop` runs when the person
+//! interrupts. No released package registers `Stop` yet. On `Stop` exit code 2 makes the agent go
+//! on, so the forwarder never exits 2: it answers `{}` and exits 0, and a failure it could not
+//! help exits 1 or 64. Another hook of the person's may still block the end, so a thread can end a
+//! turn more than once, each end being a later version of the same review. An older forwarder
+//! reports nothing for `Stop`, and an older worker refuses the frame, and the hook answers `{}`
+//! either way.
 
 use crate::hook::{Application, Report};
 
 /// The application name this bridge declares to the worker, as its registration invokes it.
 pub const APPLICATION: &str = "qoder-cli";
 
-/// Qoder CLI's hooks: a session starting and ending, a tool finishing and failing, and a
-/// notification.
+/// Qoder CLI's hooks: a session starting and ending, a tool finishing and failing, a notification,
+/// and the end of a turn.
 ///
 /// A session starting after a compaction goes on in the thread it compacted; every other start,
 /// at startup, on a resume, after `/clear` or for a new session, is a new selection.
@@ -36,6 +45,7 @@ pub static HOOKS: Application = Application {
         ("PostToolUse", Report::ToolFinished),
         ("PostToolUseFailure", Report::ToolFailed),
         ("Notification", Report::Notification),
+        ("Stop", Report::TurnEnded),
     ],
 };
 
@@ -108,6 +118,19 @@ mod tests {
         }
     }
 
+    /// `Stop`, the end of a turn the agent finished, reports that a turn ended in its thread, with
+    /// no detail, whatever else the payload carries.
+    #[test]
+    fn a_stop_event_reports_that_a_turn_ended() {
+        let payload = serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/tmp/work", "hook_event_name": "Stop", "permission_mode": "default",
+            "stop_hook_active": false, "last_assistant_message": "Done."});
+        assert_eq!(
+            translated(&payload),
+            Some(serde_json::json!({"event": "turn_ended", "thread": THREAD}))
+        );
+    }
+
     /// A finished call of the contact skill's `ask_user`, which Qoder CLI names
     /// `mcp__kalareach__ask_user` and describes in its MCP context, names the request it asked.
     #[test]
@@ -129,7 +152,6 @@ mod tests {
             "UserPromptSubmit",
             "PermissionRequest",
             "PermissionDenied",
-            "Stop",
             "StopFailure",
             "SubagentStart",
             "SubagentStop",
