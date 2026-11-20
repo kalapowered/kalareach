@@ -399,6 +399,11 @@ fn line_of(text: &str, offset: usize) -> usize {
         + 1
 }
 
+/// Whether a reason says nothing.
+fn blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
 /// The placeholder in `word` that the plan may not use, if any.
 fn placeholder_refused(word: &str) -> Option<String> {
     let mut rest = word;
@@ -609,6 +614,16 @@ impl Plan {
                     ));
                 }
             }
+            if step
+                .filter
+                .as_ref()
+                .is_some_and(|filter| blank(&filter.reason))
+            {
+                return refuse(format!("step `{id}` filters with no reason"));
+            }
+            if let Some(skip) = step.skips.iter().find(|skip| blank(&skip.reason)) {
+                return refuse(format!("step `{id}` skips `{}` with no reason", skip.name));
+            }
             if step.skips_from.is_some() && self.applications.is_none() {
                 return refuse(format!(
                     "step `{id}` skips from the applications and the plan has no `[applications]`"
@@ -622,6 +637,12 @@ impl Plan {
                     absent.group
                 ));
             }
+            if blank(&absent.reason) {
+                return refuse(format!(
+                    "a `[[group_absent]]` for the group `{}` has no reason",
+                    absent.group
+                ));
+            }
         }
         for lane in &self.lanes {
             if let Some(group) = &lane.group
@@ -631,6 +652,46 @@ impl Plan {
                     "the lane `{}` names the group `{group}`, which the plan's groups do not hold",
                     lane.files
                 ));
+            }
+        }
+        for excluded in &self.excluded_packages {
+            if blank(&excluded.reason) {
+                return refuse(format!(
+                    "an `[[excluded_package]]` for `{}` has no reason",
+                    excluded.package
+                ));
+            }
+        }
+        if let Some(lane) = self.lanes.iter().find(|lane| blank(&lane.reason)) {
+            return refuse(format!("the lane `{}` has no reason", lane.files));
+        }
+        if self
+            .terminals
+            .as_ref()
+            .is_some_and(|terminals| blank(&terminals.reason))
+        {
+            return refuse("`[terminals]` has no reason".to_owned());
+        }
+        for run in &self.ignored_runs {
+            if let Runs::ByHand { why } | Runs::Nowhere { why } = &run.runs
+                && blank(why)
+            {
+                return refuse(format!(
+                    "the `[[ignored_run]]` of `{}` `{}` has no `why`",
+                    run.package, run.target
+                ));
+            }
+        }
+        let unrun = &self.unrun;
+        for (name, text) in [
+            ("rust.linux", &unrun.rust.linux),
+            ("rust.macos", &unrun.rust.macos),
+            ("rust.windows", &unrun.rust.windows),
+            ("bench", &unrun.bench),
+            ("typescript", &unrun.typescript),
+        ] {
+            if blank(text) {
+                return refuse(format!("`[unrun]` has no `{name}` reason"));
             }
         }
         if let Some(typescript) = &self.typescript {
