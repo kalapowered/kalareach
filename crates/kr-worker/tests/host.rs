@@ -106,6 +106,40 @@ impl WorkerSupervisor for MarkedWorkers {
     }
 }
 
+/// Starts the worker through this host's own supervisor, and tells it a runtime directory that is
+/// not the daemon's.
+///
+/// The worker builds the addresses of its own below the runtime directory it is told, as the daemon
+/// builds its addresses below its own, so a case that needs the worker's address to be longer than
+/// the daemon's says so in the launch.
+#[cfg(unix)]
+#[derive(Debug)]
+struct WorkersWithARuntimeRoot {
+    root: PathBuf,
+    inner: Box<dyn WorkerSupervisor>,
+}
+
+#[cfg(unix)]
+impl WorkerSupervisor for WorkersWithARuntimeRoot {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        let mut told = launch.clone();
+        told.runtime_directory = self.root.clone();
+        self.inner.start(&told)
+    }
+
+    fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        self.inner.start_service(launch)
+    }
+
+    fn describe(&self) -> &'static str {
+        "this host's supervisor, with the worker told a runtime directory of its own"
+    }
+
+    fn readiness(&self) -> kr_controller::supervision::Readiness {
+        self.inner.readiness()
+    }
+}
+
 /// One request the daemon made of its supervisor.
 #[derive(Clone, Debug)]
 struct Launch {
@@ -379,6 +413,10 @@ struct Host {
     /// given, when a test looks for what they started by it.
     #[cfg(unix)]
     lineage: Option<(String, String)>,
+    /// The runtime directory the workers this daemon starts are told, when a test gives them one
+    /// that is not the daemon's.
+    #[cfg(unix)]
+    worker_runtime_root: Option<PathBuf>,
 }
 
 impl Host {
@@ -421,6 +459,8 @@ impl Host {
             standard_error: None,
             #[cfg(unix)]
             lineage: None,
+            #[cfg(unix)]
+            worker_runtime_root: None,
         }
     }
 
@@ -481,6 +521,14 @@ impl Host {
         self
     }
 
+    /// Tells the workers this daemon starts to build their addresses below `root`, and not below
+    /// the daemon's own runtime directory.
+    #[cfg(unix)]
+    fn with_a_runtime_root_for_workers(mut self, root: PathBuf) -> Self {
+        self.worker_runtime_root = Some(root);
+        self
+    }
+
     /// Makes this environment's record of the processes its daemon and workers create, which the
     /// product writes to wherever a test has made one, before the daemon starts.
     fn recording_creations(self) -> Self {
@@ -503,6 +551,19 @@ impl Host {
         if let Some(marker) = &self.lineage {
             return Box::new(MarkedWorkers {
                 marker: marker.clone(),
+                inner,
+            });
+        }
+        inner
+    }
+
+    /// The supervisor the daemon starts workers through: `inner`, and with the runtime directory
+    /// the workers are told changed where the host asks for it.
+    fn with_the_runtime_root(&self, inner: Box<dyn WorkerSupervisor>) -> Box<dyn WorkerSupervisor> {
+        #[cfg(unix)]
+        if let Some(root) = &self.worker_runtime_root {
+            return Box::new(WorkersWithARuntimeRoot {
+                root: root.clone(),
                 inner,
             });
         }
@@ -704,7 +765,7 @@ impl Host {
         // else fails at once.
         let started = std::time::Instant::now();
         kr_controller::testing::taken_over(|| {
-            let supervisor = self.temp.supervisor(self.with_the_marking(
+            let inner: Box<dyn WorkerSupervisor> =
                 match (self.worker_packages.clone(), self.launched.clone()) {
                     (Some(packages), _) => Box::new(WorkerWithPackageRoot {
                         packages,
@@ -716,8 +777,10 @@ impl Host {
                         inner: self.platform_supervisor(),
                     }),
                     (None, None) => self.platform_supervisor(),
-                },
-            ));
+                };
+            let supervisor = self
+                .temp
+                .supervisor(self.with_the_runtime_root(self.with_the_marking(inner)));
             start_daemon(
                 self.temp.root(),
                 &environment,
@@ -2573,6 +2636,7 @@ async fn a_worker_that_cannot_listen_says_why_to_the_create_that_waits_for_it() 
     let mut client = host.client().await;
     let params = create_params(host.environment_id, host.temp.root());
 
+    let started = std::time::Instant::now();
     let refused = client
         .mutate(
             Method::SessionCreate,
@@ -2591,6 +2655,82 @@ async fn a_worker_that_cannot_listen_says_why_to_the_create_that_waits_for_it() 
     // carries: a file that is not a socket is an untrusted file there, which would otherwise make
     // the create answer as a refusal of the caller's authority.
     assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the create did not wait out its window for a worker that had ended: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A worker whose own address does not fit a socket address says so, with the address and by how
+/// much it is over, to the create that waits for it.
+///
+/// A daemon of this release refuses a create whose worker's address would not fit before it starts a
+/// worker, so the worker is told a runtime directory that is deeper than the daemon's: its `w1.sock`
+/// is one byte over what a socket address holds, and the daemon's own addresses fit. The worker
+/// claims its reservation, cannot make its address, and says so before it ends.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_whose_own_address_is_too_long_says_so_to_the_create_that_waits_for_it() {
+    let limit = kr_ipc::paths::MAX_SOCKET_PATH_LEN;
+    let host = Host::create();
+    // The worker's address is the runtime root, a separator, eight characters of the environment's
+    // identity, a separator and `w1.sock`: seventeen bytes more than the root.
+    let anchor = host.temp.root().join("w");
+    let padding = (limit - 16)
+        .checked_sub(anchor.as_os_str().len() + 1)
+        .expect("the host tree is shallower than the worker's runtime root");
+    let root = anchor.join("p".repeat(padding));
+    assert_eq!(
+        root.as_os_str().len(),
+        limit - 16,
+        "the worker's runtime root is of the length this case is about"
+    );
+    let too_long = kr_ipc::paths::HostPaths::new(&root, host.temp.root())
+        .expect("the roots resolve")
+        .environment(host.environment_id)
+        .worker_endpoint(kr_protocol::session::DisplayNumber::new(1))
+        .expect_err("the worker's address below that root is one byte over");
+    assert!(
+        too_long.to_string().contains("w1.sock"),
+        "the address that does not fit is the worker's own: {too_long}"
+    );
+    let host = host.with_a_runtime_root_for_workers(root);
+    let _controller = host.start().await;
+    host.paths()
+        .worker_endpoint(kr_protocol::session::DisplayNumber::new(1))
+        .expect("the daemon's own address for the first worker fits");
+    let mut client = host.client().await;
+    let params = create_params(host.environment_id, host.temp.root());
+
+    let started = std::time::Instant::now();
+    let refused = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a worker whose address is too long serves no session");
+    assert!(
+        refused.message.contains("w1.sock"),
+        "the worker's own words reach the caller: {refused}"
+    );
+    assert!(
+        refused.message.contains(&format!(
+            "is {} bytes, over the {limit}-byte platform limit",
+            limit + 1
+        )),
+        "and they say by how much the address is over: {refused}"
+    );
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the create did not wait out its window for a worker that had ended: {:?}",
+        started.elapsed()
+    );
 }
 
 /// A managed create whose shell has no startup entry is refused by the worker as soon as it has
