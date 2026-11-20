@@ -104,50 +104,6 @@ export function applyNodes<T extends Identified>(
   return batch.reduce((current, node) => applyNode(current, node), state)
 }
 
-/**
- * Installs a snapshot of the document, and the nodes the stream delivered while it was being read.
- *
- * The view reads a snapshot only once its stream listener is registered, and holds what the stream
- * delivers until the snapshot answers. The order that follows is one rule:
- *
- * - The snapshot's presentation order stands: its nodes take their places in the order it gives.
- * - A held node replaces the copy of the same node already in place, and only when its revision
- *   is newer. An older revision changes nothing.
- * - A held node the snapshot lacks was published after the snapshot was taken, so it follows the
- *   snapshot's nodes, in the order the stream delivered it.
- * - Nodes the conversation already held keep their places, so a document read again under a
- *   person reading it does not move what they are reading. The same revision rule applies to them.
- */
-export function installSnapshot<T extends Identified>(
-  state: ConversationState<T>,
-  snapshot: readonly T[],
-  held: readonly T[]
-): ConversationState<T> {
-  return applyNodes(applyNodes(state, snapshot), held)
-}
-
-/**
- * Prepends a page of older nodes and keeps the reader's anchor.
- *
- * The window moves by exactly the number of nodes that were added, so the node the person was
- * looking at is still at the same place in the rendered window.
- */
-export function prependHistory<T extends Identified>(
-  state: ConversationState<T>,
-  older: readonly T[]
-): ConversationState<T> {
-  if (older.length === 0) return state
-  const known = new Set(state.nodes.map((node) => node.id))
-  const added = older.filter((node) => !known.has(node.id))
-  if (added.length === 0) return state
-  return {
-    ...state,
-    nodes: [...added, ...state.nodes],
-    windowStart: state.windowStart + added.length,
-    following: false
-  }
-}
-
 /** Records that the view reached the live end, or left it. */
 export function setFollowing<T extends Identified>(
   state: ConversationState<T>,
