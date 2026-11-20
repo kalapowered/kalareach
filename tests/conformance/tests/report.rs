@@ -112,11 +112,7 @@ fn run_step_through(
         lanes: &[],
         ignored_runs: None,
         applications: None,
-        steps: Some(vec![Step::cargo(
-            Group::Rust,
-            "the tree's tests",
-            arguments,
-        )]),
+        steps: Some(vec![Step::cargo("rust", "the tree's tests", arguments)]),
         lister,
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1511,7 +1507,7 @@ fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the tree's tests",
             &["test", "--locked", "-p", "late", "--no-fail-fast"],
         )]),
@@ -1566,7 +1562,7 @@ fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the package's tests",
             &["test", "--locked", "-p", "racy", "--no-fail-fast"],
         )]),
@@ -1608,7 +1604,7 @@ fn a_file_a_library_wrote_and_two_test_programs_read_leaves_the_listing_nothing_
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the package's tests",
             &["test", "--locked", "-p", "shared", "--no-fail-fast"],
         )]),
@@ -1752,7 +1748,7 @@ fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the tree's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         )]),
@@ -1788,7 +1784,7 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the library's tests",
             &["test", "--locked", "--lib"],
         )]),
@@ -1846,7 +1842,7 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the library's tests",
             &["test", "--locked", "--lib"],
         )]),
@@ -1890,7 +1886,7 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the tree's tests, stopping at the first failure",
             &["test", "--locked", "--workspace"],
         )]),
@@ -1939,7 +1935,7 @@ fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the library's tests",
             &["test", "--locked", "--lib"],
         )]),
@@ -1999,7 +1995,7 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the ignored tests alone",
             &["test", "--locked", "--lib", "--", "--ignored"],
         )]),

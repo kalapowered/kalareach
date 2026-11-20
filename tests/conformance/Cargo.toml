@@ -18,6 +18,9 @@ kr-test-artifacts.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The plan file, and the patched-crates case, which reads Cargo.lock and Cargo.toml as TOML and
+# compares the Git sources that they name as URLs.
+toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # The observation opens a program's file without following a link at its name.
@@ -34,9 +37,6 @@ kr-worker.workspace = true
 # its own.
 tempfile.workspace = true
 tokio.workspace = true
-# The patched-crates case reads Cargo.lock and Cargo.toml as TOML, and compares the Git sources
-# that they name as URLs.
-toml.workspace = true
 url.workspace = true
 
 [lints]

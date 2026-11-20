@@ -1,0 +1,2347 @@
+# What the conformance report runs and reads in this repository. `kr-conformance` reads
+# this file for `map` and for `run`; a step runs the argument vector it names, never a shell
+# string. The loader adds `--show-output` after `--` to each `cargo test` that leaves its
+# output captured, and `--skip <name>` for each entry of a step's `skips`.
+repository = 'kalareach'
+groups = ['rust', 'end-to-end', 'performance', 'typescript', 'applications', 'phones']
+list_table_rows = true
+
+[typescript]
+packages = ['packages/protocol', 'packages/plugin-sdk', 'apps/companion']
+
+[applications]
+lock = 'tests/conformance/applications.lock'
+
+# Why a test that no step runs is not run.
+[unrun]
+bench = 'a benchmark target: the performance group runs the measurements it holds'
+typescript = '''no step of this run's selection runs the TypeScript suites'''
+
+[unrun.rust]
+linux = '''no step of this run's selection runs this target on this platform'''
+macos = '''no step of this run's selection runs this target on this platform'''
+windows = 'no step runs this target on Windows: the suites that drive a Unix pseudo-terminal are compiled there and qualified on Unix, and the pseudo-console is qualified on the Windows test machine'
+
+[terminals]
+names = [
+    'iTerm2',
+    'Terminal.app',
+    'Ghostty',
+    'WezTerm',
+    'Windows Terminal',
+    'a VTE-based Linux terminal',
+    'the VS Code terminal',
+]
+reason = 'the physical terminal matrix runs on the terminal matrix hosts and virtual machines; this run recorded no run of it'
+
+[[group_absent]]
+group = 'end-to-end'
+platform = 'windows'
+reason = 'the end-to-end suites and the measurements drive Unix pseudo-terminals; on Windows the pseudo-console is qualified on the Windows test machine'
+explains_unrun_rust = true
+
+[[group_absent]]
+group = 'performance'
+platform = 'windows'
+reason = 'the end-to-end suites and the measurements drive Unix pseudo-terminals; on Windows the pseudo-console is qualified on the Windows test machine'
+explains_unrun_rust = true
+
+[[group_absent]]
+group = 'typescript'
+platform = 'windows'
+reason = 'the TypeScript suites are qualified on Linux and macOS'
+
+[[group_absent]]
+group = 'applications'
+platform = 'windows'
+reason = 'a console application on Windows is driven through the pseudo-console, which the Windows test machine qualifies'
+
+[[group_absent]]
+group = 'phones'
+platform = 'windows'
+reason = '''the phone applications' unit tests run on Linux (Kotlin, with Gradle) and on macOS (Swift, with Xcode)'''
+
+[[excluded_package]]
+platform = 'macos'
+package = 'kr-sync-integration'
+reason = '''every test of this package is a leg against a live deployment; the landing workflow's Linux job runs each leg against the deployment it names at a push to main and at a manual run that asks for the legs'''
+
+[[lane]]
+group = 'phones'
+files = 'apps/companion/native/android/src/test/**'
+reason = '''the Android application's unit tests run in the Linux report, with Gradle'''
+reads = 'junit'
+
+[[lane]]
+group = 'phones'
+files = 'apps/companion/native/ios/Tests/**'
+reason = '''the iOS application's unit tests run in the macOS report, with Xcode'''
+reads = 'xcode'
+
+[[lane]]
+group = 'phones'
+files = 'apps/companion/native/android/android/src/androidTest/kotlin/to/kala/reach/companion/push/PushReceiverInstrumentedTest.kt'
+reason = '''no gate builds or runs the Android push receiver's instrumented cases: `scripts/e2e-push-android-receiver.sh` runs them on the emulator'''
+
+[[lane]]
+files = 'apps/companion/e2e/**'
+reason = '''Playwright over the built interface: `pnpm --dir apps/companion run e2e` runs it, in the landing workflow's companion job'''
+
+[[case_table]]
+files = 'tests/shells/*/*/case.json'
+package = 'kr-shell-integration'
+target = 'qualification'
+tests = ['every_case_holds_against_the_package_it_names']
+
+[[case_table]]
+files = 'fixtures/shell-bridge/*.json'
+package = 'kr-shell-integration'
+target = 'harness'
+tests = ['every_committed_scenario_holds_against_the_contract']
+
+[[step]]
+id = 'rust-the-workspace-s-tests'
+group = 'rust'
+what = '''the workspace's tests'''
+platforms = ['linux']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '--workspace', '--no-fail-fast']
+
+[[step]]
+id = 'end-to-end-the-worker-the-network-suite-launches'
+group = 'end-to-end'
+what = 'the worker the network suite launches'
+platforms = ['linux', 'macos']
+reading = 'build'
+command = ['cargo', 'build', '--locked', '-p', 'kr-worker', '--bin', 'kr-worker']
+
+[[step]]
+id = 'rust-the-workspace-s-tests-less-what-the-macos-runner-cannot'
+group = 'rust'
+what = '''the workspace's tests, less what the macOS runner cannot host'''
+platforms = ['macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '--workspace',
+    '--exclude',
+    'kr-sync-integration',
+    '--no-fail-fast',
+]
+[[step.skips]]
+name = 'the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_reused_container_name_is_not_the_identity_that_was_enrolled'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'the_argument_vector_reaches_the_container_exactly_as_it_was_built'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_helper_path_with_a_space_in_it_is_one_argument_inside_the_container'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no_channel'
+reason = 'needs podman, which the macOS runner does not have; the Linux run hosts it'
+[[step.skips]]
+name = 'a_repository_whose_own_data_is_on_another_filesystem_is_captured'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'bind_mount_and_cross_device_grafts_are_refused'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'recursive_removal_refuses_a_grafted_mount'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_removal_stops_before_a_disk_image_attached_inside_the_tree'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_scope_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+[[step.skips]]
+name = 'a_volume_whose_disk_is_held_is_detached_once_it_is_let_go'
+reason = '''needs a second filesystem, which the landing workflow's macOS job attaches for it'''
+
+[[step]]
+id = 'rust-the-control-daemon-the-worker-the-forwarder-and-the'
+group = 'rust'
+what = 'the control daemon, the worker, the forwarder and the plugin host the suites start, and the release tool whose header a case reads'
+platforms = ['windows']
+reading = 'build'
+command = [
+    'cargo',
+    'build',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '-p',
+    'kr-worker',
+    '-p',
+    'kr-hook',
+    '-p',
+    'kr-plugin-host',
+    '-p',
+    'kr-release',
+]
+
+[[step]]
+id = 'rust-the-description-process-the-update-suite-assembles-into'
+group = 'rust'
+what = 'the description process the update suite assembles into releases'
+platforms = ['windows']
+reading = 'build'
+command = [
+    'cargo',
+    'build',
+    '--locked',
+    '-p',
+    'kr-describe-model',
+    '--bin',
+    'kr-describe-inference',
+]
+
+[[step]]
+id = 'rust-the-terminal-engine-the-repository-boundary-the-attach'
+group = 'rust'
+what = 'the terminal engine, the repository boundary, the attach client and pairing'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-term', '-p', 'kr-project', '-p', 'kr-cli']
+
+[[step]]
+id = 'rust-the-rust-reader-of-the-evidence-directory'
+group = 'rust'
+what = 'the Rust reader of the evidence directory'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-test-artifacts']
+
+[[step]]
+id = 'rust-the-powershell-and-shell-readers-of-the-evidence'
+group = 'rust'
+what = 'the PowerShell and shell readers of the evidence directory'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-conformance', '--test', 'artifacts_readers']
+
+[[step]]
+id = 'rust-the-worker-s-library'
+group = 'rust'
+what = '''the worker's library'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--lib']
+
+[[step]]
+id = 'rust-the-platform-time-adapter'
+group = 'rust'
+what = 'the platform time adapter'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'receipts',
+    '--',
+    '--nocapture',
+    '--exact',
+    'the_platform_time_adapter_reads_this_machines_own_time_service',
+    'every_recorded_platform_reading_classifies_the_way_the_fixture_states',
+    'retrust_needs_the_host_time_authority_or_the_owner_and_never_a_paired_peer',
+]
+
+[[step]]
+id = 'rust-the-protocol-s-library'
+group = 'rust'
+what = '''the protocol's library'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-protocol', '--lib']
+
+[[step]]
+id = 'rust-the-binder-the-channels-the-connectors-and-the'
+group = 'rust'
+what = 'the binder, the channels, the connectors and the attention source'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'binder',
+    '--test',
+    'channels',
+    '--test',
+    'connectors',
+    '--test',
+    'attention_source',
+]
+
+[[step]]
+id = 'rust-the-configuration-lock'
+group = 'rust'
+what = 'the configuration lock'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'config::']
+[step.filter]
+name = 'config::'
+reason = 'on Windows only the cases named `config::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-bridge-store-s-records'
+group = 'rust'
+what = '''the bridge store's records'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'bridge::store::']
+[step.filter]
+name = 'bridge::store::'
+reason = 'on Windows only the cases named `bridge::store::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-host-environment-a-session-takes'
+group = 'rust'
+what = 'the host environment a session takes'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--lib',
+    'a_create_that_launches_nothing::',
+]
+[step.filter]
+name = 'a_create_that_launches_nothing::'
+reason = 'on Windows only the cases named `a_create_that_launches_nothing::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-attention-inbox-s-transport'
+group = 'rust'
+what = '''the attention inbox's transport'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'attention::']
+[step.filter]
+name = 'attention::'
+reason = 'on Windows only the cases named `attention::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-decision-a-device-reads'
+group = 'rust'
+what = 'the decision a device reads'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--lib',
+    'a_share_that_names_a_current_decision::',
+]
+[step.filter]
+name = 'a_share_that_names_a_current_decision::'
+reason = 'on Windows only the cases named `a_share_that_names_a_current_decision::` of this target are qualified'
+
+[[step]]
+id = 'rust-a-read-that-meets-a-worker-on-its-way-out'
+group = 'rust'
+what = 'a read that meets a worker on its way out'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--lib',
+    'service::a_read_that_meets_a_worker_on_its_way_out::',
+]
+[step.filter]
+name = 'service::a_read_that_meets_a_worker_on_its_way_out::'
+reason = 'on Windows only the cases named `service::a_read_that_meets_a_worker_on_its_way_out::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-device-dispatch'
+group = 'rust'
+what = 'the device dispatch'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--lib',
+    'service::net::dispatch::tests::',
+]
+[step.filter]
+name = 'service::net::dispatch::tests::'
+reason = 'on Windows only the cases named `service::net::dispatch::tests::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-daemon-s-attention-barrier-configuration-and'
+group = 'rust'
+what = '''the daemon's attention, barrier, configuration and diagnostics'''
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'attention',
+    '--test',
+    'barrier',
+    '--test',
+    'configuration',
+    '--test',
+    'network_host',
+]
+
+[[step]]
+id = 'rust-the-forwarder'
+group = 'rust'
+what = 'the forwarder'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-hook']
+
+[[step]]
+id = 'rust-the-launch-endpoint-the-registration-and-the-credential'
+group = 'rust'
+what = 'the launch endpoint, the registration and the credential'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'windows_endpoint']
+
+[[step]]
+id = 'rust-the-listener-the-transport-and-the-broker-over-the'
+group = 'rust'
+what = 'the listener, the transport and the broker over the launch endpoint'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'listener',
+    '--test',
+    'transport',
+    '--test',
+    'broker',
+    '--test',
+    'gateway',
+]
+
+[[step]]
+id = 'rust-the-agent-mutations-through-the-dispatch-path'
+group = 'rust'
+what = 'the agent mutations through the dispatch path'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'agent_service']
+
+[[step]]
+id = 'rust-which-handles-a-started-process-holds'
+group = 'rust'
+what = 'which handles a started process holds'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'windows_inheritance']
+
+[[step]]
+id = 'rust-the-connector-the-worker-reads-from-an-installed-package'
+group = 'rust'
+what = 'the connector the worker reads from an installed package'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'connectors']
+
+[[step]]
+id = 'rust-what-a-launch-reads-of-its-application-s-mode'
+group = 'rust'
+what = '''what a launch reads of its application's mode'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'launch_probe']
+
+[[step]]
+id = 'rust-the-command-backends'
+group = 'rust'
+what = 'the command backends'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'command_backends']
+
+[[step]]
+id = 'rust-the-forwarder-s-placeholder'
+group = 'rust'
+what = '''the forwarder's placeholder'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-plugin-sdk', '--lib', 'forwarder']
+[step.filter]
+name = 'forwarder'
+reason = 'on Windows only the cases named `forwarder` of this target are qualified'
+
+[[step]]
+id = 'rust-the-command-a-typed-name-is-looked-up-by'
+group = 'rust'
+what = 'the command a typed name is looked up by'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-shell-integration', '--lib', 'host::command']
+[step.filter]
+name = 'host::command'
+reason = 'on Windows only the cases named `host::command` of this target are qualified'
+
+[[step]]
+id = 'rust-the-terminal-a-session-opens-in'
+group = 'rust'
+what = 'the terminal a session opens in'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-shell-integration',
+    '--lib',
+    'host::terminal::tests::native_windows::',
+    '--',
+    '--nocapture',
+]
+[step.filter]
+name = 'host::terminal::tests::native_windows::'
+reason = 'on Windows only the cases named `host::terminal::tests::native_windows::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-doctor-s-reading-of-the-platform-s-command-backends'
+group = 'rust'
+what = '''the doctor's reading of the platform's command backends'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'catalogue::integrations']
+[step.filter]
+name = 'catalogue::integrations'
+reason = 'on Windows only the cases named `catalogue::integrations` of this target are qualified'
+
+[[step]]
+id = 'rust-the-doctor-s-reading-of-the-launch-probes'
+group = 'rust'
+what = '''the doctor's reading of the launch probes'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'catalogue::launch_probes']
+[step.filter]
+name = 'catalogue::launch_probes'
+reason = 'on Windows only the cases named `catalogue::launch_probes` of this target are qualified'
+
+[[step]]
+id = 'rust-the-settings-sync-store'
+group = 'rust'
+what = 'the settings-sync store'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-client', '--test', 'sync']
+
+[[step]]
+id = 'rust-a-pseudo-console-powershell-and-the-session-job-object'
+group = 'rust'
+what = 'a pseudo-console, PowerShell and the session job object'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'windows']
+
+[[step]]
+id = 'rust-a-launched-agent-s-helper-placed-by-its-job'
+group = 'rust'
+what = '''a launched agent's helper placed by its job'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'question_bindings']
+
+[[step]]
+id = 'rust-the-local-endpoint-the-descriptors-and-the-process'
+group = 'rust'
+what = 'the local endpoint, the descriptors and the process identity'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-ipc', '--test', 'windows']
+
+[[step]]
+id = 'rust-the-store-of-releases'
+group = 'rust'
+what = 'the store of releases'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-ipc', '--test', 'install']
+
+[[step]]
+id = 'rust-stopping-a-recorded-process-by-its-identity'
+group = 'rust'
+what = 'stopping a recorded process by its identity'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-ipc', '--test', 'stop']
+
+[[step]]
+id = 'rust-what-a-pipe-says-of-its-peer'
+group = 'rust'
+what = 'what a pipe says of its peer'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-ipc', '--test', 'peer_gone']
+
+[[step]]
+id = 'rust-the-local-ipc-library'
+group = 'rust'
+what = 'the local IPC library'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-ipc', '--lib']
+
+[[step]]
+id = 'rust-the-daemon-s-side-of-the-description-process-among-it'
+group = 'rust'
+what = '''the daemon's side of the description process, among it the cases that hold the process behind its job's memory limit'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-describe', '--test', 'supervise']
+
+[[step]]
+id = 'rust-what-a-question-s-caller-token-reaches'
+group = 'rust'
+what = '''what a question's caller token reaches'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'questions_answer']
+
+[[step]]
+id = 'rust-controller-and-local-authority-at-a-worker-s-pipe'
+group = 'rust'
+what = '''controller and local authority at a worker's pipe'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'authority']
+
+[[step]]
+id = 'rust-the-registry-s-records-of-a-previous-release-s-workers'
+group = 'rust'
+what = '''the registry's records of a previous release's workers'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'registry']
+[step.filter]
+name = 'registry'
+reason = 'on Windows only the cases named `registry` of this target are qualified'
+
+[[step]]
+id = 'rust-the-environment-s-singleton-lock'
+group = 'rust'
+what = '''the environment's singleton lock'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'singleton']
+[step.filter]
+name = 'singleton'
+reason = 'on Windows only the cases named `singleton` of this target are qualified'
+
+[[step]]
+id = 'rust-the-environment-s-scheduled-task-registered-read-back'
+group = 'rust'
+what = '''the environment's scheduled task, registered, read back and run'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'supervision::windows']
+[step.filter]
+name = 'supervision::windows'
+reason = 'on Windows only the cases named `supervision::windows` of this target are qualified'
+
+[[step]]
+id = 'rust-a-start-through-the-environment-s-scheduled-task'
+group = 'rust'
+what = '''a start through the environment's scheduled task'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'task_supervisor']
+
+[[step]]
+id = 'rust-the-plugin-host-started-through-the-environment-s'
+group = 'rust'
+what = '''the plugin host started through the environment's scheduled task'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'plugin_runtime_service']
+
+[[step]]
+id = 'rust-the-plugin-host-with-its-epoch-held-which-the-plugin'
+group = 'rust'
+what = '''the plugin host with its epoch held, which the plugin world's programs start'''
+platforms = ['windows']
+reading = 'build'
+command = ['cargo', 'build', '--locked', '-p', 'kr-plugin-host', '--features', 'testing', '--bins']
+
+[[step]]
+id = 'rust-the-plugin-actions-their-decoding-their-attachments-and'
+group = 'rust'
+what = 'the plugin actions, their decoding, their attachments and the observation of terminals'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'worker_waits_prepared',
+    '--test',
+    'plugin_actions',
+    '--test',
+    'plugin_decoding',
+    '--test',
+    'plugin_insertion',
+    '--test',
+    'plugin_observation',
+    '--test',
+    'revocation_of_a_held_action',
+]
+
+[[step]]
+id = 'rust-the-plugin-host-s-launcher'
+group = 'rust'
+what = '''the plugin host's launcher'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-plugin-service', '--lib', 'launcher::']
+[step.filter]
+name = 'launcher::'
+reason = 'on Windows only the cases named `launcher::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-compile-budget-s-reading-of-a-thread-s-processor'
+group = 'rust'
+what = '''the compile budget's reading of a thread's processor time'''
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-plugin-runtime',
+    '--test',
+    'execution',
+    'kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time',
+]
+[step.filter]
+name = 'kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time'
+reason = 'this step runs only the thread-time case; the steps after it run the rest'
+
+[[step]]
+id = 'rust-the-plugin-runtime-s-library'
+group = 'rust'
+what = '''the plugin runtime's library'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-plugin-runtime', '--lib']
+
+[[step]]
+id = 'rust-the-plugin-runtime-running-real-components'
+group = 'rust'
+what = 'the plugin runtime running real components'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-plugin-runtime', '--test', 'execution']
+[[step.skips]]
+name = 'kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time'
+reason = 'it has a step of its own'
+
+[[step]]
+id = 'rust-the-plugin-runtime-s-service-over-a-pipe'
+group = 'rust'
+what = '''the plugin runtime's service over a pipe'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-plugin-runtime', '--test', 'service']
+
+[[step]]
+id = 'rust-the-control-daemon-started-through-the-environment-s'
+group = 'rust'
+what = '''the control daemon started through the environment's scheduled task'''
+platforms = ['windows']
+reading = 'cargo'
+needs = ['KR_TEST_PLATFORM_SECRET_STORE']
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-cli',
+    '--test',
+    'startup_windows',
+    '--',
+    '--ignored',
+    '--skip',
+    'a_task_the_task_scheduler_does_not_start',
+]
+
+[[step]]
+id = 'rust-the-attention-store'
+group = 'rust'
+what = 'the attention store'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-attention']
+
+[[step]]
+id = 'rust-the-client-s-stores-and-their-directory-flush'
+group = 'rust'
+what = '''the client's stores and their directory flush'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-client', '--lib']
+
+[[step]]
+id = 'rust-the-terminal-input-encoder'
+group = 'rust'
+what = 'the terminal input encoder'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-keys']
+
+[[step]]
+id = 'rust-the-loopback-listener-a-sign-in-comes-back-to'
+group = 'rust'
+what = 'the loopback listener a sign-in comes back to'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-loopback']
+
+[[step]]
+id = 'rust-the-host-s-sign-in-and-sign-out-through-the-daemon'
+group = 'rust'
+what = '''the host's sign-in and sign-out through the daemon'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'voice_broker', 'sign']
+[step.filter]
+name = 'sign'
+reason = 'on Windows only the cases named `sign` of this target are qualified'
+
+[[step]]
+id = 'rust-the-client-and-the-command-line-held-to-the-rendering'
+group = 'rust'
+what = 'the client and the command line held to the rendering rule'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-client', '--test', 'shown_rule']
+
+[[step]]
+id = 'rust-the-shared-directory-flush'
+group = 'rust'
+what = 'the shared directory flush'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-flush']
+
+[[step]]
+id = 'rust-each-store-opens-and-reads-what-the-previous-holder'
+group = 'rust'
+what = 'each store opens and reads what the previous holder committed while it still maps the index'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '-p',
+    'kr-changeset',
+    '-p',
+    'kr-delivery',
+    '-p',
+    'kr-describe',
+    '-p',
+    'kr-automation',
+    '--lib',
+    'a_previous_holder_that_is_letting_go',
+]
+[step.filter]
+name = 'a_previous_holder_that_is_letting_go'
+reason = 'on Windows only the cases named `a_previous_holder_that_is_letting_go` of this target are qualified'
+
+[[step]]
+id = 'rust-a-command-node-refused-where-no-command-can-be-run'
+group = 'rust'
+what = 'a command node refused where no command can be run'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-automation',
+    '--test',
+    'definitions',
+    'a_command_node_is_refused_where_no_command_can_be_run',
+]
+[step.filter]
+name = 'a_command_node_is_refused_where_no_command_can_be_run'
+reason = 'on Windows only the cases named `a_command_node_is_refused_where_no_command_can_be_run` of this target are qualified'
+
+[[step]]
+id = 'rust-a-descendant-keeps-its-causal-root-depth-and-parent'
+group = 'rust'
+what = 'a descendant keeps its causal root, depth and parent'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-automation',
+    '--test',
+    'causal_budget',
+    'a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger',
+]
+[step.filter]
+name = 'a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger'
+reason = 'on Windows only the cases named `a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger` of this target are qualified'
+
+[[step]]
+id = 'rust-a-workflow-does-not-retrigger-on-its-own-descendants-by'
+group = 'rust'
+what = 'a workflow does not retrigger on its own descendants by default'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-automation',
+    '--test',
+    'causal_budget',
+    'self_retrigger_is_refused_without_explicit_recurrence',
+]
+[step.filter]
+name = 'self_retrigger_is_refused_without_explicit_recurrence'
+reason = 'on Windows only the cases named `self_retrigger_is_refused_without_explicit_recurrence` of this target are qualified'
+
+[[step]]
+id = 'rust-the-contact-skill-s-installer'
+group = 'rust'
+what = '''the contact skill's installer'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'agent_tools']
+[step.filter]
+name = 'agent_tools'
+reason = 'on Windows only the cases named `agent_tools` of this target are qualified'
+
+[[step]]
+id = 'rust-the-contact-skill-installed-and-removed-through-the'
+group = 'rust'
+what = 'the contact skill installed and removed through the daemon'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'agent_tools',
+    '--test',
+    'contact_skill',
+]
+
+[[step]]
+id = 'rust-the-directory-secret-store-and-the-libsodium-boundary'
+group = 'rust'
+what = 'the directory secret store and the libsodium boundary'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-crypto']
+
+[[step]]
+id = 'rust-the-libsodium-boundary-in-the-release-profile'
+group = 'rust'
+what = 'the libsodium boundary in the release profile'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '--release', '-p', 'kr-crypto']
+
+[[step]]
+id = 'rust-the-machine-group-record'
+group = 'rust'
+what = 'the machine group record'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--lib', 'machine']
+[step.filter]
+name = 'machine'
+reason = 'on Windows only the cases named `machine` of this target are qualified'
+
+[[step]]
+id = 'rust-the-plugin-catalogue-s-package-store'
+group = 'rust'
+what = '''the plugin catalogue's package store'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-plugin-catalogue']
+
+[[step]]
+id = 'rust-plugins-installed-through-the-daemon-s-catalogue'
+group = 'rust'
+what = '''plugins installed through the daemon's catalogue'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'catalogue']
+
+[[step]]
+id = 'rust-the-powershell-bridge-client-over-a-named-pipe'
+group = 'rust'
+what = 'the PowerShell bridge client over a named pipe'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-shell-integration', '--test', 'pwsh_windows']
+
+[[step]]
+id = 'rust-the-powershell-package-a-windows-host-publishes'
+group = 'rust'
+what = 'the PowerShell package a Windows host publishes'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-shell-integration',
+    '--test',
+    'pwsh_windows_package',
+]
+
+[[step]]
+id = 'rust-the-reference-bridge-over-a-real-endpoint'
+group = 'rust'
+what = 'the reference bridge over a real endpoint'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-shell-integration', '--lib', 'host::scripted::']
+[step.filter]
+name = 'host::scripted::'
+reason = 'on Windows only the cases named `host::scripted::` of this target are qualified'
+
+[[step]]
+id = 'rust-the-repository-boundary'
+group = 'rust'
+what = 'the repository boundary'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-project', '--test', 'boundary']
+
+[[step]]
+id = 'rust-what-an-apply-carries-across'
+group = 'rust'
+what = 'what an apply carries across'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-changeset', '--test', 'apply']
+
+[[step]]
+id = 'rust-filesystem-authority-and-access-control-lists'
+group = 'rust'
+what = 'filesystem authority and access-control lists'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-transfer', '--lib', '--test', 'authority']
+
+[[step]]
+id = 'rust-the-transfer-service-s-uploads-and-downloads'
+group = 'rust'
+what = '''the transfer service's uploads and downloads'''
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-transfer',
+    '--test',
+    'uploads',
+    '--test',
+    'downloads',
+]
+
+[[step]]
+id = 'rust-a-collection-key-kept-in-this-machine-s-credential-store'
+group = 'rust'
+what = '''a collection key kept in this machine's credential store'''
+platforms = ['windows']
+reading = 'cargo'
+needs = ['KR_TEST_PLATFORM_SECRET_STORE']
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-client',
+    '--lib',
+    '--',
+    '--ignored',
+    '--exact',
+    'sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again',
+]
+
+[[step]]
+id = 'rust-the-persistence-suite'
+group = 'rust'
+what = 'the persistence suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'persistence']
+
+[[step]]
+id = 'rust-the-archive-s-cleanup-of-a-crashed-session'
+group = 'rust'
+what = '''the archive's cleanup of a crashed session'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'archive']
+
+[[step]]
+id = 'rust-the-project-and-workspace-methods-through-the-daemon'
+group = 'rust'
+what = 'the project and workspace methods through the daemon'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'project']
+
+[[step]]
+id = 'rust-a-paired-device-s-project-methods'
+group = 'rust'
+what = '''a paired device's project methods'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'network_project']
+
+[[step]]
+id = 'rust-the-session-snapshot-suite'
+group = 'rust'
+what = 'the session snapshot suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'snapshot']
+
+[[step]]
+id = 'rust-the-terminal-suite'
+group = 'rust'
+what = 'the terminal suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'terminal']
+
+[[step]]
+id = 'rust-the-session-suite'
+group = 'rust'
+what = 'the session suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'session']
+
+[[step]]
+id = 'rust-the-local-owner-suite'
+group = 'rust'
+what = 'the local owner suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'local_owner']
+
+[[step]]
+id = 'rust-the-input-lease-suite'
+group = 'rust'
+what = 'the input lease suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'input_lease']
+
+[[step]]
+id = 'rust-the-fence-suite'
+group = 'rust'
+what = 'the fence suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'fence']
+
+[[step]]
+id = 'rust-the-desktop-suite'
+group = 'rust'
+what = 'the desktop suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'desktop']
+
+[[step]]
+id = 'rust-the-worker-s-performance-suite'
+group = 'rust'
+what = '''the worker's performance suite'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'performance']
+
+[[step]]
+id = 'rust-the-shell-suite'
+group = 'rust'
+what = 'the shell suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'shell']
+
+[[step]]
+id = 'rust-the-privacy-suite'
+group = 'rust'
+what = 'the privacy suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'privacy']
+
+[[step]]
+id = 'rust-the-descriptions-suite'
+group = 'rust'
+what = 'the descriptions suite'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'descriptions']
+
+[[step]]
+id = 'rust-the-refusal-of-a-native-bridge-recipe'
+group = 'rust'
+what = 'the refusal of a native bridge recipe'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-controller', '--test', 'native_bridge']
+
+[[step]]
+id = 'rust-how-a-session-s-closure-reaches-its-attachments'
+group = 'rust'
+what = '''how a session's closure reaches its attachments'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'closure']
+
+[[step]]
+id = 'rust-the-daemon-ended-during-output'
+group = 'rust'
+what = 'the daemon ended during output'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'controller_kill']
+
+[[step]]
+id = 'rust-the-decisions-a-membership-lease-gives'
+group = 'rust'
+what = 'the decisions a membership lease gives'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'grants',
+    '--test',
+    'organisation',
+]
+
+[[step]]
+id = 'rust-an-expired-membership-on-a-live-connection'
+group = 'rust'
+what = 'an expired membership on a live connection'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'network',
+    '--',
+    '--ignored',
+    '--exact',
+    'a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serves_the_device_again',
+    'a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_once_its_lease_ends',
+    'an_exclusive_host_holds_its_local_owner_to_a_lease_at_the_worker_and_at_the_daemon',
+    'ending_exclusive_management_serves_the_local_owner_without_a_lease_and_turning_it_on_closes_it_again',
+    'a_shorter_renewal_ends_the_local_owners_access_at_the_worker_when_the_new_lease_does',
+]
+
+[[step]]
+id = 'rust-the-recovery-bundle-store-and-its-write-record'
+group = 'rust'
+what = 'the recovery bundle store and its write record'
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-client', '--test', 'recovery']
+
+[[step]]
+id = 'rust-the-host-s-events-reaching-a-real-window'
+group = 'rust'
+what = '''the host's events reaching a real window'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'companion-tauri', '--test', 'host_events']
+
+[[step]]
+id = 'rust-the-real-worker-host-tests-through-the-environment-s'
+group = 'rust'
+what = '''the real-worker host tests, through the environment's scheduled task'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-worker', '--test', 'host']
+
+[[step]]
+id = 'end-to-end-kr-worker-host-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-worker host, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'host',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-worker-terminal-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-worker terminal, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'terminal',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-worker-authority-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-worker authority, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'authority',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-worker-receipts-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-worker receipts, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'receipts',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-controller-barrier-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-controller barrier, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'barrier',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-worker-backpressure-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-worker backpressure, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'backpressure',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-worker-session-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-worker session, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'session',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-worker-fence-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-worker fence, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-worker',
+    '--test',
+    'fence',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-controller-shell-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-controller shell, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'shell',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-controller-contracts-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-controller contracts, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'contracts',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-controller-envelope-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-controller envelope, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'envelope',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-controller-project-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-controller project, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'project',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-controller-voice-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-controller voice, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'voice',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-controller-changeset-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-controller changeset, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'changeset',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-cli-attach-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-cli attach, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-cli',
+    '--test',
+    'attach',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-cli-lifecycle-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-cli lifecycle, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-cli',
+    '--test',
+    'lifecycle',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-faults-kills-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-faults kills, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-faults',
+    '--test',
+    'kills',
+    '--',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'end-to-end-kr-controller-network-one-test-at-a-time'
+group = 'end-to-end'
+what = 'kr-controller network, one test at a time'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--test',
+    'network',
+    '--',
+    '--test-threads=1',
+    '--include-ignored',
+]
+
+[[step]]
+id = 'performance-the-measurement-suite-s-own-regressions'
+group = 'performance'
+what = '''the measurement suite's own regressions'''
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '--release', '-p', 'kr-worker', '--test', 'performance']
+
+[[step]]
+id = 'performance-the-input-measurements-own-regressions'
+group = 'performance'
+what = '''the input measurements' own regressions'''
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '--release', '-p', 'kr-worker', '--bench', 'input_latency']
+
+[[step]]
+id = 'performance-the-attach-to-a-usable-screen-measurement'
+group = 'performance'
+what = 'the attach_to_a_usable_screen measurement'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '--release',
+    '-p',
+    'kr-worker',
+    '--test',
+    'performance',
+    '--',
+    '--ignored',
+    '--exact',
+    '--nocapture',
+    'attach_to_a_usable_screen',
+]
+
+[[step]]
+id = 'performance-the-added-input-forwarding-latency-measurement'
+group = 'performance'
+what = 'the added_input_forwarding_latency measurement'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '--release',
+    '-p',
+    'kr-worker',
+    '--bench',
+    'input_latency',
+    '--',
+    '--ignored',
+    '--exact',
+    '--nocapture',
+    'added_input_forwarding_latency',
+]
+
+[[step]]
+id = 'performance-the-paste-prefix-recogniser-deadline-measurement'
+group = 'performance'
+what = 'the paste_prefix_recogniser_deadline measurement'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '--release',
+    '-p',
+    'kr-worker',
+    '--bench',
+    'input_latency',
+    '--',
+    '--ignored',
+    '--exact',
+    '--nocapture',
+    'paste_prefix_recogniser_deadline',
+]
+
+[[step]]
+id = 'performance-the-idle-resources-for-twenty-sessions-and-thirty-two'
+group = 'performance'
+what = 'the idle_resources_for_twenty_sessions_and_thirty_two_views measurement'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '--release',
+    '-p',
+    'kr-worker',
+    '--test',
+    'performance',
+    '--',
+    '--ignored',
+    '--exact',
+    '--nocapture',
+    'idle_resources_for_twenty_sessions_and_thirty_two_views',
+]
+
+[[step]]
+id = 'performance-terminal-output-handling-optimised'
+group = 'performance'
+what = 'terminal output handling, optimised'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '--release',
+    '-p',
+    'kr-term',
+    '--test',
+    'perf',
+    '--',
+    '--nocapture',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'performance-transport-scheduling-and-reconnect-optimised'
+group = 'performance'
+what = 'transport scheduling and reconnect, optimised'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '--release',
+    '-p',
+    'kr-transport',
+    '--test',
+    'perf',
+    '--',
+    '--nocapture',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'typescript-the-report-s-own-reading-of-typescript'
+group = 'typescript'
+what = '''the report's own reading of TypeScript'''
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-conformance',
+    '--test',
+    'report',
+    '--',
+    '--ignored',
+    '--exact',
+    'typescript_comment_forms_and_titles_key_their_tests',
+]
+
+[[step]]
+id = 'typescript-packages-protocol-s-tests'
+group = 'typescript'
+what = '''packages/protocol's tests'''
+platforms = ['linux', 'macos']
+reading = 'vitest'
+package = 'packages/protocol'
+command = [
+    'pnpm',
+    '--dir',
+    'packages/protocol',
+    'run',
+    'test',
+    '--reporter=default',
+    '--reporter=json',
+    '--outputFile.json={evidence}/conformance/vitest/packages-protocol.json',
+    '--includeTaskLocation',
+]
+
+[[step]]
+id = 'typescript-packages-plugin-sdk-s-tests'
+group = 'typescript'
+what = '''packages/plugin-sdk's tests'''
+platforms = ['linux', 'macos']
+reading = 'vitest'
+package = 'packages/plugin-sdk'
+command = [
+    'pnpm',
+    '--dir',
+    'packages/plugin-sdk',
+    'run',
+    'test',
+    '--reporter=default',
+    '--reporter=json',
+    '--outputFile.json={evidence}/conformance/vitest/packages-plugin-sdk.json',
+    '--includeTaskLocation',
+]
+
+[[step]]
+id = 'typescript-apps-companion-s-tests'
+group = 'typescript'
+what = '''apps/companion's tests'''
+platforms = ['linux', 'macos']
+reading = 'vitest'
+package = 'apps/companion'
+command = [
+    'pnpm',
+    '--dir',
+    'apps/companion',
+    'run',
+    'test',
+    '--reporter=default',
+    '--reporter=json',
+    '--outputFile.json={evidence}/conformance/vitest/apps-companion.json',
+    '--includeTaskLocation',
+]
+
+[[step]]
+id = 'applications-the-application-matrix-in-a-real-session'
+group = 'applications'
+what = 'the application matrix in a real session'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+needs = ['KR_CONFORMANCE_APPLICATIONS']
+skips_from = 'applications'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-conformance',
+    '--test',
+    'applications',
+    '--',
+    '--ignored',
+    '--test-threads=1',
+]
+
+[[step]]
+id = 'phones-the-android-application-s-unit-tests'
+group = 'phones'
+what = '''the Android application's unit tests'''
+platforms = ['linux']
+reading = 'lane'
+lane = 'junit'
+command = ['bash', 'scripts/android-unit-tests.sh', '--results={evidence}/conformance/android']
+
+[[step]]
+id = 'phones-the-ios-application-s-unit-tests'
+group = 'phones'
+what = '''the iOS application's unit tests'''
+platforms = ['macos']
+reading = 'lane'
+lane = 'xcode'
+command = ['bash', 'scripts/ios-unit-tests.sh', '--results={evidence}/conformance/ios.json']
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test bash'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test fish'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test module_abi'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test pwsh'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test relocation'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test zsh'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --test zsh --test bash --test fish --test pwsh --test module_abi --test relocation --test fish_sources -- --test-threads=1 --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test install_homes'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --test install_homes -- --test-threads=1 --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test qualification'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --test qualification -- --test-threads=1 --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--lib'
+cases = ['host::startup::']
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p kr-shell-integration --lib host::startup:: -- --include-ignored'
+
+[[ignored_run]]
+package = 'kr-release'
+target = '--test release_tree'
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/release-tree.yml'
+line = 'run: cargo test --locked -p kr-release --test release_tree -- --include-ignored'
+
+[[ignored_run]]
+package = 'kr-shell-integration'
+target = '--test pwsh_windows'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it needs a second local account, and runs on the Windows test machine'
+
+[[ignored_run]]
+package = 'kr-client'
+target = '--lib'
+cases = [
+    'sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again',
+]
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'run: cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again'
+
+[[ignored_run]]
+package = 'kr-worker'
+target = '--test desktop_hosted'
+cases = [
+    'a_desktop_bound_workers_checks_leave_the_other_application_the_terminal_and_the_files_as_they_were',
+]
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'run: cargo test --locked -p kr-worker --test desktop_hosted -- --nocapture --ignored --exact a_desktop_bound_workers_checks_leave_the_other_application_the_terminal_and_the_files_as_they_were'
+
+[[ignored_run]]
+package = 'kr-changeset'
+target = '--test capture'
+[ignored_run.runs]
+kind = 'supplied'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p "$package" "${selector[@]}" -- --ignored --exact --color never "$check" 2>&1 | tee "$log" || ran=1'
+names_with = ['kr-changeset capture']
+
+[[ignored_run]]
+package = 'kr-changeset'
+target = '--test filesystems'
+[ignored_run.runs]
+kind = 'supplied'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p "$package" "${selector[@]}" -- --ignored --exact --color never "$check" 2>&1 | tee "$log" || ran=1'
+names_with = ['kr-changeset filesystems']
+
+[[ignored_run]]
+package = 'kr-transfer'
+target = '--test authority'
+[ignored_run.runs]
+kind = 'supplied'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p "$package" "${selector[@]}" -- --ignored --exact --color never "$check" 2>&1 | tee "$log" || ran=1'
+names_with = ['kr-transfer authority']
+
+[[ignored_run]]
+package = 'kr-project'
+target = '--test workspaces'
+[ignored_run.runs]
+kind = 'supplied'
+file = '.github/workflows/core-ci.yml'
+line = 'cargo test --locked -p "$package" "${selector[@]}" -- --ignored --exact --color never "$check" 2>&1 | tee "$log" || ran=1'
+names_with = ['kr-project workspaces']
+
+[[ignored_run]]
+package = 'kr-changeset'
+target = '--test apply'
+[ignored_run.runs]
+kind = 'nowhere'
+why = 'they need a repository tool, which the repository boundary on Windows refuses to run, so no host runs them yet'
+
+[[ignored_run]]
+package = 'kr-worker'
+target = '--test close_on_a_hung_store'
+cases = [
+    'a_close_stops_the_session_while_a_marker_write_stands_still',
+    'a_close_stops_the_session_while_a_settlement_stands_still',
+    'a_close_stops_the_session_while_the_maintenance_prune_stands_still',
+    'a_close_that_was_admitted_is_carried_out_while_a_prune_stands_still',
+    'a_close_whose_own_marker_write_stands_still_stops_the_session',
+    'a_close_whose_own_settlement_stands_still_stops_the_session',
+]
+[ignored_run.runs]
+kind = 'nowhere'
+why = '''each of these cases shows a fault that is still open: a close stops late while a storage call stands still, so each fails until the close's bounded stop is built, and the entry goes when the cases lose their `ignore`'''
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test close_on_a_hung_store'
+cases = [
+    'a_close_at_the_daemon_stops_the_session_while_a_marker_write_stands_still',
+    'a_close_from_a_paired_device_stops_the_session_while_a_marker_write_stands_still',
+]
+[ignored_run.runs]
+kind = 'nowhere'
+why = '''each of these cases shows a fault that is still open: a close stops late while a storage call stands still, so each fails until the close's bounded stop is built, and the entry goes when the cases lose their `ignore`'''
+
+[[ignored_run]]
+package = 'kr-cli'
+target = '--test startup_windows'
+cases = [
+    'the_daemon_the_task_starts_is_in_none_of_the_callers_jobs',
+    'three_first_invocations_at_once_leave_one_daemon_that_serves_every_caller',
+]
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'run: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start'
+
+[[ignored_run]]
+package = 'kr-cli'
+target = '--test startup_windows'
+cases = ['a_task_the_task_scheduler_does_not_start_is_named_with_where_to_sign_in']
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it needs an account signed in to no session, which no step of this repository arranges'
+
+[[ignored_run]]
+package = 'kr-cli'
+target = '--test shell_windows'
+cases = [
+    'a_default_session_is_refused_without_the_entry_and_managed_with_it',
+    'a_plugin_host_that_ends_with_a_registration_unanswered_takes_no_worker_with_it_on_windows',
+    'a_program_whose_package_ships_a_component_starts_the_plugin_host_on_windows',
+    'after_a_sign_out_nothing_the_session_started_is_left_and_the_startup_entry_stands',
+    'the_bundled_agents_typed_at_the_managed_prompt_are_launched_through_the_forwarder',
+    'with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed_out',
+]
+[ignored_run.runs]
+kind = 'by_hand'
+why = '''they write the account's PowerShell profiles and put them back, so they run on the Windows test machine under a run that records and restores the profiles; the case that signs the account out runs only where KR_ALLOW_SIGN_OUT=1 says the account is disposable, and is followed by the case that reads what is left, in the account's next sign-in'''
+
+[[ignored_run]]
+package = 'kr-cli'
+target = '--test desktop_sign_out_windows'
+cases = [
+    'a_desktop_bound_session_is_made_and_the_account_signed_out',
+    'after_a_sign_out_the_desktop_bound_session_is_closed_with_desktop_lost',
+]
+[ignored_run.runs]
+kind = 'by_hand'
+why = '''the first signs the account that runs it out, so it runs only where KR_ALLOW_SIGN_OUT=1 says the account is a disposable standard account that a run signs in over remote desktop; the second reads what the first left, in the account's next sign-in'''
+
+[[ignored_run]]
+package = 'kr-conformance'
+target = '--test applications'
+[ignored_run.runs]
+kind = 'plan'
+line = 'cargo test --locked -p kr-conformance --test applications -- --ignored --test-threads=1 --show-output'
+
+[[ignored_run]]
+package = 'kr-conformance'
+target = '--test report'
+cases = ['typescript_comment_forms_and_titles_key_their_tests']
+[ignored_run.runs]
+kind = 'plan'
+line = 'cargo test --locked -p kr-conformance --test report -- --ignored --exact typescript_comment_forms_and_titles_key_their_tests --show-output'
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test network'
+[ignored_run.runs]
+kind = 'plan'
+line = 'cargo test --locked -p kr-controller --test network -- --test-threads=1 --include-ignored --show-output'
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test shell'
+[ignored_run.runs]
+kind = 'command'
+file = 'scripts/real-package-cases.sh'
+line = 'step cargo test -p kr-controller --test shell -- --ignored'
+
+[[ignored_run]]
+package = 'kr-worker'
+target = '--test fence'
+[ignored_run.runs]
+kind = 'command'
+file = 'scripts/real-package-cases.sh'
+line = 'step cargo test -p kr-worker --test fence -- --ignored --exact a_real_qualified_package_registers_and_qualifies_on_this_hosts_endpoint a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is_ready_after_the_profile a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_still_closes a_real_package_asks_the_real_worker_before_each_command_and_runs_a_bypass_as_typed a_real_shell_that_ran_cd_is_described_by_its_new_directory_at_the_next_prompt a_real_shell_names_the_program_it_resolved_and_not_a_word_it_found_no_file_for a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_again a_real_readers_line_stays_empty_when_the_host_answers_an_application a_real_powershell_readers_fence_is_invalidated_by_the_hosts_answer a_real_powershell_editor_reads_its_cursor_report_whole_while_the_host_answers_the_application a_takeover_racing_an_end_of_input_at_a_real_prompt_reaches_the_shell_once_from_its_holder_or_not_at_all a_real_root_shell_killed_at_its_prompt_closes_its_session_with_the_signal kr_req_13_11_a_real_reader_is_launchable_at_its_prompt_and_not_after_a_key_until_the_next a_moved_powershell_package_qualifies_with_its_own_module_over_a_competing_one'
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test distribution_endpoints'
+cases = ['a_viewer_reaches_only_the_distribution_it_was_paired_with']
+[ignored_run.runs]
+kind = 'supplied'
+file = 'scripts/e2e-wsl.sh'
+line = '''wsl.exe -d "$distribution" -u "$linux_user" --exec /bin/sh -lc "KR_ACC_OTHER='$other' '$pairing_suite_path' --ignored --exact --nocapture --test-threads 1 $name" >"$pairing_log" 2>&1 ||'''
+names_with = ['pairing_case']
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test distribution_endpoints'
+cases = ['a_viewer_reaches_only_the_distribution_it_was_paired_with']
+[ignored_run.runs]
+kind = 'supplied'
+file = 'scripts/distribution-cases.sh'
+line = 'as_installation "$installation" env KR_ACC_OTHER="$other" cargo test -p kr-controller --test distribution_endpoints -- --ignored --exact --nocapture --test-threads 1 "$name" >"$installation/case.log" 2>&1'
+names_with = ['run_case']
+
+[[ignored_run]]
+package = 'kr-perf'
+target = '--test stress'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it runs for several minutes by design, and a person runs it on the reference host with scripts/bench-all.sh'
+
+[[ignored_run]]
+package = 'kr-worker'
+target = '--test performance'
+cases = ['attach_to_a_usable_screen', 'idle_resources_for_twenty_sessions_and_thirty_two_views']
+[ignored_run.runs]
+kind = 'supplied'
+file = 'scripts/performance.sh'
+line = 'output="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test --release -p kr-worker "$target_flag" "$target" -- --ignored --exact --nocapture "$name" 2>&1)" || status=$?'
+names_with = ['measurement_in --test performance']
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test network_input'
+cases = ['remote_input_forwarding_latency']
+[ignored_run.runs]
+kind = 'by_hand'
+why = '''it is a measurement run by name in a release build, beside the worker's input latency measurements'''
+
+[[ignored_run]]
+package = 'kr-worker'
+target = '--bench input_latency'
+[ignored_run.runs]
+kind = 'supplied'
+file = 'scripts/performance.sh'
+line = 'output="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test --release -p kr-worker "$target_flag" "$target" -- --ignored --exact --nocapture "$name" 2>&1)" || status=$?'
+names_with = ['measurement_in --bench input_latency']
+
+[[ignored_run]]
+package = 'kr-worker'
+target = '--test host'
+cases = ['a_survivor_of_a_crashed_session_tries_to_act_as_it']
+[ignored_run.runs]
+kind = 'helper'
+file = 'crates/kr-worker/tests/host.rs'
+
+[[ignored_run]]
+package = 'kr-worker'
+target = '--test host'
+cases = ['a_session_in_a_service_rests_on_a_control_group_and_a_close_ends_what_left_its_tree']
+[ignored_run.runs]
+kind = 'by_hand'
+why = '''it needs a user service manager for the account (`systemctl --user`), which a hosted runner's account does not have; it runs with `--include-ignored` on a Linux host whose account has one'''
+
+[[ignored_run]]
+package = 'companion-tauri'
+target = '--test windows_hello'
+[ignored_run.runs]
+kind = 'by_hand'
+why = '''it raises Windows Hello's dialog, which needs a signed-in desktop with Windows Hello set up and, for one case, the person'''
+
+[[ignored_run]]
+package = 'kr-ipc'
+target = '--test windows'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it needs a second local account, and runs on the Windows test machine'
+
+[[ignored_run]]
+package = 'kr-ipc'
+target = '--test install'
+cases = ['a_store_on_a_volume_that_is_not_ntfs_is_refused']
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it needs a volume that is not NTFS, a virtual disk formatted FAT32 that a person attaches and names in the environment'
+
+[[ignored_run]]
+package = 'kr-cli'
+target = '--test backup_setup'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it packs, uploads and restores about 1.5 GiB, and is run on the build box by hand'
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test managed_storage'
+cases = [
+    'a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_and_restored_with_only_the_kit',
+]
+[ignored_run.runs]
+kind = 'supplied'
+file = 'scripts/e2e-backup.sh'
+line = 'env "$@" cargo test --locked -p kr-controller --test managed_storage -- --ignored --exact "$test" --nocapture --test-threads=1 >"$log" 2>&1 || rc=$?'
+names_with = ['run_daemon_test']
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test storage_account'
+cases = ['a_shipped_controller_refuses_a_plain_http_storage_origin_before_it_sends_anything']
+[ignored_run.runs]
+kind = 'command'
+file = 'scripts/shipped-controller-gate.sh'
+line = 'KR_SHIPPED_CONTROLLER="$target/debug/kr-controller" cargo test --locked -p kr-controller --test storage_account -- --ignored --exact a_shipped_controller_refuses_a_plain_http_storage_origin_before_it_sends_anything --nocapture'
+
+[[ignored_run]]
+package = 'kr-controller'
+target = '--test descriptions'
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it needs the real description process and weights that KR_DESCRIBE_INFERENCE names, which no step of this repository has'
