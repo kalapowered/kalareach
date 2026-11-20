@@ -1670,6 +1670,8 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
 /// committed, and not as a read of the state taken when the publisher comes to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_followed_by_recovery_is_told_in_order() {
+    use companion_tauri::contact::{HostContact, HostLabel, Publication};
+
     let two = two_hosts().await;
     let companion = &two.phone.companion;
     let owner = Arc::clone(
@@ -1679,6 +1681,8 @@ async fn a_refusal_followed_by_recovery_is_told_in_order() {
             .contact_owner(),
     );
     companion.told_everything().await;
+    let start = owner.revision();
+    let told_before = companion.told_connection().len();
     two.control
         .refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
     let mut hold = owner.hold_the_publisher();
@@ -1687,18 +1691,52 @@ async fn a_refusal_followed_by_recovery_is_told_in_order() {
     two.control.refuse(None);
     // What the application holds, not what the page was told: the publisher is held.
     connection(companion, true).await;
+
+    // What the owner committed, whichever of its changes the publisher took before it was held.
+    let replay = owner.since(start);
+    assert!(!replay.resync, "the log holds every change since the start");
+    let committed: Vec<Publication> = replay.states;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|published| published.revision)
+            .collect::<Vec<_>>(),
+        [start + 1, start + 2, start + 3],
+        "the choice, the refusal and the recovery, each its own revision"
+    );
+    for published in &committed {
+        assert!(
+            matches!(&published.host, Some(HostLabel::Paired { reference, .. }) if *reference == two.references.0),
+            "each names the host chosen: {published:?}"
+        );
+    }
+    assert!(
+        !committed[0].connected && matches!(committed[0].contact, HostContact::Unknown),
+        "the choice: {:?}",
+        committed[0]
+    );
+    assert!(
+        !committed[1].connected && matches!(committed[1].contact, HostContact::Refused { .. }),
+        "the refusal: {:?}",
+        committed[1]
+    );
+    assert!(
+        committed[2].connected && matches!(committed[2].contact, HostContact::InContact),
+        "the recovery: {:?}",
+        committed[2]
+    );
+
     hold.release();
     companion.told_everything().await;
-    let told = told_states(companion);
-    let Some(refused) = told.iter().position(|each| !each.0 && each.1 == "refused") else {
-        panic!("the refusal is told: {told:?}");
-    };
-    let recovered = told[refused + 1].clone();
-    assert!(recovered.0 && recovered.1 == "in_contact", "{told:?}");
+    let told = companion.told_connection();
+    let told_since = &told[told_before..];
+    let committed: Vec<serde_json::Value> = committed
+        .iter()
+        .map(|published| serde_json::to_value(published).expect("a state"))
+        .collect();
     assert_eq!(
-        recovered.2,
-        told[refused].2 + 1,
-        "the next revision: {told:?}"
+        told_since, committed,
+        "each change is told once, as it was committed, and nothing else is told"
     );
     two.stop().await;
 }
