@@ -18,7 +18,7 @@ The Windows half of that path, and the identity behind every signature on it, is
 
 | Asset | What it is |
 | --- | --- |
-| `kalareach-protocol-<version>+<commit>.tgz` | The protocol package: the generated types, the type declarations, the JSON Schema, the KR-CBOR-1 codec, the conformance vectors under `fixtures/` for the `accounts`, `cbor`, `crypto`, `pairing`, `protocol`, `push` and `service` areas, and a `provenance.json` naming the commit it was packed from |
+| `kalareach-protocol-<version>+<commit>.tgz` | The protocol package: the generated types, the type declarations, the JSON Schema, the KR-CBOR-1 codec, the conformance vectors under `fixtures/` for the `accounts`, `cbor`, `crypto`, `metrics`, `pairing`, `protocol`, `push` and `service` areas, and a `provenance.json` naming the commit it was packed from |
 | `kalareach-plugin-sdk-<version>+<commit>.tgz` | The plugin SDK package: the manifest types, the package contract as data, the JSON Schema and the published WIT file |
 | `SHA512SUMS` | The sha512 of each archive, in the format `sha512sum -c` reads, and above it the same digest in the `sha512-<base64>` form a lockfile records as an integrity |
 
@@ -88,10 +88,11 @@ The script is what makes the release that commit's output rather than a working 
   conversion from a setting or from an attribute file outside the commit, because a working tree
   also holds files Git ignores, pnpm packs what is inside a published directory whether Git ignores
   it or not, and it packs the bytes it finds;
-- it refuses a configured `pack-gzip-level`, which changes the compressed bytes, `ignore-scripts`,
-  which would skip the step that generates most of what the protocol package publishes,
-  `skip-manifest-obfuscation`, which changes the manifest written into the archive, and a configured
-  `pnpmfile` or `global-pnpmfile`, which can rewrite that manifest from outside the commit;
+- it refuses a configured `pack-gzip-level`, which changes the compressed bytes, `ignore-scripts`
+  set to anything but `false`, which would skip the step that generates most of what the protocol
+  package publishes, `skip-manifest-obfuscation` set to anything but `false`, which changes the
+  manifest written into the archive, and a configured `pnpmfile` or `global-pnpmfile`, which can
+  rewrite that manifest from outside the commit;
 - it packs each archive twice and compares the two, then asks each archive what it contains, against
   what the package in the checkout publishes rather than against the archive's own manifest: a file
   under every published path, the file behind every entry point, those declarations unchanged, a
@@ -452,7 +453,7 @@ npm accepts a version only once, and a tag names a commit as well as a version, 
 can carry the same version. The `check` job therefore asks npm whether it already has the version
 before the run reaches manual approval, so that nobody approves a publish that then fails at its
 last step, `npm publish`. It runs
-`npm view @kalareach/plugin-sdk@<version> dist.integrity` for the version in the archive and
+`npm view @kalareach/plugin-sdk@<version> dist.integrity --json` for the version in the archive and
 compares the returned value to the archive's own sha512 integrity. There are three outcomes:
 
 - The version doesn't exist on npm. In this case, the process continues as described above (the run waits
@@ -558,8 +559,10 @@ its own name.
 
 The archive layout is pnpm's: members in a fixed order under a fixed timestamp, with fixed
 permissions and no machine identity. What is left is the environment, and the script narrows it: the
-checkout takes the committed bytes with no line-ending conversion, and a configured value for any of
-the pnpm settings the script lists is refused rather than packed under. The double pack inside one
+checkout takes the committed bytes with no line-ending conversion, and a pnpm setting the script
+lists is refused rather than packed under when it is configured: `pack-gzip-level`, `pnpmfile` and
+`global-pnpmfile` in any value, `ignore-scripts` and `skip-manifest-obfuscation` in any value but
+`false`. The double pack inside one
 run catches something that varies from moment to moment; it says nothing about another machine, which
 is what the pinned Node and pnpm versions are for.
 
