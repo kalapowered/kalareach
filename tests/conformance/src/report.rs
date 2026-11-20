@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
@@ -32,6 +32,7 @@ use crate::plan_file::{Plan, Values};
 use crate::run::{self, Blocked, Executed};
 use crate::runner_copy;
 use crate::scratch::{self, Scratch};
+use crate::tree::Deadline;
 use crate::workspace::{TargetId, TargetKind};
 
 /// The result's schema identifier.
@@ -621,14 +622,14 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                 }
             },
         };
-        if done.blocked.is_none() {
-            budgets.spend(
-                step,
-                index + 1,
-                began.elapsed(),
-                done.timed_out && deadline.is_some_and(|deadline| deadline.budget),
-            );
-        }
+        spend_budget(
+            &mut budgets,
+            step,
+            index + 1,
+            &done,
+            began.elapsed(),
+            deadline,
+        );
         if done.blocked.is_none() && (done.error.is_some() || done.exit != Some(0)) {
             done.observation = observe::observe_log(
                 &options.evidence.join(&done.log),
@@ -665,6 +666,26 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
     Ok(assemble(
         options, &groups, &map, &executed, gathered, started,
     ))
+}
+
+/// Takes the result `done` of `step`, the `number`th of the run, which took `elapsed` under
+/// `deadline`, into account in `budgets`. A step that was not run took no time, and spends none of
+/// its budget, whatever `elapsed` says; a step that its budget's deadline ended spends all of it.
+fn spend_budget(
+    budgets: &mut Budgets,
+    step: &plan::Step,
+    number: usize,
+    done: &Executed,
+    elapsed: Duration,
+    deadline: Option<Deadline>,
+) {
+    budgets.spend(
+        step,
+        number,
+        elapsed,
+        done.blocked.is_none(),
+        done.timed_out && deadline.is_some_and(|deadline| deadline.budget),
+    );
 }
 
 /// The first set-up step that `step` names in `after` and that did not exit 0, could not be run or
@@ -2012,6 +2033,31 @@ fn reproducing(runs: &[RunRecord]) -> Option<&RunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-29.01, the part about reproducible commands: the result of a step that was not run
+    /// spends none of the budget its step names, whatever time the report measured around it: the
+    /// next step of the budget has all of it.
+    #[test]
+    fn a_result_that_was_not_run_spends_none_of_its_budget_whatever_time_is_given() {
+        let mut step = plan::Step::cargo("rust", "a step", &["test"]);
+        step.budget = Some(("shared".to_owned(), 10));
+        let blocked = run::not_run(&step, 1, "a set-up step", "failed");
+        let mut budgets = Budgets::default();
+        spend_budget(
+            &mut budgets,
+            &step,
+            2,
+            &blocked,
+            Duration::from_secs(9),
+            None,
+        );
+        let now = Instant::now();
+        let next = budgets
+            .deadline(&step, now)
+            .expect("a deadline")
+            .expect("a limit");
+        assert_eq!(next.at.duration_since(now), Duration::from_secs(10));
+    }
 
     #[test]
     fn the_last_line_counts_one_failed_step_in_the_singular() {
