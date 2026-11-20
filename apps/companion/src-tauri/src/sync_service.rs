@@ -218,7 +218,7 @@ mod tests {
     /// the grant is taken away the setting is read again and the choice stands.
     #[cfg(windows)]
     #[test]
-    fn a_setting_that_could_not_be_read_is_read_again_and_the_choice_stands() {
+    fn a_setting_with_a_widened_list_is_read_again_and_the_choice_stands() {
         let data = kr_ipc::testing::PrivateTempDir::create();
         let file = data.path().join(FILE);
         write_owner_only_file(&file, b"https://sync.example").expect("a setting");
