@@ -37,6 +37,17 @@ impl Platform {
         }
     }
 
+    /// Whether `a` and `b` name one environment variable on this platform: Windows takes names that
+    /// differ only by ASCII case as one, and the others compare them as they are written.
+    #[must_use]
+    pub fn same_variable(self, a: &str, b: &str) -> bool {
+        if self == Self::Windows {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    }
+
     /// Its name in the result.
     #[must_use]
     pub const fn name(self) -> &'static str {

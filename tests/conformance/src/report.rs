@@ -417,7 +417,7 @@ fn build_directories(options: &Options, steps: &[plan::Step]) -> Vec<PathBuf> {
             .environment
             .iter()
             .chain(&step.env)
-            .rfind(|(name, _)| name == "CARGO_TARGET_DIR")
+            .rfind(|(name, _)| options.platform.same_variable(name, "CARGO_TARGET_DIR"))
             .map(|(_, value)| std::ffi::OsString::from(value))
             .or_else(|| std::env::var_os("CARGO_TARGET_DIR"));
         if let Some(target) = given {

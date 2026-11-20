@@ -500,16 +500,22 @@ fn output_of(definition: &StepDef, values: &Values<'_>) -> Option<String> {
         .map(|output| fill(output, values, ""))
 }
 
-/// The variables a step is run with: the plan's, then its own, which replace them, each value with
-/// its placeholders given their values.
+/// The variables a step is run with on `platform`: the plan's, then its own, which replace them
+/// where `platform` takes the names as one variable, each value with its placeholders given their
+/// values. They come in the order of their names.
 fn environment_of(
+    platform: Platform,
     plan: &Plan,
     definition: &StepDef,
     values: &Values<'_>,
     output: &str,
 ) -> Vec<(String, String)> {
-    let mut merged: BTreeMap<&String, &String> = plan.env.iter().collect();
-    merged.extend(definition.env.iter());
+    let mut merged: Vec<(&String, &String)> = plan.env.iter().collect();
+    for (name, value) in &definition.env {
+        merged.retain(|(held, _)| !platform.same_variable(held, name));
+        merged.push((name, value));
+    }
+    merged.sort_by(|a, b| a.0.cmp(b.0));
     merged
         .into_iter()
         .map(|(name, value)| (name.clone(), fill(value, values, output)))
@@ -1318,6 +1324,7 @@ impl Plan {
                         .map(|directory| normal(Path::new(directory)))
                         .unwrap_or_default(),
                     env: environment_of(
+                        platform,
                         self,
                         definition,
                         values,
