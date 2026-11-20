@@ -392,12 +392,4 @@ impl Reading {
         entries.sort_by(|first, second| first.method.cmp(&second.method));
         entries
     }
-
-    /// Returns true when `method` is a request that asks for a decision.
-    #[must_use]
-    pub fn asks_for_a_decision(&self, method: &UpstreamMethod) -> bool {
-        self.answers
-            .as_ref()
-            .is_some_and(|answers| answers.methods.contains(method))
-    }
 }

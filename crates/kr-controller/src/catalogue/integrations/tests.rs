@@ -786,7 +786,7 @@ fn a_platform_whose_command_backends_run_reports_an_integration_with_a_launcher_
         Integrations::new().read(&[store.admitted(&fixture::Shape::claude_code(), |_| {})]);
     let host = Host {
         search_path: Vec::new(),
-        backends: kr_worker::broker::process::ManagedProcess::runs_command_backends(),
+        backends: kr_worker::broker::process::ManagedProcess::command_backends_failure().is_none(),
         backends_failure: kr_worker::broker::process::ManagedProcess::command_backends_failure(),
         launcher: true,
         forwarder: None,

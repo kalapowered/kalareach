@@ -369,13 +369,6 @@ impl ManagedProcess {
             (!cfg!(unix)).then_some("this platform has no command backend")
         }
     }
-
-    /// Returns true when this platform's command backends run: see
-    /// [`Self::command_backends_failure`].
-    #[must_use]
-    pub fn runs_command_backends() -> bool {
-        Self::command_backends_failure().is_none()
-    }
 }
 
 /// Checks that a directory is the owning user's and closed to everybody else.
@@ -571,7 +564,7 @@ mod tests {
 
     #[test]
     fn unix_and_windows_run_command_backends_and_publish_a_credential_file() {
-        assert!(ManagedProcess::runs_command_backends());
+        assert!(ManagedProcess::command_backends_failure().is_none());
         assert!(ManagedProcess::publishes_credential_file());
     }
 
