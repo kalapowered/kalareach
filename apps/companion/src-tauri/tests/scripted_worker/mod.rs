@@ -33,7 +33,7 @@ use kr_protocol::ids::{
     ActionWindowId, AttachmentId, BootEpoch, BuildId, ConnectionId, EnvironmentId, EventSequence,
     EventType, GeometryEpoch, RequestId, SessionEpoch, SessionId, StreamId,
 };
-use kr_protocol::local::{LocalBuild, LocalHelloAck, LocalPeer, LocalRole};
+use kr_protocol::local::{LocalBuild, LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
 use kr_protocol::projection::{
     CellRendition, CellRun, CharsetState, KittyKeyboardState, MarginState, PaletteProvenance,
@@ -151,9 +151,30 @@ impl ScriptedWorker {
             challenge,
             Stated::ThisBuild,
             true,
+            false,
         );
         worker.host = Some(host);
         worker
+    }
+
+    /// A worker for one session that the host tree's own control daemon records, as it records
+    /// every session it creates, and adopts when it starts: a daemon that is started in
+    /// `environment` after this finds the worker, proves it and holds a link to it, and the calls
+    /// it passes on arrive here.
+    ///
+    /// The worker answers the daemon the way a worker does: it issues the challenge that a
+    /// controller answers for the generation it speaks for, accepts it, and takes the statements
+    /// of what the local owner may do. A link the daemon opens is handed to the test only once a
+    /// call arrives on it, so the first link taken is the one that carries the calls.
+    pub fn start_for_daemon(environment: EnvironmentPaths, environment_id: EnvironmentId) -> Self {
+        Self::publish(
+            environment,
+            environment_id,
+            Challenge::Answered,
+            Stated::ThisBuild,
+            true,
+            true,
+        )
     }
 
     /// A worker that answers its challenge and states its build, as a worker of the release before
@@ -165,6 +186,7 @@ impl ScriptedWorker {
             host.environment_id(),
             Challenge::Answered,
             Stated::ThisBuild,
+            false,
             false,
         );
         worker.host = Some(host);
@@ -180,6 +202,7 @@ impl ScriptedWorker {
             Challenge::Answered,
             stated,
             true,
+            false,
         );
         worker.host = Some(host);
         worker
@@ -193,6 +216,7 @@ impl ScriptedWorker {
             challenge,
             Stated::ThisBuild,
             true,
+            false,
         )
     }
 
@@ -207,8 +231,41 @@ impl ScriptedWorker {
         challenge: Challenge,
         stated: Stated,
         states_launch_surface: bool,
+        recorded: bool,
     ) -> Self {
-        let session_id = SessionId::new(kr_ipc::new_uuid());
+        // A session the control daemon records is reserved in its registry first, which names the
+        // session and its display; any other worker's session is its own.
+        let (session_id, display) = if recorded {
+            let mut registry = kr_controller::registry::Registry::open(
+                environment.registry_database(),
+                environment_id,
+            )
+            .expect("the registry");
+            let admitted = registry
+                .reserve(
+                    &kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
+                    kr_ipc::new_uuid(),
+                    kr_protocol::scalars::Digest256::from_bytes([0x5e; 32]),
+                    &[0xa0],
+                    kr_ipc::now_ms(),
+                )
+                .expect("the session is reserved");
+            registry
+                .set_phase(
+                    admitted.reservation.reservation_id,
+                    kr_controller::registry::LaunchPhase::Live,
+                )
+                .expect("the session is live");
+            (
+                admitted.reservation.session_id,
+                admitted.reservation.display_number,
+            )
+        } else {
+            (
+                SessionId::new(kr_ipc::new_uuid()),
+                DisplayNumber::new(NEXT_DISPLAY.fetch_add(1, Ordering::Relaxed)),
+            )
+        };
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
         let process =
             kr_ipc::identity::current_process_start_identity().expect("a process identity");
@@ -230,11 +287,31 @@ impl ScriptedWorker {
             PROTOCOL_VERSION,
         )
         .expect("another session key");
-        let display = DisplayNumber::new(NEXT_DISPLAY.fetch_add(1, Ordering::Relaxed));
         let endpoint = environment
             .worker_endpoint(display)
             .expect("an endpoint for the session");
         let listener = Listener::bind(&endpoint).expect("the worker listens");
+        if recorded {
+            kr_controller::registry::Registry::open(
+                environment.registry_database(),
+                environment_id,
+            )
+            .expect("the registry")
+            .adopt_worker(
+                &kr_controller::registry::WorkerRecord {
+                    session_id,
+                    display_number: display,
+                    public_key: *identity.public_key(),
+                    process_identity: process.clone(),
+                    endpoint: endpoint.as_text(),
+                    profile: WorkerProfile::HeadlessUser,
+                    state: kr_protocol::session::SessionState::Live,
+                    acknowledged_revision: kr_protocol::ids::AuthorityRevision::new(0),
+                },
+                Some(&kr_protocol::identity::DesktopBinding::none()),
+            )
+            .expect("the worker is recorded");
+        }
         let descriptor = WorkerDescriptor {
             session_id,
             session_epoch: SessionEpoch::V1,
@@ -261,85 +338,157 @@ impl ScriptedWorker {
                     .expect("a capability identifier"),
             );
         }
+        let served = descriptor.clone();
+        let identity = std::sync::Arc::new(identity);
+        let impostor = std::sync::Arc::new(impostor);
         let serving = tokio::spawn(async move {
             loop {
                 let Ok((connection, peer)) = listener.accept().await else {
                     return;
                 };
                 let (mut reader, mut writer) = split(connection, StreamKind::Control);
-                let Ok(ControlFrame::Hello(_)) = reader.read_message::<ControlFrame>().await else {
-                    continue;
-                };
-                if challenge == Challenge::HeldAtHello {
-                    // Held until the view gives up: the next read ends when it closes.
-                    let _ = held.send(());
-                    let _ = reader.read_message::<ControlFrame>().await;
-                    let _ = leaving.send(());
-                    continue;
-                }
-                let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-                let acknowledgement = LocalHelloAck {
-                    selected_version: PROTOCOL_VERSION,
-                    role: LocalRole::Worker,
-                    connection_id,
-                    environment_id,
-                    boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                    peer: LocalPeer {
-                        uid: U64::new(u64::from(peer.uid)),
-                        gid: U64::new(u64::from(peer.gid)),
-                        pid: Nullable::null(),
-                    },
-                    action_window: ActionWindow {
-                        action_window_id: ActionWindowId::new("window-1")
-                            .expect("a literal window identifier"),
-                        connection_id,
-                        boot_epoch: BootEpoch::new(1),
-                        issued_at_ms: TimestampMs::new(0),
-                        valid_for_ms: DurationMs::new(60_000),
-                    },
-                    capabilities: stated_capabilities.clone(),
-                    max_receive: ReceiveLimits::default(),
-                    build: stated.build(),
-                };
-                if writer
-                    .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
-                    .await
-                    .is_err()
-                {
-                    continue;
-                }
-                let Ok(ControlFrame::VerifyChallenge(asked)) =
-                    reader.read_message::<ControlFrame>().await
+                let Ok(ControlFrame::Hello(hello)) = reader.read_message::<ControlFrame>().await
                 else {
                     continue;
                 };
-                let signer = match challenge {
-                    Challenge::Answered => &identity,
-                    Challenge::Forged => &impostor,
-                    Challenge::HeldAtHello | Challenge::HeldAtProof => {
+                let controller = hello.client == LocalClientKind::Controller;
+                let (held, leaving, handing) = (held.clone(), leaving.clone(), handing.clone());
+                let (identity, impostor) = (
+                    std::sync::Arc::clone(&identity),
+                    std::sync::Arc::clone(&impostor),
+                );
+                let stated_capabilities = stated_capabilities.clone();
+                let descriptor = served.clone();
+                let stated = stated.clone();
+                let endpoint_text = endpoint_text.clone();
+                let handshake = async move {
+                    if challenge == Challenge::HeldAtHello {
+                        // Held until the view gives up: the next read ends when it closes.
                         let _ = held.send(());
                         let _ = reader.read_message::<ControlFrame>().await;
                         let _ = leaving.send(());
-                        continue;
+                        return;
                     }
+                    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                    let acknowledgement = LocalHelloAck {
+                        selected_version: PROTOCOL_VERSION,
+                        role: LocalRole::Worker,
+                        connection_id,
+                        environment_id,
+                        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                        peer: LocalPeer {
+                            uid: U64::new(u64::from(peer.uid)),
+                            gid: U64::new(u64::from(peer.gid)),
+                            pid: Nullable::null(),
+                        },
+                        action_window: ActionWindow {
+                            action_window_id: ActionWindowId::new("window-1")
+                                .expect("a literal window identifier"),
+                            connection_id,
+                            boot_epoch: BootEpoch::new(1),
+                            issued_at_ms: TimestampMs::new(0),
+                            valid_for_ms: DurationMs::new(60_000),
+                        },
+                        capabilities: stated_capabilities,
+                        max_receive: ReceiveLimits::default(),
+                        build: stated.build(),
+                    };
+                    if writer
+                        .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if controller {
+                        // A controller has to prove which generation it speaks for before it acts:
+                        // the worker issues the challenge as soon as it has acknowledged the hello.
+                        let Ok(issued) = kr_ipc::verify::fresh_challenge() else {
+                            return;
+                        };
+                        if writer
+                            .write_message(&ControlFrame::GenerationChallenge(
+                                kr_protocol::worker::GenerationChallenge {
+                                    nonce: issued.nonce,
+                                },
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let Ok(ControlFrame::VerifyChallenge(asked)) =
+                        reader.read_message::<ControlFrame>().await
+                    else {
+                        return;
+                    };
+                    let signer = match challenge {
+                        Challenge::Answered => &identity,
+                        Challenge::Forged => &impostor,
+                        Challenge::HeldAtHello | Challenge::HeldAtProof => {
+                            let _ = held.send(());
+                            let _ = reader.read_message::<ControlFrame>().await;
+                            let _ = leaving.send(());
+                            return;
+                        }
+                    };
+                    let proof = signer
+                        .answer(&asked, &endpoint_text)
+                        .expect("the challenge is answered");
+                    if writer
+                        .write_message(&ControlFrame::VerifyProof(proof))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let mut link = Link {
+                        reader,
+                        writer,
+                        sequence: 0,
+                        session_id,
+                        connection_id,
+                        pending: None,
+                        reads: controller.then(|| session_read_of(&descriptor)),
+                    };
+                    if controller {
+                        // The daemon presents its generation and the worker accepts it, then the
+                        // daemon tells the worker what the local owner may do. None of that is a
+                        // call, so the link is the test's only when a call arrives on it.
+                        let Ok(ControlFrame::GenerationToken(token)) =
+                            link.reader.read_message::<ControlFrame>().await
+                        else {
+                            return;
+                        };
+                        if link
+                            .writer
+                            .write_message(&ControlFrame::GenerationAccepted(
+                                kr_protocol::worker::GenerationAccepted {
+                                    generation: token.generation,
+                                    fenced_previous: false,
+                                },
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if let Some(call) = link.try_next_call().await {
+                            link.pending = Some(call);
+                            let _ = handing.send(link);
+                        }
+                        return;
+                    }
+                    let _ = handing.send(link);
                 };
-                let proof = signer
-                    .answer(&asked, &endpoint_text)
-                    .expect("the challenge is answered");
-                if writer
-                    .write_message(&ControlFrame::VerifyProof(proof))
-                    .await
-                    .is_err()
-                {
-                    continue;
+                if controller {
+                    // A control daemon's connections each wait on the daemon, so none of them holds
+                    // the worker's listener.
+                    tokio::spawn(handshake);
+                } else {
+                    handshake.await;
                 }
-                let _ = handing.send(Link {
-                    reader,
-                    writer,
-                    sequence: 0,
-                    session_id,
-                    connection_id,
-                });
             }
         });
         Self {
@@ -361,6 +510,21 @@ impl ScriptedWorker {
             .await
             .expect("a view connected within the watchdog")
             .expect("the worker is still listening")
+    }
+
+    /// The next connection a view opened, or the end of the command that was to open it, whichever
+    /// comes first; `Reached::Call` is never the end given.
+    pub async fn reached_by(
+        &mut self,
+        asked: &mut tokio::task::JoinHandle<Result<serde_json::Value, serde_json::Value>>,
+    ) -> Result<Link, Reached> {
+        tokio::select! {
+            link = self.accepted.recv() => Ok(link.expect("the worker is still listening")),
+            answer = &mut *asked => {
+                Err(Reached::Answered(answer.expect("the command's thread finished")))
+            }
+            () = tokio::time::sleep(WATCHDOG) => Err(Reached::Silent),
+        }
     }
 
     /// Whether a view has connected since the last one the test took.
@@ -394,6 +558,11 @@ pub struct Link {
     session_id: SessionId,
     /// The identity the worker gave this connection when it answered the opening exchange.
     connection_id: ConnectionId,
+    /// The call that arrived on a control daemon's link before the link was handed over.
+    pending: Option<Call>,
+    /// What a control daemon's link is answered when it reads the session, which it does on every
+    /// link it opens, whether for the host's own read or to adopt the worker.
+    reads: Option<kr_protocol::session::SessionReadResult>,
 }
 
 /// How a call reached the worker: as a plain request, or as a mutation with an action identifier.
@@ -453,6 +622,38 @@ pub fn written(asked: &kr_protocol::input::InputWriteParams) -> &[u8] {
     }
 }
 
+/// The session as its worker answers the control daemon's read of it.
+fn session_read_of(descriptor: &WorkerDescriptor) -> kr_protocol::session::SessionReadResult {
+    kr_protocol::session::SessionReadResult {
+        session: kr_protocol::session::SessionSummary {
+            session_id: descriptor.session_id,
+            session_epoch: descriptor.session_epoch,
+            environment_id: descriptor.environment_id,
+            display_number: descriptor.display_number,
+            state: kr_protocol::session::SessionState::Live,
+            shell_mode: kr_protocol::session::ShellMode::Managed,
+            shell_path: "/bin/zsh".to_owned(),
+            cwd: "/tmp".to_owned(),
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: kr_protocol::identity::DesktopBinding::none(),
+            created_at_ms: TimestampMs::new(1),
+            dimensions: Dimensions::new(80, 24),
+            attachment_count: U64::ZERO,
+            application_state: Nullable::null(),
+            root_process: Nullable::null(),
+            closure: Nullable::null(),
+            environment_sources: None,
+            root: None,
+            application: None,
+        },
+        endpoint: Nullable::null(),
+        launch_profile: Nullable::null(),
+        last_command_block: Nullable::null(),
+        outstanding_launches: Nullable::null(),
+        metrics: None,
+    }
+}
+
 /// The call a frame carries: a read, a mutation, or a mutation the control daemon forwarded with
 /// the caller's envelope as it arrived. Any other frame is given back.
 fn call_of(frame: ControlFrame) -> Result<Call, ControlFrame> {
@@ -503,11 +704,73 @@ impl Link {
 
     /// The next call the view makes.
     pub async fn call(&mut self) -> Call {
-        let frame = tokio::time::timeout(WATCHDOG, self.reader.read_message::<ControlFrame>())
+        tokio::time::timeout(WATCHDOG, self.next_call())
             .await
             .expect("the view called within the watchdog")
-            .expect("the view's connection is open");
-        call_of(frame).unwrap_or_else(|other| panic!("the view sent {other:?} rather than a call"))
+    }
+
+    /// The next call, which a control daemon's link may already hold.
+    async fn next_call(&mut self) -> Call {
+        self.try_next_call()
+            .await
+            .expect("the view's connection is open")
+    }
+
+    /// The next call, or nothing when the connection ends first. A statement of what the local
+    /// owner may do and the packages admitted, which a control daemon makes to every worker it holds a
+    /// link to, are answered as a worker answers them and are not calls.
+    async fn try_next_call(&mut self) -> Option<Call> {
+        if let Some(call) = self.pending.take() {
+            return Some(call);
+        }
+        loop {
+            let frame = self.reader.read_message::<ControlFrame>().await.ok()?;
+            if let (ControlFrame::Request(request), Some(read)) = (&frame, &self.reads)
+                && request.method == Method::SessionRead.into()
+            {
+                let answer = ControlFrame::Response(Response {
+                    request_id: request.request_id,
+                    outcome: Outcome::Ok(
+                        ParamsValue::from_typed(read).expect("an answer the protocol encodes"),
+                    ),
+                });
+                self.writer.write_message(&answer).await.ok()?;
+                continue;
+            }
+            match call_of(frame) {
+                Ok(call) => return Some(call),
+                Err(ControlFrame::LocalAccess(access)) => {
+                    self.writer
+                        .write_message(&ControlFrame::LocalAccessAck(
+                            kr_protocol::worker::LocalAccessAck {
+                                sequence: access.sequence,
+                            },
+                        ))
+                        .await
+                        .ok()?;
+                }
+                // The control daemon hands a worker the packages it admits, every part in order, and
+                // reads one report part back for each. This worker holds no package, so it
+                // reports none.
+                Err(ControlFrame::PluginAdmissions(part)) => {
+                    self.writer
+                        .write_message(&ControlFrame::PluginAdmissionsAck(Box::new(
+                            kr_protocol::admission::PluginAdmissionsAck {
+                                session_id: self.session_id,
+                                frame: part.frame,
+                                report_seq: U64::new(1),
+                                part: part.part,
+                                parts: part.parts,
+                                bindings: Vec::new(),
+                                refusals: Vec::new(),
+                            },
+                        )))
+                        .await
+                        .ok()?;
+                }
+                Err(other) => panic!("the view sent {other:?} rather than a call"),
+            }
+        }
     }
 
     /// The next call, or the end of the command that was to make it, whichever comes first.
@@ -520,13 +783,7 @@ impl Link {
         asked: &mut tokio::task::JoinHandle<Result<serde_json::Value, serde_json::Value>>,
     ) -> Reached {
         tokio::select! {
-            frame = self.reader.read_message::<ControlFrame>() => {
-                let frame = frame.expect("the view's connection is open");
-                Reached::Call(
-                    call_of(frame)
-                        .unwrap_or_else(|other| panic!("the view sent {other:?} rather than a call")),
-                )
-            }
+            call = self.next_call() => Reached::Call(call),
             answer = &mut *asked => {
                 Reached::Answered(answer.expect("the command's thread finished"))
             }

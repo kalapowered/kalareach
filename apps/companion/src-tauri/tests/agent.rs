@@ -950,3 +950,295 @@ async fn a_live_sessions_receipt_is_read_on_its_worker_and_every_other_from_the_
         "neither read went to the live session's worker"
     );
 }
+
+// The draft route: a prompt that names a draft goes through the host's control daemon, which
+// passes the caller's envelope on to the session's worker.
+
+/// A supervisor that starts nothing: the session's worker is this test's own.
+#[derive(Debug)]
+struct StartsNothing;
+
+impl kr_controller::supervision::WorkerSupervisor for StartsNothing {
+    fn start(
+        &self,
+        _launch: &kr_controller::supervision::WorkerLaunch,
+    ) -> kr_controller::supervision::LaunchOutcome {
+        kr_controller::supervision::LaunchOutcome::NotStarted {
+            detail: "this test starts no workers".to_owned(),
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "a supervisor that starts nothing"
+    }
+}
+
+/// The host's control daemon, running in this process on a disposable tree, with the application
+/// connected to it as it is to the host on this computer. The session's worker is the test's: the
+/// daemon records it as it records every session it creates, and finds it when it starts.
+struct Draft {
+    worker: ScriptedWorker,
+    page: Page,
+    clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    _controller: std::sync::Arc<kr_controller::service::Controller>,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _tree: kr_ipc::testing::TempHost,
+}
+
+impl Drop for Draft {
+    fn drop(&mut self) {
+        self.clients.abort();
+    }
+}
+
+impl Draft {
+    async fn start() -> Self {
+        let tree = kr_ipc::testing::TempHost::create();
+        let environment = tree.environment();
+        let environment_id = tree.environment_id();
+        let worker = ScriptedWorker::start_for_daemon(environment.clone(), environment_id);
+        let secrets = environment.secrets_dir();
+        let build_id = companion_tauri::connection::build_id().expect("a build identity");
+        let controller =
+            kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
+                paths: environment.clone(),
+                environment_id,
+                identity: Box::new(move || {
+                    let store = kr_crypto::store::open_store_in(&secrets)
+                        .expect("a secret store for the test environment");
+                    Ok(kr_ipc::verify::ControllerIdentity::open(
+                        store.store.as_ref(),
+                        environment_id,
+                        false,
+                    )
+                    .expect("an identity"))
+                }),
+                secret_store: kr_crypto::store::StoreSelection::File,
+                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                supervisor: Box::new(StartsNothing),
+                worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+                build_id: build_id.clone(),
+                release: "0".to_owned(),
+                shell_packages: None,
+                terminal: Box::new(kr_controller::supervision::NoTerminal),
+            })
+            .await
+            .expect("the daemon starts");
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let listener =
+            kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the control endpoint");
+        let clients = tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(listener));
+        let page = Page::new(environment);
+        let transport = kr_client::ipc::IpcTransport::connect(&endpoint, build_id)
+            .await
+            .expect("connects to the control endpoint");
+        page.app.state::<companion_tauri::AppState>().connected(
+            companion_tauri::connection::Connection::over(transport).expect("a connection"),
+        );
+        Self {
+            worker,
+            page,
+            clients,
+            _controller: controller,
+            _tree: tree,
+        }
+    }
+}
+
+/// What a prompt that names a draft came to.
+#[derive(Debug)]
+enum Driven {
+    /// The worker was sent the probe that holds no lifetime and then the prompt itself, and the
+    /// page was given the command's answer.
+    Sent {
+        probe: scripted_worker::Call,
+        live: scripted_worker::Call,
+        settled: Result<Value, Value>,
+    },
+    /// The command ended, or nothing came, before both reached the worker.
+    Ended(Reached),
+}
+
+impl Draft {
+    /// Calls `command` as the page does with a draft and the `n`th call's own instance and binding
+    /// revision, and plays the worker: it says it holds no receipt for the probe, which is the one
+    /// answer that has the daemon record the draft and send the prompt, and answers the prompt.
+    async fn drives(&mut self, command: &'static str, n: u8) -> Driven {
+        let (instance, revision) = own(n);
+        let params = json!({
+            "target": target(&self.worker, instance, revision),
+            "draft_id": "55555555-5555-4555-8555-555555555555",
+            "text": null
+        });
+        let mut asked = self.page.call(command, json!({ "params": params }));
+        let mut link = match self.worker.reached_by(&mut asked).await {
+            Ok(link) => link,
+            Err(ended) => return Driven::Ended(ended),
+        };
+        let probe = link.call().await;
+        link.refuse_with(&probe, ErrorCode::PermissionDenied, "no receipt")
+            .await;
+        let live = match link.reached_by(&mut asked).await {
+            Reached::Call(call) => call,
+            ended => return Driven::Ended(ended),
+        };
+        link.answer(&live, &mutated()).await;
+        let settled = answered(asked).await;
+        Driven::Sent {
+            probe,
+            live,
+            settled,
+        }
+    }
+}
+
+/// KR-REQ-14.11: a prompt that names a draft is sent to the host's control daemon, which passes the
+/// caller's envelope on to the session's worker as it arrived, first as the probe that holds no
+/// lifetime and then as the prompt itself. Both envelopes name the application instance and the
+/// binding revision that the call's own parameters name, which are the call's own and no other
+/// the page, the daemon or the worker holds, and the page is given the worker's answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_submit_reaches_the_worker_in_envelopes_that_name_its_own_instance_and_revision() {
+    let mut draft = Draft::start().await;
+    let driven = draft.drives("agent_prompt_submit", 1).await;
+    assert!(
+        matches!(driven, Driven::Sent { .. }),
+        "agent_prompt_submit reached the worker twice: {driven:?}"
+    );
+    let Driven::Sent {
+        probe,
+        live,
+        settled,
+    } = driven
+    else {
+        unreachable!("asserted to be sent")
+    };
+    let (own_instance, own_revision) = own(1);
+    assert_eq!(
+        probe.deadline_boot_ms,
+        Some(0),
+        "the first call holds no lifetime"
+    );
+    assert!(
+        live.deadline_boot_ms.is_some_and(|deadline| deadline > 0),
+        "the prompt carries the deadline it was admitted under: {:?}",
+        live.deadline_boot_ms
+    );
+    for (which, call) in [("the probe", &probe), ("the prompt", &live)] {
+        assert_eq!(
+            call.method,
+            Method::AgentPromptSubmit.to_string(),
+            "{which}"
+        );
+        assert_eq!(call.kind, CallKind::Mutation, "{which}");
+        let envelope = call.target.clone().expect("a mutation's envelope");
+        assert_eq!(envelope.session_id.as_ref(), Some(&draft.worker.session_id));
+        assert_eq!(
+            envelope.session_epoch.as_ref(),
+            Some(&draft.worker.descriptor.session_epoch)
+        );
+        let sent: AgentPromptParams = call.params();
+        assert!(sent.draft_id.is_present(), "{which} names the draft");
+        assert_eq!(
+            envelope.application_instance_id.as_ref(),
+            Some(&sent.target.subject.application_instance_id),
+            "{which}'s envelope names the instance its parameters name"
+        );
+        assert_eq!(
+            envelope.agent_binding_revision.as_ref(),
+            Some(&sent.target.binding_revision),
+            "{which}'s envelope names the binding revision its parameters name"
+        );
+        assert_eq!(
+            sent.target.subject.application_instance_id, own_instance,
+            "{which}'s parameters carry the page's instance"
+        );
+        assert_eq!(
+            sent.target.binding_revision, own_revision,
+            "{which}'s parameters carry the page's binding revision"
+        );
+    }
+    assert_eq!(
+        probe.target, live.target,
+        "the probe and the prompt carry one envelope"
+    );
+    assert_eq!(probe.action_id, live.action_id);
+    let settled = settled.expect("the worker's answer");
+    assert_eq!(
+        settled["value"],
+        serde_json::to_value(mutated()).expect("JSON"),
+        "the page is given the worker's answer"
+    );
+}
+
+/// KR-REQ-14.11: a queued prompt that names a draft goes the same way as a submitted one, in the
+/// queue method's own envelopes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draft_queue_reaches_the_worker_in_envelopes_that_name_its_own_instance_and_revision() {
+    let mut draft = Draft::start().await;
+    let driven = draft.drives("agent_prompt_queue", 2).await;
+    assert!(
+        matches!(driven, Driven::Sent { .. }),
+        "agent_prompt_queue reached the worker twice: {driven:?}"
+    );
+    let Driven::Sent {
+        probe,
+        live,
+        settled,
+    } = driven
+    else {
+        unreachable!("asserted to be sent")
+    };
+    let (own_instance, own_revision) = own(2);
+    assert_eq!(
+        probe.deadline_boot_ms,
+        Some(0),
+        "the first call holds no lifetime"
+    );
+    assert!(
+        live.deadline_boot_ms.is_some_and(|deadline| deadline > 0),
+        "the prompt carries the deadline it was admitted under: {:?}",
+        live.deadline_boot_ms
+    );
+    for (which, call) in [("the probe", &probe), ("the prompt", &live)] {
+        assert_eq!(call.method, Method::AgentPromptQueue.to_string(), "{which}");
+        assert_eq!(call.kind, CallKind::Mutation, "{which}");
+        let envelope = call.target.clone().expect("a mutation's envelope");
+        assert_eq!(envelope.session_id.as_ref(), Some(&draft.worker.session_id));
+        assert_eq!(
+            envelope.session_epoch.as_ref(),
+            Some(&draft.worker.descriptor.session_epoch)
+        );
+        let sent: AgentPromptParams = call.params();
+        assert!(sent.draft_id.is_present(), "{which} names the draft");
+        assert_eq!(
+            envelope.application_instance_id.as_ref(),
+            Some(&sent.target.subject.application_instance_id),
+            "{which}'s envelope names the instance its parameters name"
+        );
+        assert_eq!(
+            envelope.agent_binding_revision.as_ref(),
+            Some(&sent.target.binding_revision),
+            "{which}'s envelope names the binding revision its parameters name"
+        );
+        assert_eq!(
+            sent.target.subject.application_instance_id, own_instance,
+            "{which}'s parameters carry the page's instance"
+        );
+        assert_eq!(
+            sent.target.binding_revision, own_revision,
+            "{which}'s parameters carry the page's binding revision"
+        );
+    }
+    assert_eq!(
+        probe.target, live.target,
+        "the probe and the prompt carry one envelope"
+    );
+    assert_eq!(probe.action_id, live.action_id);
+    let settled = settled.expect("the worker's answer");
+    assert_eq!(
+        settled["value"],
+        serde_json::to_value(mutated()).expect("JSON"),
+        "the page is given the worker's answer"
+    );
+}
