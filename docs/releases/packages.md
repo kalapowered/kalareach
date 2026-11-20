@@ -448,16 +448,14 @@ used for the first publish should be revoked.
 
 ### A version npm already has
 
-Since npm only allows a specific version to be published once, and a tag names a commit as well as a
-version, so that two releases can carry the same version, there is need to check whether the version
-is already published on npm or not before it goes to the stage for manual approval (in order to
-avoid going all the way there only to fail at the very last step of the job, i. e. on
-`npm publish`). That's why there is a job called `check`. It basically runs the command
+npm accepts a version only once, and a tag names a commit as well as a version, so two releases
+can carry the same version. The `check` job therefore asks npm whether it already has the version
+before the run reaches manual approval, so that nobody approves a publish that then fails at its
+last step, `npm publish`. It runs
 `npm view @kalareach/plugin-sdk@<version> dist.integrity` for the version in the archive and
-compares the returned value to the archive's own sha512 integrity. There are three scenarios
-possible:
+compares the returned value to the archive's own sha512 integrity. There are three outcomes:
 
-- The version doesn't exist on npm. In this case, the process continues as described above (awaiting
+- The version doesn't exist on npm. In this case, the process continues as described above (the run waits
   for manual approval in the `publish` job).
 - The version exists on npm with the same integrity. That archive is already published, so the whole
   run is terminated with a notice and the `publish` job is skipped. Nobody is asked to approve
@@ -494,7 +492,7 @@ line tool: `gh workflow run package-npm.yml --ref <tag>`.
 Whether re-running the existing run or starting a new run, the action will run the version of the
 workflow as it was at the tagged commit. This means if a problem occurred because the workflow was
 incorrect, then a new tag is needed to fix it. If, however, the problem was with the package's
-settings on npm (e.g. the trusted publisher field has a typo), then simply fix the problem and run
+settings on npm (e.g. the trusted publisher field has a typo), then fix the problem and run
 the action again.
 
 ## How a consumer pins a release
