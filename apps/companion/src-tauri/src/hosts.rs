@@ -40,26 +40,37 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
     let device = state.device()?;
     let (first, reached) = tokio::sync::oneshot::channel();
     // One step: the host chosen before is let go, this choice is kept, and the task that keeps its
-    // connection starts, so no task of an earlier choice can put its connection back.
+    // connection starts, so no task of an earlier choice can put its connection back. The step
+    // takes the choice gate and writes the use file, so it runs on a thread of its own and holds
+    // no thread of the runtime that the other commands' tasks run on.
     let handle = app.clone();
-    state.choose_host(
-        "this application is reaching the host you chose",
-        move || {
-            // The host was found before the gate was taken, and it can have been forgotten since,
-            // or paired again, which gives this device another identity with it: a record that
-            // is not the one this choice names is not one to connect to.
-            if device.paired_as(host.host_device_id)? != Some(host.device_id) {
-                return Err(unknown_host());
-            }
-            device.use_host(host.host_device_id)?;
-            Ok(Started {
-                target: target_of(&host),
-                spawn: Box::new(move |choice| {
-                    tauri::async_runtime::spawn(keep(handle, host, choice, Some(first)))
-                }),
+    tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .state::<AppState>()
+            .choose_host("this application is reaching the host you chose", {
+                let handle = handle.clone();
+                move || {
+                    // The host was found before the gate was taken, and it can have been
+                    // forgotten since, or paired again, which gives this device another identity
+                    // with it: a record that is not the one this choice names is not one to
+                    // connect to.
+                    if device.paired_as(host.host_device_id)? != Some(host.device_id) {
+                        return Err(unknown_host());
+                    }
+                    device.use_host(host.host_device_id)?;
+                    Ok(Started {
+                        target: target_of(&host),
+                        spawn: Box::new(move |choice| {
+                            tauri::async_runtime::spawn(keep(handle, host, choice, Some(first)))
+                        }),
+                    })
+                }
             })
-        },
-    )?;
+    })
+    .await
+    .map_err(|error| {
+        CommandError::local_failure(format!("the host choice did not finish: {error}"))
+    })??;
     let _ = tokio::time::timeout(FIRST_ATTEMPT_WITHIN, reached).await;
     Ok(state.connection_state())
 }
