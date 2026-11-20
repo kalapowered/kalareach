@@ -69,17 +69,6 @@ export function controlStateOf(facts: ControlFacts): ControlState {
   }
 }
 
-/** An empty state: nothing known, which hides everything conditional. */
-export function emptyControlState(): ControlState {
-  return {
-    capabilities: new Map(),
-    rights: null,
-    bindingState: null,
-    presentNodes: new Set(),
-    flags: new Map()
-  }
-}
-
 /** The predicate grammar, as the package contract types it. */
 export type Predicate =
   | { readonly op: 'always' }

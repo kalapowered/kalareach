@@ -42,7 +42,7 @@ import {
   unresolved,
   wasRefused
 } from '../src/model/receipts'
-import { emptyControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
+import { type ControlState, evaluate, isRendered, visibilityOf } from '../src/model/controls'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../src/terminal/cells'
 import { copiedText, drawableText, placedCursor, placedPieces, REPLACEMENT } from '../src/terminal/frame'
 import {
@@ -401,6 +401,17 @@ describe('drafts', () => {
     expect(adoptFirstTarget(empty, first)).toBe(empty)
   })
 })
+
+/** An empty state: nothing known, which hides everything conditional. */
+function emptyControlState(): ControlState {
+  return {
+    capabilities: new Map(),
+    rights: null,
+    bindingState: null,
+    presentNodes: new Set(),
+    flags: new Map()
+  }
+}
 
 describe('declarative controls', () => {
   it('answers three values, so an unknown fact is not a false one', () => {
