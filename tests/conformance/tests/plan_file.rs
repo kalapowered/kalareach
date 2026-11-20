@@ -493,6 +493,58 @@ fn a_group_the_plan_does_not_have_is_refused_with_exit_2() {
     );
 }
 
+/// A plan option with no path is a usage error with exit status 2 and its own reason, before the
+/// map is built or anything runs: the program does not take the repository's own plan instead.
+#[test]
+fn a_plan_option_without_a_path_is_a_usage_error_for_map_and_run() {
+    let repository = tempfile::tempdir().expect("a directory");
+    let evidence = tempfile::tempdir().expect("a directory");
+    std::fs::create_dir(repository.path().join("conformance")).expect("a directory");
+    let default_plan = with(
+        "[[step]]\nid = 'version'\ngroup = 'rust'\nwhat = 'the version'\n\
+         platforms = ['linux', 'macos', 'windows']\nreading = 'build'\ncommand = ['cargo', '--version']\n",
+    );
+    std::fs::write(
+        repository.path().join("conformance/plan.toml"),
+        default_plan,
+    )
+    .expect("the repository's own plan");
+    let root = repository.path().to_string_lossy().into_owned();
+    let evidence_path = evidence.path().to_string_lossy().into_owned();
+    for arguments in [
+        vec!["map", "--root", root.as_str(), "--plan"],
+        vec![
+            "run",
+            "--root",
+            root.as_str(),
+            "--group",
+            "rust",
+            "--evidence",
+            evidence_path.as_str(),
+            "--plan",
+        ],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_kr-conformance"))
+            .args(&arguments)
+            .output()
+            .expect("the program runs");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.starts_with("kr-conformance: --plan takes the path of a plan file\n"),
+            "{arguments:?}: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{arguments:?}: something ran");
+        assert_eq!(
+            std::fs::read_dir(evidence.path())
+                .expect("the evidence")
+                .count(),
+            0,
+            "{arguments:?}: something was written"
+        );
+    }
+}
+
 /// No constant or static of the plan or the report holds a step, a table row or a reason, and the
 /// code names none of the groups that carry behaviour: the plan file is the one place for both.
 #[test]

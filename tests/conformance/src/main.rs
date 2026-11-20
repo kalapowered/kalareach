@@ -57,7 +57,10 @@ fn main() -> ExitCode {
             "--root" => root = rest.next().map(PathBuf::from),
             "--evidence" => evidence_directory = rest.next().map(PathBuf::from),
             "--applications" => applications = rest.next().map(PathBuf::from),
-            "--plan" => plan_path = rest.next().map(PathBuf::from),
+            "--plan" => match rest.next() {
+                Some(path) => plan_path = Some(PathBuf::from(path)),
+                None => return usage("--plan takes the path of a plan file"),
+            },
             "--group" => match rest.next() {
                 Some(group) => groups.push(group.clone()),
                 None => return usage("--group takes the name of a group of the plan"),
