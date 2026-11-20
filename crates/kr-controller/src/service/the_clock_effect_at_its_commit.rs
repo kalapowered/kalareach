@@ -601,12 +601,19 @@ fn a_deadline_that_passes_after_the_guard_asked_stops_the_establishment_at_the_c
     finish(rig);
 }
 
-/// KR-REQ-09.19: the establishment of the clock holds the device directory while it asks for the
-/// hold on commits at its commit; a raise of a feed refusal holds that hold, for writing, while it
-/// asks for the policy's lock; and a policy commit holds the policy's lock while it asks for the
-/// device directory. Forced into that order, the three finish: the raise lets go of the hold where
-/// the policy's lock is held, so the establishment commits, the policy commit is made, and the
-/// raise takes the lock last. A watchdog ends the process where they wait for each other.
+/// KR-REQ-09.19: a raise of a feed refusal that finds the policy's lock held does not hold up an
+/// establishment of the clock at its commit. The raise takes the hold on commits, for writing,
+/// before it asks for the policy's lock, and the establishment takes that hold, for reading,
+/// before the clock's state and the directory's connection, so it waits for the raise wherever
+/// the raise waits. The establishment is stopped where its effect is handed to its commit's guard,
+/// holding the challenges and neither the hold nor the directory. A policy commit takes the
+/// policy's lock and stops there, and the raise takes the registry's guard and the hold and stops.
+/// The establishment then asks for the hold, which the raise holds, and the raise finds the
+/// policy's lock held: it lets go of the hold and waits for the lock holding nothing, so the
+/// establishment commits while the policy commit still holds the lock. Only then is the policy
+/// commit let go: it is made, and the raise takes the lock last. A raise that waited for the lock
+/// with the hold taken would keep the establishment from its commit for as long as the policy's
+/// lock is held. A watchdog ends the process where they wait for each other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_refusal_that_finds_the_policy_held_does_not_hold_up_an_establishment_at_its_commit()
 {
@@ -632,8 +639,8 @@ async fn a_feed_refusal_that_finds_the_policy_held_does_not_hold_up_an_establish
     door.answer(&challenge.request).await.expect("answered");
 
     // The establishment stops where its effect has been handed to its commit's guard, before the
-    // guard takes the registration's hold.
-    let (connected, let_the_establishment_go) = controller
+    // guard takes the registration's hold: it holds neither the hold nor the directory.
+    let (at_the_guard, let_the_establishment_go) = controller
         .owner_authority()
         .pauses
         .before_the_registration_hold
@@ -642,9 +649,9 @@ async fn a_feed_refusal_that_finds_the_policy_held_does_not_hold_up_an_establish
         let door = door.clone();
         async move { door.establish().await }
     });
-    connected
+    at_the_guard
         .await
-        .expect("the establishment holds the directory");
+        .expect("the establishment reached its commit's guard");
 
     // The policy commit takes the policy's lock and stops there, before it goes on to the
     // directory.
@@ -692,22 +699,28 @@ async fn a_feed_refusal_that_finds_the_policy_held_does_not_hold_up_an_establish
         .expect("the wait for the raise ends")
         .expect("the raise holds the hold on commits");
 
-    // The establishment asks for the hold, which the raise holds; the commit asks for the
-    // directory, which the establishment holds; and the raise asks for the policy's lock.
+    // The establishment asks for the hold, which the raise holds, and the raise asks for the
+    // policy's lock, which the commit holds. The commit is kept there: the establishment commits
+    // only if the raise lets go of the hold to wait for the lock.
     let_the_establishment_go
         .send(())
         .expect("the establishment goes on");
-    let_the_commit_go.send(()).expect("the commit goes on");
     let_the_raise_go.send(()).expect("the raise goes on");
-
     tokio::time::timeout(BOUND, establishing)
         .await
-        .expect("the establishment commits while the raise asks for the policy's lock")
+        .expect("the establishment commits while the raise waits for the policy's lock")
         .expect("the establishment ends")
         .expect("the owner establishes the clock");
+    assert!(
+        !raising.is_finished(),
+        "the raise still waits for the policy's lock, which the policy commit holds"
+    );
+
+    // The policy commit goes on: it is made, and the raise takes the lock last.
+    let_the_commit_go.send(()).expect("the commit goes on");
     tokio::time::timeout(BOUND, committing)
         .await
-        .expect("the commit is made once the establishment has left the directory")
+        .expect("the commit is made once the establishment has committed")
         .expect("the commit ends")
         .expect("the policy is written");
     tokio::time::timeout(BOUND, raising)
