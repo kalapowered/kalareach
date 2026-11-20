@@ -187,28 +187,30 @@ them.
 
 ### What the plan names to read
 
-The plan says where the report looks. The report takes no default from this repository: `[rust] manifests` and `[ignored_runs] held` are required, and any other key that is absent names nothing.
+The plan says where the report looks. The report takes no default from this repository: `[rust] manifests` and `[ignored_runs] held` are required, and each of the five optional keys below names nothing when it is absent.
 
-`[rust] manifests` lists the manifest of each Rust workspace, relative to the repository. An empty list turns Rust discovery off. Each entry is a workspace's own manifest: the manifest of one of its members is a problem of the map that names the workspace's, and a manifest named twice is refused when the plan loads. The report runs one `cargo metadata` for each manifest and reads the lock from the workspace root that Cargo reports. An absent lock is a problem of the map. So is a package name that two workspaces hold, which names both manifests, because a target is named by its package, its kind and its name. `[ignored_runs] held` is `true` for a tree held to its `[[ignored_run]]` entries and `false` for one that is not.
+`[rust] manifests` lists the manifest of each Rust workspace, relative to the repository. An empty list turns Rust discovery off. Each entry is a workspace's own manifest: the manifest of one of its members is a problem of the map that names the workspace's, and a manifest named twice, with or without a `.` in its path, is refused when the plan loads. The report runs one `cargo metadata` for each manifest and reads the lock from the workspace root that Cargo reports. An absent lock is a problem of the map. So is a package name that two workspaces hold, which names both manifests, because a target is named by its package, its kind and its name. `[ignored_runs] held` is `true` for a tree held to its `[[ignored_run]]` entries and `false` for one that is not.
 
-Five keys are optional, and each names nothing when it is absent:
+These five keys are optional, and each names nothing when it is absent:
 
 - `scripts` lists the directories whose files are read for the rows they name.
 - `lane_directories` lists the directories whose Kotlin, Swift and Java files are read for the lanes.
 - `[typescript] compiler_from` lists the directories whose own `node_modules` holds the compiler.
 - `[typescript] skip_directories` lists the names of directories that no TypeScript file is read below, at any depth. An entry is one name, with no `/` or `\`.
-- `[terminal_profile] path` names the file that holds the terminal profile the result records. A plan without it leaves the profile out of the result, and a field that the file lacks, or a file that is not JSON, gives `unknown`.
+- `[terminal_profile] path` names the file that holds the terminal profile the result records. The table is optional and `path` is required when it is present. A plan without the table leaves the profile out of the result, and a field that the file lacks, or a file that is not JSON, gives `unknown`.
 
 `scripts` and `lane_directories` sit at the top of the plan, so a repository with lanes and no TypeScript can name them. `[typescript] packages` is required when that table is present, and an empty list turns TypeScript discovery off. The scripts, the lanes and the case tables still supply their entries when `manifests` and `packages` are empty.
 
-The loader refuses a path in any of these keys, and a script that a step runs, when it:
+The loader refuses a path in each of six keys (`[rust] manifests`, `scripts`, `lane_directories`, `[typescript] packages`, `[typescript] compiler_from` and `[terminal_profile] path`), and a script that a step runs, when it:
 
-- is absolute, or holds `..` or `\`;
+- is empty, is absolute, or holds `..` or `\`;
 - holds a pattern character (`*`, `?`, `[` or `]`), which is refused on every platform before any file is looked for;
 - is absent, or is the other kind of place: a manifest, a script and the profile are regular files, and every other key names a directory;
 - is a link, or reaches a place outside the repository through a link.
 
-The files that the map names are relative to the tested root, with one exception: Cargo names a Rust source by its absolute path, and the map shows it relative only when `--root` is an absolute path with no `.` or `..` part. The suffixes of the files read stay constants of the program, because they are the suffixes its parsers read. Two sets of directory names are constants too, because build tools write their output there: no walk enters `node_modules` or `target`, and the walk of the lanes also leaves out `build`, `.gradle`, `Pods`, `DerivedData` and `gen`, whatever the plan says.
+The paths of `[applications] lock`, of the `file` of an `[[ignored_run]]` entry and of the `package` of a Vitest step, and the patterns in the `files` of `[[case_table]]` and `[[lane]]`, are older keys that this check does not reach.
+
+The files that the map names are relative to the tested root, with one exception: Cargo names a Rust source by its absolute path, and the map shows it relative only when `--root` is an absolute path with no `.` or `..` part. The suffixes of the files read stay constants of the program, because they are the suffixes its parsers read. Two sets of directory names are constants too, because build tools write their output there: a walk never enters a child directory named `node_modules` or `target` (a directory that the plan names itself, such as `scripts = ['target']`, is still read), and the walk of the lanes also leaves out `build`, `.gradle`, `Pods`, `DerivedData` and `gen`, whatever the plan says.
 
 A group that no step uses is refused. The identifier grammar is compiled into the program and holds three bounds only (30 sections, 35 acceptance rows, 10 performance rows), so a tool release does not prove which revision of the specification a repository cites.
 
@@ -405,16 +407,16 @@ The report reads TypeScript with a compiler that the tested tree has installed, 
 line names (`tests/conformance/typescript-facts.mjs`, which the program embeds), so a comment marker
 inside a string, a template or JSX text is never taken for a comment. The compiler is the package
 `node_modules/typescript` of the first directory in the plan's `[typescript] compiler_from` that
-holds one, loaded by its own path: no parent directory and no `NODE_PATH` is searched.
+holds one, loaded by its own path: no parent directory and no `NODE_PATH` is searched. A package that does not load is an error that the map reports, and the next directory's compiler does not take its place.
 `--typescript-compiler <directory>`, which `map` and `run` take, names a directory instead and
 replaces `compiler_from`. A tree with neither has no compiler: the map says so and names the install
 command. The result records the compiler's version in `run.toolchain.typescript` and leaves the field
 out when the run read no TypeScript.
 
-A call is a test when its callee is `it`, `test`, `describe` or `suite` (with modifiers such as
-`.skip`, `.only` and `.each(table)`) and its first argument is a string or a template, or an arrow
+A call is a test when its callee starts with `it`, `test`, `describe` or `suite` (with modifiers such as
+`.skip`, `.only` and `.each(table)`; a call of `controls.describe` is not one) and its first argument is a string or a template, or an arrow
 function or a function expression follows its first argument. A function passed by its name does
-not count. A `test.skip(condition, reason)`, a `test.step`, a `test.use`, a `test.extend` and the
+not make a call a test: `it('title', callback)` is one because of its title, and `test.skip(condition, callback)` is not one. A `test.skip(condition, reason)`, a `test.step`, a `test.use`, a `test.extend` and the
 four hooks (`beforeAll`, `beforeEach`, `afterAll` and `afterEach`), with a title or without one, are
 not tests.
 

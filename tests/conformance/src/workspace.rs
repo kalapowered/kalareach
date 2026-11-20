@@ -93,8 +93,8 @@ pub struct Package {
     /// The names its dependencies are known by in its source: a rename where the manifest gives
     /// one, the package's name otherwise.
     pub dependency_names: BTreeSet<String>,
-    /// The directory of its workspace's manifest, relative to the tested root as the plan names
-    /// it: `.` for the root.
+    /// The directory of its workspace's root, relative to the tested root, as Cargo's path for it
+    /// resolves: `.` for the root.
     pub workspace: String,
     /// The names of the workspace's members.
     pub workspace_members: Vec<String>,
