@@ -50,6 +50,8 @@ mod history_gate;
 mod inventory;
 #[path = "retained_surface/inventory_cases.rs"]
 mod inventory_cases;
+#[path = "retained_surface/mechanisms.rs"]
+mod mechanisms;
 #[path = "retained_surface/narrower.rs"]
 mod narrower;
 #[path = "retained_surface/narrower_cases.rs"]
