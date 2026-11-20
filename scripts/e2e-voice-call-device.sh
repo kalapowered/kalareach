@@ -151,6 +151,8 @@ fi
 
 # shellcheck source=scripts/lib/artifacts-dir.sh
 . "$here/scripts/lib/artifacts-dir.sh"
+# shellcheck source=scripts/lib/host-program.sh
+. "$here/scripts/lib/host-program.sh"
 kr_artifacts_dir
 artefacts_base="$kr_artifacts/voice-call-device-$platform-$mode${KR_RUN_TAG:+-$KR_RUN_TAG}"
 app_id=to.kala.reach
@@ -290,6 +292,7 @@ print(found)
 PY
 )"
     [ -n "$harness_exe" ] && [ -x "$harness_exe" ] || { say "the harness left no executable"; return 2; }
+    harness_exe="$(host_install "$harness_exe" voice_device)" || { say "the harness could not be installed"; return 2; }
 }
 
 # Starts the host and the stand-in for a phone that reaches this machine as `peer`, and waits
@@ -310,7 +313,7 @@ start_harness() { # <peer>
         KR_HARNESS_AUDIO_PORT="$audio_port" KR_HARNESS_AUDIO_TOKEN="$audio_token" \
         KR_HARNESS_SESSIONS="$sessions" KR_HARNESS_LEG="$harness_leg" \
         KR_HARNESS_PLATFORM="$platform" KR_TEST_ARTIFACTS_DIR="$artefacts" \
-        "$harness_exe" --ignored --exact a_phone_is_paired_and_runs_a_call_against_a_real_host --nocapture \
+        host_start "$harness_exe" --ignored --exact a_phone_is_paired_and_runs_a_call_against_a_real_host --nocapture \
         >"$artefacts/harness.log" 2>&1 &
     harness_pid=$!
     local waited=0
