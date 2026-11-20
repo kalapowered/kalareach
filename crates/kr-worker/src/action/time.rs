@@ -809,6 +809,14 @@ pub struct TimeContract {
     /// nothing is taken beneath it.
     readings: Mutex<Readings>,
     state: Mutex<TimeState>,
+    /// Where this host's own tests stop the look at the floor's pathname, which is where a storage
+    /// call that does not return stops it. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    floor_look_stall: crate::testing::Stall,
+    /// How many looks at the floor's pathname go by before the stop above is entered, once it is
+    /// armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    floor_looks_to_pass: std::sync::atomic::AtomicUsize,
 }
 
 /// Returns the uncertainty a reading claims, in microseconds, or nought when it claims none.
@@ -947,6 +955,10 @@ impl TimeContract {
                 high_water,
                 tombstones,
             }),
+            #[cfg(feature = "testing")]
+            floor_look_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            floor_looks_to_pass: std::sync::atomic::AtomicUsize::new(0),
         };
         // The complete sample is taken at construction, so the first observation compares against
         // something rather than treating an unremembered clock as proof that nothing moved, and a
@@ -1415,6 +1427,8 @@ impl TimeContract {
             self.proven_wall_ms(&state)
         };
         let loaded = floor.raise(proven);
+        #[cfg(feature = "testing")]
+        self.stand_in_floor_look();
         if !floor.named() {
             return UtcDeadline::FloorLost;
         }
@@ -1426,6 +1440,45 @@ impl TimeContract {
         }
         floor.owe(loaded);
         UtcDeadline::Unrecorded
+    }
+
+    /// Stops the next look at the floor's pathname, for this host's own tests, as a call that
+    /// blocks its thread: what a storage call that does not return does to the thread that made it.
+    ///
+    /// `let_pass` looks go by first, so a test can let the looks made before the one it is about
+    /// stand where they are made. The count covers every caller of
+    /// [`Self::check_utc_deadline`], so a test that also has a local gate looking at a deadline
+    /// counts that gate's looks too. Returns the end that says the look has arrived and the end
+    /// that lets it go. The stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn arm_floor_look_stall(
+        &self,
+        let_pass: usize,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.floor_looks_to_pass
+            .store(let_pass, std::sync::atomic::Ordering::SeqCst);
+        self.floor_look_stall.arm_blocking()
+    }
+
+    /// Stands where the floor's pathname is looked at, once the stop is armed and its looks to let
+    /// pass have gone by.
+    #[cfg(feature = "testing")]
+    fn stand_in_floor_look(&self) {
+        if !self.floor_look_stall.is_armed() {
+            return;
+        }
+        let passes = self.floor_looks_to_pass.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |left| left.checked_sub(1),
+        );
+        if passes.is_err() {
+            self.floor_look_stall.stand();
+        }
     }
 
     /// Decides whether an object is still valid.

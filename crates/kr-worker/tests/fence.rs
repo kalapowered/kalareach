@@ -389,12 +389,8 @@ fn reference() -> ReferenceShell {
     ReferenceShell::new(ShellKind::Zsh, "/bin/cat", "5.9", "zle-5.9")
 }
 
-/// Attaches a terminal over `client` and gives it the keys.
-///
-/// The connection has to own the attachment that holds the lease: a launch is attributed to the
-/// client that asked for it, so one that does not hold the keys on this connection cannot put a
-/// command in the editor under somebody else's name.
-async fn holder_over(client: &mut LocalClient, wired: &Wired) -> AttachmentId {
+/// Attaches a terminal over `client`, without the keys.
+async fn attached_over(client: &mut LocalClient, wired: &Wired) -> AttachmentId {
     let attached: kr_protocol::attachment::SessionAttachResult = client
         .mutate(
             Method::SessionAttach,
@@ -407,7 +403,16 @@ async fn holder_over(client: &mut LocalClient, wired: &Wired) -> AttachmentId {
         .expect("attaches")
         .to_typed()
         .expect("decodes");
-    let attachment_id = attached.attachment.attachment_id;
+    attached.attachment.attachment_id
+}
+
+/// Attaches a terminal over `client` and gives it the keys.
+///
+/// The connection has to own the attachment that holds the lease: a launch is attributed to the
+/// client that asked for it, so one that does not hold the keys on this connection cannot put a
+/// command in the editor under somebody else's name.
+async fn holder_over(client: &mut LocalClient, wired: &Wired) -> AttachmentId {
+    let attachment_id = attached_over(client, wired).await;
     client
         .mutate(
             Method::InputAcquire,
@@ -10435,5 +10440,328 @@ async fn a_session_that_refused_a_request_goes_on_serving() {
     detach(&mut client, &wired, Nullable::null(), Nullable::null())
         .await
         .expect_err("the connection answers again, and refuses again");
+    wired.close().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-08.62, KR-REQ-07.77, KR-REQ-07.79, KR-REQ-07.83: a look at the clock floor's name that
+// does not return holds nothing but the writer that made it.
+// --------------------------------------------------------------------------------------------
+
+/// The bytes of the first holder that the cases below leave unwritten behind a stopped look, and
+/// that a change of the lease then counts.
+const LEFT_BEHIND: &[u8] = b"left-behind";
+
+/// A session whose writer decides a UTC deadline against a clock floor of this process's own.
+///
+/// Such a floor has no pathname to look at, so the look at its name answers at once until a case
+/// stops it.
+async fn wired_with_a_floor() -> Wired {
+    wired_built(
+        ShellMode::Managed,
+        true,
+        Bridging::on_a_clock_of_its_own(),
+        |config| {
+            config.time = kr_worker::action::time::TimeSources::system()
+                .with_floor(Arc::new(kr_ipc::floor::SharedFloor::in_process(0)));
+        },
+    )
+    .await
+}
+
+/// Stands the terminal's writer in the look at the floor's name, behind a batch of `holder`'s
+/// bytes, and returns the end that lets it go. Dropping that end lets the writer go too, so a case
+/// that fails ends with the writer free.
+///
+/// The batch carries a UTC end an hour away, so every look answers that the deadline has not
+/// passed. The writer makes one look before it offers the batch to the terminal and one for each
+/// piece it offers: the first is let by, and the stop is where the piece's look is made.
+async fn stand_the_writer_in_a_look(
+    wired: &Wired,
+    holder: AttachmentId,
+    bytes: &[u8],
+) -> std::sync::mpsc::Sender<()> {
+    let time = Arc::clone(wired.runtime.session().time());
+    let (arrived, release) = time.arm_floor_look_stall(1);
+    {
+        let mut session = wired.runtime.session();
+        let epoch = session.lease().epoch.get();
+        session
+            .write_input_until(
+                holder,
+                epoch,
+                0,
+                bytes,
+                kr_worker::session::InputAuthority {
+                    boot_ms: None,
+                    utc_ms: Some(kr_ipc::now_ms().get() + 3_600_000),
+                },
+                std::time::Instant::now(),
+            )
+            .expect("accepted");
+    }
+    wired.runtime.flush_input();
+    tokio::time::timeout(SOON, arrived)
+        .await
+        .expect("the writer reached the look at the floor's name")
+        .expect("the look was armed");
+    release
+}
+
+/// Has `client` ask for the keys for `attachment_id` from a task of its own, and returns the end
+/// the answer arrives on.
+///
+/// A case waits on that end with a bound of the standard library's own: a wait on the runtime's
+/// clock could stand behind the very stop the case is about.
+fn acquiring(
+    mut client: LocalClient,
+    wired: &Wired,
+    attachment_id: AttachmentId,
+) -> std::sync::mpsc::Receiver<kr_protocol::input::InputAcquireResult> {
+    let (answer, answered) = std::sync::mpsc::channel();
+    let target = wired.target();
+    let session_id = wired.session_id;
+    tokio::spawn(async move {
+        let taken = client
+            .mutate(
+                Method::InputAcquire,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &kr_protocol::input::InputAcquireParams {
+                    session_id,
+                    attachment_id,
+                    expected_epoch: Nullable::null(),
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("takes the keys");
+        let _ = answer.send(taken.to_typed().expect("decodes"));
+    });
+    answered
+}
+
+/// Has `client` let the keys go from a task of its own, and returns the end the answer arrives on,
+/// as [`acquiring`] does.
+fn releasing(
+    mut client: LocalClient,
+    wired: &Wired,
+    attachment_id: AttachmentId,
+    epoch: InputLeaseEpoch,
+) -> std::sync::mpsc::Receiver<kr_protocol::input::InputLeaseResult> {
+    let (answer, answered) = std::sync::mpsc::channel();
+    let target = wired.target();
+    let session_id = wired.session_id;
+    tokio::spawn(async move {
+        let released = client
+            .mutate(
+                Method::InputRelease,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &kr_protocol::input::InputReleaseParams {
+                    session_id,
+                    attachment_id,
+                    epoch,
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("releases the keys");
+        let _ = answer.send(released.to_typed().expect("decodes"));
+    });
+    answered
+}
+
+/// KR-REQ-08.62: `input.acquire` returns the new epoch, and the exact count of what the lease it
+/// ended left unwritten, while the terminal's writer stands in a look at the floor's name that does
+/// not return.
+///
+/// The writer stands in the look it makes for the first holder's piece, with that holder's bytes
+/// still unwritten. A takeover stores the new fence and takes the count on the boundary the writer
+/// also takes, so the writer's look must not be made while it holds that boundary. And the count
+/// stays true of what the application receives: once the look returns the writer finds the
+/// piece's lease ended, and none of those bytes reaches the terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_returns_its_epoch_while_the_writer_stands_in_a_look_at_the_floors_name() {
+    let wired = wired_with_a_floor().await;
+    let mut first = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut second = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut first, &wired).await;
+    let challenger = attached_over(&mut second, &wired).await;
+    let epoch = wired.runtime.session().lease().epoch.get();
+    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
+
+    let answered = acquiring(second, &wired, challenger);
+    let taken = answered.recv_timeout(SOON);
+    assert!(
+        taken.is_ok(),
+        "the takeover was not answered while the writer stood in the look at the floor's name"
+    );
+    let taken = taken.expect("answered");
+    assert_eq!(
+        taken.lease.epoch.get(),
+        epoch + 1,
+        "the takeover returns the epoch that follows the one it ended"
+    );
+    assert_eq!(taken.lease.holder.0, Some(challenger));
+    assert_eq!(
+        taken.discarded_bytes.get(),
+        LEFT_BEHIND.len() as u64,
+        "the takeover counts what the first holder's lease left unwritten"
+    );
+
+    // The look returns. The writer is serial, so the first holder's batch is settled once nothing
+    // is owed for it, and what it settled to is what the application was handed.
+    drop(release);
+    let settled = std::time::Instant::now() + SOON;
+    while queued.load(std::sync::atomic::Ordering::Acquire) != 0
+        && std::time::Instant::now() < settled
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        queued.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the writer settled the first holder's batch"
+    );
+    let handed: Vec<u8> = wired
+        .runtime
+        .input()
+        .terminal_writes()
+        .into_iter()
+        .filter(|write| write.of_a_lease)
+        .flat_map(|write| write.bytes)
+        .collect();
+    assert!(
+        !contains(&handed, LEFT_BEHIND),
+        "bytes the takeover counted as discarded reached the application: {handed:?}"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-07.77, KR-REQ-07.79, KR-REQ-07.83: a release of the keys completes while the terminal's
+/// writer stands in a look at the floor's name that does not return.
+///
+/// A release is one of the changes of the lease that wait for the writer's boundary, and it holds
+/// the session and the input domain while it waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_of_the_keys_completes_while_the_writer_stands_in_a_look_at_the_floors_name() {
+    let wired = wired_with_a_floor().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let epoch = wired.runtime.session().lease().epoch;
+    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
+
+    let answered = releasing(client, &wired, holder, epoch);
+    let released = answered.recv_timeout(SOON);
+    assert!(
+        released.is_ok(),
+        "the release was not answered while the writer stood in the look at the floor's name"
+    );
+    let lease = released.expect("answered").lease;
+    assert_eq!(
+        lease.holder.0, None,
+        "the release leaves the keys with no holder"
+    );
+    assert_eq!(
+        lease.epoch.get(),
+        epoch.get() + 1,
+        "the release ends the lease it was made for"
+    );
+    drop(release);
+    wired.close().await;
+}
+
+/// KR-REQ-07.77, KR-REQ-07.79, KR-REQ-07.83: the timer of the fence's hold fires while a change of
+/// the lease is waiting on the terminal's writer, and the writer stands in a look at the floor's
+/// name that does not return.
+///
+/// A reader enters, and a second attachment takes the keys, so the machine starts an exchange for
+/// it with the 250 ms hold. The case moves the machine's clock and wakes its timer without the
+/// session or the input domain, which the takeover holds while it waits for the writer, and then
+/// waits for the editor-busy event the timer sends the holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hold_timer_fires_while_the_writer_stands_in_a_look_at_the_floors_name() {
+    let mut wired = wired_with_a_floor().await;
+    let holder = wired.holder();
+    let challenger = AttachmentId::new(kr_ipc::new_uuid());
+    let params = terminal(wired.session_id);
+    let mut events = {
+        let mut session = wired.runtime.session();
+        session
+            .attach(&params, params.requested.clone(), challenger)
+            .expect("attaches");
+        session.subscribe(challenger).expect("subscribes")
+    };
+    // Taken before anything holds the session: the clock and the timer's waker are moved without
+    // it, which `Wired::pass` does not.
+    let waker = wired.runtime.session().fence().expect("a driver").waker();
+    let epoch = wired.runtime.session().lease().epoch.get();
+    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
+
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Fence(_) => break,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    }
+
+    // The takeover is made on a thread of its own, which says that it holds the session before it
+    // asks for the keys.
+    let runtime = Arc::clone(&wired.runtime);
+    let (owning, owned) = std::sync::mpsc::channel();
+    let (done, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut session = runtime.session();
+        let _ = owning.send(());
+        let acquired =
+            session.acquire_input(challenger, ConnectionId::new(kr_ipc::new_uuid()), None);
+        drop(session);
+        runtime.flush_input();
+        let _ = done.send(acquired.is_ok());
+    });
+    assert!(
+        owned.recv_timeout(SOON).is_ok(),
+        "the takeover never took the session"
+    );
+    // Whether the takeover is answered is the first case's to say. Where it is, the machine holds
+    // the new exchange before the clock moves, so only the bridge's timer can end it.
+    let _ = answered.recv_timeout(SOON);
+
+    wired.clock.advance(THE_HOLD);
+    waker.notify_one();
+    let by = std::time::Instant::now() + SOON;
+    let busy = loop {
+        match events.try_recv() {
+            Some(kr_worker::output::OutputDelivery::EditorBusy(event)) => break Some(*event),
+            Some(_) => {}
+            None if std::time::Instant::now() >= by => break None,
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    assert!(
+        busy.is_some(),
+        "the timer of the hold never fired while the writer stood in the look at the floor's name"
+    );
+    let busy = busy.expect("an event");
+    assert_eq!(busy.attachment_id, challenger);
+    assert_eq!(busy.reason, EditorBusyReason::FenceExchangeTimedOut);
+    assert_eq!(busy.input_epoch.get(), epoch + 1);
+    drop(release);
     wired.close().await;
 }
