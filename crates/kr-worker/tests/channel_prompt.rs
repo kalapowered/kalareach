@@ -62,9 +62,13 @@ fn bindings(action: &mut ActionDeclaration) -> &mut Vec<kr_plugin_sdk::effect::P
 #[test]
 fn a_channel_event_shape_comes_from_the_packages_declared_prompt_action() {
     let package = Package::laid_out();
-    let shape = ChannelEventShape::of(&package.connector).expect("the package declares a shape");
+    let shape = ChannelEventShape::of(&package.connector);
+    assert!(shape.is_some(), "the package declares a shape");
+    let shape = shape.expect("a shape, as asserted");
     assert_eq!(shape.max_characters(), 8000, "the declared maximum");
-    let frame = shape.frame("", &the_owner()).expect("a frame");
+    let frame = shape.frame("", &the_owner());
+    assert!(frame.is_ok(), "a frame: {frame:?}");
+    let frame = frame.expect("a frame, as asserted");
     let frame: serde_json::Value = serde_json::from_slice(&frame).expect("a frame is JSON");
     assert_eq!(frame["method"], CHANNEL_EVENT_WIRE_NAME);
     assert_eq!(
@@ -204,8 +208,12 @@ fn a_package_without_a_writable_prompt_shape_has_no_event_shape() {
 #[test]
 fn a_prepared_event_names_content_and_the_hosts_own_sender_members() {
     let package = Package::laid_out();
-    let shape = ChannelEventShape::of(&package.connector).expect("the package declares a shape");
-    let frame = shape.frame("hello", &the_owner()).expect("a frame");
+    let shape = ChannelEventShape::of(&package.connector);
+    assert!(shape.is_some(), "the package declares a shape");
+    let shape = shape.expect("a shape, as asserted");
+    let frame = shape.frame("hello", &the_owner());
+    assert!(frame.is_ok(), "a frame: {frame:?}");
+    let frame = frame.expect("a frame, as asserted");
     assert_eq!(
         String::from_utf8(frame).expect("UTF-8"),
         concat!(
@@ -215,7 +223,9 @@ fn a_prepared_event_names_content_and_the_hosts_own_sender_members() {
     );
 
     let text = "say \"hi\"\nand a \\ backslash";
-    let frame = shape.frame(text, &the_owner()).expect("a frame");
+    let frame = shape.frame(text, &the_owner());
+    assert!(frame.is_ok(), "a frame: {frame:?}");
+    let frame = frame.expect("a frame, as asserted");
     let frame: serde_json::Value = serde_json::from_slice(&frame).expect("a frame is JSON");
     assert_eq!(
         frame["params"]["content"], text,
@@ -238,7 +248,9 @@ fn a_prepared_event_names_content_and_the_hosts_own_sender_members() {
         device_id: Some(DeviceId::new(Uuid::from_bytes([9; 16]))),
         grant_id: Some(GrantId::new(Uuid::from_bytes([8; 16]))),
     };
-    let frame = shape.frame("hello", &phone).expect("a frame");
+    let frame = shape.frame("hello", &phone);
+    assert!(frame.is_ok(), "a frame: {frame:?}");
+    let frame = frame.expect("a frame, as asserted");
     let frame: serde_json::Value = serde_json::from_slice(&frame).expect("a frame is JSON");
     assert_eq!(frame["params"]["meta"]["sender"], "paired_device");
     assert_eq!(frame["params"]["meta"]["sender_id"], "8dea4a0a91fb8dda");
