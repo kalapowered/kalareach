@@ -1107,3 +1107,182 @@ fn a_step_that_ends_in_its_time_is_read_as_a_step_without_a_limit() {
         assert!(ran.document.passed(), "{what}: {:?}", ran.document.problems);
     }
 }
+
+/// The step of the plan `time-limits` that waits `seconds` with `sleep`, with `limits`.
+#[cfg(unix)]
+fn waiting(id: &str, seconds: u64, limits: &str) -> String {
+    timed_step(
+        id,
+        "build",
+        &format!("'bash', 'scripts/sleep.sh', '{seconds}'"),
+        limits,
+    )
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the steps that name a budget spend it in the
+/// order of the plan. The step that runs into the budget's end is failed with the limit's words,
+/// and each later step of the budget is not run: it has no log and no exit status, its error names
+/// the step that spent the budget, and the run fails. A step that names no budget runs.
+#[cfg(unix)]
+#[test]
+fn a_step_that_spends_its_budget_fails_and_each_later_step_of_the_budget_is_not_run() {
+    let (_directory, root) = copy("time-limits");
+    let text = timed_plan(
+        "[[budget]]\nid = 'shared'\nseconds = 3\n",
+        &[
+            waiting("first", 300, "budget = 'shared'"),
+            waiting("second", 0, "budget = 'shared'"),
+            waiting("free", 0, ""),
+        ],
+    );
+    let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let steps = &ran.document.steps;
+    assert_eq!(
+        (steps[0].exit, steps[0].error.as_deref()),
+        (None, Some("ran out of its time limit: 3 s")),
+        "{:?}",
+        steps[0]
+    );
+    assert!(steps[0].seconds < 3 + 30, "{:?}", steps[0]);
+    assert_eq!(
+        (steps[1].exit, steps[1].error.as_deref(), steps[1].seconds),
+        (
+            None,
+            Some("not run because its budget was spent by step 1"),
+            0
+        ),
+        "{:?}",
+        steps[1]
+    );
+    assert!(steps[1].log.is_empty(), "{:?}", steps[1]);
+    assert_eq!(
+        (steps[2].exit, steps[2].error.as_deref()),
+        (Some(0), None),
+        "a step that names no budget runs"
+    );
+    assert!(!ran.document.passed());
+    assert_eq!(ran.document.summary.failed_steps, [1, 2]);
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a step that comes after a step that took part
+/// of the budget has what is left and not the whole budget. The first of two steps takes 4 of the 10
+/// seconds and passes; the second would take the 300 it waits for, and is ended when the 6 left are
+/// spent, which is under the 12 s (the whole budget and the wait that ends the group) it would take
+/// if it had the whole budget.
+#[cfg(unix)]
+#[test]
+fn a_step_has_the_time_its_budget_has_left_after_the_steps_before_it() {
+    let (_directory, root) = copy("time-limits");
+    let text = timed_plan(
+        "[[budget]]\nid = 'shared'\nseconds = 10\n",
+        &[
+            waiting("first", 4, "budget = 'shared'"),
+            waiting("second", 300, "budget = 'shared'"),
+        ],
+    );
+    let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let steps = &ran.document.steps;
+    assert_eq!(
+        (steps[0].exit, steps[0].error.as_deref()),
+        (Some(0), None),
+        "{:?}",
+        steps[0]
+    );
+    assert_eq!(
+        (steps[1].exit, steps[1].error.as_deref()),
+        (None, Some("ran out of its time limit: 10 s")),
+        "{:?}",
+        steps[1]
+    );
+    assert!(
+        steps[1].seconds < 11,
+        "the second step ran {} s, as long as it would with the whole budget",
+        steps[1].seconds
+    );
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a set-up step that its budget stopped is not
+/// run, and the step that names it is not run either, with the budget's words: a set-up step is a
+/// step of its budget like any other.
+#[cfg(unix)]
+#[test]
+fn a_step_that_names_a_set_up_step_its_budget_stopped_is_not_run_with_the_budgets_words() {
+    let (_directory, root) = copy("time-limits");
+    let set_up = timed_step(
+        "prepare",
+        "exit",
+        "'bash', 'scripts/sleep.sh', '0'",
+        "setup = true\nbudget = 'shared'",
+    );
+    let text = timed_plan(
+        "[[budget]]\nid = 'shared'\nseconds = 2\n",
+        &[
+            waiting("first", 300, "budget = 'shared'"),
+            set_up,
+            waiting("last", 0, "after = ['prepare']"),
+        ],
+    );
+    let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let steps = &ran.document.steps;
+    assert_eq!(
+        steps[1].error.as_deref(),
+        Some("not run because its budget was spent by step 1")
+    );
+    assert_eq!(
+        steps[2].error.as_deref(),
+        Some(
+            "not run because its set-up step 2 (the prepare step) was not run, because its budget was spent by step 1"
+        )
+    );
+    assert_eq!(ran.document.summary.failed_steps, [1, 2, 3]);
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a step that has a `timeout` and a budget is
+/// out of time at the earlier of the two. A `timeout` of 2 s ends the step before its budget of 100
+/// s, which the step spent little of, so the next step of the budget runs. A budget of 3 s ends the
+/// step before its `timeout` of 100 s, and the next step of the budget is not run.
+#[cfg(unix)]
+#[test]
+fn the_earlier_of_a_steps_timeout_and_its_budget_is_the_end_of_its_time() {
+    let (_directory, root) = copy("time-limits");
+    let run_with = |timeout: u64, seconds: u64| {
+        let text = timed_plan(
+            &format!("[[budget]]\nid = 'shared'\nseconds = {seconds}\n"),
+            &[
+                waiting(
+                    "first",
+                    300,
+                    &format!("timeout = {timeout}\nbudget = 'shared'"),
+                ),
+                waiting("second", 0, "budget = 'shared'"),
+            ],
+        );
+        run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"))
+    };
+    let by_the_timeout = run_with(2, 100);
+    let steps = &by_the_timeout.document.steps;
+    assert_eq!(
+        (steps[0].exit, steps[0].error.as_deref()),
+        (None, Some("ran out of its time limit: 2 s")),
+        "{:?}",
+        steps[0]
+    );
+    assert_eq!(
+        (steps[1].exit, steps[1].error.as_deref()),
+        (Some(0), None),
+        "{:?}",
+        steps[1]
+    );
+    let by_the_budget = run_with(100, 3);
+    let steps = &by_the_budget.document.steps;
+    assert_eq!(
+        (steps[0].exit, steps[0].error.as_deref()),
+        (None, Some("ran out of its time limit: 3 s")),
+        "{:?}",
+        steps[0]
+    );
+    assert_eq!(
+        steps[1].error.as_deref(),
+        Some("not run because its budget was spent by step 1")
+    );
+}

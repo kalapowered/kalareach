@@ -17,6 +17,7 @@ pub mod identity;
 pub mod ignored;
 pub mod lane;
 pub mod libtest;
+pub mod limits;
 pub mod map;
 pub mod observe;
 pub mod plan;

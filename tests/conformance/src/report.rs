@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use serde::Serialize;
 
@@ -24,14 +24,14 @@ use crate::id::{Family, Identifier};
 use crate::identity::{self, Commit, PackageVersion, System, TerminalProfile, Toolchain};
 use crate::lane::{self, Part};
 use crate::libtest::Outcome as LibtestOutcome;
+use crate::limits::Budgets;
 use crate::map::{self, Binding, Declarations, Map, Place, Reference, TypeScriptRead};
 use crate::observe::{self, Observed};
 use crate::plan::{self, ApplicationsPlan, Platform};
 use crate::plan_file::{Plan, Values};
-use crate::run::{self, Executed};
+use crate::run::{self, Blocked, Executed};
 use crate::runner_copy;
 use crate::scratch::{self, Scratch};
-use crate::tree::Deadline;
 use crate::workspace::{TargetId, TargetKind};
 
 /// The result's schema identifier.
@@ -567,6 +567,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
         .parent()
         .map_or_else(PathBuf::new, |directory| directory.join(run::REFUSALS));
     let mut executed = Vec::new();
+    let mut budgets = Budgets::default();
     for (index, step) in steps.iter().enumerate() {
         progress(&format!(
             "step {} of {}: {} ({})",
@@ -586,27 +587,39 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             .chain(&step.env)
             .cloned()
             .collect();
+        let began = Instant::now();
+        let mut deadline = None;
         let mut done = match failed_set_up(step, &executed) {
             Some((number, what, why)) => run::not_run(step, number, &what, &why),
-            None => run::execute(
+            None => match budgets.deadline(step, began) {
+                Err(by) => run::not_run_for_budget(step, by),
+                Ok(limit) => {
+                    deadline = limit;
+                    run::execute(
+                        step,
+                        index + 1,
+                        &run::Place {
+                            root: &options.root,
+                            directory: &directory,
+                            evidence: &options.evidence,
+                            environment: &environment,
+                            lister: &runner,
+                            deadline,
+                        },
+                        &map.packages,
+                    )
+                }
+            },
+        };
+        if done.blocked.is_none() {
+            budgets.spend(
                 step,
                 index + 1,
-                &run::Place {
-                    root: &options.root,
-                    directory: &directory,
-                    evidence: &options.evidence,
-                    environment: &environment,
-                    lister: &runner,
-                    deadline: step.timeout.map(|seconds| Deadline {
-                        at: Instant::now() + Duration::from_secs(seconds),
-                        seconds,
-                        budget: false,
-                    }),
-                },
-                &map.packages,
-            ),
-        };
-        if done.blocked_by.is_none() && (done.error.is_some() || done.exit != Some(0)) {
+                began.elapsed(),
+                done.timed_out && deadline.is_some_and(|deadline| deadline.budget),
+            );
+        }
+        if done.blocked.is_none() && (done.error.is_some() || done.exit != Some(0)) {
             done.observation = observe::observe_log(
                 &options.evidence.join(&done.log),
                 &runner_records,
@@ -654,9 +667,12 @@ fn failed_set_up(step: &plan::Step, executed: &[Executed]) -> Option<(usize, Str
             .iter()
             .enumerate()
             .find(|(_, done)| done.step.id == *name)?;
-        let why = match (set_up.blocked_by, &set_up.error, set_up.exit) {
-            (Some(blocker), _, _) => {
+        let why = match (set_up.blocked, &set_up.error, set_up.exit) {
+            (Some(Blocked::SetUp(blocker)), _, _) => {
                 format!("was not run, because its set-up step {blocker} did not succeed")
+            }
+            (Some(Blocked::Budget(by)), _, _) => {
+                format!("was not run, because its budget was spent by step {by}")
             }
             (None, Some(error), _) => format!("could not be run or read: {error}"),
             (None, None, Some(0)) => return None,
@@ -1026,7 +1042,7 @@ impl<'a> Resolver<'a> {
                     // A step that was not run because a set-up step failed still holds its targets
                     // in the selection: their tests are listed, not run.
                     || self.executed.iter().any(|done| {
-                        done.blocked_by.is_some()
+                        done.blocked.is_some()
                             && matches!(done.step.reading, plan::Reading::Cargo)
                             && command_holds(&done.step.command, target)
                     })
@@ -1118,7 +1134,7 @@ impl<'a> Resolver<'a> {
                 None,
             )]
         };
-        if let (Some(_), Some(why)) = (step.blocked_by, &step.error) {
+        if let (Some(_), Some(why)) = (step.blocked, &step.error) {
             let reason = format!("the step that runs the lane's tests was {why}");
             let run = RunRecord {
                 step: index + 1,
@@ -1436,7 +1452,7 @@ impl<'a> Resolver<'a> {
                 && command_holds(&step.step.command, target)
         }) {
             let why = failed.error.clone().unwrap_or_default();
-            return if failed.blocked_by.is_some() {
+            return if failed.blocked.is_some() {
                 format!(
                     "no step that ran listed this target; `{}` was {why}",
                     failed.step.line()
@@ -1579,7 +1595,7 @@ impl<'a> Resolver<'a> {
                 Some(unreported),
             )];
         };
-        if let (Some(_), Some(why)) = (step.blocked_by, &step.error) {
+        if let (Some(_), Some(why)) = (step.blocked, &step.error) {
             let run = RunRecord {
                 step: index + 1,
                 outcome: Outcome::NotRun,
