@@ -43,7 +43,7 @@ jobs:
     # A manual run can leave a job out; the nightly run has all three.
     if: github.event_name != 'workflow_dispatch' || inputs.linux
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 340
     env:
       # No debug information and no incremental artefacts: nothing here reads them, and the disk
       # has to hold a debug build of every test target and a release build for the measurements.
@@ -80,12 +80,15 @@ jobs:
           cargo --version
 
       # The companion application's backend links the system WebView and the window toolkit. The
-      # curses headers are for the applications the matrix builds from their release's source.
+      # curses headers are for the applications the matrix builds from their release's source. The
+      # packages come to 70 MB. A mirror has answered at 50 kB/s, which is 23 minutes of download,
+      # and apt has no rate below which it gives up, so the script retries the update and the
+      # download, each under a bound, for 30 minutes at most and installs from what it fetched. The
+      # step's 35 minutes are those 30, the install itself, and a margin.
       - name: Install the build dependencies
-        timeout-minutes: 6
+        timeout-minutes: 35
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes \
+          bash scripts/apt-install.sh --deadline 1800 \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libncurses-dev
 
@@ -137,10 +140,11 @@ jobs:
       # Every group this platform runs, the applications fetched and built from the pins in
       # tests/conformance/applications.lock. The step fails when the run did. It took 152 to 207
       # minutes on the eleven nights of 30 October to 9 November (207 on 8 November), and the job
-      # 155 to 210. The limits of the job's steps add up to 286 of its 300 minutes, the other steps'
+      # 155 to 210. The limits of the job's steps add up to 322 of its 340 minutes, the other steps'
       # each at least twice the longest its step took in those nights (the disk step, at 2.7
-      # minutes, has 6). The report's 240 minutes are 33 over the slowest night, and 10 over it with
-      # the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) added.
+      # minutes, has 6), and the package install's 35 minutes the retries of its script. The
+      # report's 240 minutes are 33 over the slowest night, and 10 over it with the fetch's worst
+      # case (22 and a half minutes, in scripts/run-conformance.sh) added.
       - name: The conformance report
         timeout-minutes: 240
         env:
