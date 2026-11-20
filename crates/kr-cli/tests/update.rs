@@ -3587,20 +3587,18 @@ fn a_host_refuses_a_channel_root_that_shares_a_key_and_does_not_say_who_made_it(
     );
 }
 
-/// KR-REQ-26.40: a root that names one key twice in a role is refused as that, and is not said to be
-/// unsigned.
+/// KR-REQ-26.40: a root that names one key under two identifiers in a role is refused as that, and
+/// is not said to be unsigned or to have counted the key twice toward a threshold.
 #[cfg(unix)]
 #[test]
 fn a_host_refuses_a_channel_root_that_names_a_key_twice_as_that() {
     let text = roots_refused_for_their_keys().twice;
     let carried = said_of_a_carried_root(&text);
     assert!(
-        carried.contains(
-            "names one key under two identifiers for one role, which counts it twice toward the \
-             role's threshold"
-        ),
+        carried.contains("names one key under two identifiers for one role"),
         "{carried}"
     );
+    assert!(!carried.contains("which counts it twice"), "{carried}");
     let kept = said_of_a_kept_root(&text);
     assert!(
         kept.contains("this host kept names one key under two identifiers for one role"),

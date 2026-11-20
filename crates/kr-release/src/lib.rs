@@ -16,8 +16,9 @@
 //! one private key could answer for both. A root that names one key under two identifiers in a role
 //! is refused here, before any signature is counted, and so is a root that names one key for two of
 //! its roles. The comparison is of the 32 bytes of each key, so a key derived from another, such as
-//! its negation or its sum with a small-order point, is not found; each role has keys of its own
-//! because `kr-release dev-keys` makes them so, not because this check proves it.
+//! its negation or its sum with a small-order point, is not found; the separation of a root's keys,
+//! within a role and between roles, rests on how they were made (`kr-release dev-keys` makes a new
+//! key for each) and not on this check.
 
 mod agents;
 pub mod assemble;

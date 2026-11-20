@@ -4,7 +4,7 @@
 //! channel live in hardware and on offline media, and nothing here touches them. A run that proves
 //! the whole signing path makes a root and keys of its own, signs with them, and throws them away
 //! with the run: a release they sign is trusted by no host. The root gives each of its roles a key
-//! of its own, as a root a host reads must.
+//! of its own; a host refuses a root that names one key's bytes for two roles.
 
 use std::collections::HashMap;
 use std::num::NonZeroU64;

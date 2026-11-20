@@ -111,7 +111,7 @@ fn release_key(key: &Key) -> Option<[u8; 32]> {
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError::ReusedKey`] naming the first role that names a key twice,
+/// Returns [`VerifyError::ReusedKey`] naming the first role that names a key under two identifiers,
 /// [`VerifyError::UnsupportedKey`] naming the first role that names a key of another kind or size,
 /// and [`VerifyError::SharedKey`] naming the first two roles, in the order of their names, that name
 /// one key.
