@@ -432,7 +432,9 @@ fn script_operands(command: &[String]) -> Vec<&str> {
     }
 }
 
-/// Why `operand` is not a script this plan may run from `root`, or `None`.
+/// Why `operand` is not a script this plan may run from `root`, or `None`: it is a relative path
+/// inside the repository, a regular file that is not a link, and the very name under which Git's
+/// index holds a file. Git is asked about the name as a literal, never as a pattern.
 fn operand_refused(root: &Path, operand: &str) -> Option<String> {
     let path = Path::new(operand);
     if path.is_absolute() || operand.starts_with('/') || operand.contains('\\') {
@@ -444,19 +446,52 @@ fn operand_refused(root: &Path, operand: &str) -> Option<String> {
     {
         return Some("holds `..`".to_owned());
     }
-    if std::fs::symlink_metadata(root.join(path)).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        return Some("is a link".to_owned());
+    match std::fs::symlink_metadata(root.join(path)) {
+        Ok(meta) if meta.file_type().is_symlink() => return Some("is a link".to_owned()),
+        Ok(meta) if !meta.is_file() => return Some("is not a regular file".to_owned()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some("does not exist".to_owned());
+        }
+        Err(error) => return Some(format!("cannot be checked: {error}")),
     }
-    match Command::new("git")
+    let output = match Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "--error-unmatch", "--"])
+        .args([
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--error-unmatch",
+            "--",
+        ])
         .arg(operand)
         .output()
     {
-        Ok(output) if output.status.success() => None,
-        Ok(_) => Some("is not a tracked file of the repository".to_owned()),
-        Err(error) => Some(format!("cannot be checked: git did not run ({error})")),
+        Ok(output) => output,
+        Err(error) => return Some(format!("cannot be checked: git did not run ({error})")),
+    };
+    match output.status.code() {
+        // Git exits 1 for a name that the index does not hold, and 128 for a failure of its own.
+        Some(0) => {
+            let held = output.stdout.split(|byte| *byte == 0).next().unwrap_or(&[]);
+            (held != operand.as_bytes()).then(|| {
+                format!(
+                    "is not spelled the way the repository's index holds it (`{}`)",
+                    String::from_utf8_lossy(held)
+                )
+            })
+        }
+        Some(1) => Some("is not a tracked file of the repository".to_owned()),
+        code => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let first = stderr.lines().next().unwrap_or_default();
+            let status = code.map_or_else(
+                || "git was stopped by a signal".to_owned(),
+                |code| format!("git ended with status {code}"),
+            );
+            Some(format!("cannot be checked: {status}: {first}"))
+        }
     }
 }
 

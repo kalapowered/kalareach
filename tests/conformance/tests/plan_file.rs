@@ -49,7 +49,7 @@ fn step_with(from: &str, to: &str) -> String {
 }
 
 /// The planted files: a name, the text, and the words the refusal holds, each in the order the
-/// loader checks them. `Some(root)` is a root other than the repository.
+/// loader checks them.
 fn faults() -> Vec<(&'static str, String, &'static str)> {
     vec![
         (
@@ -117,12 +117,36 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "step `one` runs the script `../x.sh`, which holds `..`",
         ),
         (
-            "a script that is not tracked",
+            "a script that is not there",
             step_with(
                 "command = ['cargo', 'test']",
                 "command = ['bash', '-e', 'scripts/not-a-script.sh']",
             ),
-            "step `one` runs the script `scripts/not-a-script.sh`, which is not a tracked file of the repository",
+            "step `one` runs the script `scripts/not-a-script.sh`, which does not exist",
+        ),
+        (
+            "a script that is a directory of tracked files",
+            step_with(
+                "command = ['cargo', 'test']",
+                "command = ['bash', 'scripts']",
+            ),
+            "step `one` runs the script `scripts`, which is not a regular file",
+        ),
+        (
+            "a script that is a wildcard of tracked files",
+            step_with(
+                "command = ['cargo', 'test']",
+                "command = ['bash', 'scripts/*.sh']",
+            ),
+            "step `one` runs the script `scripts/*.sh`, which does not exist",
+        ),
+        (
+            "a script spelled other than the index holds it",
+            step_with(
+                "command = ['cargo', 'test']",
+                "command = ['bash', './scripts/android-unit-tests.sh']",
+            ),
+            "step `one` runs the script `./scripts/android-unit-tests.sh`, which is not spelled the way the repository's index holds it (`scripts/android-unit-tests.sh`)",
         ),
         (
             "a placeholder outside the plan's",
@@ -212,16 +236,17 @@ fn a_plan_file_is_refused_for_each_fault_by_its_reason() {
     let root = repository();
     let control = Plan::parse(&format!("{}{STEP}", with("")), &root);
     assert!(control.is_ok(), "the control file loads: {control:?}");
+    let mut wrong = Vec::new();
     for (name, text, reason) in faults() {
-        let refused = match Plan::parse(&text, &root) {
-            Ok(_) => panic!("the loader refused nothing for {name}"),
-            Err(refusal) => refusal.to_string(),
-        };
-        assert!(
-            refused.contains(reason),
-            "{name}: refused as `{refused}`, which lacks `{reason}`"
-        );
+        match Plan::parse(&text, &root) {
+            Ok(_) => wrong.push(format!("{name}: the loader refused nothing")),
+            Err(refusal) if refusal.to_string().contains(reason) => {}
+            Err(refusal) => wrong.push(format!(
+                "{name}: refused as `{refusal}`, which lacks `{reason}`"
+            )),
+        }
     }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// A script that is a link is refused, and so is one that is tracked and is not a link (accepted).
@@ -246,6 +271,98 @@ fn a_script_that_is_a_link_is_refused_and_a_tracked_one_is_accepted() {
         "command = ['bash', 'scripts/android-unit-tests.sh', '--results={evidence}/x']",
     );
     assert!(Plan::parse(&tracked, &repository()).is_ok());
+}
+
+/// Runs `git` in `root`.
+fn git(root: &Path, arguments: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .status()
+        .expect("git runs");
+    assert!(status.success(), "git {arguments:?}: {status}");
+}
+
+/// A repository of its own whose index holds `tracked.sh` and `gone.sh`, with `gone.sh` removed
+/// from the tree, `untracked.sh` beside them and, where a name may hold `*`, a file named `*.sh`
+/// that the index does not hold.
+fn planted_repository() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = directory.path();
+    for name in ["tracked.sh", "gone.sh", "untracked.sh"] {
+        std::fs::write(root.join(name), "").expect("a file");
+    }
+    git(root, &["init", "-q"]);
+    git(root, &["add", "tracked.sh", "gone.sh"]);
+    std::fs::remove_file(root.join("gone.sh")).expect("the file is removed from the tree");
+    #[cfg(unix)]
+    std::fs::write(root.join("*.sh"), "").expect("a file named as a wildcard");
+    directory
+}
+
+/// A script is a regular file that the index of the repository holds under exactly that name: not
+/// a file the index lacks, not one that the tree has lost, and not a name that Git reads as a
+/// pattern that matches tracked files. A file that the index holds loads. Each refusal is exit
+/// status 2 from the program, with the script's own reason.
+#[test]
+fn a_script_must_be_a_regular_file_that_the_index_holds_under_that_name() {
+    let repository = planted_repository();
+    let root = repository.path();
+    let scripts = tempfile::tempdir().expect("a directory");
+    let mut refusals = vec![
+        ("untracked.sh", "is not a tracked file of the repository"),
+        ("gone.sh", "does not exist"),
+    ];
+    if cfg!(unix) {
+        refusals.push(("*.sh", "is not a tracked file of the repository"));
+    }
+    let command = |operand: &str| {
+        step_with(
+            "command = ['cargo', 'test']",
+            &format!("command = ['bash', '{operand}']"),
+        )
+    };
+    let control = Plan::parse(&command("tracked.sh"), root);
+    assert!(control.is_ok(), "a tracked file loads: {control:?}");
+    let mut wrong = Vec::new();
+    for (index, (operand, why)) in refusals.into_iter().enumerate() {
+        let expected = format!("step `one` runs the script `{operand}`, which {why}");
+        match Plan::parse(&command(operand), root) {
+            Ok(_) => wrong.push(format!("{operand}: the loader refused nothing")),
+            Err(refusal) if refusal.0 == expected => {}
+            Err(refusal) => wrong.push(format!("{operand}: refused as `{refusal}`")),
+        }
+        let file = scripts.path().join(format!("plan-{index}.toml"));
+        std::fs::write(&file, command(operand)).expect("the planted file");
+        let (code, stderr) = program(&[
+            "map",
+            "--root",
+            &root.to_string_lossy(),
+            "--plan",
+            &file.to_string_lossy(),
+        ]);
+        if code != Some(2) || !stderr.contains(&expected) {
+            wrong.push(format!("{operand}: exit {code:?}, stderr `{stderr}`"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A root that Git cannot read is not taken for a root without the script: the loader says that it
+/// cannot check the script, with the first line of what Git wrote.
+#[test]
+fn a_script_is_not_checked_in_a_root_that_git_cannot_read() {
+    let directory = tempfile::tempdir().expect("a directory");
+    std::fs::write(directory.path().join("x.sh"), "").expect("a file");
+    let text = step_with("command = ['cargo', 'test']", "command = ['bash', 'x.sh']");
+    let refusal = Plan::parse(&text, directory.path()).expect_err("git cannot read the root");
+    assert!(
+        refusal.0.starts_with(
+            "step `one` runs the script `x.sh`, which cannot be checked: git ended with status 128: fatal: "
+        ),
+        "{refusal}"
+    );
 }
 
 /// A plan with a step that reads vitest takes a package, and a lane a `lane`.
