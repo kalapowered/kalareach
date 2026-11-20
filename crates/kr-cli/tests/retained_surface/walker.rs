@@ -1188,10 +1188,13 @@ fn without_docs(stream: TokenStream) -> TokenStream {
                 }
                 out.push(TokenTree::Punct(punct));
             }
-            TokenTree::Group(group) => out.push(TokenTree::Group(Group::new(
-                group.delimiter(),
-                without_docs(group.stream()),
-            ))),
+            // The rebuilt group keeps the span of the written one: the lines a sighting covers come from
+            // the span of the last token of its item.
+            TokenTree::Group(group) => {
+                let mut rebuilt = Group::new(group.delimiter(), without_docs(group.stream()));
+                rebuilt.set_span(group.span());
+                out.push(TokenTree::Group(rebuilt));
+            }
             other => out.push(other),
         }
     }

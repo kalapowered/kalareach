@@ -1145,3 +1145,45 @@ fn an_item_keeps_its_written_tokens_and_a_nested_place_no_configuration_builds_g
     let (_, other) = scan_only("let _ = Method::AgentTurnSteer;");
     assert_ne!(source.digest, other.digest);
 }
+
+#[test]
+fn the_lines_of_a_sighting_run_from_the_first_token_of_its_item_to_where_its_last_token_ends() {
+    let lib = concat!(
+        "pub fn free() {\n",
+        "    let _ = Method::AgentTurnCancel;\n",
+        "}\n",
+        "#[inline]\n",
+        "pub fn attributed(x: u8) -> u8 {\n",
+        "    let _ = Method::AgentTurnSteer;\n",
+        "    x\n",
+        "}\n",
+        "pub struct S;\n",
+        "impl S {\n",
+        "    pub fn method(&self) {\n",
+        "        let _ = Method::AgentPromptQueue;\n",
+        "    }\n",
+        "}\n",
+    );
+    let folder = small_tree(lib);
+    let tree = tree_at(folder.path()).expect("the tree");
+    let extents = tree
+        .sighting_extents(&|krate| krate == "kr_sender")
+        .expect("the extents");
+    let file = "crates/kr-sender/src/lib.rs".to_owned();
+    let lines: Vec<(String, (String, usize, usize))> = extents
+        .iter()
+        .flat_map(|((_, name), set)| {
+            set.iter()
+                .map(|extent| (name.clone(), extent.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("S::method".to_owned(), (file.clone(), 11, 13)),
+            ("attributed".to_owned(), (file.clone(), 4, 8)),
+            ("free".to_owned(), (file, 1, 3)),
+        ]
+    );
+}
