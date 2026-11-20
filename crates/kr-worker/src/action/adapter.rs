@@ -505,11 +505,13 @@ mod windows {
 /// It exists for two callers: a test that needs a particular platform state, and the fixture
 /// check, which replays recorded platform values through the same classifier the real adapter
 /// uses.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Debug)]
 pub struct RecordedTimeAdapter {
     reading: std::sync::Arc<std::sync::Mutex<TimeAdapterReading>>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl RecordedTimeAdapter {
     /// Creates an adapter that answers with this reading.
     #[must_use]
@@ -528,6 +530,7 @@ impl RecordedTimeAdapter {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl TimeAdapter for RecordedTimeAdapter {
     fn read(&self) -> TimeAdapterReading {
         self.reading
