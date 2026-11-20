@@ -93,6 +93,11 @@ fn supervised(
     deadline: Deadline,
     capture: bool,
 ) -> io::Result<Waited<Output>> {
+    // The work between one command of a step and the next can take the time that is left: a command
+    // whose time is spent is not started.
+    if Instant::now() >= deadline.at {
+        return Ok(Waited::TimedOut);
+    }
     Group::prepare(command);
     if capture {
         command.stdout(Stdio::piped());
