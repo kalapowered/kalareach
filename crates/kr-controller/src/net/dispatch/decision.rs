@@ -50,9 +50,12 @@ pub(super) struct Asked {
     /// door's own stores, a service), and is written only while the standing it was checked under
     /// holds ([`Answers::Conflict`]).
     admitted: Option<Footing>,
-    /// For a page of retained output, the privacy state it was read under, which the page is
-    /// released under ([`RemoteConnection::write_answer`]).
+    /// For a page of retained output, or an answer with text a model wrote, the privacy state it
+    /// was read under, which the answer is released under ([`RemoteConnection::write_answer`]).
     pub(super) read_under: Option<ReadUnder>,
+    /// For an answer with text a model wrote, the same answer without it, which is written in its
+    /// place once `read_under` no longer stands.
+    pub(super) withheld: Option<ParamsValue>,
 }
 
 impl Asked {
@@ -186,10 +189,24 @@ impl RemoteConnection {
             );
             // A page of retained output goes only under the privacy state it was read under. Once
             // that has moved it goes with none of its output, and says the range it covered is
-            // gone, as privacy mode left it.
+            // gone, as privacy mode left it. An answer with text a model wrote goes the same way:
+            // the answer without that text is written in its place.
             let (shown, read_under) = match asked.read_under.as_ref() {
                 Some(read_under) if !read_under.stands() => {
-                    (std::borrow::Cow::Owned(without_its_output(&shown)), None)
+                    let held_back = match asked.withheld.as_ref() {
+                        Some(withheld) => super::super::answer_shown(
+                            &ControlFrame::Response(kr_protocol::envelope::Response {
+                                request_id,
+                                outcome: kr_protocol::envelope::Outcome::Ok(withheld.clone()),
+                            }),
+                            asked.shown_as,
+                            &asked.decision.decided.permitted.rights,
+                            &asked.acting.grant.history,
+                        )
+                        .into_owned(),
+                        None => without_its_output(&shown),
+                    };
+                    (std::borrow::Cow::Owned(held_back), None)
                 }
                 other => (shown, other),
             };
@@ -233,10 +250,11 @@ impl RemoteConnection {
                 asked.claims_geometry,
             ) {
                 Ok(again) => {
-                    let read_under = asked.read_under.take();
+                    let (read_under, withheld) = (asked.read_under.take(), asked.withheld.take());
                     let (kept, admitted) = (asked.kept, asked.admitted);
                     asked = again.answering(asked.shown_as);
                     asked.read_under = read_under;
+                    asked.withheld = withheld;
                     asked.kept = kept;
                     asked.admitted = admitted;
                 }
@@ -366,6 +384,7 @@ impl RemoteConnection {
             kept: None,
             admitted: None,
             read_under: None,
+            withheld: None,
         })
     }
 

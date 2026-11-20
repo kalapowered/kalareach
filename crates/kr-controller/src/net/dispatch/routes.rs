@@ -554,6 +554,12 @@ impl RemoteConnection {
                 }
             }
             DeviceRead::Description => {
+                // What a model wrote is released only under the privacy state it was read under,
+                // which is taken before the description is read.
+                let read_under = match super::output::ReadUnder::now(&self.controller).await {
+                    Ok(read_under) => read_under,
+                    Err(error) => return failure(request.request_id, error),
+                };
                 let described = async {
                     let params: kr_protocol::describe::SessionDescribeParams =
                         request.params.to_typed().map_err(|error| {
@@ -571,11 +577,19 @@ impl RemoteConnection {
                 };
                 match described.await {
                     // What a model wrote is answered only while the privacy state it was read
-                    // under holds, decided now.
-                    Ok(read) => ControlFrame::Response(Response {
-                        request_id: request.request_id,
-                        outcome: Outcome::Ok(self.controller.attention().settled(read).await),
-                    }),
+                    // under holds: decided now, and again where the frame is written, where the
+                    // answer without it goes in its place.
+                    Ok(read) => {
+                        let withheld = read.withheld().cloned();
+                        if let (Some(asked), Some(withheld)) = (asked.as_mut(), withheld) {
+                            asked.read_under = Some(read_under);
+                            asked.withheld = Some(withheld);
+                        }
+                        ControlFrame::Response(Response {
+                            request_id: request.request_id,
+                            outcome: Outcome::Ok(self.controller.attention().settled(read).await),
+                        })
+                    }
                     Err(error) => failure(request.request_id, error.to_protocol_error()),
                 }
             }

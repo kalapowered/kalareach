@@ -655,6 +655,11 @@ impl Read {
         Self { value, text: None }
     }
 
+    /// The same answer with its session text withheld, when it carries any.
+    pub(crate) fn withheld(&self) -> Option<&ParamsValue> {
+        self.text.as_ref().map(|(withheld, _)| withheld)
+    }
+
     /// An answer whose live session text, if it carries any, is released under `ticket`.
     pub(crate) fn with(value: ParamsValue, withheld: ParamsValue, ticket: Ticket) -> Self {
         if ticket.is_empty() {
