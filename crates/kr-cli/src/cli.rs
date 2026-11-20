@@ -137,7 +137,7 @@ pub enum BackupCommand {
     /// The kit is the only way to read the backups if this host is lost, and KalaReach keeps no
     /// copy. The command runs at a terminal outside every session, shows what it will do, shows
     /// the kit once, and sets nothing up until you have typed back the end of the kit's seed and
-    /// said that the kit is stored. It works on Unix.
+    /// said that the kit is stored. It runs at a terminal on macOS, Linux and Windows.
     Setup(BackupSetupArguments),
 }
 
