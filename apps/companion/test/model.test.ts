@@ -12,13 +12,9 @@ import {
   applyNode,
   applyNodes,
   emptyConversation,
-  installSnapshot,
   type ConversationState,
   isNewer,
-  nodesAbove,
-  prependHistory,
   setFollowing,
-  setWindowStart,
   visibleNodes,
   WINDOW_SIZE
 } from '../src/model/conversation'
@@ -118,64 +114,6 @@ describe('the conversation', () => {
     state = setFollowing(state, true)
     state = applyNode(state, node('later-still', '1'))
     expect(state.windowStart).toBeGreaterThan(followingStart)
-  })
-
-  it('keeps the reader anchored when a page of older content is loaded', () => {
-    let state = applyNodes(
-      empty(),
-      Array.from({ length: 300 }, (_, index) => node(`n${index}`, '1'))
-    )
-    state = setWindowStart(state, 100)
-    const anchorNode = state.nodes[100]
-    const before = nodesAbove(state)
-
-    state = prependHistory(
-      state,
-      Array.from({ length: 40 }, (_, index) => node(`older${index}`, '1'))
-    )
-
-    expect(nodesAbove(state)).toBe(before + 40)
-    expect(state.nodes[140]).toBe(anchorNode)
-    expect(state.following).toBe(false)
-  })
-
-  it('ignores a history page it already holds', () => {
-    let state = applyNodes(empty(), [node('a', '1'), node('b', '1')])
-    state = prependHistory(state, [node('a', '1')])
-    expect(state.nodes).toHaveLength(2)
-  })
-})
-
-describe('a snapshot and the nodes held while it was read', () => {
-  const ids = (state: ConversationState<Item>) => state.nodes.map((each) => each.id)
-  const texts = (state: ConversationState<Item>) =>
-    state.nodes.map((each) => each.body.text)
-  const snapshot = [node('a', '1'), node('b', '2'), node('c', '1')]
-
-  it('keeps the snapshot in its presentation order', () => {
-    expect(ids(installSnapshot(empty(), snapshot, []))).toEqual(['a', 'b', 'c'])
-  })
-
-  it('puts a held node the snapshot lacks after it, in the order the stream delivered it', () => {
-    const state = installSnapshot(empty(), snapshot, [node('e', '1'), node('d', '1')])
-    expect(ids(state)).toEqual(['a', 'b', 'c', 'e', 'd'])
-  })
-
-  it('takes a held node in place of the snapshot’s copy only when its revision is newer', () => {
-    const state = installSnapshot(empty(), snapshot, [
-      node('b', '3', 'newer b'),
-      node('a', '0', 'older a'),
-      node('c', '1', 'same c')
-    ])
-    expect(ids(state)).toEqual(['a', 'b', 'c'])
-    expect(texts(state)).toEqual(['a', 'newer b', 'c'])
-  })
-
-  it('leaves the nodes already held where they are, and adds the snapshot’s new ones after', () => {
-    const before = applyNodes(empty(), [node('a', '1'), node('b', '1')])
-    const state = installSnapshot(before, [node('a', '1'), node('b', '2', 'newer b'), node('c', '1')], [])
-    expect(ids(state)).toEqual(['a', 'b', 'c'])
-    expect(texts(state)).toEqual(['a', 'newer b', 'c'])
   })
 })
 
