@@ -82,7 +82,11 @@ fn main() -> ExitCode {
             "--all-terminals" => all_terminals = true,
             "--part" => match rest.next().and_then(|text| parse_part(text)) {
                 Some(chosen) => part = Some(chosen),
-                None => return usage("--part takes <number>/<parts>, with 1 <= number <= parts"),
+                None => {
+                    return usage(
+                        "--part takes <number>/<parts>, with 1 <= number <= parts <= 4294967295",
+                    );
+                }
             },
             "--typescript" => typescript = true,
             "--typescript-compiler" => match value(&mut rest) {
@@ -143,11 +147,16 @@ fn value<'a>(rest: &mut std::slice::Iter<'a, String>) -> Option<&'a str> {
         .filter(|word| !word.starts_with("--"))
 }
 
-/// A part of a plan as `<number>/<parts>`: the number of the part from 1, and the number of parts.
+/// A part of a plan as `<number>/<parts>`: the number of the part from 1, and the number of parts,
+/// which is no more than `u32::MAX`: a plan has far fewer steps, and the products that place them in
+/// parts stay far from the limits of a `usize`.
 fn parse_part(text: &str) -> Option<(usize, usize)> {
     let (number, parts) = text.split_once('/')?;
     let (number, parts): (usize, usize) = (number.parse().ok()?, parts.parse().ok()?);
-    (1..=parts).contains(&number).then_some((number, parts))
+    (1..=parts)
+        .contains(&number)
+        .then_some((number, parts))
+        .filter(|_| u32::try_from(parts).is_ok())
 }
 
 fn map(
@@ -378,5 +387,27 @@ fn run(root: PathBuf, plan: Plan, evidence_directory: &std::path::Path, asked: A
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_part;
+
+    /// KR-REQ-29.01, the part about reproducible commands: a part is `<number>/<parts>` with the
+    /// number from 1 to the count, and a count of at most `u32::MAX`: a count above is refused.
+    #[test]
+    fn a_part_count_above_the_largest_u32_is_refused() {
+        assert_eq!(parse_part("1/1"), Some((1, 1)));
+        assert_eq!(parse_part("3/4294967295"), Some((3, 4_294_967_295)));
+        assert_eq!(
+            parse_part("4294967295/4294967295"),
+            Some((4_294_967_295, 4_294_967_295))
+        );
+        assert_eq!(parse_part("1/4294967296"), None);
+        assert_eq!(parse_part("1/18446744073709551615"), None);
+        assert_eq!(parse_part("0/2"), None);
+        assert_eq!(parse_part("3/2"), None);
+        assert_eq!(parse_part("1"), None);
     }
 }
