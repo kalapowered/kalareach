@@ -417,6 +417,21 @@ pub struct Call {
     /// The preconditions a mutation carries, which name an uncertain earlier send when it quotes
     /// one; a read carries none.
     pub expected: Option<ParamsValue>,
+    /// The deadline, on the machine's boot clock, that the control daemon forwarded the mutation
+    /// under: zero for the probe that holds no lifetime. A call made directly, and a read, carry
+    /// none.
+    pub deadline_boot_ms: Option<u64>,
+}
+
+/// What the worker meets after the page made a call and before the worker is asked for anything.
+#[derive(Debug)]
+pub enum Reached {
+    /// The call arrived.
+    Call(Call),
+    /// The page's command ended first, so nothing reached the worker.
+    Answered(Result<serde_json::Value, serde_json::Value>),
+    /// Neither happened within the watchdog.
+    Silent,
 }
 
 impl Call {
@@ -438,6 +453,48 @@ pub fn written(asked: &kr_protocol::input::InputWriteParams) -> &[u8] {
     }
 }
 
+/// The call a frame carries: a read, a mutation, or a mutation the control daemon forwarded with
+/// the caller's envelope as it arrived. Any other frame is given back.
+fn call_of(frame: ControlFrame) -> Result<Call, ControlFrame> {
+    match frame {
+        ControlFrame::Request(request) => Ok(Call {
+            request_id: request.request_id,
+            method: request.method.to_string(),
+            params: request.params,
+            kind: CallKind::Request,
+            target: None,
+            action_id: None,
+            expected: None,
+            deadline_boot_ms: None,
+        }),
+        ControlFrame::Mutation(mutation) => Ok(Call {
+            request_id: mutation.request_id,
+            method: mutation.method.to_string(),
+            params: mutation.params,
+            kind: CallKind::Mutation,
+            target: Some(mutation.target),
+            action_id: Some(mutation.action_id),
+            expected: Some(mutation.expected),
+            deadline_boot_ms: None,
+        }),
+        ControlFrame::Forwarded(forwarded) => {
+            let forwarded = *forwarded;
+            let mutation = forwarded.mutation;
+            Ok(Call {
+                request_id: mutation.request_id,
+                method: mutation.method.to_string(),
+                params: mutation.params,
+                kind: CallKind::Mutation,
+                target: Some(mutation.target),
+                action_id: Some(mutation.action_id),
+                expected: Some(mutation.expected),
+                deadline_boot_ms: Some(forwarded.accepted_deadline_boot_ms.get()),
+            })
+        }
+        other => Err(other),
+    }
+}
+
 impl Link {
     /// The identity the worker gave this connection.
     pub fn connection_id(&self) -> ConnectionId {
@@ -450,26 +507,30 @@ impl Link {
             .await
             .expect("the view called within the watchdog")
             .expect("the view's connection is open");
-        match frame {
-            ControlFrame::Request(request) => Call {
-                request_id: request.request_id,
-                method: request.method.to_string(),
-                params: request.params,
-                kind: CallKind::Request,
-                target: None,
-                action_id: None,
-                expected: None,
-            },
-            ControlFrame::Mutation(mutation) => Call {
-                request_id: mutation.request_id,
-                method: mutation.method.to_string(),
-                params: mutation.params,
-                kind: CallKind::Mutation,
-                target: Some(mutation.target),
-                action_id: Some(mutation.action_id),
-                expected: Some(mutation.expected),
-            },
-            other => panic!("the view sent {other:?} rather than a call"),
+        call_of(frame).unwrap_or_else(|other| panic!("the view sent {other:?} rather than a call"))
+    }
+
+    /// The next call, or the end of the command that was to make it, whichever comes first.
+    ///
+    /// A command that is refused before it sends anything ends without a call, and the caller is
+    /// told so and decides what that means, where waiting for the call alone would end in a panic
+    /// of this support's own.
+    pub async fn reached_by(
+        &mut self,
+        asked: &mut tokio::task::JoinHandle<Result<serde_json::Value, serde_json::Value>>,
+    ) -> Reached {
+        tokio::select! {
+            frame = self.reader.read_message::<ControlFrame>() => {
+                let frame = frame.expect("the view's connection is open");
+                Reached::Call(
+                    call_of(frame)
+                        .unwrap_or_else(|other| panic!("the view sent {other:?} rather than a call")),
+                )
+            }
+            answer = &mut *asked => {
+                Reached::Answered(answer.expect("the command's thread finished"))
+            }
+            () = tokio::time::sleep(WATCHDOG) => Reached::Silent,
         }
     }
 
@@ -501,6 +562,7 @@ impl Link {
                         target: None,
                         action_id: None,
                         expected: None,
+                        deadline_boot_ms: None,
                     }),
                     Ok(ControlFrame::Mutation(mutation)) => sent.push(Call {
                         request_id: mutation.request_id,
@@ -510,6 +572,7 @@ impl Link {
                         target: Some(mutation.target),
                         action_id: Some(mutation.action_id),
                         expected: Some(mutation.expected),
+                        deadline_boot_ms: None,
                     }),
                     Ok(_) => {}
                     Err(_) => return,

@@ -41,7 +41,7 @@ use kr_protocol::scalars::{Bytes, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{
     Dimensions, DisplayNumber, Durability, SessionState, SessionSummary, ShellMode,
 };
-use scripted_worker::{CallKind, Challenge, ScriptedWorker};
+use scripted_worker::{CallKind, Challenge, Reached, ScriptedWorker};
 use serde_json::{Value, json};
 use tauri::Manager as _;
 use tauri::test::MockRuntime;
@@ -164,15 +164,38 @@ fn binding() -> AgentBindingState {
 
 /// The subject every agent call about `worker`'s session names, as the page writes it.
 fn subject(worker: &ScriptedWorker) -> Value {
+    subject_of(worker, instance())
+}
+
+/// The subject of a call about `worker`'s session and the application `instance`.
+fn subject_of(worker: &ScriptedWorker, instance: ApplicationInstanceId) -> Value {
     json!({
         "session_id": worker.session_id.to_string(),
-        "application_instance_id": instance().to_string(),
+        "application_instance_id": instance.to_string(),
     })
 }
 
-/// The target every agent mutation about `worker`'s session names, as the page writes it.
-fn target(worker: &ScriptedWorker) -> Value {
-    json!({ "subject": subject(worker), "binding_revision": revision().get().to_string() })
+/// The target an agent mutation about `worker`'s session names, as the page writes it: the
+/// application `instance` and the binding `revision` the action was prepared against.
+fn target(
+    worker: &ScriptedWorker,
+    instance: ApplicationInstanceId,
+    revision: AgentBindingRevision,
+) -> Value {
+    json!({
+        "subject": subject_of(worker, instance),
+        "binding_revision": revision.get().to_string(),
+    })
+}
+
+/// The instance and the binding revision the page's `n`th mutation is prepared against. Each of the
+/// six has an instance and a revision of its own, and neither is one that the double's binding or
+/// another call holds, so an envelope can take them from nowhere but the call's own parameters.
+fn own(n: u8) -> (ApplicationInstanceId, AgentBindingRevision) {
+    (
+        ApplicationInstanceId::new(Uuid::from_bytes([0x30 + n; 16])),
+        AgentBindingRevision::new(10 + u64::from(n)),
+    )
 }
 
 fn mutated() -> AgentMutationResult {
@@ -297,74 +320,112 @@ async fn every_agent_read_goes_to_the_sessions_worker_on_one_link() {
 /// and its envelope names what the parameters name and nothing the page chose: the worker's
 /// environment, its session at its epoch, the instance and the binding revision the action was
 /// prepared against. A cancellation is the typed `agent.turn.cancel` and carries the turn it names.
+///
+/// Each call is prepared against an instance and a revision of its own, which no double holds, and
+/// each envelope is compared with the parameters the worker decoded, field by field. A command
+/// that ends before it reaches the worker is a failure of this case.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_agent_mutation_names_the_workers_session_the_instance_and_the_revision() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
-    let actions: [(&'static str, Method, Value); 5] = [
+    let actions: [(&'static str, Method, u8, Value); 5] = [
         (
             "agent_prompt_submit",
             Method::AgentPromptSubmit,
-            json!({ "target": target(&worker), "draft_id": null, "text": "Try the subscription." }),
+            1,
+            json!({ "draft_id": null, "text": "Try the subscription." }),
         ),
         (
             "agent_prompt_queue",
             Method::AgentPromptQueue,
-            json!({ "target": target(&worker), "draft_id": null, "text": "Then run the suite." }),
+            2,
+            json!({ "draft_id": null, "text": "Then run the suite." }),
         ),
         (
             "agent_turn_steer",
             Method::AgentTurnSteer,
-            json!({ "target": target(&worker), "turn_id": turn().to_string(), "text": "Only the one test." }),
+            3,
+            json!({ "turn_id": turn().to_string(), "text": "Only the one test." }),
         ),
         (
             "agent_turn_cancel",
             Method::AgentTurnCancel,
-            json!({ "target": target(&worker), "turn_id": turn().to_string() }),
+            4,
+            json!({ "turn_id": turn().to_string() }),
         ),
         (
             "agent_approval_respond",
             Method::AgentApprovalRespond,
+            5,
             json!({
-                "target": target(&worker),
                 "resource_id": PendingResourceId::new(Uuid::from_bytes([7; 16])).to_string(),
                 "option_id": "allow_once"
             }),
         ),
     ];
     let mut link = None;
-    for (command, method, params) in actions {
-        let asked = page.call(command, json!({ "params": params }));
+    for (command, method, n, mut params) in actions {
+        let (own_instance, own_revision) = own(n);
+        params["target"] = target(&worker, own_instance, own_revision);
+        let mut asked = page.call(command, json!({ "params": params }));
         if link.is_none() {
             link = Some(worker.link().await);
         }
         let link = link.as_mut().expect("the session's link");
-        let call = link.expect(method).await;
+        let reached = link.reached_by(&mut asked).await;
+        assert!(
+            matches!(reached, Reached::Call(_)),
+            "{command} reached the worker: {reached:?}"
+        );
+        let Reached::Call(call) = reached else {
+            unreachable!("asserted to be a call")
+        };
+        assert_eq!(call.method, method.to_string(), "{command}'s method");
         assert_eq!(call.kind, CallKind::Mutation, "{command} is a mutation");
-        let target = call.target.clone().expect("a mutation's envelope");
-        assert_eq!(target.environment_id, worker.descriptor.environment_id);
-        assert_eq!(target.session_id.as_ref(), Some(&worker.session_id));
+        let envelope = call.target.clone().expect("a mutation's envelope");
+        assert_eq!(envelope.environment_id, worker.descriptor.environment_id);
+        assert_eq!(envelope.session_id.as_ref(), Some(&worker.session_id));
         assert_eq!(
-            target.session_epoch.as_ref(),
+            envelope.session_epoch.as_ref(),
             Some(&worker.descriptor.session_epoch)
         );
-        assert_eq!(target.application_instance_id.as_ref(), Some(&instance()));
-        assert_eq!(target.agent_binding_revision.as_ref(), Some(&revision()));
-        match method {
+        let named = match method {
             Method::AgentPromptSubmit | Method::AgentPromptQueue => {
-                let _: AgentPromptParams = call.params();
+                let sent: AgentPromptParams = call.params();
+                sent.target
             }
             Method::AgentTurnSteer => {
-                let _: AgentSteerParams = call.params();
+                let sent: AgentSteerParams = call.params();
+                sent.target
             }
             Method::AgentTurnCancel => {
                 let cancel: AgentCancelParams = call.params();
                 assert_eq!(cancel.turn_id, turn(), "the cancellation names its turn");
+                cancel.target
             }
             _ => {
-                let _: AgentApprovalRespondParams = call.params();
+                let sent: AgentApprovalRespondParams = call.params();
+                sent.target
             }
-        }
+        };
+        assert_eq!(
+            envelope.application_instance_id.as_ref(),
+            Some(&named.subject.application_instance_id),
+            "{command}'s envelope names the instance its parameters name"
+        );
+        assert_eq!(
+            envelope.agent_binding_revision.as_ref(),
+            Some(&named.binding_revision),
+            "{command}'s envelope names the binding revision its parameters name"
+        );
+        assert_eq!(
+            named.subject.application_instance_id, own_instance,
+            "{command}'s parameters carry the page's instance"
+        );
+        assert_eq!(
+            named.binding_revision, own_revision,
+            "{command}'s parameters carry the page's binding revision"
+        );
         link.answer(&call, &mutated()).await;
         let settled = answered(asked).await.expect("the worker's answer");
         assert_eq!(settled["receipt"], Value::Null);
@@ -391,10 +452,11 @@ async fn a_package_action_is_invoked_on_the_sessions_worker_and_answered_in_the_
     let page = Page::new(worker.paths());
     let plugin_id = PluginId::new("kalareach.codex").expect("a package");
     let action = ActionName::new("turn.cancel").expect("an action");
-    let asked = page.call(
+    let (own_instance, own_revision) = own(6);
+    let mut asked = page.call(
         "plugin_action_invoke",
         json!({ "params": {
-            "target": target(&worker),
+            "target": target(&worker, own_instance, own_revision),
             "plugin_id": plugin_id.to_string(),
             "action": action.to_string(),
             "draft_id": null,
@@ -403,14 +465,38 @@ async fn a_package_action_is_invoked_on_the_sessions_worker_and_answered_in_the_
         } }),
     );
     let mut link = worker.link().await;
-    let call = link.expect(Method::PluginActionInvoke).await;
+    let reached = link.reached_by(&mut asked).await;
+    assert!(
+        matches!(reached, Reached::Call(_)),
+        "plugin_action_invoke reached the worker: {reached:?}"
+    );
+    let Reached::Call(call) = reached else {
+        unreachable!("asserted to be a call")
+    };
+    assert_eq!(call.method, Method::PluginActionInvoke.to_string());
     assert_eq!(call.kind, CallKind::Mutation);
     let envelope = call.target.clone().expect("a mutation's envelope");
     assert_eq!(envelope.environment_id, worker.descriptor.environment_id);
     assert_eq!(envelope.session_id.as_ref(), Some(&worker.session_id));
-    assert_eq!(envelope.application_instance_id.as_ref(), Some(&instance()));
-    assert_eq!(envelope.agent_binding_revision.as_ref(), Some(&revision()));
     let sent: PluginActionInvokeParams = call.params();
+    assert_eq!(
+        envelope.application_instance_id.as_ref(),
+        Some(&sent.target.subject.application_instance_id),
+        "the envelope names the instance the parameters name"
+    );
+    assert_eq!(
+        envelope.agent_binding_revision.as_ref(),
+        Some(&sent.target.binding_revision),
+        "the envelope names the binding revision the parameters name"
+    );
+    assert_eq!(
+        sent.target.subject.application_instance_id, own_instance,
+        "the parameters carry the page's instance"
+    );
+    assert_eq!(
+        sent.target.binding_revision, own_revision,
+        "the parameters carry the page's binding revision"
+    );
     assert_eq!(sent.plugin_id, plugin_id);
     assert_eq!(sent.action, action);
     assert!(!sent.draft_id.is_present() && !sent.resource_id.is_present());
@@ -437,8 +523,8 @@ async fn a_prompt_that_names_both_a_draft_and_text_or_neither_reaches_nothing() 
     let page = Page::new(worker.paths());
     let draft = "55555555-5555-4555-8555-555555555555";
     for params in [
-        json!({ "target": target(&worker), "draft_id": draft, "text": "and text" }),
-        json!({ "target": target(&worker), "draft_id": null, "text": null }),
+        json!({ "target": target(&worker, instance(), revision()), "draft_id": draft, "text": "and text" }),
+        json!({ "target": target(&worker, instance(), revision()), "draft_id": null, "text": null }),
     ] {
         let refused = answered(page.call("agent_prompt_submit", json!({ "params": params })))
             .await
@@ -460,7 +546,11 @@ async fn a_prompt_that_names_a_draft_never_goes_to_the_worker_directly() {
     let page = Page::new(worker.paths());
     let draft = "55555555-5555-4555-8555-555555555555";
     for command in ["agent_prompt_submit", "agent_prompt_queue"] {
-        let params = json!({ "target": target(&worker), "draft_id": draft, "text": null });
+        let params = json!({
+            "target": target(&worker, instance(), revision()),
+            "draft_id": draft,
+            "text": null
+        });
         let refused = answered(page.call(command, json!({ "params": params })))
             .await
             .expect_err("there is no host to record the draft with");
