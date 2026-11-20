@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -31,6 +31,11 @@ const INTERVAL: Duration = Duration::from_millis(100);
 /// How long a read waits for the agent's own writes before it fails: the database is in
 /// write-ahead mode, which readers rarely wait on.
 const BUSY: Duration = Duration::from_secs(2);
+
+/// How long a wait for a pass gives a thread that never finishes one. A loaded machine only slows a
+/// pass and the wait follows it, so this is no bound on a pass: it ends a wait on a thread that is
+/// hung.
+const HANG_GUARD: Duration = Duration::from_secs(120);
 
 /// Whether `session` can name a mirror file: letters, digits, `_` and `-`, and not empty.
 fn file_safe(session: &str) -> bool {
@@ -103,13 +108,87 @@ pub fn export(database: &Path, query: &str, directory: &Path) -> Result<usize, S
     Ok(sessions.len())
 }
 
+/// What the mirroring thread has done: the passes it has begun, how the newest finished pass went
+/// and which pass that was, and whether the thread has ended.
+#[derive(Default)]
+struct Counts {
+    begun: u64,
+    newest: Option<(u64, Result<usize, String>)>,
+    ended: bool,
+}
+
+/// The thread's [`Counts`], shared with the waits on it.
+#[derive(Default)]
+struct Progress {
+    counts: Mutex<Counts>,
+    changed: Condvar,
+}
+
+impl Progress {
+    fn counts(&self) -> MutexGuard<'_, Counts> {
+        self.counts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn begin(&self) {
+        self.counts().begun += 1;
+    }
+
+    /// Records the result of the pass that began last: passes run one at a time.
+    fn finish(&self, made: Result<usize, String>) {
+        let mut counts = self.counts();
+        let number = counts.begun;
+        counts.newest = Some((number, made));
+        self.changed.notify_all();
+    }
+
+    fn end(&self) {
+        self.counts().ended = true;
+        self.changed.notify_all();
+    }
+
+    /// Waits until a pass numbered above `begun` has finished and gives the newest finished pass's
+    /// result, or fails when the thread ended first or `guard` ran out.
+    fn wait_after(&self, begun: u64, guard: Duration) -> Result<usize, String> {
+        let (counts, _) = self
+            .changed
+            .wait_timeout_while(self.counts(), guard, |counts| {
+                counts
+                    .newest
+                    .as_ref()
+                    .is_none_or(|(number, _)| *number <= begun)
+                    && !counts.ended
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        match &counts.newest {
+            Some((number, made)) if *number > begun => made.clone(),
+            _ if counts.ended => Err(
+                "the mirroring thread ended before it finished a pass that began after the mark"
+                    .to_owned(),
+            ),
+            _ => Err(format!(
+                "no pass finished within {guard:?}: this is the guard against a thread that never \
+                 finishes a pass, not the wait a pass is expected to need"
+            )),
+        }
+    }
+}
+
+/// Marks the thread as ended when it is dropped, whether the thread returned or panicked.
+struct Ending(Arc<Progress>);
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
 /// A thread that exports a mirror again and again until it is finished.
 pub struct Mirroring {
     database: PathBuf,
     query: String,
     directory: PathBuf,
     stop: Arc<AtomicBool>,
-    last: Arc<Mutex<Option<String>>>,
+    progress: Arc<Progress>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -118,14 +197,15 @@ impl Mirroring {
     #[must_use]
     pub fn start(database: PathBuf, query: String, directory: PathBuf) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let last = Arc::new(Mutex::new(None));
+        let progress = Arc::new(Progress::default());
         let thread = {
             let (database, query, directory) = (database.clone(), query.clone(), directory.clone());
-            let (stop, last) = (Arc::clone(&stop), Arc::clone(&last));
+            let (stop, progress) = (Arc::clone(&stop), Arc::clone(&progress));
             std::thread::spawn(move || {
+                let progress = Ending(progress);
                 while !stop.load(Ordering::SeqCst) {
-                    let made = export(&database, &query, &directory);
-                    *last.lock().unwrap_or_else(PoisonError::into_inner) = made.err();
+                    progress.0.begin();
+                    progress.0.finish(export(&database, &query, &directory));
                     std::thread::sleep(INTERVAL);
                 }
             })
@@ -135,19 +215,30 @@ impl Mirroring {
             query,
             directory,
             stop,
-            last,
+            progress,
             thread: Some(thread),
         }
     }
 
-    /// The most recent export's failure, where it failed: a read that waited on the agent's own
-    /// write fails and is made again, so this says something only when a later export did not mend it.
+    /// How many passes the thread has begun. A pass that begins after this call reads the database
+    /// as it is when this call returns: [`Mirroring::wait_for_pass_after`] waits for such a pass.
     #[must_use]
-    pub fn failing(&self) -> Option<String> {
-        self.last
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    pub fn passes_begun(&self) -> u64 {
+        self.progress.counts().begun
+    }
+
+    /// Waits for the first pass that began after `begun` passes had begun (the count
+    /// [`Mirroring::passes_begun`] gave) to finish, and gives the result of the newest finished pass,
+    /// which also began after that count: how many conversations it wrote out. A read that waited on
+    /// the agent's own write fails and is made again, so a failure here is one that a pass made
+    /// after the agent's last write did not mend.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of that pass, or says that the thread ended first, or that no pass
+    /// finished within two minutes, which is the guard against a thread that never finishes a pass.
+    pub fn wait_for_pass_after(&self, begun: u64) -> Result<usize, String> {
+        self.progress.wait_after(begun, HANG_GUARD)
     }
 
     /// Stops the thread and exports once more, whole, which is the mirror a reader afterwards sees.
@@ -341,16 +432,13 @@ mod tests {
                 [],
             )
             .expect("a row");
-        let started = std::time::Instant::now();
-        while !directory.join("ses_a.jsonl").is_file() && started.elapsed() < Duration::from_secs(5)
-        {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(
-            directory.join("ses_a.jsonl").is_file(),
-            "the thread exported it"
+        let begun = mirroring.passes_begun();
+        assert_eq!(
+            mirroring.wait_for_pass_after(begun),
+            Ok(1),
+            "the first pass after the insert exported it"
         );
-        assert_eq!(mirroring.failing(), None);
+        assert!(directory.join("ses_a.jsonl").is_file());
         connection
             .execute(
                 "INSERT INTO message VALUES ('m2', 'ses_a', 2, '{\"role\":\"assistant\"}')",
@@ -365,6 +453,57 @@ mod tests {
                 .count(),
             2,
             "the last row is in the whole export"
+        );
+    }
+
+    /// A pass that began before the mark does not end a wait; one that began after it does, and the
+    /// wait gives that pass's result.
+    #[test]
+    fn a_wait_gives_the_result_of_a_pass_that_began_after_the_mark() {
+        let progress = Progress::default();
+        progress.begin();
+        let mark = progress.counts().begun;
+        progress.finish(Err("a pass that began before the mark".to_owned()));
+        let early = progress
+            .wait_after(mark, Duration::ZERO)
+            .expect_err("no pass has begun after the mark");
+        assert!(early.contains("guard"), "{early}");
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| progress.wait_after(mark, Duration::from_secs(60)));
+            progress.begin();
+            progress.finish(Ok(3));
+            assert_eq!(waiting.join().expect("the wait ended"), Ok(3));
+        });
+        assert_eq!(progress.wait_after(mark, Duration::ZERO), Ok(3));
+    }
+
+    /// A thread that ended ends the wait at once, unless a pass after the mark had finished.
+    #[test]
+    fn a_wait_on_a_thread_that_ended_ends_with_it() {
+        let progress = Arc::new(Progress::default());
+        progress.begin();
+        let mark = progress.counts().begun;
+        drop(Ending(Arc::clone(&progress)));
+        let ended = progress
+            .wait_after(mark, Duration::from_secs(60))
+            .expect_err("the thread ended");
+        assert!(ended.contains("ended"), "{ended}");
+        progress.begin();
+        progress.finish(Ok(2));
+        assert_eq!(progress.wait_after(mark, Duration::from_secs(60)), Ok(2));
+    }
+
+    /// The guard ends a wait on a thread that never finishes a pass, and says that it is the guard.
+    #[test]
+    fn the_guard_ends_a_wait_on_a_thread_that_never_finishes_a_pass() {
+        let progress = Progress::default();
+        progress.begin();
+        let guarded = progress
+            .wait_after(0, Duration::ZERO)
+            .expect_err("no pass finished");
+        assert!(
+            guarded.contains("guard against a thread that never finishes a pass"),
+            "{guarded}"
         );
     }
 }
