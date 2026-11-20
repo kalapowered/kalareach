@@ -2624,6 +2624,50 @@ fn the_identifier_the_observer_said_is_found_after_the_test_programs_own_text() 
     assert_eq!(pid_the_observer_said("kr-observer: ready"), None);
 }
 
+/// A line that waits in the console's input behind the answer to the question about the seed's end
+/// is not the answer to the question after it: the person answers what is on the screen. The
+/// observer puts the seed's end and a `yes` behind it into the console's input in one write and
+/// reads the `yes` back from the queue, so the `yes` is in the input before the stored-kit
+/// question is shown and cannot arrive after the command has thrown the input away. A fresh answer
+/// is then needed, and a `no` ends the command with nothing set up.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_line_queued_behind_the_seeds_end_does_not_answer_the_stored_kit_question() {
+    let rig = Rig::start().await;
+    let ask = rig.work.join("type-ahead");
+    let asked = ask.display().to_string();
+    let mut window = Window::run_with(
+        &rig,
+        &["backup", "setup"],
+        &[(setup_console::TYPE_AHEAD_FILE, asked.as_str())],
+    );
+    let kit = window.bring_up_the_kit();
+    // Put in place whole: the observer reads the file as soon as it shows up.
+    let staged = rig.work.join("type-ahead.staged");
+    std::fs::write(&staged, format!("{}\nyes\n", kit.end_as_typed())).expect("stages the line");
+    std::fs::rename(&staged, &ask).expect("asks the observer to queue the line");
+    let shown = window.wait_for_either(&["kr-observer: typed ahead", "panicked"]);
+    assert!(
+        shown.contains("kr-observer: typed ahead"),
+        "this case could not make its condition: the yes was not queued behind the answer: {shown}"
+    );
+    window.wait_for("Type yes when the kit is stored");
+    window.type_line("no");
+    let shown = window.wait_for("kr ended");
+    assert!(
+        !shown.contains("kr ended 0"),
+        "the yes that waited behind the seed's end answered the stored-kit question: {shown}"
+    );
+    assert!(shown.contains("opens nothing"), "{shown}");
+    window.assert_the_terminal_is_as_found(&shown);
+    assert_eq!(rig.requests_to(SYNC), 0, "no bundle was written");
+    assert_eq!(rig.recorded_kit().await, None);
+    assert!(matches!(
+        rig.status().await.setup,
+        BackupSetupState::None {}
+    ));
+}
+
 /// The way Ctrl-Break reaches a program on a console on this machine.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]

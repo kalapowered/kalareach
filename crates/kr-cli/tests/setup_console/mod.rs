@@ -67,6 +67,11 @@ pub const DEBUGGED: &str = "KR_SETUP_OBSERVER_DEBUGGED";
 pub const TYPE_AHEAD: &str = "KR_SETUP_OBSERVER_TYPE_AHEAD";
 /// The path of a file whose appearance makes the observer send Ctrl-Break to its console.
 pub const BREAK_FILE: &str = "KR_SETUP_OBSERVER_BREAK_FILE";
+/// The path of a file whose appearance makes the observer put the file's text into the console's
+/// input, as key records in one write, and read the input back. The text up to its first line end
+/// is an answer that `kr` waits for and takes at once; what follows it waits behind it, and the
+/// observer fails unless that is still in the input after the write.
+pub const TYPE_AHEAD_FILE: &str = "KR_SETUP_OBSERVER_TYPE_AHEAD_FILE";
 
 /// The rows and columns of the console. More rows than the dialogue prints, so nothing scrolls and
 /// the screen shows each line once.
@@ -210,11 +215,14 @@ fn key_records(text: &str) -> Vec<INPUT_RECORD> {
     records
 }
 
-/// Puts `text` into the console's input as key records, and reads the input back to see that they
-/// are there: the line a person typed before the command had said anything, which no program has
-/// read yet. The case that asks for this fails here, in words, when the console did not take them.
-fn type_ahead(input: &File, text: &str) {
-    let records = key_records(text);
+/// Puts `taken` and then `behind` into the console's input as key records in one write, and reads
+/// the input back to see that the records of `behind` are there: the line a person typed before the
+/// command asked its question, which no program has read yet. What `taken` holds may already have
+/// been read by a program that waits for it, so only `behind` is counted. The case that asks for
+/// this fails here, in words, when the console did not take them.
+fn type_ahead(input: &File, taken: &str, behind: &str) {
+    let records = key_records(&format!("{taken}{behind}"));
+    let kept = key_records(behind).len();
     let count = u32::try_from(records.len()).expect("a short line");
     let mut written = 0_u32;
     // SAFETY: the handle is an open console input, the buffer holds `count` records and the count
@@ -244,10 +252,31 @@ fn type_ahead(input: &File, text: &str) {
         )
     };
     assert!(
-        peek != 0 && seen >= count,
-        "the observer sees the typed-ahead line in the input: {seen} of {count} records queued"
+        peek != 0 && usize::try_from(seen).is_ok_and(|seen| seen >= kept),
+        "the observer sees the typed-ahead line in the input: {seen} of {kept} records queued"
     );
     println!("kr-observer: typed ahead {count} records, {seen} queued");
+}
+
+/// Types the text of the file named by [`TYPE_AHEAD_FILE`] into the console's input when the file
+/// shows up: its first line is the answer to the question `kr` waits at, and the rest is queued
+/// behind it. The file is read once and removed.
+fn type_ahead_when_asked(input: File) {
+    let Some(file) = std::env::var_os(TYPE_AHEAD_FILE).map(PathBuf::from) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                let _ = std::fs::remove_file(&file);
+                let at = text.find('\n').map_or(text.len(), |at| at + 1);
+                let (taken, behind) = text.split_at(at);
+                type_ahead(&input, taken, behind);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
 }
 
 /// How many input records wait in the console, as the console says.
@@ -276,8 +305,13 @@ fn run_kr() {
     }
     let before = (mode_of(&input), mode_of(&output));
     if let Ok(text) = std::env::var(TYPE_AHEAD) {
-        type_ahead(&input, &text);
+        type_ahead(&input, "", &text);
     }
+    type_ahead_when_asked(
+        input
+            .try_clone()
+            .expect("the observer types from the input's own handle"),
+    );
     send_break_when_asked();
     // The most records that waited in the console's input at any time while `kr` ran: a case that
     // asks whether `kr` throws input away reads it, so that a case whose input never waited cannot
