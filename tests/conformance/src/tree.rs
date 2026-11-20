@@ -6,9 +6,11 @@
 //! force: the command and every process it started that is still in the group. A process that
 //! left the group by starting a session or a group of its own is not reached.
 //!
-//! The command's leader is not reaped before the group is ended: a leader that has ended and is not
-//! reaped still holds the group's number, so no other process can have it while the signals are
-//! sent. The report reads the command's pipes to their end first, and waits for the leader after.
+//! When the time is spent, the report sends both signals before it reaps the command's leader: a
+//! leader that has ended and is not reaped still holds the group's number, so no other process can
+//! have it while the signals are sent. A command that ends in its time is reaped as it ends and no
+//! signal is sent. The report reads the command's pipes to their end first, and waits for the leader
+//! after.
 //!
 //! A step without a limit is run as it always was, in the report's own group, and this module
 //! starts nothing for it. Windows has no such group in the standard library, so a step with a limit
@@ -135,16 +137,13 @@ fn supervised(
     // that a process that holds one past the command's end holds this loop no longer than the
     // deadline, and nothing is left reading when it returns.
     while pipes.open() {
-        let read = pipes.read();
-        if !pipes.open() {
-            break;
-        }
-        let now = Instant::now();
-        if now >= deadline.at {
-            return Ok(Waited::TimedOut(Group::ended(&mut child, pipes)));
-        }
-        if !read {
-            std::thread::sleep(POLL.min(deadline.at - now));
+        match pipes.pass(deadline.at, Instant::now) {
+            Pass::Ended => break,
+            Pass::Spent => return Ok(Waited::TimedOut(Group::ended(&mut child, pipes))),
+            Pass::Open(true) => {}
+            Pass::Open(false) => {
+                std::thread::sleep(POLL.min(deadline.at.saturating_duration_since(Instant::now())));
+            }
         }
     }
     let status = loop {
@@ -157,10 +156,9 @@ fn supervised(
                 }
                 std::thread::sleep(POLL.min(deadline.at - now));
             }
-            Err(error) => {
-                Group::end(&mut child, &mut pipes, GRACE);
-                return Err(error);
-            }
+            // A wait that fails means that the leader is not this report's unreaped child, so no
+            // signal is sent: the number could be another process's.
+            Err(error) => return Err(error),
         }
     };
     let captured = pipes.into_captured();
@@ -169,6 +167,18 @@ fn supervised(
         stdout: captured.stdout,
         stderr: captured.stderr,
     }))
+}
+
+/// What one pass over a running command's pipes found.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum Pass {
+    /// Every pipe is at its end.
+    Ended,
+    /// A pipe is open and the time is not spent. Whether the pass read anything.
+    Open(bool),
+    /// A pipe is still open after the time was spent and the pipes were drained.
+    Spent,
 }
 
 /// The command's captured pipes, each read without waiting.
@@ -280,6 +290,28 @@ impl Pipes {
         out + err > 0
     }
 
+    /// One pass: reads once from each open pipe, and, when that leaves a pipe open, looks at the
+    /// clock, which `clock` gives after the read. When the time `deadline` is spent a command may
+    /// have written its last bytes and ended in the interval since the last pass, with the end of
+    /// its pipes not yet read, so the pipes are drained before the time is read as spent. The read
+    /// is of at most [`READ_AT_MOST`] bytes a pipe, and the drain of the bytes queued when it begins
+    /// and one piece more, so a process that goes on writing does not extend the pass.
+    fn pass(&mut self, deadline: Instant, clock: impl FnOnce() -> Instant) -> Pass {
+        let read = self.read();
+        if !self.open() {
+            return Pass::Ended;
+        }
+        if clock() < deadline {
+            return Pass::Open(read);
+        }
+        self.drain();
+        if self.open() {
+            Pass::Spent
+        } else {
+            Pass::Ended
+        }
+    }
+
     /// Reads what each open pipe holds at this moment, and looks for its end.
     fn drain(&mut self) {
         self.stdout.drain(&mut self.buffer);
@@ -388,5 +420,50 @@ mod tests {
         }
         Group::end(&mut child, &mut pipes, Duration::ZERO);
         assert_eq!(pipes.into_captured().stdout, b"queued");
+    }
+
+    /// The pipes of a pass: standard output is `reader`, standard error is not captured.
+    fn pipes_of(reader: std::io::PipeReader) -> Pipes {
+        Pipes {
+            stdout: Pipe::new(Some(OwnedFd::from(reader))).expect("a pipe to read"),
+            stderr: Pipe {
+                fd: None,
+                bytes: Vec::new(),
+            },
+            buffer: vec![0; 64],
+        }
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a command that writes its last byte and
+    /// ends in the last interval before the deadline is not read as out of time. The pass that
+    /// reads the byte is at the deadline, and the read does not see the end of the pipe, so the
+    /// pass drains the pipe before it decides.
+    #[test]
+    fn a_command_that_wrote_its_last_byte_and_ended_by_the_deadline_is_not_out_of_time() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        writer.write_all(b"x").expect("a write");
+        drop(writer);
+        let mut pipes = pipes_of(reader);
+        let at = Instant::now();
+        assert_eq!(pipes.pass(at, || at), Pass::Ended);
+        assert_eq!(pipes.stdout.bytes, b"x");
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a pipe that a process still holds at the
+    /// deadline is out of time, after the pipe is drained of what it holds, and before the deadline
+    /// the pass goes on.
+    #[test]
+    fn a_pipe_that_a_process_holds_at_the_deadline_is_out_of_time_and_before_it_is_open() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        writer.write_all(b"x").expect("a write");
+        let mut pipes = pipes_of(reader);
+        let at = Instant::now();
+        assert_eq!(
+            pipes.pass(at + Duration::from_secs(60), Instant::now),
+            Pass::Open(true)
+        );
+        writer.write_all(b"yz").expect("a write");
+        assert_eq!(pipes.pass(at, || at), Pass::Spent);
+        assert_eq!(pipes.stdout.bytes, b"xyz");
     }
 }
