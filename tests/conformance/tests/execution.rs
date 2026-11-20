@@ -304,6 +304,68 @@ command = ['bash', 'check-root.sh', '{root}']
     );
 }
 
+/// KR-REQ-29.01, the part about reproducible commands: two packages whose `tests/shared.rs` are
+/// links to one file have a target each, and each test program of the build is the tests of its own
+/// package. A match by the file the links lead to, and the name, gives both programs to the first.
+#[cfg(unix)]
+#[test]
+fn two_packages_with_test_files_that_link_to_one_file_each_keep_their_own_target() {
+    let (_directory, root) = copy("linked-source");
+    for package in ["alpha", "beta"] {
+        let tests = root.join(package).join("tests");
+        std::fs::create_dir(&tests).expect("a directory");
+        std::os::unix::fs::symlink("../../common/shared.rs", tests.join("shared.rs"))
+            .expect("a link");
+    }
+    let text = plan_of(
+        &["Cargo.toml"],
+        "[[step]]
+id = 'both'
+group = 'rust'
+what = 'the tests of both packages'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '--workspace']
+",
+    );
+    let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let step = &ran.document.steps[0];
+    assert_eq!(
+        (step.exit, step.error.as_deref()),
+        (Some(0), None),
+        "{step:?}"
+    );
+    let identifier = &ran.document.identifiers["KR-REQ-05.01"];
+    let mut tests: Vec<(&str, Vec<(usize, Outcome)>)> = identifier
+        .tests
+        .iter()
+        .map(|test| {
+            (
+                test.test.as_str(),
+                test.runs
+                    .iter()
+                    .map(|run| (run.step, run.outcome.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+    tests.sort_by_key(|(name, _)| *name);
+    assert_eq!(
+        tests,
+        vec![
+            (
+                "alpha --test shared the_file_both_packages_build",
+                vec![(1, Outcome::Passed)]
+            ),
+            (
+                "beta --test shared the_file_both_packages_build",
+                vec![(1, Outcome::Passed)]
+            ),
+        ],
+        "{identifier:?}"
+    );
+}
+
 /// A plan of one `bash` script step that reads nothing, whose command is `words`.
 #[cfg(unix)]
 fn script_plan(words: &str, more: &str) -> String {
