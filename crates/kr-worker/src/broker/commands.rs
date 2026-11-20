@@ -349,6 +349,10 @@ struct GatewayRun {
     tables: Mutex<Option<crate::broker::connectors::NativeTables>>,
     /// The socket, from the moment it is bound until the task that accepts on it takes it.
     listener: Mutex<Option<crate::broker::endpoint::BoundEndpoint>>,
+    /// The identity of the socket this backend's bind made, kept where the endpoint's move to the
+    /// task that accepts does not take it: retirement removes `socket` only if it is still that
+    /// socket, and where no bind succeeded there is none and nothing is removed.
+    made: Mutex<Option<crate::broker::endpoint::SocketIdentity>>,
     /// Set when the program's one connection has been admitted: no other is.
     claimed: AtomicBool,
     /// The connection's owner while the program is connected, so a backend that is retired ends it.
@@ -405,6 +409,7 @@ impl GatewayRun {
             server: Mutex::new(None),
             tables: Mutex::new(None),
             listener: Mutex::new(None),
+            made: Mutex::new(None),
             claimed: AtomicBool::new(false),
             connection: Mutex::new(None),
             ladders: Mutex::new(Vec::new()),
@@ -1851,14 +1856,18 @@ impl Backend {
         let _ = std::fs::remove_file(self.directory.join(crate::broker::attach::EVENTS_FILE));
         let _ = std::fs::remove_file(&self.registration);
         let _ = std::fs::remove_file(self.directory.join(LAUNCH_RECORD_FILE));
-        if let crate::broker::listener::ListenerAddress::PrivateSocket(socket) =
-            self.gateway.address()
-        {
-            let _ = std::fs::remove_file(socket);
-        }
+        // Only the sockets this backend's binds made: a path that names something else is left, as
+        // is one where no bind succeeded.
         #[cfg(unix)]
-        if let Some(run) = self.gateway_run.as_ref() {
-            let _ = std::fs::remove_file(&run.socket);
+        self.gateway.remove_its_socket();
+        #[cfg(unix)]
+        if let Some(run) = self.gateway_run.as_ref()
+            && let Some(made) = *run
+                .made
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            crate::broker::endpoint::remove_socket_made(&run.socket, made);
         }
         // The directory goes with what was in it, so the names a session draws from are used up
         // only by the backends it still holds and not by every backend it ever had.

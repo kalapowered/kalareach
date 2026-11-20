@@ -566,6 +566,13 @@ impl NativeGateway {
         self.endpoint.address()
     }
 
+    /// Removes the socket file this gateway's endpoint made, if it still stands where it was bound:
+    /// what a retirement takes down of the endpoint.
+    #[cfg(unix)]
+    pub(crate) fn remove_its_socket(&self) {
+        self.endpoint.remove_its_socket();
+    }
+
     /// Returns the registration file a launched process reads.
     #[must_use]
     pub fn registration(&self) -> Option<String> {
