@@ -310,6 +310,21 @@
     },
     {
       "entry": {
+        "store": "draft-revisions",
+        "scope": "environment",
+        "path": "transfers/draft-revisions.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "draft_revisions_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "d24603896090c4bd59c2bafe21eefbaf5f3d7d18881b409edf23e7f6b69ec8d7",
+      "kept": []
+    },
+    {
+      "entry": {
         "store": "environments",
         "scope": "environment",
         "path": "environments.json",
