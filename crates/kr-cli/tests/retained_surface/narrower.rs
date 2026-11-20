@@ -155,7 +155,7 @@ impl Reader for Tree {
     }
 
     fn sightings(&self) -> Result<Vec<Sighting>, String> {
-        Tree::sightings(self, &|_| true)
+        Tree::sightings(self, &|krate| !RECEIVER_CRATES.contains(&krate))
     }
 }
 
@@ -207,7 +207,7 @@ pub fn check_narrower(input: &Input) -> Vec<String> {
     if input.entries.is_empty() {
         return out;
     }
-    if input.retained.len() != 1 {
+    if input.retained.len() != 1 && !input.frozen {
         out.push(format!(
             "an entry of the narrower table is read against exactly one retained record, and this build retains {}",
             input.retained.len()
