@@ -1096,10 +1096,7 @@ fn a_listing_that_does_not_end_is_ended_at_the_steps_limit_with_the_process_it_s
     let kept = log.find("== the listing failed: ").expect(&log);
     let said = log.find("== ran out of its time limit: 8 s").expect(&log);
     assert!(kept < said, "{log}");
-    assert!(
-        log[kept..said].contains("(ended at the time limit)"),
-        "{log}"
-    );
+    assert!(log[kept..said].contains("(time limit reached)"), "{log}");
     assert!(log[kept..said].contains("Compiling timelimits"), "{log}");
 }
 

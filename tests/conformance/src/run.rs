@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::lane;
@@ -721,7 +721,7 @@ fn host(place: &Place<'_>) -> Result<String, Stop> {
     .map_err(|error| format!("rustc could not be asked for the host: {error}"))?
     {
         Waited::Done(output) => output,
-        Waited::TimedOut(_) => return Err(Stop::TimedOut),
+        Waited::TimedOut(_) | Waited::NotStarted => return Err(Stop::TimedOut),
     };
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -765,7 +765,7 @@ fn list(
         .cloned()
         .collect();
     command.extend(["--".to_owned(), "--list".to_owned()]);
-    let output = match tree::output(
+    let waited = tree::output(
         place
             .command(&command)
             .env(&variable, runner)
@@ -775,21 +775,8 @@ fn list(
             .stderr(Stdio::piped()),
         place.deadline,
     )
-    .map_err(|error| format!("the step's tests could not be listed: {error}"))?
-    {
-        Waited::Done(output) => output,
-        Waited::TimedOut(captured) => {
-            // What the listing wrote before its time was spent is kept in the log, where the next
-            // failure of the same kind is read.
-            let _ = keep_failed_listing(
-                log_path,
-                &format!("`{}` (ended at the time limit)", command.join(" ")),
-                &String::from_utf8_lossy(&captured.stdout),
-                &String::from_utf8_lossy(&captured.stderr),
-            );
-            return Err(Stop::TimedOut);
-        }
-    };
+    .map_err(|error| format!("the step's tests could not be listed: {error}"))?;
+    let output = listed(waited, &command, log_path)?;
     let standard_error = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         let command = command.join(" ");
@@ -1079,6 +1066,25 @@ fn keep_failed_listing(
     )
 }
 
+/// What the listing of a step's tests gave. A listing whose time was spent leaves what it wrote
+/// before then in the log, where the next failure of the same kind is read, and a listing that was
+/// not started, because the time was spent before it was due, leaves nothing: it wrote nothing.
+fn listed(waited: Waited<Output>, command: &[String], log_path: &Path) -> Result<Output, Stop> {
+    match waited {
+        Waited::Done(output) => Ok(output),
+        Waited::TimedOut(captured) => {
+            let _ = keep_failed_listing(
+                log_path,
+                &format!("`{}` (time limit reached)", command.join(" ")),
+                &String::from_utf8_lossy(&captured.stdout),
+                &String::from_utf8_lossy(&captured.stderr),
+            );
+            Err(Stop::TimedOut)
+        }
+        Waited::NotStarted => Err(Stop::TimedOut),
+    }
+}
+
 /// Appends `text` to the step's log.
 fn append_to_log(log_path: &Path, text: &str) -> Result<(), String> {
     let mut log = std::fs::OpenOptions::new()
@@ -1236,7 +1242,7 @@ fn build_first(
     .map_err(|error| format!("{} could not be started: {error}", command[0]))?
     {
         Waited::Done(output) => output,
-        Waited::TimedOut(_) => return Err(Stop::TimedOut),
+        Waited::TimedOut(_) | Waited::NotStarted => return Err(Stop::TimedOut),
     };
     if !output.status.success() {
         return Err(Stop::Failed(format!(
@@ -1676,7 +1682,7 @@ fn run_logged(
         .map_err(|error| format!("{} could not be started: {error}", command[0]))?
     {
         Waited::Done(status) => Ok(status.code()),
-        Waited::TimedOut(_) => Err(Stop::TimedOut),
+        Waited::TimedOut(_) | Waited::NotStarted => Err(Stop::TimedOut),
     }
 }
 
@@ -1687,11 +1693,12 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        Binary, Compiled, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, artifact_key, date_before,
-        dependency_file, ends_of, ends_of_root_resolved, file_name, is_count, is_named_by_digest,
-        libtest, may_have_been_read_while_written, read_listing, reconcile, targets_by_artifact,
-        unrecorded,
+        Binary, Compiled, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Stop, Unit, artifact_key,
+        date_before, dependency_file, ends_of, ends_of_root_resolved, file_name, is_count,
+        is_named_by_digest, libtest, listed, may_have_been_read_while_written, read_listing,
+        reconcile, targets_by_artifact, unrecorded,
     };
+    use crate::tree::{Captured, Waited};
     use crate::workspace::{Package, Target, TargetId, TargetKind};
 
     fn test_target(name: &str) -> TargetId {
@@ -1757,6 +1764,36 @@ mod tests {
                 (test_target("t"), names(&["a::one", "a::two"])),
                 (test_target("u"), names(&["b"])),
             ])
+        );
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a listing whose time was spent leaves what
+    /// it wrote in the step's log, with the words that its time limit was reached, and a listing
+    /// that was not started leaves nothing: it never ran, so no line says that it failed.
+    #[test]
+    fn a_listing_that_reached_its_time_limit_is_logged_and_one_that_was_not_started_is_not() {
+        let place = tempfile::tempdir().expect("a directory");
+        let log = place.path().join("step.log");
+        let command: Vec<String> = ["cargo", "test", "--", "--list"]
+            .map(str::to_owned)
+            .to_vec();
+        assert!(matches!(
+            listed(Waited::NotStarted, &command, &log),
+            Err(Stop::TimedOut)
+        ));
+        assert!(!log.exists(), "a listing that did not start left a line");
+        let captured = Captured {
+            stdout: b"listed\n".to_vec(),
+            stderr: b"warned\n".to_vec(),
+        };
+        assert!(matches!(
+            listed(Waited::TimedOut(captured), &command, &log),
+            Err(Stop::TimedOut)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("the log"),
+            "== the listing failed: `cargo test -- --list` (time limit reached)\n\
+             == its standard output\nlisted\n\n== its standard error\nwarned\n\n"
         );
     }
 

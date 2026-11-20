@@ -65,9 +65,10 @@ pub struct Captured {
 pub enum Waited<T> {
     /// It ended before its time was spent.
     Done(T),
-    /// Its time was spent, and its processes were ended, or it was not started. This is what it
-    /// had written.
+    /// Its time was spent, and its processes were ended. This is what it had written.
     TimedOut(Captured),
+    /// Its time was spent before it was due to start, so it was not started.
+    NotStarted,
 }
 
 /// Runs `command` to its end with its standard output (and its standard error, when the caller set
@@ -96,6 +97,7 @@ pub fn status(command: &mut Command, deadline: Option<Deadline>) -> io::Result<W
         Some(deadline) => Ok(match supervised(command, deadline, false)? {
             Waited::Done(output) => Waited::Done(output.status),
             Waited::TimedOut(captured) => Waited::TimedOut(captured),
+            Waited::NotStarted => Waited::NotStarted,
         }),
     }
 }
@@ -117,7 +119,7 @@ fn supervised(
     // The work between one command of a step and the next can take the time that is left: a command
     // whose time is spent is not started.
     if Instant::now() >= deadline.at {
-        return Ok(Waited::TimedOut(Captured::default()));
+        return Ok(Waited::NotStarted);
     }
     Group::prepare(command);
     if capture {
