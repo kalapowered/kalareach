@@ -11,10 +11,11 @@
 //! What the inventory does not read it refuses, with an error that names the file (the crate, for a
 //! crate with no target): a path through a link or outside the checkout, a module declared in a
 //! block or by a macro, `include!`, a `#[path]` that is not one string, a module that is at no file
-//! or at two, a crate with no target, a `macro_rules!` written in the tokens of another macro, and
-//! an item-position macro of another crate that is not on the list of those accepted. The macros
-//! called in the transcribers of a `macro_rules!` definition, at any depth, are held to the same
-//! list. A `macro_rules!` name that is defined more than once is one definition under it.
+//! or at two, a crate with no target, a `macro_rules!` written in the tokens of another macro,
+//! `#[macro_use]` on `extern crate`, and an item-position macro of another crate that is not on the
+//! list of those accepted. The macros called in the transcribers of a `macro_rules!` definition, at
+//! any depth, are held to the same list. A `macro_rules!` name that is defined more than once is one
+//! definition under it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
 use super::condition;
-use super::walker::{VARIANTS, is_own_prefix, normalised, path_before, transcribers};
+use super::walker::{VARIANTS, normalised, path_before, transcribers};
 
 /// The macros of other crates that product code may call at item position and in a transcriber, each
 /// with the paths that name its provider (`""` is a bare call) and why none of them can make a module
@@ -123,64 +124,80 @@ const STD_MACROS: &[&str] = &[
     "writeln",
 ];
 
-/// What a macro call is resolved in: the crate's own definitions and modules, and what its `use`
-/// lines import by name.
-struct Scope {
-    /// The `macro_rules!` names defined in the crate, and those written in the tokens of one.
-    defined: BTreeSet<String>,
-    /// The names of the modules the crate declares.
-    modules: BTreeSet<String>,
-    /// For each name a `use` brings in, the full paths it stands for. A glob stands for none.
-    imports: BTreeMap<String, BTreeSet<Vec<String>>>,
+/// Where a macro of another crate may be called that the scan does not read: at item position, or in
+/// the transcriber of a `macro_rules!` definition.
+#[derive(Clone, Copy)]
+enum Position {
+    Item,
+    Transcriber,
 }
 
-impl Scope {
-    /// Whether the call written as `path` is the crate's own macro, a macro of the standard library
-    /// that makes no item (by its bare name or by a path of `std`, `core` or `alloc`), or one of
-    /// [`ACCEPTED`] from the provider that makes it safe.
-    fn accepts(&self, path: &[String]) -> bool {
-        let Some(first) = path.first() else {
-            return false;
-        };
-        match self.imports.get(first) {
-            Some(fulls) => fulls.iter().all(|full| {
-                let mut resolved = full.clone();
-                resolved.extend_from_slice(&path[1..]);
-                self.resolved(&resolved)
-            }),
-            None => self.resolved(path),
+impl Position {
+    fn words(self) -> &'static str {
+        match self {
+            Self::Item => "item position",
+            Self::Transcriber => "a transcriber",
         }
     }
+}
 
-    /// `accepts` for a path whose first segment is no imported name.
-    fn resolved(&self, path: &[String]) -> bool {
-        let (Some(name), Some(first)) = (path.last(), path.first()) else {
-            return false;
-        };
-        if path.len() == 1 {
-            return self.defined.contains(name)
-                || STD_MACROS.contains(&name.as_str())
-                || Self::provided(name, "");
-        }
-        // The crate's own prefix, or one of its modules, names a macro the crate defines: a name that a
-        // `use` brought from elsewhere, or that a re-export holds, is none.
-        if is_own_prefix(first) {
-            return self.defined.contains(name);
-        }
-        if matches!(first.as_str(), "std" | "core" | "alloc") && STD_MACROS.contains(&name.as_str())
-        {
-            return true;
-        }
-        (self.modules.contains(first) && self.defined.contains(name))
-            || Self::provided(name, &path[..path.len() - 1].join("::"))
-    }
+/// What one file's `use` lines bring in by name: for each name, the full paths it stands for. A glob
+/// stands for none.
+type Imports = BTreeMap<String, BTreeSet<Vec<String>>>;
 
-    /// Whether `provider` is one of those the family `name` is accepted from.
-    fn provided(name: &str, provider: &str) -> bool {
-        ACCEPTED
-            .iter()
-            .any(|(accepted, providers, _)| *accepted == name && providers.contains(&provider))
+/// Whether the call written as `path` in a file with these imports is a macro the scan accepts (R3):
+/// the crate's own (a bare call, or one written from `crate`, `self`, `super`, `$crate` or one of its
+/// modules, of a name the crate defines), a macro of the standard library that makes no item (by its
+/// bare name or by a path of `std`, `core` or `alloc`), or one of [`ACCEPTED`] written with the path
+/// of its provider. A bare name that the file imports stands for the paths it imports.
+fn accepts(
+    path: &[String],
+    imports: &Imports,
+    defined: &BTreeSet<String>,
+    modules: &BTreeSet<String>,
+) -> bool {
+    let Some(first) = path.first() else {
+        return false;
+    };
+    match imports.get(first) {
+        Some(fulls) => fulls.iter().all(|full| {
+            let mut written = full.clone();
+            written.extend_from_slice(&path[1..]);
+            written_as_accepted(&written, defined, modules)
+        }),
+        None => written_as_accepted(path, defined, modules),
     }
+}
+
+/// `accepts` for a path whose first segment no `use` of the file gives.
+fn written_as_accepted(
+    path: &[String],
+    defined: &BTreeSet<String>,
+    modules: &BTreeSet<String>,
+) -> bool {
+    let (Some(name), Some(first)) = (path.last(), path.first()) else {
+        return false;
+    };
+    if path.len() == 1 {
+        return defined.contains(name) || STD_MACROS.contains(&name.as_str()) || provided(name, "");
+    }
+    // The crate's own prefix names a macro the crate defines: a name that a `use` brought from
+    // elsewhere, or that a re-export holds, is none. A module of the crate is one too, and a path from
+    // a module named like a provider is never that provider's.
+    if matches!(first.as_str(), "crate" | "$crate" | "self" | "super") || modules.contains(first) {
+        return defined.contains(name);
+    }
+    if matches!(first.as_str(), "std" | "core" | "alloc") && STD_MACROS.contains(&name.as_str()) {
+        return true;
+    }
+    provided(name, &path[..path.len() - 1].join("::"))
+}
+
+/// Whether `provider` is one of those the family `name` is accepted from.
+fn provided(name: &str, provider: &str) -> bool {
+    ACCEPTED
+        .iter()
+        .any(|(accepted, providers, _)| *accepted == name && providers.contains(&provider))
 }
 
 /// What the product code of a crate is made of.
@@ -189,16 +206,9 @@ pub struct Inventory {
     pub files: Vec<PathBuf>,
     /// The `macro_rules!` names product code defines, at any depth.
     pub defined: BTreeSet<String>,
-    /// The names of those that carry `#[macro_export]`.
-    pub exported: BTreeSet<String>,
     /// Each `use` or `extern crate` that gives a name another name: the file, the name it came as and
     /// the name it gives.
     pub renames: Vec<(String, String, String)>,
-    /// For each name a `use` gives under a name of its own (`use a::b as c`): the name it came as.
-    pub imported_as: BTreeMap<String, BTreeSet<String>>,
-    /// The item-position macros that nothing in the crate defines and the scan does not accept:
-    /// the file and the name of the first call of each.
-    pub unaccepted: Vec<(String, String)>,
 }
 
 /// One body-less module declaration that product code makes: where its file may be, and whether a
@@ -245,9 +255,8 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
     // The names the crate defines a `macro_rules!` for. Definitions of one name, in any place, are one
     // under it: what either calls is called, so a name defined twice adds marks and takes none away.
     let mut defined: BTreeSet<String> = BTreeSet::new();
-    let mut exported = BTreeSet::new();
-    let mut calls: Vec<(String, Vec<String>)> = Vec::new();
-    let mut imports: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
+    // The macros called at item position and in transcribers, with the imports of the file they are in.
+    let mut calls: Vec<(String, Imports, Vec<(Position, Vec<String>)>)> = Vec::new();
     let mut module_set: BTreeSet<String> = BTreeSet::new();
     let mut renames: Vec<(String, String, String)> = Vec::new();
     while let Some(visit) = todo.pop() {
@@ -291,7 +300,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             declared: Vec::new(),
             defined: Vec::new(),
             calls: Vec::new(),
-            imports: Vec::new(),
+            imports: Imports::new(),
             module_names: Vec::new(),
             renamed: Vec::new(),
             error: None,
@@ -300,16 +309,8 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
         if let Some(error) = reader.error {
             return Err(error);
         }
-        for (name, export) in reader.defined {
-            if export {
-                exported.insert(name.clone());
-            }
-            defined.insert(name);
-        }
-        calls.extend(reader.calls.into_iter().map(|path| (at.clone(), path)));
-        for (local, full) in reader.imports {
-            imports.entry(local).or_default().insert(full);
-        }
+        defined.extend(reader.defined);
+        calls.push((at.clone(), reader.imports, reader.calls));
         module_set.extend(reader.module_names);
         renames.extend(
             reader
@@ -356,42 +357,30 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             }
         }
     }
-    let mut imported_as: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (local, fulls) in &imports {
-        for full in fulls {
-            if let Some(original) = full.last()
-                && original != local
+    // R3: a macro called at item position or in a transcriber is the crate's own, a macro of the
+    // standard library or one the scan lists, each by its written path. The first refused, by name.
+    let mut unaccepted: BTreeMap<String, (String, Position)> = BTreeMap::new();
+    for (at, imports, found) in &calls {
+        for (position, path) in found {
+            if let Some(name) = path.last()
+                && !accepts(path, imports, &defined, &module_set)
             {
-                imported_as
-                    .entry(local.clone())
-                    .or_default()
-                    .insert(original.clone());
+                unaccepted
+                    .entry(name.clone())
+                    .or_insert_with(|| (at.clone(), *position));
             }
         }
     }
-    let scope = Scope {
-        defined: defined.clone(),
-        modules: module_set,
-        imports,
-    };
-    let mut unaccepted: BTreeMap<String, String> = BTreeMap::new();
-    for (at, path) in &calls {
-        if let Some(name) = path.last()
-            && !scope.accepts(path)
-        {
-            unaccepted.entry(name.clone()).or_insert_with(|| at.clone());
-        }
+    if let Some((name, (at, position))) = unaccepted.into_iter().next() {
+        return Err(format!(
+            "{at}: {name}! is called at {}, is not defined in {krate} and is not written as one of the macros the scan accepts",
+            position.words()
+        ));
     }
     Ok(Inventory {
         files: reached.into_iter().collect(),
         defined,
-        exported,
-        imported_as,
         renames,
-        unaccepted: unaccepted
-            .into_iter()
-            .map(|(name, at)| (at, name))
-            .collect(),
     })
 }
 
@@ -404,12 +393,12 @@ struct Reader<'a> {
     /// How many blocks the visit is inside.
     block: usize,
     declared: Vec<Declared>,
-    /// `macro_rules!` definitions: the name, and whether it is exported.
-    defined: Vec<(String, bool)>,
+    /// The names of the `macro_rules!` definitions.
+    defined: Vec<String>,
     /// The macros called at item position and in the transcribers of a definition, as written.
-    calls: Vec<Vec<String>>,
-    /// What each `use` brings in: the name it gives, and the path it stands for.
-    imports: Vec<(String, Vec<String>)>,
+    calls: Vec<(Position, Vec<String>)>,
+    /// What each `use` brings in: the name it gives, and the paths it stands for.
+    imports: Imports,
     /// The modules declared.
     module_names: Vec<String>,
     /// The names a `use` or an `extern crate` gives another name: the name it came as, and its own.
@@ -486,17 +475,16 @@ impl Reader<'_> {
 
     fn call(&mut self, path: &syn::Path) {
         if !path.segments.is_empty() {
-            self.calls.push(
+            self.calls.push((
+                Position::Item,
                 path.segments
                     .iter()
                     .map(|segment| segment.ident.unraw().to_string())
                     .collect(),
-            );
+            ));
         }
     }
 
-    /// Whether the attributes carry `#[name]`, written or added by a `cfg_attr` that some
-    /// configuration enables.
     /// Takes the renames of a `use` or an `extern crate`, and refuses one of a name the scan reads.
     fn note_renames(&mut self, found: Vec<(String, String)>) {
         for (old, new) in found {
@@ -524,6 +512,8 @@ impl Reader<'_> {
         }
     }
 
+    /// Whether the attributes carry `#[name]`, written or added by a `cfg_attr` that some
+    /// configuration enables.
     fn carries(&mut self, attrs: &[syn::Attribute], name: &str) -> bool {
         match condition::carries(attrs, name, self.at) {
             Ok(found) => found,
@@ -565,6 +555,13 @@ impl<'ast> Visit<'ast> for Reader<'_> {
 
     fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
         if self.enter(&node.attrs) {
+            // A `#[macro_use]` on `extern crate` brings the macros of that crate in by name (R4).
+            if self.carries(&node.attrs, "macro_use") {
+                self.error.get_or_insert(format!(
+                    "{}: the scan does not read #[macro_use] on extern crate",
+                    self.at
+                ));
+            }
             if let Some((_, rename)) = &node.rename {
                 self.note_renames(vec![(node.ident.to_string(), rename.to_string())]);
             }
@@ -652,8 +649,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         }
         match &node.ident {
             Some(name) if node.mac.path.is_ident("macro_rules") => {
-                let exported = self.carries(&node.attrs, "macro_export");
-                self.defined.push((name.to_string(), exported));
+                self.defined.push(name.to_string());
                 for expansion in transcribers(&node.mac.tokens) {
                     token_calls(&expansion, &mut self.calls);
                 }
@@ -725,7 +721,9 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                     })
                     .collect(),
             );
-            self.imports.extend(found);
+            for (local, full) in found {
+                self.imports.entry(local).or_default().insert(full);
+            }
         }
     }
 }
@@ -832,7 +830,7 @@ fn form_in(tokens: &TokenStream) -> Option<Form> {
 /// The macros the tokens of a transcriber call, at any depth, each as the path it is written with.
 /// A call through a metavariable (`$m!(..)`) names no macro, and a `macro_rules!` written in the
 /// tokens is refused before this is read.
-fn token_calls(stream: &TokenStream, calls: &mut Vec<Vec<String>>) {
+fn token_calls(stream: &TokenStream, calls: &mut Vec<(Position, Vec<String>)>) {
     let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
     let mut at = 0;
     while at < flat.len() {
@@ -844,7 +842,7 @@ fn token_calls(stream: &TokenStream, calls: &mut Vec<Vec<String>>) {
                     && !(at > 0
                         && matches!(&flat[at - 1], TokenTree::Punct(dollar) if dollar.as_char() == '$')) =>
             {
-                calls.push(path_before(&flat, at));
+                calls.push((Position::Transcriber, path_before(&flat, at)));
             }
             _ => {}
         }

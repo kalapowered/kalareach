@@ -501,10 +501,7 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("macro:own", vec![Names]),
         ("macro:forwards", vec![Names]),
         ("macro:check", vec![Names]),
-        // The definitions written in the body of `local` are macros of their own.
-        ("macro:check_local", vec![Names]),
-        ("macro:check_paren", vec![Names]),
-        ("macro:check_brack", vec![Names]),
+        // The definitions written in the body of `local` are part of it.
         ("local", vec![Names]),
         ("uses_fwd", vec![Names]),
         ("macro:outer_fwd", vec![Expands]),
