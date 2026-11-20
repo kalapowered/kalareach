@@ -484,6 +484,22 @@ fn an_inner_condition_of_a_file_decides_whether_the_file_is_read() {
             "{name}"
         );
     }
+    // The condition of the declaration that reaches a file holds for each item in it as well.
+    let folder = small_tree("#[cfg(unix)]\nmod unix_only;\n");
+    write(
+        folder.path(),
+        "crates/kr-sender/src/unix_only.rs",
+        "#[cfg(windows)]\nfn from_windows_in_unix() {}\nfn from_unix_file() {}\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
+    assert_eq!(
+        tree.item("kr_sender", "from_windows_in_unix"),
+        Lookup::Absent
+    );
+    assert!(matches!(
+        tree.item("kr_sender", "from_unix_file"),
+        Lookup::Found(_)
+    ));
 }
 
 #[test]
@@ -952,6 +968,10 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
     // A call at item position by a path, with a sighting in its arguments.
     let lib = "schemars::json_schema!({ \"x\": \"agent.turn.cancel\" });\nmacro_rules! json_schema { ($m:expr) => { $m }; }\n";
     assert_eq!(across(lib, "json_schema"), refused("json_schema"));
+    // The same call whose arguments begin with a name, which the scan takes for the item it defines:
+    // the call is then the one place that tells the scan the macro is the other crate's.
+    let lib = "schemars::json_schema!(Holder { \"x\": \"agent.turn.cancel\" });\nmacro_rules! json_schema { ($m:expr) => { $m }; }\n";
+    assert_eq!(across(lib, "json_schema"), refused("json_schema"));
 }
 
 #[test]
@@ -974,11 +994,10 @@ fn a_macro_defined_in_a_function_body_is_a_macro_of_its_own() {
         ]))
     );
     // Its rules are an item, whose source holds the definition; one that no build holds is not.
-    let source = tree
+    let held = tree
         .source("kr_sender", "macro:inner")
-        .expect("a lookup")
-        .expect("a source");
-    assert!(source.text.contains("macro_rules"), "{}", source.text);
+        .is_ok_and(|found| found.is_some_and(|source| source.text.contains("macro_rules")));
+    assert!(held, "the source of macro:inner holds its definition");
     assert!(matches!(
         tree.item("kr_sender", "macro:inner"),
         Lookup::Found(_)
@@ -1018,6 +1037,7 @@ fn a_cfg_attr_that_adds_macro_export_or_macro_use_counts_where_some_configuratio
         "#[cfg_attr(test, macro_export)]",
         "#[cfg_attr(all(unix, test), macro_export)]",
         "#[cfg_attr(unix, cfg_attr(test, macro_export))]",
+        "#[cfg_attr(windows, cfg_attr(unix, macro_export))]",
         "#[cfg_attr(unix, allow(unused))]",
     ] {
         assert_eq!(
@@ -1176,6 +1196,16 @@ fn a_crate_is_read_from_the_targets_cargo_reports_for_it() {
     assert_eq!(
         sender_names(&tree_at(folder.path()).expect("the tree")),
         Ok(vec!["on".to_owned()])
+    );
+    // A workspace Cargo cannot read is no tree, and the first line of its complaint is the text.
+    let folder = small_tree("pub fn quiet() {}\n");
+    write(folder.path(), "crates/odd/Cargo.toml", "[workspace]\n");
+    let refused = tree_at(folder.path()).err();
+    assert!(
+        refused.as_ref().is_some_and(|error| error
+            .contains(": cargo cannot read the workspace (error: ")
+            && error.ends_with(')')),
+        "{refused:?}"
     );
 }
 

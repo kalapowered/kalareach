@@ -1080,12 +1080,13 @@ fn the_gate_lists_the_tags_apart_from_the_reader_and_holds_the_snapshots_to_them
         .trim()
         .parse()
         .expect("a date");
-    let annotated = listed_releases(work)
-        .expect("the tags")
-        .into_iter()
-        .find(|tagged| tagged.tag == tag)
-        .expect("the annotated tag is listed");
-    assert_eq!((annotated.commit, annotated.committed), (commit, date));
+    let listed = listed_releases(work);
+    let annotated = listed
+        .as_ref()
+        .ok()
+        .and_then(|all| all.iter().find(|tagged| tagged.tag == tag))
+        .map(|tagged| (tagged.commit.clone(), tagged.committed));
+    assert_eq!(annotated, Some((commit, date)), "{listed:?}");
 }
 
 #[test]
