@@ -217,10 +217,12 @@ manifest again, refuses a `release.json` that is not what the tree makes, and si
 key. The channel's root names the keys that may sign and how many must; a release signed by one
 key of a two-key threshold, or by one key described twice, does not verify. A release key is an
 Ed25519 key of 32 bytes, the one spelling of a key; a root that names a key of another kind or
-size, one key under two identifiers in a role, or one key for two roles, is refused: each role
-(root, targets, snapshot and timestamp) has keys of its own, so the key that signs a release signs
-nothing else. The tool and a host refuse such a root in the same place. A host that holds one,
-which only a root made by an older `kr-release dev-keys` is, is installed again in a new store.
+size, one key under two identifiers in a role, or one key for two roles, is refused: no role
+(root, targets, snapshot or timestamp) shares a key's bytes with another, which is what the tool
+and a host check, and a key derived from another, such as its negation or its sum with a
+small-order point, is not found. The tool and a host refuse such a root in the same place. A host
+that holds one, which a root made by an older `kr-release dev-keys` is, is installed again in a new
+store.
 `check` refuses a tree whose `release.json` is not what the tree now makes, without signing.
 `--development` lets the record keep a pending class, which a release does not. `verify` is a host's
 own check of a release: the signatures against the root, then every file against the manifest.
