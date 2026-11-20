@@ -93,6 +93,63 @@ fn names(root: &Path, directory: &str) {
     write(root, &format!("{directory}/benches/m.rs"), MAIN);
 }
 
+/// The workspace `variants`: `p` has features, targets that need them, a dev-dependency on itself,
+/// and targets with a `bench` key; `r` has a dev-dependency on itself that leaves its default
+/// features off; `q` has no feature.
+fn variants(root: &Path, directory: &str) {
+    write(
+        root,
+        &format!("{directory}/Cargo.toml"),
+        "[workspace]\nresolver = \"3\"\nmembers = [\"p\", \"q\", \"r\"]\n",
+    );
+    write(
+        root,
+        &format!("{directory}/p/Cargo.toml"),
+        &manifest(
+            "p",
+            "\n[features]\ndefault = [\"d\"]\nd = []\nf = []\ng = [\"f\"]\ns = []\n\n\
+             [dev-dependencies]\np = { path = \".\", features = [\"s\"] }\n\n\
+             [[bin]]\nname = \"y\"\npath = \"src/bin/y.rs\"\nbench = false\n\n\
+             [[test]]\nname = \"off\"\npath = \"tests/off.rs\"\ntest = false\n\n\
+             [[test]]\nname = \"needf\"\npath = \"tests/needf.rs\"\nrequired-features = [\"f\"]\n\n\
+             [[test]]\nname = \"needs\"\npath = \"tests/needs.rs\"\nrequired-features = [\"s\"]\n\n\
+             [[test]]\nname = \"needd\"\npath = \"tests/needd.rs\"\nrequired-features = [\"d\"]\n\n\
+             [[test]]\nname = \"needg\"\npath = \"tests/needg.rs\"\nrequired-features = [\"g\"]\n\n\
+             [[test]]\nname = \"v\"\npath = \"tests/v.rs\"\ntest = false\nbench = true\n\n\
+             [[test]]\nname = \"w\"\npath = \"tests/w.rs\"\nbench = true\n\n\
+             [[bench]]\nname = \"m\"\npath = \"benches/m.rs\"\nharness = false\n\n\
+             [[bench]]\nname = \"nb\"\npath = \"benches/nb.rs\"\nharness = false\nbench = false\n\n\
+             [[example]]\nname = \"g\"\npath = \"examples/g.rs\"\nbench = true\n",
+        ),
+    );
+    write(root, &format!("{directory}/p/src/lib.rs"), LIB);
+    write(root, &format!("{directory}/p/src/bin/x.rs"), MAIN);
+    write(root, &format!("{directory}/p/src/bin/y.rs"), MAIN);
+    for test in ["t1", "off", "needf", "needs", "needd", "needg", "v", "w"] {
+        write(root, &format!("{directory}/p/tests/{test}.rs"), TEST);
+    }
+    for bench in ["m", "nb"] {
+        write(root, &format!("{directory}/p/benches/{bench}.rs"), MAIN);
+    }
+    write(root, &format!("{directory}/p/examples/g.rs"), MAIN);
+    write(
+        root,
+        &format!("{directory}/r/Cargo.toml"),
+        &manifest(
+            "r",
+            "\n[features]\ndefault = [\"d\"]\nd = []\ns = []\n\n\
+             [dev-dependencies]\nr = { path = \".\", default-features = false, features = [\"s\"] }\n\n\
+             [[test]]\nname = \"rd\"\npath = \"tests/rd.rs\"\nrequired-features = [\"d\"]\n\n\
+             [[test]]\nname = \"rs\"\npath = \"tests/rs.rs\"\nrequired-features = [\"s\"]\n",
+        ),
+    );
+    write(root, &format!("{directory}/r/src/lib.rs"), LIB);
+    for test in ["rd", "rs"] {
+        write(root, &format!("{directory}/r/tests/{test}.rs"), TEST);
+    }
+    small(root, &format!("{directory}/q"), "q", false, true);
+}
+
 /// The workspaces with the commands each is asked about: a virtual one with `default-members`, a
 /// virtual one without, one whose root is a package with two members, and one whose only package has
 /// a library that is never tested.
@@ -129,11 +186,13 @@ fn fixtures(root: &Path) -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
         "[workspace]\nresolver = \"3\"\nmembers = [\"n\"]\n",
     );
     names(root, "names/n");
+    variants(root, "variants");
     vec![
         ("virtual-with-defaults", table()),
         ("virtual-without-defaults", table()),
         ("package-root", table()),
         ("names", names_table()),
+        ("variants", variants_table()),
     ]
 }
 
@@ -200,6 +259,55 @@ fn table() -> Vec<Vec<&'static str>> {
         "-p a --bin x --bin [yz]",
         "somename",
         "-p a somename",
+    ]
+    .iter()
+    .map(|line| line.split(' ').filter(|word| !word.is_empty()).collect())
+    .collect()
+}
+
+/// The commands of the table for the workspace `variants`: the features a command turns on, the
+/// targets that need them, and the `bench` key.
+fn variants_table() -> Vec<Vec<&'static str>> {
+    [
+        "",
+        "-p p",
+        "-p p --features f",
+        "-p p -F g",
+        "-p p --features p/f",
+        "-p p --features d",
+        "-p p --features f,s",
+        "-p p --all-features",
+        "-p p --no-default-features",
+        "-p p --no-default-features --features f",
+        "-p p --test off",
+        "-p p --test needf --features f",
+        "-p p --test need* --all-features",
+        "-p p --test needg --features g",
+        "-p p --tests",
+        "-p p --tests --features f",
+        "-p p --benches",
+        "-p p --benches --features f",
+        "-p p --all-targets",
+        "-p p --all-targets --all-features",
+        "-p p --bench nb",
+        "-p p --bench m",
+        "-p p --example g",
+        "-p p --examples",
+        "-p p --bins",
+        "-p p --bin y",
+        "-p p somename",
+        "-p p somename --features g",
+        "-p r",
+        "-p r --no-default-features",
+        "-p r --all-features",
+        "-p r --test rs",
+        "--features f",
+        "--workspace --features p/f",
+        "--features s",
+        "--all-features",
+        "--no-default-features",
+        "--benches",
+        "--all-targets",
     ]
     .iter()
     .map(|line| line.split(' ').filter(|word| !word.is_empty()).collect())

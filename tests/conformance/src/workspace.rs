@@ -91,6 +91,11 @@ pub struct Target {
     pub src_path: PathBuf,
     /// Whether `cargo test` builds and runs it without being asked by name.
     pub tested_by_default: bool,
+    /// Whether `cargo test --benches` builds it: its manifest's `bench` key, else Cargo's default for
+    /// its kind, which is true for a library, a binary and a benchmark and false for the rest.
+    pub benchmarked: bool,
+    /// The features that its manifest asks to be on before Cargo builds it.
+    pub required_features: Vec<String>,
     /// Whether it runs under the standard test harness. A target whose manifest entry says
     /// `harness = false` is a program of its own: it prints no list and no verdicts the report can
     /// read, and only its exit status says anything.
@@ -108,6 +113,11 @@ pub struct Package {
     pub version: String,
     /// Its targets.
     pub targets: Vec<Target>,
+    /// Its features, each with the features and dependencies that turning it on turns on.
+    pub features: BTreeMap<String, Vec<String>>,
+    /// The features that its dev-dependency on itself turns on, `default` among them unless that
+    /// dependency leaves the default features off.
+    pub self_dev_features: BTreeSet<String>,
     /// Its manifest.
     pub manifest: PathBuf,
     /// The crates it depends on from crates.io under their own names, with no other dependency
@@ -298,59 +308,95 @@ fn describe(root: &Path, manifest: &str, value: &Value) -> Result<Vec<Package>, 
             .registry_crates
             .retain(|name| locked_from_crates_io(&lock, name));
     }
-    // Cargo's description leaves the harness out, so each manifest says it.
+    // Cargo's description leaves the harness and the `bench` key out, so each manifest says them.
     for package in &mut packages {
         let manifest = std::fs::read_to_string(&package.manifest).map_err(|error| {
             format!("{} could not be read: {error}", package.manifest.display())
         })?;
-        let own = own_harnesses(&manifest, &package.name);
+        let tables = table_keys(&manifest, &package.name);
         for target in &mut package.targets {
-            target.harness = !own.contains(&(target.id.kind, target.id.name.clone()));
+            let table = tables
+                .iter()
+                .find(|table| table.kind == target.id.kind && table.name == target.id.name);
+            target.harness = !table.is_some_and(|table| table.own_harness);
+            if let Some(bench) = table.and_then(|table| table.bench) {
+                target.benchmarked = bench;
+            }
         }
     }
     Ok(packages)
 }
 
-/// The targets a manifest gives a harness of their own (`harness = false`), each by the kind of
-/// table it is declared in and its name. A `[lib]` table without a name is the package's library.
-fn own_harnesses(manifest: &str, package: &str) -> Vec<(TargetKind, String)> {
+/// What a manifest's table for one target says about its harness and its benchmark.
+#[derive(Debug, PartialEq, Eq)]
+struct TableKeys {
+    kind: TargetKind,
+    name: String,
+    /// The table says `harness = false`: the target is a program of its own.
+    own_harness: bool,
+    /// The table's `bench` key, if it has one.
+    bench: Option<bool>,
+}
+
+/// The tables of a manifest that declare a target, each with the keys above, by the kind of table
+/// and its name. A `[lib]` table without a name is the package's library.
+fn table_keys(manifest: &str, package: &str) -> Vec<TableKeys> {
     let mut found = Vec::new();
-    let mut table: Option<TargetKind> = None;
-    let mut name: Option<String> = None;
-    let mut own = false;
-    let mut close = |table: Option<TargetKind>, name: Option<String>, own: bool| {
-        if let (Some(kind), true) = (table, own) {
-            found.push((kind, name.unwrap_or_else(|| package.replace('-', "_"))));
-        }
-    };
+    let mut open: Option<TableKeys> = None;
     for line in manifest.lines() {
         let line = line.split('#').next().unwrap_or_default().trim();
         if line.starts_with('[') {
-            close(table, name.take(), own);
-            table = match line {
+            found.extend(open.take());
+            open = match line {
                 "[lib]" => Some(TargetKind::Lib),
                 "[[bin]]" => Some(TargetKind::Bin),
                 "[[test]]" => Some(TargetKind::Test),
                 "[[bench]]" => Some(TargetKind::Bench),
                 "[[example]]" => Some(TargetKind::Example),
                 _ => None,
-            };
-            own = false;
+            }
+            .map(|kind| TableKeys {
+                kind,
+                name: String::new(),
+                own_harness: false,
+                bench: None,
+            });
             continue;
         }
-        if table.is_none() {
+        let Some(table) = open.as_mut() else {
             continue;
-        }
+        };
         if let Some((key, value)) = line.split_once('=') {
             match (key.trim(), value.trim()) {
-                ("name", value) => name = Some(value.trim_matches('"').to_owned()),
-                ("harness", "false") => own = true,
+                ("name", value) => table.name = value.trim_matches('"').to_owned(),
+                ("harness", "false") => table.own_harness = true,
+                ("bench", "true") => table.bench = Some(true),
+                ("bench", "false") => table.bench = Some(false),
                 _ => {}
             }
         }
     }
-    close(table, name, own);
+    found.extend(open);
+    for table in &mut found {
+        if table.name.is_empty() {
+            table.name = package.replace('-', "_");
+        }
+    }
     found
+}
+
+/// The strings of a JSON array; none for anything else.
+fn strings(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Reads packages out of `cargo metadata`'s output.
@@ -414,6 +460,8 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
                 },
                 src_path,
                 tested_by_default: tested,
+                benchmarked: matches!(kind, TargetKind::Lib | TargetKind::Bin | TargetKind::Bench),
+                required_features: strings(&target["required-features"]),
                 harness: true,
                 edition: target["edition"].as_str().unwrap_or("2015").to_owned(),
             });
@@ -447,10 +495,34 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
             })
             .map(str::to_owned)
             .collect();
+        let features = package["features"]
+            .as_object()
+            .map(|features| {
+                features
+                    .iter()
+                    .map(|(feature, enables)| (feature.clone(), strings(enables)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut self_dev_features = BTreeSet::new();
+        for dependency in dependencies.iter().filter(|dependency| {
+            dependency["name"].as_str() == Some(name.as_str())
+                && dependency["kind"].as_str() == Some("dev")
+        }) {
+            self_dev_features.extend(strings(&dependency["features"]));
+            if dependency["uses_default_features"]
+                .as_bool()
+                .unwrap_or(true)
+            {
+                self_dev_features.insert("default".to_owned());
+            }
+        }
         packages.push(Package {
             name,
             version,
             targets,
+            features,
+            self_dev_features,
             manifest,
             registry_crates,
             dependency_names,
@@ -602,13 +674,107 @@ name = \"ordinary\"
 [build-dependencies]
 harness = false
 ";
+        let own = |manifest: &str, package: &str| -> Vec<(TargetKind, String)> {
+            table_keys(manifest, package)
+                .into_iter()
+                .filter(|table| table.own_harness)
+                .map(|table| (table.kind, table.name))
+                .collect()
+        };
         assert_eq!(
-            own_harnesses(manifest, "companion-tauri"),
+            own(manifest, "companion-tauri"),
             [(TargetKind::Test, "navigation".to_owned())]
         );
         assert_eq!(
-            own_harnesses("[lib]\nharness = false\n", "a-crate"),
+            own("[lib]\nharness = false\n", "a-crate"),
             [(TargetKind::Lib, "a_crate".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_target_the_manifest_benchmarks_or_not_is_found_by_its_table_and_name() {
+        let manifest = "\
+[package]
+name = \"a-crate\"
+bench = true
+
+[lib]
+bench = false
+
+[[bin]]
+name = \"tool\" # benchmarked by default
+path = \"src/main.rs\"
+
+[[test]]
+name = \"flow\"
+bench = true
+
+[[example]]
+bench=true
+name = \"demo\"
+
+[[bench]]
+name = \"speed\"
+bench = false
+";
+        let keys: Vec<(TargetKind, String, Option<bool>)> = table_keys(manifest, "a-crate")
+            .into_iter()
+            .map(|table| (table.kind, table.name, table.bench))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (TargetKind::Lib, "a_crate".to_owned(), Some(false)),
+                (TargetKind::Bin, "tool".to_owned(), None),
+                (TargetKind::Test, "flow".to_owned(), Some(true)),
+                (TargetKind::Example, "demo".to_owned(), Some(true)),
+                (TargetKind::Bench, "speed".to_owned(), Some(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_target_carries_its_required_features_and_a_package_its_features_and_its_dev_dependency_on_itself()
+     {
+        let value = serde_json::json!({
+            "workspace_members": ["path+file:///w/a#0.1.0"],
+            "workspace_default_members": ["path+file:///w/a#0.1.0"],
+            "packages": [{
+                "id": "path+file:///w/a#0.1.0",
+                "name": "a",
+                "version": "0.1.0",
+                "features": { "default": ["d"], "d": [], "g": ["f"], "f": [] },
+                "dependencies": [
+                    { "name": "a", "kind": "dev", "features": ["s"], "uses_default_features": false },
+                    { "name": "a", "kind": null, "features": ["n"], "uses_default_features": true },
+                    { "name": "b", "kind": "dev", "features": ["t"], "uses_default_features": true }
+                ],
+                "targets": [
+                    { "kind": ["test"], "name": "needs", "src_path": "/w/a/tests/needs.rs", "test": true, "required-features": ["f", "s"] },
+                    { "kind": ["test"], "name": "free", "src_path": "/w/a/tests/free.rs", "test": true }
+                ]
+            }]
+        });
+        let packages = parse(&value).expect("parses");
+        assert_eq!(packages[0].targets[0].required_features, ["f", "s"]);
+        assert!(packages[0].targets[1].required_features.is_empty());
+        assert_eq!(packages[0].features["g"], ["f"]);
+        assert_eq!(packages[0].features["default"], ["d"]);
+        assert_eq!(
+            packages[0].self_dev_features,
+            BTreeSet::from(["s".to_owned()])
+        );
+        let with_default = serde_json::json!({
+            "workspace_members": ["path+file:///w/a#0.1.0"],
+            "workspace_default_members": ["path+file:///w/a#0.1.0"],
+            "packages": [{
+                "id": "path+file:///w/a#0.1.0", "name": "a", "version": "0.1.0", "targets": [],
+                "dependencies": [{ "name": "a", "kind": "dev", "features": [] }]
+            }]
+        });
+        assert_eq!(
+            parse(&with_default).expect("parses")[0].self_dev_features,
+            BTreeSet::from(["default".to_owned()])
         );
     }
 

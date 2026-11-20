@@ -1618,6 +1618,8 @@ mod tests {
             name: "p".to_owned(),
             version: "0.1.0".to_owned(),
             targets: Vec::new(),
+            features: std::collections::BTreeMap::new(),
+            self_dev_features: BTreeSet::new(),
             manifest: "/p/Cargo.toml".into(),
             workspace: ".".to_owned(),
             workspace_members: Vec::new(),
