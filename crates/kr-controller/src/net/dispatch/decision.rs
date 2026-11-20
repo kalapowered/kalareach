@@ -167,8 +167,8 @@ fn without_its_output(frame: &ControlFrame, method: Method) -> ControlFrame {
 }
 
 /// A snapshot of an agent's retained entries as a read made after privacy mode removed them is
-/// answered: no entry, nowhere to continue from, and the range said to be gone. The binding and the
-/// count of entries the history filter withheld are as they were read.
+/// answered: no entry, nowhere to continue from, none counted as withheld by the history filter,
+/// and the range said to be gone. The binding is as it was read.
 fn withheld_snapshot(
     snapshot: kr_protocol::agent::AgentSnapshotResult,
 ) -> kr_protocol::agent::AgentSnapshotResult {
@@ -176,6 +176,7 @@ fn withheld_snapshot(
         entries: Vec::new(),
         continuation: kr_protocol::scalars::Nullable::null(),
         history_gap: true,
+        withheld_entries: kr_protocol::scalars::U64::ZERO,
         ..snapshot
     }
 }
