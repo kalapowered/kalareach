@@ -272,6 +272,268 @@ fn fill(template: &str, endpoint: &str, parts: &[Part]) -> String {
     text
 }
 
+/// Which of the control daemon's three local endpoints a bind was for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenRole {
+    /// The endpoint clients send commands to.
+    Control,
+    /// The endpoint workers and plugin hosts report in on.
+    Rendezvous,
+    /// The endpoint attachment chunks are sent on.
+    Transfer,
+}
+
+impl ListenRole {
+    /// Every role, in the order the daemon binds them.
+    pub const ALL: [Self; 3] = [Self::Rendezvous, Self::Control, Self::Transfer];
+
+    /// The role's one word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Rendezvous => "rendezvous",
+            Self::Transfer => "transfer",
+        }
+    }
+
+    fn from_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.word() == word)
+    }
+}
+
+/// What every line the daemon writes for a refused bind begins with.
+pub const LISTEN_LINE_PREFIX: &str = "kr-controller: cannot listen ";
+
+/// The longest human tail of a listen line, in bytes.
+const LISTEN_TAIL_BOUND: usize = 200;
+
+/// The one line a control daemon writes to its log when it cannot bind one of its endpoints, and
+/// that the command line that started it reads back.
+///
+/// `kr-controller: cannot listen role=<role> class=<class> object=<kind|-> pid=<n|-> os=<n|->
+/// op=<step|-> path=<encoded path> daemon=<own pid> -- <human tail>`. The keys come in this order
+/// and each class fills only the keys its row of the table lists; the path is percent-encoded
+/// outside `[A-Za-z0-9/._-]`, so no byte of it can split the record. The tail is for a person
+/// reading the log and is never read back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenLine {
+    /// The endpoint.
+    pub role: ListenRole,
+    /// Why the bind was refused.
+    pub refusal: ListenRefusal,
+    /// The endpoint's path, as text.
+    pub path: String,
+    /// The process that wrote the line.
+    pub daemon: u32,
+}
+
+impl ListenLine {
+    /// The line for this refusal, with a human tail made of `tail`: one line, controls replaced and
+    /// at most 200 bytes. `None` for a class the daemon's own binds cannot give.
+    #[must_use]
+    pub fn written(&self, tail: &str) -> Option<String> {
+        let (class, object, pid, os, op) = match &self.refusal {
+            ListenRefusal::NotASocket { object } => {
+                ("not_a_socket", object_word(*object), None, None, "-")
+            }
+            ListenRefusal::Held { pid } => ("held", "-", pid.map(u64::from), None, "-"),
+            ListenRefusal::LockHeld => ("lock_held", "-", None, None, "-"),
+            ListenRefusal::Unanswered => ("unanswered", "-", None, None, "-"),
+            ListenRefusal::NameTaken => ("name_taken", "-", None, None, "-"),
+            ListenRefusal::NotRemoved { os } => ("not_removed", "-", None, Some(*os), "-"),
+            ListenRefusal::Other { operation, os } => ("other", "-", None, *os, operation.word()),
+            ListenRefusal::Occupied => return None,
+        };
+        let number = |value: Option<String>| value.unwrap_or_else(|| "-".to_owned());
+        let mut tail: String = tail
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        if tail.len() > LISTEN_TAIL_BOUND {
+            let mut end = LISTEN_TAIL_BOUND;
+            while !tail.is_char_boundary(end) {
+                end -= 1;
+            }
+            tail.truncate(end);
+        }
+        Some(format!(
+            "{LISTEN_LINE_PREFIX}role={} class={class} object={object} pid={} os={} op={op} \
+             path={} daemon={} -- {tail}",
+            self.role.word(),
+            number(pid.map(|pid| pid.to_string())),
+            number(os.map(|os| os.to_string())),
+            encode_path(&self.path),
+            self.daemon,
+        ))
+    }
+
+    /// The record a line holds, or `None` for a line that is not exactly the grammar: an unknown
+    /// role or class, keys out of order or repeated or missing, a key that its class does not
+    /// take, a number that is not plain digits, or a path that is not canonically encoded.
+    #[must_use]
+    pub fn parse(line: &str) -> Option<Self> {
+        let rest = line.strip_prefix(LISTEN_LINE_PREFIX)?;
+        let fields = rest
+            .split_once(" -- ")
+            .map_or(rest, |(fields, _tail)| fields);
+        let mut values = Vec::with_capacity(8);
+        for (token, key) in fields.split(' ').zip(Self::KEYS) {
+            values.push(token.strip_prefix(key)?.strip_prefix('=')?);
+        }
+        if values.len() != Self::KEYS.len() || fields.split(' ').count() != Self::KEYS.len() {
+            return None;
+        }
+        let [role, class, object, pid, os, op, path, daemon] = values[..] else {
+            return None;
+        };
+        let role = ListenRole::from_word(role)?;
+        let number = |text: &str| {
+            (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| text.parse::<u32>().ok())
+                .flatten()
+        };
+        let none = |text: &str| (text == "-").then_some(());
+        let optional = |text: &str| match text {
+            "-" => Some(None),
+            other => number(other).map(Some),
+        };
+        let refusal = match class {
+            "not_a_socket" => {
+                none(pid)?;
+                none(os)?;
+                none(op)?;
+                ListenRefusal::NotASocket {
+                    object: object_from_word(object)?,
+                }
+            }
+            "held" => {
+                none(object)?;
+                none(os)?;
+                none(op)?;
+                ListenRefusal::Held {
+                    pid: optional(pid)?,
+                }
+            }
+            "lock_held" | "unanswered" | "name_taken" => {
+                none(object)?;
+                none(pid)?;
+                none(os)?;
+                none(op)?;
+                match class {
+                    "lock_held" => ListenRefusal::LockHeld,
+                    "unanswered" => ListenRefusal::Unanswered,
+                    _ => ListenRefusal::NameTaken,
+                }
+            }
+            "not_removed" => {
+                none(object)?;
+                none(pid)?;
+                none(op)?;
+                ListenRefusal::NotRemoved {
+                    os: i32::try_from(number(os)?).ok()?,
+                }
+            }
+            "other" => {
+                none(object)?;
+                none(pid)?;
+                ListenRefusal::Other {
+                    operation: [
+                        ListenStep::Inspect,
+                        ListenStep::Probe,
+                        ListenStep::Lock,
+                        ListenStep::Bind,
+                        ListenStep::Permissions,
+                    ]
+                    .into_iter()
+                    .find(|step| step.word() == op)?,
+                    os: optional(os)?.and_then(|os| i32::try_from(os).ok()),
+                }
+            }
+            _ => return None,
+        };
+        Some(Self {
+            role,
+            refusal,
+            path: decode_path(path)?,
+            daemon: number(daemon)?,
+        })
+    }
+
+    const KEYS: [&'static str; 8] = [
+        "role", "class", "object", "pid", "os", "op", "path", "daemon",
+    ];
+}
+
+const fn object_word(object: ObjectKind) -> &'static str {
+    match object {
+        ObjectKind::File => "file",
+        ObjectKind::Directory => "directory",
+        ObjectKind::Link => "link",
+        ObjectKind::Other => "other",
+    }
+}
+
+fn object_from_word(word: &str) -> Option<ObjectKind> {
+    [
+        ObjectKind::File,
+        ObjectKind::Directory,
+        ObjectKind::Link,
+        ObjectKind::Other,
+    ]
+    .into_iter()
+    .find(|object| object_word(*object) == word)
+}
+
+/// `path` with every byte outside `[A-Za-z0-9/._-]` written as `%` and two upper-case hexadecimal
+/// digits.
+fn encode_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// The path an encoding stands for, or `None` for text that [`encode_path`] would not have made.
+fn decode_path(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == b'%' {
+            let pair = bytes.get(at + 1..at + 3)?;
+            if !pair
+                .iter()
+                .all(|digit| digit.is_ascii_digit() || (b'A'..=b'F').contains(digit))
+            {
+                return None;
+            }
+            decoded.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+            at += 3;
+        } else if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-') {
+            decoded.push(byte);
+            at += 1;
+        } else {
+            return None;
+        }
+    }
+    let path = String::from_utf8(decoded).ok()?;
+    // A byte that needed no encoding and was encoded is not what the writer makes.
+    (encode_path(&path) == text).then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +663,139 @@ mod tests {
                 "{said}"
             );
         }
+    }
+
+    fn every_refusal() -> Vec<ListenRefusal> {
+        let mut all = vec![
+            ListenRefusal::Held { pid: Some(41) },
+            ListenRefusal::Held { pid: None },
+            ListenRefusal::LockHeld,
+            ListenRefusal::Unanswered,
+            ListenRefusal::NameTaken,
+            ListenRefusal::NotRemoved { os: 13 },
+        ];
+        for object in [
+            ObjectKind::File,
+            ObjectKind::Directory,
+            ObjectKind::Link,
+            ObjectKind::Other,
+        ] {
+            all.push(ListenRefusal::NotASocket { object });
+        }
+        for operation in [
+            ListenStep::Inspect,
+            ListenStep::Probe,
+            ListenStep::Lock,
+            ListenStep::Bind,
+            ListenStep::Permissions,
+        ] {
+            all.push(ListenRefusal::Other {
+                operation,
+                os: Some(2),
+            });
+            all.push(ListenRefusal::Other {
+                operation,
+                os: None,
+            });
+        }
+        all
+    }
+
+    /// Every role, every class and every awkward path goes through the writer and the parser and
+    /// comes back as it was.
+    #[test]
+    fn the_listen_line_round_trips_for_every_role_and_class() {
+        for role in ListenRole::ALL {
+            for refusal in every_refusal() {
+                for path in [
+                    "/run/user/1000/kr/c.sock",
+                    "/tmp/a line\nbreak/c.sock",
+                    "/tmp/a b=c%d/\u{e9}\u{4e2d}.sock",
+                ] {
+                    let line = ListenLine {
+                        role,
+                        refusal: refusal.clone(),
+                        path: path.to_owned(),
+                        daemon: 4242,
+                    };
+                    let written = line.written("a tail\nof text").expect("a line");
+                    assert!(!written.contains('\n'), "{written:?}");
+                    assert_eq!(ListenLine::parse(&written), Some(line), "{written}");
+                }
+            }
+        }
+        assert!(
+            ListenLine {
+                role: ListenRole::Control,
+                refusal: ListenRefusal::Occupied,
+                path: "/x".to_owned(),
+                daemon: 1,
+            }
+            .written("")
+            .is_none()
+        );
+    }
+
+    /// A line outside the grammar is not a record: an unknown role or class, keys out of order,
+    /// repeated or extra, a key its class does not take, a number that is not digits and a path
+    /// that is not the writer's encoding.
+    #[test]
+    fn a_line_outside_the_grammar_is_refused() {
+        let good = ListenLine {
+            role: ListenRole::Rendezvous,
+            refusal: ListenRefusal::Held { pid: Some(7) },
+            path: "/r.sock".to_owned(),
+            daemon: 9,
+        }
+        .written("tail")
+        .expect("a line");
+        assert!(ListenLine::parse(&good).is_some());
+        let changed = |from: &str, to: &str| good.replacen(from, to, 1);
+        for bad in [
+            changed("role=rendezvous", "role=gateway"),
+            changed("class=held", "class=gone"),
+            changed("pid=7", "pid=seven"),
+            changed("pid=7", "pid=+7"),
+            changed("object=-", "object=file"),
+            changed("os=-", "os=1"),
+            changed("op=-", "op=bind"),
+            changed("path=/r.sock", "path=/r sock"),
+            changed("path=/r.sock", "path=%2fr.sock"),
+            changed("path=/r.sock", "path=%41r.sock"),
+            changed("daemon=9", "daemon=9 daemon=9"),
+            changed("role=rendezvous class=held", "class=held role=rendezvous"),
+            good.replacen("kr-controller: ", "kr-controller:  ", 1),
+            good.split(" -- ")
+                .next()
+                .expect("fields")
+                .replacen(" path=/r.sock", "", 1),
+            "kr-controller: cannot listen".to_owned(),
+        ] {
+            assert_eq!(ListenLine::parse(&bad), None, "{bad}");
+        }
+        // The tail is for a person and is not read.
+        assert!(ListenLine::parse(&good.replace(" -- tail", "")).is_some());
+        assert_eq!(
+            ListenLine::parse(&good.replace(" -- tail", " -- anything at all")),
+            ListenLine::parse(&good)
+        );
+    }
+
+    /// A tail is one line of at most 200 bytes with its controls replaced.
+    #[test]
+    fn a_tail_is_one_bounded_line() {
+        let line = ListenLine {
+            role: ListenRole::Transfer,
+            refusal: ListenRefusal::Unanswered,
+            path: "/t.sock".to_owned(),
+            daemon: 1,
+        }
+        .written(&format!("{}\r\n", "\u{e9}".repeat(300)))
+        .expect("a line");
+        let tail = line.split_once(" -- ").expect("a tail").1;
+        assert!(
+            tail.len() <= 200 && !tail.contains(['\r', '\n']),
+            "{tail:?}"
+        );
     }
 }
