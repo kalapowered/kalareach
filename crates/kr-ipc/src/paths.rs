@@ -2256,6 +2256,8 @@ mod windows {
         let user = account_in(accounts.user(), &accounts.user, usize::MAX).map_err(refused)?;
         let descriptor = format!("D:P(A;;GA;;;OW)(A;;GA;;;{})", describe(accounts.user()));
         let file = create_new_file_with_descriptor(path, &descriptor)?;
+        #[cfg(test)]
+        tests::before_the_check(path, &file);
         if let Err(error) = keeps_the_list(&file, &user) {
             drop(file);
             let _ = std::fs::remove_file(path);
@@ -2270,8 +2272,7 @@ mod windows {
         use std::os::windows::io::AsHandle as _;
 
         #[cfg(test)]
-        let seen = tests::BEFORE_THE_CHECK
-            .with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook(file)));
+        let seen = tests::seen();
         let mut flags: u32 = 0;
         // SAFETY: the handle is open for the call, `flags` is a live out parameter, and the other
         // out parameters are null with a length of zero, which the call documents as "not asked
@@ -2422,14 +2423,61 @@ mod windows {
             OtherList,
         }
 
-        /// Run with the new file as the check of its list begins, before any content is written
-        /// through the handle; it may say what the check sees in place of the file system's answer.
-        type BeforeTheCheck = Box<dyn FnMut(&std::fs::File) -> Option<Seen>>;
+        /// Run with the new file's path and the handle that created it as the check of its list
+        /// begins, before any content is written through the handle; it may do what it likes to
+        /// the file, and say what the check sees in place of the file system's answer.
+        type BeforeTheCheck = Box<dyn FnMut(&Path, &std::fs::File) -> Option<Seen>>;
 
         thread_local! {
-            pub(super) static BEFORE_THE_CHECK: std::cell::RefCell<Option<BeforeTheCheck>> =
+            static BEFORE_THE_CHECK: std::cell::RefCell<Option<BeforeTheCheck>> =
                 const { std::cell::RefCell::new(None) };
+            static SEEN: std::cell::Cell<Option<Seen>> = const { std::cell::Cell::new(None) };
         }
+
+        /// Runs the hook of this thread, if there is one, and keeps what it says the check sees.
+        pub(super) fn before_the_check(path: &Path, file: &std::fs::File) {
+            let seen = BEFORE_THE_CHECK
+                .with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook(path, file)));
+            SEEN.with(|cell| cell.set(seen));
+        }
+
+        /// What the hook said the check sees.
+        pub(super) fn seen() -> Option<Seen> {
+            SEEN.with(std::cell::Cell::get)
+        }
+
+        /// The hook of this thread, taken away when this is dropped however the case ends.
+        struct Hooked;
+
+        impl Hooked {
+            fn install(hook: impl FnMut(&Path, &std::fs::File) -> Option<Seen> + 'static) -> Self {
+                BEFORE_THE_CHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+                Self
+            }
+        }
+
+        impl Drop for Hooked {
+            fn drop(&mut self) {
+                BEFORE_THE_CHECK.with(|slot| *slot.borrow_mut() = None);
+                SEEN.with(|cell| cell.set(None));
+            }
+        }
+
+        /// A writer of this module, by its name.
+        type Writer = fn(&Path, &[u8]) -> Result<()>;
+
+        /// Both writers: each makes its temporary file the same way.
+        const WRITERS: [(&str, Writer); 2] = [
+            ("write_owner_only_file", crate::paths::write_owner_only_file),
+            (
+                "create_new_owner_only_file",
+                crate::paths::create_new_owner_only_file,
+            ),
+        ];
+
+        /// The words of the refusal for a volume that keeps no access lists.
+        const NO_LISTS: &str = "the volume does not keep access lists, so this file cannot be made \
+                                readable by its owner alone";
 
         /// A folder under the system's temporary directory, removed when the case ends however it
         /// ends.
@@ -2494,34 +2542,15 @@ mod windows {
 
             let lengths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let recorded = std::rc::Rc::clone(&lengths);
-            BEFORE_THE_CHECK.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move |file: &std::fs::File| {
-                    recorded
-                        .borrow_mut()
-                        .push(file.metadata().map_or(u64::MAX, |metadata| metadata.len()));
-                    Some(seen)
-                }));
+            let _hooked = Hooked::install(move |_path, file| {
+                recorded
+                    .borrow_mut()
+                    .push(file.metadata().map_or(u64::MAX, |metadata| metadata.len()));
+                Some(seen)
             });
-            /// Takes the hook away however the case ends.
-            struct Cleared;
-            impl Drop for Cleared {
-                fn drop(&mut self) {
-                    BEFORE_THE_CHECK.with(|hook| *hook.borrow_mut() = None);
-                }
-            }
-            let _cleared = Cleared;
 
-            for (writer, outcome) in [
-                (
-                    "write_owner_only_file",
-                    crate::paths::write_owner_only_file(&destination, b"other"),
-                ),
-                (
-                    "create_new_owner_only_file",
-                    crate::paths::create_new_owner_only_file(&destination, b"other"),
-                ),
-            ] {
-                let error = outcome.expect_err("the write is refused");
+            for (writer, write) in WRITERS {
+                let error = write(&destination, b"other").expect_err("the write is refused");
                 assert!(
                     error.to_string().contains(words),
                     "{writer} refuses with the words of the check: {error}"
@@ -2549,11 +2578,7 @@ mod windows {
         /// any content is written. The volume's answer is replaced here; no case makes a volume.
         #[test]
         fn a_volume_that_keeps_no_access_lists_refuses_both_writers_before_any_content() {
-            refused_before_any_content(
-                Seen::NoLists,
-                "the volume does not keep access lists, so this file cannot be made readable by its \
-                 owner alone",
-            );
+            refused_before_any_content(Seen::NoLists, NO_LISTS);
         }
 
         /// A list that reads back other than as set refuses both writers before any content is
@@ -2566,6 +2591,121 @@ mod windows {
                 "the access list of the new file reads back other than as set, so it cannot be made \
                  readable by its owner alone",
             );
+        }
+
+        /// A refusal removes the file it made and no other: a file put at the temporary name after
+        /// the check began stays as it is, and so do the file at the destination and its list. Each
+        /// writer's file is renamed away while the writer holds it, which its share mode allows, and
+        /// another file is put under the name it had.
+        #[test]
+        fn a_refusal_removes_the_file_it_made_and_not_one_put_at_its_name() {
+            for (writer, write) in WRITERS {
+                let folder = Folder::new("replaced");
+                let destination = folder.0.join("setting");
+                crate::paths::write_owner_only_file(&destination, b"kept").expect("a file to keep");
+                let before = FileAccess::of(&destination).expect("reads who can reach the file");
+                let moved = folder.0.join("moved");
+                let named = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+                let hooked_name = std::rc::Rc::clone(&named);
+                let aside = moved.clone();
+                let _hooked = Hooked::install(move |path, _file| {
+                    std::fs::rename(path, &aside)
+                        .expect("the new file is renamed while it is held");
+                    std::fs::write(path, b"replacement").expect("another file is put at its name");
+                    *hooked_name.borrow_mut() = Some(path.to_path_buf());
+                    Some(Seen::NoLists)
+                });
+                let error = write(&destination, b"other").expect_err("the write is refused");
+                assert!(error.to_string().contains(NO_LISTS), "{writer}: {error}");
+                let temporary = named.borrow().clone().expect("the check ran");
+                assert_eq!(
+                    std::fs::read(&temporary).expect("the file put at the name is still there"),
+                    b"replacement",
+                    "{writer}"
+                );
+                assert!(
+                    !moved.exists(),
+                    "{writer}: the file the writer made is removed through its own handle"
+                );
+                assert_eq!(
+                    std::fs::read(&destination).expect("reads"),
+                    b"kept",
+                    "{writer}"
+                );
+                assert_eq!(
+                    FileAccess::of(&destination).expect("reads who can reach the file"),
+                    before,
+                    "{writer}: the file at the destination keeps its list"
+                );
+                let mut expected = vec![
+                    "setting".to_owned(),
+                    temporary
+                        .file_name()
+                        .expect("a name")
+                        .to_string_lossy()
+                        .into_owned(),
+                ];
+                expected.sort();
+                assert_eq!(folder.names(), expected, "{writer}");
+            }
+        }
+
+        /// A refusal that cannot remove the file it made says so after its own reason, and leaves
+        /// the empty file where it is, with the file at the destination and its list as they were.
+        /// The deletion is refused because the new file carries the read-only attribute.
+        #[test]
+        fn a_refusal_that_cannot_remove_the_file_it_made_says_so() {
+            for (writer, write) in WRITERS {
+                let folder = Folder::new("kept-empty");
+                let destination = folder.0.join("setting");
+                crate::paths::write_owner_only_file(&destination, b"kept").expect("a file to keep");
+                let before = FileAccess::of(&destination).expect("reads who can reach the file");
+                let named = std::rc::Rc::new(std::cell::RefCell::new(None::<std::path::PathBuf>));
+                let hooked_name = std::rc::Rc::clone(&named);
+                let _hooked = Hooked::install(move |path, file| {
+                    let mut permissions = file.metadata().expect("its attributes").permissions();
+                    permissions.set_readonly(true);
+                    file.set_permissions(permissions)
+                        .expect("the new file is made read-only");
+                    *hooked_name.borrow_mut() = Some(path.to_path_buf());
+                    Some(Seen::NoLists)
+                });
+                let error = write(&destination, b"other").expect_err("the write is refused");
+                let text = error.to_string();
+                assert!(text.contains(NO_LISTS), "{writer} gives its reason: {text}");
+                assert!(
+                    text.contains("; the empty file it made could not be removed: "),
+                    "{writer} says that the empty file stays: {text}"
+                );
+                let temporary = named.borrow().clone().expect("the check ran");
+                assert_eq!(
+                    std::fs::metadata(&temporary)
+                        .expect("the empty file stays")
+                        .len(),
+                    0,
+                    "{writer}"
+                );
+                assert_eq!(
+                    std::fs::read(&destination).expect("reads"),
+                    b"kept",
+                    "{writer}"
+                );
+                assert_eq!(
+                    FileAccess::of(&destination).expect("reads who can reach the file"),
+                    before,
+                    "{writer}: the file at the destination keeps its list"
+                );
+                let mut expected = vec![
+                    "setting".to_owned(),
+                    temporary
+                        .file_name()
+                        .expect("a name")
+                        .to_string_lossy()
+                        .into_owned(),
+                ];
+                expected.sort();
+                assert_eq!(folder.names(), expected, "{writer}");
+            }
         }
 
         /// This process's token again, as a primary token of its own this test may read and give
