@@ -1062,23 +1062,6 @@ impl<'c> Journal<'c> {
             .optional()?)
     }
 
-    /// Checks whether a node of a run has a receipt, which is what makes it a usable parent.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when the row cannot be read.
-    pub fn node_receipt_exists(&self, run_id: WorkflowRunId, node_id: &str) -> Result<bool> {
-        let found: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM node_receipts WHERE run_id = ?1 AND node_id = ?2",
-                params![run_id.to_string(), node_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(found.is_some())
-    }
-
     /// Lists durable run records sharing a causal root.
     ///
     /// # Errors
@@ -3359,15 +3342,6 @@ impl WorkflowStore {
             )
             .optional()?;
         Ok(status.and_then(|value| NodeStatus::from_wire(&value)))
-    }
-
-    /// Checks whether a node of a run has a receipt, which is what makes it a usable parent.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when the row cannot be read.
-    pub fn node_receipt_exists(&self, run_id: WorkflowRunId, node_id: &str) -> Result<bool> {
-        self.read(|journal| journal.node_receipt_exists(run_id, node_id))
     }
 
     /// Lists durable run records sharing a causal root.
