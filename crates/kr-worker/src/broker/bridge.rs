@@ -659,6 +659,8 @@ pub enum ObservedEvent {
     ToolFailed,
     /// The application raised a notification.
     Notification,
+    /// The application finished a turn it ran. It does not move the thread binding.
+    TurnEnded,
 }
 
 impl ObservedEvent {
@@ -672,6 +674,7 @@ impl ObservedEvent {
             Self::ToolFinished => "tool.finished",
             Self::ToolFailed => "tool.failed",
             Self::Notification => "notification",
+            Self::TurnEnded => "turn.ended",
         }
     }
 }
@@ -1523,6 +1526,56 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    /// A turn's end is an observation a hook reports: it is read from its frame, it is recorded in
+    /// the observed history under its own kind, and it moves no thread binding.
+    #[test]
+    fn a_turn_end_is_read_and_recorded_without_touching_the_thread() {
+        let read =
+            Observation::from_frame(br#"{"kr_observation":{"event":"turn_ended","thread":"t1"}}"#);
+        assert!(read.is_ok(), "{read:?}");
+        let Ok(observation) = read else {
+            return;
+        };
+        assert_eq!(observation.event, ObservedEvent::TurnEnded);
+        assert_eq!(observation.event.kind(), "turn.ended");
+        assert!(
+            Observation::from_frame(
+                br#"{"kr_observation":{"event":"turn_ended","thread":"t1","contact_request":"r-1"}}"#,
+            )
+            .is_err(),
+            "only a finished tool call carries a contact request"
+        );
+        let id = instance(1);
+        let broker = broker_with(&[id]);
+        apply(&broker, id, 10, &start("t1"));
+        let before = revision(&broker, id);
+        assert_eq!(
+            apply(&broker, id, 20, &observation),
+            ThreadChange::Unchanged
+        );
+        assert_eq!(selected(&broker, id).as_deref(), Some("t1"));
+        assert_eq!(revision(&broker, id), before, "the binding did not move");
+        let replay = broker
+            .replay(
+                id,
+                None,
+                &crate::broker::semantic::GrantLowerBound {
+                    from: kr_protocol::ids::StreamCursor::new(1),
+                },
+                kr_protocol::semantic::MAX_SEMANTIC_SNAPSHOT_BYTES,
+            )
+            .expect("replays");
+        let kinds: Vec<&str> = replay
+            .entries
+            .iter()
+            .map(|entry| entry.kind.as_str())
+            .collect();
+        assert_eq!(
+            kinds.iter().filter(|kind| **kind == "turn.ended").count(),
+            1
+        );
     }
 
     #[tokio::test]

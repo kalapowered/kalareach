@@ -83,11 +83,12 @@ fn start(placed: &Placed) -> Launch {
     )
 }
 
-/// KR-REQ-11.42, KR-REQ-12.18: each of the five events the package registers runs the forwarder,
-/// which reports its observation to the worker and answers exactly `{}` with exit 0, with nothing
-/// on standard error, well inside the timeout the package registers for it. The worker records
-/// each in the instance's observed history, and only the session starting and ending touch the
-/// thread binding.
+/// KR-REQ-11.42, KR-REQ-12.18: each of the five events the package registers, and `Stop`, which
+/// the forwarder reports and no released package registers yet and which gets the timeout of the
+/// others, runs the forwarder, which reports its observation to the worker and answers exactly
+/// `{}` with exit 0, with nothing on standard error, well inside the timeout the package registers
+/// for it. The worker records each in the instance's observed history, and only the session
+/// starting and ending touch the thread binding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_18_each_registered_hook_observes_and_answers_neutrally() {
     let placed = Placed::new();
@@ -123,6 +124,14 @@ async fn kr_req_12_18_each_registered_hook_observes_and_answers_neutrally() {
             .to_string()
             .into_bytes(),
             ObservedEvent::Notification,
+            Duration::from_secs(5),
+        ),
+        (
+            serde_json::json!({"session_id": FIRST_THREAD, "hook_event_name": "Stop",
+                "stop_hook_active": false, "last_assistant_message": "Done."})
+            .to_string()
+            .into_bytes(),
+            ObservedEvent::TurnEnded,
             Duration::from_secs(5),
         ),
         (

@@ -36,6 +36,10 @@
     {
       "name": "Notification",
       "report": "notification"
+    },
+    {
+      "name": "Stop",
+      "report": "turn_ended"
     }
   ],
   "details": {

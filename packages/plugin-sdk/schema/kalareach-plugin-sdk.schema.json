@@ -1031,7 +1031,7 @@
               "type": "null"
             }
           ],
-          "description": "How the forwarder reads the hook payload of the application's bridge: where the event and\nthe session are, which event names report which of five things, and where the members a\nreport carries are.\n\nA table that does not state it leaves the member out, and a bridge's forwarder then reads the\npayload as Claude Code writes it, so a connector written before the member existed reads and\nhashes exactly as it did. A package that states it declares an `sdk_range` from SDK 0.1.8."
+          "description": "How the forwarder reads the hook payload of the application's bridge: where the event and\nthe session are, which event names report which of six things, and where the members a\nreport carries are.\n\nA table that does not state it leaves the member out, and a bridge's forwarder then reads the\npayload as Claude Code writes it, so a connector written before the member existed reads and\nhashes exactly as it did. A package that states it declares an `sdk_range` from SDK 0.1.8."
         },
         "launch_variables": {
           "description": "The environment variables the package's command integration sets, each by exact name and\nvalue with the reason a reviewer reads, under the rules the package contract publishes as\n`command_integration.launch_variable_rules`.\n\nA table that does not state it leaves the member out, so a connector written before the\nmember existed reads and hashes exactly as it did; its integration may then set a pair of\nthe contract's `command_integration.permitted_variables` without declaring it, only where\nits `sdk_range` is written in release versions only and admits an SDK version before the\nmember arrived. A package that states it declares an `sdk_range` written in release\nversions only that admits no SDK version before the one the contract's `arrivals` table\nlists for this member, and the statement the owner confirms says that every program the\ncommand starts gets the variables too, unless the command removes them.",
@@ -2311,7 +2311,7 @@
       "type": "object"
     },
     "HookReport": {
-      "description": "The five things the forwarder reports. The worker reads these and no others.",
+      "description": "The six things the forwarder reports. The worker reads these and no others.",
       "oneOf": [
         {
           "const": "session_started",
@@ -2336,6 +2336,11 @@
         {
           "const": "notification",
           "description": "The application raised a notification.",
+          "type": "string"
+        },
+        {
+          "const": "turn_ended",
+          "description": "The agent finished a turn it ran. It has no detail. A later hook of the person's own may\nstill block the end and let the agent go on, so a thread's later end is a later turn end,\nnot a repeat.",
           "type": "string"
         }
       ]

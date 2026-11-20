@@ -7,6 +7,16 @@
 //! Code starts both itself, so both run under its permissions and outside the KalaReach plugin
 //! sandbox, and both inherit the environment of the session Claude Code runs in.
 //!
+//! [`kr_plugin_sdk::hook_events::HookEvents::claude_code`] also reports `Stop`, which Claude Code runs when the main agent has finished
+//! responding, and does not run when the person interrupted it or when an API error ended the turn
+//! (`StopFailure` is that event, and is not reported). No released package registers `Stop` yet,
+//! so a worker hears of a turn's end only from a package that does. The forwarder answers `{}` and
+//! exits 0 on `Stop` as on every event, and never exits 2, which on `Stop` would make Claude Code go
+//! on; a failure it could not help exits 1 or 64. Another hook of the person's may still block
+//! the end, so a thread can end a turn more than once, each end being a later version of the same
+//! review. An older forwarder reports nothing for `Stop`, and an older worker refuses the frame,
+//! and the hook answers `{}` either way.
+//!
 //! | Item | What it owns |
 //! | --- | --- |
 //! | [`kr_plugin_sdk::hook_events::HookEvents::claude_code`] | What each hook event reports when a package declares no events of its own; [`crate::hook`] runs every hook: prompt, neutral, and never a decision |
@@ -62,6 +72,25 @@ mod tests {
         ];
         for (payload, expected) in cases {
             assert_eq!(translated(&payload), Some(expected), "{payload}");
+        }
+    }
+
+    /// `Stop`, the end of a turn the agent finished, reports that a turn ended in its thread, with
+    /// no detail, whatever else the payload carries; `StopFailure`, an API error ending a turn,
+    /// and `SubagentStop` report nothing.
+    #[test]
+    fn a_stop_event_reports_that_a_turn_ended() {
+        let thread = "4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11";
+        let payload = serde_json::json!({"session_id": thread, "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/tmp", "hook_event_name": "Stop", "stop_hook_active": false,
+            "last_assistant_message": "Done.", "background_tasks": [], "session_crons": []});
+        assert_eq!(
+            translated(&payload),
+            Some(serde_json::json!({"event": "turn_ended", "thread": thread}))
+        );
+        for event in ["StopFailure", "SubagentStop"] {
+            let payload = serde_json::json!({"session_id": thread, "hook_event_name": event});
+            assert_eq!(translated(&payload), None, "{event}");
         }
     }
 

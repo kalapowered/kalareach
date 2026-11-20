@@ -55,6 +55,12 @@ fn every_application() -> Vec<Hooks> {
                     serde_json::json!({"session_id": THREAD, "hook_event_name": "SessionEnd",
                         "reason": "other"}),
                 ),
+                (
+                    "Stop",
+                    serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",
+                        "cwd": "/tmp", "hook_event_name": "Stop", "stop_hook_active": false,
+                        "last_assistant_message": "Done."}),
+                ),
             ],
         },
         Hooks {
@@ -118,6 +124,11 @@ fn every_application() -> Vec<Hooks> {
                         "permission_mode": "default", "notification_type": "permission_prompt",
                         "message": "Agent is requesting permission to run: ls",
                         "title": "Permission Required", "details": {}}),
+                ),
+                (
+                    "Stop",
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "Stop",
+                        "permission_mode": "default", "stop_hook_active": false}),
                 ),
             ],
         },

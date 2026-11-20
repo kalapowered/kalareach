@@ -282,7 +282,8 @@ async fn kr_req_12_20_each_registered_gemini_cli_hook_observes_and_answers_neutr
 /// nothing on standard error, inside the registered timeout. A session starting selects its
 /// thread and a compaction goes on in it; a finished tool, a failed one and a permission
 /// notification are recorded; a finished call of the contact skill's `ask_user` names the request
-/// it asked; the session ending leaves no thread selected.
+/// it asked; the end of a turn, `Stop`, is recorded and no released package registers it yet, and
+/// it gets the timeout of the others; the session ending leaves no thread selected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_22_each_registered_qoder_cli_hook_observes_and_answers_neutrally() {
     let base = |event: &str| {
@@ -363,6 +364,20 @@ async fn kr_req_12_22_each_registered_qoder_cli_hook_observes_and_answers_neutra
                 event: ObservedEvent::Notification,
                 detail: Some("permission_prompt"),
                 text: Some("Agent is requesting permission to run: ls"),
+                contact_request: None,
+                thread: FIRST_THREAD,
+                change: unchanged,
+                timeout: Duration::from_secs(5),
+            },
+            Case {
+                payload: with(
+                    base("Stop"),
+                    serde_json::json!({"stop_hook_active": false,
+                        "last_assistant_message": "Done."}),
+                ),
+                event: ObservedEvent::TurnEnded,
+                detail: None,
+                text: None,
                 contact_request: None,
                 thread: FIRST_THREAD,
                 change: unchanged,

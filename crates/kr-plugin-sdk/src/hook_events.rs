@@ -2,10 +2,10 @@
 //!
 //! An application that starts a hook runs the forwarder with the event as one JSON document on
 //! standard input. A package whose table carries [`HookEvents`] names, in that document, where the
-//! event's name and the session are, which of its event names reports which of the five things the
+//! event's name and the session are, which of its event names reports which of the six things the
 //! forwarder can report, and where the few members a report carries are. It cannot name a new kind
 //! of report, a wire member or anything the worker does. Like [`crate::connector::Observation`],
-//! nothing here lets a package say what happened: it says where to read and which of five words a
+//! nothing here lets a package say what happened: it says where to read and which of six words a
 //! name stands for.
 //!
 //! The same value is checked in three places, by the one function [`HookEvents::refusals`]: the
@@ -73,7 +73,7 @@ pub struct HookEvent {
     pub continued_by: Option<String>,
 }
 
-/// The five things the forwarder reports. The worker reads these and no others.
+/// The six things the forwarder reports. The worker reads these and no others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HookReport {
@@ -87,6 +87,10 @@ pub enum HookReport {
     ToolFailed,
     /// The application raised a notification.
     Notification,
+    /// The agent finished a turn it ran. It has no detail. A later hook of the person's own may
+    /// still block the end and let the agent go on, so a thread's later end is a later turn end,
+    /// not a repeat.
+    TurnEnded,
 }
 
 /// The places of the members a report carries, each optional.
@@ -261,6 +265,7 @@ impl HookEvents {
                 event("PostToolUse", HookReport::ToolFinished, None),
                 event("PostToolUseFailure", HookReport::ToolFailed, None),
                 event("Notification", HookReport::Notification, None),
+                event("Stop", HookReport::TurnEnded, None),
             ],
             details: HookDetails {
                 start_source: Some(place(&["source"])),

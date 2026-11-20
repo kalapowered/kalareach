@@ -1477,7 +1477,7 @@ export interface ConnectorManifest {
       }
   /**
    * How the forwarder reads the hook payload of the application's bridge: where the event and
-   * the session are, which event names report which of five things, and where the members a
+   * the session are, which event names report which of six things, and where the members a
    * report carries are.
    *
    * A table that does not state it leaves the member out, and a bridge's forwarder then reads the
@@ -1813,7 +1813,13 @@ export interface HookEvent {
   /**
    * What the forwarder reports for it.
    */
-  report: 'session_started' | 'session_ended' | 'tool_finished' | 'tool_failed' | 'notification'
+  report:
+    | 'session_started'
+    | 'session_ended'
+    | 'tool_finished'
+    | 'tool_failed'
+    | 'notification'
+    | 'turn_ended'
 }
 /**
  * A bounded path into a decoded native message.

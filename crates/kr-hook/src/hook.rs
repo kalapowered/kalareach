@@ -11,7 +11,7 @@
 //! the input of the members a report carries. The package declares those as hook events in its
 //! connector table, the worker publishes them for the launch and the registration names them; a
 //! package that declares none gets Claude Code's, which [`HookEvents::claude_code`] holds. What a
-//! hook can report is five things, whatever the package says. The deadline, the input bound, the
+//! hook can report is six things, whatever the package says. The deadline, the input bound, the
 //! exchange with the worker and the answer are this module's, the same for all of them.
 //!
 //! Every run waits for its observation for at most [`HOOK_DEADLINE`] from its start, well inside the
@@ -814,9 +814,9 @@ pub fn read_input(
 /// outside the events' vocabulary, or input that names no thread.
 ///
 /// A session starting or ending selects or ends the thread, and a start the events mark as a
-/// continuation goes on in it; a tool finishing or failing and a notification are recorded as
-/// observed history. A finished call of the contact skill's `ask_user` also names the request it
-/// asked, so the worker learns which thread the question was asked in.
+/// continuation goes on in it; a tool finishing or failing, a notification and the end of a turn
+/// are recorded as observed history. A finished call of the contact skill's `ask_user` also names
+/// the request it asked, so the worker learns which thread the question was asked in.
 #[must_use]
 pub fn observation(events: &HookEvents, input: &Observed) -> Option<serde_json::Value> {
     let event: &HookEvent = events
@@ -836,6 +836,7 @@ pub fn observation(events: &HookEvents, input: &Observed) -> Option<serde_json::
         HookReport::ToolFinished => ("tool_finished", input.tool_name.as_deref()),
         HookReport::ToolFailed => ("tool_failed", input.tool_name.as_deref()),
         HookReport::Notification => ("notification", input.notification_kind.as_deref()),
+        HookReport::TurnEnded => ("turn_ended", None),
     };
     let mut reported = serde_json::Map::new();
     reported.insert("event".to_owned(), serde_json::json!(word));
@@ -1770,11 +1771,11 @@ mod tests {
         );
     }
 
-    /// KR-REQ-11.44: every application word reports the same five events, each as the observation
+    /// KR-REQ-11.44: every application word reports the same six events, each as the observation
     /// written out here, a start from the source `compact` continues the thread, and an event
-    /// outside the five reports nothing.
+    /// outside the six reports nothing.
     #[test]
-    fn kr_req_11_44_every_application_word_reports_the_same_five_events_and_compact_continues() {
+    fn kr_req_11_44_every_application_word_reports_the_same_six_events_and_compact_continues() {
         let thread = "4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11";
         let cases = [
             (
@@ -1818,6 +1819,10 @@ mod tests {
                 Some(
                     serde_json::json!({"event": "notification", "thread": thread, "detail": "n", "text": "m"}),
                 ),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "Stop", "last_assistant_message": "m"}),
+                Some(serde_json::json!({"event": "turn_ended", "thread": thread})),
             ),
             (
                 serde_json::json!({"session_id": thread, "hook_event_name": "BeforeTool", "tool_name": "Bash"}),
@@ -1920,6 +1925,23 @@ mod tests {
             assert_eq!(reported["contact_request"], "r-7f3a");
         }
 
+        /// `Stop`, which Qoder CLI runs when the main agent has finished responding with no tool
+        /// call pending, reports that a turn ended in its thread, with no detail, whatever else
+        /// the payload carries. Its reference does not say whether `Stop` runs when the person
+        /// interrupts. No released package registers `Stop` yet. On `Stop` exit code 2 makes the
+        /// agent go on, so the forwarder never exits 2: it answers `{}` and exits 0, and a failure
+        /// it could not help exits 1 or 64.
+        #[test]
+        fn a_stop_event_reports_that_a_turn_ended() {
+            let payload = serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",
+                "cwd": "/tmp/work", "hook_event_name": "Stop", "permission_mode": "default",
+                "stop_hook_active": false, "last_assistant_message": "Done."});
+            assert_eq!(
+                translated(&payload),
+                Some(serde_json::json!({"event": "turn_ended", "thread": THREAD}))
+            );
+        }
+
         /// Every event the registration does not name is answered and reports nothing.
         #[test]
         fn an_event_the_registration_does_not_name_reports_nothing() {
@@ -1928,7 +1950,6 @@ mod tests {
                 "UserPromptSubmit",
                 "PermissionRequest",
                 "PermissionDenied",
-                "Stop",
                 "StopFailure",
                 "SubagentStart",
                 "SubagentStop",

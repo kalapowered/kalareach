@@ -19,7 +19,7 @@ cannot read the new members and refuses such a package. The `decision_response`,
 declares `"sdk_range": ">=0.1.6, <0.2.0"`, and a host on an earlier contract refuses it.
 
 The `hook_events` member of a connector table is in version 0.1.8. It says where a bridge's
-forwarder finds the event and the session in the application's hook input and which of five reports
+forwarder finds the event and the session in the application's hook input and which of six reports
 each event name stands for; a table without it means Claude Code's names. A package whose table
 states it declares `"sdk_range": ">=0.1.8, <0.2.0"`, and the package check refuses a table that
 carries it under a range that admits an earlier SDK version or one with a prerelease part. The
