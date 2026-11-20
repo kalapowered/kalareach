@@ -45,19 +45,6 @@ impl CommitPoint {
         Self::Closure,
         Self::RecoveryGap,
     ];
-
-    /// Returns what this point commits before.
-    #[must_use]
-    pub const fn commits_before(self) -> &'static str {
-        match self {
-            Self::IntentAcceptance => "the caller is told the action was accepted",
-            Self::DispatchMarker => "the effect leaves this host",
-            Self::Outcome => "the result is served to anyone",
-            Self::Rejection => "the refusal is returned",
-            Self::Closure => "the session identity is released",
-            Self::RecoveryGap => "the journal is treated as durable again",
-        }
-    }
 }
 
 /// What kind of write is being made.
@@ -146,16 +133,6 @@ mod tests {
                 flush_policy(kind),
                 FlushPolicy::Immediate,
                 "{kind:?} must not wait for an fsync of its own"
-            );
-        }
-    }
-
-    #[test]
-    fn every_commit_point_says_what_it_commits_before() {
-        for point in CommitPoint::ALL {
-            assert!(
-                !point.commits_before().is_empty(),
-                "{point:?} does not say what it is ahead of"
             );
         }
     }

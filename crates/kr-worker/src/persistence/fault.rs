@@ -175,12 +175,6 @@ impl DurabilityPosture {
         }
     }
 
-    /// Returns true when work that needs a durable receipt may start.
-    #[must_use]
-    pub const fn admits_durable_work(&self) -> bool {
-        matches!(self, Self::Full)
-    }
-
     /// Returns whether this kind of work may proceed under this posture.
     #[must_use]
     pub const fn admits(&self, work: WorkClass) -> bool {
@@ -427,7 +421,6 @@ mod tests {
         assert!(posture.admits(WorkClass::AuthorisedStop));
         assert!(posture.admits(WorkClass::NativeTerminal));
         assert!(posture.admits(WorkClass::Read));
-        assert!(!posture.admits_durable_work());
     }
 
     #[test]

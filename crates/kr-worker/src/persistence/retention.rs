@@ -46,12 +46,6 @@ pub enum RetentionLimit {
 }
 
 impl RetentionLimit {
-    /// Every limit, in the order section 20 states them.
-    ///
-    /// The order is what "the first applicable limit" refers to, so it is fixed here rather than
-    /// left to whichever check a caller happens to run first.
-    pub const ALL: &'static [Self] = &[Self::Age, Self::HostCap, Self::SessionCap];
-
     /// Returns what a reader of a history gap is told this limit was.
     #[must_use]
     pub const fn cause(self) -> HistoryGapCause {
@@ -136,19 +130,6 @@ impl OutputRetention {
             RetentionLimit::HostCap => pressure.host_bytes > self.host_cap_bytes,
             RetentionLimit::SessionCap => pressure.session_bytes > self.session_cap_bytes,
         }
-    }
-
-    /// Returns the first limit that applies, in the order section 20 states them.
-    #[must_use]
-    pub fn first_applicable(
-        self,
-        pressure: &Pressure,
-        now_ms: TimestampMs,
-    ) -> Option<RetentionLimit> {
-        RetentionLimit::ALL
-            .iter()
-            .copied()
-            .find(|limit| self.applies(*limit, pressure, now_ms))
     }
 
     /// Returns how many bytes this session gives up so every cap holds at once.
@@ -240,10 +221,6 @@ mod tests {
         };
         assert!(!retention.applies(RetentionLimit::SessionCap, &pressure, now()));
         assert!(retention.applies(RetentionLimit::HostCap, &pressure, now()));
-        assert_eq!(
-            retention.first_applicable(&pressure, now()),
-            Some(RetentionLimit::HostCap)
-        );
         assert_eq!(retention.bytes_over_cap(&pressure), 16 * 1024 * 1024);
     }
 
@@ -255,33 +232,7 @@ mod tests {
             host_bytes: SESSION_CAP_BYTES + 5,
             oldest_at_ms: Some(now()),
         };
-        assert_eq!(
-            retention.first_applicable(&pressure, now()),
-            Some(RetentionLimit::SessionCap)
-        );
         assert_eq!(retention.bytes_over_cap(&pressure), 5);
-    }
-
-    #[test]
-    fn the_first_applicable_limit_is_the_first_in_the_order_section_twenty_states() {
-        let retention = OutputRetention::DEFAULT;
-        let everything = Pressure {
-            session_bytes: SESSION_CAP_BYTES + 1,
-            host_bytes: HOST_CAP_BYTES + 1,
-            oldest_at_ms: Some(TimestampMs::new(now().get() - 9 * DAY)),
-        };
-        assert_eq!(
-            retention.first_applicable(&everything, now()),
-            Some(RetentionLimit::Age)
-        );
-        assert_eq!(
-            RetentionLimit::ALL,
-            &[
-                RetentionLimit::Age,
-                RetentionLimit::HostCap,
-                RetentionLimit::SessionCap
-            ]
-        );
     }
 
     #[test]
@@ -303,7 +254,6 @@ mod tests {
             host_bytes: 1,
             oldest_at_ms: Some(now()),
         };
-        assert_eq!(retention.first_applicable(&pressure, now()), None);
         assert_eq!(retention.bytes_over_cap(&pressure), 0);
     }
 

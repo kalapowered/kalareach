@@ -630,13 +630,6 @@ pub fn store(name: &str) -> Option<&'static StoreDescriptor> {
     STORES.iter().find(|store| store.name == name)
 }
 
-/// Returns every store a history byte cap may evict.
-pub fn evictable_under_history_cap() -> impl Iterator<Item = &'static StoreDescriptor> {
-    STORES
-        .iter()
-        .filter(|store| store.evictable_under_history_cap)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,7 +685,9 @@ mod tests {
 
     #[test]
     fn only_terminal_content_what_describes_it_and_host_events_are_evictable_under_the_cap() {
-        let evictable: Vec<&str> = evictable_under_history_cap()
+        let evictable: Vec<&str> = STORES
+            .iter()
+            .filter(|store| store.evictable_under_history_cap)
             .map(|store| store.name)
             .collect();
         assert_eq!(

@@ -26,7 +26,7 @@ pub mod outbox;
 pub mod retention;
 pub mod stores;
 
-pub use crate::persistence::capacity::{Exception, StoreCapacity};
+pub use crate::persistence::capacity::StoreCapacity;
 pub use crate::persistence::contract::{CommitPoint, FlushPolicy, WriteKind, flush_policy};
 pub use crate::persistence::fault::{
     DurabilityPosture, FaultKind, JournalCondition, JournalFault, JournalHealth, RecoveryGap,
