@@ -331,6 +331,13 @@ export function tauriPort(): HostPort {
     deviceDraftRetarget: (request) => read('device_draft_retarget', request),
     deviceDraftDiscard: (request) => read('device_draft_discard', request),
     deviceDraftMarkRemoval: (request) => read('device_draft_mark_removal', request),
+    deviceChannelMessages: (request) => read('device_channel_messages', request),
+    deviceChannelMessageKeep: (request) => read('device_channel_message_keep', request),
+    deviceChannelMessageRemove: (request) => read('device_channel_message_remove', request),
+    deviceChannelHoldCreate: (request) => read('device_channel_hold_create', request),
+    deviceChannelHoldUpdate: (request) => read('device_channel_hold_update', request),
+    deviceChannelHoldClear: (request) => read('device_channel_hold_clear', request),
+    deviceDraftsLedgerSetAside: () => call('device_drafts_ledger_set_aside', {}),
     draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
     // The upload belongs to the same session the subject names; sending the subject without it
     // would reserve the transfer against no session while the action targeted one.

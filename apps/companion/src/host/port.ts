@@ -1468,6 +1468,105 @@ export interface StoredDrafts {
   readonly unreadable: number
   /** The removals an earlier run began and could not finish, each naming the version to remove. */
   readonly pendingRemovals: readonly DraftDiscardRequest[]
+  /**
+   * Whether every place that can say a draft was sent was read. While it is `unknown` no stored
+   * draft is put in a composer by itself: it can be the text of a message that was sent.
+   */
+  readonly sources: 'known' | 'unknown'
+  /** What the list of removals is: readable, unreadable now, or damaged (the one state a person can set aside). */
+  readonly ledger: 'ok' | 'unreadable' | 'damaged'
+}
+
+/** A message sent over a channel that confirms nothing, as this device keeps it apart from the drafts. */
+export interface StoredChannelMessage {
+  readonly actionId: string
+  readonly holdId: string | null
+  /** The page's own identity for the submission. */
+  readonly localId: string
+  readonly sessionId: string
+  readonly applicationInstanceId: string | null
+  readonly agentBindingRevision: string | null
+  readonly environmentId: string | null
+  /** What the person called the host when it was sent. */
+  readonly hostName: string
+  /** The whole text, only in a read that asked for it. */
+  readonly text?: string
+  readonly sentAtMs: string
+}
+
+/** The record of a send whose outcome nobody could establish, which holds the next message to its session. */
+export interface StoredHold {
+  readonly holdId: string
+  /** The action, once the host's answer named one. */
+  readonly actionId: string | null
+  readonly localId: string
+  readonly sessionId: string
+  readonly applicationInstanceId: string | null
+  readonly agentBindingRevision: string | null
+  readonly environmentId: string | null
+  readonly hostName: string
+  readonly sentAtMs: string
+  /** The exact stored records the press wrote for the sent text. */
+  readonly drafts: readonly DraftDiscardRequest[]
+}
+
+/** How many files of one kind could not be read: another layout, or not now. */
+export interface UnreadableCount {
+  readonly layout: number
+  readonly now: number
+}
+
+/** What the store of channel messages holds, and what it holds to. */
+export interface ChannelMessageList {
+  readonly messages: readonly StoredChannelMessage[]
+  readonly holds: readonly StoredHold[]
+  /** The names of records of this layout whose bytes do not parse, which a person can remove. */
+  readonly damagedHolds: readonly string[]
+  readonly unreadableMessages: UnreadableCount
+  readonly unreadableHolds: UnreadableCount
+  readonly used: { readonly entries: number; readonly bytes: number }
+  readonly limits: { readonly entries: number; readonly bytes: number; readonly holds: number }
+}
+
+/** A message to keep, whole, before the draft that held it goes. */
+export interface ChannelMessageKeep {
+  readonly actionId: string
+  /** The record of the send this ends, removed with the keep. */
+  readonly holdId: string | null
+  readonly localId: string
+  readonly sessionId: string
+  readonly applicationInstanceId: string | null
+  readonly agentBindingRevision: string | null
+  readonly environmentId: string | null
+  readonly hostName: string
+  readonly text: string
+  readonly sentAtMs: string
+  /** The stored records that held the text: at most two. */
+  readonly drafts: readonly DraftDiscardRequest[]
+}
+
+/** What to remove: one message, or every message of a session. */
+export type ChannelMessageRemoval =
+  | { readonly actionId: string; readonly sessionId?: undefined }
+  | { readonly sessionId: string; readonly actionId?: undefined }
+
+/** A record of a send to make, before the send. */
+export interface ChannelHoldCreate {
+  readonly holdId: string
+  readonly localId: string
+  readonly sessionId: string
+  readonly applicationInstanceId: string | null
+  readonly agentBindingRevision: string | null
+  readonly environmentId: string | null
+  readonly hostName: string
+  readonly sentAtMs: string
+  readonly drafts: readonly DraftDiscardRequest[]
+}
+
+/** What setting the ledger aside did: whether it moved, and whether the move is known to be on disk. */
+export interface LedgerSetAside {
+  readonly moved: boolean
+  readonly confirmed: boolean
 }
 
 /** A save: a new draft when `id` is null, else a replacement of the version `expectedRevision`. */
@@ -1952,6 +2051,25 @@ export interface HostPort {
    * took does not return as a draft because the store refused once.
    */
   deviceDraftMarkRemoval(request: DraftDiscardRequest): Promise<void>
+
+  /**
+   * The messages sent over a channel that confirms nothing, and the records of sends under way, as
+   * this device keeps them. A read without `withText` leaves the text out. The store refuses
+   * `STORAGE_UNAVAILABLE` only when its folder cannot be read as one.
+   */
+  deviceChannelMessages(request: { readonly withText: boolean }): Promise<ChannelMessageList>
+  /** Keeps a message whole, durably, before the draft that held it is removed. */
+  deviceChannelMessageKeep(request: ChannelMessageKeep): Promise<{ readonly resumed: boolean }>
+  /** Removes one message, or every message of a session. Nothing else removes one. */
+  deviceChannelMessageRemove(request: ChannelMessageRemoval): Promise<{ readonly removed: number }>
+  /** Records a send before it is made, so that a restart still holds the next message to its session. */
+  deviceChannelHoldCreate(request: ChannelHoldCreate): Promise<void>
+  /** Gives a record of a send the action the host named. */
+  deviceChannelHoldUpdate(request: { readonly holdId: string; readonly actionId: string }): Promise<void>
+  /** Removes a record of a send. A record that is not there is already removed. */
+  deviceChannelHoldClear(request: { readonly holdId: string }): Promise<void>
+  /** Sets a damaged list of removals aside, as a file of its own, and starts a rebuilt one. */
+  deviceDraftsLedgerSetAside(): Promise<LedgerSetAside>
 
   draftCreate(params: unknown, subject: SessionSubject): Promise<Settled>
   /**
