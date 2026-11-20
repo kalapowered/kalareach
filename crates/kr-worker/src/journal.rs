@@ -181,6 +181,9 @@ struct Transition {
     state: ReceiptState,
     reason: Option<RejectionReason>,
     error: Option<ProtocolError>,
+    /// The provenance a channel's operation is marked with in the same transaction, where this
+    /// transition is its dispatch marker.
+    channel_provenance: Option<ActionProvenance>,
     now_ms: TimestampMs,
 }
 
@@ -1803,6 +1806,7 @@ impl Journal {
         let mut receipt = self
             .read(actor_id.clone(), action_id)?
             .ok_or_else(|| WorkerError::InvalidArgument(format!("no receipt for {action_id}")))?;
+        let was_dispatching = receipt.state == ReceiptState::Dispatching;
         let revision = U64::new(receipt.revision.get() + 1);
         receipt.advance(state, revision, None).map_err(|error| {
             WorkerError::InvalidArgument(format!("receipt transition refused: {error}"))
@@ -1818,7 +1822,8 @@ impl Journal {
             .execute(
                 "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
                      error_message = ?7, updated_at_ms = ?8,
-                     channel_provenance = COALESCE(?9, channel_provenance)
+                     channel_provenance = CASE WHEN ?10 THEN COALESCE(?9, channel_provenance)
+                                               ELSE NULL END
                  WHERE actor_id = ?1 AND action_id = ?2",
                 params![
                     receipt.actor_id.as_str(),
@@ -1833,6 +1838,11 @@ impl Journal {
                     receipt.error.as_ref().map(|error| error.message.clone()),
                     i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
                     channel_provenance.map(ActionProvenance::as_str),
+                    // The mark of an operation still at its dispatch marker says where it ends
+                    // unknown for good, so one that ends any other way has no such end to mark.
+                    // A receipt that already ended unknown keeps the provenance it went by when
+                    // a later word settles it.
+                    !was_dispatching || receipt.state == ReceiptState::Unknown,
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
@@ -2129,14 +2139,23 @@ impl Journal {
         action_id: ActionId,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
-        self.mark_dispatching_while(actor_id, action_id, now_ms, || Ok(()))
+        self.mark_dispatching_while(actor_id, action_id, None, now_ms, || Ok(()))
     }
 
-    /// Commits the dispatch marker before the external effect, once `still` agrees to it.
+    /// Commits the dispatch marker before the external effect, once `still` agrees to it, and
+    /// marks the receipt as a channel's when `channel_provenance` names the provenance the
+    /// operation reaches the application by.
     ///
     /// `still` is asked after the receipt is read and immediately before the marker's first write,
     /// where nothing but instructions stands between it and the write. What it refuses is
-    /// refused with nothing written, and its error is returned as it came.
+    /// refused with nothing written, the mark included, and its error is returned as it came.
+    ///
+    /// A channel confirms nothing and says nothing later, so whatever the operation turns out to
+    /// be, nothing will ever change what its receipt says once it is unknown. A restart between
+    /// the marker and the operation's end settles the receipt as unknown
+    /// ([`Self::resolve_unfinished_dispatches`]) and leaves the mark where the marker put it, so
+    /// the receipt is a channel end like one settled by [`Self::settle_channel_end`]: a fresh
+    /// request for the same subject is not held back by it.
     ///
     /// # Errors
     ///
@@ -2145,6 +2164,7 @@ impl Journal {
         &mut self,
         actor_id: ActorId,
         action_id: ActionId,
+        channel_provenance: Option<ActionProvenance>,
         now_ms: TimestampMs,
         still: impl FnOnce() -> Result<()>,
     ) -> Result<Receipt> {
@@ -2154,6 +2174,7 @@ impl Journal {
             ReceiptState::Dispatching,
             None,
             None,
+            channel_provenance,
             now_ms,
             still,
         )
@@ -2191,7 +2212,16 @@ impl Journal {
         error: Option<ProtocolError>,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
-        self.advance_while(actor_id, action_id, state, reason, error, now_ms, || Ok(()))
+        self.advance_while(
+            actor_id,
+            action_id,
+            state,
+            reason,
+            error,
+            None,
+            now_ms,
+            || Ok(()),
+        )
     }
 
     /// Advances a receipt once `still` agrees to it, asked after the receipt is read and before
@@ -2204,6 +2234,7 @@ impl Journal {
         state: ReceiptState,
         reason: Option<RejectionReason>,
         error: Option<ProtocolError>,
+        channel_provenance: Option<ActionProvenance>,
         now_ms: TimestampMs,
         still: impl FnOnce() -> Result<()>,
     ) -> Result<Receipt> {
@@ -2214,6 +2245,7 @@ impl Journal {
                 state,
                 reason,
                 error,
+                channel_provenance,
                 now_ms,
             },
             None,
@@ -2239,6 +2271,7 @@ impl Journal {
             state,
             reason,
             error,
+            channel_provenance,
             now_ms,
         } = transition;
         let mut receipt = self
@@ -2264,6 +2297,19 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         still()?;
         write_state(&self.health, &transaction, &receipt)?;
+        if let Some(provenance) = channel_provenance {
+            transaction
+                .execute(
+                    "UPDATE receipts SET channel_provenance = ?3
+                     WHERE actor_id = ?1 AND action_id = ?2",
+                    params![
+                        receipt.actor_id.as_str(),
+                        receipt.action_id.get().as_bytes().as_slice(),
+                        provenance.as_str(),
+                    ],
+                )
+                .map_err(|error| faulted(&self.health, error))?;
+        }
         // A rejection is a settlement: what the caller sent is committed with the receipt only
         // where privacy mode does not withhold it. Read once the write lock is held.
         if withholds_content(&self.health, &transaction, state)? {
@@ -2380,6 +2426,7 @@ impl Journal {
                     state: ReceiptState::Rejected,
                     reason: Some(RejectionReason::Revoked),
                     error: error.clone(),
+                    channel_provenance: None,
                     now_ms,
                 },
                 Some(revision),

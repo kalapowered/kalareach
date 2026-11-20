@@ -8890,9 +8890,19 @@ impl WorkerService {
             // The accepted deadline is asked again inside the marker's own step, after the
             // receipt is read and before the first write: the checks above wait for locks, and
             // the read is storage.
+            //
+            // A message carried on a channel is marked as a channel's in that same step, so that
+            // a restart before its end settles it as a channel end and not as an unknown that
+            // holds the actor's later messages for good, and a message whose window ended before
+            // the step is refused with neither the marker nor the mark written.
+            let channel_mark = match &prepared {
+                Some(Prepared::Upstream(handoff)) => handoff.channel_mark(),
+                _ => None,
+            };
             if let Err(error) = journal.mark_dispatching_while(
                 actor_id.clone(),
                 mutation.action_id,
+                channel_mark,
                 kr_ipc::now_ms(),
                 || self.check_accepted_deadline(deadline),
             ) {
@@ -14402,6 +14412,18 @@ pub struct UpstreamHandoff {
 }
 
 impl UpstreamHandoff {
+    /// The provenance to mark the receipt of a message with when its dispatch marker is
+    /// committed, when the transport it was admitted for is a channel's.
+    ///
+    /// A channel's operation ends as a channel end whenever it ends unknown, so a receipt that a
+    /// restart settles between the marker and the end is one too.
+    fn channel_mark(&self) -> Option<kr_protocol::broker::ActionProvenance> {
+        (matches!(self.kind, UpstreamKind::Mutation)
+            && self.admitted.provenance()
+                == kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse)
+            .then_some(kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse)
+    }
+
     /// Gives the admission up without transmitting.
     ///
     /// A dispatch marker this host could not write leaves no executable permit behind it: what

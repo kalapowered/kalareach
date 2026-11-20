@@ -7520,6 +7520,49 @@ async fn kr_req_12_26_a_prompt_still_queued_at_the_workers_bound_is_a_channel_en
     );
 }
 
+/// KR-REQ-12.26: a message carried on a channel is marked as a channel's when its dispatch marker
+/// is committed, so a worker that stops before the message's end leaves a receipt that is already a
+/// channel end. The writer is held, so the receipt reads dispatching and the journal's file already
+/// holds the channel's provenance for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_a_prompt_is_marked_as_a_channels_when_its_dispatch_marker_is_committed() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+    let mut watcher = cli(&host).await;
+    let (arrived, release) = host.service.broker().pause_before_channel_write();
+
+    let window = client.action_window().action_window_id.clone();
+    let mutation = queue_mutation(&host, 60, window, "held at the write");
+    let action_id = mutation.action_id;
+    client
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("writes the mutation");
+    let reached = tokio::time::timeout(LIVENESS_DEADLINE, arrived).await;
+    assert!(
+        matches!(reached, Ok(Ok(_))),
+        "the writer reached the message: {reached:?}"
+    );
+    assert_eq!(
+        receipt(&mut watcher, action_id).await.state,
+        ReceiptState::Dispatching,
+        "the message is queued and not yet written"
+    );
+    assert_eq!(
+        stored_provenance(&host, action_id).as_deref(),
+        Some("authenticated_hook_response"),
+        "the marker's own commit marks the receipt as a channel's"
+    );
+
+    let _ = release.send(());
+    assert_eq!(
+        channel.next().await["params"]["content"],
+        "held at the write"
+    );
+}
+
 /// KR-REQ-12.26: a prompt to a typed upstream needs no sender identity: a caller that entered as a
 /// workflow, with no device and no grant, is admitted and carried by the typed transport as it
 /// was, and the admission keeps the typed transport's provenance.

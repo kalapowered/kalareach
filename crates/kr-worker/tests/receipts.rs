@@ -9724,6 +9724,110 @@ fn an_unknown_outcome_that_is_not_a_channel_end_still_stands_in_the_way() {
     assert_eq!(held_by(&journal, 7), Some(action(1)));
 }
 
+/// Records an action for the approval-answer method, commits its dispatch marker as a channel's
+/// operation when `channel` is set and as any other operation's when it is not, and leaves it
+/// there, as a worker that stops between the marker and the end does.
+fn marked_and_left(journal: &mut Journal, action_byte: u8, subject_byte: u8, channel: bool) {
+    let phone = actor("device:phone");
+    journal
+        .accept(&submission(action_byte, action_byte, subject_byte))
+        .expect("an intent");
+    let marked = if channel {
+        journal.mark_dispatching_while(
+            phone,
+            action(action_byte),
+            Some(kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse),
+            TimestampMs::new(2_000),
+            || Ok(()),
+        )
+    } else {
+        journal.mark_dispatching(phone, action(action_byte), TimestampMs::new(2_000))
+    };
+    assert_eq!(
+        marked.expect("the marker is committed").state,
+        ReceiptState::Dispatching
+    );
+}
+
+/// KR-REQ-12.18: an operation a channel carries that a restart finds between its dispatch marker
+/// and its end is a channel end after the restart: its receipt reads unknown, the provenance it
+/// went by is kept, and a fresh request for its subject is not held back by it.
+#[test]
+fn a_restart_leaves_the_receipt_of_a_channels_operation_a_channel_end() {
+    let mut journal = Journal::in_memory().expect("a journal");
+    marked_and_left(&mut journal, 1, 7, true);
+    assert_eq!(
+        journal
+            .resolve_unfinished_dispatches(TimestampMs::new(9_000))
+            .expect("the markers are resolved"),
+        1
+    );
+    let receipt = journal
+        .read(actor("device:phone"), action(1))
+        .expect("reads")
+        .expect("a receipt");
+    assert_eq!(receipt.state, ReceiptState::Unknown);
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(1))
+            .expect("reads"),
+        Some(kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse),
+        "the mark committed with the marker survives the recovery"
+    );
+    assert_eq!(
+        held_by(&journal, 7),
+        None,
+        "a channel end holds no later message of its subject back"
+    );
+}
+
+/// KR-REQ-23.24: an operation of any other transport that a restart finds between its dispatch
+/// marker and its end is an unknown that holds its subject, as it always did.
+#[test]
+fn a_restart_leaves_the_receipt_of_any_other_operation_an_unknown_that_holds() {
+    let mut journal = Journal::in_memory().expect("a journal");
+    marked_and_left(&mut journal, 1, 7, false);
+    assert_eq!(
+        journal
+            .resolve_unfinished_dispatches(TimestampMs::new(9_000))
+            .expect("the markers are resolved"),
+        1
+    );
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(1))
+            .expect("reads"),
+        None
+    );
+    assert_eq!(held_by(&journal, 7), Some(action(1)));
+}
+
+/// KR-REQ-12.18: the mark a channel's operation is given with its marker says where it ends
+/// unknown for good, so an operation that ends any other way, with a result, loses it.
+#[test]
+fn an_operation_marked_as_a_channels_that_ends_another_way_loses_its_mark() {
+    let mut journal = Journal::in_memory().expect("a journal");
+    marked_and_left(&mut journal, 1, 7, true);
+    let ended = journal
+        .settle(
+            actor("device:phone"),
+            action(1),
+            ReceiptState::Applied,
+            None,
+            None,
+            TimestampMs::new(3_000),
+        )
+        .expect("the result is recorded");
+    assert_eq!(ended.state, ReceiptState::Applied);
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(1))
+            .expect("reads"),
+        None,
+        "a receipt that did not end unknown is not a channel end"
+    );
+}
+
 /// KR-REQ-23.24: a channel end hides no other unknown outcome of its subject, whichever of the two
 /// came last.
 #[test]
