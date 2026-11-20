@@ -38,6 +38,10 @@ use std::path::{Path, PathBuf};
 use kr_protocol::retained::{RETAINED, RetainedLevel};
 use serde_json::{Value, json};
 
+#[path = "retained_surface/narrower.rs"]
+mod narrower;
+#[path = "retained_surface/narrower_table.rs"]
+mod narrower_table;
 #[path = "retained_surface/probes.rs"]
 mod probes;
 // The reader that `kr-protocol-gen` records a level's table of public majors with.
@@ -48,6 +52,7 @@ mod walker;
 #[path = "retained_surface/walker_cases.rs"]
 mod walker_cases;
 
+use narrower::{LevelRecord, Narrower};
 use walker::{Depth, Followed, Tree};
 
 /// A rule of the surface: where it is rooted, and the names it is followed from.
@@ -82,6 +87,7 @@ const REMOVED: &str = "removed";
 
 /// A change to a rule that a reviewer found leaves what the level accepts as it was: the root, the
 /// digest it now has ([`REMOVED`] when the rule is gone), and why.
+#[derive(Clone)]
 struct Same {
     root: &'static str,
     digest: &'static str,
@@ -237,39 +243,46 @@ fn read_record(level: &RetainedLevel, name: &str) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
-fn same_for(root: &str, digest: &str) -> Option<&'static Same> {
-    SAME.iter()
-        .find(|entry| entry.root == root && entry.digest == digest)
-}
-
-/// The digests of the rules are the ones the previous release had, or a reviewer says the change
-/// leaves what it accepted as it was.
-#[test]
-fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
-    let followed = follow_all(&tree());
+/// The problems of the rules this tree follows, against the records of the retained levels.
+///
+/// A difference from a record is excused by a [`Same`] entry or by a [`Narrower`] that names the
+/// root and the digest. The own-tree check that a `Same` entry matches a digest now is made only
+/// where `own_tree` says the tree read is this checkout. A `Narrower`'s own staleness is checked by
+/// [`check_narrower`].
+fn compare_with_records(
+    retained: &[LevelRecord],
+    followed: &BTreeMap<String, Followed>,
+    same: &[Same],
+    narrower: &[Narrower],
+    own_tree: bool,
+) -> Vec<String> {
+    let excused = |root: &str, digest: &str| {
+        same.iter()
+            .any(|entry| entry.root == root && entry.digest == digest)
+            || narrower
+                .iter()
+                .any(|entry| entry.root == root && entry.digest == digest)
+    };
     let mut problems = Vec::new();
-    for level in &RETAINED {
-        let recorded = read_record(level, "sources.json");
-        let recorded = recorded["roots"].as_object().expect("a record of roots");
+    for level in retained {
+        let recorded = level.roots;
         // A rule the previous release had that this tree does not follow any more (a decoder
         // written by hand that a derive replaced, a type renamed) is a change in what is accepted
         // unless a reviewer says otherwise.
         for label in recorded.keys() {
-            if !followed.contains_key(label.as_str()) && same_for(label, REMOVED).is_none() {
+            if !followed.contains_key(label.as_str()) && !excused(label, REMOVED) {
                 problems.push(format!(
                     "level {}: {label} had a rule recorded and this tree follows none",
                     level.level
                 ));
             }
         }
-        for (label, now) in &followed {
+        for (label, now) in followed {
             let Some(before) = recorded.get(label.as_str()) else {
                 // A type the previous release's surface held without a rule of its own, and that
                 // has one now, accepts what it did not before. A type or a macro the surface did
                 // not hold is not a difference from it.
-                if level.surface().definition(label).is_some()
-                    && same_for(label, &now.digest).is_none()
-                {
+                if (level.surface_defines)(label) && !excused(label, &now.digest) {
                     problems.push(format!(
                         "level {}: {label} is a type of the surface that had no rule of its own and has one now (digest {})",
                         level.level, now.digest
@@ -277,14 +290,14 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
                 }
                 continue;
             };
-            let before = before["digest"].as_str().unwrap_or_default();
-            if before != now.digest && same_for(label, &now.digest).is_none() {
+            let before_digest = before["digest"].as_str().unwrap_or_default();
+            if before_digest != now.digest && !excused(label, &now.digest) {
                 let names: BTreeSet<&str> = before_items(&recorded[label.as_str()])
                     .into_iter()
                     .collect();
                 let now_names: BTreeSet<&str> = now.items.iter().map(String::as_str).collect();
                 problems.push(format!(
-                    "level {}: what {label} names changed (digest {} now, {before} recorded); items only recorded: {:?}; items only now: {:?}",
+                    "level {}: what {label} names changed (digest {} now, {before_digest} recorded); items only recorded: {:?}; items only now: {:?}",
                     level.level,
                     now.digest,
                     names.difference(&now_names).collect::<Vec<_>>(),
@@ -295,8 +308,7 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
     }
     // An entry carries this checkout's digest of a root, so it is held to this checkout and not to
     // a release's tree, whose digests are the recorded ones.
-    let own_tree = std::env::var_os("KR_RELEASE_TREE").is_none();
-    for entry in SAME.iter().filter(|_| own_tree) {
+    for entry in same.iter().filter(|_| own_tree) {
         let now = followed.get(entry.root);
         let matches = match now {
             Some(now) => now.digest == entry.digest,
@@ -309,7 +321,59 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
             ));
         }
     }
+    problems
+}
+
+/// The digests of the rules are the ones the previous release had, or a reviewer says the change
+/// leaves what it accepted as it was, or says the rule refuses more.
+#[test]
+fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
+    let followed = follow_all(&tree());
+    let own_tree = std::env::var_os("KR_RELEASE_TREE").is_none();
+    let records = level_records();
+    let problems = compare_with_records(
+        &records.levels(),
+        &followed,
+        SAME,
+        narrower_table::NARROWER,
+        own_tree,
+    );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// What the retained levels recorded, read once.
+struct Records {
+    levels: Vec<String>,
+    roots: Vec<Value>,
+}
+
+fn level_records() -> Records {
+    Records {
+        levels: RETAINED
+            .iter()
+            .map(|level| level.level.to_string())
+            .collect(),
+        roots: RETAINED
+            .iter()
+            .map(|level| read_record(level, "sources.json"))
+            .collect(),
+    }
+}
+
+impl Records {
+    fn levels(&self) -> Vec<LevelRecord<'_>> {
+        RETAINED
+            .iter()
+            .zip(self.levels.iter().zip(&self.roots))
+            .map(|(level, (name, record))| LevelRecord {
+                level: name,
+                roots: record["roots"].as_object().expect("a record of roots"),
+                surface_defines: Box::leak(Box::new(move |label: &str| {
+                    level.surface().definition(label).is_some()
+                })),
+            })
+            .collect()
+    }
 }
 
 fn before_items(record: &Value) -> Vec<&str> {
