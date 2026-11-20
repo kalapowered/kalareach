@@ -2124,7 +2124,6 @@ fn settled_by_a_service<Ended>(
     }
 }
 
-/// The frame a service's answer goes out as.
 /// Holds an answer to the privacy state it was read under, when it carries text a model wrote:
 /// `withheld` is the same answer without that text, which is written in its place once the state
 /// has moved ([`RemoteConnection::write_answer`]). An answer that carries no such text is held to
@@ -2140,6 +2139,7 @@ fn hold_text(
     }
 }
 
+/// The frame a service's answer goes out as.
 fn framed(request_id: RequestId, answer: Result<ParamsValue>) -> ControlFrame {
     framed_protocol(
         request_id,
