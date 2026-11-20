@@ -472,6 +472,8 @@ fn replace_checked(
     }
     match parent.fetch(temporary, MAX_FILE_BYTES) {
         Ok(Fetched::File(read)) if digest_of(&read.bytes) == expected => {
+            #[cfg(test)]
+            cleanup_pause::run(path);
             parent.remove_file(temporary).map_err(storage)
         }
         _ => Err(put_back(parent, temporary, name, staged, path)),
@@ -500,6 +502,8 @@ fn put_back(
     match parent.fetch(temporary, MAX_FILE_BYTES) {
         Ok(Fetched::Absent) if back => changed_since_checked(path),
         Ok(Fetched::File(read)) if back && read.identity.same_object(staged) => {
+            #[cfg(test)]
+            cleanup_pause::run(path);
             let _ = parent.remove_file(temporary);
             changed_since_checked(path)
         }
@@ -528,6 +532,33 @@ pub(crate) mod publish_pause {
 
     pub(crate) fn run(path: &Path) {
         if let Some(then) = BEFORE_PUBLISH.with(|before| before.borrow_mut().take()) {
+            then(path);
+        }
+    }
+}
+
+/// What the unit tests run in a write after it has read a staged or displaced file and before it
+/// removes that file, to make the change another process could make between the two.
+#[cfg(test)]
+pub(crate) mod cleanup_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE_REMOVAL: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a write on this thread is about to remove a file it staged
+    /// or displaced.
+    #[cfg(unix)]
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE_REMOVAL.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(path: &Path) {
+        if let Some(then) = BEFORE_REMOVAL.with(|before| before.borrow_mut().take()) {
             then(path);
         }
     }

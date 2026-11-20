@@ -5987,6 +5987,116 @@ mod tests {
         }
     }
 
+    /// What another process does to the entry a write made beside its destination: it moves that
+    /// entry aside and puts a file of its own under the name. Returns that file's path.
+    #[cfg(unix)]
+    fn put_a_file_under_the_temporary_name(folder: &Path) -> PathBuf {
+        let entries: Vec<PathBuf> = std::fs::read_dir(folder)
+            .expect("the folder")
+            .map(|entry| entry.expect("an entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(".kalareach"))
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "one temporary entry stands: {entries:?}");
+        let temporary = entries[0].clone();
+        std::fs::rename(&temporary, folder.join("moved-aside")).expect("moves it aside");
+        std::fs::write(&temporary, b"theirs").expect("another process writes its own file");
+        temporary
+    }
+
+    /// KR-REQ-11.01: a file another process puts under the temporary name of a write is not
+    /// removed when the publication then fails. The host takes back what it staged, never what it
+    /// did not.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_under_the_temporary_name_is_kept_when_the_publication_fails() {
+        for variant in ["the checked file is gone", "a free name is taken"] {
+            let tree = Tree::create();
+            let walk = anchor::Anchor::open(&tree.home())
+                .expect("opens")
+                .expect("a root");
+            let place = tree.home().join("doc.json");
+            let checked = (variant == "the checked file is gone").then(|| digest_of(b"one"));
+            if checked.is_some() {
+                walk.write(&place, b"one", 0o600, None).expect("a new file");
+            }
+            let theirs = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+            let (put, at, home) = (std::rc::Rc::clone(&theirs), place.clone(), tree.home());
+            anchor::publish_pause::once(move |_| {
+                *put.borrow_mut() = Some(put_a_file_under_the_temporary_name(&home));
+                if variant == "a free name is taken" {
+                    std::fs::write(&at, b"taken").expect("another process makes the file");
+                } else {
+                    std::fs::remove_file(&at).expect("another process removes the file");
+                }
+            });
+            let refused = walk
+                .write(&place, b"two", 0o600, checked)
+                .expect_err(variant);
+            assert!(
+                matches!(&refused, ControllerError::PermissionDenied { detail }
+                    if detail.contains("replaces only the file it checked")),
+                "{variant}: {refused}"
+            );
+            let theirs = theirs.borrow().clone().expect("a file was put there");
+            assert_eq!(
+                std::fs::read(&theirs).ok().as_deref(),
+                Some(&b"theirs"[..]),
+                "{variant}: the file put under the temporary name is kept"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: a file another process puts under the temporary name after the write has read
+    /// the file it is about to remove is not removed. This holds where the write removes the file
+    /// it displaced and where it takes back its own staged file.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_under_the_temporary_name_after_its_check_is_kept() {
+        for variant in [
+            "the displaced file is removed",
+            "the staged file is taken back",
+        ] {
+            let tree = Tree::create();
+            let walk = anchor::Anchor::open(&tree.home())
+                .expect("opens")
+                .expect("a root");
+            let place = tree.home().join("doc.json");
+            walk.write(&place, b"one", 0o600, None).expect("a new file");
+            let theirs = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+            if variant == "the staged file is taken back" {
+                let at = place.clone();
+                anchor::publish_pause::once(move |_| {
+                    std::fs::write(&at, b"changed").expect("another process writes the file");
+                });
+            }
+            let (put, home) = (std::rc::Rc::clone(&theirs), tree.home());
+            anchor::cleanup_pause::once(move |_| {
+                *put.borrow_mut() = Some(put_a_file_under_the_temporary_name(&home));
+            });
+            let written = walk.write(&place, b"two", 0o600, Some(digest_of(b"one")));
+            if variant == "the displaced file is removed" {
+                written.expect(variant);
+                assert_eq!(std::fs::read(&place).expect("a file"), b"two", "{variant}");
+            } else {
+                written.expect_err(variant);
+                assert_eq!(
+                    std::fs::read(&place).expect("a file"),
+                    b"changed",
+                    "{variant}"
+                );
+            }
+            let theirs = theirs.borrow().clone().expect("a file was put there");
+            assert_eq!(
+                std::fs::read(&theirs).ok().as_deref(),
+                Some(&b"theirs"[..]),
+                "{variant}: the file put under the temporary name is kept"
+            );
+        }
+    }
+
     /// KR-REQ-11.01: a file where a folder is needed and a folder where a file is to be written
     /// stop the installation before anything is written, by the walk's approved words.
     #[cfg(unix)]
