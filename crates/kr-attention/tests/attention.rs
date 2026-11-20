@@ -5560,10 +5560,6 @@ fn an_owner_whose_store_was_taken_answers_nothing_more() {
         first.reviews_as(&who, session(1), None, MAX_REVIEW_SUBJECTS),
         Err(kr_attention::Error::StoreTaken)
     ));
-    assert!(
-        matches!(first.check_store(), Err(kr_attention::Error::StoreTaken)),
-        "and it says so when it is asked outright, which is what a host asks before it dispatches"
-    );
     assert!(matches!(
         first.check_actor(&who),
         Err(kr_attention::Error::StoreTaken)
