@@ -10461,9 +10461,28 @@ async fn wired_with_a_floor() -> Wired {
         ShellMode::Managed,
         true,
         Bridging::on_a_clock_of_its_own(),
+        with_a_floor,
+    )
+    .await
+}
+
+/// Gives a session the floor [`wired_with_a_floor`] describes.
+fn with_a_floor(config: &mut SessionConfig) {
+    config.time = kr_worker::action::time::TimeSources::system()
+        .with_floor(Arc::new(kr_ipc::floor::SharedFloor::in_process(0)));
+}
+
+/// The same, with an application that sets its terminal to take input as it comes and then reads
+/// none of it, so a terminal that has taken what it has room for takes no more.
+async fn wired_with_a_floor_over_an_application_that_does_not_read() -> Wired {
+    wired_built(
+        ShellMode::Managed,
+        true,
+        Bridging::on_a_clock_of_its_own(),
         |config| {
-            config.time = kr_worker::action::time::TimeSources::system()
-                .with_floor(Arc::new(kr_ipc::floor::SharedFloor::in_process(0)));
+            with_a_floor(config);
+            config.shell =
+                kr_worker::testing::posix_script("stty raw -echo; printf 'kr-ready\\n'; sleep 120");
         },
     )
     .await
@@ -10828,6 +10847,161 @@ async fn a_piece_whose_boot_end_passes_while_the_writer_stands_in_a_look_is_not_
     assert!(
         !contains(&handed, LEFT_BEHIND),
         "a piece was written after the end of its authority: {handed:?}"
+    );
+    wired.close().await;
+}
+
+/// How much `holder` hands the terminal to fill it: far more than a terminal takes while nothing
+/// reads.
+fn more_than_the_terminal_takes() -> Vec<u8> {
+    b"fill-the-terminal\n".repeat(4096)
+}
+
+/// Fills the terminal with `holder`'s bytes until the writer waits for room, and stands the writer
+/// in the look it makes there. Returns the end that lets the look go, and what the writer still
+/// owes the terminal.
+///
+/// The batch carries a UTC end an hour away, so the look answers that the deadline has not passed.
+/// The writer is waiting for room once what it owes has stopped falling.
+async fn stand_the_writer_waiting_for_room_in_a_look(
+    wired: &Wired,
+    holder: AttachmentId,
+) -> (std::sync::mpsc::Sender<()>, usize) {
+    let ready = std::time::Instant::now() + SOON;
+    while !contains(&retained(&wired.runtime.session()), b"kr-ready")
+        && std::time::Instant::now() < ready
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        contains(&retained(&wired.runtime.session()), b"kr-ready"),
+        "the application has set its terminal"
+    );
+    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let bytes = more_than_the_terminal_takes();
+    {
+        let mut session = wired.runtime.session();
+        let epoch = session.lease().epoch.get();
+        session
+            .write_input_until(
+                holder,
+                epoch,
+                0,
+                &bytes,
+                kr_worker::session::InputAuthority {
+                    boot_ms: None,
+                    utc_ms: Some(kr_ipc::now_ms().get() + 3_600_000),
+                },
+                std::time::Instant::now(),
+            )
+            .expect("accepted");
+    }
+    wired.runtime.flush_input();
+    let by = std::time::Instant::now() + 6 * SOON;
+    let mut owed = queued.load(std::sync::atomic::Ordering::Acquire);
+    let mut since = std::time::Instant::now();
+    while std::time::Instant::now() < by {
+        std::thread::sleep(Duration::from_millis(20));
+        let now = queued.load(std::sync::atomic::Ordering::Acquire);
+        if now != owed {
+            owed = now;
+            since = std::time::Instant::now();
+        } else if owed < bytes.len() && since.elapsed() >= Duration::from_millis(500) {
+            break;
+        }
+    }
+    assert!(
+        owed > 0 && owed < bytes.len(),
+        "the terminal took some of the bytes and not all of them: {owed} of {} are owed",
+        bytes.len()
+    );
+    let time = Arc::clone(wired.runtime.session().time());
+    let (arrived, release) = time.arm_floor_look_stall(0);
+    tokio::time::timeout(SOON, arrived)
+        .await
+        .expect("the writer reached the look at the floor's name while it waited for room")
+        .expect("the look was armed");
+    (release, owed)
+}
+
+/// KR-REQ-08.62: `input.acquire` returns the new epoch, and the exact count of what the lease it
+/// ended left unwritten, while the writer waits for room in a terminal that has none and stands in
+/// a look at the floor's name that does not return.
+///
+/// The look the writer makes while it waits for room is made outside the boundary too, so a
+/// takeover is answered before that look returns. The case records whether the look had been let
+/// go when the takeover was answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Unix terminal stops taking input while the application is not reading, which makes the writer wait for room; a Windows pseudo-console takes it at once"
+)]
+async fn a_takeover_returns_its_epoch_while_the_writer_waiting_for_room_stands_in_a_look_at_the_floors_name()
+ {
+    let wired = wired_with_a_floor_over_an_application_that_does_not_read().await;
+    let holder = wired.holder();
+    let challenger = AttachmentId::new(kr_ipc::new_uuid());
+    let params = terminal(wired.session_id);
+    wired
+        .runtime
+        .session()
+        .attach(&params, params.requested.clone(), challenger)
+        .expect("attaches");
+    let epoch = wired.runtime.session().lease().epoch.get();
+    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let (release, owed) = stand_the_writer_waiting_for_room_in_a_look(&wired, holder).await;
+
+    // The takeover is made on a thread of its own, which notes whether the look had been let go
+    // when the takeover was answered.
+    let let_go = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime = Arc::clone(&wired.runtime);
+    let noted = Arc::clone(&let_go);
+    let (done, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let acquired = runtime
+            .session()
+            .acquire_input(challenger, ConnectionId::new(kr_ipc::new_uuid()), None)
+            .ok();
+        let _ = done.send((acquired, noted.load(std::sync::atomic::Ordering::SeqCst)));
+        runtime.flush_input();
+    });
+    let in_the_look = answered_within_soon(&answered);
+    let_go.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(release);
+    let (taken, let_go_before_the_answer) = match in_the_look {
+        Some(answer) => answer,
+        None => answered
+            .recv_timeout(SOON)
+            .expect("the takeover is answered once the look returns"),
+    };
+    assert!(
+        !let_go_before_the_answer,
+        "the takeover was answered only once the look at the floor's name had returned"
+    );
+    let taken = taken.expect("the takeover takes the keys");
+    assert_eq!(
+        taken.lease.epoch.get(),
+        epoch + 1,
+        "the takeover returns the epoch that follows the one it ended"
+    );
+    assert_eq!(taken.lease.holder.0, Some(challenger));
+    assert_eq!(
+        taken.discarded_bytes.get(),
+        owed as u64,
+        "the takeover counts what the first holder's lease left unwritten"
+    );
+
+    // The look returns and finds the lease ended: nothing more of the first holder's bytes goes.
+    let settled = std::time::Instant::now() + SOON;
+    while queued.load(std::sync::atomic::Ordering::Acquire) != 0
+        && std::time::Instant::now() < settled
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        queued.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the writer settled the first holder's batch"
     );
     wired.close().await;
 }
