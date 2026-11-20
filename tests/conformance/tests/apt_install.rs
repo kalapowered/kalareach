@@ -275,7 +275,9 @@ impl Rig {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = {
-            let _spawning = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _spawning = SPAWNING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             command.spawn().expect("bash runs the script")
         };
         let output = child.wait_with_output().expect("the script ends");
@@ -341,7 +343,9 @@ impl Rig {
 static SPAWNING: Mutex<()> = Mutex::new(());
 
 fn write_program(path: &Path, text: &str) {
-    let _writing = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _writing = SPAWNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     fs::write(path, text).expect("a stand-in");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("a mode");
 }
@@ -815,17 +819,30 @@ fn the_playwright_package_list_is_empty_when_every_package_is_installed() {
 #[test]
 fn the_playwright_package_list_fails_on_any_other_shape() {
     for (printed, status) in [
-        ("Missing system dependencies (3):\n  libgbm1\n  libwoff1\n", 1),
-        ("Missing system dependencies (1):\n  libgbm1\nWarning: something\n", 1),
+        (
+            "Missing system dependencies (3):\n  libgbm1\n  libwoff1\n",
+            1,
+        ),
+        (
+            "Missing system dependencies (1):\n  libgbm1\nWarning: something\n",
+            1,
+        ),
         ("Missing system dependencies (0):\n", 1),
-        ("Failed to install browser dependencies\nE: Unable to locate package\n", 1),
+        (
+            "Failed to install browser dependencies\nE: Unable to locate package\n",
+            1,
+        ),
         ("Missing system dependencies (1):\n  libgbm1\n", 0),
         ("All system dependencies are installed.\n", 1),
         ("Missing system dependencies (1):\n  libgbm1\n", 2),
         ("", 0),
     ] {
         let (outcome, _) = playwright_names(printed, status);
-        assert_eq!(outcome.status, 1, "{printed:?} {status}: {}{}", outcome.stdout, outcome.stderr);
+        assert_eq!(
+            outcome.status, 1,
+            "{printed:?} {status}: {}{}",
+            outcome.stdout, outcome.stderr
+        );
         assert_eq!(outcome.stdout, "", "{printed:?}");
         assert!(
             outcome.stderr.starts_with("playwright-system-packages: "),
@@ -924,7 +941,10 @@ fn manifest(rig: &Rig) -> Vec<String> {
 #[test]
 fn a_cold_run_with_an_archive_directory_lists_fetches_and_keeps_a_verified_set() {
     let rig = Rig::new();
-    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    pool(
+        &rig,
+        &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")],
+    );
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert_eq!(rig.phases(), ["update", "list", "download", "install"]);
@@ -933,9 +953,14 @@ fn a_cold_run_with_an_archive_directory_lists_fetches_and_keeps_a_verified_set()
         list.contains("install --print-uris -qq --no-install-recommends -o Acquire::ForceHash=SHA256 -o Dir::Cache::Archives="),
         "{list}"
     );
-    assert!(!list.contains(&rig.path("archives").display().to_string()), "an empty directory: {list}");
     assert!(
-        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=0 fetched=2 dropped=0 attempts=1 "),
+        !list.contains(&rig.path("archives").display().to_string()),
+        "an empty directory: {list}"
+    );
+    assert!(
+        summary(&outcome).starts_with(
+            "apt-install: packages=2 archives=2 seeded=0 fetched=2 dropped=0 attempts=1 "
+        ),
         "{}",
         summary(&outcome)
     );
@@ -955,21 +980,37 @@ fn a_cold_run_with_an_archive_directory_lists_fetches_and_keeps_a_verified_set()
 #[test]
 fn a_run_that_restores_a_verified_directory_fetches_nothing_and_saves_nothing() {
     let rig = Rig::new();
-    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    pool(
+        &rig,
+        &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")],
+    );
     assert_eq!(archive_run(&rig, &["tmux", "fuse3"]).status, 0);
     let digest = output_of(&rig, "digest");
     new_runner(&rig);
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert!(
-        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=2 fetched=0 dropped=0 attempts=1 "),
+        summary(&outcome).starts_with(
+            "apt-install: packages=2 archives=2 seeded=2 fetched=0 dropped=0 attempts=1 "
+        ),
         "{}",
         summary(&outcome)
     );
-    assert!(outcome.stdout.contains("apt-install: seeded tmux_1.0_all.deb"));
-    assert!(rig.lines("fetched.log").is_empty(), "the download fetched: {:?}", rig.lines("fetched.log"));
+    assert!(
+        outcome
+            .stdout
+            .contains("apt-install: seeded tmux_1.0_all.deb")
+    );
+    assert!(
+        rig.lines("fetched.log").is_empty(),
+        "the download fetched: {:?}",
+        rig.lines("fetched.log")
+    );
     assert_eq!(output_of(&rig, "save"), Some("false".to_owned()));
-    assert_eq!(sha256_hex(&cache(&rig).join("MANIFEST")), digest.expect("a digest"));
+    assert_eq!(
+        sha256_hex(&cache(&rig).join("MANIFEST")),
+        digest.expect("a digest")
+    );
 }
 
 /// An archive that has the right name and size and other bytes is not copied: it is dropped and
@@ -978,7 +1019,10 @@ fn a_run_that_restores_a_verified_directory_fetches_nothing_and_saves_nothing() 
 #[test]
 fn an_archive_with_the_right_size_and_other_bytes_is_dropped_fetched_again_and_saved_as_a_repair() {
     let rig = Rig::new();
-    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    pool(
+        &rig,
+        &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")],
+    );
     assert_eq!(archive_run(&rig, &["tmux", "fuse3"]).status, 0);
     let digest = output_of(&rig, "digest").expect("a digest");
     fs::write(cache(&rig).join("tmux_1.0_all.deb"), "tmux BYTES").expect("a changed archive");
@@ -986,23 +1030,41 @@ fn an_archive_with_the_right_size_and_other_bytes_is_dropped_fetched_again_and_s
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert!(
-        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=1 fetched=1 dropped=1 attempts=1 "),
+        summary(&outcome).starts_with(
+            "apt-install: packages=2 archives=2 seeded=1 fetched=1 dropped=1 attempts=1 "
+        ),
         "{}",
         summary(&outcome)
     );
-    assert!(outcome.stdout.contains("apt-install: dropped tmux_1.0_all.deb"));
+    assert!(
+        outcome
+            .stdout
+            .contains("apt-install: dropped tmux_1.0_all.deb")
+    );
     assert_eq!(rig.lines("fetched.log"), ["tmux_1.0_all.deb"]);
     let installed = fs::read(rig.path("archives/tmux_1.0_all.deb")).expect("the archive apt holds");
     assert_eq!(installed, b"tmux bytes");
-    assert_eq!(output_of(&rig, "digest"), Some(digest.clone()), "the manifest is the same");
+    assert_eq!(
+        output_of(&rig, "digest"),
+        Some(digest.clone()),
+        "the manifest is the same"
+    );
     assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
-    assert_eq!(output_of(&rig, "entry"), Some(format!("{digest}-repair-77-2")));
-    assert_eq!(fs::read(cache(&rig).join("tmux_1.0_all.deb")).expect("a repaired archive"), b"tmux bytes");
+    assert_eq!(
+        output_of(&rig, "entry"),
+        Some(format!("{digest}-repair-77-2"))
+    );
+    assert_eq!(
+        fs::read(cache(&rig).join("tmux_1.0_all.deb")).expect("a repaired archive"),
+        b"tmux bytes"
+    );
 
     new_runner(&rig);
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
     assert!(
-        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=2 fetched=0 dropped=0 attempts=1 "),
+        summary(&outcome).starts_with(
+            "apt-install: packages=2 archives=2 seeded=2 fetched=0 dropped=0 attempts=1 "
+        ),
         "{}",
         summary(&outcome)
     );
@@ -1015,7 +1077,10 @@ fn an_archive_with_the_right_size_and_other_bytes_is_dropped_fetched_again_and_s
 #[test]
 fn the_saved_directory_is_built_from_the_list_and_keeps_nothing_that_is_not_listed() {
     let rig = Rig::new();
-    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    pool(
+        &rig,
+        &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")],
+    );
     assert_eq!(archive_run(&rig, &["tmux", "fuse3"]).status, 0);
     let first = output_of(&rig, "digest").expect("a digest");
 
@@ -1028,7 +1093,13 @@ fn the_saved_directory_is_built_from_the_list_and_keeps_nothing_that_is_not_list
     assert_eq!(manifest(&rig), [manifest_line(&rig, "tmux")]);
     let files: Vec<String> = fs::read_dir(cache(&rig))
         .expect("the directory")
-        .map(|entry| entry.expect("an entry").file_name().to_string_lossy().into_owned())
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert_eq!(files.len(), 2, "{files:?}");
     assert_ne!(output_of(&rig, "digest"), Some(first));
@@ -1037,7 +1108,13 @@ fn the_saved_directory_is_built_from_the_list_and_keeps_nothing_that_is_not_list
     assert!(!entry.contains("repair"), "{entry}");
 
     // A replacement under the same name, and a link where an archive is listed.
-    pool(&rig, &[("tmux", "tmux bytes, replaced"), ("fuse3", "fuse3 bytes, longer")]);
+    pool(
+        &rig,
+        &[
+            ("tmux", "tmux bytes, replaced"),
+            ("fuse3", "fuse3 bytes, longer"),
+        ],
+    );
     std::os::unix::fs::symlink(
         rig.path("pool/fuse3_1.0_all.deb"),
         cache(&rig).join("fuse3_1.0_all.deb"),
@@ -1047,12 +1124,17 @@ fn the_saved_directory_is_built_from_the_list_and_keeps_nothing_that_is_not_list
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert!(
-        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=0 fetched=2 dropped=2 "),
+        summary(&outcome)
+            .starts_with("apt-install: packages=2 archives=2 seeded=0 fetched=2 dropped=2 "),
         "{}",
         summary(&outcome)
     );
     assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
-    assert!(output_of(&rig, "entry").expect("an entry").contains("-repair-77-2"));
+    assert!(
+        output_of(&rig, "entry")
+            .expect("an entry")
+            .contains("-repair-77-2")
+    );
     assert!(!cache(&rig).join("fuse3_1.0_all.deb").is_symlink());
 }
 
@@ -1061,11 +1143,20 @@ fn the_saved_directory_is_built_from_the_list_and_keeps_nothing_that_is_not_list
 #[test]
 fn an_archive_that_apt_no_longer_holds_is_left_out_of_the_saved_set() {
     let rig = Rig::new();
-    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    pool(
+        &rig,
+        &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")],
+    );
     rig.plan("install", &["consume"]);
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
-    assert!(outcome.stdout.contains("apt-install: not saved tmux_1.0_all.deb"), "{}", outcome.stdout);
+    assert!(
+        outcome
+            .stdout
+            .contains("apt-install: not saved tmux_1.0_all.deb"),
+        "{}",
+        outcome.stdout
+    );
     assert_eq!(manifest(&rig), [manifest_line(&rig, "fuse3")]);
     assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
 }
@@ -1074,11 +1165,18 @@ fn an_archive_that_apt_no_longer_holds_is_left_out_of_the_saved_set() {
 #[test]
 fn an_archive_with_no_hash_in_the_list_is_neither_seeded_nor_saved() {
     let rig = Rig::new();
-    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    pool(
+        &rig,
+        &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")],
+    );
     fs::write(rig.path("nohash"), "tmux").expect("a marker");
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
-    assert!(summary(&outcome).contains(" archives=1 "), "{}", summary(&outcome));
+    assert!(
+        summary(&outcome).contains(" archives=1 "),
+        "{}",
+        summary(&outcome)
+    );
     assert_eq!(manifest(&rig), [manifest_line(&rig, "fuse3")]);
 }
 
@@ -1113,7 +1211,11 @@ fn an_archive_directory_that_is_relative_or_the_root_is_refused() {
     for directory in ["cache/desktop", "/", ""] {
         let rig = Rig::new();
         let outcome = rig.run(&["--archive", directory, "tmux"]);
-        assert_eq!(outcome.status, 2, "{directory:?}: {}{}", outcome.stdout, outcome.stderr);
+        assert_eq!(
+            outcome.status, 2,
+            "{directory:?}: {}{}",
+            outcome.stdout, outcome.stderr
+        );
         assert!(rig.phases().is_empty(), "{directory:?}");
     }
 }
