@@ -23,10 +23,6 @@ held = false
 [unrun]
 bench = 'b'
 typescript = 't'
-[unrun.rust]
-linux = 'l'
-macos = 'm'
-windows = 'w'
 ";
 
 fn git(root: &Path, arguments: &[&str]) {

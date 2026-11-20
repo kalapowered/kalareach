@@ -17,11 +17,6 @@ KR_IN_BOTH = "the plan's"
 bench = 'a benchmark'
 typescript = 'no step runs TypeScript'
 
-[unrun.rust]
-linux = 'no step runs this target'
-macos = 'no step runs this target'
-windows = 'no step runs this target'
-
 [[step]]
 id = 'make-the-file'
 group = 'rust'

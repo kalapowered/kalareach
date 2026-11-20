@@ -190,37 +190,11 @@ pub struct GroupAbsent {
     pub explains_unrun_rust: bool,
 }
 
-/// One reason for each platform.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PerPlatform {
-    /// On Linux.
-    pub linux: String,
-    /// On macOS.
-    pub macos: String,
-    /// On Windows.
-    pub windows: String,
-}
-
-impl PerPlatform {
-    /// The reason for `platform`.
-    #[must_use]
-    pub fn get(&self, platform: Platform) -> &str {
-        match platform {
-            Platform::Linux => &self.linux,
-            Platform::MacOs => &self.macos,
-            Platform::Windows => &self.windows,
-        }
-    }
-}
-
 /// Why a test no step runs is not run.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Unrun {
-    /// A Rust target that no step runs, in general, on each platform.
-    pub rust: PerPlatform,
-    /// A benchmark target, before the reason for Rust targets in general.
+    /// A benchmark target that no step of the selection covers, before the sentence that says so.
     pub bench: String,
     /// A TypeScript test that no step runs, when no group says why.
     pub typescript: String,
@@ -453,11 +427,6 @@ pub struct Plan {
 impl Default for Unrun {
     fn default() -> Self {
         Self {
-            rust: PerPlatform {
-                linux: String::new(),
-                macos: String::new(),
-                windows: String::new(),
-            },
             bench: String::new(),
             typescript: String::new(),
         }
@@ -1362,13 +1331,7 @@ impl Plan {
             }
         }
         let unrun = &self.unrun;
-        for (name, text) in [
-            ("rust.linux", &unrun.rust.linux),
-            ("rust.macos", &unrun.rust.macos),
-            ("rust.windows", &unrun.rust.windows),
-            ("bench", &unrun.bench),
-            ("typescript", &unrun.typescript),
-        ] {
+        for (name, text) in [("bench", &unrun.bench), ("typescript", &unrun.typescript)] {
             if blank(text) {
                 return refuse(format!("`[unrun]` has no `{name}` reason"));
             }
@@ -1422,11 +1385,6 @@ impl Plan {
                 manifests: vec!["Cargo.toml".to_owned()],
             },
             unrun: Unrun {
-                rust: PerPlatform {
-                    linux: reason.to_owned(),
-                    macos: reason.to_owned(),
-                    windows: reason.to_owned(),
-                },
                 bench: reason.to_owned(),
                 typescript: reason.to_owned(),
             },
@@ -1654,9 +1612,9 @@ impl Plan {
             .any(|step| step.skips_from == Some(SkipsFrom::Applications))
     }
 
-    /// Why an unrun Rust target is unrun beyond the platform's general reason: the first reason, in
-    /// the plan's order of groups, of a selected group that runs nothing on `platform` and is
-    /// marked as explaining it.
+    /// Why a Rust target that no step of the selection covers is not run: the first reason, in the
+    /// plan's order of groups, of a selected group that runs nothing on `platform` and is marked as
+    /// explaining it.
     #[must_use]
     pub fn unrun_rust_reason(&self, platform: Platform, groups: &[String]) -> Option<&str> {
         self.groups

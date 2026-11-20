@@ -42,11 +42,6 @@ lock = 'tests/conformance/applications.lock'
 bench = 'a benchmark target: the performance group runs the measurements it holds'
 typescript = '''no step of this run's selection runs the TypeScript suites'''
 
-[unrun.rust]
-linux = '''no step of this run's selection runs this target on this platform'''
-macos = '''no step of this run's selection runs this target on this platform'''
-windows = 'no step runs this target on Windows: the suites that drive a Unix pseudo-terminal are compiled there and qualified on Unix, and the pseudo-console is qualified on the Windows test machine'
-
 [terminals]
 names = [
     'iTerm2',
