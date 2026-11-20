@@ -4858,6 +4858,15 @@ async fn receipt_of_the_device(
     daemon: &mut BoundLink,
     action_id: ActionId,
 ) -> kr_protocol::receipt::Receipt {
+    receipt_of_the_actor(daemon, &a_test_phone(), action_id).await
+}
+
+/// As [`receipt_of_the_device`], for the actor `envelope` names.
+async fn receipt_of_the_actor(
+    daemon: &mut BoundLink,
+    envelope: &kr_protocol::actor::ActorEnvelope,
+    action_id: ActionId,
+) -> kr_protocol::receipt::Receipt {
     let frame = ControlFrame::ForwardedRead(Box::new(kr_protocol::local::ForwardedRequest {
         request: Request {
             request_id: RequestId::new(901),
@@ -4872,7 +4881,7 @@ async fn receipt_of_the_device(
         authority_deadline_boot_ms: Nullable::some(kr_protocol::scalars::U64::new(
             kr_ipc::clock::boot_elapsed_ms() + 30_000,
         )),
-        actor: a_test_phone(),
+        actor: envelope.clone(),
         history: None,
     }));
     daemon.send(&frame).await.expect("writes the read");
@@ -4900,7 +4909,35 @@ async fn forward_as_device_within(
     grant_rights: &[kr_protocol::rights::ActionRight],
     history: Option<kr_protocol::grant::HistoryScope>,
 ) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
-    let envelope = a_test_phone();
+    forward_as_actor_within(daemon, mutation, &a_test_phone(), grant_rights, history).await
+}
+
+/// Forwards one mutation as the control daemon does for the actor `envelope` names, under a grant
+/// that carries `grant_rights`, and whose history reaches back to the start of time.
+async fn forward_as_actor(
+    daemon: &mut BoundLink,
+    mutation: &MutationRequest,
+    envelope: &kr_protocol::actor::ActorEnvelope,
+    grant_rights: &[kr_protocol::rights::ActionRight],
+) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
+    forward_as_actor_within(
+        daemon,
+        mutation,
+        envelope,
+        grant_rights,
+        Some(common::a_scope_with_the_live_screen()),
+    )
+    .await
+}
+
+/// As [`forward_as_device_within`], for the actor `envelope` names.
+async fn forward_as_actor_within(
+    daemon: &mut BoundLink,
+    mutation: &MutationRequest,
+    envelope: &kr_protocol::actor::ActorEnvelope,
+    grant_rights: &[kr_protocol::rights::ActionRight],
+    history: Option<kr_protocol::grant::HistoryScope>,
+) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {
     let lease =
         common::a_lease_after_the_announcement(daemon, mutation.target.environment_id, 1, 1).await;
     let rights = grant_rights.iter().copied().collect();
@@ -4910,12 +4947,12 @@ async fn forward_as_device_within(
     match history {
         Some(history) => {
             daemon
-                .forward_within(mutation, &envelope, &rights, deadline, Some(lease), history)
+                .forward_within(mutation, envelope, &rights, deadline, Some(lease), history)
                 .await
         }
         None => {
             daemon
-                .forward(mutation, &envelope, &rights, deadline, Some(lease))
+                .forward(mutation, envelope, &rights, deadline, Some(lease))
                 .await
         }
     }
@@ -7661,6 +7698,88 @@ async fn kr_req_12_26_a_prompt_inside_its_window_is_marked_as_a_channels_by_its_
     assert_eq!(
         channel.next().await["params"]["content"],
         "held after the marker"
+    );
+}
+
+/// KR-REQ-12.26: a message from a caller the host cannot name as a sender is refused when it reaches
+/// the worker through the daemon's forwarding, as it is at the broker: a local caller under a
+/// grant, and a paired device with a device and no grant, the two refused rows a forwarded caller
+/// can still reach. Each ends as not permitted with the sender sentence, holds a rejected receipt
+/// and writes no frame, and the approval stays answerable: the next frame is its verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_a_forwarded_caller_with_no_verified_sender_cannot_send_a_message() {
+    use kr_protocol::actor::{ActorEnvelope, ActorIngress};
+
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let resource_id = channel.relay(&host, "abcde").await;
+    let mut daemon = daemon(&host).await;
+    let phone = a_test_phone();
+    let rows = [
+        (
+            "a local caller under a grant",
+            ActorEnvelope {
+                ingress: ActorIngress::LocalIpc,
+                device_id: Nullable::null(),
+                ..phone.clone()
+            },
+        ),
+        (
+            "a paired device with no grant",
+            ActorEnvelope {
+                grant_id: Nullable::null(),
+                grant_revision: Nullable::null(),
+                ..phone
+            },
+        ),
+    ];
+    for (request_id, (name, envelope)) in (70..).zip(&rows) {
+        let message = queue_mutation(
+            &host,
+            request_id,
+            kr_protocol::ids::ActionWindowId::new("forwarded").expect("a window"),
+            "must not go out",
+        );
+        let outcome = forward_as_actor(
+            &mut daemon,
+            &message,
+            envelope,
+            &[kr_protocol::rights::ActionRight::AgentPrompt],
+        )
+        .await;
+        assert!(outcome.is_err(), "{name} is refused: {outcome:?}");
+        let error = outcome.expect_err(name);
+        assert_eq!(error.code, ErrorCode::PermissionDenied, "{name}: {error:?}");
+        assert_eq!(
+            error.message,
+            "This message was not sent. On this channel, only this computer's own account or a \
+             paired device that holds a grant can send a message.",
+            "{name}"
+        );
+        assert_eq!(
+            receipt_of_the_actor(&mut daemon, envelope, message.action_id)
+                .await
+                .state,
+            ReceiptState::Rejected,
+            "{name} holds a rejected receipt"
+        );
+    }
+
+    // Nothing was written for either, and the approval is still answerable: the next frame the
+    // channel carries is its verdict.
+    let mut client = cli(&host).await;
+    let answer = channel_answer(&client, &host, &channel.connector, 60, resource_id, "allow");
+    let Outcome::Error(error) = send(&mut client, answer).await else {
+        panic!("the answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "abcde", "behavior": "allow" }
+        }),
+        "no message went out before the verdict"
     );
 }
 

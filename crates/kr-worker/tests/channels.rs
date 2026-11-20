@@ -2830,7 +2830,7 @@ async fn kr_req_12_26_a_prompt_from_an_actor_with_no_verified_sender_is_refused_
                 assert!(
                     refusal.to_string().contains(
                         "This message was not sent. On this channel, only this computer's own \
-                         account or a paired device can send a message."
+                         account or a paired device that holds a grant can send a message."
                     ),
                     "{refusal}"
                 );
