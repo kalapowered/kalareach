@@ -53,6 +53,15 @@
   "modules": [],
   "patches": [
     {
+      "name": "cmake-code-signature",
+      "file": "patches/upstream/cmake-code-signature.patch",
+      "revision": "1",
+      "upstream_revision": "95dccbe55eefe73e526563296beded4a8407b8a8",
+      "strip": 1,
+      "sha256": "9e986e395c774a5c2286eb98ba04bc508e1b5d3c63dafb0e71d7fee7ea830465",
+      "purpose": "The fish project's own commit 95dccbe55eef, byte for byte as GitHub publishes it: the inline directory-creation commands of the install rules use `install(CODE ...)` where 4.9.3 wrote `install(SCRIPT CODE ...)`, a form that CMake 4.5 refuses at configuration because SCRIPT has no file name, and that every earlier CMake read as a plain CODE. Drop this patch when the pinned release contains that commit."
+    },
+    {
       "name": "fish-reader-event-bridge",
       "file": "patches/0001-fish-reader-event-bridge.patch",
       "revision": "1",

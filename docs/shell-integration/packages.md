@@ -6,8 +6,9 @@ which licence each part travels.
 
 Three of the four are built from an upstream release the manifest pins by URL and SHA-256. Nothing
 upstream is copied into this repository, except the twenty official patches of Bash 5.3, which GNU
-publishes as separate files and no tarball includes: each is kept exactly as ftp.gnu.org publishes
-it, and the manifest pins its SHA-256. What lives here is the patch sets, the bridge sources the
+publishes as separate files and no tarball includes, and one fix to fish 4.9.3's install rules that
+no release contains yet: each is kept exactly as its project publishes it, and the manifest pins
+its SHA-256. What lives here is the patch sets, the bridge sources the
 patches bring with them, the guarded startup entry and the manifest that ties them together:
 
 ```
@@ -222,13 +223,15 @@ taken from marked text reports the paste as its source, so it is never the end-o
 
 ## What fish changes
 
-There are five patches, against `fish-4.9.3`. This shell's reader is Rust, so the reader's own half
+There are six patches, against `fish-4.9.3`: one the fish project published, applied first with
+`patch -p1` as GitHub serves it, and five of the package's own. This shell's reader is Rust, so the reader's own half
 of the bridge is Rust beside it and the shell-independent core is the same C the other packages
 compile, built into the shell by the build script that already compiles C for the shell's own
 probes.
 
 | Patch | Files | What it adds |
 | --- | --- | --- |
+| `cmake-code-signature` | `cmake/Install.cmake` | The fish project's commit `95dccbe55eef`, kept unchanged in `patches/upstream/`: the inline install commands use `install(CODE ...)`, which every CMake accepts, where 4.9.3 wrote `install(SCRIPT CODE ...)`, which CMake 4.5 refuses at configuration. It is dropped when the pinned release contains the commit |
 | `0001-fish-reader-event-bridge` | `src/env/environment.rs`, `src/fd_readable_set.rs`, `src/input/input.rs`, `src/input/decode.rs`, `src/input/binding.rs`, `src/reader/input.rs`, `src/reader/mod.rs`, `src/reader/reader.rs` | The mailbox, the reader's boundaries, the named binding and the bridge's view of the reader |
 | `0002-fish-reader-state` | `src/input/binding.rs` | The states the detach condition needs that this reader keeps no flag for |
 | `0003-fish-bridge-activation` | `build.rs`, `src/bin/fish.rs`, `src/builtins/mod.rs`, `src/builtins/shared/misc.rs` | The core compiled in, the `kr-bridge` builtin, and the bridge loading before the startup files |

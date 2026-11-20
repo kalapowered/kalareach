@@ -6,9 +6,11 @@ against them, and the update target each package is published under.
 
 Upstream is never vendored: `scripts/place-shell-sources.sh` fetches the pinned archive,
 `scripts/build-shells.sh` checks its digest and applies the ordered patches in `shells/<shell>/patches`.
-The one exception is the official patch series of the pinned Bash release, which GNU publishes as
-files of their own: `shells/bash/patches/upstream/` keeps each exactly as ftp.gnu.org publishes it,
-and the manifest pins each file's digest, so the release tool states them beside the package's own. The pins live in
+The exceptions are patches the upstream projects publish as files of their own. GNU publishes the
+official patch series of the pinned Bash release: `shells/bash/patches/upstream/` keeps each exactly
+as ftp.gnu.org publishes it. The fish project's commit that lets the install rules of fish 4.9.3
+configure under CMake 4.5 is in no release yet: `shells/fish/patches/upstream/` keeps it exactly as
+GitHub publishes it. The manifest pins each file's digest, so the release tool states them beside the package's own. The pins live in
 `shells/<shell>/manifest.json`, and the identity record the build writes beside the binary
 (`kr-shell-identity.json`) carries the archive it actually fetched, its digest, the patches it
 applied and the module tree it installed. The qualification reads all three and refuses a package
