@@ -314,6 +314,11 @@ mod tests {
     }
 
     #[test]
+    fn the_capacity_is_the_specified_four_mebibytes() {
+        assert_eq!(ObservationQueue::new().capacity_bytes, 4_194_304);
+    }
+
+    #[test]
     fn events_within_the_bound_queue_without_a_gap() {
         let mut queue = ObservationQueue::new();
         for index in 0..4 {
