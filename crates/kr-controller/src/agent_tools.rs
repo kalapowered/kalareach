@@ -6178,6 +6178,404 @@ mod tests {
     const FOLDER_WRITE_BIT: &str = "because the folder it is in lets its group or every user \
         change what is in it, so nothing is written there";
 
+    /// The skill file the declared word `amp` installs, below the home folder.
+    #[cfg(unix)]
+    const SKILL_FILE: &str = ".amp/skills/kalareach-contact/SKILL.md";
+
+    /// The installer for the declared word `amp`, after it installed.
+    #[cfg(unix)]
+    fn amp_installed(tree: &Tree) -> Installer {
+        let target = declared(
+            Some(
+                json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+            ),
+            &[".amp", "skills"],
+        );
+        let installer = tree.installer().with_declaration(Some(target), Vec::new());
+        installer
+            .install(&params(amp(), InstallScope::User))
+            .expect("installs");
+        installer
+    }
+
+    /// Makes `$name(place, act)`, which runs `act` once, the next time the pause `$pause` is reached
+    /// for a place whose path ends with `place`; every other place passes by.
+    #[cfg(unix)]
+    macro_rules! pause_at {
+        ($name:ident, $pause:ident) => {
+            fn $name(place: &'static str, act: impl FnOnce() + 'static) {
+                anchor::$pause::once(move |path| {
+                    if path.ends_with(place) {
+                        act();
+                    } else {
+                        $name(place, act);
+                    }
+                });
+            }
+        };
+    }
+    #[cfg(unix)]
+    pause_at!(when_walked_to, walked_pause);
+    #[cfg(unix)]
+    pause_at!(when_read, removal_pause);
+    #[cfg(unix)]
+    pause_at!(when_taken_out, trade_pause);
+
+    /// Notes every place a removal or a write on this thread takes a file out of.
+    #[cfg(unix)]
+    fn note_parks(seen: std::rc::Rc<std::cell::RefCell<Vec<PathBuf>>>) {
+        anchor::trade_pause::once(move |path| {
+            seen.borrow_mut().push(path.to_owned());
+            note_parks(seen);
+        });
+    }
+
+    /// Puts a file with the contents `bytes` at `place` that is not the file that was there: it is
+    /// made beside the place and renamed over it, so it is an object of its own.
+    #[cfg(unix)]
+    fn put_another_file(place: &Path, bytes: &[u8]) {
+        let beside = place.with_file_name("another-process.tmp");
+        std::fs::write(&beside, bytes).expect("another process writes a file");
+        std::fs::rename(&beside, place).expect("and puts it at the place");
+    }
+
+    /// Changes the contents of the file at `place` in place, so it stays the same object.
+    #[cfg(unix)]
+    fn edit_in_place(place: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(place)
+            .expect("another process opens the file")
+            .write_all(bytes)
+            .expect("and changes it");
+    }
+
+    /// The names in `folder` that a write or a removal makes for its own use.
+    #[cfg(unix)]
+    fn temporary_names(folder: &Path) -> Vec<String> {
+        std::fs::read_dir(folder)
+            .expect("the folder")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with('.') && name.ends_with(".kalareach"))
+            .collect()
+    }
+
+    /// The words of a folder refused for its write bit when a removal was to take place.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const FOLDER_WRITE_BIT_REMOVING: &str = "because the folder it is in lets its group or every \
+        user change what is in it, so nothing is removed there";
+
+    /// KR-REQ-11.01: a file another process puts under a recorded name before the removal reads it
+    /// is kept and named, and it is not even taken out of its place.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_under_a_recorded_name_before_it_is_read_is_kept_and_not_moved() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let parked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        note_parks(parked.clone());
+        let at = skill.clone();
+        when_walked_to(SKILL_FILE, move || put_another_file(&at, b"theirs"));
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal keeps a file it did not check");
+        assert_eq!(
+            std::fs::read(&skill).ok().as_deref(),
+            Some(&b"theirs"[..]),
+            "the file another process put there is kept"
+        );
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with("SKILL.md has changed since it was installed")),
+            "{:?}",
+            result.retained
+        );
+        assert!(
+            !parked
+                .borrow()
+                .iter()
+                .any(|place| place.ends_with(SKILL_FILE)),
+            "a file that is not the checked one is not taken out of its place: {:?}",
+            parked.borrow()
+        );
+    }
+
+    /// KR-REQ-11.01: a file another process puts under a recorded name after the removal read it,
+    /// with other contents, is kept and named at its place, and no temporary file is left.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_under_a_recorded_name_after_it_was_read_is_kept_and_named() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let at = skill.clone();
+        when_read(SKILL_FILE, move || put_another_file(&at, b"theirs"));
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal keeps a file it did not check");
+        assert_eq!(
+            std::fs::read(&skill).ok().as_deref(),
+            Some(&b"theirs"[..]),
+            "the file another process put there is kept at its place"
+        );
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with("SKILL.md has changed since it was installed")),
+            "{:?}",
+            result.retained
+        );
+        assert!(
+            result
+                .removed
+                .iter()
+                .all(|operation| !operation.path().ends_with("SKILL.md")),
+            "it is not counted as removed"
+        );
+        assert_eq!(
+            temporary_names(skill.parent().expect("a folder")),
+            Vec::<String>::new(),
+            "no temporary file is left"
+        );
+    }
+
+    /// KR-REQ-11.01: a file another process puts under a recorded name after the removal read it,
+    /// with the contents that were checked, is kept: it is not the file that was checked.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_the_checked_contents_but_another_identity_is_kept_on_removal() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let installed = std::fs::read(&skill).expect("the installed file");
+        let (at, same) = (skill.clone(), installed.clone());
+        when_read(SKILL_FILE, move || put_another_file(&at, &same));
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal keeps a file it did not check");
+        assert_eq!(
+            std::fs::read(&skill).ok().as_deref(),
+            Some(installed.as_slice()),
+            "the file that stands at the name is kept"
+        );
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with("SKILL.md has changed since it was installed")),
+            "{:?}",
+            result.retained
+        );
+        assert!(
+            result
+                .removed
+                .iter()
+                .all(|operation| !operation.path().ends_with("SKILL.md")),
+            "it is not counted as removed"
+        );
+    }
+
+    /// KR-REQ-11.01: a file another process edits in place after the removal read it is kept, and
+    /// named: it is the file that was checked, with other contents.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_edited_in_place_after_it_was_read_is_kept_on_removal() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let at = skill.clone();
+        when_read(SKILL_FILE, move || {
+            edit_in_place(&at, b"edited after the read")
+        });
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal keeps a file it did not check");
+        assert_eq!(
+            std::fs::read(&skill).ok().as_deref(),
+            Some(&b"edited after the read"[..]),
+            "the file that stands at the name is kept at its place"
+        );
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with("SKILL.md has changed since it was installed")),
+            "{:?}",
+            result.retained
+        );
+        assert_eq!(
+            temporary_names(skill.parent().expect("a folder")),
+            Vec::<String>::new(),
+            "no temporary file is left"
+        );
+    }
+
+    /// KR-REQ-11.01: a file another process puts at the name while the removal has the checked
+    /// name's file out of its place is never displaced, whatever else is found. When the file taken
+    /// out was another one, it cannot go back to a name that is taken, so it is kept under its
+    /// temporary name and the removal says where.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_at_the_name_while_a_removal_has_the_name_out_is_kept_and_the_taken_file_named() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let folder = skill.parent().expect("a folder").to_owned();
+        let at = skill.clone();
+        when_read(SKILL_FILE, move || put_another_file(&at, b"theirs"));
+        let at = skill.clone();
+        when_taken_out(SKILL_FILE, move || {
+            std::fs::write(&at, b"third").expect("another process makes the name again");
+        });
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal keeps what it did not check");
+        assert_eq!(
+            std::fs::read(&skill).ok().as_deref(),
+            Some(&b"third"[..]),
+            "the file put at the name is not displaced"
+        );
+        let kept = temporary_names(&folder);
+        assert_eq!(kept.len(), 1, "the taken file is kept beside it: {kept:?}");
+        assert_eq!(
+            std::fs::read(folder.join(&kept[0])).ok().as_deref(),
+            Some(&b"theirs"[..]),
+            "it is the file that was taken out of the place"
+        );
+        let words = format!(
+            "{} was replaced by another process while the installer removed it, and that file \
+             could not be put back, so it is kept as {} in the folder that held {}; its last \
+             known path was {}",
+            skill.display(),
+            kept[0],
+            skill.display(),
+            folder.join(&kept[0]).display()
+        );
+        assert!(result.retained.contains(&words), "{:?}", result.retained);
+    }
+
+    /// KR-REQ-11.01: a document this host created that another process replaces after the removal
+    /// read it is kept, and named, whatever it holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_put_under_its_name_after_it_was_read_is_kept_and_named() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let document = tree.home().join(".amp/mcp.json");
+        let at = document.clone();
+        when_read(".amp/mcp.json", move || {
+            put_another_file(&at, br#"{"theirs": true}"#);
+        });
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal keeps a document it did not check");
+        assert_eq!(
+            std::fs::read(&document).ok().as_deref(),
+            Some(&br#"{"theirs": true}"#[..]),
+            "the document another process put there is kept"
+        );
+        assert!(
+            result.retained.iter().any(|line| line.ends_with(&format!(
+                "{}: it has changed since it was installed",
+                document.display()
+            ))),
+            "{:?}",
+            result.retained
+        );
+        assert_eq!(
+            temporary_names(document.parent().expect("a folder")),
+            Vec::<String>::new(),
+            "no temporary file is left"
+        );
+    }
+
+    /// KR-REQ-11.01: a removal is refused before it takes anything away when a folder that holds a
+    /// recorded name is one every user can change.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_another_user_can_change_is_refused_before_any_removal() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let folder = tree.home().join(".amp");
+        set_mode(&folder, 0o757);
+        let refused = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a folder every user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(FOLDER_WRITE_BIT_REMOVING)),
+            "{refused}"
+        );
+        assert!(skill.exists(), "nothing was removed before the refusal");
+        assert!(tree.home().join(".amp/mcp.json").exists());
+        set_mode(&folder, 0o755);
+        installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("the same removal goes ahead where the folder is not shared");
+        assert!(!skill.exists(), "and it takes the file away");
+    }
+
+    /// KR-REQ-11.01: a folder another process makes changeable by every user after the check is
+    /// judged at the removal of a file, through the handle the removal holds.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_made_changeable_after_the_check_is_refused_at_the_removal_of_a_file() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let folder = skill.parent().expect("a folder").to_owned();
+        when_walked_to(SKILL_FILE, move || set_mode(&folder, 0o757));
+        let refused = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a folder every user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(FOLDER_WRITE_BIT_REMOVING)),
+            "{refused}"
+        );
+        assert!(skill.exists(), "the file stays");
+    }
+
+    /// KR-REQ-11.01: a folder another process makes changeable by every user after the check is
+    /// judged at the removal of a folder as well.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_made_changeable_after_the_check_is_refused_at_the_removal_of_a_directory() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let folder = tree.home().join(".amp/skills/kalareach-contact");
+        for entry in std::fs::read_dir(&folder).expect("the folder") {
+            std::fs::remove_file(entry.expect("an entry").path()).expect("a file goes");
+        }
+        std::fs::remove_file(tree.home().join(".amp/mcp.json")).expect("the document goes");
+        let skills = tree.home().join(".amp/skills");
+        when_walked_to(".amp/skills/kalareach-contact", move || {
+            set_mode(&skills, 0o757);
+        });
+        let refused = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a folder every user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(FOLDER_WRITE_BIT_REMOVING)),
+            "{refused}"
+        );
+        assert!(folder.exists(), "the folder stays");
+    }
+
     /// KR-REQ-11.01: a write judges the folder it walked to, read through the handle it holds. A
     /// folder another process swaps for a different one at the same name after the walk changes
     /// nothing: an open folder is refused whatever stands at its name afterwards, and a closed one

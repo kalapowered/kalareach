@@ -409,6 +409,10 @@ impl Anchor {
         let Some(parent) = self.parent(&place, false)? else {
             return Ok(());
         };
+        #[cfg(test)]
+        walked_pause::run(path);
+        #[cfg(test)]
+        removal_pause::run(path);
         match parent.remove_file(place.name) {
             Ok(()) => parent.flush().map_err(storage),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -426,6 +430,8 @@ impl Anchor {
             .parent(&place, false)
             .map_err(|error| std::io::Error::other(error.to_string()))?
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        #[cfg(test)]
+        walked_pause::run(path);
         parent.remove_directory(place.name)?;
         parent.flush()
     }
@@ -802,8 +808,36 @@ pub(crate) mod cleanup_pause {
     }
 }
 
-/// What the unit tests run in a write right after its walk to the place's folder, to make the change
-/// another process could make to that folder's name in between. The hook is given the place's path.
+/// What the unit tests run in a removal after it has read the file at a place and before it takes the
+/// file away, to make the change another process could make in between. The hook is given the
+/// place's path.
+#[cfg(test)]
+pub(crate) mod removal_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE_TAKING: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a removal on this thread has read the file it will take away.
+    #[cfg(unix)]
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE_TAKING.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(path: &Path) {
+        if let Some(then) = BEFORE_TAKING.with(|before| before.borrow_mut().take()) {
+            then(path);
+        }
+    }
+}
+
+/// What the unit tests run in a write or a removal right after its walk to the place's folder, to
+/// make the change another process could make to that folder's name in between. The hook is given
+/// the place's path.
 #[cfg(test)]
 pub(crate) mod walked_pause {
     use std::cell::RefCell;
@@ -815,7 +849,7 @@ pub(crate) mod walked_pause {
         static AFTER_WALK: RefCell<Option<Then>> = const { RefCell::new(None) };
     }
 
-    /// Runs `then` once, the next time a write on this thread has walked to its folder.
+    /// Runs `then` once, the next time a write or a removal on this thread has walked to its folder.
     #[cfg(unix)]
     pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
         AFTER_WALK.with(|after| *after.borrow_mut() = Some(Box::new(then)));
