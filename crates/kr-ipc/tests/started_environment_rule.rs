@@ -259,6 +259,11 @@ const KEPT: &[Row] = &[
         removal: NAMES_ONLY_REMOVAL,
     },
     Row {
+        file: "tests/conformance/tests/report.rs",
+        reason: NAMES_ONLY,
+        removal: NAMES_ONLY_REMOVAL,
+    },
+    Row {
         file: "crates/kr-cli/tests/support/mod.rs",
         reason: "it places copies of the programs other sources start and starts each copy once with \
                  `--version` to establish that it runs; it creates no session",
