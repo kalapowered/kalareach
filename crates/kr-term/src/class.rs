@@ -42,19 +42,6 @@ impl SequenceClass {
         }
     }
 
-    /// Parses the single letter section 8 uses for this class.
-    #[must_use]
-    pub const fn from_letter(letter: char) -> Option<Self> {
-        match letter {
-            'D' => Some(Self::Display),
-            'M' => Some(Self::Mode),
-            'Q' => Some(Self::Query),
-            'S' => Some(Self::SideEffect),
-            'X' => Some(Self::Extension),
-            _ => None,
-        }
-    }
-
     /// Whether the canonical grid reducer may apply this class at all.
     ///
     /// Only `D` and `M` reach the grid. A snapshot therefore replays `D`/`M` state and never

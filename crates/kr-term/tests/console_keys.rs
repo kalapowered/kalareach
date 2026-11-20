@@ -13,8 +13,7 @@ use kr_protocol::input::ConsoleKey;
 use kr_term::conformance::WIN32_INPUT_CASES;
 use kr_term::modes::KeyboardEncoding;
 use kr_term::win32::{
-    KeyRecord, Keyboard, PairHold, Refused, TooLong, control_keys, encode_all, legacy_within,
-    records_within,
+    KeyRecord, Keyboard, PairHold, Refused, TooLong, control_keys, legacy_within, records_within,
 };
 use serde_json::Value;
 
@@ -69,6 +68,11 @@ fn keyboard_of(value: &Value) -> Keyboard {
 
 /// The largest write one input frame may carry.
 const LIMIT: usize = kr_protocol::limits::MAX_INPUT_FRAME_LEN;
+
+/// Encodes a run of records, in the order they were read, into one buffer.
+fn encode_all(records: &[KeyRecord]) -> Vec<u8> {
+    records_within(records, usize::MAX).unwrap_or_default()
+}
 
 fn ordinary() -> Keyboard {
     Keyboard {
