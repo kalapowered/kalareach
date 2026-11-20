@@ -101,9 +101,11 @@ fn workspace(root: &Path) -> Result<BTreeMap<String, (PathBuf, Manifest)>, Strin
         .map_err(|error| cannot(&error.to_string()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Cargo may print a `warning:` line first: the complaint is the first line that is an error.
         let first = stderr
             .lines()
-            .find(|line| !line.trim().is_empty())
+            .find(|line| line.starts_with("error"))
+            .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
             .unwrap_or("it failed");
         return Err(cannot(first.trim()));
     }
@@ -1729,9 +1731,18 @@ impl Tree {
 fn mentions_a_sighting(text: &str) -> bool {
     // An escape or a line continuation can spell a wire name that the text does not hold: a file
     // with one is parsed, and the literal's value decides.
-    ["Method", "MutationRequest", "ActionTarget", "macro_rules", "\\x", "\\u{", "\\\n", "\\\r\n"]
-        .iter()
-        .any(|word| text.contains(word))
+    [
+        "Method",
+        "MutationRequest",
+        "ActionTarget",
+        "macro_rules",
+        "\\x",
+        "\\u{",
+        "\\\n",
+        "\\\r\n",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
         || WIRE_NAMES.iter().any(|name| text.contains(name))
 }
 
@@ -1854,12 +1865,7 @@ impl Scanner {
         }
     }
 
-    fn items(
-        &mut self,
-        items: &[syn::Item],
-        file: &str,
-        under_src: &str,
-    ) -> Result<(), String> {
+    fn items(&mut self, items: &[syn::Item], file: &str, under_src: &str) -> Result<(), String> {
         for item in items {
             if !condition::enabled(item_attrs(item), file)? {
                 continue;

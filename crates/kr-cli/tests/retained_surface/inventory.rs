@@ -8,12 +8,13 @@
 //! attributes are not false. A file no declaration reaches is not read. The item index and the scan
 //! both take their files from here.
 //!
-//! What the inventory does not read it refuses, with an error that names the file: a path through a
-//! link or outside the checkout, a module declared in a block or by a macro, `include!`, a `#[path]`
-//! that is not one string, a module that is at no file or at two, a crate with no target, a macro
-//! defined twice, and an item-position macro of another crate that is not on the list of those
-//! accepted. The macros called in the transcribers of a `macro_rules!` definition, at any depth,
-//! are held to the same list.
+//! What the inventory does not read it refuses, with an error that names the file (the crate, for a
+//! crate with no target): a path through a link or outside the checkout, a module declared in a
+//! block or by a macro, `include!`, a `#[path]` that is not one string, a module that is at no file
+//! or at two, a crate with no target, a `macro_rules!` written in the tokens of another macro, and
+//! an item-position macro of another crate that is not on the list of those accepted. The macros
+//! called in the transcribers of a `macro_rules!` definition, at any depth, are held to the same
+//! list. A `macro_rules!` name that is defined more than once is one definition under it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -35,12 +36,12 @@ const ACCEPTED: &[(&str, &[&str], &str)] = &[
     (
         "thread_local",
         &["", "std"],
-        "the standard library's macro makes thread-local statics from `static` items: no module and no path of `Method`",
+        "the standard library's macro makes thread-local statics from `static` items: it makes no module, and the scan reads the initialisers in the call's tokens as written",
     ),
     (
         "task_local",
         &["tokio"],
-        "tokio's macro makes task-local statics from `static` items, as `thread_local` does",
+        "tokio's macro makes task-local statics from `static` items, as `thread_local` does: it makes no module, and the scan reads the call's tokens as written",
     ),
     (
         "bindgen",
@@ -84,14 +85,17 @@ const ACCEPTED: &[(&str, &[&str], &str)] = &[
     ),
 ];
 
-/// The macros of the standard library that a bare call names and that make no item and read no file:
-/// the ones the transcribers of the workspace and of its release tags call, and their siblings.
+/// The macros of the standard library that a bare call names and that make no item and read no Rust
+/// file: the ones the transcribers of the workspace and of its release tags call, and their
+/// siblings. `include_str` and `include_bytes` read a data file, whose wire names the scan does not
+/// see.
 /// `include` is not among them (the scan does not read it), and `thread_local` and `compile_error`
 /// are in [`ACCEPTED`].
 const STD_MACROS: &[&str] = &[
     "assert",
     "assert_eq",
     "assert_ne",
+    "cfg",
     "column",
     "concat",
     "dbg",
@@ -236,7 +240,8 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             .display()
             .to_string()
     };
-    let mut todo: Vec<(PathBuf, bool)> = roots.iter().map(|target| (target.clone(), true)).collect();
+    let mut todo: Vec<(PathBuf, bool)> =
+        roots.iter().map(|target| (target.clone(), true)).collect();
     let mut seen: BTreeSet<(PathBuf, bool)> = BTreeSet::new();
     let mut reached: BTreeSet<PathBuf> = BTreeSet::new();
     // The names the crate defines a `macro_rules!` for. Definitions of one name, in any place, are one
@@ -754,8 +759,11 @@ fn form_in(tokens: &TokenStream) -> Option<Form> {
                 }
             }
             TokenTree::Ident(word) if word == "macro_rules" => {
-                if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Ident(name)), Some(TokenTree::Group(_))) =
-                    (flat.get(at + 1), flat.get(at + 2), flat.get(at + 3))
+                if let (
+                    Some(TokenTree::Punct(bang)),
+                    Some(TokenTree::Ident(name)),
+                    Some(TokenTree::Group(_)),
+                ) = (flat.get(at + 1), flat.get(at + 2), flat.get(at + 3))
                     && bang.as_char() == '!'
                 {
                     return Some(Form::Rules(name.to_string()));
