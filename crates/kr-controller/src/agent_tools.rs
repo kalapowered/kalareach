@@ -2777,9 +2777,17 @@ fn names_path(recorded: &str, path: &Path) -> bool {
 /// Whether two paths are one place for a claim: the same components, ASCII case ignored, for the
 /// six compiled words and the declared ones alike. On a file system that tells `Mcp.json` from
 /// `mcp.json` this takes two places for one, and the host then refuses more than it must: a
-/// document another record holds under the other spelling is not written into. It decides
-/// refusals only, never what is written or whose a file is: the move check compares places by
-/// their exact components.
+/// document another record holds under the other spelling is not written into.
+///
+/// The fold still decides more than refusals. Through `names_path` it decides whose a file is, which
+/// document an installation created and which record an update belongs to, and the claims of two
+/// records are compared with it. It never chooses where a file is written: the move check compares
+/// the skills folder and the document by their exact components, so a declaration that changes only
+/// a spelling is refused before anything is written. The check of a direct installation that reads
+/// the owners runs before the move check, but it only reads, and a write follows only for a place
+/// the move check accepts. Where either installation is for a declared word, an entry another
+/// record claims with other contents is refused, and no two compiled layouts differ only in letter
+/// case, so the only entry the fold lets the host write is an identical one.
 fn same_place(first: &Path, second: &Path) -> bool {
     let folded = |path: &Path| -> Vec<String> {
         path.components()
