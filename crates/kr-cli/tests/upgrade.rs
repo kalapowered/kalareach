@@ -5000,3 +5000,176 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
     );
     drop(owner);
 }
+
+/// KR-REQ-12.06, KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before ends no draft and keeps
+/// the binding revision of a draft written for an application, so that the update again meets a draft
+/// whose revision is still on record. The journal is at the version the release before reads, the
+/// draft and the row that holds its revision are still there, and a draft the release before wrote
+/// for an application is given no revision, so it is never sent.
+///
+/// The suite has no bound application, so the draft is made through the transfer store of this
+/// release with the daemon stopped, the route the daemon's own create takes; the case asserts what
+/// the journal and the store beside it hold, and no answer of a daemon about a prompt. The release
+/// before's daemon then runs on the journal and changes a draft as its own `draft.update` does: its
+/// text, its revision and its time, and nothing else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_revision_for_the_update_again()
+ {
+    use kr_protocol::ids::{ActorId, ApplicationInstanceId, DraftId, DraftRevision};
+    use kr_protocol::scalars::{TimestampMs, Uuid};
+    use kr_protocol::transfer::DraftState;
+
+    let updated = Updated::new().await;
+    let host = &updated.host;
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    assert!(
+        host.stop_the_daemon().await,
+        "the daemon of this release is stopped through its own door"
+    );
+
+    let journal = kr_transfer::staging::StagingArea::store_path(&host.tree.environment());
+    let environment = host.tree.environment_id();
+    let application = ApplicationInstanceId::new(Uuid::from_bytes([0x0A; 16]));
+    let written = DraftId::new(Uuid::from_bytes([0x0B; 16]));
+    let before = DraftId::new(Uuid::from_bytes([0x0C; 16]));
+    {
+        let mut store = kr_transfer::store::Store::open(&journal, environment)
+            .expect("this release's store opens the journal");
+        store
+            .insert_draft(
+                &kr_transfer::store::DraftRow {
+                    draft_id: written,
+                    environment_id: environment,
+                    actor_id: ActorId::new("local:501").expect("a valid principal"),
+                    device_id: None,
+                    session_id: None,
+                    application_instance_id: Some(application),
+                    agent_binding_revision: Some(kr_protocol::ids::AgentBindingRevision::new(7)),
+                    revision: DraftRevision::new(1),
+                    state: DraftState::Open,
+                    text: "written under revision 7".to_owned(),
+                    created_at_ms: TimestampMs::new(1000),
+                    updated_at_ms: TimestampMs::new(1000),
+                },
+                None,
+                None,
+            )
+            .expect("a draft that names an application is written with its revision");
+    }
+    // A draft the release before wrote for the same application: the journal's own columns and no
+    // revision anywhere.
+    rusqlite::Connection::open(&journal)
+        .expect("opens the journal")
+        .execute(
+            "INSERT INTO drafts (draft_id, environment_id, actor_id, application_instance_id,
+                                 revision, state, text, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 'local:501', ?3, 1, 'open', 'written by the release before', 1000, 1000)",
+            rusqlite::params![
+                before.get().as_bytes().to_vec(),
+                environment.get().as_bytes().to_vec(),
+                application.get().as_bytes().to_vec(),
+            ],
+        )
+        .expect("writes the draft as the release before wrote it");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["draft_limit"], true, "{said}");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.one.name().clone()),
+        "the host is on the release before"
+    );
+    let read = |query: &str| -> String {
+        rusqlite::Connection::open(&journal)
+            .expect("opens")
+            .query_row(query, [], |row| row.get::<_, String>(0))
+            .expect("reads")
+    };
+    assert_eq!(
+        read("SELECT CAST(version AS TEXT) FROM schema_version"),
+        "5",
+        "the journal is at the version the release before reads"
+    );
+    assert_eq!(
+        read("SELECT COUNT(*) || ' ' || MAX(text) FROM drafts WHERE state = 'open'"),
+        "2 written under revision 7",
+        "the rollback ended no draft"
+    );
+    let side = kr_transfer::revisions::Revisions::beside(&journal);
+    assert_eq!(
+        rusqlite::Connection::open(&side)
+            .expect("opens the store of binding revisions")
+            .query_row(
+                "SELECT agent_binding_revision FROM draft_revisions",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("the draft's revision is still on record"),
+        7
+    );
+
+    // The release before's daemon runs on the journal, and a draft changes as its `draft.update`
+    // changes it: text, revision and time.
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the release before's daemon starts on the journal"
+    );
+    assert!(host.stop_the_daemon().await);
+    rusqlite::Connection::open(&journal)
+        .expect("opens the journal")
+        .execute(
+            "UPDATE drafts SET text = 'rewritten by the release before', revision = revision + 1,
+                               updated_at_ms = 2000
+              WHERE draft_id = ?1",
+            rusqlite::params![written.get().as_bytes().to_vec()],
+        )
+        .expect("changes the draft as its own update does");
+
+    // Update again with the release before's `kr`.
+    let archive = host.scratch("archives").join("two-again.tar.gz");
+    updated.two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the release before's kr host update goes on: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = kr_transfer::store::Store::open(&journal, environment)
+        .expect("this release's store opens the journal again");
+    let kept = store
+        .draft(written)
+        .expect("reads the draft")
+        .expect("the draft is there");
+    assert_eq!(kept.text, "rewritten by the release before");
+    assert_eq!(
+        kept.agent_binding_revision.map(|revision| revision.get()),
+        Some(7),
+        "the revision it was written under is still on record after the release before rewrote it"
+    );
+    assert_eq!(
+        store
+            .draft(before)
+            .expect("reads the draft")
+            .expect("the draft is there")
+            .agent_binding_revision,
+        None,
+        "a draft the release before wrote for an application has no revision, and is never sent"
+    );
+}
