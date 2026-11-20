@@ -1,1 +1,2 @@
 msrv = "1.97.1"
+await-holding-invalid-types = ["companion_tauri::contact::Guard"]

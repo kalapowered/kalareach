@@ -101,7 +101,7 @@ fn the_device_is_asked_after_the_owner_has_answered() {
         .and_then(|rest| rest.split("\n    }\n").next())
         .expect("the function is there");
     let held = body
-        .find("self.contact.held()")
+        .find("self.contact.stand()")
         .expect("the owner is asked");
     let device = body.find("host_in_use()").expect("the device is asked");
     assert!(

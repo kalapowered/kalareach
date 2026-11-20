@@ -965,6 +965,8 @@ pub async fn keep<R, A, F>(
         // A replacement admitted while this connection was supervised is supervised as it is, and
         // the owner is asked again when that one ends.
         loop {
+            #[cfg(feature = "testing")]
+            owner.before_adopting().await;
             match owner.adopt(choice, last.as_ref()) {
                 Adopt::Stale => return,
                 Adopt::None => break,
@@ -1077,6 +1079,8 @@ async fn supervise<R: Runtime>(
                     // first, after every stop that is reported.
                     session.close();
                 }
+                #[cfg(feature = "testing")]
+                owner.at_the_stop(&session).await;
                 // The connection is closed or closing, and ends the way any does.
                 ended.await;
             }

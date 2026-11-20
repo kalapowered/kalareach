@@ -10,6 +10,8 @@
 //! under it. Every method that removes, replaces or rejects a resource returns it in a
 //! [`Disposal`], which releases it when it is dropped, after the guard is gone.
 
+#![deny(clippy::await_holding_lock, clippy::await_holding_invalid_type)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -445,6 +447,8 @@ struct State {
     revision: u64,
     /// The highest revision the publisher has taken.
     taken: u64,
+    /// The highest revision the publisher has finished with: its emit was attempted.
+    told: u64,
     last: Visible,
 }
 
@@ -467,6 +471,7 @@ impl State {
             log: VecDeque::new(),
             revision: 0,
             taken: 0,
+            told: 0,
             last: Visible {
                 connection: ConnectionState::unreachable(""),
                 link: 0,
@@ -570,13 +575,14 @@ impl State {
         true
     }
 
-    /// Keeps the last [`KEPT_REVISIONS`] publications and every one not yet taken.
+    /// Keeps the last [`KEPT_REVISIONS`] publications and every one the publisher has not finished
+    /// with: a publication that was taken and not yet emitted is still one a page may miss.
     fn trim(&mut self) {
         while self.log.len() > KEPT_REVISIONS
             && self
                 .log
                 .front()
-                .is_some_and(|oldest| oldest.revision <= self.taken)
+                .is_some_and(|oldest| oldest.revision <= self.told)
         {
             self.log.pop_front();
         }
@@ -686,14 +692,22 @@ pub enum Adopt {
     },
 }
 
+/// The choice in force and the connection held when they were read together.
+pub struct Stand {
+    /// The number of the choice.
+    pub choice: u64,
+    /// The connection held, when one is.
+    pub held: Option<Connection>,
+}
+
 /// The owner. See the module's description.
 pub struct ContactOwner {
     state: Mutex<State>,
     wake: Notify,
     emitted: watch::Sender<u64>,
-    /// Holds the publisher before an emit, for a suite.
+    /// Where a suite has paused the owner's tasks.
     #[cfg(feature = "testing")]
-    hold: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    pauses: testing::Pauses,
 }
 
 impl std::fmt::Debug for ContactOwner {
@@ -725,7 +739,7 @@ impl ContactOwner {
             wake: Notify::new(),
             emitted: watch::channel(0).0,
             #[cfg(feature = "testing")]
-            hold: Mutex::new(None),
+            pauses: testing::Pauses::default(),
         }
     }
 
@@ -801,7 +815,7 @@ impl ContactOwner {
     pub fn set_task(&self, choice: u64, task: tauri::async_runtime::JoinHandle<()>) -> Disposal {
         self.commit(|state, disposal| {
             if state.choice == choice {
-                state.task = Some(Held::new(task));
+                disposal.task(state.task.replace(Held::new(task)));
             } else {
                 disposal.task = Some(Held::new(task));
             }
@@ -960,15 +974,14 @@ impl ContactOwner {
         if ended.is_some_and(|ended| Arc::ptr_eq(&held.get().session(), ended)) {
             return Adopt::None;
         }
-        let connection = held.get().clone();
-        state
-            .adoption
-            .take()
-            .map_or(Adopt::None, |adoption| Adopt::Candidate {
-                connection,
-                events: adoption.events.into_inner(),
-                revision: adoption.revision,
-            })
+        let Some(adoption) = state.adoption.take() else {
+            return Adopt::None;
+        };
+        Adopt::Candidate {
+            connection: held.get().clone(),
+            events: adoption.events.into_inner(),
+            revision: adoption.revision,
+        }
     }
 
     // The readers of the slot.
@@ -977,6 +990,30 @@ impl ContactOwner {
     #[must_use]
     pub fn held(&self) -> Option<Connection> {
         self.lock().slot.as_ref().map(|held| held.get().clone())
+    }
+
+    /// The choice in force and the connection held, read together. A reader that must ask
+    /// something else outside the owner takes this first and asks [`Self::stands_as`] afterwards.
+    #[must_use]
+    pub fn stand(&self) -> Stand {
+        let state = self.lock();
+        Stand {
+            choice: state.choice,
+            held: state.slot.as_ref().map(|held| held.get().clone()),
+        }
+    }
+
+    /// Whether the choice in force and the connection held are still what `stand` read: the same
+    /// choice number, and the same session or none.
+    #[must_use]
+    pub fn stands_as(&self, stand: &Stand) -> bool {
+        let state = self.lock();
+        state.choice == stand.choice
+            && match (&state.slot, &stand.held) {
+                (None, None) => true,
+                (Some(now), Some(then)) => Arc::ptr_eq(&now.get().session(), &then.session()),
+                _ => false,
+            }
     }
 
     /// What the page sees now, as a publication.
@@ -1025,7 +1062,8 @@ impl ContactOwner {
         }
     }
 
-    /// Takes the next publication the publisher has not taken, in order.
+    /// Takes the next publication the publisher has not taken, in order. It stays in the log until
+    /// [`Self::told`] is called for it.
     fn next_unemitted(&self) -> Option<Arc<Publication>> {
         let mut state = self.lock();
         let next = state.taken + 1;
@@ -1035,8 +1073,19 @@ impl ContactOwner {
             .find(|published| published.revision == next)
             .cloned()?;
         state.taken = next;
-        state.trim();
         Some(found)
+    }
+
+    /// The publisher has attempted the emit of `revision`, and a failed attempt counts: the
+    /// publication may leave the log once it is beyond the kept ones, and whoever waits for it is let
+    /// go.
+    fn told(&self, revision: u64) {
+        {
+            let mut state = self.lock();
+            state.told = revision;
+            state.trim();
+        }
+        self.emitted.send_replace(revision);
     }
 
     /// Waits until the publisher has told `revision`, for at most `within`. Returns whether it was
@@ -1062,6 +1111,13 @@ impl Drop for ContactOwner {
     }
 }
 
+/// Tells the page one publication, and hands it to the suite's tap.
+fn tell<R: Runtime>(app: &AppHandle<R>, published: &Publication) {
+    #[cfg(feature = "testing")]
+    crate::told::tap(app, CONNECTION_EVENT, published);
+    let _ = app.emit(CONNECTION_EVENT, published);
+}
+
 /// Starts the one task that tells the page each publication, in order, once. It is started where
 /// the state is managed, after the application is built.
 pub fn serve<R: Runtime>(app: &AppHandle<R>) {
@@ -1075,12 +1131,9 @@ pub fn serve<R: Runtime>(app: &AppHandle<R>) {
             owner.wake.notified().await;
             while let Some(published) = owner.next_unemitted() {
                 #[cfg(feature = "testing")]
-                {
-                    crate::told::tap(&app, CONNECTION_EVENT, &*published);
-                    owner.before_emit().await;
-                }
-                let _ = app.emit(CONNECTION_EVENT, &*published);
-                owner.emitted.send_replace(published.revision);
+                owner.before_telling().await;
+                tell(&app, &published);
+                owner.told(published.revision);
             }
         }
     });
@@ -1089,6 +1142,11 @@ pub fn serve<R: Runtime>(app: &AppHandle<R>) {
 /// Seams the application's own suites act through.
 #[cfg(feature = "testing")]
 pub mod testing {
+    use std::sync::{Mutex, PoisonError};
+
+    use kr_client::Session;
+    use tokio::sync::{mpsc, oneshot};
+
     use super::{
         Adoption, Arc, Connection, ContactOwner, DROPPED_UNDER_GUARD, Held, HostKey, StoredRead,
     };
@@ -1099,26 +1157,133 @@ pub mod testing {
         DROPPED_UNDER_GUARD.with(std::cell::Cell::get)
     }
 
-    impl ContactOwner {
-        /// Holds the publisher before its next emit until the returned sender is used or dropped.
-        #[must_use]
-        pub fn hold_the_publisher(&self) -> tokio::sync::oneshot::Sender<()> {
-            let (release, held) = tokio::sync::oneshot::channel();
-            *self
-                .hold
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(held);
-            release
+    /// A pause a suite set at one place of the owner's tasks. The task that reaches the place waits
+    /// until the hold is released or dropped.
+    #[derive(Debug)]
+    pub struct Hold {
+        reached: oneshot::Receiver<()>,
+        release: oneshot::Sender<()>,
+    }
+
+    impl Hold {
+        /// Resolves once a task has reached the place and waits there.
+        pub async fn reached(&mut self) {
+            let _ = (&mut self.reached).await;
         }
 
-        pub(super) async fn before_emit(&self) {
-            let held = self
-                .hold
+        /// Lets the waiting task go on.
+        pub fn release(self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    /// One place a task can be paused at.
+    #[derive(Debug, Default)]
+    pub(super) struct Place(Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
+
+    impl Place {
+        fn set(&self) -> Hold {
+            let (reached, reached_by) = oneshot::channel();
+            let (release, released) = oneshot::channel();
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((reached, released));
+            Hold {
+                reached: reached_by,
+                release,
+            }
+        }
+
+        /// Waits here when a suite paused this place, once.
+        pub(super) async fn wait(&self) {
+            let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some((reached, released)) = held {
+                let _ = reached.send(());
+                let _ = released.await;
+            }
+        }
+    }
+
+    /// A lease stop the keeper has reported and acted on, held at the keeper's checkpoint until it is
+    /// released.
+    #[derive(Debug)]
+    pub struct Stop {
+        /// The session the stop was for.
+        pub session: Arc<Session>,
+        release: oneshot::Sender<()>,
+    }
+
+    impl Stop {
+        /// Lets the keeper go on.
+        pub fn release(self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    /// Every place a task of the owner can be paused at.
+    #[derive(Debug, Default)]
+    pub(super) struct Pauses {
+        publisher: Place,
+        adoption: Place,
+        stops: Mutex<Option<mpsc::UnboundedSender<Stop>>>,
+    }
+
+    impl ContactOwner {
+        /// Pauses the publisher after it has taken its next publication and before it tells it.
+        #[must_use]
+        pub fn hold_the_publisher(&self) -> Hold {
+            self.pauses.publisher.set()
+        }
+
+        pub(super) async fn before_telling(&self) {
+            self.pauses.publisher.wait().await;
+        }
+
+        /// Pauses the keeper after the connection it supervised has ended and before it asks for a
+        /// replacement to take up.
+        #[must_use]
+        pub fn hold_adoption(&self) -> Hold {
+            self.pauses.adoption.set()
+        }
+
+        pub(crate) async fn before_adopting(&self) {
+            self.pauses.adoption.wait().await;
+        }
+
+        /// Whether a replacement waits for the keeper to take it up.
+        #[must_use]
+        pub fn adoption_pending(&self) -> bool {
+            self.lock().adoption.is_some()
+        }
+
+        /// Hands every lease stop the keeper acts on to the returned receiver, held at the
+        /// keeper's checkpoint after the place where it closes the stopped session and before it
+        /// waits for the connection to end, until the stop is released.
+        #[must_use]
+        pub fn watch_stops(&self) -> mpsc::UnboundedReceiver<Stop> {
+            let (watching, stops) = mpsc::unbounded_channel();
+            *self
+                .pauses
+                .stops
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(held) = held {
-                let _ = held.await;
+                .unwrap_or_else(PoisonError::into_inner) = Some(watching);
+            stops
+        }
+
+        pub(crate) async fn at_the_stop(&self, session: &Arc<Session>) {
+            let watching = self
+                .pauses
+                .stops
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(watching) = watching {
+                let (release, released) = oneshot::channel();
+                let sent = watching.send(Stop {
+                    session: Arc::clone(session),
+                    release,
+                });
+                if sent.is_ok() {
+                    let _ = released.await;
+                }
             }
         }
 
@@ -1289,6 +1454,13 @@ mod tests {
     fn owner_at(now: &Arc<AtomicU64>) -> ContactOwner {
         let now = Arc::clone(now);
         ContactOwner::with_clock(Arc::new(move || now.load(Ordering::SeqCst)))
+    }
+
+    /// Takes every publication and finishes with it, as the publisher does.
+    fn told_all(owner: &ContactOwner) {
+        while let Some(published) = owner.next_unemitted() {
+            owner.told(published.revision);
+        }
     }
 
     fn revisions(since: &Since) -> Vec<u64> {
@@ -1510,7 +1682,7 @@ mod tests {
             300,
             "none is told, so none is dropped"
         );
-        while owner.next_unemitted().is_some() {}
+        told_all(&owner);
         let kept = owner.since(44);
         assert_eq!(revisions(&kept).first(), Some(&45));
         assert_eq!(kept.states.len(), 256, "the last 256 stay");
@@ -1523,7 +1695,7 @@ mod tests {
         for turn in 0..299 {
             drop(owner.failed(choice, None, Outcome::Lost, &format!("turn {turn}")));
         }
-        while owner.next_unemitted().is_some() {}
+        told_all(&owner);
         let missed = owner.since(295);
         assert!(!missed.resync);
         assert_eq!(revisions(&missed), [296, 297, 298, 299, 300]);
@@ -1544,7 +1716,7 @@ mod tests {
         for turn in 0..299 {
             drop(owner.failed(choice, None, Outcome::Lost, &format!("turn {turn}")));
         }
-        while owner.next_unemitted().is_some() {}
+        told_all(&owner);
         // The oldest kept is 45.
         assert!(owner.since(43).resync);
         let exact = owner.since(44);

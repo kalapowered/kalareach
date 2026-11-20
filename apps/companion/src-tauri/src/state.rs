@@ -62,6 +62,9 @@ pub struct AppState {
     paired_links: Arc<crate::standing::PairedLinks>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
+    /// Where a suite has paused the state's own steps.
+    #[cfg(feature = "testing")]
+    pauses: testing::Pauses,
 }
 
 /// A choice of host that has been made ready: the host it is for, and what starts the task that
@@ -100,6 +103,8 @@ impl AppState {
             paired_links: Arc::new(crate::standing::PairedLinks::default()),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
+            #[cfg(feature = "testing")]
+            pauses: testing::Pauses::default(),
         }
     }
 
@@ -125,17 +130,31 @@ impl AppState {
             .choice_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(feature = "testing")]
+        self.pauses.before_start.wait();
         let started = start()?;
         let chosen = self.contact.choose(&started.target, reason);
         let choice = chosen.value;
         let task = (started.spawn)(choice);
         let stale = self.contact.set_task(choice, task);
+        #[cfg(feature = "testing")]
+        self.pauses.before_cleanup.wait();
         // The sessions opened on the host before are let go with it, and the tokens that opened
         // them are forgotten, after the owner tells the host changed: a call that read the host
         // before the change then finds the generation moved when it hands its link over.
         self.paired_links.close_all();
         drop((chosen.disposal, stale));
         Ok(())
+    }
+
+    /// Runs `work` under the lock a choice of host is made under, so that it is done before a
+    /// choice or a forget that is under way, or after it, and never in the middle of one.
+    pub fn under_the_choice_gate<T>(&self, work: impl FnOnce() -> T) -> T {
+        let _gate = self
+            .choice_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        work()
     }
 
     /// Forgets the host `host` under the lock a choice of host is made under, and ends the
@@ -154,7 +173,7 @@ impl AppState {
         &self,
         host: kr_protocol::ids::DeviceId,
         reason: &str,
-        forget: impl FnOnce() -> Result<bool>,
+        forget: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         let _gate = self
             .choice_gate
@@ -281,18 +300,32 @@ impl AppState {
     /// the owner is never held while the device's records are read.
     #[must_use]
     pub fn paired_context(&self) -> Option<PairedContext> {
-        let held = self.contact.held();
         let device = self.device.get()?;
-        match held.as_ref().map(Connection::standing) {
-            Some(Standing::Owner) => None,
-            Some(Standing::Paired { host, .. }) => Some(PairedContext {
-                device: Arc::clone(device),
-                host: (**host).clone(),
-            }),
-            None => device.host_in_use().map(|host| PairedContext {
-                device: Arc::clone(device),
-                host,
-            }),
+        loop {
+            // The choice and the connection are read together, and read again once the device has
+            // answered: a choice that completed meanwhile, or a connection that arrived, makes the
+            // device's answer one about a host that is no longer the one in use.
+            let stand = self.contact.stand();
+            match stand.held.as_ref().map(Connection::standing) {
+                Some(Standing::Owner) => return None,
+                Some(Standing::Paired { host, .. }) => {
+                    return Some(PairedContext {
+                        device: Arc::clone(device),
+                        host: (**host).clone(),
+                    });
+                }
+                None => {
+                    let host = device.host_in_use();
+                    #[cfg(feature = "testing")]
+                    self.pauses.device_read.wait();
+                    if self.contact.stands_as(&stand) {
+                        return host.map(|host| PairedContext {
+                            device: Arc::clone(device),
+                            host,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -684,6 +717,95 @@ const MAX_PENDING_DROPS: usize = 64;
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Seams the application's own suites act through.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::{Mutex, PoisonError, mpsc};
+
+    use tokio::sync::oneshot;
+
+    /// A pause a suite set at one place of the state's own steps. The step that reaches the place
+    /// waits until the hold is released or dropped.
+    #[derive(Debug)]
+    pub struct Hold {
+        reached: oneshot::Receiver<()>,
+        release: mpsc::Sender<()>,
+    }
+
+    impl Hold {
+        /// Resolves once a step has reached the place and waits there.
+        pub async fn reached(&mut self) {
+            let _ = (&mut self.reached).await;
+        }
+
+        /// Lets the waiting step go on.
+        pub fn release(self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    /// One place a step can be paused at.
+    #[derive(Debug, Default)]
+    pub(super) struct Place(Mutex<Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>>);
+
+    impl Place {
+        fn set(&self) -> Hold {
+            let (reached, reached_by) = oneshot::channel();
+            let (release, released) = mpsc::channel();
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some((reached, released));
+            Hold {
+                reached: reached_by,
+                release,
+            }
+        }
+
+        /// Waits here when a suite paused this place, once.
+        pub(super) fn wait(&self) {
+            let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some((reached, released)) = held {
+                let _ = reached.send(());
+                let _ = released.recv();
+            }
+        }
+    }
+
+    /// Every place a step can be paused at.
+    #[derive(Debug, Default)]
+    pub(super) struct Pauses {
+        pub(super) device_read: Place,
+        pub(super) before_start: Place,
+        pub(super) before_cleanup: Place,
+    }
+
+    /// Where in the making of a choice of host a step is paused.
+    #[derive(Clone, Copy, Debug)]
+    pub enum ChoicePoint {
+        /// Inside the choice gate, before the choice is made ready.
+        BeforeStart,
+        /// Inside the choice gate, after the owner has accepted the choice and before the sessions
+        /// the host before held are let go.
+        BeforeCleanup,
+    }
+
+    impl super::AppState {
+        /// Pauses the next read of the device's records that `paired_context` makes, after the
+        /// device has answered and before the owner is read again.
+        #[must_use]
+        pub fn hold_the_device_read(&self) -> Hold {
+            self.pauses.device_read.set()
+        }
+
+        /// Pauses the next choice of a host at `point`, with the choice gate held.
+        #[must_use]
+        pub fn hold_the_choice_at(&self, point: ChoicePoint) -> Hold {
+            match point {
+                ChoicePoint::BeforeStart => self.pauses.before_start.set(),
+                ChoicePoint::BeforeCleanup => self.pauses.before_cleanup.set(),
+            }
+        }
     }
 }
 

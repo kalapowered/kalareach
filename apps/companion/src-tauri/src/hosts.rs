@@ -103,7 +103,7 @@ pub async fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> R
     state.forget_host(
         host.host_device_id,
         "no host is in use: you forgot the one this application was reaching",
-        || device.forget_host(host.host_device_id),
+        || device.forget_host(host.host_device_id).map(|_| ()),
     )?;
     // The feed of a host this computer no longer reaches is one it no longer reads, so a request
     // it left there is not waited for: nothing could say it is settled.

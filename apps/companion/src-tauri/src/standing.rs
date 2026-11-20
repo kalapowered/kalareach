@@ -493,6 +493,13 @@ struct Opened {
     losses: u32,
 }
 
+/// An opening that was admitted and not yet dialled.
+pub struct Admitted {
+    attempt: u64,
+    superseded: Arc<Notify>,
+    replaced: Option<Opened>,
+}
+
 #[derive(Default)]
 struct Inner {
     attempts: u64,
@@ -610,18 +617,68 @@ impl PairedLinks {
         self.freed.notify_waiters();
     }
 
-    /// Opens `session_id` under `grant_id` (the pairing when none), as the opening the page chose.
+    /// Admits an opening of `session_id`: the opening is the session's current one from the moment
+    /// this returns, the session's earlier opening, if any, is over then, whatever becomes of this
+    /// one, and a place among the eight is held for it until it is left. The dial follows, in
+    /// [`Self::open`].
     ///
-    /// The opening is the session's current one from the moment this is called: the session's
-    /// earlier opening, if any, is over then, whatever becomes of this one, and a place among the
-    /// eight is held for it until it is left.
+    /// # Errors
+    ///
+    /// Returns a token the page may not use, and a ninth opened session.
+    pub fn admit(&self, session_id: SessionId, opening: &str) -> Result<Admitted> {
+        if !well_formed(opening) {
+            return Err(CommandError::invalid(
+                "an opening is up to 64 letters, digits and dashes",
+            ));
+        }
+        let mut inner = self.lock();
+        let seen = inner.seen.entry(session_id).or_default();
+        if seen.iter().any(|seen| seen == opening) {
+            return Err(CommandError::invalid(
+                "that opening has been used; open the session again with a new one",
+            ));
+        }
+        if seen.len() >= SEEN_LIMIT {
+            seen.pop_front();
+        }
+        seen.push_back(opening.to_owned());
+        // A place is held from the call, not from the link: nine opens made together are
+        // refused at the ninth whichever has answered.
+        if !inner.current.contains_key(&session_id) && inner.current.len() >= OPENED_LIMIT {
+            return Err(CommandError::unavailable(
+                "too many sessions are open; leave one first",
+            ));
+        }
+        inner.attempts += 1;
+        let attempt = inner.attempts;
+        let superseded = Arc::new(Notify::new());
+        // The dial of the opening this one replaces is stopped, not left to finish.
+        if let Some(earlier) = inner.current.insert(
+            session_id,
+            Current {
+                opening: opening.to_owned(),
+                attempt,
+                superseded: Arc::clone(&superseded),
+            },
+        ) {
+            earlier.superseded.notify_one();
+        }
+        Ok(Admitted {
+            attempt,
+            superseded,
+            replaced: inner.opened.remove(&session_id),
+        })
+    }
+
+    /// Opens `session_id` under `grant_id` (the pairing when none), as the opening `admitted` made
+    /// the session's current one.
     ///
     /// A host that cannot be reached, or cannot answer now, does not fail the open: the opening
     /// stands as `reconnecting` and its watch reaches the host as soon as it can.
     ///
     /// # Errors
     ///
-    /// Returns a token the page may not use, a ninth opened session, and the host's refusal.
+    /// Returns the host's refusal.
     pub async fn open(
         self: &Arc<Self>,
         dial: &Dial,
@@ -629,47 +686,13 @@ impl PairedLinks {
         session_id: SessionId,
         grant_id: Option<GrantId>,
         opening: &str,
+        admitted: Admitted,
     ) -> Result<SessionStanding> {
-        if !well_formed(opening) {
-            return Err(CommandError::invalid(
-                "an opening is up to 64 letters, digits and dashes",
-            ));
-        }
-        let (attempt, superseded, replaced) = {
-            let mut inner = self.lock();
-            let seen = inner.seen.entry(session_id).or_default();
-            if seen.iter().any(|seen| seen == opening) {
-                return Err(CommandError::invalid(
-                    "that opening has been used; open the session again with a new one",
-                ));
-            }
-            if seen.len() >= SEEN_LIMIT {
-                seen.pop_front();
-            }
-            seen.push_back(opening.to_owned());
-            // A place is held from the call, not from the link: nine opens made together are
-            // refused at the ninth whichever has answered.
-            if !inner.current.contains_key(&session_id) && inner.current.len() >= OPENED_LIMIT {
-                return Err(CommandError::unavailable(
-                    "too many sessions are open; leave one first",
-                ));
-            }
-            inner.attempts += 1;
-            let attempt = inner.attempts;
-            let superseded = Arc::new(Notify::new());
-            // The dial of the opening this one replaces is stopped, not left to finish.
-            if let Some(earlier) = inner.current.insert(
-                session_id,
-                Current {
-                    opening: opening.to_owned(),
-                    attempt,
-                    superseded: Arc::clone(&superseded),
-                },
-            ) {
-                earlier.superseded.notify_one();
-            }
-            (attempt, superseded, inner.opened.remove(&session_id))
-        };
+        let Admitted {
+            attempt,
+            superseded,
+            replaced,
+        } = admitted;
         // The earlier opening is over now, not when this one has answered: its commands are
         // refused, its watch stops and its link and views close.
         if let Some(old) = replaced {
@@ -1658,7 +1681,19 @@ pub async fn open_session<R: tauri::Runtime>(
         ),
         None => None,
     };
-    let Some(context) = state.paired_context() else {
+    // The host in use and the admission of the opening are done under the lock a choice of host is
+    // made under: a choice that is under way has let go of the sessions of the host before it lets
+    // go of the lock, and an opening admitted after it is for the host it chose. The dial follows
+    // outside the lock.
+    let admitted = state.under_the_choice_gate(|| {
+        state.paired_context().map(|context| {
+            state
+                .paired_links()
+                .admit(session_id, opening)
+                .map(|admitted| (context, admitted))
+        })
+    });
+    let Some(admitted) = admitted else {
         if !well_formed(opening) {
             return Err(CommandError::invalid(
                 "an opening is up to 64 letters, digits and dashes",
@@ -1673,6 +1708,7 @@ pub async fn open_session<R: tauri::Runtime>(
             ends_at_ms: None,
         });
     };
+    let (context, admitted) = admitted?;
     let emitter = app.clone();
     let emit: Emitter = Arc::new(move |event| {
         #[cfg(feature = "testing")]
@@ -1687,6 +1723,7 @@ pub async fn open_session<R: tauri::Runtime>(
             session_id,
             grant_id,
             opening,
+            admitted,
         )
         .await
 }
