@@ -1218,6 +1218,20 @@ impl OwnKeyFake {
     fn halves(&self) -> Vec<&'static str> {
         self.halves.lock().expect("the halves").clone()
     }
+
+    /// Lets the other tasks run until `dispatch` has been called. The case asserts what it saw.
+    async fn until_dispatched(&self) {
+        while !self.halves().contains(&"dispatch") {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Lets the other tasks run until `close` has been called. The case asserts what it saw.
+    async fn until_closing(&self) {
+        while self.closed.lock().expect("what was closed").is_empty() {
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 impl VoiceProviderService for OwnKeyFake {
@@ -1859,9 +1873,7 @@ async fn a_start_and_a_close_on_the_owners_key_hold_no_account_change() {
         &kr_voice::Unbounded,
     );
     let watching = async {
-        while !provider.halves().contains(&"dispatch") {
-            tokio::task::yield_now().await;
-        }
+        provider.until_dispatched().await;
         assert!(
             !coordinator.account_calls_open(),
             "a start on the owner's key that waits on OpenAI holds no account change"
@@ -1881,9 +1893,7 @@ async fn a_start_and_a_close_on_the_owners_key_hold_no_account_change() {
         131_000,
     );
     let watching = async {
-        while provider.closed.lock().expect("what was closed").is_empty() {
-            tokio::task::yield_now().await;
-        }
+        provider.until_closing().await;
         assert!(
             !coordinator.account_calls_open(),
             "a close on the owner's key that is still going on holds no account change"

@@ -930,9 +930,7 @@ async fn only_a_session_closed_the_profile_defines_closes_the_call() {
     let own = started(&world).await;
     let control = world.provider.host_control(&own.call_id).expect("control");
     world.stand_in.event(&json!({ "type": "session.closed" }));
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(
         control.state(),
         SidebandState::Ready,
@@ -944,9 +942,7 @@ async fn only_a_session_closed_the_profile_defines_closes_the_call() {
         "session": { "id": "live_1", "model": "gpt-live-1", "status": "active", "expires_at": 1 },
         "usage": { "seconds": 3 },
     }));
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(
         control.state(),
         SidebandState::Closed(SidebandEnd::ProviderClosed)
@@ -1551,9 +1547,7 @@ async fn a_closure_on_a_channel_a_fence_overtook_is_read_before_the_channel_is_l
     let release = Arc::new(tokio::sync::Notify::new());
     world.stand_in.hold_attach(Arc::clone(&release));
     world.stand_in.drop_socket();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(control.state(), SidebandState::Recovering);
     assert_eq!(
         world.stand_in.recorded().attaches_asked,
@@ -1564,9 +1558,7 @@ async fn a_closure_on_a_channel_a_fence_overtook_is_read_before_the_channel_is_l
     let fenced = world.provider.registry().fence().expect("a fence");
     world.stand_in.close_at_attach(true);
     release.notify_one();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(
         control.state(),
         SidebandState::Closed(SidebandEnd::ProviderClosed),
@@ -1700,9 +1692,7 @@ async fn a_closure_on_the_retained_channel_is_read_before_the_next_attachment_re
     // The first reattachment attaches, and its probe is never answered.
     world.stand_in.acknowledge(false);
     world.stand_in.drop_socket();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(control.state(), SidebandState::Recovering);
     assert_eq!(
         world.stand_in.recorded().attaches,
@@ -1713,13 +1703,9 @@ async fn a_closure_on_the_retained_channel_is_read_before_the_next_attachment_re
     let release = Arc::new(tokio::sync::Notify::new());
     world.stand_in.hold_attach(Arc::clone(&release));
     world.stand_in.drop_socket();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     tokio::time::advance(Duration::from_millis(250)).await;
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(
         world.stand_in.recorded().attaches_asked,
         3,
@@ -1730,9 +1716,7 @@ async fn a_closure_on_the_retained_channel_is_read_before_the_next_attachment_re
     world.stand_in.acknowledge(true);
     let written = world.stand_in.recorded().commands.len();
     release.notify_one();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(
         control.state(),
         SidebandState::Closed(SidebandEnd::ProviderClosed),
@@ -1756,6 +1740,14 @@ fn other_code_body() -> Vec<u8> {
         "message": "The request could not be completed" } })
     .to_string()
     .into_bytes()
+}
+
+/// Lets the other tasks run for a fixed number of turns, without moving the clock. The case
+/// asserts what it saw.
+async fn turns() {
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Lets the other tasks run, without moving the clock, until the stand-in has seen `count`
@@ -1974,9 +1966,7 @@ async fn a_closure_that_comes_while_the_hangup_of_a_failed_recovery_waits_is_rea
     world.stand_in.acknowledge(false);
     let release = held_hangup(&world);
     world.stand_in.drop_socket();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(control.state(), SidebandState::Recovering);
     // The recovery bound passes, and the hangup starts and is held.
     tokio::time::advance(RECOVERY_BOUND).await;
@@ -1990,9 +1980,7 @@ async fn a_closure_that_comes_while_the_hangup_of_a_failed_recovery_waits_is_rea
     // answered.
     world.stand_in.event(&closed_event("close_requested", None));
     release.notify_one();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(
         control.state(),
         SidebandState::Closed(SidebandEnd::ProviderClosed),
@@ -2163,16 +2151,12 @@ async fn a_fence_that_comes_while_a_reattachment_waits_for_its_pace_stops_it_bef
         written += 1;
     }
     world.stand_in.drop_socket();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(control.state(), SidebandState::Recovering);
     let asked = world.stand_in.recorded().attaches_asked;
     let fenced = world.provider.registry().fence().expect("a fence");
     tokio::time::advance(Duration::from_secs(5)).await;
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(
         world.stand_in.recorded().attaches_asked,
         asked,
@@ -2211,9 +2195,7 @@ async fn a_reattachment_after_a_burst_waits_for_the_pace_before_it_attaches_and_
     assert!(control.next_write_at().is_some(), "the burst is full");
     let commands_before = world.stand_in.recorded().commands.len();
     world.stand_in.drop_socket();
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(control.state(), SidebandState::Recovering);
     assert_eq!(
         world.stand_in.recorded().commands.len(),
@@ -2221,9 +2203,7 @@ async fn a_reattachment_after_a_burst_waits_for_the_pace_before_it_attaches_and_
         "no probe is written while the burst window is full"
     );
     tokio::time::advance(Duration::from_secs(5)).await;
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    turns().await;
     assert_eq!(control.state(), SidebandState::Ready);
     assert_eq!(control.revision(), 2);
     assert_eq!(

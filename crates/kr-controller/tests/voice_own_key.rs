@@ -944,6 +944,15 @@ fn the_registry_is(daemon: &Daemon, state: RegistryState) -> bool {
     daemon.host.controller().own_key_registry_state() == state
 }
 
+/// Waits, within twenty seconds, until the write that the case held at the stand-in has reached
+/// it. The case asserts what it saw.
+async fn until_the_close_is_held(daemon: &Daemon) {
+    let began = std::time::Instant::now();
+    while daemon.stand_in.sends_not_yet_held() > 0 && began.elapsed() < Duration::from_secs(20) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// The live voice grants a device holds in the host's own store.
 fn live_voice_grants(daemon: &Daemon, phone: &Phone) -> usize {
     daemon
@@ -1483,13 +1492,9 @@ async fn a_clean_stop_fences_the_registry_before_it_ends_the_calls_and_admits_no
         let controller = Arc::clone(daemon.host.controller());
         tokio::spawn(async move { controller.close_host_calls_for_stop().await })
     };
-    // The stop fences the registry before it ends the call, whose close is held.
-    let began = std::time::Instant::now();
-    while !the_registry_is(&daemon, RegistryState::Settling)
-        && began.elapsed() < Duration::from_secs(20)
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // The stop fences the registry before it ends the call, so the registry settles by the time
+    // the call's close is held.
+    until_the_close_is_held(&daemon).await;
     assert!(
         the_registry_is(&daemon, RegistryState::Settling),
         "the stop fences the registry while it ends the call"

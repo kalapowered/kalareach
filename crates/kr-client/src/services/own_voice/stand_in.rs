@@ -216,6 +216,12 @@ impl StandIn {
         self.script().send_hold.push_back(release);
     }
 
+    /// How many held writes no write has reached yet.
+    #[must_use]
+    pub fn sends_not_yet_held(&self) -> usize {
+        self.script().send_hold.len()
+    }
+
     /// Whether an attach is answered at once with a valid `session.closed`, in the place of
     /// `session.started`.
     pub fn close_at_attach(&self, on: bool) {
