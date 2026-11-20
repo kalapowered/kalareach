@@ -2981,22 +2981,15 @@ fn first_thread_of(pid: u32) -> setup_console::Thread {
         .unwrap_or_else(|| panic!("the process {pid} has a thread whose creation time can be read"))
 }
 
-/// The threads of `pid` made after `mark`, waited for: the command writes its question before it
-/// makes the thread that reads the answer, so a list taken at the moment the question shows can
-/// miss it. Empty when none appears within the window's deadline.
+/// The threads of `pid` made after `mark`, as the system lists them now: none while `kr` has made
+/// none. The command writes its question before it makes the thread that reads the answer, so a
+/// list taken at the moment the question shows can miss it; each case looks again in its own body.
 #[cfg(windows)]
 fn threads_made_after(pid: u32, mark: u64) -> Vec<setup_console::Thread> {
-    let started = Instant::now();
-    loop {
-        let later: Vec<_> = setup_console::threads_of(pid)
-            .into_iter()
-            .filter(|thread| thread.created > mark)
-            .collect();
-        if !later.is_empty() || started.elapsed() >= LIVENESS_DEADLINE {
-            return later;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    setup_console::threads_of(pid)
+        .into_iter()
+        .filter(|thread| thread.created > mark)
+        .collect()
 }
 
 /// Whether the thread `thread` of `pid` has ended since it was listed: an open of it then gives the
@@ -3095,32 +3088,48 @@ async fn the_token_of_a_command_at_a_question_refuses_the_opens_that_change_what
     }
 
     // The next question's reader thread is made after the tries above and must take the default
-    // list that the token holds, not what the tries changed.
+    // list that the token holds, not what the tries changed. A thread counts only when every open
+    // below was tried on it while it was live: a thread that ends first is passed over, and the
+    // loop looks again until one completes or the deadline comes.
     let after_the_tries = setup_console::now();
     window.type_line("yes");
     window.wait_for("type the last 8 symbols of its seed line");
-    let later = threads_made_after(pid, after_the_tries);
-    assert!(
-        !later.is_empty(),
-        "this case could not make its condition: no thread of kr was made after the tries"
-    );
-    for thread in later {
-        for (what, right) in [
-            ("its context", rights::THREAD_GET_CONTEXT),
-            ("its list", rights::WRITE_DAC),
-        ] {
-            let opened = open_thread(thread.id, right);
-            if opened.as_ref().err() == Some(&ERROR_INVALID_PARAMETER) && has_ended(pid, thread.id)
-            {
-                continue;
+    let mut completed = 0_usize;
+    let started = Instant::now();
+    while completed == 0 && started.elapsed() < LIVENESS_DEADLINE {
+        for thread in threads_made_after(pid, after_the_tries) {
+            let mut live = true;
+            for (what, right) in [
+                ("its context", rights::THREAD_GET_CONTEXT),
+                ("its list", rights::WRITE_DAC),
+            ] {
+                let opened = open_thread(thread.id, right);
+                if opened.as_ref().err() == Some(&ERROR_INVALID_PARAMETER)
+                    && has_ended(pid, thread.id)
+                {
+                    live = false;
+                    break;
+                }
+                assert_eq!(
+                    opened.map(|_| ()),
+                    Err(ACCESS_DENIED),
+                    "the open of a later thread for {what} is refused with ERROR_ACCESS_DENIED"
+                );
             }
-            assert_eq!(
-                opened.map(|_| ()),
-                Err(ACCESS_DENIED),
-                "the open of a later thread for {what} is refused with ERROR_ACCESS_DENIED"
-            );
+            if live {
+                completed += 1;
+            }
+        }
+        if completed == 0 {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
+    println!("kr-case: {completed} later thread(s) completed both opens while live");
+    assert!(
+        completed >= 1,
+        "this case could not make its condition: no thread made after the tries stayed live \
+         through both opens"
+    );
 }
 
 /// The thread that ran the protection refuses the opens that take a thread over; a plain
@@ -3168,31 +3177,56 @@ async fn a_thread_made_after_the_protection_refuses_the_opens_that_take_it_over(
     let before = setup_console::now();
     window.type_line("yes");
     window.wait_for("type the last 8 symbols of its seed line");
-    let later = threads_made_after(pid, before);
-    assert!(
-        !later.is_empty(),
-        "this case could not make its condition: no thread of kr was made after the first answer"
-    );
-    for thread in later {
-        for (what, right) in TAKEOVER {
-            let opened = open_thread(thread.id, right);
-            if opened.as_ref().err() == Some(&ERROR_INVALID_PARAMETER) && has_ended(pid, thread.id)
-            {
-                continue;
+    // A thread counts only when every open below was tried on it while it was live: a thread that
+    // ends first is passed over, and the loop looks again until one completes or the deadline
+    // comes.
+    let mut completed = 0_usize;
+    let started = Instant::now();
+    while completed == 0 && started.elapsed() < LIVENESS_DEADLINE {
+        for thread in threads_made_after(pid, before) {
+            let mut live = true;
+            for (what, right) in TAKEOVER {
+                let opened = open_thread(thread.id, right);
+                if opened.as_ref().err() == Some(&ERROR_INVALID_PARAMETER)
+                    && has_ended(pid, thread.id)
+                {
+                    live = false;
+                    break;
+                }
+                assert_eq!(
+                    opened.map(|_| ()),
+                    Err(ACCESS_DENIED),
+                    "the open of thread {} for {what} is refused with ERROR_ACCESS_DENIED",
+                    thread.id
+                );
             }
-            assert_eq!(
-                opened.map(|_| ()),
-                Err(ACCESS_DENIED),
-                "the open of thread {} for {what} is refused with ERROR_ACCESS_DENIED",
-                thread.id
-            );
+            if live {
+                let queried = open_thread(thread.id, rights::THREAD_QUERY_LIMITED);
+                if queried.as_ref().err() == Some(&ERROR_INVALID_PARAMETER)
+                    && has_ended(pid, thread.id)
+                {
+                    live = false;
+                } else {
+                    assert!(
+                        queried.is_ok(),
+                        "the open of thread {} for a query is granted, and the system said {:?}",
+                        thread.id,
+                        queried.err()
+                    );
+                }
+            }
+            if live {
+                completed += 1;
+            }
         }
-        let queried = open_thread(thread.id, rights::THREAD_QUERY_LIMITED);
-        assert!(
-            queried.is_ok() || has_ended(pid, thread.id),
-            "the open of thread {} for a query is granted, and the system said {:?}",
-            thread.id,
-            queried.err()
-        );
+        if completed == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
+    println!("kr-case: {completed} later thread(s) completed every open while live");
+    assert!(
+        completed >= 1,
+        "this case could not make its condition: no thread made after the first answer stayed \
+         live through every open"
+    );
 }
