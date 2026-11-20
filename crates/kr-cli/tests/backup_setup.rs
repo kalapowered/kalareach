@@ -24,8 +24,10 @@ use kr_controller::account::{HostAccount, Service};
 use kr_controller::backup::store::{Production, Remote};
 use kr_controller::backup::uploader::SERVICE_CHAIN_LENGTH;
 use kr_controller::config::Outbound;
+use kr_controller::error::ControllerError;
 use kr_controller::quiet::Timer;
 use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::singleton::SingletonLock;
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_controller::testing::HeldTimer;
 use kr_crypto::kdf::RecoverySeed;
@@ -84,7 +86,7 @@ struct Rig {
     served: Arc<Served>,
     timer: Arc<HeldTimer>,
     endpoint: Endpoint,
-    controller: Arc<Controller>,
+    controller: Option<Arc<Controller>>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: PathBuf,
     home: PathBuf,
@@ -199,10 +201,49 @@ impl Rig {
             served,
             timer,
             endpoint,
-            controller,
+            controller: Some(controller),
             serving,
             work,
             home,
+        }
+    }
+
+    /// The daemon, which the rig holds until [`Self::let_go_of_the_daemon`].
+    fn controller(&self) -> &Arc<Controller> {
+        self.controller
+            .as_ref()
+            .expect("the daemon is held until the case lets go of it")
+    }
+
+    /// Ends the daemon and returns when it is gone: the tasks that serve are cancelled and awaited,
+    /// the rig lets go of the daemon, and the lock that the daemon holds on its environment can be
+    /// taken. On Windows that lock is an open file that shares nothing, so a scan of the host's
+    /// files meets it for as long as the daemon is alive. The host's folder stays.
+    async fn let_go_of_the_daemon(&mut self) {
+        for task in std::mem::take(&mut self.serving) {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(self.controller.take());
+        let lock = self.temp.environment().singleton_lock();
+        let begun = Instant::now();
+        loop {
+            match SingletonLock::hold(&lock, self.temp.environment_id()) {
+                Ok(held) => {
+                    drop(held);
+                    return;
+                }
+                Err(ControllerError::AlreadyRunning { .. })
+                    if begun.elapsed() < LIVENESS_DEADLINE =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!(
+                    "the lock {} was not free {:?} after the rig let go of the daemon: {error}",
+                    lock.display(),
+                    begun.elapsed()
+                ),
+            }
         }
     }
 
@@ -319,7 +360,7 @@ impl Rig {
 
     /// Whether the daemon's record shows `generation` of `archive` as made and published.
     fn published(&self, archive: ArchiveId, generation: u64) -> bool {
-        self.controller
+        self.controller()
             .backup()
             .generation(archive, BackupGeneration::new(generation))
             .expect("the store reads")
@@ -343,7 +384,7 @@ impl Rig {
         deadline: Duration,
     ) {
         let mut passes = self
-            .controller
+            .controller()
             .backup_runtime()
             .expect("a carrier")
             .passes();
@@ -844,7 +885,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// which the restore and export cases show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_given_no_seed() {
-    let rig = Rig::start().await;
+    let mut rig = Rig::start().await;
     kr_controller::testing::tap_backup_enable(rig.temp.environment_id());
     let mut window = Window::run(&rig, &["backup", "setup"]);
     let kit = window.bring_up_the_kit();
@@ -908,7 +949,9 @@ async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_
         contains(&calls[0], &sealed),
         "the tap sees the bundle the daemon was given, so its search is not empty"
     );
-    // Nor does any file of the host.
+    // Nor does any file of the host. The daemon holds `controller.lock` open and shares nothing on
+    // Windows, so it is ended first and its folder is kept for the scan.
+    rig.let_go_of_the_daemon().await;
     for (name, bytes) in tree(rig.temp.root()) {
         for (what, value) in &hidden {
             assert!(!contains(&bytes, value), "{name} holds {what}");
@@ -1516,7 +1559,7 @@ async fn a_host_whose_storage_is_a_service_its_owner_runs_is_set_up_there_and_th
     );
     assert_eq!(rig.recorded_kit().await, Some(kit.fingerprint()));
     assert!(
-        rig.controller
+        rig.controller()
             .storage_account()
             .token_scopes_asked()
             .iter()
@@ -1524,7 +1567,7 @@ async fn a_host_whose_storage_is_a_service_its_owner_runs_is_set_up_there_and_th
         "the host's account at that service carried the setup"
     );
     assert!(
-        rig.controller
+        rig.controller()
             .host_account()
             .token_scopes_asked()
             .is_empty(),
@@ -1565,7 +1608,7 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     let rig = Rig::start().await;
-    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let (arrived, go) = rig.controller().backup().pause_the_next_setup_commit();
     let mut window = Window::run(&rig, &["backup", "setup"]);
     let kit = window.bring_up_the_kit();
     window.confirm(&kit);
@@ -1612,7 +1655,7 @@ async fn an_interrupt_during_a_replacement_voids_the_new_kit_only_by_the_earlier
     window.wait_for("kr ended 0");
     let first_fingerprint = first.fingerprint();
 
-    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let (arrived, go) = rig.controller().backup().pause_the_next_setup_commit();
     let mut window = Window::run(&rig, &["backup", "setup", "--replace"]);
     let second = window.bring_up_the_kit();
     window.confirm(&second);
@@ -2074,7 +2117,7 @@ async fn a_generation_deleted_under_privacy_mode_is_one_a_fresh_host_can_no_long
     // A day later, with the configuration changed, the host makes a second generation.
     rig.timer.advance_day(Duration::from_secs(25 * 3600));
     write_document_at(&rig.temp, rig.origin(), 2);
-    rig.controller.backup().signals().produce.notify_one();
+    rig.controller().backup().signals().produce.notify_one();
     rig.until_published(archive_id, 2).await;
 
     // Another collection of the account, which no deletion of this host's may touch.
@@ -2088,7 +2131,7 @@ async fn a_generation_deleted_under_privacy_mode_is_one_a_fresh_host_can_no_long
     );
 
     let objects_of = |generation: u64| -> Vec<kr_protocol::ids::BackupObjectId> {
-        rig.controller
+        rig.controller()
             .backup()
             .objects(archive_id, BackupGeneration::new(generation))
             .expect("the store reads")
@@ -2615,7 +2658,7 @@ fn ctrl_break_reaches_a_program_on_a_console_by_a_key_record_or_by_the_console_e
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ctrl_break_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     let rig = Rig::start().await;
-    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let (arrived, go) = rig.controller().backup().pause_the_next_setup_commit();
     let file = rig.work.join("break-now").display().to_string();
     let mut window = Window::run_with(
         &rig,
