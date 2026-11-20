@@ -64,6 +64,16 @@ enum Workers {
     Live,
 }
 
+/// Whether the application is given a connection to the daemon when the test starts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Link {
+    /// One, as the command line makes it: the commands the page calls have a host to ask.
+    Made,
+    /// None: the application holds no connection until the test connects it, and a test that is
+    /// about how a connection is made, or refused, starts here.
+    Unmade,
+}
+
 /// The worker binary this workspace built, copied to the internal disk and started once there.
 ///
 /// # Panics
@@ -119,24 +129,30 @@ impl Drop for Host {
 impl Host {
     /// Starts the daemon, and an application whose connection is to it.
     async fn start() -> Self {
-        Self::start_with(None, Workers::None).await
+        Self::start_with(None, Workers::None, Link::Made).await
+    }
+
+    /// Starts the daemon as `start` does, and an application that holds no connection to it.
+    async fn start_unconnected() -> Self {
+        Self::start_with(None, Workers::None, Link::Unmade).await
     }
 
     /// Starts the daemon as `start` does, and lets it start the workers of the sessions it creates.
     async fn start_creating_sessions() -> Self {
-        Self::start_with(None, Workers::Live).await
+        Self::start_with(None, Workers::Live, Link::Made).await
     }
 
     /// Starts the daemon as `start` does, with its description host choosing from `catalogue` when
     /// one is given, and told that nothing stands in the way of a model: the memory is free and
     /// the power is the mains'.
     async fn start_describing(catalogue: Option<kr_describe::testing::TestCatalogue>) -> Self {
-        Self::start_with(catalogue, Workers::None).await
+        Self::start_with(catalogue, Workers::None, Link::Made).await
     }
 
     async fn start_with(
         catalogue: Option<kr_describe::testing::TestCatalogue>,
         workers: Workers,
+        link: Link,
     ) -> Self {
         let tree = teardown::Tree::create();
         let environment = tree.environment();
@@ -216,6 +232,7 @@ impl Host {
             .manage(companion_tauri::AppState::new())
             .manage(companion_tauri::agent::WorkerLinks::at(environment))
             .invoke_handler(tauri::generate_handler![
+                companion_tauri::commands::connection_state,
                 companion_tauri::commands::attention_read,
                 companion_tauri::commands::attention_acknowledge,
                 companion_tauri::commands::review_read,
@@ -243,12 +260,14 @@ impl Host {
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
-        let transport = IpcTransport::connect(&endpoint, build_id)
-            .await
-            .expect("connects to the control endpoint");
-        app.state::<companion_tauri::AppState>().connected(
-            companion_tauri::connection::Connection::over(transport).expect("a connection"),
-        );
+        if link == Link::Made {
+            let transport = IpcTransport::connect(&endpoint, build_id)
+                .await
+                .expect("connects to the control endpoint");
+            app.state::<companion_tauri::AppState>().connected(
+                companion_tauri::connection::Connection::over(transport).expect("a connection"),
+            );
+        }
         let kept = tempfile::tempdir().expect("a place for the kept answers");
         app.state::<companion_tauri::AppState>()
             .keep_under(kept.path());
@@ -270,6 +289,14 @@ impl Host {
 
     fn environment_id(&self) -> String {
         self.tree.environment_id().to_string()
+    }
+
+    /// The endpoint the daemon's clients connect to.
+    fn endpoint(&self) -> kr_ipc::paths::Endpoint {
+        self.tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint")
     }
 
     /// Reads the card's setup until `holds` says it does, or the watchdog runs out.
@@ -845,21 +872,17 @@ impl Drop for EndsTheKeeper<'_> {
 async fn a_connection_to_the_host_is_taken_up_again_when_it_ends() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use companion_tauri::connection::{Attempt, Connection, build_id, reach_host_on_this_machine};
+    use companion_tauri::connection::{Attempt, connect_local_at, reach_host_on_this_machine};
 
     let host = Host::start().await;
     let state = host.app.state::<companion_tauri::AppState>();
     // However the case ends, the task that keeps the connection ends with it.
     let _ends = EndsTheKeeper(host.app.state::<companion_tauri::AppState>());
-    let endpoint = host
-        .tree
-        .environment()
-        .controller_endpoint()
-        .expect("an endpoint");
+    let endpoint = host.endpoint();
     let attempts = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&attempts);
     // The application's own entry for reaching the host on its machine, with this daemon's endpoint
-    // in place of the user's.
+    // in place of the user's, and the application's own way of connecting to it.
     reach_host_on_this_machine(host.app.handle(), move || {
         let endpoint = endpoint.clone();
         let attempts = Arc::clone(&counted);
@@ -870,13 +893,7 @@ async fn a_connection_to_the_host_is_taken_up_again_when_it_ends() {
                     "the host did not answer",
                 ));
             }
-            let reached =
-                match IpcTransport::connect(&endpoint, build_id().expect("a build identity")).await
-                {
-                    Ok(transport) => Connection::over(transport),
-                    Err(error) => Err(companion_tauri::CommandError::from(error)),
-                };
-            match reached {
+            match connect_local_at(&endpoint).await {
                 Ok(connection) => Attempt::Reached(connection),
                 Err(error) => Attempt::Failed(error),
             }
@@ -920,6 +937,235 @@ async fn a_connection_to_the_host_is_taken_up_again_when_it_ends() {
         .await
         .expect("the host answers on the new connection");
     assert_eq!(read.environment_id.to_string(), host.environment_id());
+}
+
+/// What a stand-in host answers a hello with.
+#[derive(Clone, Copy)]
+enum Hello {
+    /// A refusal, as a host that does not admit the caller answers.
+    Refused,
+    /// An acknowledgement that selects a protocol major this build does not speak.
+    OtherMajor,
+}
+
+/// The words of the refusal a stand-in host gives, as the host says them.
+const REFUSAL: &str = "this stand-in host admits no caller";
+
+/// A listener that answers every hello it is sent as `answer` says, and nothing else.
+struct StandIn {
+    hellos: Arc<std::sync::atomic::AtomicUsize>,
+    serving: tokio::task::JoinHandle<()>,
+}
+
+impl StandIn {
+    /// Listens at `endpoint`, which no other listener holds, and gives each caller an answer that
+    /// states `environment_id` where it states one.
+    fn bind(
+        endpoint: &kr_ipc::paths::Endpoint,
+        environment_id: kr_protocol::ids::EnvironmentId,
+        answer: Hello,
+    ) -> Self {
+        let listener = Listener::bind(endpoint).expect("binds the stand-in endpoint");
+        let hellos = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hellos);
+        let serving = tokio::spawn(async move {
+            while let Ok((connection, peer)) = listener.accept().await {
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) =
+                        kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                    let Ok(kr_protocol::envelope::ControlFrame::Hello(_)) = reader
+                        .read_message::<kr_protocol::envelope::ControlFrame>()
+                        .await
+                    else {
+                        return;
+                    };
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let reply = match answer {
+                        Hello::Refused => kr_protocol::envelope::ControlFrame::Response(
+                            kr_protocol::envelope::Response {
+                                request_id: kr_protocol::ids::RequestId::new(0),
+                                outcome: kr_protocol::envelope::Outcome::Error(
+                                    kr_protocol::error::ProtocolError::new(
+                                        kr_protocol::error::ErrorCode::PermissionDenied,
+                                        REFUSAL,
+                                    ),
+                                ),
+                            },
+                        ),
+                        Hello::OtherMajor => kr_protocol::envelope::ControlFrame::HelloAck(
+                            Box::new(other_major_acknowledgement(environment_id, peer)),
+                        ),
+                    };
+                    let _ = writer.write_message(&reply).await;
+                    // Held open until the caller has read the answer and gone.
+                    let _ = reader
+                        .read_message::<kr_protocol::envelope::ControlFrame>()
+                        .await;
+                });
+            }
+        });
+        Self { hellos, serving }
+    }
+
+    /// How many hellos this stand-in has answered.
+    fn hellos(&self) -> usize {
+        self.hellos.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        self.serving.abort();
+    }
+}
+
+/// The acknowledgement of a host whose protocol major is not this build's.
+fn other_major_acknowledgement(
+    environment_id: kr_protocol::ids::EnvironmentId,
+    peer: kr_ipc::peer::PeerIdentity,
+) -> kr_protocol::local::LocalHelloAck {
+    use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION, ProtocolVersion, ReceiveLimits};
+    use kr_protocol::ids::{ActionWindowId, BootEpoch, ConnectionId};
+    use kr_protocol::local::{LocalHelloAck, LocalPeer, LocalRole};
+    use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, TimestampMs, U64};
+
+    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    LocalHelloAck {
+        selected_version: ProtocolVersion::new(PROTOCOL_VERSION.major + 1, 0),
+        role: LocalRole::Controller,
+        connection_id,
+        environment_id,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        peer: LocalPeer {
+            uid: U64::new(u64::from(peer.uid)),
+            gid: U64::new(u64::from(peer.gid)),
+            pid: Nullable::null(),
+        },
+        action_window: ActionWindow {
+            action_window_id: ActionWindowId::new("window-1").expect("a literal window identifier"),
+            connection_id,
+            boot_epoch: BootEpoch::new(1),
+            issued_at_ms: TimestampMs::new(0),
+            valid_for_ms: DurationMs::new(60_000),
+        },
+        capabilities: CanonicalSet::new(),
+        max_receive: ReceiveLimits::default(),
+        build: None,
+    }
+}
+
+/// KR-REQ-23.22: the application connects to the host at the endpoint it is given, as it connects
+/// to the host on its machine, and the state it tells the page is the one the command reports. The
+/// application starts with no connection, the connection is made, and a second one is opened from
+/// it at the same endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_application_connects_to_the_host_at_the_endpoint_it_is_given() {
+    use companion_tauri::connection::connect_local_at;
+
+    let host = Host::start_unconnected().await;
+    let before = host
+        .call("connection_state", json!({}))
+        .await
+        .expect("the state is read");
+    assert_eq!(before["connected"], json!(false), "{before}");
+    assert!(before["environment_id"].is_null(), "{before}");
+    assert!(before["reason"].is_string(), "{before}");
+
+    let connection = connect_local_at(&host.endpoint())
+        .await
+        .expect("the host at the endpoint is reached");
+    host.app
+        .state::<companion_tauri::AppState>()
+        .connected(connection.clone());
+    let after = host
+        .call("connection_state", json!({}))
+        .await
+        .expect("the state is read");
+    assert_eq!(after["connected"], json!(true), "{after}");
+    assert_eq!(after["environment_id"], json!(host.environment_id()));
+    assert_eq!(after["paired"], json!(false), "{after}");
+
+    let another = connection
+        .another()
+        .await
+        .expect("another connection is opened at the same endpoint");
+    assert!(!Arc::ptr_eq(&connection.session(), &another.session()));
+    assert_eq!(another.environment_id(), connection.environment_id());
+    let read: kr_protocol::hostinfo::HostInfoResult = another
+        .session()
+        .read(kr_protocol::method::Method::HostInfo, &json!({}))
+        .await
+        .expect("the host answers on the second connection");
+    assert_eq!(read.environment_id.to_string(), host.environment_id());
+}
+
+/// KR-REQ-23.22: a host that refuses the hello is the failure the application is given as the
+/// refusal of the connection, and one that states a protocol major this build does not speak is the
+/// failure that says no major is shared. Neither leaves the application holding a connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_refuses_the_hello_or_speaks_another_major_is_not_connected_to() {
+    use companion_tauri::connection::connect_local_at;
+
+    let host = Host::start_unconnected().await;
+    for answer in [Hello::Refused, Hello::OtherMajor] {
+        let tree = kr_ipc::testing::TempHost::create();
+        let endpoint = tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let stand_in = StandIn::bind(&endpoint, tree.environment_id(), answer);
+        let failure = connect_local_at(&endpoint)
+            .await
+            .expect_err("a host that does not admit the application is not connected to");
+        assert_eq!(stand_in.hellos(), 1, "the stand-in was the host reached");
+        let told = match answer {
+            Hello::Refused => "the host refused the connection",
+            Hello::OtherMajor => "no shared protocol major",
+        };
+        assert!(failure.message.contains(told), "{failure:?}");
+    }
+    let state = host
+        .call("connection_state", json!({}))
+        .await
+        .expect("the state is read");
+    assert_eq!(state["connected"], json!(false), "{state}");
+}
+
+/// KR-REQ-23.22: a connection opened at an endpoint is opened again at that endpoint, and says what
+/// it found there: no host once the daemon has gone, and the refusal of the connection when
+/// something else answers in its place.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_opened_at_an_endpoint_says_what_it_finds_there_when_opened_again() {
+    use companion_tauri::connection::connect_local_at;
+
+    let mut host = Host::start_unconnected().await;
+    let endpoint = host.endpoint();
+    let connection = connect_local_at(&endpoint)
+        .await
+        .expect("the host at the endpoint is reached");
+
+    // The daemon stops answering new callers, and its listener, which the task held, goes with it.
+    host.clients.abort();
+    let _ = (&mut host.clients).await;
+    let gone = connection
+        .another()
+        .await
+        .expect_err("no connection is opened to a host that has gone")
+        .into_error();
+    assert!(gone.message.contains("no host on this machine"), "{gone:?}");
+
+    let stand_in = StandIn::bind(&endpoint, host.tree.environment_id(), Hello::Refused);
+    let refused = connection
+        .another()
+        .await
+        .expect_err("no connection is opened to a host that refuses the hello")
+        .into_error();
+    assert_eq!(stand_in.hellos(), 1);
+    assert!(
+        refused.message.contains("the host refused the connection"),
+        "{refused:?}"
+    );
 }
 
 /// KR-REQ-13.14: a file the page hands over is given a path on the host through the commands the
