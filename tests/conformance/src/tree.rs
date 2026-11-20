@@ -33,16 +33,10 @@ pub const GRACE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const POLL: Duration = Duration::from_millis(10);
 
-/// How many bytes of a pipe are read at once, so that the deadline is looked at at least as often as
-/// that many bytes arrive.
+/// How many bytes of a pipe are read at once, so that the deadline, and the end of the grace, are
+/// looked at at least as often as that many bytes arrive.
 #[cfg(unix)]
 const READ_AT_MOST: usize = 64 * 1024;
-
-/// How many times the pipes are read for what is left in them after the processes were ended: what
-/// a process of the command wrote as it ended, and no more than a process that is outside the
-/// group and still writes can add.
-#[cfg(unix)]
-const LAST_READS: usize = 16;
 
 /// When a step's time is spent.
 #[derive(Clone, Copy, Debug)]
@@ -131,7 +125,7 @@ fn supervised(
     let mut pipes = match Pipes::of(&mut child) {
         Ok(pipes) => pipes,
         Err(error) => {
-            Group::end(&mut child);
+            Group::end(&mut child, &mut Pipes::none(), GRACE);
             return Err(error);
         }
     };
@@ -164,7 +158,7 @@ fn supervised(
                 std::thread::sleep(POLL.min(deadline.at - now));
             }
             Err(error) => {
-                Group::end(&mut child);
+                Group::end(&mut child, &mut pipes, GRACE);
                 return Err(error);
             }
         }
@@ -204,27 +198,47 @@ impl Pipe {
         })
     }
 
-    /// Reads at most `buffer`'s length of what the pipe holds now. A pipe that is at its end, or
-    /// that cannot be read, is closed. Whether it read anything.
-    fn read(&mut self, buffer: &mut [u8]) -> bool {
+    /// Reads at most `buffer`'s length of what the pipe holds now, without waiting. A pipe that is
+    /// at its end, or that cannot be read, is closed. How many bytes it read.
+    fn read(&mut self, buffer: &mut [u8]) -> usize {
         let Some(fd) = &self.fd else {
-            return false;
+            return 0;
         };
         match rustix::io::read(fd, &mut *buffer) {
             Ok(0) => {
                 self.fd = None;
-                false
+                0
             }
             Ok(count) => {
                 self.bytes.extend_from_slice(&buffer[..count]);
-                true
+                count
             }
-            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => false,
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => 0,
             Err(_) => {
                 self.fd = None;
-                false
+                0
             }
         }
+    }
+
+    /// Reads what the pipe holds at this moment, in pieces of at most `buffer`'s length, and then
+    /// once more for the end of the pipe. The count of queued bytes is taken once, before the reads,
+    /// so a process that goes on writing cannot extend this: it adds at most one piece.
+    fn drain(&mut self, buffer: &mut [u8]) {
+        let Some(fd) = &self.fd else {
+            return;
+        };
+        let mut queued = rustix::io::ioctl_fionread(fd).unwrap_or(0);
+        while queued > 0 {
+            let piece =
+                usize::try_from(queued).map_or(buffer.len(), |queued| queued.min(buffer.len()));
+            let count = self.read(&mut buffer[..piece]);
+            if count == 0 {
+                break;
+            }
+            queued = queued.saturating_sub(u64::try_from(count).unwrap_or(u64::MAX));
+        }
+        self.read(buffer);
     }
 }
 
@@ -238,16 +252,38 @@ impl Pipes {
         })
     }
 
+    /// No pipe: a command whose pipes could not be read.
+    fn none() -> Self {
+        Self {
+            stdout: Pipe {
+                fd: None,
+                bytes: Vec::new(),
+            },
+            stderr: Pipe {
+                fd: None,
+                bytes: Vec::new(),
+            },
+            buffer: Vec::new(),
+        }
+    }
+
     /// Whether a pipe is still open.
     fn open(&self) -> bool {
         self.stdout.fd.is_some() || self.stderr.fd.is_some()
     }
 
-    /// Reads once from each open pipe. Whether either gave anything.
+    /// Reads once from each open pipe, at most [`READ_AT_MOST`] bytes from each, without waiting.
+    /// Whether either gave anything.
     fn read(&mut self) -> bool {
         let out = self.stdout.read(&mut self.buffer);
         let err = self.stderr.read(&mut self.buffer);
-        out || err
+        out + err > 0
+    }
+
+    /// Reads what each open pipe holds at this moment, and looks for its end.
+    fn drain(&mut self) {
+        self.stdout.drain(&mut self.buffer);
+        self.stderr.drain(&mut self.buffer);
     }
 
     fn into_captured(self) -> Captured {
@@ -270,32 +306,87 @@ impl Group {
         std::os::unix::process::CommandExt::process_group(command, 0);
     }
 
-    /// Ends the group `child` leads: asks it to end, waits [`GRACE`], ends what is left by force
+    /// Ends the group `child` leads: asks it to end, waits `grace`, ends what is left by force
     /// whether or not `child` is, and reaps `child`. Until it is reaped `child` holds the group's
     /// number even when it has ended, so the signals go to this group and to no other.
-    fn end(child: &mut Child) {
+    ///
+    /// The pipes are read through the grace, so that a process that writes more than a pipe holds as
+    /// it ends is not blocked on its write, and then once they are drained of what the processes
+    /// that were ended left in them. A pass reads at most [`READ_AT_MOST`] bytes from a pipe and the
+    /// passes end with the grace, whatever a process that goes on writing adds; the drain reads the
+    /// bytes queued when it begins.
+    fn end(child: &mut Child, pipes: &mut Pipes, grace: Duration) {
         let _ = rustix::process::kill_process_group(
             rustix::process::Pid::from_child(child),
             rustix::process::Signal::TERM,
         );
-        std::thread::sleep(GRACE);
+        let until = Instant::now() + grace;
+        loop {
+            let now = Instant::now();
+            if now >= until {
+                break;
+            }
+            if !pipes.read() {
+                std::thread::sleep(POLL.min(until - now));
+            }
+        }
         let _ = rustix::process::kill_process_group(
             rustix::process::Pid::from_child(child),
             rustix::process::Signal::KILL,
         );
         let _ = child.wait();
+        pipes.drain();
     }
 
-    /// [`Group::end`], and what the pipes held when the processes had ended. The pipes are closed
-    /// when this returns, so a process that is outside the group and holds one is not read from
-    /// again and cannot grow what the report keeps.
+    /// [`Group::end`] with the [`GRACE`], and what the pipes held when the processes had ended. The
+    /// pipes are closed when this returns, so a process that is outside the group and holds one is
+    /// not read from again and cannot grow what the report keeps.
     fn ended(child: &mut Child, mut pipes: Pipes) -> Captured {
-        Self::end(child);
-        for _ in 0..LAST_READS {
-            if !pipes.read() {
-                break;
-            }
-        }
+        Self::end(child, &mut pipes, GRACE);
         pipes.into_captured()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    /// KR-REQ-29.01, the part about reproducible commands: the bytes queued in a pipe when the
+    /// processes that wrote them were ended are all read, however many pieces of the buffer's length
+    /// they make: 1 KiB read in pieces of 16 bytes is 64 pieces, more than any fixed number of reads
+    /// that the report could make. The writer still holds the pipe, so the pipe stays open.
+    #[test]
+    fn a_drain_reads_every_queued_byte_whatever_the_length_of_its_pieces() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        writer.write_all(&[7; 1024]).expect("a write");
+        let mut pipe = Pipe::new(Some(OwnedFd::from(reader))).expect("a pipe to read");
+        pipe.drain(&mut [0; 16]);
+        assert_eq!(pipe.bytes.len(), 1024);
+        assert!(pipe.fd.is_some(), "the writer holds the pipe open");
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: what a command had written when the group
+    /// was killed, and not yet read, is kept, though the grace is no time at all: the pipes are
+    /// drained after the leader is waited for.
+    #[test]
+    fn what_the_pipes_hold_when_the_group_is_killed_and_reaped_is_kept() {
+        let mut command = Command::new("bash");
+        command
+            .args(["-c", "printf queued; sleep 300"])
+            .stdin(Stdio::null());
+        Group::prepare(&mut command);
+        command.stdout(Stdio::piped());
+        let mut child = command.spawn().expect("a command");
+        let mut pipes = Pipes::of(&mut child).expect("pipes");
+        let fd = pipes.stdout.fd.as_ref().expect("a pipe");
+        let until = Instant::now() + Duration::from_secs(30);
+        while rustix::io::ioctl_fionread(fd).unwrap_or(0) == 0 {
+            assert!(Instant::now() < until, "the command wrote nothing");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Group::end(&mut child, &mut pipes, Duration::ZERO);
+        assert_eq!(pipes.into_captured().stdout, b"queued");
     }
 }

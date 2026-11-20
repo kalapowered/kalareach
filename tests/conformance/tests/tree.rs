@@ -189,25 +189,50 @@ fn a_leader_that_ended_while_a_process_of_its_group_holds_the_pipe_is_not_reaped
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: the group is asked to end first and has the
-/// grace to do it: a leader that, asked to, takes a second to write a line and end writes it, and
-/// is not ended by force before.
+/// grace to do it: a leader that, asked to, takes a second to write a line to a file and a line to
+/// its standard output and end writes them, and is not ended by force before; what it wrote to the
+/// standard output is kept.
 #[test]
 fn the_group_is_asked_to_end_and_has_the_grace_before_it_is_ended_by_force() {
     let place = tempfile::tempdir().expect("a directory");
     let file = place.path().join("ended.txt");
     let pids = place.path().join("pids.txt");
     let _ends = EndsWhatItRecorded(&pids);
-    let script = "trap 'sleep 1; printf \"%s\\n\" ended >> \"$1\"; exit 0' TERM\nsleep 300 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait";
+    let script = "trap 'sleep 1; printf \"%s\\n\" ended >> \"$1\"; printf \"%s\\n\" asked; exit 0' TERM\nsleep 300 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait";
     let waited = returned(within(
         &start(bash(script, &[&file, &pids]), deadline_in(3)),
         Duration::from_secs(60),
     ));
-    assert!(matches!(waited, Waited::TimedOut(_)), "{waited:?}");
+    let captured = timed_out(waited);
     let written = std::fs::read_to_string(&file).unwrap_or_default();
     assert_eq!(
         written, "ended\n",
         "the leader was not asked to end, or was not given the grace to"
     );
+    assert_eq!(captured.stdout, b"asked\n");
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a process that writes more than a pipe holds
+/// when it is asked to end is not blocked on its write, because the pipe is read through the grace:
+/// asked to end, it writes 600 000 bytes and then a line to a file, and the report has the line and
+/// every byte.
+#[test]
+fn a_process_that_writes_more_than_a_pipe_holds_when_asked_to_end_is_read_through_the_grace() {
+    let place = tempfile::tempdir().expect("a directory");
+    let marker = place.path().join("marker.txt");
+    let pids = place.path().join("pids.txt");
+    let _ends = EndsWhatItRecorded(&pids);
+    let script = "trap 'head -c 600000 /dev/zero; printf \"%s\\n\" done >> \"$1\"; exit 0' TERM\nsleep 300 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait";
+    let captured = timed_out(returned(within(
+        &start(bash(script, &[&marker, &pids]), deadline_in(3)),
+        Duration::from_secs(60),
+    )));
+    let written = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        written, "done\n",
+        "the process was ended by force before it had written what it was asked to end with"
+    );
+    assert_eq!(captured.stdout.len(), 600_000);
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: a pipe that a process of the group holds
