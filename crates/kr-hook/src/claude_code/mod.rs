@@ -10,9 +10,10 @@
 //! [`HOOKS`] also reports `Stop`, which Claude Code runs when the main agent has finished
 //! responding, and does not run when the person interrupted it or when an API error ended the turn
 //! (`StopFailure` is that event, and is not reported). No released package registers `Stop` yet,
-//! so a worker hears of a turn's end only from a package that does. The forwarder answers `{}` and
-//! exits 0 on `Stop` as on every event, and never exits 2, which on `Stop` would make Claude Code go
-//! on; a failure it could not help exits 1 or 64. Another hook of the person's may still block
+//! so a worker hears of a turn's end only from a package that does. A valid run answers `{}` and
+//! exits 0 on `Stop` as on every event, after an operational error or a timeout too; a command line
+//! it refuses exits 64 and a forwarder that cannot hold its release exits 1. None exits 2, which
+//! on `Stop` would make Claude Code go on. Another hook of the person's may still block
 //! the end, so a thread can end a turn more than once, each end being a later version of the same
 //! review. An older forwarder reports nothing for `Stop`, and an older worker refuses the frame,
 //! and the hook answers `{}` either way.

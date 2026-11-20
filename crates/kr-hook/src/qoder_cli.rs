@@ -16,8 +16,9 @@
 //! [`HOOKS`] also reports `Stop`, which Qoder CLI runs when the main agent has finished responding
 //! with no tool call pending. Its reference does not say whether `Stop` runs when the person
 //! interrupts. No released package registers `Stop` yet. On `Stop` exit code 2 makes the agent go
-//! on, so the forwarder never exits 2: it answers `{}` and exits 0, and a failure it could not
-//! help exits 1 or 64. Another hook of the person's may still block the end, so a thread can end a
+//! on, and the forwarder never exits 2: a valid run answers `{}` and exits 0, after an operational
+//! error or a timeout too, a command line it refuses exits 64 and a forwarder that cannot hold its
+//! release exits 1. Another hook of the person's may still block the end, so a thread can end a
 //! turn more than once, each end being a later version of the same review. An older forwarder
 //! reports nothing for `Stop`, and an older worker refuses the frame, and the hook answers `{}`
 //! either way.
