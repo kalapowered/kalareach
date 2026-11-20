@@ -20,7 +20,8 @@
 //! 4. Each of those lists is read back and compared with what was set.
 //! 5. The process's list, read back the same way.
 //! 6. The list of each thread the process has, found by a snapshot; a second snapshot then reads
-//!    every thread's list and compares it, which covers a thread made during the first pass.
+//!    every thread's list and compares it, which covers a thread made during the first pass. A
+//!    snapshot that ends for any reason but the system's word that no entry is left refuses.
 //!
 //! Every list names OWNER RIGHTS: an owner has the right to rewrite a list implicitly, and an
 //! entry for OWNER RIGHTS replaces that. Every entry is compared by its type, flags, mask and
@@ -302,6 +303,29 @@ pub trait Calls {
     fn debugger_present(&mut self) -> bool;
 }
 
+/// The system's error code for a snapshot that has no entry left to give.
+const ERROR_NO_MORE_FILES: i32 = 18;
+
+/// Whether a step through the entries of a snapshot gave an entry. `found` says the call returned
+/// one, and when it did not, `code` is the system's last error, read at once after the call.
+///
+/// Only the system's word that no entry is left ends an enumeration as complete. Any other error
+/// refuses, so that a pass that ended early never counts as one that saw every thread: two such
+/// passes would admit a thread whose list was never set or read.
+///
+/// # Errors
+///
+/// The system's error when the call failed for a reason other than the end of the entries.
+pub fn another_entry(found: bool, code: i32) -> io::Result<bool> {
+    if found {
+        Ok(true)
+    } else if code == ERROR_NO_MORE_FILES {
+        Ok(false)
+    } else {
+        Err(io::Error::from_raw_os_error(code))
+    }
+}
+
 /// Why the lists could not be set.
 #[derive(Debug)]
 pub enum Reason {
@@ -510,6 +534,8 @@ mod tests {
         behaviour: HashMap<u32, Behaviour>,
         /// The call that fails, by name.
         fails: Option<&'static str>,
+        /// A call that fails only at its nth making, by name and count from one.
+        fails_at: Option<(&'static str, usize)>,
         /// What a list reads back as, by name, in place of what was set.
         reads_as: HashMap<&'static str, List>,
         set: HashMap<&'static str, List>,
@@ -524,6 +550,7 @@ mod tests {
                 threads: vec![10, 11, 12],
                 behaviour: HashMap::new(),
                 fails: None,
+                fails_at: None,
                 reads_as: HashMap::new(),
                 set: HashMap::new(),
                 debugger: false,
@@ -536,7 +563,8 @@ mod tests {
 
         fn call(&mut self, name: &'static str) -> io::Result<()> {
             self.log.push(name.to_owned());
-            if self.fails == Some(name) {
+            let times = self.log.iter().filter(|logged| *logged == name).count();
+            if self.fails == Some(name) || self.fails_at == Some((name, times)) {
                 Err(io::Error::from_raw_os_error(1_450))
             } else {
                 Ok(())
@@ -966,6 +994,55 @@ mod tests {
         };
         let mut kept = None;
         assert!(apply(Recorder(&mut kept, fake)).is_ok());
+    }
+
+    /// Only the end of the entries that the system names completes an enumeration: any other error
+    /// is the system's error, so a pass cut short never reads as a whole one.
+    #[test]
+    fn only_the_systems_end_of_the_entries_ends_an_enumeration_as_complete() {
+        assert_eq!(another_entry(true, 0).ok(), Some(true));
+        assert_eq!(another_entry(true, 18).ok(), Some(true));
+        assert_eq!(another_entry(false, 18).ok(), Some(false));
+        for code in [0, 5, 6, 87, 1_450] {
+            let Err(error) = another_entry(false, code) else {
+                panic!("error {code} ended the enumeration as complete");
+            };
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    /// A snapshot that fails, before its first thread or after some, refuses with the system's
+    /// words at the first pass and at the second, and nothing later is made: no list is read on a
+    /// thread of a pass that did not see them all, and no debugger check is reached.
+    #[test]
+    fn a_snapshot_that_fails_refuses_at_either_pass_and_stops() {
+        for (failing, later) in [(1, "set 10"), (2, "read 10")] {
+            let mut fake = Fake::new();
+            fake.threads = vec![10];
+            fake.fails_at = Some(("snapshot", failing));
+            let mut kept = None;
+            let Err(refusal) = apply(Recorder(&mut kept, fake)) else {
+                panic!("snapshot {failing} failed and the protection held");
+            };
+            let words = refusal.words();
+            assert!(
+                words.starts_with(
+                    "the recovery kit is not made because the access lists of this process could \
+                     not be set: "
+                ),
+                "snapshot {failing}: {words}"
+            );
+            assert!(
+                words.contains("os error 1450"),
+                "snapshot {failing}: {words}"
+            );
+            let log = kept.expect("the log");
+            assert!(
+                !log.iter()
+                    .any(|logged| logged == later || logged == "debugger"),
+                "snapshot {failing} stopped the calls: {log:?}"
+            );
+        }
     }
 
     /// A debugger refuses, in its own words, after the lists are set.

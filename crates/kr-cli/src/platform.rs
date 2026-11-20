@@ -253,7 +253,9 @@ mod protection {
         TerminateProcess,
     };
 
-    use crate::backup::protect::{Calls, Entry, List, Open, Previous, acl_image, entries_of};
+    use crate::backup::protect::{
+        Calls, Entry, List, Open, Previous, acl_image, another_entry, entries_of,
+    };
 
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
@@ -381,6 +383,15 @@ mod protection {
         list
     }
 
+    /// The system's last error when a call that just ran did not succeed, and zero when it did.
+    fn last_error_unless(succeeded: bool) -> i32 {
+        if succeeded {
+            0
+        } else {
+            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        }
+    }
+
     fn own_token(held: &Option<OwnedHandle>) -> io::Result<HANDLE> {
         held.as_ref()
             .map(|token| token.as_raw_handle().cast())
@@ -501,15 +512,15 @@ mod protection {
             let own = unsafe { GetCurrentProcessId() };
             let mut ids = Vec::new();
             // SAFETY: the snapshot is open and the pointer is a live structure.
-            let mut more =
-                unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
+            let first = unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) };
+            let mut more = another_entry(first != 0, last_error_unless(first != 0))?;
             while more {
                 if entry.th32OwnerProcessID == own {
                     ids.push(entry.th32ThreadID);
                 }
                 // SAFETY: as above.
-                more =
-                    unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
+                let next = unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) };
+                more = another_entry(next != 0, last_error_unless(next != 0))?;
             }
             Ok(ids)
         }
