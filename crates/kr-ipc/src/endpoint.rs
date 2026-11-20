@@ -267,12 +267,16 @@ mod platform {
 
     #[cfg(target_vendor = "apple")]
     mod apple;
+    pub(in crate::endpoint) mod live;
 
     #[derive(Debug)]
     pub(super) struct Listener {
         inner: UnixListener,
         path: std::path::PathBuf,
         identity: (u64, u64),
+        // Declared last: the socket closes before the lock is released, so no bind finds a lock
+        // free while its socket still listens. Nothing reads it: it holds the lock until it drops.
+        _hold: live::Hold,
     }
 
     impl Listener {
@@ -287,17 +291,24 @@ mod platform {
             let guard = EndpointGuard::take(&path)?;
             let text = endpoint.as_text();
             replace_stale_socket(&path, &text)?;
+            // The lock is taken before the bind, so no bound listener of this release ever lacks
+            // it, and it is shared so that nothing but a decision to remove a socket asks for it
+            // exclusively.
+            let mut hold = live::Hold::take(&path)
+                .map_err(|error| refused(&text, ListenStep::Lock, &error))?;
             let inner = UnixListener::bind(&path)
                 .map_err(|error| refused(&text, ListenStep::Bind, &error))?;
             set_owner_only(&path)
                 .map_err(|error| refused_by(&text, ListenStep::Permissions, &error))?;
             let identity = socket_identity(&path)
                 .map_err(|error| refused_by(&text, ListenStep::Inspect, &error))?;
+            hold.publish(identity);
             drop(guard);
             Ok(Self {
                 inner,
                 path,
                 identity,
+                _hold: hold,
             })
         }
 
@@ -332,13 +343,25 @@ mod platform {
         }
     }
 
-    /// Removes a socket file only when nothing is listening on it.
+    /// Removes a socket file only when its listener is shown to have ended.
     ///
-    /// A socket file is not a lock, so its presence proves nothing on its own. A connection that
-    /// is refused proves the previous owner is gone. Any other failure — a permission error, an
-    /// exhausted descriptor table, a full backlog — proves nothing at all, and unlinking on those
-    /// would let one process delete another's live endpoint.
+    /// A socket file is not a lock, so its presence proves nothing on its own, and a refused
+    /// connect proves less than it seems to: on macOS a listener whose queue is full refuses a
+    /// connect as well. Any other failure of the probe, a permission error or an exhausted
+    /// descriptor table, proves nothing at all, and unlinking on those would let one process
+    /// delete another's live endpoint.
     fn replace_stale_socket(path: &std::path::Path, text: &str) -> Result<()> {
+        replace_stale_socket_with(path, text, &volume_ids)
+    }
+
+    /// [`replace_stale_socket`] with the volume's report supplied, which only macOS asks for.
+    pub(in crate::endpoint) fn replace_stale_socket_with(
+        path: &std::path::Path,
+        text: &str,
+        volume: &dyn Fn(&std::path::Path) -> live::Volume,
+    ) -> Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -356,15 +379,75 @@ mod platform {
             // Something answered, or its backlog was full, which only a live listener has. Either
             // way the address belongs to a running process.
             Probe::Listening { pid } => Err(IpcError::listen(text, ListenRefusal::Held { pid })),
-            Probe::Abandoned => std::fs::remove_file(path).map_err(|error| {
-                IpcError::listen(
-                    text,
-                    ListenRefusal::NotRemoved {
-                        os: error.raw_os_error().unwrap_or_default(),
-                    },
-                )
-            }),
+            Probe::Abandoned => {
+                let evidence = live::read(path, (metadata.dev(), metadata.ino()));
+                let removal = if cfg!(target_vendor = "apple") {
+                    // On macOS a refused connect is no proof that a listener ended, since a full
+                    // queue is refused too. A socket is removed only when its lock file is free,
+                    // its record names this socket and the file that was opened, and the volume
+                    // says that its object numbers are persistent. The volume is read at each
+                    // decision, and only when everything else allows the removal.
+                    //
+                    // On macOS, a listening socket that another process holds without that lock
+                    // can be removed once its queue is full, whether or not that process accepts
+                    // on it. No kr code passes a listener to another process on purpose. A child
+                    // that another thread starts between the listener's socket call and its
+                    // close-on-exec mark inherits it (see `stream_socket`); that is this
+                    // residual's only kr source.
+                    //
+                    // A machine that sleeps for more than about three days can wake with `.live`
+                    // older than the cleaners' bound, because the refresh counts only time awake
+                    // and the cleaners run at that wake; that costs the record, never the socket.
+                    //
+                    // Any replacement of `.live` reads Unanswered, because its recorded inode is
+                    // not the one this listener holds.
+                    //
+                    // A binder of an earlier release runs the old rule and can remove a live
+                    // socket of this release once its queue is full: the daemon's three endpoints
+                    // are protected by its singleton lock and the plugin host's by the host's
+                    // adoption rules, and two bridge names that share six characters can still
+                    // meet it. The time between this check and the removal is open to a binder
+                    // that takes no part in this scheme, on both platforms.
+                    let persistent =
+                        if matches!(evidence.lock, live::Lock::Free) && evidence.record_matches {
+                            path.parent().map_or(live::Volume::ReadFailed, volume)
+                        } else {
+                            live::Volume::Unknown
+                        };
+                    live::removal_where_a_full_queue_refuses(evidence, persistent)
+                } else {
+                    // Elsewhere a full queue is `EAGAIN`, so a refused connect proves that no
+                    // listener holds the socket, and only a held lock stays.
+                    live::removal_where_a_refused_connect_proves_an_end(evidence)
+                };
+                match removal {
+                    live::Removal::Allowed => std::fs::remove_file(path).map_err(|error| {
+                        IpcError::listen(
+                            text,
+                            ListenRefusal::NotRemoved {
+                                os: error.raw_os_error().unwrap_or_default(),
+                            },
+                        )
+                    }),
+                    live::Removal::LockHeld => Err(IpcError::listen(text, ListenRefusal::LockHeld)),
+                    live::Removal::Unanswered => {
+                        Err(IpcError::listen(text, ListenRefusal::Unanswered))
+                    }
+                }
+            }
         }
+    }
+
+    /// What the volume of a folder says about its object numbers, where it is asked.
+    #[cfg(target_vendor = "apple")]
+    pub(in crate::endpoint) fn volume_ids(folder: &std::path::Path) -> live::Volume {
+        apple::volume_ids(folder)
+    }
+
+    /// No other system is asked: a full queue is not refused there.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(in crate::endpoint) fn volume_ids(_folder: &std::path::Path) -> live::Volume {
+        live::Volume::Unknown
     }
 
     /// A refusal of a step, from the error the system gave.
