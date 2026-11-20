@@ -43,9 +43,9 @@ pub fn seal(key: &SymmetricKey, aad: &[u8], plaintext: &[u8]) -> Result<(Nonce19
 ///
 /// # Errors
 ///
-/// Returns [`CryptoError::Authentication`] when the ciphertext, the nonce or the additional
-/// authenticated data does not match. The three are indistinguishable from outside, which is the
-/// point.
+/// Returns [`CryptoError::Authentication`](crate::CryptoError::Authentication) when the
+/// ciphertext, the nonce or the additional authenticated data does not match. The three are
+/// indistinguishable from outside, which is the point.
 pub fn open(
     key: &SymmetricKey,
     nonce: &Nonce192,
