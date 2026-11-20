@@ -138,6 +138,9 @@ fn listed_releases(repository: &Path) -> Result<Vec<Release>, String> {
 // The report
 // ---------------------------------------------------------------------------------------------
 
+/// The lines the items of a sighting cover: a file, the first line and the last.
+type Lines = BTreeSet<(String, usize, usize)>;
+
 /// What the reader reports for one tag.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Tag {
@@ -148,7 +151,7 @@ struct Tag {
     /// For each sighting `(crate, name)`: its kinds.
     sightings: BTreeMap<(String, String), String>,
     /// The lines the items of each sighting cover.
-    extents: BTreeMap<(String, String), BTreeSet<(String, usize, usize)>>,
+    extents: BTreeMap<(String, String), Lines>,
 }
 
 /// The tags of a report in the order it lists them.
