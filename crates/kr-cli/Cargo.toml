@@ -158,8 +158,9 @@ zip.workspace = true
 winx = "=0.36.4"
 
 [target.'cfg(windows)'.dev-dependencies]
-# The cases that change the security of the logon's window station and of the interactive one.
-windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_StationsAndDesktops", "Win32_System_SystemServices"] }
+# The cases that change the security of the logon's window station and of the interactive one, and
+# the setup cases that debug a command, list its threads and open it as another program does.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_StationsAndDesktops", "Win32_System_SystemServices"] }
 
 # The workspace forbids unsafe code, which a crate that calls the console API cannot honour. This
 # package denies it instead. Two product modules relax the rule: `platform`, and `windows::records`,

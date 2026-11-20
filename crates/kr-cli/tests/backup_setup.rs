@@ -1,13 +1,16 @@
 //! `kr backup setup`, against a real control daemon, the storage service stand-in and the real `kr`
-//! binary on a pseudo-terminal.
+//! binary on a pseudo-terminal, or on Windows on a pseudo-console.
 //!
 //! The owner's command makes the recovery seed in its own process, shows the kit once, and gives
 //! the daemon what it needs to write the bundle, enrol the host's writer and record the setup, and
 //! nothing that opens a backup.
 //! Everything but the service is real. The service is the stand-in (`kr-service-stand-in`), which
 //! answers as the deployed Worker does and is held to a recording of it.
-
-#![cfg(unix)]
+//!
+//! On Windows the window is a pseudo-console that runs this test binary as the observer
+//! (`setup_console`), which runs `kr`, ignores Ctrl-C and Ctrl-Break itself, and then says how it
+//! ended and what it found in the console, and reads one line of its own: the one thing that shows
+//! what `kr` left waiting in the console.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -40,6 +43,8 @@ use kr_protocol::service::GatewayOrigin;
 use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve};
 use serde_json::Value;
 
+#[cfg(windows)]
+mod setup_console;
 mod support;
 
 use support::kr;
@@ -139,6 +144,11 @@ impl Rig {
         for directory in [&work, &home] {
             std::fs::create_dir(directory).expect("a directory on the internal disk");
         }
+        #[cfg(windows)]
+        for directory in ["Local", "Roaming"] {
+            std::fs::create_dir_all(home.join("AppData").join(directory))
+                .expect("a folder for the host's program data");
+        }
         write_document(&temp, served.origin());
         keep_sign_in(&temp, served.origin()).await;
         let environment = temp.environment();
@@ -205,8 +215,59 @@ impl Rig {
         self.served.web().requests_to(path)
     }
 
+    /// The environment every `kr` this test runs is given on Windows: what a program needs to start
+    /// there, and this host's directories.
+    #[cfg(windows)]
+    fn variables(&self) -> Vec<(&'static str, String)> {
+        let mut variables = Vec::new();
+        for name in [
+            "SystemRoot",
+            "SystemDrive",
+            "windir",
+            "TEMP",
+            "TMP",
+            "ComSpec",
+            "PATHEXT",
+        ] {
+            if let Ok(value) = std::env::var(name) {
+                variables.push((name, value));
+            }
+        }
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned());
+        variables.push(("PATH", format!(r"{root}\System32")));
+        variables.push(("TERM", "xterm-256color".to_owned()));
+        // The folders a program keeps its data in are the host's own below its home.
+        variables.push(("USERPROFILE", self.home.display().to_string()));
+        variables.push((
+            "LOCALAPPDATA",
+            self.home
+                .join("AppData")
+                .join("Local")
+                .display()
+                .to_string(),
+        ));
+        variables.push((
+            "APPDATA",
+            self.home
+                .join("AppData")
+                .join("Roaming")
+                .display()
+                .to_string(),
+        ));
+        variables.push((
+            "KR_RUNTIME_DIR",
+            self.temp.paths().runtime_root().display().to_string(),
+        ));
+        variables.push((
+            "KR_STATE_DIR",
+            self.temp.paths().state_root().display().to_string(),
+        ));
+        variables
+    }
+
     /// The environment every `kr` this test runs is given: this host's directories, a home of its
     /// own, and nothing of the person running the test.
+    #[cfg(unix)]
     fn variables(&self) -> Vec<(&'static str, String)> {
         vec![
             ("PATH", "/usr/bin:/bin".to_owned()),
@@ -363,9 +424,14 @@ async fn keep_sign_in(host: &kr_ipc::testing::TempHost, origin: &str) {
 /// A terminal window `kr` runs in, with the person's side of it: what the window has shown, and a
 /// way to type.
 struct Window {
+    /// Held so that the terminal stays open for as long as the window does; Unix reads its modes.
+    #[cfg_attr(
+        windows,
+        expect(dead_code, reason = "the pseudo-console is held open and never read")
+    )]
     terminal: portable_pty::PtyPair,
     shell: Box<dyn portable_pty::Child + Send + Sync>,
-    typing: Box<dyn Write + Send>,
+    typing: Arc<Mutex<Box<dyn Write + Send>>>,
     seen: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -386,6 +452,45 @@ impl Window {
 
     /// As [`Self::run`], with more variables in the command's environment.
     fn run_with(rig: &Rig, arguments: &[&str], more: &[(&str, &str)]) -> Self {
+        Self::start(rig, arguments, more, &[])
+    }
+
+    /// As [`Self::run`], with `typed` already waiting in the terminal's input before `kr` starts, as
+    /// a person's line typed before the command has said anything.
+    fn run_after_typing(rig: &Rig, arguments: &[&str], typed: &[u8]) -> Self {
+        Self::start(rig, arguments, &[], typed)
+    }
+
+    /// The window of a command on Windows: this test binary as the observer, which runs `kr` with
+    /// `arguments`. The observer's own settings go in `more` (`setup_console`'s variables).
+    #[cfg(windows)]
+    fn start(rig: &Rig, arguments: &[&str], more: &[(&str, &str)], typed: &[u8]) -> Self {
+        let mut environment: Vec<(String, String)> = rig
+            .variables()
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        environment.extend(
+            more.iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+        );
+        environment.push((setup_console::KR.to_owned(), kr().display().to_string()));
+        environment.push((setup_console::ARGUMENTS.to_owned(), arguments.join("\n")));
+        let opened = setup_console::open(setup_console::SETUP, &environment, &rig.work);
+        let mut window = Self {
+            terminal: opened.terminal,
+            shell: opened.shell,
+            typing: opened.typing,
+            seen: opened.seen,
+        };
+        if !typed.is_empty() {
+            window.type_bytes(typed);
+        }
+        window
+    }
+
+    #[cfg(unix)]
+    fn start(rig: &Rig, arguments: &[&str], more: &[(&str, &str)], typed: &[u8]) -> Self {
         let terminal = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
                 rows: 24,
@@ -415,6 +520,14 @@ impl Window {
         command.env("KR", kr().display().to_string());
         command.cwd(&rig.work);
         let typing = terminal.master.take_writer().expect("a writer");
+        let mut typing = typing;
+        if !typed.is_empty() {
+            typing
+                .write_all(typed)
+                .and_then(|()| typing.flush())
+                .expect("types into the window");
+        }
+        let typing = Arc::new(Mutex::new(typing));
         let shell = terminal
             .slave
             .spawn_command(command)
@@ -451,9 +564,18 @@ impl Window {
     }
 
     /// What the window has shown so far, with the terminal's own line endings made plain.
+    #[cfg(unix)]
     fn shown(&self) -> String {
         String::from_utf8_lossy(&self.seen.lock().unwrap_or_else(PoisonError::into_inner))
             .replace("\r\n", "\n")
+    }
+
+    /// What the console has drawn so far, read as a person reads the screen: the pseudo-console's
+    /// bytes hold cursor moves and redraws, so a count of a line measures what the console drew and
+    /// not how often it sent it.
+    #[cfg(windows)]
+    fn shown(&self) -> String {
+        setup_console::Screen::of(&self.transcript()).text()
     }
 
     /// Waits until the window has shown `marker`, and returns what it has shown. It fails when it
@@ -494,9 +616,17 @@ impl Window {
 
     /// Types bytes as they are.
     fn type_bytes(&mut self, bytes: &[u8]) {
-        self.typing
-            .write_all(bytes)
-            .and_then(|()| self.typing.flush())
+        // The Enter key of a console sends a carriage return, where a Unix terminal sends a line
+        // feed, so a line end typed as `\n` here is typed as the key of the platform.
+        #[cfg(windows)]
+        let bytes: Vec<u8> = bytes
+            .iter()
+            .map(|byte| if *byte == b'\n' { b'\r' } else { *byte })
+            .collect();
+        let mut typing = self.typing.lock().unwrap_or_else(PoisonError::into_inner);
+        typing
+            .write_all(&bytes)
+            .and_then(|()| typing.flush())
             .expect("types into the window");
     }
 
@@ -505,7 +635,27 @@ impl Window {
         self.type_bytes(format!("{line}\n").as_bytes());
     }
 
+    /// Asserts that the terminal is as `kr` found it after the command ended and `shown` was read:
+    /// on Unix that echo is on; on Windows that the console's two mode words, which the observer
+    /// read before it started `kr` and read again after it ended, are equal.
+    fn assert_the_terminal_is_as_found(&self, shown: &str) {
+        #[cfg(unix)]
+        {
+            let _ = shown;
+            assert!(self.echoes(), "echo is on");
+        }
+        #[cfg(windows)]
+        {
+            let (before, after) = modes_of(shown);
+            assert_eq!(
+                before, after,
+                "the console's modes after kr ended are the ones before it started: {shown}"
+            );
+        }
+    }
+
     /// Whether the terminal echoes what is typed, as its modes say now.
+    #[cfg(unix)]
     fn echoes(&self) -> bool {
         use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -541,6 +691,22 @@ impl Window {
         self.wait_for("Type yes when the kit is stored");
         self.type_line("yes");
     }
+}
+
+/// What the observer on Windows said the console's two mode words were before it started `kr` and
+/// after `kr` ended.
+#[cfg(windows)]
+fn modes_of(shown: &str) -> (String, String) {
+    let line = shown
+        .lines()
+        .find_map(|line| {
+            line.find("kr-observer: modes before ")
+                .map(|at| &line[at..])
+        })
+        .unwrap_or_else(|| panic!("the observer said what the modes were: {shown}"));
+    let words: Vec<&str> = line.split_whitespace().collect();
+    // "kr-observer:" "modes" "before" <words> "after" <words>
+    (words[3].to_owned(), words[5].to_owned())
 }
 
 /// The kit as the window showed it.
@@ -1207,7 +1373,7 @@ async fn setup_is_refused_inside_a_session_without_a_terminal_and_as_json() {
     let output = rig.run(&["backup", "setup"]);
     assert!(!output.status.success());
     assert!(
-        text(&output.stderr).contains("needs a terminal"),
+        text(&output.stderr).contains(NEEDS_A_TERMINAL),
         "{}",
         text(&output.stderr)
     );
@@ -1376,7 +1542,7 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(shown.contains("Nothing was set up."), "{shown}");
-    assert!(window.echoes(), "echo is on");
+    window.assert_the_terminal_is_as_found(&shown);
     assert!(!shown.contains("kalareach-recovery-kit"), "{shown}");
 
     let mut window = Window::run(&rig, &["backup", "setup"]);
@@ -1385,7 +1551,7 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(shown.contains("opens nothing"), "{shown}");
-    assert!(window.echoes(), "echo is on");
+    window.assert_the_terminal_is_as_found(&shown);
 
     assert_eq!(rig.requests_to(SYNC), 0);
     assert_eq!(rig.recorded_kit().await, None);
@@ -1418,7 +1584,7 @@ async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     assert!(said.contains(&kit.fingerprint()), "{said}");
     assert!(!shown.contains("Nothing was set up"), "{shown}");
     assert!(!shown.contains("opens nothing: delete it"), "{shown}");
-    assert!(window.echoes(), "echo is on");
+    window.assert_the_terminal_is_as_found(&shown);
 
     go.send(()).expect("the commit is waiting");
     tokio::time::timeout(LIVENESS_DEADLINE, async {
@@ -1500,7 +1666,7 @@ async fn an_interrupt_while_the_daemon_says_nothing_ends_the_command_at_once() {
     // The interrupt ended it, and not the ten seconds the connection is given.
     assert!(shown.contains("stopped before it finished"), "{shown}");
     assert_eq!(shown.matches("Nothing was set up.").count(), 1, "{shown}");
-    assert!(window.echoes(), "echo is on");
+    window.assert_the_terminal_is_as_found(&shown);
 }
 
 /// As the case above, after the kit was shown and `yes` was typed: the call's own connection is the
@@ -1632,7 +1798,7 @@ async fn a_daemon_that_cannot_be_reached_when_the_call_is_made_has_been_given_no
         "{shown}"
     );
     assert_eq!(rig.requests_to(SYNC), 0, "nothing reached the service");
-    assert!(window.echoes(), "echo is on");
+    window.assert_the_terminal_is_as_found(&shown);
 }
 
 /// A closed session the registry holds a closure for, with output in its spool, written into the
@@ -2190,4 +2356,620 @@ fn session_id_at_the_head_of(path: &Path) -> String {
     let value = head[at..].trim_start();
     let end = value[1..].find('"').expect("a closing quote") + 2;
     value[..end].to_owned()
+}
+
+/* -------------------------------------------------------------------------- */
+/* What the terminal is left as, on both platforms                             */
+/* -------------------------------------------------------------------------- */
+
+/// What a command that is run without a terminal says.
+#[cfg(unix)]
+const NEEDS_A_TERMINAL: &str = "needs a terminal";
+/// What a command that is run without a console says on Windows.
+#[cfg(windows)]
+const NEEDS_A_TERMINAL: &str =
+    "this command needs a Windows console: run it in a console window or in Windows Terminal";
+
+/// Ctrl-C at each question that setup asks ends the command with nothing set up and the terminal as
+/// it was found, and the next line the person types is the shell's: nothing the dialogue read
+/// ahead or left waiting takes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_at_each_question_leaves_the_next_line_to_the_shell() {
+    let rig = Rig::start().await;
+
+    for question in ["go", "seed", "stored", "retry"] {
+        if question == "retry" {
+            rig.served.web().refuse_bundle_writes(true);
+        }
+        let mut window = Window::run(&rig, &["backup", "setup"]);
+        match question {
+            "go" => {
+                window.wait_for("Type yes to go on");
+            }
+            "seed" => {
+                window.bring_up_the_kit();
+            }
+            "stored" => {
+                let kit = window.bring_up_the_kit();
+                window.type_line(&kit.end_as_typed());
+                window.wait_for("Type yes when the kit is stored");
+            }
+            _ => {
+                let kit = window.bring_up_the_kit();
+                window.confirm(&kit);
+                window.wait_for("type retry to use the same kit again");
+            }
+        }
+        window.type_bytes(&[0x03]);
+        let shown = window.wait_for("kr ended");
+        assert!(!shown.contains("kr ended 0"), "{question}: {shown}");
+        window.assert_the_terminal_is_as_found(&shown);
+        window.type_line("marker");
+        let shown = window.wait_for("first:");
+        assert!(
+            shown.contains("first:marker"),
+            "{question}: the next line is the shell's: {}",
+            shown.escape_debug()
+        );
+    }
+
+    assert_eq!(rig.recorded_kit().await, None);
+}
+
+/// A line typed before a question is shown is not the answer to it: the person answers what is on
+/// the screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_line_typed_before_the_question_is_shown_does_not_answer_it() {
+    let rig = Rig::start().await;
+    let mut window = Window::run_after_typing(&rig, &["backup", "setup"], b"yes\n");
+    window.wait_for("Type yes to go on");
+    window.type_line("no");
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(shown.contains("Nothing was set up."), "{shown}");
+    assert!(
+        !shown.contains("kalareach-recovery-kit"),
+        "the line typed ahead went on: {shown}"
+    );
+    assert_eq!(rig.requests_to(SYNC), 0);
+    assert_eq!(rig.recorded_kit().await, None);
+}
+
+/* -------------------------------------------------------------------------- */
+/* The console on Windows                                                      */
+/* -------------------------------------------------------------------------- */
+
+/// When this binary is started as the observer of a console, this case runs it, and otherwise it
+/// does nothing.
+#[cfg(windows)]
+#[test]
+fn the_console_half_of_a_setup_window() {
+    if let Some(mode) = std::env::var_os(setup_console::MARKER) {
+        setup_console::observe(&mode.to_string_lossy());
+    }
+}
+
+/// The identifier of the `kr` the observer started.
+#[cfg(windows)]
+fn kr_pid_of(shown: &str) -> u32 {
+    shown
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("kr-observer: kr pid "))
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the observer said which kr it started: {shown}"))
+}
+
+/// The way Ctrl-Break reaches a program on a console on this machine.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+enum BreakRoute {
+    /// The key record of Ctrl+Break, written to the console's input as a person's key is.
+    KeyRecord,
+    /// A call that sends the event to every program on the console, made from a program on it.
+    ConsoleEvent,
+}
+
+/// Which way Ctrl-Break reaches a program on a console here, found once by asking a program on a
+/// console of its own; the words say why none does.
+#[cfg(windows)]
+fn break_route() -> &'static Result<BreakRoute, String> {
+    static ROUTE: std::sync::OnceLock<Result<BreakRoute, String>> = std::sync::OnceLock::new();
+    ROUTE.get_or_init(|| {
+        let place = kr_ipc::testing::PrivateTempDir::create();
+        let file = place.path().join("break-now");
+        let environment: Vec<(String, String)> = std::env::vars()
+            .chain([(
+                setup_console::BREAK_FILE.to_owned(),
+                file.display().to_string(),
+            )])
+            .collect();
+        let opened = setup_console::open(setup_console::BREAK_PROBE, &environment, place.path());
+        let mut window = Window {
+            terminal: opened.terminal,
+            shell: opened.shell,
+            typing: opened.typing,
+            seen: opened.seen,
+        };
+        fn waited_for(window: &Window, marker: &str, seconds: u64) -> bool {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(seconds) {
+                if window.shown().contains(marker) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        }
+        if !waited_for(&window, "kr-observer: ready", 60) {
+            return Err(format!(
+                "the program on the console never said it was ready: {}",
+                window.shown()
+            ));
+        }
+        window.type_bytes_exactly(BREAK_KEY_DOWN);
+        window.type_bytes_exactly(BREAK_KEY_UP);
+        if waited_for(&window, "kr-observer: break arrived", 5) {
+            return Ok(BreakRoute::KeyRecord);
+        }
+        std::fs::write(&file, b"").expect("asks the observer for the event");
+        if waited_for(&window, "kr-observer: break arrived", 5) {
+            return Ok(BreakRoute::ConsoleEvent);
+        }
+        Err(format!(
+            "neither the Ctrl+Break key record nor the console event reached a program on a \
+             console: {}",
+            window.shown()
+        ))
+    })
+}
+
+/// Ctrl+Break going down and coming up, as the console's input spells a key record.
+#[cfg(windows)]
+const BREAK_KEY_DOWN: &[u8] = b"\x1b[3;70;3;1;8;1_";
+/// See [`BREAK_KEY_DOWN`].
+#[cfg(windows)]
+const BREAK_KEY_UP: &[u8] = b"\x1b[3;70;3;0;8;1_";
+
+#[cfg(windows)]
+impl Window {
+    /// Types bytes with no change at all: `type_bytes` makes the line end of a console of them.
+    fn type_bytes_exactly(&mut self, bytes: &[u8]) {
+        let mut typing = self.typing.lock().unwrap_or_else(PoisonError::into_inner);
+        typing
+            .write_all(bytes)
+            .and_then(|()| typing.flush())
+            .expect("types into the window");
+    }
+
+    /// Sends Ctrl-Break to the program on the console, the way that reaches it here, or fails with
+    /// the words that say this machine has none.
+    fn send_break(&mut self, rig: &Rig) {
+        match break_route() {
+            Ok(BreakRoute::KeyRecord) => {
+                self.type_bytes_exactly(BREAK_KEY_DOWN);
+                self.type_bytes_exactly(BREAK_KEY_UP);
+            }
+            Ok(BreakRoute::ConsoleEvent) => {
+                std::fs::write(rig.work.join("break-now"), b"").expect("asks for the event");
+            }
+            Err(why) => panic!(
+                "this case could not make its condition, because Ctrl-Break reaches no program \
+                 on a console here: {why}"
+            ),
+        }
+    }
+}
+
+/// The two ways of delivering Ctrl-Break are tried one after the other, so that the cases that
+/// need it can say which one they use, and fail with the reason when neither reaches a program.
+#[cfg(windows)]
+#[test]
+fn ctrl_break_reaches_a_program_on_a_console_by_a_key_record_or_by_the_console_event() {
+    match break_route() {
+        Ok(route) => println!("kr-case: Ctrl-Break reaches a program on a console by {route:?}"),
+        Err(why) => panic!(
+            "this case could not make its condition, because Ctrl-Break reaches no program on a \
+             console here: {why}"
+        ),
+    }
+}
+
+/// Ctrl-C and Ctrl-Break are two ends of the same wait for the daemon: while the daemon has the
+/// call, either says to keep the kit.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_break_while_the_daemon_has_the_call_says_to_keep_the_kit() {
+    let rig = Rig::start().await;
+    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let file = rig.work.join("break-now").display().to_string();
+    let mut window = Window::run_with(
+        &rig,
+        &["backup", "setup"],
+        &[(setup_console::BREAK_FILE, file.as_str())],
+    );
+    let kit = window.bring_up_the_kit();
+    window.confirm(&kit);
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends")
+        .expect("the commit is on its thread");
+
+    window.send_break(&rig);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    let said = shown
+        .rsplit_once("The command stopped while the setup was under way")
+        .expect("the interrupt is said")
+        .1;
+    assert!(said.contains("Keep the kit"), "{said}");
+    assert!(said.contains(&kit.fingerprint()), "{said}");
+    window.assert_the_terminal_is_as_found(&shown);
+    window.type_line("marker");
+    let shown = window.wait_for("first:");
+    assert!(shown.contains("first:marker"), "{}", shown.escape_debug());
+
+    go.send(()).expect("the commit is waiting");
+}
+
+/// A console that another program left in a raw mode is given back as it was: the dialogue needs
+/// line input, echo and processed input and sets them, and the command's end puts the two mode
+/// words back.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_console_left_raw_is_given_back_raw_when_the_command_ends() {
+    let rig = Rig::start().await;
+    let mut window = Window::run_with(&rig, &["backup", "setup"], &[(setup_console::RAW, "1")]);
+    window.wait_for("Type yes to go on");
+    window.type_bytes_exactly(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    let (before, after) = modes_of(&shown);
+    let input_before = u32::from_str_radix(before.split(':').next().unwrap_or("0"), 16)
+        .expect("the input mode is hexadecimal");
+    assert_eq!(
+        input_before & (0x0002 | 0x0004 | 0x0001),
+        0,
+        "this case could not make its condition, because the console did not start raw: {shown}"
+    );
+    assert_eq!(
+        before, after,
+        "the modes are put back as they were: {shown}"
+    );
+    window.type_line("marker");
+    let shown = window.wait_for("first:");
+    assert!(shown.contains("first:marker"), "{}", shown.escape_debug());
+}
+
+/// A console that does not return to the start of a line at a line feed shows the kit as it
+/// is, line under line: the dialogue sets the output mode it needs and puts it back.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_kit_is_shown_without_a_staircase_on_a_console_that_does_not_return_at_a_line_end() {
+    let rig = Rig::start().await;
+    let mut window = Window::run_with(
+        &rig,
+        &["backup", "setup"],
+        &[(setup_console::NO_AUTO_RETURN, "1")],
+    );
+    window.bring_up_the_kit();
+    let lines = setup_console::Screen::of(&window.transcript()).lines();
+    for start in ["kalareach-recovery-kit/1", "seed: ", "locator: "] {
+        assert!(
+            lines.iter().any(|line| line.starts_with(start)),
+            "a line of the kit begins at the left edge with {start:?}: {lines:#?}"
+        );
+    }
+    window.type_bytes_exactly(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    window.assert_the_terminal_is_as_found(&shown);
+}
+
+/// An answer longer than the bound is read to the end of its line and kept to the bound, and
+/// nothing of it is left in the console: the next line the person types is the shell's.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_over_the_bound_is_read_to_the_end_of_its_line_and_leaves_nothing_behind() {
+    let rig = Rig::start().await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    window.wait_for("Type yes to go on");
+    window.type_line(&"a".repeat(10_000));
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(shown.contains("Nothing was set up."), "{shown}");
+    window.assert_the_terminal_is_as_found(&shown);
+    window.type_line("marker");
+    let shown = window.wait_for("first:");
+    assert!(shown.contains("first:marker"), "{}", shown.escape_debug());
+}
+
+/// A command run under a debugger refuses before it makes a kit, in the words of the refusal.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_run_under_a_debugger_is_refused_before_a_kit_is_made() {
+    let rig = Rig::start().await;
+    let window = Window::run_with(
+        &rig,
+        &["backup", "setup"],
+        &[(setup_console::DEBUGGED, "1")],
+    );
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(
+        shown.contains(
+            "the recovery kit is not made because a debugger is attached to this process"
+        ),
+        "{shown}"
+    );
+    assert!(!shown.contains("kalareach-recovery-kit"), "{shown}");
+    assert_eq!(rig.requests_to(SYNC), 0);
+    assert_eq!(rig.recorded_kit().await, None);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Another program of the account                                              */
+/* -------------------------------------------------------------------------- */
+
+/// A plain program of the account, which the opens of a case are tried on too: what its list lets
+/// an open do is what the opens at `kr` would do without the protection.
+#[cfg(windows)]
+struct Control {
+    child: std::process::Child,
+}
+
+#[cfg(windows)]
+impl Control {
+    fn start() -> Self {
+        let child = std::process::Command::new(std::env::current_exe().expect("this binary"))
+            .args([
+                "--exact",
+                setup_console::THE_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(setup_console::MARKER, setup_console::IDLE)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("starts a plain program");
+        let control = Self { child };
+        let started = Instant::now();
+        while setup_console::threads_of(control.child.id()).len() < 2 {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "this case could not make its condition: the plain program never had its threads"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        control
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Control {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Asserts that an open was refused for want of access.
+#[cfg(windows)]
+fn refused(what: &str, result: Result<std::os::windows::io::OwnedHandle, u32>) {
+    assert_eq!(
+        result.map(|_| ()),
+        Err(setup_console::ACCESS_DENIED),
+        "{what} is refused with ERROR_ACCESS_DENIED"
+    );
+}
+
+/// Asserts that an open was granted.
+#[cfg(windows)]
+fn granted(what: &str, result: Result<std::os::windows::io::OwnedHandle, u32>) {
+    assert!(
+        result.is_ok(),
+        "{what} is granted, and the system said {:?}",
+        result.err()
+    );
+}
+
+/// `setup` waiting at its first question, as a program of the same account sees it: its
+/// identifier, with the removal of this program's own debug privilege said first.
+#[cfg(windows)]
+async fn setup_at_its_first_question() -> (Rig, Window, u32) {
+    println!("kr-case: {}", setup_console::drop_the_debug_privilege());
+    let rig = Rig::start().await;
+    let window = Window::run(&rig, &["backup", "setup"]);
+    let shown = window.wait_for("Type yes to go on");
+    let pid = kr_pid_of(&shown);
+    (rig, window, pid)
+}
+
+/// The thread of `pid` that was made first, which ran the command's protection.
+#[cfg(windows)]
+fn first_thread_of(pid: u32) -> setup_console::Thread {
+    setup_console::threads_of(pid)
+        .into_iter()
+        .filter(|thread| thread.created != 0)
+        .min_by_key(|thread| thread.created)
+        .unwrap_or_else(|| panic!("the process {pid} has a thread whose creation time can be read"))
+}
+
+/// The process of a command that waits at a question refuses a program of the account the opens
+/// that read its memory, copy its handles or rewrite its list, and grants the one a supervisor
+/// needs; a plain program of the account grants all four.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_process_of_a_command_at_a_question_refuses_the_opens_that_read_or_take_it() {
+    use setup_console::{open_process, rights};
+
+    let (_rig, _window, pid) = setup_at_its_first_question().await;
+    refused(
+        "the open for reading memory",
+        open_process(pid, rights::PROCESS_VM_READ),
+    );
+    refused(
+        "the open for copying a handle",
+        open_process(pid, rights::PROCESS_DUP_HANDLE),
+    );
+    refused(
+        "the open for rewriting the list",
+        open_process(pid, rights::WRITE_DAC),
+    );
+    granted(
+        "the open for a query",
+        open_process(pid, rights::PROCESS_QUERY_LIMITED),
+    );
+
+    let control = Control::start();
+    for (what, right) in [
+        ("reading memory", rights::PROCESS_VM_READ),
+        ("copying a handle", rights::PROCESS_DUP_HANDLE),
+        ("rewriting the list", rights::WRITE_DAC),
+    ] {
+        assert!(
+            open_process(control.pid(), right).is_ok(),
+            "this case could not make its condition: a plain program of the account refuses the \
+             open for {what}, so a refusal at kr shows nothing"
+        );
+    }
+}
+
+/// The token of a command at a question grants a program of the account a query and refuses it the
+/// opens that change what the command's later threads allow, or copy the token; and a thread the
+/// command makes at its next question, after those tries, is still refused.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_token_of_a_command_at_a_question_refuses_the_opens_that_change_what_it_allows() {
+    use setup_console::{open_process, open_thread, open_token, rights};
+
+    let (_rig, mut window, pid) = setup_at_its_first_question().await;
+    let process = open_process(pid, rights::PROCESS_QUERY_LIMITED).expect("a query of the process");
+    granted(
+        "the token open for a query",
+        open_token(&process, rights::TOKEN_QUERY),
+    );
+    refused(
+        "the token open for its default list",
+        open_token(&process, rights::TOKEN_ADJUST_DEFAULT),
+    );
+    refused(
+        "the token open for a copy",
+        open_token(&process, rights::TOKEN_DUPLICATE),
+    );
+    refused(
+        "the token open for its list",
+        open_token(&process, rights::WRITE_DAC),
+    );
+
+    let control = Control::start();
+    let plain =
+        open_process(control.pid(), rights::PROCESS_QUERY_LIMITED).expect("a plain program");
+    for (what, right) in [
+        ("a query", rights::TOKEN_QUERY),
+        ("its default list", rights::TOKEN_ADJUST_DEFAULT),
+        ("a copy", rights::TOKEN_DUPLICATE),
+        ("its list", rights::WRITE_DAC),
+    ] {
+        assert!(
+            open_token(&plain, right).is_ok(),
+            "this case could not make its condition: the token of a plain program of the account \
+             refuses the open for {what}, so the premise is wrong and a refusal at kr shows \
+             nothing"
+        );
+    }
+
+    // The next question's reader thread is made after the tries above and must take the default
+    // list that the token holds, not what the tries changed.
+    let after_the_tries = setup_console::now();
+    window.type_line("yes");
+    window.wait_for("type the last 8 symbols of its seed line");
+    let later: Vec<_> = setup_console::threads_of(pid)
+        .into_iter()
+        .filter(|thread| thread.created > after_the_tries)
+        .collect();
+    assert!(
+        !later.is_empty(),
+        "this case could not make its condition: no thread of kr was made after the tries"
+    );
+    for thread in later {
+        refused(
+            "the open of a later thread for its context",
+            open_thread(thread.id, rights::THREAD_GET_CONTEXT),
+        );
+        refused(
+            "the open of a later thread for its list",
+            open_thread(thread.id, rights::WRITE_DAC),
+        );
+    }
+}
+
+/// Each thread that a program of the account opens for the rights that take it over is refused, for
+/// the thread the command made first and, in the next test, for one made at a later question; a
+/// plain program's threads grant them all.
+#[cfg(windows)]
+fn assert_a_thread_refuses_the_takeover(thread: u32) {
+    use setup_console::{open_thread, rights};
+
+    for (what, right) in [
+        ("its context", rights::THREAD_GET_CONTEXT),
+        ("setting its context", rights::THREAD_SET_CONTEXT),
+        ("suspending it", rights::THREAD_SUSPEND_RESUME),
+        ("ending it", rights::THREAD_TERMINATE),
+        ("rewriting its list", rights::WRITE_DAC),
+    ] {
+        refused(
+            &format!("the open of thread {thread} for {what}"),
+            open_thread(thread, right),
+        );
+    }
+    granted(
+        &format!("the open of thread {thread} for a query"),
+        open_thread(thread, rights::THREAD_QUERY_LIMITED),
+    );
+}
+
+/// The thread that ran the protection refuses the opens that take a thread over.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_thread_of_a_command_at_a_question_refuses_the_opens_that_take_it_over() {
+    use setup_console::{open_thread, rights};
+
+    let (_rig, _window, pid) = setup_at_its_first_question().await;
+    assert_a_thread_refuses_the_takeover(first_thread_of(pid).id);
+
+    let control = Control::start();
+    for thread in setup_console::threads_of(control.pid()) {
+        assert!(
+            open_thread(thread.id, rights::THREAD_GET_CONTEXT).is_ok()
+                && open_thread(thread.id, rights::WRITE_DAC).is_ok(),
+            "this case could not make its condition: a thread of a plain program of the account \
+             refuses the opens, so a refusal at kr shows nothing"
+        );
+    }
+}
+
+/// A thread the command makes after the protection, here the reader of the next question, takes
+/// the token's default list and refuses the same opens.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_thread_made_after_the_protection_refuses_the_opens_that_take_it_over() {
+    let (_rig, mut window, pid) = setup_at_its_first_question().await;
+    let before = setup_console::now();
+    window.type_line("yes");
+    window.wait_for("type the last 8 symbols of its seed line");
+    let later: Vec<_> = setup_console::threads_of(pid)
+        .into_iter()
+        .filter(|thread| thread.created > before)
+        .collect();
+    assert!(
+        !later.is_empty(),
+        "this case could not make its condition: no thread of kr was made after the first answer"
+    );
+    for thread in later {
+        assert_a_thread_refuses_the_takeover(thread.id);
+    }
 }
