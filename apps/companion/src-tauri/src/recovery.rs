@@ -1197,16 +1197,27 @@ fn qr_svg(code: &qrcodegen::QrCode) -> Zeroizing<String> {
     svg
 }
 
+/// The error Windows gives for a file that another program has open without sharing it with this
+/// open (ERROR_SHARING_VIOLATION).
+const SHARING_VIOLATION: i32 = 32;
+
 /// What a refused write of the file the person chose tells them.
 ///
 /// A volume that keeps no access lists, such as FAT or exFAT, is refused on Windows, because the
 /// file cannot be made readable by its owner alone there, and the person is told where to go
-/// instead.
+/// instead. A file that another program has open for reading or writing is refused there too, in
+/// words that say the file was not changed; the system's own words for the error go to the log.
 fn write_failure(what: &str, error: &std::io::Error) -> CommandError {
     if cfg!(windows) && error.kind() == std::io::ErrorKind::Unsupported {
         CommandError::local_failure(format!(
             "{what} was not written: {error}. Choose a folder on a volume that keeps access \
              lists, such as your computer's own drive."
+        ))
+    } else if cfg!(windows) && error.raw_os_error() == Some(SHARING_VIOLATION) {
+        tracing::warn!(%error, %what, "a file the person chose is open in another program");
+        CommandError::local_failure(format!(
+            "{what} could not be written: another program has the file open, so the file was \
+             not changed; close that program or choose another file"
         ))
     } else {
         CommandError::local_failure(format!("{what} could not be written: {error}"))
@@ -1230,7 +1241,11 @@ fn write_failure(what: &str, error: &std::io::Error) -> CommandError {
 /// A file whose mode this user cannot change, or whose list cannot be cleared or set, keeps its
 /// contents and the save fails. A process that opened the file before it was made private (an
 /// earlier file that was wider, or a new file made in a folder whose inherited list names another
-/// account, on a platform whose mode or list is not set at creation) keeps what that open gave it.
+/// account, on a platform whose mode or list is not set at creation) keeps what that open gave it,
+/// except on Windows, where the file is opened sharing deleting only: a file that another program
+/// has open for reading or writing is not opened and keeps its contents, and no program opens it
+/// for either while the kit is written. A program that kept a handle with only the right to change
+/// the file's list or owner is not stopped by that.
 fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 

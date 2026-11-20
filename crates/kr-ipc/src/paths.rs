@@ -2210,9 +2210,14 @@ mod windows {
     /// The descriptor is part of the creation, so a new file never exists under another list; a
     /// file that already stood at the name keeps the list it had, which only the caller can narrow.
     /// The handle holds write, delete, read-control and read-attributes access, and for a name
-    /// that may be taken also the right to change a list, shares reading, writing and deleting as
-    /// the standard library's own opens do, and is not inherited by a child. The name goes
-    /// through [`kr_flush::native_name`], which refuses a NUL and lifts the old length limit.
+    /// that may be taken also the right to change a list, and is not inherited by a child. A new
+    /// file shares reading, writing and deleting as the standard library's own opens do. A name
+    /// that may be taken shares deleting only: the open fails with a sharing violation while
+    /// another handle holds the file for reading or writing, so no read open made before the
+    /// list is narrowed is left to read what is written next, and none succeeds while this handle
+    /// is open. A handle that holds neither right, such as one kept to change the list or the
+    /// owner, is not stopped by this. The name goes through [`kr_flush::native_name`], which
+    /// refuses a NUL and lifts the old length limit.
     ///
     /// # Errors
     ///
@@ -2231,14 +2236,16 @@ mod windows {
             lpSecurityDescriptor: built.0,
             bInheritHandle: 0,
         };
-        let (access, creation) = match disposition {
+        let (access, creation, sharing) = match disposition {
             Disposition::New => (
                 GENERIC_WRITE | DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
                 CREATE_NEW,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ),
             Disposition::NewOrExisting => (
                 GENERIC_WRITE | DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC,
                 OPEN_ALWAYS,
+                FILE_SHARE_DELETE,
             ),
         };
         // SAFETY: `name` is a NUL-terminated wide buffer with no NUL before its end, which this
@@ -2248,7 +2255,7 @@ mod windows {
             CreateFileW(
                 name.as_ptr(),
                 access,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                sharing,
                 &raw const attributes,
                 creation,
                 FILE_ATTRIBUTE_NORMAL,
@@ -4274,7 +4281,10 @@ fn create_temporary(path: &Path) -> std::io::Result<std::fs::File> {
 /// opened as it is and given that list through the handle before the caller empties or writes it,
 /// provided an account this process could have created it as owns it, its volume keeps access
 /// lists and the list reads back as set. When any of that fails, the file keeps its contents. The
-/// handle can write, and shares reading, writing and deleting.
+/// handle can write, and shares deleting only: while another handle holds the file for reading or
+/// writing the open fails with a sharing violation, and while this handle is open no other opens
+/// the file for either. A handle kept only to change the file's list or owner is not stopped by
+/// this.
 ///
 /// Unlike [`write_owner_only_file`] this does not go through a temporary file, for the caller whose
 /// destination is the one file the person chose and not the folder it is in. A volume that keeps
