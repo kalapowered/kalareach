@@ -49,6 +49,9 @@ pub struct Snapshot {
     pub sightings: Result<Vec<Sighting>, String>,
     /// Every client row item, every client-crate account and every sighted item.
     pub records: BTreeMap<(String, String), Source>,
+    /// The sources that could not be read, by item: a crate whose files do not all parse reads
+    /// no text, and a missing text must not pass for an item that has none.
+    pub source_errors: BTreeMap<(String, String), String>,
 }
 
 /// One text of an item and the tags that have it, in the order of releases.
@@ -218,6 +221,11 @@ pub fn audit_tags(entry: &Narrower, expected: &[Tagged], snapshots: &[Snapshot])
             report
                 .problems
                 .push(said(format!("{tag}: the scan failed: {error}")));
+        }
+        for ((krate, name), error) in &snapshot.source_errors {
+            report.problems.push(said(format!(
+                "{tag}: the source of {krate}::{name} cannot be read: {error}"
+            )));
         }
     }
     for item in &items {
@@ -530,6 +538,7 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
     let sightings = tree.sightings(&|krate| is_client(krate));
     let scan_took = scan_started.elapsed();
     let mut records: BTreeMap<(String, String), Source> = BTreeMap::new();
+    let mut source_errors: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut wanted: BTreeSet<(String, String)> = client_items(entry)
         .iter()
         .map(|item| (item.krate.to_owned(), item.name.to_owned()))
@@ -549,8 +558,16 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
         );
     }
     for key in wanted {
-        if let Ok(Some(source)) = tree.source(&key.0, &key.1) {
-            records.insert(key, source);
+        match tree.source(&key.0, &key.1) {
+            Ok(Some(source)) => {
+                records.insert(key, source);
+            }
+            Ok(None) => {}
+            // A row item's failure is its lookup's.
+            Err(_) if items.contains_key(&key) => {}
+            Err(error) => {
+                source_errors.insert(key, error);
+            }
         }
     }
     let failed_items: Vec<String> = items
@@ -580,6 +597,7 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
         items,
         sightings,
         records,
+        source_errors,
     })
 }
 

@@ -1,14 +1,18 @@
 //! The cases of the historical audit, on a repository a case makes with `git init`: its tags, an
 //! origin that is a bare repository, and the production reader of snapshots.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use super::history::{Report, Snapshot, Tagged, audit_tags, expected_below, read_history};
+use quote::ToTokens as _;
+
+use super::history::{
+    Group, Report, Shown, Snapshot, Span, Tagged, audit_tags, expected_below, read_history,
+};
 use super::narrower::{Account, Evidence, Item, Narrower, Range, Sender};
 use super::narrower_cases::leak;
-use super::walker::{Lookup, SightKind, Sighting};
+use super::walker::{Lookup, SightKind, Sighting, Source};
 
 fn git(dir: &Path, args: &[&str], date: Option<i64>) -> String {
     let mut command = Command::new("git");
@@ -49,18 +53,34 @@ fn write(root: &Path, path: &str, text: &str) {
 }
 
 const MANIFEST: &str = "[package]\nname = \"NAME\"\nversion = \"0.0.0\"\n";
+const APP: &str = "apps/x/src-tauri";
 
-/// The client crate's library at a step: a builder, an old builder, a later one that names a
-/// method.
-fn client_lib(step: usize) -> Option<String> {
-    let target = if step >= 2 { 2 } else { 1 };
+/// The text of each function of the fixture, so that the digests a case expects are made apart
+/// from the walker.
+fn target_text(instance: u8) -> String {
+    format!("fn target(&self) -> ActionTarget {{ ActionTarget {{ instance: {instance} }} }}")
+}
+const RELAY: &str = "fn relay(value: u8) -> u8 { value }";
+const OLD_BUILDER: &str = "fn old_builder() { let _ = Method::AgentTurnCancel; }";
+const NAMES_ONE: &str = "fn names_one() { let _ = Method::AgentTurnSteer; }";
+const OTHER_ONE: &str = "fn other_one() { let _ = Method::AgentTurnCancel; }";
+
+/// The companion's library at a step: the builder (its target changes at the third release), a
+/// relay that builds nothing, an old builder, and a later one that names a method; the later one
+/// moves unchanged into its own file at the last release.
+fn app_lib(step: usize) -> Option<String> {
+    if step == 0 {
+        return None;
+    }
+    let instance = if step >= 2 { 2 } else { 1 };
     let mut text = format!(
-        "struct Link;\nimpl Link {{ fn target(&self) -> ActionTarget {{ ActionTarget {{ instance: {target} }} }} }}\n"
+        "struct Link;\nimpl Link {{ {} }}\n{RELAY}\n",
+        target_text(instance)
     );
     match step {
-        0 => return None,
-        1 | 2 => text.push_str("fn old_builder() { let _ = Method::AgentTurnCancel; }\n"),
-        _ => text.push_str("fn names_one() { let _ = Method::AgentTurnSteer; }\n"),
+        1 | 2 => text.push_str(&format!("{OLD_BUILDER}\n")),
+        3..=5 => text.push_str(&format!("{NAMES_ONE}\n")),
+        _ => text.push_str("mod more;\n"),
     }
     Some(text)
 }
@@ -84,7 +104,9 @@ const RELEASES: [(&str, i64, usize); 8] = [
     ("0.11.0", 600, 7),
 ];
 
-fn repo(unreadable_at: Option<usize>) -> Repo {
+/// `unreadable_at` is the release whose tree holds a manifest that names no package, `broken_at`
+/// the one with a file in the account-only crate that does not parse.
+fn repo(unreadable_at: Option<usize>, broken_at: Option<usize>) -> Repo {
     let work = tempfile::tempdir().expect("a folder");
     let origin = tempfile::tempdir().expect("a folder");
     git(origin.path(), &["init", "--bare", "-b", "main"], None);
@@ -99,8 +121,8 @@ fn repo(unreadable_at: Option<usize>) -> Repo {
         ],
         None,
     );
+    let root = work.path();
     for (at, (version, date, step)) in RELEASES.iter().enumerate() {
-        let root = work.path();
         write(
             root,
             "crates/kr-protocol/Cargo.toml",
@@ -112,21 +134,49 @@ fn repo(unreadable_at: Option<usize>) -> Repo {
             "crates/kr-protocol/src/method.rs",
             "const NAME: &str = \"agent.turn.steer\";\n",
         );
-        let client = root.join("crates/kr-client");
-        if let Some(lib) = client_lib((*step).min(5)) {
-            write(
-                root,
-                "crates/kr-client/Cargo.toml",
-                &MANIFEST.replace("NAME", "kr-client"),
-            );
-            write(root, "crates/kr-client/src/lib.rs", &lib);
+        let remove = |path: &str| {
+            let _ = std::fs::remove_dir_all(root.join(path));
+        };
+        match app_lib(*step) {
+            Some(lib) => {
+                write(
+                    root,
+                    &format!("{APP}/Cargo.toml"),
+                    &MANIFEST.replace("NAME", "companion-tauri"),
+                );
+                write(root, &format!("{APP}/src/lib.rs"), &lib);
+                if *step >= 6 {
+                    write(
+                        root,
+                        &format!("{APP}/src/more.rs"),
+                        &format!("{NAMES_ONE}\n"),
+                    );
+                }
+                write(
+                    root,
+                    "crates/kr-other/Cargo.toml",
+                    &MANIFEST.replace("NAME", "kr-other"),
+                );
+                write(
+                    root,
+                    "crates/kr-other/src/lib.rs",
+                    &format!("{OTHER_ONE}\n"),
+                );
+            }
+            None => {
+                remove("apps/x");
+                remove("crates/kr-other");
+            }
+        }
+        if broken_at == Some(at) {
+            write(root, "crates/kr-other/src/broken.rs", "fn (\n");
         } else {
-            let _ = std::fs::remove_dir_all(client);
+            let _ = std::fs::remove_file(root.join("crates/kr-other/src/broken.rs"));
         }
         if unreadable_at == Some(at) {
             write(root, "crates/odd/Cargo.toml", "[workspace]\n");
         } else {
-            let _ = std::fs::remove_dir_all(root.join("crates/odd"));
+            remove("crates/odd");
         }
         write(root, "notes.txt", &format!("{at}\n"));
         git(root, &["add", "-A"], None);
@@ -150,23 +200,24 @@ fn leaked(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
 }
 
-/// The entry for the repository: the builder, the old builder that only earlier tags have, an
-/// account for the later one, and a crate that sends none.
-fn entry(digests: &[String], tags: u32, first_tag: &'static str) -> Narrower {
-    let [absent, one, two, old] = [
-        "absent".to_owned(),
-        digests[0].clone(),
-        digests[1].clone(),
-        digests[2].clone(),
-    ];
+/// The entry for the repository: the builder and the old builder (that only earlier tags have),
+/// a relay that no sighting names, accounts for the later builder and for an account-only crate,
+/// and a crate that sends none.
+fn entry(digests: &[String; 4], tags: u32, first_tag: &'static str) -> Narrower {
     let sentence = "a text";
-    let target: &'static [(&'static str, &'static str)] = leak(vec![
-        (leaked(absent.clone()), sentence),
-        (leaked(one), sentence),
-        (leaked(two), sentence),
+    let across = |texts: Vec<&String>| -> &'static [(&'static str, &'static str)] {
+        let mut pairs = vec![("absent", sentence)];
+        pairs.extend(
+            texts
+                .into_iter()
+                .map(|text| (leaked(text.clone()), sentence)),
+        );
+        leak(pairs)
+    };
+    let old_builder: &'static [(&'static str, &'static str)] = leak(vec![
+        (leaked(digests[2].clone()), sentence),
+        ("absent", sentence),
     ]);
-    let old_builder: &'static [(&'static str, &'static str)] =
-        leak(vec![(leaked(old), sentence), (leaked(absent), sentence)]);
     Narrower {
         level: "0.11",
         root: "the envelope a worker checks",
@@ -190,18 +241,30 @@ fn entry(digests: &[String], tags: u32, first_tag: &'static str) -> Narrower {
                 evidence: Evidence::Builds {
                     items: leak(vec![
                         Item {
-                            krate: "kr_client",
+                            krate: "companion_tauri",
                             name: "Link::target",
                             now: "n",
-                            across: target,
+                            across: across(vec![&digests[0], &digests[1]]),
                         },
                         Item {
-                            krate: "kr_client",
+                            krate: "companion_tauri",
                             name: "old_builder",
                             now: "absent",
                             across: old_builder,
                         },
                     ]),
+                },
+            },
+            Sender {
+                class: "kr",
+                sends: "x",
+                evidence: Evidence::Relays {
+                    items: leak(vec![Item {
+                        krate: "companion_tauri",
+                        name: "relay",
+                        now: "n",
+                        across: across(vec![&digests[3]]),
+                    }]),
                 },
             },
             Sender {
@@ -212,13 +275,22 @@ fn entry(digests: &[String], tags: u32, first_tag: &'static str) -> Narrower {
                 },
             },
         ]),
-        accounts: leak(vec![Account {
-            krate: "kr_client",
-            name: "names_one",
-            kinds: &[SightKind::Names],
-            now: "n",
-            why: "x",
-        }]),
+        accounts: leak(vec![
+            Account {
+                krate: "companion_tauri",
+                name: "names_one",
+                kinds: &[SightKind::Names],
+                now: "n",
+                why: "x",
+            },
+            Account {
+                krate: "kr_other",
+                name: "other_one",
+                kinds: &[SightKind::Names],
+                now: "n",
+                why: "x",
+            },
+        ]),
     }
 }
 
@@ -228,15 +300,44 @@ struct Read {
     entry: Narrower,
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The source of an item as the walker is to give it: made here from the text with `syn`, and the
+/// digest of the record the walker documents.
+fn source_of(krate: &str, file: &str, label: &str, text: &str) -> Source {
+    let text = if label.contains("::") {
+        syn::parse_str::<syn::ImplItemFn>(text)
+            .expect("a method")
+            .to_token_stream()
+            .to_string()
+    } else {
+        syn::parse_str::<syn::ItemFn>(text)
+            .expect("a function")
+            .to_token_stream()
+            .to_string()
+    };
+    let record = format!("{krate} {file} {label}\n{text}\n");
+    Source {
+        digest: hex(&kr_cbor::sha256(record.as_bytes())),
+        text,
+        files: vec![file.to_owned()],
+    }
+}
+
+fn app_source(label: &str, file: &str, text: &str) -> Source {
+    source_of("companion_tauri", &format!("{APP}/src/{file}"), label, text)
+}
+
 /// Reads the repository once with an entry that lists no text, takes the digests the snapshots
 /// show, and returns the entry that lists them.
 fn read(repo: &Repo) -> Read {
-    let first = leaked(String::new());
-    let probe = entry(&["".into(), "".into(), "".into()], 7, first);
+    let probe = entry(&Default::default(), 7, leaked(String::new()));
     let (_, snapshots) = read_history(repo.work.path(), &probe).expect("the history");
     let digest = |name: &str, tag_at: usize| match snapshots[tag_at]
         .items
-        .get(&("kr_client".to_owned(), name.to_owned()))
+        .get(&("companion_tauri".to_owned(), name.to_owned()))
     {
         Some(Lookup::Found(digest)) => digest.clone(),
         other => panic!("{name} at {tag_at}: {other:?}"),
@@ -245,14 +346,9 @@ fn read(repo: &Repo) -> Read {
         digest("Link::target", 1),
         digest("Link::target", 2),
         digest("old_builder", 1),
+        digest("relay", 1),
     ];
-    let oldest = snapshots
-        .iter()
-        .min_by(|a, b| a.at.order().cmp(&b.at.order()))
-        .expect("a snapshot")
-        .at
-        .tag
-        .clone();
+    let oldest = snapshots[0].at.tag.clone();
     let entry = entry(&digests, 7, leaked(oldest));
     let (expected, snapshots) = read_history(repo.work.path(), &entry).expect("the history");
     Read {
@@ -267,102 +363,7 @@ fn said(text: &str) -> String {
 }
 
 fn tag_at(read: &Read, at: usize) -> String {
-    let mut ordered: Vec<&Tagged> = read.expected.iter().collect();
-    ordered.sort_by(|a, b| a.order().cmp(&b.order()));
-    ordered[at].tag.clone()
-}
-
-#[test]
-fn the_history_of_a_repository_that_fits_its_entry_has_no_problem_and_is_reported_as_data() {
-    let read = read(&repo(None));
-    let report = audit_tags(&read.entry, &read.expected, &read.snapshots);
-    assert_eq!(report.problems, Vec::<String>::new());
-    let target: Vec<(String, Vec<String>)> = report
-        .groups
-        .iter()
-        .filter(|group| group.name == "Link::target")
-        .map(|group| (group.digest.clone(), group.tags.clone()))
-        .collect();
-    let all: Vec<String> = (0..7).map(|at| tag_at(&read, at)).collect();
-    assert_eq!(target.len(), 3);
-    assert_eq!(target[0], ("absent".to_owned(), vec![all[0].clone()]));
-    assert_eq!(target[1].1, vec![all[1].clone()]);
-    assert_eq!(target[2].1, all[2..].to_vec());
-    // The old builder has two groups: its text at the two tags that had it, and absent.
-    let old: Vec<(String, Vec<String>)> = report
-        .groups
-        .iter()
-        .filter(|group| group.name == "old_builder")
-        .map(|group| (group.digest.clone(), group.tags.clone()))
-        .collect();
-    assert_eq!(old.len(), 2);
-    assert_eq!(old[0].0, "absent");
-    assert_eq!(old[0].1.first(), Some(&all[0]));
-    assert_eq!(old[1].1, vec![all[1].clone(), all[2].clone()]);
-    // Each distinct text once with its tags: the builder has two texts, the later builder one.
-    let mut shown: Vec<(&str, usize)> = report
-        .texts
-        .iter()
-        .map(|shown| (shown.name.as_str(), shown.tags.len()))
-        .collect();
-    shown.sort_unstable();
-    assert_eq!(
-        shown,
-        vec![
-            ("Link::target", 1),
-            ("Link::target", 5),
-            ("names_one", 4),
-            ("old_builder", 2),
-        ]
-    );
-    // The account's span is the first and last tag that have it.
-    assert_eq!(report.spans.len(), 1);
-    assert_eq!(report.spans[0].name, "names_one");
-    assert_eq!(report.spans[0].first, all[3]);
-    assert_eq!(report.spans[0].last, all[6]);
-}
-
-#[test]
-fn the_snapshots_must_be_the_releases_origin_lists() {
-    let read = read(&repo(None));
-    let at = |tag: &str| {
-        read.expected
-            .iter()
-            .find(|t| t.tag == tag)
-            .expect("a tag")
-            .commit
-            .clone()
-    };
-    // A snapshot left out.
-    let mut missing: Vec<Snapshot> = Vec::new();
-    for snapshot in &read.snapshots {
-        missing.push(clone_snapshot(snapshot));
-    }
-    let left_out = missing.remove(3);
-    let report = audit_tags(&read.entry, &read.expected, &missing);
-    assert_eq!(
-        report.problems,
-        vec![said(&format!(
-            "{} at {} is expected and has no snapshot",
-            left_out.at.tag,
-            at(&left_out.at.tag)
-        ))]
-    );
-    assert!(report.groups.is_empty() && report.texts.is_empty() && report.spans.is_empty());
-    // A snapshot that origin does not list, with the one that is left out.
-    let mut extra: Vec<Snapshot> = read.snapshots.iter().map(clone_snapshot).collect();
-    let mut stranger = clone_snapshot(&extra[0]);
-    stranger.at.tag = "packages/v0.0.1+000000000000".to_owned();
-    stranger.at.commit = "0".repeat(40);
-    extra.push(stranger);
-    let report = audit_tags(&read.entry, &read.expected, &extra);
-    assert_eq!(
-        report.problems,
-        vec![said(&format!(
-            "packages/v0.0.1+000000000000 at {} has a snapshot and is not expected",
-            "0".repeat(40)
-        ))]
-    );
+    read.snapshots[at].at.tag.clone()
 }
 
 fn clone_snapshot(snapshot: &Snapshot) -> Snapshot {
@@ -373,6 +374,7 @@ fn clone_snapshot(snapshot: &Snapshot) -> Snapshot {
         items: snapshot.items.clone(),
         sightings: snapshot.sightings.clone(),
         records: snapshot.records.clone(),
+        source_errors: snapshot.source_errors.clone(),
     }
 }
 
@@ -390,9 +392,130 @@ fn snapshot_of<'a>(snapshots: &'a mut [Snapshot], tag: &str) -> &'a mut Snapshot
         .expect("a snapshot")
 }
 
+fn group(name: &str, digest: &str, tags: &[String]) -> Group {
+    Group {
+        krate: "companion_tauri".to_owned(),
+        name: name.to_owned(),
+        digest: digest.to_owned(),
+        tags: tags.to_vec(),
+    }
+}
+
+fn shown(krate: &str, name: &str, source: Source, tags: &[String]) -> Shown {
+    Shown {
+        krate: krate.to_owned(),
+        name: name.to_owned(),
+        source,
+        tags: tags.to_vec(),
+    }
+}
+
+#[test]
+fn the_history_of_a_repository_that_fits_its_entry_has_no_problem_and_is_reported_as_data() {
+    let read = read(&repo(None, None));
+    let report = audit_tags(&read.entry, &read.expected, &read.snapshots);
+    assert_eq!(report.problems, Vec::<String>::new());
+    let all: Vec<String> = (0..7).map(|at| tag_at(&read, at)).collect();
+    let lib = "lib.rs";
+    let target_1 = app_source("Link::target", lib, &target_text(1));
+    let target_2 = app_source("Link::target", lib, &target_text(2));
+    let old = app_source("old_builder", lib, OLD_BUILDER);
+    let relay = app_source("relay", lib, RELAY);
+    let names_here = app_source("names_one", lib, NAMES_ONE);
+    let names_moved = app_source("names_one", "more.rs", NAMES_ONE);
+    let other = source_of(
+        "kr_other",
+        "crates/kr-other/src/lib.rs",
+        "other_one",
+        OTHER_ONE,
+    );
+    // The groups of each client item, in the order of its first tag.
+    let mut absent_old = vec![all[0].clone()];
+    absent_old.extend(all[3..].iter().cloned());
+    let groups = vec![
+        group("Link::target", "absent", &all[..1]),
+        group("Link::target", &target_1.digest, &all[1..2]),
+        group("Link::target", &target_2.digest, &all[2..]),
+        group("old_builder", "absent", &absent_old),
+        group("old_builder", &old.digest, &all[1..3]),
+        group("relay", "absent", &all[..1]),
+        group("relay", &relay.digest, &all[1..]),
+    ];
+    assert_eq!(report.groups, groups);
+    // Each distinct text once with its tags, in the order of crate, item and digest: the relay has
+    // no sighting, and the account that moved between files has two digests and one text.
+    assert_eq!(names_here.text, names_moved.text);
+    assert_ne!(names_here.digest, names_moved.digest);
+    let mut texts = vec![
+        shown("companion_tauri", "Link::target", target_1, &all[1..2]),
+        shown("companion_tauri", "Link::target", target_2, &all[2..]),
+        shown("companion_tauri", "names_one", names_here, &all[3..6]),
+        shown("companion_tauri", "names_one", names_moved, &all[6..]),
+        shown("companion_tauri", "old_builder", old, &all[1..3]),
+        shown("companion_tauri", "relay", relay, &all[1..]),
+        shown("kr_other", "other_one", other, &all[1..]),
+    ];
+    texts.sort_by(|a, b| {
+        (&a.krate, &a.name, &a.source.digest).cmp(&(&b.krate, &b.name, &b.source.digest))
+    });
+    assert_eq!(report.texts, texts);
+    // The account's span is the first and last tag that have it, over both files.
+    let span = |krate: &str, name: &str, first: &str, last: &str| Span {
+        krate: krate.to_owned(),
+        name: name.to_owned(),
+        first: first.to_owned(),
+        last: last.to_owned(),
+    };
+    assert_eq!(
+        report.spans,
+        vec![
+            span("companion_tauri", "names_one", &all[3], &all[6]),
+            span("kr_other", "other_one", &all[1], &all[6]),
+        ]
+    );
+}
+
+#[test]
+fn the_snapshots_must_be_the_releases_origin_lists() {
+    let read = read(&repo(None, None));
+    let commit = |tag: &str| {
+        read.expected
+            .iter()
+            .find(|t| t.tag == tag)
+            .expect("a tag")
+            .commit
+            .clone()
+    };
+    let mut missing: Vec<Snapshot> = read.snapshots.iter().map(clone_snapshot).collect();
+    let left_out = missing.remove(3);
+    let report = audit_tags(&read.entry, &read.expected, &missing);
+    assert_eq!(
+        report.problems,
+        vec![said(&format!(
+            "{} at {} is expected and has no snapshot",
+            left_out.at.tag,
+            commit(&left_out.at.tag)
+        ))]
+    );
+    assert!(report.groups.is_empty() && report.texts.is_empty() && report.spans.is_empty());
+    let mut extra: Vec<Snapshot> = read.snapshots.iter().map(clone_snapshot).collect();
+    let mut stranger = clone_snapshot(&extra[0]);
+    stranger.at.tag = "packages/v0.0.1+000000000000".to_owned();
+    stranger.at.commit = "0".repeat(40);
+    extra.push(stranger);
+    let report = audit_tags(&read.entry, &read.expected, &extra);
+    assert_eq!(
+        report.problems,
+        vec![said(&format!(
+            "packages/v0.0.1+000000000000 at {} has a snapshot and is not expected",
+            "0".repeat(40)
+        ))]
+    );
+}
+
 #[test]
 fn the_count_the_oldest_tag_and_the_oldest_naming_release_are_each_held() {
-    let read = read(&repo(None));
+    let read = read(&repo(None, None));
     let oldest = tag_at(&read, 0);
     let second = tag_at(&read, 1);
     let report = report_with(&read, |entry, _| entry.range.tags = 6);
@@ -432,12 +555,23 @@ fn the_count_the_oldest_tag_and_the_oldest_naming_release_are_each_held() {
             )),
         ]
     );
+    // No release names one of the six.
+    let report = report_with(&read, |_, snapshots| {
+        for snapshot in snapshots.iter_mut() {
+            snapshot.names_a_method = Ok(false);
+        }
+    });
+    assert_eq!(
+        report.problems,
+        vec![said("no release's method.rs names one of the six")]
+    );
 }
 
 #[test]
-fn a_text_the_entry_does_not_list_a_failed_reading_and_an_unreadable_manifest_name_the_tag() {
-    let read = read(&repo(None));
+fn a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_the_tag() {
+    let read = read(&repo(None, None));
     let third = tag_at(&read, 2);
+    let target_2 = app_source("Link::target", "lib.rs", &target_text(2)).digest;
     let report = report_with(&read, |entry, _| {
         let mut senders = entry.senders.to_vec();
         let Evidence::Builds { items } = &senders[0].evidence else {
@@ -448,18 +582,16 @@ fn a_text_the_entry_does_not_list_a_failed_reading_and_an_unreadable_manifest_na
         senders[0].evidence = Evidence::Builds { items: leak(items) };
         entry.senders = leak(senders);
     });
-    assert_eq!(report.problems.len(), 1);
-    assert!(
-        report.problems[0].starts_with(&said(&format!(
-            "{third}: the item kr_client::Link::target has a text ("
-        ))),
-        "{:?}",
-        report.problems
+    assert_eq!(
+        report.problems,
+        vec![said(&format!(
+            "{third}: the item companion_tauri::Link::target has a text ({target_2}) that the entry does not list"
+        ))]
     );
     let report = report_with(&read, |_, snapshots| {
         let snapshot = snapshot_of(snapshots, &third);
         snapshot.items.insert(
-            ("kr_client".to_owned(), "Link::target".to_owned()),
+            ("companion_tauri".to_owned(), "Link::target".to_owned()),
             Lookup::Failed("e".to_owned()),
         );
         snapshot.sightings = Err("scan".to_owned());
@@ -467,33 +599,83 @@ fn a_text_the_entry_does_not_list_a_failed_reading_and_an_unreadable_manifest_na
             .krates
             .insert("kr_hook".to_owned(), Lookup::Failed("k".to_owned()));
     });
-    let problems: BTreeSet<String> = report.problems.into_iter().collect();
     assert_eq!(
-        problems,
-        BTreeSet::from([
-            said(&format!(
-                "{third}: the item kr_client::Link::target cannot be read: e"
-            )),
-            said(&format!("{third}: the scan failed: scan")),
+        report.problems,
+        vec![
             said(&format!("{third}: the crate kr_hook cannot be read: k")),
-        ])
+            said(&format!("{third}: the scan failed: scan")),
+            said(&format!(
+                "{third}: the item companion_tauri::Link::target cannot be read: e"
+            )),
+        ]
     );
-    // A manifest that names no package, in a release's tree.
-    let odd = repo(Some(2));
-    let (_, snapshots) = read_history(odd.work.path(), &read.entry).expect("history");
+    let report = report_with(&read, |_, snapshots| {
+        snapshot_of(snapshots, &third)
+            .items
+            .remove(&("companion_tauri".to_owned(), "relay".to_owned()));
+    });
+    assert_eq!(
+        report.problems,
+        vec![said(&format!(
+            "{third}: the snapshot has no reading of the item companion_tauri::relay"
+        ))]
+    );
+    // A tree with a manifest that names no package, read by the production reader and audited.
+    let odd = repo(Some(2), None);
+    let (expected, snapshots) = read_history(odd.work.path(), &read.entry).expect("history");
+    let report = audit_tags(&read.entry, &expected, &snapshots);
     let unreadable = snapshots
         .iter()
         .find(|snapshot| snapshot.sightings.is_err())
         .expect("a snapshot whose scan failed");
-    assert!(
-        matches!(unreadable.krates.get("kr_hook"), Some(Lookup::Failed(_))),
-        "a crate that no readable manifest names is unknown"
+    let (Some(Lookup::Failed(crate_error)), Err(scan_error)) =
+        (unreadable.krates.get("kr_hook"), &unreadable.sightings)
+    else {
+        panic!("a crate and a scan that failed");
+    };
+    assert!(crate_error.contains("unreadable") && scan_error.contains("could not read"));
+    assert_eq!(
+        report.problems,
+        vec![
+            said(&format!(
+                "{}: the crate kr_hook cannot be read: {crate_error}",
+                unreadable.at.tag
+            )),
+            said(&format!(
+                "{}: the scan failed: {scan_error}",
+                unreadable.at.tag
+            )),
+        ]
+    );
+}
+
+#[test]
+fn a_source_that_cannot_be_read_at_a_tag_is_a_text_of_its_own() {
+    // The crate that holds only an account has a file that does not parse at one release: the
+    // scan, which reads the files that name a sighting, goes on, and the account's text cannot be read.
+    let broken = repo(None, Some(2));
+    let read = read(&repo(None, None));
+    let (expected, snapshots) = read_history(broken.work.path(), &read.entry).expect("history");
+    let report = audit_tags(&read.entry, &expected, &snapshots);
+    let at = &snapshots[2];
+    let error = at
+        .source_errors
+        .get(&("kr_other".to_owned(), "other_one".to_owned()))
+        .expect("the account's source failed");
+    assert!(error.contains("broken.rs"), "{error}");
+    assert!(at.sightings.is_ok());
+    assert_eq!(
+        report.problems,
+        vec![said(&format!(
+            "{}: the source of kr_other::other_one cannot be read: {error}",
+            at.at.tag
+        ))]
     );
 }
 
 #[test]
 fn a_sighting_is_held_to_its_row_its_account_or_its_crate() {
-    let read = read(&repo(None));
+    let read = read(&repo(None, None));
     let fourth = tag_at(&read, 3);
     let sighting = |krate: &str, name: &str, kinds: &[SightKind]| Sighting {
         krate: krate.to_owned(),
@@ -512,19 +694,29 @@ fn a_sighting_is_held_to_its_row_its_account_or_its_crate() {
             "{fourth}: kr_hook::send is a sighting in a crate that a row says sends none"
         ))]
     );
-    // A4: no account, so each tag that has the later builder names it.
+    // A4: with no account, each tag names each sighting that only an account covers.
     let report = report_with(&read, |entry, _| entry.accounts = &[]);
-    assert_eq!(report.problems.len(), 4);
-    assert!(report.problems.iter().all(|problem| {
-        problem.contains("names_one ({Names}) is no item of a row and no account covers it")
-    }));
-    // A4: a sighting in a daemon crate at a tag is not read; an account lacking a kind is.
+    let mut texts = Vec::new();
+    for at in 1..7 {
+        let tag = tag_at(&read, at);
+        if at >= 3 {
+            texts.push(said(&format!(
+                "{tag}: the sighting companion_tauri::names_one ({{Names}}) is no item of a row and no account covers it"
+            )));
+        }
+        texts.push(said(&format!(
+            "{tag}: the sighting kr_other::other_one ({{Names}}) is no item of a row and no account covers it"
+        )));
+    }
+    assert_eq!(report.problems, texts);
+    // A4: a sighting in a daemon crate or a receiver crate at a tag is not read; an account that
+    // lacks a kind of its sighting is.
     let report = report_with(&read, |_, snapshots| {
         if let Ok(list) = &mut snapshot_of(snapshots, &fourth).sightings {
             list.push(sighting("kr_controller", "daemon", &[SightKind::Request]));
             list.push(sighting("kr_protocol", "receiver", &[SightKind::Request]));
             list.push(sighting(
-                "kr_client",
+                "companion_tauri",
                 "names_one",
                 &[SightKind::Names, SightKind::Request],
             ));
@@ -533,31 +725,32 @@ fn a_sighting_is_held_to_its_row_its_account_or_its_crate() {
     assert_eq!(
         report.problems,
         vec![said(&format!(
-            "{fourth}: the account for kr_client::names_one lacks the kind [Request] of its sighting ({{Names, Request}})"
+            "{fourth}: the account for companion_tauri::names_one lacks the kind [Request] of its sighting ({{Names, Request}})"
         ))]
     );
 }
 
 #[test]
 fn an_item_or_account_that_is_gone_now_and_no_tag_has_is_stale() {
-    let read = read(&repo(None));
+    let read = read(&repo(None, None));
+    let old = app_source("old_builder", "lib.rs", OLD_BUILDER).digest;
     // An item with now absent that no tag defines.
     let report = report_with(&read, |_, snapshots| {
         for snapshot in snapshots.iter_mut() {
             snapshot.items.insert(
-                ("kr_client".to_owned(), "old_builder".to_owned()),
+                ("companion_tauri".to_owned(), "old_builder".to_owned()),
                 Lookup::Absent,
             );
         }
     });
-    assert!(report.problems.contains(&said(
-        "the item kr_client::old_builder is absent now and no release defines it"
-    )));
-    assert!(
-        report
-            .problems
-            .iter()
-            .any(|p| p.contains("is stale: no release has it"))
+    assert_eq!(
+        report.problems,
+        vec![
+            said(&format!(
+                "the text {old} of companion_tauri::old_builder is stale: no release has it"
+            )),
+            said("the item companion_tauri::old_builder is absent now and no release defines it"),
+        ]
     );
     // An across digest that no tag has.
     let report = report_with(&read, |entry, _| {
@@ -578,10 +771,10 @@ fn an_item_or_account_that_is_gone_now_and_no_tag_has_is_stale() {
     assert_eq!(
         report.problems,
         vec![said(
-            "the text nowhere of kr_client::Link::target is stale: no release has it"
+            "the text nowhere of companion_tauri::Link::target is stale: no release has it"
         )]
     );
-    // An account that is gone now and that no tag has, and one with a digest that no tag has.
+    // An account that is gone now and that no tag has.
     let report = report_with(&read, |entry, snapshots| {
         let mut accounts = entry.accounts.to_vec();
         accounts[0].now = "absent";
@@ -590,9 +783,13 @@ fn an_item_or_account_that_is_gone_now_and_no_tag_has_is_stale() {
             snapshot.records.retain(|key, _| key.1 != "names_one");
         }
     });
-    assert!(report.problems.contains(&said(
-        "the account kr_client::names_one is absent now and no release has it"
-    )));
+    assert_eq!(
+        report.problems,
+        vec![said(
+            "the account companion_tauri::names_one is absent now and no release has it"
+        )]
+    );
+    // An account with a digest that no tag sights is not stale.
     let report = report_with(&read, |_, snapshots| {
         for snapshot in snapshots.iter_mut() {
             snapshot.records.retain(|key, _| key.1 != "names_one");
@@ -601,17 +798,14 @@ fn an_item_or_account_that_is_gone_now_and_no_tag_has_is_stale() {
             }
         }
     });
-    assert_eq!(
-        report.problems,
-        Vec::<String>::new(),
-        "an account with a digest is not stale for want of a sighting"
-    );
+    assert_eq!(report.problems, Vec::<String>::new());
 }
 
 #[test]
 fn a_daemon_item_and_a_daemon_account_cause_no_reading_and_no_text() {
-    let repo = repo(None);
+    let repo = repo(None, None);
     let read = read(&repo);
+    let baseline = audit_tags(&read.entry, &read.expected, &read.snapshots);
     let mut entry = read.entry.clone();
     let mut senders = entry.senders.to_vec();
     senders.push(Sender {
@@ -644,23 +838,14 @@ fn a_daemon_item_and_a_daemon_account_cause_no_reading_and_no_text() {
     }));
     let report = audit_tags(&entry, &expected, &snapshots);
     assert_eq!(report.problems, Vec::<String>::new());
-    assert!(
-        report
-            .spans
-            .iter()
-            .all(|span| span.krate != "kr_controller")
-    );
-    assert!(
-        report
-            .groups
-            .iter()
-            .all(|group| group.krate != "kr_controller")
-    );
+    assert_eq!(report.groups, baseline.groups);
+    assert_eq!(report.texts, baseline.texts);
+    assert_eq!(report.spans, baseline.spans);
 }
 
 #[test]
 fn the_releases_are_ordered_by_version_then_date_then_tag_and_only_below_the_level_are_read() {
-    let repo = repo(None);
+    let repo = repo(None, None);
     let level = "0.11".parse().expect("a level");
     let expected = expected_below(repo.work.path(), level).expect("the releases");
     assert_eq!(
@@ -684,7 +869,7 @@ fn the_releases_are_ordered_by_version_then_date_then_tag_and_only_below_the_lev
 
 #[test]
 fn an_origin_with_a_tag_the_checkout_lacks_is_refused_before_any_snapshot() {
-    let repo = repo(None);
+    let repo = repo(None, None);
     let read = read(&repo);
     let head = git(repo.work.path(), &["rev-parse", "HEAD~1"], None)
         .trim()
@@ -703,4 +888,26 @@ fn an_origin_with_a_tag_the_checkout_lacks_is_refused_before_any_snapshot() {
         .expect("an error before any snapshot");
     assert!(error.contains("packages/v0.3.5"), "{error}");
     let _ = &repo.origin;
+}
+
+#[test]
+fn the_snapshots_are_read_in_the_order_of_releases_and_hold_the_apps_crate() {
+    let read = read(&repo(None, None));
+    let order: Vec<_> = read
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.at.order())
+        .collect();
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
+    // The crate under `apps/` is read at each tag from the second.
+    assert_eq!(
+        read.snapshots[0].krates.get("companion_tauri"),
+        Some(&Lookup::Absent)
+    );
+    assert!(
+        read.snapshots[1..]
+            .iter()
+            .all(|snapshot| snapshot.krates.get("companion_tauri")
+                == Some(&Lookup::Found(String::new())))
+    );
 }
