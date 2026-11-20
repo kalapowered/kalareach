@@ -432,20 +432,53 @@ mod tests {
     fn what_the_pipes_hold_when_the_group_is_killed_and_reaped_is_kept() {
         let mut command = Command::new("bash");
         command
-            .args(["-c", "printf queued; sleep 300"])
+            .args(["-c", "printf queued; sleep 30"])
             .stdin(Stdio::null());
         Group::prepare(&mut command);
         command.stdout(Stdio::piped());
-        let mut child = command.spawn().expect("a command");
-        let mut pipes = Pipes::of(&mut child).expect("pipes");
-        let fd = pipes.stdout.fd.as_ref().expect("a pipe");
+        let mut leader = Leader(Some(command.spawn().expect("a command")));
+        let mut pipes = Pipes::of(leader.child()).expect("pipes");
+        // Waits for the bytes for 30 s at most, and ends the group whether or not they came: the
+        // case asserts after, and a failed assertion leaves nothing.
         let until = Instant::now() + Duration::from_secs(30);
-        while rustix::io::ioctl_fionread(fd).unwrap_or(0) == 0 {
-            assert!(Instant::now() < until, "the command wrote nothing");
+        let queued = loop {
+            let held = pipes
+                .stdout
+                .fd
+                .as_ref()
+                .is_some_and(|fd| rustix::io::ioctl_fionread(fd).unwrap_or(0) > 0);
+            if held || Instant::now() >= until {
+                break held;
+            }
             std::thread::sleep(Duration::from_millis(20));
-        }
-        Group::end(&mut child, &mut pipes, Duration::ZERO);
+        };
+        leader.end(&mut pipes);
+        assert!(queued, "the command wrote nothing");
         assert_eq!(pipes.into_captured().stdout, b"queued");
+    }
+
+    /// The leader of a group a case started: owned until it is ended. [`Leader::end`] ends the group
+    /// and reaps the leader, once; a leader that is dropped without that is ended, so that a case
+    /// that fails before it ends the group leaves none. The leader is unreaped until its last
+    /// signal, so the number is its own.
+    struct Leader(Option<Child>);
+
+    impl Leader {
+        fn child(&mut self) -> &mut Child {
+            self.0.as_mut().expect("the leader is owned")
+        }
+
+        fn end(&mut self, pipes: &mut Pipes) {
+            if let Some(mut child) = self.0.take() {
+                Group::end(&mut child, pipes, Duration::ZERO);
+            }
+        }
+    }
+
+    impl Drop for Leader {
+        fn drop(&mut self) {
+            self.end(&mut Pipes::none());
+        }
     }
 
     /// The pipes of a pass: standard output is `reader`, standard error is not captured.
