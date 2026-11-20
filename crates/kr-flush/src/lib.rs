@@ -455,6 +455,9 @@ fn flush_held_through(
     self::windows::reopen_directory(directory, right)?.sync_all()
 }
 
+#[cfg(windows)]
+pub use self::windows::native_name;
+
 /// The two calls this crate makes that have no safe form: opening a held directory again, and a
 /// rename that does not replace.
 #[cfg(windows)]
@@ -574,7 +577,7 @@ mod windows {
     ///
     /// Returns an error of kind [`std::io::ErrorKind::InvalidInput`] for a name that holds a NUL
     /// or is empty.
-    pub(super) fn native_name(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    pub fn native_name(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
         use std::os::windows::ffi::OsStrExt as _;
 
         /// The length from which the standard library prefixes a name: some calls stop at 248
