@@ -2,12 +2,12 @@
 //! folder holds.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use quote::ToTokens as _;
 
 use super::repository;
-use super::walker::{Depth, Lookup, SightKind, Tree};
+use super::walker::{Depth, Lookup, SightKind, Tree, normalised};
 
 fn manifest(name: &str) -> String {
     format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n")
@@ -574,6 +574,42 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
         scan(&folder.path().join("crates/kr-sender/../..")),
         expected
     );
+    // And through a relative root that steps up past every folder of the working directory, as a
+    // release tree named by a relative path is.
+    let here = std::env::current_dir().expect("a working directory");
+    let up: PathBuf = here
+        .components()
+        .filter(|part| matches!(part, Component::Normal(_)))
+        .map(|_| "..")
+        .collect();
+    let absolute = folder.path().to_owned();
+    let relative = up.join(absolute.strip_prefix("/").expect("an absolute path"));
+    assert!(
+        relative.starts_with("../.."),
+        "{} does not step up twice",
+        relative.display()
+    );
+    assert_eq!(scan(&relative), expected);
+}
+
+#[test]
+fn a_path_keeps_every_step_up_that_nothing_before_it_can_take() {
+    let table = [
+        ("", ""),
+        ("../..", "../.."),
+        ("../../release-tree", "../../release-tree"),
+        ("a/../../x", "../x"),
+        ("./a/./b/..", "a"),
+        ("/a/b/../c", "/a/c"),
+        ("/a/../..", "/"),
+        ("/../x", "/x"),
+    ];
+    for (given, expected) in table {
+        assert_eq!(normalised(Path::new(given)), Path::new(expected), "{given}");
+    }
+    let missing = Path::new("/this/folder/does/not/exist-r5");
+    let error = Tree::at(missing).err().expect("a root that is not there");
+    assert!(error.contains("exist-r5"), "{error}");
 }
 
 #[test]
