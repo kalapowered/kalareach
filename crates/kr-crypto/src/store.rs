@@ -2984,4 +2984,108 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
         }
     }
+
+    /// The switch a run sets when it is prepared for this machine's own credential store to be
+    /// written to and cleared again, as the collection key case of `kr-client` takes it.
+    #[cfg(windows)]
+    const PLATFORM_STORE_SWITCH: &str = "KR_TEST_PLATFORM_SECRET_STORE";
+
+    /// Takes the item the case wrote away again, including when the case panicked.
+    ///
+    /// An attempt rather than a guarantee: a destructor that runs while the thread is unwinding
+    /// cannot report a store that refused the deletion, and a process that was killed runs no
+    /// destructor at all, which is why the case prints the item's service and user first. The
+    /// successful path removes the item itself and checks that it is gone.
+    #[cfg(windows)]
+    struct Removes<'a> {
+        store: &'a PlatformStore,
+        name: &'a SecretName,
+    }
+
+    #[cfg(windows)]
+    impl Drop for Removes<'_> {
+        fn drop(&mut self) {
+            // Nothing useful can be done with a failure here: the thread may already be unwinding,
+            // and panicking inside a destructor during a panic ends the process.
+            let _ = self.store.delete(self.name);
+        }
+    }
+
+    /// The recovery seed's item in the Credential Manager is stored with the Local persistence
+    /// class, so that it stays on this computer and does not roam with a roaming profile.
+    ///
+    /// It is the half of the row that only a real Credential Manager can answer, so an ordinary
+    /// run leaves it out as ignored. A run that includes it with `--ignored` also sets
+    /// `KR_TEST_PLATFORM_SECRET_STORE=1` to say it is prepared for this machine's own store to be
+    /// written to; without the switch the case fails with that reason before it writes anything. It
+    /// writes one item under a service drawn for this run alone, a name with a space in it as the
+    /// companion's own has, holds a made-up seed and never a person's, and removes the item again
+    /// on the way out. The item's service and user go to the output before the write, so that a
+    /// run that was killed can be cleaned up by hand.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "writes one item to this machine's own credential store and removes it again; it runs with --ignored and KR_TEST_PLATFORM_SECRET_STORE=1 where a run is prepared for that, as continuous integration's credential store steps do"]
+    fn the_recovery_seed_is_kept_in_the_credential_manager_with_the_local_class() {
+        assert!(
+            std::env::var(PLATFORM_STORE_SWITCH).is_ok_and(|value| value == "1"),
+            "this test writes one item to this machine's own credential store and removes it \
+             again, so it runs only where {PLATFORM_STORE_SWITCH}=1 says the run is prepared for that"
+        );
+
+        let mut bytes = [0u8; 8];
+        crate::random_bytes(&mut bytes).expect("a name");
+        let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let service = format!("KalaReach recovery test {suffix}");
+        let name = SecretName::recovery_seed("owner").expect("a name");
+        println!(
+            "the item under test: service {service:?}, user {:?}",
+            name.as_str()
+        );
+
+        let store = PlatformStore::open(service.as_str())
+            .expect("the Credential Manager this run promised");
+        // Installed before the write, so that a failure anywhere after it still takes the item away.
+        let _removes = Removes {
+            store: &store,
+            name: &name,
+        };
+        assert!(
+            store.get(&name).expect("the store is read").is_none(),
+            "the item is absent before the write"
+        );
+
+        let seed = crate::kdf::RecoverySeed::generate().expect("a made-up seed");
+        store_recovery_seed(&store, "owner", &seed).expect("written");
+
+        // A second handle reads the item out of the store, not out of anything the first holds.
+        let second = PlatformStore::open(service.as_str()).expect("the same store");
+        let read = load_recovery_seed(&second, "owner")
+            .expect("read back")
+            .expect("the seed is there");
+        assert_eq!(read.expose(), seed.expose());
+
+        // The store's own attributes: `persistence` is the Credential Manager's marker, which a
+        // stand-in lacks, so its presence shows that the native store took the call.
+        let attributes = store
+            .entry(&name)
+            .expect("an entry")
+            .inner
+            .get_attributes()
+            .expect("the item's attributes");
+        println!(
+            "the item's target: {}",
+            attributes.get("target_name").map_or("", String::as_str)
+        );
+        assert_eq!(
+            attributes.get("persistence").map(String::as_str),
+            Some("Local"),
+            "the seed's item takes the Local class: {attributes:?}"
+        );
+
+        store.delete(&name).expect("taken away");
+        assert!(
+            store.get(&name).expect("the store is read").is_none(),
+            "the item is absent after it is taken away"
+        );
+    }
 }
