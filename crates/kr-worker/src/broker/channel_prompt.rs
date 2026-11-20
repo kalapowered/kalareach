@@ -29,7 +29,7 @@ pub const CHANNEL_EVENT_WIRE_NAME: &str = "notifications/claude/channel";
 
 /// What a sender is told when no sender can be named from the facts the host verified.
 pub const NO_SENDER: &str = "This message was not sent. On this channel, only this computer's own \
-     account or a paired device can send a message.";
+     account or a paired device that holds a grant can send a message.";
 
 /// What a sender is told when the text looks like an answer to an approval.
 pub const LOOKS_LIKE_AN_ANSWER: &str = "This looks like an answer to an approval, so it was not \
