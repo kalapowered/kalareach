@@ -17,9 +17,11 @@
  *   draft first, the store keeps this window's text as a separate draft and leaves the other
  *   window's alone. Neither text is lost, and a person chooses between them in the list of kept
  *   drafts. A copy is never put in a composer on its own.
- * - **A draft that was sent is removed only once the host took it.** A prompt sent from a draft
- *   takes the stored draft with it, as it stood when the person pressed Send, and what is typed
- *   after that is a draft of its own. When the host took the prompt, the stored draft is removed.
+ * - **A draft that was sent is removed only once the host took it, or once its text is kept in the
+ *   channel store.** A prompt sent from a draft takes the stored draft with it, as it stood when
+ *   the person pressed Send, and what is typed after that is a draft of its own. When the host took
+ *   the prompt, the stored draft is removed; so it is when a message to a channel that confirms
+ *   nothing was handed over and the device's store of channel messages kept its text whole.
  *   When the host refused it or its outcome is unknown, the book gives the text back to the
  *   composer if the composer is empty, and otherwise keeps it as a draft apart, so that neither
  *   the text that was sent nor the text written since is replaced by the other. The book does this
@@ -1224,6 +1226,19 @@ export class DraftBook {
    */
   endSend(
     token: Pick<SendToken, 'key'>,
+    outcome: 'handed_over',
+    localId: string,
+    ended: ((storedDraftId: string | null) => void) | undefined,
+    keep: (held: HeldPrompt) => Promise<boolean>
+  ): void
+  endSend(
+    token: Pick<SendToken, 'key'>,
+    outcome: Exclude<SendOutcome, 'handed_over'>,
+    localId?: string,
+    ended?: (storedDraftId: string | null) => void
+  ): void
+  endSend(
+    token: Pick<SendToken, 'key'>,
     outcome: SendOutcome,
     localId?: string,
     ended?: (storedDraftId: string | null) => void,
@@ -1357,20 +1372,23 @@ export class DraftBook {
       const composer = this.#drafts.find((draft) => draft.stored?.id === ref.id)
       const key = composer?.draftId ?? `held-${ref.id}`
       await this.#enqueueAwait(key, async () => {
+        let changedSince = false
         try {
           await this.#port.deviceDraftDiscard({ id: ref.id, expectedRevision: ref.revision })
         } catch (failure) {
           // A draft changed since is the person's now, and stays.
-          if (failureCode(failure) !== 'DRAFT_CONFLICT') {
-            await this.#port.deviceDraftMarkRemoval({ id: ref.id, expectedRevision: ref.revision })
-          }
+          if (failureCode(failure) === 'DRAFT_CONFLICT') changedSince = true
+          else await this.#port.deviceDraftMarkRemoval({ id: ref.id, expectedRevision: ref.revision })
         }
         this.#moves += 1
-        const listed = this.#others.filter((other) => other.id !== ref.id)
+        // Only the version that was retired leaves the list; a newer one of the same draft stays.
+        const listed = this.#others.filter((other) => other.id !== ref.id || other.revision !== ref.revision)
         if (listed.length !== this.#others.length) {
           this.#others = listed
           this.#changed()
         }
+        // What this window lists of a draft that changed since may be older than the store's: read again.
+        if (changedSince) this.#hold(this.reload())
         const mine = composer === undefined ? undefined : this.#find(composer.draftId)
         if (
           mine?.stored?.id === ref.id &&

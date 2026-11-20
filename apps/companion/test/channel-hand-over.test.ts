@@ -307,6 +307,48 @@ describe('a message handed over to the channel store', () => {
     expect(book.draft(MAIN).text).toBe('')
   })
 
+  it('leaves a newer revision of a draft listed when its retirement conflicts, and shows the store’s', async () => {
+    const of = world()
+    const book = await opened(of)
+    type(book, MAIN, 'what the composer holds')
+    await book.settled()
+    const save = (id: string | null, expectedRevision: string | null, text: string) =>
+      of.drafts.save({
+        id,
+        expectedRevision,
+        sessionId: MAIN,
+        applicationInstanceId: null,
+        agentBindingRevision: null,
+        state: 'open',
+        text,
+        attachments: []
+      }).draft
+    const apart = save(null, null, 'the draft that was held')
+    await book.reload()
+    expect(book.snapshot().kept.map((each) => each.text)).toEqual(['the draft that was held'])
+    // The person edits it in another window; the retirement names the version that was held.
+    const newer = save(apart.id, apart.revision, 'edited since')
+    await book.retireHeld([{ id: apart.id, revision: apart.revision }])
+    await book.settled()
+    expect(of.drafts.all().map((each) => each.text)).toContain('edited since')
+    expect(book.snapshot().kept.map((each) => each.text)).toEqual(['edited since'])
+    expect(book.snapshot().kept[0]?.revision).toBe(newer.revision)
+    // The exact version that was held goes, and nothing else.
+    await book.retireHeld([{ id: newer.id, revision: newer.revision }])
+    await book.settled()
+    expect(book.snapshot().kept).toEqual([])
+  })
+
+  it('names the keep and the submission in the type of a handed-over end', () => {
+    const wrong = (book: DraftBook, token: Parameters<DraftBook['endSend']>[0]) => {
+      // @ts-expect-error a handed_over end names its submission and its keep
+      book.endSend(token, 'handed_over')
+      // @ts-expect-error the keep is required
+      book.endSend(token, 'handed_over', LOCAL, undefined)
+    }
+    expect(typeof wrong).toBe('function')
+  })
+
   it('exact() is true only when the press stored the sent text', async () => {
     const of = world()
     const { token } = await pressed(of)
