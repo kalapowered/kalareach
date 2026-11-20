@@ -19,6 +19,7 @@ use std::time::{Instant, SystemTime};
 
 use serde::Serialize;
 
+use crate::coverage;
 use crate::evidence::{self, Figure, KnownDifference};
 use crate::id::{Family, Identifier};
 use crate::identity::{self, Commit, PackageVersion, System, TerminalProfile, Toolchain};
@@ -32,7 +33,7 @@ use crate::plan_file::{Plan, Values};
 use crate::run::{self, Blocked, Executed};
 use crate::runner_copy;
 use crate::scratch::{self, Scratch};
-use crate::workspace::{TargetId, TargetKind};
+use crate::workspace::{Package, TargetId, TargetKind};
 
 /// The result's schema identifier.
 pub const SCHEMA: &str = "kalareach.conformance/1";
@@ -711,6 +712,7 @@ pub fn assemble(
     } = gathered;
     problems.extend(unowned_lane_cases(options, map, executed));
     let resolver = Resolver::new(options, groups, map, executed, &known);
+    problems.extend(resolver.ran_without_cover());
     // The identifiers of each test that recorded a known difference.
     let mut recorded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut identifiers = BTreeMap::new();
@@ -991,8 +993,9 @@ struct Resolver<'a> {
     executed: &'a [Executed],
     /// For each target, the steps whose binaries of it ran, with those binaries.
     ran: BTreeMap<&'a TargetId, Vec<(usize, &'a crate::libtest::Binary)>>,
-    /// Every target some step built to test.
-    built: BTreeSet<&'a TargetId>,
+    /// For each step, the targets its command selects in its workspace: none for a step that does
+    /// not read the output of `cargo test`.
+    covered: Vec<BTreeSet<TargetId>>,
     /// The known differences each test recorded, by the test's package, target and name.
     known: BTreeMap<(&'a str, &'a str, &'a str), Vec<&'a KnownDifference>>,
 }
@@ -1013,14 +1016,12 @@ impl<'a> Resolver<'a> {
                 .push(difference);
         }
         let mut ran: BTreeMap<&TargetId, Vec<(usize, &crate::libtest::Binary)>> = BTreeMap::new();
-        let mut built = BTreeSet::new();
         for (index, step) in executed.iter().enumerate() {
             for (target, binary) in &step.binaries {
                 if let Some(target) = target {
                     ran.entry(target).or_default().push((index, binary));
                 }
             }
-            built.extend(step.built.iter());
         }
         Self {
             options,
@@ -1028,7 +1029,10 @@ impl<'a> Resolver<'a> {
             map,
             executed,
             ran,
-            built,
+            covered: executed
+                .iter()
+                .map(|done| covered_by(&done.step, &map.packages))
+                .collect(),
             known: recorded,
         }
     }
@@ -1037,15 +1041,7 @@ impl<'a> Resolver<'a> {
     fn selected(&self, place: &Place) -> bool {
         match place {
             Place::Rust { target, .. } | Place::RustModule { target, .. } => {
-                self.ran.contains_key(target)
-                    || self.built.contains(target)
-                    // A step that was not run because a set-up step failed still holds its targets
-                    // in the selection: their tests are listed, not run.
-                    || self.executed.iter().any(|done| {
-                        done.blocked.is_some()
-                            && matches!(done.step.reading, plan::Reading::Cargo)
-                            && command_holds(&done.step.command, target)
-                    })
+                self.covered.iter().any(|targets| targets.contains(target))
             }
             Place::TypeScript { package, .. } => {
                 self.options.plan.selects_package(self.groups, package)
@@ -1416,17 +1412,93 @@ impl<'a> Resolver<'a> {
             outcome,
             reason,
             command: Some(self.rust_command(target, name, &runs)),
-            needs: self.needs(&runs),
+            needs: self.needs(target, &runs),
             runs,
             known_differences: known,
         }
     }
 
-    /// The variables the step its command is taken from reads (see [`reproducing`]).
-    fn needs(&self, runs: &[RunRecord]) -> Vec<String> {
+    /// The step a record's command is taken from: the one that ran the test (see [`reproducing`]),
+    /// and where none did, the first step that selects its target.
+    fn reproducing_step<'s>(
+        &'s self,
+        target: &'s TargetId,
+        runs: &[RunRecord],
+    ) -> Option<&'s Executed> {
         reproducing(runs)
-            .map(|run| self.executed[run.step - 1].step.needs.clone())
-            .unwrap_or_default()
+            .map(|run| &self.executed[run.step - 1])
+            .or_else(|| self.covering(target).next())
+    }
+
+    /// The steps whose command selects `target`, in plan order.
+    fn covering<'s>(&'s self, target: &'s TargetId) -> impl Iterator<Item = &'s Executed> + 's {
+        self.executed
+            .iter()
+            .zip(&self.covered)
+            .filter(move |(_, targets)| targets.contains(target))
+            .map(|(done, _)| done)
+    }
+
+    /// The variables the step its command is taken from reads, and those of its own `env` that hold
+    /// a placeholder, whose values that step's set-up gave them (see [`Self::reproducing_step`]).
+    fn needs(&self, target: &TargetId, runs: &[RunRecord]) -> Vec<String> {
+        let Some(done) = self.reproducing_step(target, runs) else {
+            return Vec::new();
+        };
+        let mut needs = done.step.needs.clone();
+        for variable in &done.step.placeholder_env {
+            if !needs.contains(variable) {
+                needs.push(variable.clone());
+            }
+        }
+        needs
+    }
+
+    /// The targets a step built or ran that no step of the selection covers, each as a problem of the
+    /// result: the selection rule and Cargo disagree about them, and the result says so, where a
+    /// target left out of the selection would leave its results out without a word.
+    fn ran_without_cover(&self) -> Vec<String> {
+        let mut found: BTreeMap<&TargetId, usize> = BTreeMap::new();
+        for (index, done) in self.executed.iter().enumerate() {
+            let targets = done
+                .binaries
+                .iter()
+                .filter_map(|(target, _)| target.as_ref())
+                .chain(&done.built);
+            for target in targets {
+                if !self.covered.iter().any(|set| set.contains(target)) {
+                    found.entry(target).or_insert(index + 1);
+                }
+            }
+        }
+        found
+            .into_iter()
+            .map(|(target, step)| {
+                format!(
+                    "step {step} built or ran {target}, but no step of this selection covers it: \
+                     the selection rule and Cargo disagree"
+                )
+            })
+            .collect()
+    }
+
+    /// What `target` reads when no step of the selection covers it: the workspace holds no step of
+    /// the selection, or it holds one and none selects this target.
+    fn uncovered(&self, target: &TargetId) -> &'static str {
+        let workspace = self
+            .map
+            .packages
+            .iter()
+            .find(|package| package.name == target.package)
+            .map_or(".", |package| package.workspace.as_str());
+        if self.executed.iter().any(|done| {
+            done.step.reading == plan::Reading::Cargo
+                && workspace_directory(&done.step.directory) == workspace
+        }) {
+            "no step of this selection covers this target"
+        } else {
+            "no step of this selection covers this workspace"
+        }
     }
 
     fn unrun_reason(&self, target: &TargetId) -> String {
@@ -1440,37 +1512,37 @@ impl<'a> Resolver<'a> {
             .find(|step| step.error.is_some() && step.built.contains(target))
         {
             return format!(
-                "`{}` built this target, and no run of it can be read from that step ({})",
-                stopped.step.line(),
+                "{} built this target, and no run of it can be read from that step ({})",
+                named(&stopped.step),
                 stopped.error.clone().unwrap_or_default()
             );
         }
-        if let Some(failed) = self.executed.iter().find(|step| {
-            step.error.is_some()
-                && step.built.is_empty()
-                && matches!(step.step.reading, plan::Reading::Cargo)
-                && command_holds(&step.step.command, target)
-        }) {
+        let covering: Vec<&Executed> = self.covering(target).collect();
+        if let Some(failed) = covering
+            .iter()
+            .find(|step| step.error.is_some() && step.built.is_empty())
+        {
             let why = failed.error.clone().unwrap_or_default();
+            let step = named(&failed.step);
             return if failed.blocked.is_some() {
-                format!(
-                    "no step that ran listed this target; `{}` was {why}",
-                    failed.step.line()
-                )
+                format!("no step that ran listed this target; {step} was {why}")
             } else {
-                format!(
-                    "no step that ran listed this target; `{}` did not build ({why})",
-                    failed.step.line()
-                )
+                format!("no step that ran listed this target; {step} did not build ({why})")
             };
+        }
+        if let Some(step) = covering.first() {
+            return format!(
+                "no step that ran listed this target, though {} selects it",
+                named(&step.step)
+            );
         }
         // Only the groups that run Rust targets say why a Rust target was not run.
         let absent = plan.unrun_rust_reason(self.options.platform, self.groups);
-        let general = plan.unrun.rust.get(self.options.platform);
+        let covers = self.uncovered(target);
         let base = match (target.kind, absent) {
-            (TargetKind::Bench, _) => format!("{}, and {general}", plan.unrun.bench),
-            (_, Some(reason)) => format!("{general}; {reason}"),
-            _ => general.to_owned(),
+            (TargetKind::Bench, _) => format!("{}, and {covers}", plan.unrun.bench),
+            (_, Some(reason)) => format!("{covers}; {reason}"),
+            _ => covers.to_owned(),
         };
         match self.options.part {
             Some((number, parts)) => format!(
@@ -1480,15 +1552,33 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// The command that reproduces a Rust test: the step that ran it, narrowed to its package,
-    /// its target and the test, or the ordinary `cargo test` of it where no step did.
+    /// The command that reproduces a Rust test: the step that ran it, or the first that selects its
+    /// target where none did, narrowed to the test's package, its target and the test. It runs in the
+    /// directory of the package's workspace, with the variables the step sets that hold no
+    /// placeholder, the step's features and profile, and the options the step passes the test binary.
     fn rust_command(&self, target: &TargetId, name: &str, runs: &[RunRecord]) -> String {
-        let step = reproducing(runs).map(|run| &self.executed[run.step - 1].step);
+        let step = self.reproducing_step(target, runs).map(|done| &done.step);
+        let mut line = String::new();
+        if let Some(directory) = self
+            .map
+            .packages
+            .iter()
+            .find(|package| package.name == target.package)
+            .map(|package| package.workspace.as_str())
+            .filter(|directory| !matches!(*directory, "" | "."))
+        {
+            line.push_str(&format!("cd {} && ", plan::quote(directory)));
+        }
         let mut words = vec!["cargo".to_owned(), "test".to_owned(), "--locked".to_owned()];
         let mut test_arguments: Vec<String> = Vec::new();
         if let Some(step) = step {
-            if step.command.iter().any(|word| word == "--release") {
-                words.push("--release".to_owned());
+            for (variable, value) in &step.env {
+                if !step.placeholder_env.contains(variable) {
+                    line.push_str(&format!("{variable}={} ", plan::quote(value)));
+                }
+            }
+            if let Ok(selection) = coverage::parse(&step.command) {
+                words.extend(selection.carried().iter().cloned());
             }
             let mut after = step
                 .command
@@ -1520,11 +1610,14 @@ impl<'a> Resolver<'a> {
         words.extend(test_arguments);
         words.push("--exact".to_owned());
         words.push(name.to_owned());
-        words
-            .iter()
-            .map(|word| plan::quote(word))
-            .collect::<Vec<_>>()
-            .join(" ")
+        line.push_str(
+            &words
+                .iter()
+                .map(|word| plan::quote(word))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        line
     }
 
     /// The records of one keyed TypeScript test: one for each test the run reported at its
@@ -1798,32 +1891,36 @@ fn case_names(file: &str, cases: &[crate::vitest::Case]) -> Vec<String> {
         .collect()
 }
 
-/// Whether a Cargo step's command could have held a target, so that a step that failed before it
-/// listed its targets is named as the reason for the targets it would have run and no others: a
-/// run of the workspace holds every target, one that names packages holds their targets, and one
-/// that names integration tests holds those.
-fn command_holds(command: &[String], target: &TargetId) -> bool {
-    let words: Vec<&str> = command
+/// The directory of a step's workspace as a package names it: `.` for the repository's root.
+fn workspace_directory(directory: &str) -> &str {
+    if directory.is_empty() { "." } else { directory }
+}
+
+/// The targets that `step`'s command selects in the workspace it runs in: none for a step that does
+/// not read the output of `cargo test`, or whose command the loader would have refused.
+fn covered_by(step: &plan::Step, packages: &[Package]) -> BTreeSet<TargetId> {
+    if step.reading != plan::Reading::Cargo {
+        return BTreeSet::new();
+    }
+    let Ok(selection) = coverage::parse(&step.command) else {
+        return BTreeSet::new();
+    };
+    let here = workspace_directory(&step.directory);
+    let members: Vec<&Package> = packages
         .iter()
-        .map(String::as_str)
-        .take_while(|word| *word != "--")
+        .filter(|package| package.workspace == here)
         .collect();
-    if words.contains(&"--workspace") {
-        return true;
+    selection.covers(&members)
+}
+
+/// A step as a reason names it: its command, and the directory it runs in when that is not the
+/// repository's root.
+fn named(step: &plan::Step) -> String {
+    if step.directory.is_empty() {
+        format!("`{}`", step.line())
+    } else {
+        format!("`cd {} && {}`", plan::quote(&step.directory), step.line())
     }
-    let mut packages: Vec<&str> = Vec::new();
-    let mut tests: Vec<&str> = Vec::new();
-    for pair in words.windows(2) {
-        match pair[0] {
-            "-p" | "--package" => packages.push(pair[1]),
-            "--test" => tests.push(pair[1]),
-            _ => {}
-        }
-    }
-    (packages.is_empty() || packages.contains(&target.package.as_str()))
-        && (tests.is_empty()
-            || !matches!(target.kind, TargetKind::Test)
-            || tests.contains(&target.name.as_str()))
 }
 
 /// Combines a test's runs into one outcome and reason, or `None` when nothing ran it.
@@ -2031,39 +2128,6 @@ mod tests {
              damage seen, 0 failed otherwise"
         );
         assert_eq!(summary(&[], &[]).failure_line(), None);
-    }
-
-    #[test]
-    fn a_step_that_failed_before_listing_is_named_only_for_the_targets_it_would_have_run() {
-        let target = |package: &str, kind: TargetKind, name: &str| TargetId {
-            package: package.to_owned(),
-            kind,
-            name: name.to_owned(),
-        };
-        let words = |line: &str| -> Vec<String> { line.split(' ').map(str::to_owned).collect() };
-        let transport =
-            words("cargo test --locked --release -p kr-transport --test perf -- --nocapture");
-        assert!(command_holds(
-            &transport,
-            &target("kr-transport", TargetKind::Test, "perf")
-        ));
-        assert!(!command_holds(
-            &transport,
-            &target("kr-transport", TargetKind::Test, "other")
-        ));
-        assert!(!command_holds(
-            &transport,
-            &target("kr-worker", TargetKind::Test, "perf")
-        ));
-        assert!(command_holds(
-            &transport,
-            &target("kr-transport", TargetKind::Lib, "kr_transport")
-        ));
-        let workspace = words("cargo test --locked --workspace --no-fail-fast");
-        assert!(command_holds(
-            &workspace,
-            &target("kr-worker", TargetKind::Lib, "kr_worker")
-        ));
     }
 
     #[test]
