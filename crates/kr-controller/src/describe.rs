@@ -1130,12 +1130,14 @@ impl crate::service::Controller {
     /// reaches the whole of it when `reaches_the_session` ([`history_reaches_the_session`]), under
     /// the environment's privacy state as it stands now.
     ///
-    /// What a model wrote is released only while the privacy state it was read under holds: the
+    /// What a model wrote is released only while the privacy state it was read under holds. The
     /// owner's door writes the answer under that state
-    /// ([`crate::attention::AttentionModule::write_released`]), and a paired device's door decides
-    /// it now ([`crate::attention::AttentionModule::settled`]) and holds that state until the
-    /// frame is written (`RemoteConnection::write_answer`). An answer that is held while privacy
-    /// mode is enabled is written without it.
+    /// ([`crate::attention::AttentionModule::write_released`]). A paired device's door decides it
+    /// now ([`crate::attention::AttentionModule::settled`]), and its writer
+    /// (`RemoteConnection::write_answer`) holds the privacy state during each write attempt,
+    /// letting the guard go before it waits for the stream. When the state has moved before
+    /// transmission may have begun, the writer substitutes the answer without that text; once an
+    /// attempt has started, a state that moves can end the connection instead.
     ///
     /// # Errors
     ///
