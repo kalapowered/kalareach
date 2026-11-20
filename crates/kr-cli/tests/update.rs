@@ -5852,6 +5852,142 @@ async fn a_rollback_that_a_store_refuses_after_a_journal_was_brought_back_says_s
     );
 }
 
+/// KR-REQ-12.06, KR-REQ-26.10: a rollback that cannot bring the journal of a second environment back,
+/// after it brought the first one's back, is refused in the words of that failure and says what it
+/// had already done, and switches nothing. The first journal stays at version 5 with the revision its
+/// draft was written under beside it, the second stays at version 6 as it was, and the draft of each
+/// is kept.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_that_cannot_bring_back_the_journal_of_a_second_environment_says_what_it_had_brought_back()
+ {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+        "transfers",
+        1,
+        5,
+    ));
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    // A rollback takes the environments in the order of their identifiers written out, so the one
+    // that sorts last is the one whose journal fails to come back, after the other's has.
+    let mut idles = [Idle::new(&host.store), Idle::new(&host.store)];
+    idles.sort_by_key(Idle::environment_id);
+    let [first, second] = &idles;
+    let journal_of =
+        |idle: &Idle| kr_transfer::staging::StagingArea::store_path(&idle.temp.environment());
+    let (first_journal, second_journal) = (journal_of(first), journal_of(second));
+    a_journal_at_version_six(&first_journal, first.temp.environment_id());
+    a_journal_at_version_six(&second_journal, second.temp.environment_id());
+
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The store of binding revisions of the second environment is damaged, so its journal's
+    // revisions cannot be kept and the step from version 6 fails closed.
+    std::fs::write(
+        second_journal.with_file_name(kr_transfer::revisions::FILE_NAME),
+        b"these bytes are not a database, and are long enough to be read as a damaged one",
+    )
+    .expect("damages the store of binding revisions");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "the transfers journal of environment {} at ",
+            second.environment_id()
+        )) && message.contains(&format!(
+            " could not be brought back to schema version 5, which {} reads, so the switch was \
+             not made: ",
+            one.name().as_str()
+        )),
+        "the refusal names the second environment's journal: {said}"
+    );
+    assert!(
+        message.contains(
+            "the binding revisions of its drafts could not be kept in draft-revisions.sqlite3"
+        ),
+        "and the reason the journal could not be brought back: {said}"
+    );
+    assert!(
+        message.contains(&format!(
+            "The rollback had already brought back the transfers journal of environment {} from \
+             schema version 6 to 5; this release reads those journals as they are now",
+            first.environment_id()
+        )),
+        "and what the rollback had already done: {said}"
+    );
+    assert!(
+        !message.contains(&format!(
+            "brought back the transfers journal of environment {}",
+            second.environment_id()
+        )),
+        "and does not say it brought the second back: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        journal_reads(
+            &first_journal,
+            "SELECT CAST(version AS TEXT) FROM schema_version"
+        ),
+        "5",
+        "the first journal stays brought back"
+    );
+    assert_eq!(
+        revision_of_the_draft(&first_journal, first.temp.environment_id()),
+        Some(7),
+        "with the revision its draft was written under beside it"
+    );
+    assert_eq!(
+        journal_reads(
+            &second_journal,
+            "SELECT CAST(version AS TEXT) FROM schema_version"
+        ),
+        "6",
+        "the second journal is at the version it was"
+    );
+    assert_eq!(
+        journal_reads(
+            &second_journal,
+            "SELECT CAST(agent_binding_revision AS TEXT) FROM drafts"
+        ),
+        "7",
+        "and still holds the revision in its column"
+    );
+    for journal in [&first_journal, &second_journal] {
+        assert_eq!(
+            journal_reads(journal, "SELECT text FROM drafts"),
+            "a draft",
+            "the draft of each environment is kept"
+        );
+    }
+}
+
 /// KR-REQ-12.06: a rollback to a release that lists no store of binding revisions and reads the
 /// transfers journal below version 6 says, in the lines and in the JSON, that the release records a
 /// prompt that names a draft under the revision in force at the prompt and that no draft was ended; a
