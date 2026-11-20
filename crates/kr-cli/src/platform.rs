@@ -392,10 +392,12 @@ mod protection {
         }
     }
 
+    /// The token handle that the protection opened first. A call before that open has no handle to
+    /// use, and the system's own answer for that is the invalid handle.
     fn own_token(held: &Option<OwnedHandle>) -> io::Result<HANDLE> {
         held.as_ref()
             .map(|token| token.as_raw_handle().cast())
-            .ok_or_else(|| io::Error::other("the token was not opened"))
+            .ok_or_else(|| io::Error::from_raw_os_error(6))
     }
 
     /// Ends the process at once on an unhandled exception that reaches the filter, so that no

@@ -384,11 +384,17 @@ pub struct Protected<C: Calls> {
     _calls: C,
 }
 
+/// Compares a list that was read back with the one that was set. A list that the system gave in a
+/// form that is not an access list is a list that did not read back as set, and says so in the
+/// words of its list; every other failure of the read is the system's own.
 fn read_back(read: io::Result<List>, set: &[Entry], which: &'static str) -> Result<(), Refusal> {
-    if read? == set {
-        Ok(())
-    } else {
-        Err(Refusal::Lists(Reason::NotAsSet(which)))
+    match read {
+        Ok(list) if list == set => Ok(()),
+        Ok(_) => Err(Refusal::Lists(Reason::NotAsSet(which))),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            Err(Refusal::Lists(Reason::NotAsSet(which)))
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -541,6 +547,10 @@ mod tests {
         /// What a list reads back as, by name, in place of what was set.
         reads_as: HashMap<&'static str, List>,
         set: HashMap<&'static str, List>,
+        /// The lists that read back in a form that is not an access list, by name.
+        unparsable: Vec<&'static str>,
+        /// The list that each thread was given, by identifier.
+        set_threads: HashMap<u32, List>,
         debugger: bool,
         previous: Previous,
     }
@@ -555,6 +565,8 @@ mod tests {
                 fails_at: None,
                 reads_as: HashMap::new(),
                 set: HashMap::new(),
+                unparsable: Vec::new(),
+                set_threads: HashMap::new(),
                 debugger: false,
                 previous: Previous {
                     error_mode: 0,
@@ -577,12 +589,19 @@ mod tests {
             self.behaviour.get(&id).cloned().unwrap_or_else(ordinary)
         }
 
-        fn read(&self, name: &'static str) -> List {
-            self.reads_as
+        fn read(&self, name: &'static str) -> io::Result<List> {
+            if self.unparsable.contains(&name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "an access list that is not a list",
+                ));
+            }
+            Ok(self
+                .reads_as
                 .get(name)
                 .or_else(|| self.set.get(name))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default())
         }
     }
 
@@ -609,7 +628,7 @@ mod tests {
 
         fn default_list(&mut self) -> io::Result<List> {
             self.call("read default")?;
-            Ok(self.read("default"))
+            self.read("default")
         }
 
         fn set_token_list(&mut self, list: &[Entry]) -> io::Result<()> {
@@ -619,7 +638,7 @@ mod tests {
 
         fn token_list(&mut self) -> io::Result<List> {
             self.call("read token")?;
-            Ok(self.read("token"))
+            self.read("token")
         }
 
         fn set_process_list(&mut self, list: &[Entry]) -> io::Result<()> {
@@ -629,7 +648,7 @@ mod tests {
 
         fn process_list(&mut self) -> io::Result<List> {
             self.call("read process")?;
-            Ok(self.read("process"))
+            self.read("process")
         }
 
         fn thread_ids(&mut self) -> io::Result<Vec<u32>> {
@@ -669,6 +688,12 @@ mod tests {
 
         fn thread_list(&mut self, thread: &u32) -> io::Result<List> {
             self.log.push(format!("read {thread}"));
+            if self.unparsable.contains(&"thread") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "an access list that is not a list",
+                ));
+            }
             Ok(self.behaviour_of(*thread).holds.unwrap_or_else(|| {
                 // A thread holds what was set on it, and another list until then.
                 self.set_threads
@@ -873,6 +898,31 @@ mod tests {
             assert!(
                 !log.iter().any(|logged| logged == "debugger"),
                 "{name}: nothing went on: {log:?}"
+            );
+        }
+
+        // A list that the system gives in a form that is not a list did not read back as set
+        // either, and names its list in the same words: no words of the system's own about a
+        // format reach the person.
+        for (name, which) in [
+            ("default", "the token's default list was not as set"),
+            ("token", "the token's own list was not as set"),
+            ("process", "the process's list was not as set"),
+            ("thread", "a thread's list was not as set"),
+        ] {
+            let mut fake = Fake::new();
+            fake.unparsable.push(name);
+            let mut kept = None;
+            let Err(refusal) = apply(Recorder(&mut kept, fake)) else {
+                panic!("{name}: the protection held although the list was not a list");
+            };
+            assert_eq!(
+                refusal.words(),
+                format!(
+                    "the recovery kit is not made because the access lists of this process could \
+                     not be set: {which}"
+                ),
+                "{name} unparsable"
             );
         }
     }
