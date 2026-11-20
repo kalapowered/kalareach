@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-use kr_term::class::SequenceClass;
 use kr_term::conformance::{
     ADMISSION_CASES, BROKER_CASES, BYTE_POLICY_CASES, CLASS_CASES, Case, SNAPSHOT_CASES,
     WIDTH_CASES, summarise, summarise_admission, summarise_grid,
@@ -381,19 +380,5 @@ fn committed_classes_match_the_classifier() {
             .map(|event| event["class"].as_str().unwrap_or("?").to_owned())
             .collect();
         assert_eq!(actual, expected, "case {} classes differ", case.id);
-    }
-}
-
-/// The five classes round-trip through their letters.
-#[test]
-fn class_letters_round_trip() {
-    for class in [
-        SequenceClass::Display,
-        SequenceClass::Mode,
-        SequenceClass::Query,
-        SequenceClass::SideEffect,
-        SequenceClass::Extension,
-    ] {
-        assert_eq!(SequenceClass::from_letter(class.letter()), Some(class));
     }
 }

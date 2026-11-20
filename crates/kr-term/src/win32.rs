@@ -59,12 +59,6 @@ pub mod control_keys {
     pub const LEFT_CTRL_PRESSED: u32 = 0x0008;
     /// A Shift key is down.
     pub const SHIFT_PRESSED: u32 = 0x0010;
-    /// Num Lock is on.
-    pub const NUMLOCK_ON: u32 = 0x0020;
-    /// Scroll Lock is on.
-    pub const SCROLLLOCK_ON: u32 = 0x0040;
-    /// Caps Lock is on.
-    pub const CAPSLOCK_ON: u32 = 0x0080;
     /// The key is an enhanced key.
     pub const ENHANCED_KEY: u32 = 0x0100;
 
@@ -75,12 +69,6 @@ pub mod control_keys {
         state & RIGHT_ALT_PRESSED != 0 && state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0
     }
 }
-
-/// The sequence a ConPTY sends to ask for win32 input mode.
-pub const MODE_SET: &[u8] = b"\x1b[?9001h";
-
-/// The sequence that disables it.
-pub const MODE_RESET: &[u8] = b"\x1b[?9001l";
 
 /// The terminal profile a Windows console declares when its environment names no terminal.
 ///
@@ -216,19 +204,11 @@ impl From<KeyRecord> for kr_protocol::input::ConsoleKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TooLong;
 
-/// Encodes a run of records, in the order they were read, into one buffer.
+/// Encodes a run of records, in the order they were read, and stops at the first one that would
+/// take the buffer past `limit` bytes.
 ///
 /// The order is the record path's own promise: a key-down and the key-up that follows it arrive in
-/// that order, and a repeat count is one record rather than several.
-#[must_use]
-pub fn encode_all(records: &[KeyRecord]) -> Vec<u8> {
-    records_within(records, usize::MAX).unwrap_or_default()
-}
-
-/// Encodes a run of records as [`encode_all`] does, and stops at the first one that would take the
-/// buffer past `limit` bytes.
-///
-/// The bound is checked before each record is appended, so the buffer never holds more than the
+/// that order, and a repeat count is one record rather than several. The bound is checked before each record is appended, so the buffer never holds more than the
 /// bound and a run is never built to be refused.
 ///
 /// # Errors
@@ -422,7 +402,6 @@ impl Fidelity {
     pub const fn carries_console_scan_codes(&self) -> bool {
         matches!(self, Self::Records)
     }
-
     /// The sentence a receipt or a diagnostic prints.
     #[must_use]
     pub const fn describe(&self) -> &'static str {
@@ -518,7 +497,7 @@ mod tests {
             ..KeyRecord::DEFAULT
         };
         assert!(high.is_high_surrogate() && low.is_low_surrogate());
-        let bytes = encode_all(&[high, low]);
+        let bytes = records_within(&[high, low], usize::MAX).unwrap_or_default();
         assert_eq!(bytes, b"\x1b[0;0;55357;1;0;1_\x1b[0;0;56832;1;0;1_");
         // And the pair still names the character it came from.
         let pair = [0xD83D_u16, 0xDE00];

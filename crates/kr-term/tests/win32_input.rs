@@ -19,7 +19,18 @@ use kr_term::engine::{Engine, EngineConfig};
 use kr_term::modes::ModeKind;
 use kr_term::policy::{Backend, Policy};
 use kr_term::snapshot::Viewport;
-use kr_term::win32::{Fidelity, KeyRecord, MODE_RESET, MODE_SET, control_keys, decode, encode_all};
+use kr_term::win32::{Fidelity, KeyRecord, control_keys, decode, records_within};
+
+/// The sequence a ConPTY sends to ask for win32 input mode.
+const MODE_SET: &[u8] = b"\x1b[?9001h";
+
+/// The sequence that disables it.
+const MODE_RESET: &[u8] = b"\x1b[?9001l";
+
+/// Encodes a run of records, in the order they were read, into one buffer.
+fn encode_all(records: &[KeyRecord]) -> Vec<u8> {
+    records_within(records, usize::MAX).unwrap_or_default()
+}
 
 /// An engine whose backend is the pseudo-console this worker owns.
 fn owned_conpty() -> Engine {
