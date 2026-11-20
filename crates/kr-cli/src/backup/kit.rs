@@ -287,16 +287,64 @@ fn read_line_through(
     Ok(Some(String::from_utf8_lossy(&answer).into_owned()))
 }
 
-/// Reads one line from the console's input.
+/// Reads one line from the console's input, as text. A plain read of the handle gives no bytes both
+/// at the end of the input and when a Ctrl-C ended the read; the console's text read tells them
+/// apart, and a Ctrl-C is the interrupt.
 #[cfg(windows)]
 fn read_console_line(stopped: &AtomicBool) -> Result<Option<String>> {
-    use std::io::Read as _;
-
-    let mut input = File::options()
+    let input = File::options()
         .read(true)
         .open("CONIN$")
         .map_err(|error| answer_unreadable(&error))?;
-    read_line_through(|chunk| input.read(chunk), stopped)
+    let mut held = None;
+    read_line_through(
+        |chunk| {
+            let mut units = [0_u16; CONSOLE_UNITS];
+            loop {
+                let read = crate::platform::read_console_text(&input, &mut units)?;
+                if read == 0 {
+                    return Ok(0);
+                }
+                let taken = utf8_of_units(&mut held, &units[..read], chunk);
+                if taken > 0 {
+                    return Ok(taken);
+                }
+            }
+        },
+        stopped,
+    )
+}
+
+/// How many UTF-16 units one read of the console's text takes: at most three bytes each, so the
+/// bytes of a read, and a high surrogate held from the one before, fit the reader's chunk.
+#[cfg(windows)]
+const CONSOLE_UNITS: usize = 64;
+
+/// Writes the UTF-8 of `units` into `into`, and says how many bytes it wrote. A high surrogate that
+/// ends `units` is held in `held` for the units of the next read, which a long line splits; a
+/// surrogate with no partner is the replacement character.
+#[cfg(any(windows, test))]
+fn utf8_of_units(held: &mut Option<u16>, units: &[u16], into: &mut [u8]) -> usize {
+    let mut all: Vec<u16> = held
+        .take()
+        .into_iter()
+        .chain(units.iter().copied())
+        .collect();
+    if all
+        .last()
+        .is_some_and(|unit| (0xD800..0xDC00).contains(unit))
+    {
+        *held = all.pop();
+    }
+    let mut written = 0;
+    for decoded in char::decode_utf16(all) {
+        let character = decoded.unwrap_or(char::REPLACEMENT_CHARACTER);
+        let mut buffer = [0_u8; 4];
+        let encoded = character.encode_utf8(&mut buffer);
+        into[written..written + encoded.len()].copy_from_slice(encoded.as_bytes());
+        written += encoded.len();
+    }
+    written
 }
 
 /// The thread that reads an answer, held so that it is ended before anything changes the console
@@ -951,7 +999,7 @@ impl Typing {
 #[cfg(test)]
 mod answer_tests {
     //! The reading of one answer and the ending of its reader, through the steps a case gives in
-    //! place of the console's read. The real read is `File::read` on `CONIN$`.
+    //! place of the console's read. The real read is the console's text read of `CONIN$`.
 
     use std::io;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -962,7 +1010,7 @@ mod answer_tests {
 
     use super::{
         LONGEST_ANSWER, OPERATION_ABORTED, end_the_reader, end_the_reader_or_the_command,
-        read_line_through,
+        read_line_through, utf8_of_units,
     };
 
     /// A step that gives `bytes` in reads of at most the size the caller offers, then the end of
@@ -1013,6 +1061,33 @@ mod answer_tests {
         let (answer, given) = read(&typed);
         assert_eq!(answer.expect("an answer").len(), LONGEST_ANSWER);
         assert_eq!(given, typed.len(), "every byte of the line was taken");
+    }
+
+    /// The units of a console read become UTF-8: a pair that two reads split is one character, a
+    /// surrogate with no partner is the replacement character, and the line end is kept.
+    #[test]
+    fn the_units_of_a_console_read_become_utf8_with_a_split_pair_joined() {
+        let mut into = [0_u8; 256];
+        let mut held = None;
+        let units: Vec<u16> = "yes\r\n".encode_utf16().collect();
+        let written = utf8_of_units(&mut held, &units, &mut into);
+        assert_eq!(&into[..written], b"yes\r\n");
+        assert_eq!(held, None);
+
+        // U+1F600 is the pair D83D DE00, and the first read ends between its two units.
+        let first = utf8_of_units(&mut held, &[0x61, 0xD83D], &mut into);
+        assert_eq!(&into[..first], b"a");
+        assert_eq!(held, Some(0xD83D));
+        let second = utf8_of_units(&mut held, &[0xDE00, 0x62], &mut into);
+        assert_eq!(&into[..second], "\u{1F600}b".as_bytes());
+        assert_eq!(held, None);
+
+        let lone = utf8_of_units(&mut held, &[0xDE00, 0x63], &mut into);
+        assert_eq!(&into[..lone], "\u{FFFD}c".as_bytes());
+        let kept = utf8_of_units(&mut held, &[0xD83D], &mut into);
+        assert_eq!((kept, held), (0, Some(0xD83D)));
+        let unpaired = utf8_of_units(&mut held, &[0x64], &mut into);
+        assert_eq!(&into[..unpaired], "\u{FFFD}d".as_bytes());
     }
 
     /// A read that fails as cancelled, with no stop asked for, is the person's Ctrl-C, and is said as

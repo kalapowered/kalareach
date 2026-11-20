@@ -125,9 +125,6 @@ pub async fn run(
     // default handler until this, which skips every destructor.
     let mut interrupt = Interrupt::install()?;
     interrupt.arm()?;
-    // Held from here to the end, so that every exit puts the terminal back and drops what is
-    // waiting in it.
-    let _terminal = Terminal::hold()?;
     let mut dialogue = Dialogue {
         interrupt,
         stage: Stage::Asking,
@@ -135,6 +132,11 @@ pub async fn run(
         kit: None,
         storage: false,
     };
+    // Held from here to the end, so that every exit puts the terminal back and drops what is
+    // waiting in it. Declared after the dialogue, which holds the interrupt's receivers: it drops
+    // first, so a Ctrl-C that comes while the terminal is put back is still an interrupt and not
+    // the default end, which skips the restore.
+    let _terminal = Terminal::hold()?;
 
     // The connection that reads the status is let go of before the dialogue begins: a person can
     // take longer over it than a connection nobody reads from is kept.

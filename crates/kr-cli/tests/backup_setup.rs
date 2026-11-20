@@ -1587,6 +1587,10 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(shown.contains("Nothing was set up."), "{shown}");
+    // Said as the interrupt, not as an answer that declined: a console ends a read that a Ctrl-C
+    // interrupted with no text, which an answer of the end of the input also is.
+    assert!(shown.contains("stopped before it finished"), "{shown}");
+    assert!(!shown.contains("backups were not set up"), "{shown}");
     window.assert_the_terminal_is_as_found(&shown);
     assert!(!shown.contains("kalareach-recovery-kit"), "{shown}");
 
@@ -2448,6 +2452,13 @@ async fn an_interrupt_at_each_question_leaves_the_next_line_to_the_shell() {
         window.type_bytes(&[0x03]);
         let shown = window.wait_for("kr ended");
         assert!(!shown.contains("kr ended 0"), "{question}: {shown}");
+        // The command's own words for the interrupt, at every question: a command that is not armed
+        // for it, or that takes the interrupt's empty read for the end of the input, ends without
+        // them.
+        assert!(
+            shown.contains("stopped before it finished"),
+            "{question}: the command said it was interrupted: {shown}"
+        );
         window.assert_the_terminal_is_as_found(&shown);
         window.type_line("marker");
         let shown = window.wait_for("first:");

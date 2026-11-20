@@ -578,7 +578,7 @@ mod protection {
 }
 
 #[cfg(not(unix))]
-pub use console::{ControllingTerminal, SavedModes};
+pub use console::{ControllingTerminal, SavedModes, read_console_text};
 
 #[cfg(not(unix))]
 mod console {
@@ -1048,6 +1048,51 @@ mod console {
                 "read the console's mode: the console did not answer",
             )))
         }
+    }
+
+    /// Reads what a person typed at the console's current line as UTF-16 units into `units`, and
+    /// says how many it read. Nothing read is the end of the input.
+    ///
+    /// A Ctrl-C or a Ctrl-Break that ends the read gives the console's `ERROR_OPERATION_ABORTED`
+    /// as the error, as a read that was cancelled does. The console completes such a read with no
+    /// text and no failure, and says so only in the last error, which a plain read of the handle
+    /// never looks at: it would be taken for the end of the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns the system's error when the read fails, and `ERROR_OPERATION_ABORTED` when a Ctrl-C
+    /// or a Ctrl-Break ended it.
+    pub fn read_console_text(input: &File, units: &mut [u16]) -> std::io::Result<usize> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, GetLastError, SetLastError};
+        use windows_sys::Win32::System::Console::ReadConsoleW;
+
+        let mut read = 0_u32;
+        // SAFETY: the call takes one integer and sets the calling thread's last error.
+        unsafe { SetLastError(0) };
+        // SAFETY: the handle is an open console input and the buffer holds the number of units the
+        // call is told; the count read is a local; no input control is passed.
+        let ok = unsafe {
+            ReadConsoleW(
+                input.as_raw_handle().cast(),
+                units.as_mut_ptr().cast(),
+                u32::try_from(units.len()).unwrap_or(1),
+                &raw mut read,
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let read = usize::try_from(read).unwrap_or(0).min(units.len());
+        // SAFETY: the call reads the calling thread's last error.
+        if read == 0 && unsafe { GetLastError() } == ERROR_OPERATION_ABORTED {
+            return Err(std::io::Error::from_raw_os_error(
+                i32::try_from(ERROR_OPERATION_ABORTED).unwrap_or(0),
+            ));
+        }
+        Ok(read)
     }
 
     fn set_console_mode(handle: &File, mode: u32) -> Result<()> {
