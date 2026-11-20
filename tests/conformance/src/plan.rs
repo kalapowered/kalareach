@@ -69,7 +69,8 @@ impl Group {
 }
 
 /// The platforms the report knows how to run on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Platform {
     /// Linux.
     Linux,
@@ -122,7 +123,8 @@ pub enum Reading {
 }
 
 /// How a lane's tool reports the tests it ran.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Tests {
     /// Gradle's JUnit files, one for each test class, in a directory.
     Junit,
@@ -134,13 +136,13 @@ pub enum Tests {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     /// Its group.
-    pub group: Group,
+    pub group: String,
     /// What it runs, in a few words.
     pub what: String,
     /// The program and its arguments, as run.
     pub command: Vec<String>,
     /// Variables it reads from the environment the report was started in, which must be set.
-    pub needs: Vec<&'static str>,
+    pub needs: Vec<String>,
     /// How its output is read.
     pub reading: Reading,
     /// A name filter the command passes to the test binaries, and why tests outside it are not
@@ -158,7 +160,7 @@ impl Step {
     /// early says so, and where the report reads it. One that shows the output as it is written,
     /// with `--nocapture`, is left as it is.
     #[must_use]
-    pub fn cargo(group: Group, what: &str, arguments: &[&str]) -> Self {
+    pub fn cargo(group: &str, what: &str, arguments: &[&str]) -> Self {
         let mut command = vec!["cargo".to_owned()];
         command.extend(arguments.iter().map(|argument| (*argument).to_owned()));
         if arguments.first() == Some(&"test") && !arguments.contains(&"--nocapture") {
@@ -168,7 +170,7 @@ impl Step {
             command.push("--show-output".to_owned());
         }
         Self {
-            group,
+            group: group.to_owned(),
             what: what.to_owned(),
             command,
             needs: Vec::new(),
@@ -451,7 +453,7 @@ pub fn steps(
                 steps.push(Step {
                     reading: Reading::Build,
                     ..Step::cargo(
-                        Group::EndToEnd,
+                        Group::EndToEnd.name(),
                         "the worker the network suite launches",
                         &["build", "--locked", "-p", "kr-worker", "--bin", "kr-worker"],
                     )
@@ -471,7 +473,7 @@ pub fn steps(
                         arguments.push("--include-ignored");
                     }
                     steps.push(Step::cargo(
-                        Group::EndToEnd,
+                        Group::EndToEnd.name(),
                         &format!("{package} {suite}, one test at a time"),
                         &arguments,
                     ));
@@ -479,7 +481,7 @@ pub fn steps(
             }
             Group::Performance if platform != Platform::Windows => {
                 steps.push(Step::cargo(
-                    Group::Performance,
+                    Group::Performance.name(),
                     "the measurement suite's own regressions",
                     &[
                         "test",
@@ -492,7 +494,7 @@ pub fn steps(
                     ],
                 ));
                 steps.push(Step::cargo(
-                    Group::Performance,
+                    Group::Performance.name(),
                     "the input measurements' own regressions",
                     &[
                         "test",
@@ -507,7 +509,7 @@ pub fn steps(
                 for (target, name) in MEASUREMENTS {
                     let (kind, target) = target.split_once(' ').unwrap_or(("test", target));
                     steps.push(Step::cargo(
-                        Group::Performance,
+                        Group::Performance.name(),
                         &format!("the {name} measurement"),
                         &[
                             "test",
@@ -526,7 +528,7 @@ pub fn steps(
                     ));
                 }
                 steps.push(Step::cargo(
-                    Group::Performance,
+                    Group::Performance.name(),
                     "terminal output handling, optimised",
                     &[
                         "test",
@@ -542,7 +544,7 @@ pub fn steps(
                     ],
                 ));
                 steps.push(Step::cargo(
-                    Group::Performance,
+                    Group::Performance.name(),
                     "transport scheduling and reconnect, optimised",
                     &[
                         "test",
@@ -562,7 +564,7 @@ pub fn steps(
                 // The report's own reading of TypeScript, over its fixture: it needs the compiler
                 // the packages install, which this group has.
                 steps.push(Step::cargo(
-                    Group::TypeScript,
+                    Group::TypeScript.name(),
                     "the report's own reading of TypeScript",
                     &[
                         "test",
@@ -583,7 +585,7 @@ pub fn steps(
                         directory.replace('/', "-")
                     );
                     steps.push(Step {
-                        group: Group::TypeScript,
+                        group: Group::TypeScript.name().to_owned(),
                         what: format!("{directory}'s tests"),
                         command: vec![
                             "pnpm".to_owned(),
@@ -608,7 +610,7 @@ pub fn steps(
             Group::Applications if platform != Platform::Windows => {
                 if let Some(plan) = applications {
                     let mut step = Step::cargo(
-                        Group::Applications,
+                        Group::Applications.name(),
                         "the application matrix in a real session",
                         &[
                             "test",
@@ -622,7 +624,7 @@ pub fn steps(
                             "--test-threads=1",
                         ],
                     );
-                    step.needs.push(APPLICATIONS_VARIABLE);
+                    step.needs.push(APPLICATIONS_VARIABLE.to_owned());
                     let skips: Vec<(String, String)> = plan
                         .left_out
                         .iter()
@@ -672,7 +674,7 @@ fn phones(platform: Platform, evidence: &str) -> Option<Step> {
         Platform::Windows => return None,
     };
     Some(Step {
-        group: Group::Phones,
+        group: Group::Phones.name().to_owned(),
         what: what.to_owned(),
         command: vec![
             "bash".to_owned(),
@@ -702,13 +704,13 @@ pub struct ApplicationsPlan {
 fn rust(platform: Platform) -> Vec<Step> {
     match platform {
         Platform::Linux => vec![Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the workspace's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         )],
         Platform::MacOs => vec![
             Step::cargo(
-                Group::Rust,
+                Group::Rust.name(),
                 "the workspace's tests, less what the macOS runner cannot host",
                 &[
                     "test",
@@ -733,7 +735,7 @@ fn windows() -> Vec<Step> {
         )
     };
     let qualified_only = |what: &str, arguments: &[&str], filter: &str| {
-        let mut step = Step::cargo(Group::Rust, what, arguments);
+        let mut step = Step::cargo(Group::Rust.name(), what, arguments);
         step.filter = Some(only(filter));
         step
     };
@@ -746,7 +748,7 @@ fn windows() -> Vec<Step> {
         Step {
             reading: Reading::Build,
             ..Step::cargo(
-                Group::Rust,
+                Group::Rust.name(),
                 "the control daemon, the worker, the forwarder and the plugin host the suites start, and the release tool whose header a case reads",
                 &[
                     "build",
@@ -767,7 +769,7 @@ fn windows() -> Vec<Step> {
         Step {
             reading: Reading::Build,
             ..Step::cargo(
-                Group::Rust,
+                Group::Rust.name(),
                 "the description process the update suite assembles into releases",
                 &[
                     "build",
@@ -780,7 +782,7 @@ fn windows() -> Vec<Step> {
             )
         },
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the terminal engine, the repository boundary, the attach client and pairing",
             &[
                 "test",
@@ -794,12 +796,12 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the Rust reader of the evidence directory",
             &["test", "--locked", "-p", "kr-test-artifacts"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the PowerShell and shell readers of the evidence directory",
             &[
                 "test",
@@ -811,12 +813,12 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the worker's library",
             &["test", "--locked", "-p", "kr-worker", "--lib"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the platform time adapter",
             &[
                 "test",
@@ -834,12 +836,12 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the protocol's library",
             &["test", "--locked", "-p", "kr-protocol", "--lib"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the binder, the channels, the connectors and the attention source",
             &[
                 "test",
@@ -941,7 +943,7 @@ fn windows() -> Vec<Step> {
             "service::net::dispatch::tests::",
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the daemon's attention, barrier, configuration and diagnostics",
             &[
                 "test",
@@ -959,12 +961,12 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the forwarder",
             &["test", "--locked", "-p", "kr-hook"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the launch endpoint, the registration and the credential",
             &[
                 "test",
@@ -976,7 +978,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the listener, the transport and the broker over the launch endpoint",
             &[
                 "test",
@@ -994,7 +996,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the agent mutations through the dispatch path",
             &[
                 "test",
@@ -1006,7 +1008,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "which handles a started process holds",
             &[
                 "test",
@@ -1018,7 +1020,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the connector the worker reads from an installed package",
             &[
                 "test",
@@ -1030,7 +1032,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "what a launch reads of its application's mode",
             &[
                 "test",
@@ -1042,7 +1044,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the command backends",
             &[
                 "test",
@@ -1116,17 +1118,17 @@ fn windows() -> Vec<Step> {
             "catalogue::launch_probes",
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the settings-sync store",
             &["test", "--locked", "-p", "kr-client", "--test", "sync"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "a pseudo-console, PowerShell and the session job object",
             &["test", "--locked", "-p", "kr-worker", "--test", "windows"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "a launched agent's helper placed by its job",
             &[
                 "test",
@@ -1138,32 +1140,32 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the local endpoint, the descriptors and the process identity",
             &["test", "--locked", "-p", "kr-ipc", "--test", "windows"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the store of releases",
             &["test", "--locked", "-p", "kr-ipc", "--test", "install"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "stopping a recorded process by its identity",
             &["test", "--locked", "-p", "kr-ipc", "--test", "stop"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "what a pipe says of its peer",
             &["test", "--locked", "-p", "kr-ipc", "--test", "peer_gone"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the local IPC library",
             &["test", "--locked", "-p", "kr-ipc", "--lib"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the daemon's side of the description process, among it the cases that hold the process behind its job's memory limit",
             &[
                 "test",
@@ -1175,7 +1177,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "what a question's caller token reaches",
             &[
                 "test",
@@ -1187,7 +1189,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "controller and local authority at a worker's pipe",
             &["test", "--locked", "-p", "kr-worker", "--test", "authority"],
         ),
@@ -1228,7 +1230,7 @@ fn windows() -> Vec<Step> {
             "supervision::windows",
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "a start through the environment's scheduled task",
             &[
                 "test",
@@ -1240,7 +1242,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the plugin host started through the environment's scheduled task",
             &[
                 "test",
@@ -1256,7 +1258,7 @@ fn windows() -> Vec<Step> {
         Step {
             reading: Reading::Build,
             ..Step::cargo(
-                Group::Rust,
+                Group::Rust.name(),
                 "the plugin host with its epoch held, which the plugin world's programs start",
                 &[
                     "build",
@@ -1270,7 +1272,7 @@ fn windows() -> Vec<Step> {
             )
         },
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the plugin actions, their decoding, their attachments and the observation of terminals",
             &[
                 "test",
@@ -1306,7 +1308,7 @@ fn windows() -> Vec<Step> {
         // The compile budget's reading of a thread's processor time, which no other case checks on
         // this platform, and the rest of the plugin runtime's suites, which run the test components.
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the compile budget's reading of a thread's processor time",
             &[
                 "test",
@@ -1323,12 +1325,12 @@ fn windows() -> Vec<Step> {
             "this step runs only the thread-time case; the steps after it run the rest",
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the plugin runtime's library",
             &["test", "--locked", "-p", "kr-plugin-runtime", "--lib"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the plugin runtime running real components",
             &[
                 "test",
@@ -1341,7 +1343,7 @@ fn windows() -> Vec<Step> {
         )
         .skipping(&[(thread_time, "it has a step of its own")]),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the plugin runtime's service over a pipe",
             &[
                 "test",
@@ -1357,9 +1359,9 @@ fn windows() -> Vec<Step> {
         // and fail before anything is started unless KR_TEST_PLATFORM_SECRET_STORE=1 says the run
         // may; the case that needs an account signed in nowhere is the test machine's.
         Step {
-            needs: vec![SECRET_STORE_VARIABLE],
+            needs: vec![SECRET_STORE_VARIABLE.to_owned()],
             ..Step::cargo(
-                Group::Rust,
+                Group::Rust.name(),
                 "the control daemon started through the environment's scheduled task",
                 &[
                     "test",
@@ -1376,22 +1378,22 @@ fn windows() -> Vec<Step> {
             )
         },
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the attention store",
             &["test", "--locked", "-p", "kr-attention"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the client's stores and their directory flush",
             &["test", "--locked", "-p", "kr-client", "--lib"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the terminal input encoder",
             &["test", "--locked", "-p", "kr-keys"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the loopback listener a sign-in comes back to",
             &["test", "--locked", "-p", "kr-loopback"],
         ),
@@ -1409,7 +1411,7 @@ fn windows() -> Vec<Step> {
             "sign",
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the client and the command line held to the rendering rule",
             &[
                 "test",
@@ -1421,7 +1423,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the shared directory flush",
             &["test", "--locked", "-p", "kr-flush"],
         ),
@@ -1497,7 +1499,7 @@ fn windows() -> Vec<Step> {
             "agent_tools",
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the contact skill installed and removed through the daemon",
             &[
                 "test",
@@ -1511,12 +1513,12 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the directory secret store and the libsodium boundary",
             &["test", "--locked", "-p", "kr-crypto"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the libsodium boundary in the release profile",
             &["test", "--locked", "--release", "-p", "kr-crypto"],
         ),
@@ -1533,12 +1535,12 @@ fn windows() -> Vec<Step> {
             "machine",
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the plugin catalogue's package store",
             &["test", "--locked", "-p", "kr-plugin-catalogue"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "plugins installed through the daemon's catalogue",
             &[
                 "test",
@@ -1550,7 +1552,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the PowerShell bridge client over a named pipe",
             &[
                 "test",
@@ -1562,7 +1564,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the PowerShell package a Windows host publishes",
             &[
                 "test",
@@ -1588,17 +1590,17 @@ fn windows() -> Vec<Step> {
         // The landing workflow runs these three with `--nocapture`, so that a case that could not
         // build what it needs says so; `--show-output` prints the same, under each test's name.
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the repository boundary",
             &["test", "--locked", "-p", "kr-project", "--test", "boundary"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "what an apply carries across",
             &["test", "--locked", "-p", "kr-changeset", "--test", "apply"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "filesystem authority and access-control lists",
             &[
                 "test",
@@ -1614,9 +1616,9 @@ fn windows() -> Vec<Step> {
         // and fails before it writes unless KR_TEST_PLATFORM_SECRET_STORE=1 says the run may, as
         // the conformance workflow's runner does.
         Step {
-            needs: vec![SECRET_STORE_VARIABLE],
+            needs: vec![SECRET_STORE_VARIABLE.to_owned()],
             ..Step::cargo(
-                Group::Rust,
+                Group::Rust.name(),
                 "a collection key kept in this machine's credential store",
                 &[
                     "test",
@@ -1632,7 +1634,7 @@ fn windows() -> Vec<Step> {
             )
         },
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the persistence suite",
             &[
                 "test",
@@ -1644,7 +1646,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the archive's cleanup of a crashed session",
             &[
                 "test",
@@ -1656,7 +1658,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the project and workspace methods through the daemon",
             &[
                 "test",
@@ -1668,7 +1670,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "a paired device's project methods",
             &[
                 "test",
@@ -1680,22 +1682,22 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the session snapshot suite",
             &["test", "--locked", "-p", "kr-worker", "--test", "snapshot"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the terminal suite",
             &["test", "--locked", "-p", "kr-worker", "--test", "terminal"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the session suite",
             &["test", "--locked", "-p", "kr-worker", "--test", "session"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the local owner suite",
             &[
                 "test",
@@ -1707,7 +1709,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the input lease suite",
             &[
                 "test",
@@ -1719,17 +1721,17 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the fence suite",
             &["test", "--locked", "-p", "kr-worker", "--test", "fence"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the desktop suite",
             &["test", "--locked", "-p", "kr-worker", "--test", "desktop"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the worker's performance suite",
             &[
                 "test",
@@ -1741,12 +1743,12 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the shell suite",
             &["test", "--locked", "-p", "kr-controller", "--test", "shell"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the privacy suite",
             &[
                 "test",
@@ -1758,7 +1760,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the descriptions suite",
             &[
                 "test",
@@ -1770,7 +1772,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the refusal of a native bridge recipe",
             &[
                 "test",
@@ -1782,12 +1784,12 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "how a session's closure reaches its attachments",
             &["test", "--locked", "-p", "kr-worker", "--test", "closure"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the daemon ended during output",
             &[
                 "test",
@@ -1799,7 +1801,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the decisions a membership lease gives",
             &[
                 "test",
@@ -1813,7 +1815,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "an expired membership on a live connection",
             &[
                 "test",
@@ -1833,12 +1835,12 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the recovery bundle store and its write record",
             &["test", "--locked", "-p", "kr-client", "--test", "recovery"],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the host's events reaching a real window",
             &[
                 "test",
@@ -1850,7 +1852,7 @@ fn windows() -> Vec<Step> {
             ],
         ),
         Step::cargo(
-            Group::Rust,
+            Group::Rust.name(),
             "the real-worker host tests, through the environment's scheduled task",
             &["test", "--locked", "-p", "kr-worker", "--test", "host"],
         ),
@@ -2496,7 +2498,7 @@ mod tests {
     #[test]
     fn the_parts_of_a_plan_each_hold_the_opening_builds_and_together_every_other_step_once() {
         let step = |what: &str, reading: Reading| Step {
-            group: Group::Rust,
+            group: Group::Rust.name().to_owned(),
             what: what.to_owned(),
             command: vec!["cargo".to_owned()],
             needs: Vec::new(),
@@ -2519,7 +2521,7 @@ mod tests {
 
     fn step_of(what: &str, command: &[&str], reading: Reading) -> Step {
         Step {
-            group: Group::Rust,
+            group: Group::Rust.name().to_owned(),
             what: what.to_owned(),
             command: command.iter().map(|word| (*word).to_owned()).collect(),
             needs: Vec::new(),
@@ -2683,14 +2685,13 @@ mod tests {
         for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
             let steps = steps(platform, &Group::ALL, "/tmp/e", None);
             assert!(
-                steps.iter().any(|step| step.group == Group::Rust),
+                steps.iter().any(|step| step.group == Group::Rust.name()),
                 "{platform:?}"
             );
             let unix_only = steps.iter().any(|step| {
-                matches!(
-                    step.group,
-                    Group::EndToEnd | Group::Performance | Group::TypeScript
-                )
+                [Group::EndToEnd, Group::Performance, Group::TypeScript]
+                    .iter()
+                    .any(|group| step.group == group.name())
             });
             assert_eq!(unix_only, platform != Platform::Windows, "{platform:?}");
         }
@@ -2713,7 +2714,7 @@ mod tests {
 
     #[test]
     fn a_test_step_shows_what_its_passing_tests_wrote_unless_it_shows_it_as_written() {
-        let line = |arguments: &[&str]| Step::cargo(Group::Rust, "x", arguments).line();
+        let line = |arguments: &[&str]| Step::cargo("rust", "x", arguments).line();
         assert_eq!(
             line(&["test", "--locked", "--workspace"]),
             "cargo test --locked --workspace -- --show-output"
@@ -2747,7 +2748,7 @@ mod tests {
             steps[0].line()
         );
         assert!(steps[0].line().starts_with("cargo test"));
-        assert_eq!(steps[0].needs, [APPLICATIONS_VARIABLE]);
+        assert_eq!(steps[0].needs, [APPLICATIONS_VARIABLE.to_owned()]);
     }
 
     #[test]

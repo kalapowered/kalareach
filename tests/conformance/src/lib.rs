@@ -20,6 +20,7 @@ pub mod libtest;
 pub mod map;
 pub mod observe;
 pub mod plan;
+pub mod plan_file;
 pub mod report;
 pub mod run;
 pub mod runner_copy;

@@ -29,7 +29,7 @@ fn shell(what: &str, script: &str, arguments: &[&Path]) -> Step {
             .map(|argument| argument.to_string_lossy().into_owned()),
     );
     Step {
-        group: Group::Rust,
+        group: "rust".to_owned(),
         what: what.to_owned(),
         command,
         needs: Vec::new(),
@@ -232,7 +232,7 @@ fn tests_through(evidence: &Path, runner: PathBuf) -> Document {
         evidence,
         runner,
         vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the tree's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         )],
@@ -352,7 +352,7 @@ fn a_step_that_a_later_step_follows_keeps_the_file_as_it_was_when_it_ended() {
 /// A first step that runs no test program, so that a refusal is in a later step.
 fn a_step_before() -> Step {
     Step::cargo(
-        Group::Rust,
+        "rust",
         "the tree's check",
         &["check", "--locked", "--workspace"],
     )
@@ -377,7 +377,7 @@ fn a_program_the_runner_refused_in_a_later_step_is_recorded_for_that_step_at_the
             vec![
                 a_step_before(),
                 Step::cargo(
-                    Group::Rust,
+                    "rust",
                     "the tree's tests",
                     &["test", "--locked", "--workspace", "--no-fail-fast"],
                 ),

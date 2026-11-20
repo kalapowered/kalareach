@@ -30,7 +30,7 @@ fn options(evidence: &Path, base: &Path, lister: PathBuf, target: &Path) -> Opti
         ignored_runs: None,
         applications: None,
         steps: Some(vec![Step::cargo(
-            Group::Rust,
+            "rust",
             "the tree's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         )]),

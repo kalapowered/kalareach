@@ -783,15 +783,10 @@ pub fn assemble(
             .enumerate()
             .map(|(index, step)| StepRecord {
                 number: index + 1,
-                group: step.step.group.name().to_owned(),
+                group: step.step.group.clone(),
                 what: step.step.what.clone(),
                 command: step.step.line(),
-                needs: step
-                    .step
-                    .needs
-                    .iter()
-                    .map(|need| (*need).to_owned())
-                    .collect(),
+                needs: step.step.needs.clone(),
                 exit: step.exit,
                 seconds: step.seconds,
                 log: step.log.clone(),
@@ -1301,14 +1296,7 @@ impl<'a> Resolver<'a> {
     /// The variables the step its command is taken from reads (see [`reproducing`]).
     fn needs(&self, runs: &[RunRecord]) -> Vec<String> {
         reproducing(runs)
-            .map(|run| {
-                self.executed[run.step - 1]
-                    .step
-                    .needs
-                    .iter()
-                    .map(|need| (*need).to_owned())
-                    .collect()
-            })
+            .map(|run| self.executed[run.step - 1].step.needs.clone())
             .unwrap_or_default()
     }
 

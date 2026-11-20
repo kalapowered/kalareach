@@ -20,7 +20,7 @@ fn tree(name: &str) -> PathBuf {
 /// writes reads.
 fn zeroing(path: &Path) -> Step {
     Step {
-        group: Group::Rust,
+        group: "rust".to_owned(),
         what: "a build that damages the report's program".to_owned(),
         command: vec![
             "sh".to_owned(),
@@ -73,7 +73,7 @@ fn a_step_that_writes_zeros_at_the_programs_shared_path_does_not_break_a_later_l
     let steps = vec![
         zeroing(&shared),
         Step::cargo(
-            Group::Rust,
+            "rust",
             "the tree's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         ),
