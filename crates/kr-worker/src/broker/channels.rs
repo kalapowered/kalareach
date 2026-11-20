@@ -1184,15 +1184,18 @@ mod tests {
     }
 
     /// A submit into the session, a steer, a cancellation and a package's action are refused on
-    /// a channel, each with its own reason, and nothing is queued for any of them.
+    /// a channel, each with its own reason, and nothing is queued for any of them. The channel has
+    /// a whole event shape, so a submit is refused for being a submit and not for the lack of a
+    /// shape.
     #[test]
     fn a_submit_a_steer_a_cancellation_and_an_action_are_refused_with_their_reasons() {
+        let package = crate::broker::channel_fixture::Package::laid_out();
         let (queue, mut outgoing) = tokio::sync::mpsc::channel(MAX_QUEUED_ANSWERS);
         let channel = ChannelDispatch {
             connection: GatewayConnectionId::new(7),
             queue: Mutex::new(Some(queue)),
             counted: None,
-            shape: None,
+            shape: ChannelEventShape::of(&package.connector).map(Arc::new),
             prompts: Arc::new(AtomicUsize::new(0)),
         };
         let refused = [
@@ -1240,7 +1243,10 @@ mod tests {
         ];
         for (operation, body, reason) in refused {
             let admitted = channel.admit(&request(operation, body.clone()));
-            let refusal = admitted.expect_err("refused");
+            assert!(admitted.is_err(), "{operation:?} is refused on a channel");
+            let Err(refusal) = admitted else {
+                unreachable!("the refusal was asserted");
+            };
             assert_eq!(refusal.code(), ErrorCode::UnsupportedCapability);
             assert!(refusal.to_string().contains(reason), "{refusal}");
             assert!(
