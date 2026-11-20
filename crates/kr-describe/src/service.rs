@@ -928,12 +928,6 @@ impl DescriptionService {
         }
     }
 
-    /// Returns what cleanup privacy mode is still owed.
-    #[must_use]
-    pub const fn cleanup_debt(&self) -> &CleanupDebt {
-        &self.debt
-    }
-
     /// Returns how many times inference has been restarted after a failure.
     #[must_use]
     pub const fn inference_restarts(&self) -> u64 {
@@ -1461,19 +1455,6 @@ impl DescriptionService {
             Model::Resident { profile } => Some(profile.execution().resident_estimate),
             Model::Absent | Model::Loading { .. } => None,
         }
-    }
-
-    /// Returns whether a result produced under a profile revision is still current.
-    #[must_use]
-    pub fn accepts_profile_revision(&self, profile_id: &str, revision: ProfileRevision) -> bool {
-        self.mapping
-            .accepts_result(self.environment.id(), profile_id, revision)
-    }
-
-    /// Returns the gates an owner has recorded as met.
-    #[must_use]
-    pub const fn met_gates(&self) -> &MetGates {
-        &self.met
     }
 
     /// Says what the host does now.

@@ -111,13 +111,6 @@ impl MachineGroup {
     pub fn name(&self) -> &str {
         &self.0
     }
-
-    /// Returns whether membership of this group grants access to another environment's
-    /// transcripts. It does not, on any host, under any configuration.
-    #[must_use]
-    pub const fn grants_transcript_access(&self) -> bool {
-        false
-    }
 }
 
 /// One execution environment.

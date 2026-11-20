@@ -213,36 +213,3 @@ impl ResidentCost {
         self.total().saturating_sub(self.weights_bytes)
     }
 }
-
-/// The figures a run reports beside the separated model and runtime ones.
-///
-/// Section 22: *measure whole-product RSS/CPU alongside the separated model/runtime figures*. Both
-/// are here, in one value, because reporting one without the other is how a product comes to
-/// believe it costs what its smallest component costs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ProcessFigures {
-    /// The whole product's resident set: controller, workers, shared services and the model.
-    pub whole_product_rss_bytes: u64,
-    /// The model and its runtime alone.
-    pub model_rss_bytes: u64,
-    /// The whole product's processor use, in hundredths of one core.
-    pub whole_product_cpu_centis: u64,
-    /// The model and its runtime alone, in hundredths of one core.
-    pub model_cpu_centis: u64,
-}
-
-impl ProcessFigures {
-    /// Returns the product's resident set with the model's share taken out.
-    #[must_use]
-    pub const fn product_without_model_rss_bytes(&self) -> u64 {
-        self.whole_product_rss_bytes
-            .saturating_sub(self.model_rss_bytes)
-    }
-
-    /// Returns the product's processor use with the model's share taken out.
-    #[must_use]
-    pub const fn product_without_model_cpu_centis(&self) -> u64 {
-        self.whole_product_cpu_centis
-            .saturating_sub(self.model_cpu_centis)
-    }
-}

@@ -583,7 +583,7 @@ fn a_summary_is_judged_against_what_is_in_force_when_it_arrives() {
             session_id: session(1)
         })
     );
-    assert!(service.scheduler().has_summary(&session(1)));
+    assert!(service.scheduler().has_queued(&session(1)));
 }
 
 /// KR-REQ-18.02: a request for a session the service does not track, or on a host that selected no

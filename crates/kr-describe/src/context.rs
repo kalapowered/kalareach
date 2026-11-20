@@ -44,9 +44,6 @@ use crate::time::Reading;
 /// The most recent semantic events one context may carry.
 pub const MAX_RECENT_EVENTS: usize = 8;
 
-/// The longest summary one semantic event may carry, in Unicode codepoints.
-pub const MAX_EVENT_SUMMARY_CODEPOINTS: usize = 120;
-
 /// The longest piece of project text one context may carry, in Unicode codepoints.
 pub const MAX_PROJECT_TEXT_CODEPOINTS: usize = 120;
 

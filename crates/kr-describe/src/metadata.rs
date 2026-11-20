@@ -332,12 +332,6 @@ impl LabelSource {
             Self::Generated => "generated",
         }
     }
-
-    /// Returns whether text from this source is labelled generated where it is shown.
-    #[must_use]
-    pub const fn is_generated(self) -> bool {
-        matches!(self, Self::Generated)
-    }
 }
 
 /// Builds the deterministic title for a session.

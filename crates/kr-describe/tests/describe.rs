@@ -1595,7 +1595,6 @@ fn generated_text_cannot_reach_a_status_a_permission_or_a_review() {
             .expect("a label");
         assert_eq!(label.status, status, "the status is the host's, always");
         assert_eq!(label.source, LabelSource::Generated);
-        assert!(label.source.is_generated());
     }
 
     let record = store
