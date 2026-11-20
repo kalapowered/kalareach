@@ -198,7 +198,9 @@ jobs:
 
       # A level is one surface: this commit has the surface of every release at its level, taken
       # from origin's complete list of release tags, which have to be this checkout's. A commit
-      # that moves the level runs the cut's own check here too.
+      # that moves the level runs the cut's own check here too; any other commit runs
+      # scripts/check-narrower-entries.sh, which holds the rules of each entry of the narrower
+      # table to every release at the level and builds nothing while the table is empty.
       # The generator is built first, so that no tag can land between fetching the tags and
       # comparing them with origin's while it compiles; each check then fetches first, and a tag only
       # this checkout has is removed, so the comparison is with origin as it is now. All before

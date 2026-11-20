@@ -1295,17 +1295,18 @@ fn a_commit_that_moves_the_level_runs_the_cuts_check_once_and_one_that_holds_doe
         calls.set(calls.get() + 1);
         Ok(())
     };
+    let held = |_: &Path| Ok(());
     let data = repo.head(&now, &head);
-    conclude(&repo.directory, &data, &releases, true, &cut).expect("the cut's check passes");
+    conclude(&repo.directory, &data, &releases, true, &cut, &held).expect("the cut's check passes");
     assert_eq!(
         calls.get(),
         1,
         "run once for the commit that moves the level"
     );
-    conclude(&repo.directory, &data, &releases, false, &cut).expect("nothing to compare");
+    conclude(&repo.directory, &data, &releases, false, &cut, &held).expect("nothing to compare");
     assert_eq!(calls.get(), 1, "not run when it is told to leave it");
     let failing = |_: &Path| Err("the cut's check said no".to_owned());
-    let error = conclude(&repo.directory, &data, &releases, true, &failing)
+    let error = conclude(&repo.directory, &data, &releases, true, &failing, &held)
         .expect_err("its failure is the check's");
     assert!(error.contains("said no"), "{error}");
 
@@ -1326,9 +1327,159 @@ fn a_commit_that_moves_the_level_runs_the_cuts_check_once_and_one_that_holds_doe
         &tags,
         true,
         &cut,
+        &held,
     )
     .expect("the level holds");
     assert_eq!(calls.get(), 0);
+}
+
+/// The held check of the narrower table runs for a commit at a level that has a release, with the
+/// cut asked for or not, and for no commit that moves the level; what it says fails the run.
+#[test]
+fn the_narrower_entries_are_held_for_a_commit_at_a_level_that_has_a_release() {
+    use crate::in_level::conclude;
+    use std::cell::Cell;
+
+    let now = Tree::the_level();
+    let level = Repo::new("held-level");
+    let kept = level.commit(&now, "a release of the level");
+    level.release("0.76.0", &kept);
+    let after = level.commit(&now, "after");
+    let tags = inventory(&level.directory).expect("an inventory");
+    let data = level.head(&now, &after);
+    let held_calls = Cell::new(0);
+    let held = |_: &Path| {
+        held_calls.set(held_calls.get() + 1);
+        Ok(())
+    };
+    let cut_calls = Cell::new(0);
+    let cut = |_: &Path| {
+        cut_calls.set(cut_calls.get() + 1);
+        Ok(())
+    };
+    conclude(&level.directory, &data, &tags, true, &cut, &held).expect("the level holds");
+    assert_eq!(held_calls.get(), 1, "run with the cut asked for");
+    conclude(&level.directory, &data, &tags, false, &cut, &held).expect("the level holds");
+    assert_eq!(held_calls.get(), 2, "run without the cut");
+    assert_eq!(
+        cut_calls.get(),
+        0,
+        "the cut's check is for a commit that moves the level"
+    );
+    let failing = |_: &Path| Err("the held check said no".to_owned());
+    let error = conclude(&level.directory, &data, &tags, true, &cut, &failing)
+        .expect_err("its failure is the run's");
+    assert!(error.contains("held check said no"), "{error}");
+
+    // A commit that moves the level runs the cut's check and not this one, and so does the first
+    // commit that is tagged: its own tag leaves no other release at the level.
+    let moving = Repo::new("held-moves");
+    let old = Tree {
+        version: "0.75.0",
+        ..Tree::before_the_lease()
+    };
+    let first = moving.commit(&old, "an older level");
+    moving.release("0.75.0", &first);
+    let next = moving.commit(&now, "the next level");
+    let held_calls = Cell::new(0);
+    let held = |_: &Path| {
+        held_calls.set(held_calls.get() + 1);
+        Ok(())
+    };
+    let tags = inventory(&moving.directory).expect("an inventory");
+    for cut in [true, false] {
+        conclude(
+            &moving.directory,
+            &moving.head(&now, &next),
+            &tags,
+            cut,
+            &|_: &Path| Ok(()),
+            &held,
+        )
+        .expect("the level moves");
+    }
+    moving.release("0.76.0", &next);
+    let tags = inventory(&moving.directory).expect("an inventory");
+    for cut in [true, false] {
+        conclude(
+            &moving.directory,
+            &moving.head(&now, &next),
+            &tags,
+            cut,
+            &|_: &Path| Ok(()),
+            &held,
+        )
+        .expect("the first tagged commit moves the level");
+    }
+    assert_eq!(
+        held_calls.get(),
+        0,
+        "no commit that moves the level runs it"
+    );
+}
+
+/// The releases of a level that the held check reads: every tag of the level but the commit's own,
+/// one that no history reaches too, and none of another level; and not before the checkout's tags
+/// are origin's.
+#[test]
+fn the_releases_of_the_level_are_listed_apart_from_the_commits_own_and_after_origin_agrees() {
+    use crate::in_level::level_releases;
+
+    let now = Tree::the_level();
+    let repo = Repo::new("level-releases");
+    let older = Tree {
+        version: "0.75.0",
+        ..Tree::before_the_lease()
+    };
+    let other_level = repo.commit(&older, "an older level");
+    repo.release("0.75.0", &other_level);
+    let first = repo.commit(&now, "the first of the level");
+    let first_tag = repo.release("0.76.0", &first);
+    // A release no history of the head reaches.
+    repo.git(&["checkout", "-q", "-b", "aside", &first]);
+    let aside = repo.commit(&now, "a release made on another branch");
+    let aside_tag = repo.release("0.76.1", &aside);
+    repo.git(&["checkout", "-q", "main"]);
+    let head = repo.commit(&now, "the commit under test");
+    let own_tag = repo.release("0.76.2", &head);
+    let level = CompatibilityLevel::of(PackageVersion::new(0, 76, 0));
+
+    let mut expected = vec![
+        format!("{first_tag} {first}"),
+        format!("{aside_tag} {aside}"),
+    ];
+    expected.sort();
+    assert_eq!(
+        level_releases(&repo.directory, level, &head).expect("a list"),
+        expected,
+        "the commit's own tag ({own_tag}) and the tag of another level are not listed"
+    );
+
+    // A tag only origin has, and a tag only this checkout has, fail before any list.
+    let late = repo.commit(&now, "a release this checkout loses");
+    let lost = repo.release("0.76.3", &late);
+    repo.git(&["tag", "-d", &lost]);
+    let error = level_releases(&repo.directory, level, &head).expect_err("origin has one more");
+    assert!(
+        error.contains(&format!("{lost} is on origin and not in this checkout")),
+        "{error}"
+    );
+    repo.git(&[
+        "fetch",
+        "-q",
+        "--force",
+        "origin",
+        &format!("+refs/tags/{lost}:refs/tags/{lost}"),
+    ]);
+    let local_only = repo.tag_here("0.76.4", &late);
+    let error =
+        level_releases(&repo.directory, level, &head).expect_err("this checkout has one more");
+    assert!(
+        error.contains(&format!(
+            "{local_only} is in this checkout and not on origin"
+        )),
+        "{error}"
+    );
 }
 
 /// The cut compares every kept release of the retained level with what the level kept, from the
