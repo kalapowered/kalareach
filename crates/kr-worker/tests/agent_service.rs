@@ -1297,38 +1297,6 @@ fn offer_approval_until<U: UpstreamDispatch + 'static>(
         .resource_id
 }
 
-/// Offers one more approval on the typed upstream's connection, as a decoder has interpreted it:
-/// the native request `native_id` and its one decision.
-fn offer_another_approval(host: &Host, native_id: u64) -> kr_protocol::ids::PendingResourceId {
-    let broker = host.service.broker();
-    let opaque = broker
-        .forward_native(
-            kr_protocol::ids::GatewayConnectionId::new(1),
-            format!(r#"{{"id":{native_id},"method":"session/request_permission"}}"#).as_bytes(),
-            TimestampMs::new(2),
-        )
-        .expect("forwarded")
-        .1
-        .expect("it expects a response");
-    broker
-        .interpret(
-            binding(),
-            opaque.resource_id,
-            kr_protocol::broker::DecodedProjection {
-                schema_version: "kr-approval/1".to_owned(),
-                summary: "the agent wants to write another file".to_owned(),
-                decisions: vec![kr_protocol::broker::OfferedDecision {
-                    option_id: "allow".to_owned(),
-                    label: "Allow".to_owned(),
-                }],
-            },
-            None,
-            TimestampMs::new(3),
-        )
-        .expect("interpreted")
-        .resource_id
-}
-
 fn record_evidence(
     host: &Host,
     name: &str,
@@ -4433,7 +4401,7 @@ async fn kr_req_09_an_answer_whose_transport_blocks_is_uncertain_before_its_call
 
 /// KR-REQ-12.18: only a channel's own end is marked. An approval answer a typed upstream took and
 /// never acknowledged within the worker's bound is an unknown outcome that stores no provenance, and
-/// it still holds the next answer of its subject: nothing second reaches the upstream.
+/// it still holds the next answer to the same approval: nothing second reaches the upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_18_a_typed_answer_that_passes_the_workers_bound_is_not_a_channel_end() {
     let host = host().await;
@@ -4443,13 +4411,12 @@ async fn kr_req_12_18_a_typed_answer_that_passes_the_workers_bound_is_not_a_chan
         carried: std::sync::atomic::AtomicUsize::new(0),
     });
     register(&host, None);
-    let first = offer_approval(&host, Arc::clone(&upstream));
-    let second = offer_another_approval(&host, 12);
+    let approval = offer_approval(&host, Arc::clone(&upstream));
     host.service
         .set_upstream_deadline_for_tests(std::time::Duration::from_secs(1));
     let mut client = cli(&host).await;
 
-    let mutation = approval_mutation(&client, &host, 72, first);
+    let mutation = approval_mutation(&client, &host, 72, approval);
     let action_id = mutation.action_id;
     let Outcome::Error(error) = send(&mut client, mutation).await else {
         panic!("an answer nobody acknowledged is not applied");
@@ -4465,14 +4432,17 @@ async fn kr_req_12_18_a_typed_answer_that_passes_the_workers_bound_is_not_a_chan
         "a typed upstream's answer that passed the bound is no channel's, so it records no mark"
     );
 
-    let next = approval_mutation(&client, &host, 73, second);
+    // A new action answering the same approval: the subject of an approval's answer is the approval
+    // itself, so the earlier unknown outcome stands in this one's way, and an answer to another
+    // approval would not.
+    let next = approval_mutation(&client, &host, 73, approval);
     let Outcome::Error(held) = send(&mut client, next).await else {
         panic!("an answer after an outcome nobody can establish is held back");
     };
     assert_eq!(
         held.code,
         ErrorCode::DraftConflict,
-        "a typed upstream's unknown outcome holds the next answer of its subject"
+        "a typed upstream's unknown outcome holds the next answer to the same approval"
     );
     assert_eq!(
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
