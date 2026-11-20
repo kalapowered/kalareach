@@ -29,11 +29,10 @@
 //! # Two limits, and which one binds
 //!
 //! Section 20 gives the public descriptor two defaults: 64 KiB and 128 recipients. The first
-//! applicable one binds, and in this encoding that is the byte limit, at about
-//! a hundred recipients rather than at 128, because a sealed key wrap
-//! carries its whole authenticated context beside the box. The exact figure moves with the
-//! generation's integer width, so [`seal_archive`] enforces the encoded size rather than a count
-//! and names the limit it hit.
+//! applicable one binds, and in this encoding that is the byte limit, at about a hundred
+//! recipients rather than at 128, because a sealed key wrap carries its whole authenticated
+//! context beside the box. The exact figure moves with the generation's integer width, so
+//! [`seal_archive`] enforces the encoded size rather than a count and names the limit it hit.
 //!
 //! # What a backup carries
 //!
