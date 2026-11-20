@@ -140,6 +140,38 @@ describe('a message handed over to the channel store', () => {
     expect(of.drafts.all()).toEqual([])
   })
 
+  const failingKeeps: readonly [
+    string,
+    (of: World) => void,
+    ((held: HeldPrompt) => Promise<boolean>) | null
+  ][] = [
+    [
+      'a refusal that is a local failure',
+      (of) => {
+        of.messages.refuseKeeps({ code: 'RESOURCE_UNAVAILABLE', message: 'refused' })
+      },
+      null
+    ],
+    ['a keep that rejects', () => undefined, () => Promise.reject(new Error('the keep rejected'))]
+  ]
+  it.each(failingKeeps)(
+    'ends as an unknown send for %s and leaves the press record stored',
+    async (_name, arrange, rejecting) => {
+      const of = world()
+      arrange(of)
+      const { book, token } = await pressed(of)
+      const record = token.pressed()[0]
+      const told: (string | null)[] = []
+      book.endSend(token, 'handed_over', LOCAL, (id) => told.push(id), rejecting ?? keeping(of))
+      await book.settled()
+      expect(book.handedOver(LOCAL)).toBeNull()
+      expect(book.draft(MAIN).text).toBe('the message')
+      expect(told).toHaveLength(1)
+      // The press record is the one that stays, with the text: the composer takes it back under the same identity.
+      expect(of.drafts.all().map((draft) => [draft.id, draft.text])).toEqual([[record?.id, 'the message']])
+    }
+  )
+
   it('owes the removal of the draft when the discard fails after the keep, and makes it at the next start', async () => {
     const of = world()
     const { book, token } = await pressed(of)
@@ -214,6 +246,7 @@ describe('a message handed over to the channel store', () => {
     book.endSend(token, 'handed_over', LOCAL, undefined, keeping(of, seen))
     await book.settled()
     expect(seen[0]?.drafts.map((ref) => ref.id)).toEqual(before.map((draft) => draft.id))
+    expect(seen[0]?.drafts.map((ref) => ref.revision)).toEqual(before.map((draft) => draft.revision))
     expect(of.drafts.all()).toEqual([])
   })
 
