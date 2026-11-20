@@ -1280,7 +1280,7 @@ fn a_damaged_ledger_is_set_aside_as_a_copy_and_replaced_by_the_rebuilt_list() {
     let kept = window.draft("kept text");
     let stays = window.draft("a draft nobody sent");
     window
-        .keep(message(1, "kept text", &[kept.clone()]))
+        .keep(message(1, "kept text", std::slice::from_ref(&kept)))
         .expect("kept");
     let damaged = b"[ truncated".to_vec();
     let _clock = testing::clock(data.path(), 1_700_000_000_123);
@@ -1406,7 +1406,7 @@ fn a_second_window_after_a_set_aside_reads_the_rebuilt_ledger_and_adopts_no_sour
     let second = Window::over(data.path());
     let kept = first.draft("kept text");
     first
-        .keep(message(1, "kept text", &[kept.clone()]))
+        .keep(message(1, "kept text", std::slice::from_ref(&kept)))
         .expect("kept");
     second
         .drafts()
@@ -1487,7 +1487,7 @@ fn a_set_aside_loses_the_removal_of_a_message_the_person_removed() {
     let window = Window::over(data.path());
     let kept = window.draft("kept text");
     window
-        .keep(message(1, "kept text", &[kept.clone()]))
+        .keep(message(1, "kept text", std::slice::from_ref(&kept)))
         .expect("kept");
     window
         .call(
