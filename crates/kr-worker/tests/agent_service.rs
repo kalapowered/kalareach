@@ -7500,8 +7500,10 @@ async fn kr_req_12_26_a_prompt_still_queued_at_the_workers_bound_is_a_channel_en
     let mut channel = ServedChannel::open(&host).await;
     channel.relay(&host, "abcde").await;
     let mut client = cli(&host).await;
+    // The bound covers the hop to the thread that queues the message, so it is long enough for a
+    // slow hop: what makes the bound pass first is the pause before the write.
     host.service
-        .set_upstream_deadline_for_tests(std::time::Duration::from_secs(1));
+        .set_upstream_deadline_for_tests(std::time::Duration::from_secs(3));
     let (arrived, release) = host.service.broker().pause_before_channel_write();
 
     let window = client.action_window().action_window_id.clone();
@@ -7698,6 +7700,71 @@ async fn kr_req_12_26_a_prompt_inside_its_window_is_marked_as_a_channels_by_its_
     assert_eq!(
         channel.next().await["params"]["content"],
         "held after the marker"
+    );
+}
+
+/// KR-REQ-12.26: an answer whose wait ended before the channel's queue took it is refused as not
+/// sent, in the words for an answer, and its request is pending again. The call that queues it is
+/// held before its queue and let go after the worker stopped waiting: the late queue is refused, so
+/// the first answer is never written and the next answer is the one that goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_an_answer_the_queue_had_not_taken_when_the_worker_stopped_waiting_is_pending_again()
+ {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let resource_id = channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+    host.service
+        .set_upstream_deadline_for_tests(std::time::Duration::from_secs(1));
+    let (arrived, release) = host.service.broker().pause_before_submit();
+
+    let first = channel_answer(&client, &host, &channel.connector, 60, resource_id, "allow");
+    let first_id = first.action_id;
+    let Outcome::Error(error) = send(&mut client, first).await else {
+        panic!("an answer the queue never took is refused");
+    };
+    assert_eq!(
+        error.message,
+        "The worker stopped waiting before the channel's queue took the answer. Nothing was sent.",
+        "the person is told the answer was not sent, in the words for an answer"
+    );
+    assert_ne!(
+        error.code,
+        ErrorCode::OutcomeUnknown,
+        "nothing went out, so nothing is unknown"
+    );
+    assert!(
+        arrived.try_recv().is_ok(),
+        "the call was held before its queue"
+    );
+    assert_eq!(
+        receipt(&mut client, first_id).await.state,
+        ReceiptState::Refused,
+        "an answer nothing was sent for is refused and not unknown"
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(resource_id)
+            .expect("held")
+            .state,
+        kr_protocol::gateway::PendingState::Pending,
+        "the request is pending again"
+    );
+
+    release.send(()).expect("the held call is let go");
+    let second = channel_answer(&client, &host, &channel.connector, 61, resource_id, "deny");
+    let Outcome::Error(error) = send(&mut client, second).await else {
+        panic!("the second answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "abcde", "behavior": "deny" }
+        }),
+        "the first answer is never written: the late queue is refused"
     );
 }
 

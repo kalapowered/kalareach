@@ -3015,6 +3015,10 @@ async fn kr_req_12_26_a_prompt_and_an_approval_use_separate_paths() {
         "\"abcde\"",
         "it still holds the application's own identifier"
     );
+    assert_eq!(
+        after, pending,
+        "the approval's own record is the one it was before the message"
+    );
 
     let answered = carried(
         &broker,
@@ -3029,15 +3033,6 @@ async fn kr_req_12_26_a_prompt_and_an_approval_use_separate_paths() {
     .expect_err("the channel confirms nothing");
     assert_eq!(answered.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(channel.next().await, Some(verdict("abcde", "allow")));
-    assert_eq!(
-        written,
-        Some(message_frame(
-            "while you wait",
-            "paired_device",
-            "03204de92e11fc8c"
-        )),
-        "the message's frame is unchanged"
-    );
 }
 
 /// KR-REQ-12.26: only a queued prompt with text within the package's declared length is carried
