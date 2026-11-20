@@ -449,7 +449,7 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
 fn the_digest_of_a_name_only_the_scan_gives_moves_on_a_token() {
     let digests = |import: &str, call: &str, constant: &str| {
         let lib = format!(
-            "use kr_protocol::Method::{import};\nunnamed!(\"{call}\");\nimpl T for [u8] {{ const NAME: &'static str = \"{constant}\"; }}\n"
+            "use kr_protocol::Method::{import};\nmacro_rules! unnamed {{ ($($t:tt)*) => {{}}; }}\nunnamed!(\"{call}\");\nimpl T for [u8] {{ const NAME: &'static str = \"{constant}\"; }}\n"
         );
         let folder = small_tree(&lib);
         let tree = Tree::at(folder.path()).expect("the tree");
@@ -520,6 +520,14 @@ mod product_commented;
 mod support_two;
 #[cfg(test)]
 mod r#loop;
+#[cfg(all(test, unix))]
+mod t_all;
+#[cfg(not(not(test)))]
+mod t_not;
+#[cfg(not(all(test, unix)))]
+mod p_not;
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+mod p_any;
 "##;
 
 #[test]
@@ -561,6 +569,11 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
         ("shared2.rs", sends("from_shared_two", "AgentTurnSteer")),
         // A test module with a raw name is the file of the name without `r#`.
         ("loop.rs", sends("from_loop", "AgentTurnCancel")),
+        // Conditions no configuration without `test` enables, and ones some configuration does.
+        ("t_all.rs", sends("from_t_all", "AgentTurnCancel")),
+        ("t_not.rs", sends("from_t_not", "AgentTurnCancel")),
+        ("p_not.rs", sends("from_p_not", "AgentTurnSteer")),
+        ("p_any.rs", sends("from_p_any", "AgentTurnSteer")),
     ] {
         write(
             folder.path(),
@@ -572,6 +585,8 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
         "from_a",
         "from_beside",
         "from_inner_d",
+        "from_p_any",
+        "from_p_not",
         "from_shared",
         "from_shared_two",
         "from_wide",
@@ -664,16 +679,20 @@ fn a_root_lookup_in_a_crate_that_is_absent_or_unreadable_says_so_and_a_failed_fo
 
 #[test]
 fn a_scan_reads_only_what_it_may_hold_a_sighting_in() {
-    // A file with none of the words is not parsed, so what does not parse there raises nothing.
+    // A file that does not hold a word a sighting is made of is not scanned for one.
     let quiet = small_tree("mod other;\npub fn quiet() {}\n");
-    write(quiet.path(), "crates/kr-sender/src/other.rs", "fn (\n");
+    write(
+        quiet.path(),
+        "crates/kr-sender/src/other.rs",
+        "fn quiet_two() {}\n",
+    );
     let tree = Tree::at(quiet.path()).expect("the tree");
     assert_eq!(
         tree.sightings(&|krate| krate == "kr_sender"),
         Ok(Vec::new())
     );
     // A file with a word that does not parse is an error.
-    let loud = small_tree("pub fn quiet() {}\n");
+    let loud = small_tree("mod other;\npub fn quiet() {}\n");
     write(
         loud.path(),
         "crates/kr-sender/src/other.rs",
@@ -683,6 +702,11 @@ fn a_scan_reads_only_what_it_may_hold_a_sighting_in() {
     assert!(tree.sightings(&|krate| krate == "kr_sender").is_err());
     // The crates the caller leaves out are not scanned.
     let two = small_tree("pub fn quiet() {}\n");
+    write(
+        two.path(),
+        "crates/kr-worker/src/lib.rs",
+        "pub fn worker() {}\nmod extra;\n",
+    );
     write(
         two.path(),
         "crates/kr-worker/src/extra.rs",
@@ -733,6 +757,11 @@ fn a_sighting_in_the_companions_crate_under_apps_is_found() {
 fn the_reader_of_a_tree_does_not_scan_the_receiver_crates() {
     use super::narrower::Reader;
     let folder = small_tree("fn sends() { let _ = Method::AgentTurnSteer; }\n");
+    write(
+        folder.path(),
+        "crates/kr-worker/src/lib.rs",
+        "pub fn worker() {}\nmod extra;\n",
+    );
     write(
         folder.path(),
         "crates/kr-worker/src/extra.rs",

@@ -71,10 +71,11 @@ const PLATFORMS: [Platform; 5] = [
 ];
 
 /// The atoms that any configuration may set either way, with or without a value.
-const FREE: [&str; 6] = [
+const FREE: [&str; 7] = [
     "debug_assertions",
     "feature",
     "target_arch",
+    "target_feature",
     "target_pointer_width",
     "target_endian",
     "target_env",
@@ -109,6 +110,7 @@ impl Condition {
     /// configuration enables them all. `at` names the file for the error.
     pub fn within(&self, attrs: &[Attribute], at: &str) -> Result<Option<Self>, String> {
         let mut added = Vec::new();
+        let mut sets = None;
         for attribute in attrs {
             if attribute.path().is_ident("cfg") {
                 let meta = attribute
@@ -119,13 +121,9 @@ impl Condition {
                 let listed = attribute
                     .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
                     .map_err(|_| unreadable(at, &attribute.to_token_stream().to_string()))?;
-                let adds = listed.iter().skip(1).any(|meta| {
-                    ["cfg", "cfg_attr", "path"]
-                        .iter()
-                        .any(|name| meta.path().is_ident(name))
-                });
-                if adds {
-                    return Err(format!(
+                let adds = sets_path_or_condition(&listed);
+                if adds && sets.is_none() {
+                    sets = Some(format!(
                         "{at}: the scan does not read a cfg_attr that sets a path or a condition ({})",
                         attribute.to_token_stream()
                     ));
@@ -133,16 +131,35 @@ impl Condition {
             }
         }
         if added.is_empty() {
-            return Ok(Some(self.clone()));
+            return match sets {
+                Some(error) => Err(error),
+                None => Ok(Some(self.clone())),
+            };
         }
         let mut all = (*self.0).clone();
         all.extend(added);
-        if enabled(&all, at)? {
-            Ok(Some(Self(Rc::new(all))))
-        } else {
-            Ok(None)
+        // What no configuration builds is not read, whatever else is written on it.
+        if !enabled(&all, at)? {
+            return Ok(None);
+        }
+        match sets {
+            Some(error) => Err(error),
+            None => Ok(Some(Self(Rc::new(all)))),
         }
     }
+}
+
+/// Whether the attributes a `cfg_attr` adds (after its predicate) set a path or a condition,
+/// looking into a `cfg_attr` it holds.
+fn sets_path_or_condition(listed: &Punctuated<Meta, Token![,]>) -> bool {
+    listed.iter().skip(1).any(|meta| match meta {
+        Meta::List(list) if list.path.is_ident("cfg_attr") => list
+            .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            .map_or(true, |inner| sets_path_or_condition(&inner)),
+        _ => ["cfg", "path"]
+            .iter()
+            .any(|name| meta.path().is_ident(name)),
+    })
 }
 
 fn unreadable(at: &str, text: &str) -> String {
