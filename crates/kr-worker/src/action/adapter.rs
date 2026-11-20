@@ -500,11 +500,8 @@ mod windows {
     }
 }
 
-/// An adapter that answers with a reading a caller supplied.
-///
-/// It exists for two callers: a test that needs a particular platform state, and the fixture
-/// check, which replays recorded platform values through the same classifier the real adapter
-/// uses.
+/// An adapter that answers with a reading a caller supplied, for tests. Only this crate's tests
+/// and the `testing` feature compile it; no shipped build does.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Clone, Debug)]
 pub struct RecordedTimeAdapter {
