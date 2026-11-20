@@ -131,8 +131,8 @@ impl Answered {
 
 /// A page of retained output, or a snapshot of an agent's retained entries, answered with none of
 /// its text and the range it covered said to be gone, as privacy mode left it; a context for a
-/// voice call answered with the refusal a read that privacy mode moved under is given; and any
-/// other answer as it is.
+/// voice call answered with the refusal a read that privacy mode moved under is given; any other
+/// result, a receipt's among them, refused as one that cannot be shown; and a refusal as it is.
 ///
 /// An answer that is not one this host can read is not passed on in its place.
 fn without_its_output(frame: &ControlFrame, method: Method) -> ControlFrame {
@@ -151,16 +151,16 @@ fn without_its_output(frame: &ControlFrame, method: Method) -> ControlFrame {
             ProtocolError::new(ErrorCode::ResourceUnavailable, crate::voice::CONTEXT_MOVED),
         );
     }
-    let withheld = if method == Method::AgentSnapshot {
-        value
+    let withheld = match method {
+        Method::AgentSnapshot => value
             .to_typed::<kr_protocol::agent::AgentSnapshotResult>()
             .ok()
-            .and_then(|snapshot| ParamsValue::from_typed(&withheld_snapshot(snapshot)).ok())
-    } else {
-        value
+            .and_then(|snapshot| ParamsValue::from_typed(&withheld_snapshot(snapshot)).ok()),
+        Method::HistoryPage => value
             .to_typed::<kr_protocol::recovery::HistoryPageResult>()
             .ok()
-            .and_then(|page| ParamsValue::from_typed(&crate::service::withheld_page(&page)).ok())
+            .and_then(|page| ParamsValue::from_typed(&crate::service::withheld_page(&page)).ok()),
+        _ => None,
     };
     match withheld {
         Some(value) => ControlFrame::Response(Response {

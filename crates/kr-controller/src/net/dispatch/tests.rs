@@ -1931,7 +1931,7 @@ async fn a_description_is_written_whole_under_the_privacy_state_it_was_read_in()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_description_is_withheld_when_privacy_mode_starts_before_it_is_sent() {
     use kr_protocol::describe::{LabelSource, SessionDescribeResult};
-    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
     let world = world_holding_a_generated_description().await;
     let controller = &world.controller;
@@ -1961,6 +1961,17 @@ async fn a_description_is_withheld_when_privacy_mode_starts_before_it_is_sent() 
         }
     );
     assert!(stands, "the connection stands");
+    assert!(
+        matches!(
+            &kept.frames()[0],
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "the device is told the answer without what a model wrote: {:?}",
+        kept.frames()[0]
+    );
     let withheld: SessionDescribeResult = answered(kept.frames()[0].clone());
     assert_eq!(
         withheld.source,
@@ -2084,7 +2095,7 @@ async fn a_snapshot_is_written_whole_under_the_privacy_state_it_was_read_in() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_a_worker_answered_is_withheld_when_privacy_mode_starts_before_it_is_sent() {
     use kr_protocol::agent::AgentSnapshotResult;
-    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
     let snapshot = a_snapshot_of_retained_entries();
     let world = worker_answering_a_snapshot_with(&snapshot).await;
@@ -2115,6 +2126,17 @@ async fn a_snapshot_a_worker_answered_is_withheld_when_privacy_mode_starts_befor
         }
     );
     assert!(stands, "the connection stands");
+    assert!(
+        matches!(
+            &kept.frames()[0],
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "the device is told the entries are gone: {:?}",
+        kept.frames()[0]
+    );
     let withheld: AgentSnapshotResult = answered(kept.frames()[0].clone());
     assert!(
         withheld.entries.is_empty(),
@@ -2132,6 +2154,55 @@ async fn a_snapshot_a_worker_answered_is_withheld_when_privacy_mode_starts_befor
         kr_protocol::scalars::U64::ZERO,
         "a count of the removed generation is no fact"
     );
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: an agent's retained entries that a worker answered while privacy mode was already
+/// on are not published, though the worker was never told of the mode: the device is told the
+/// entries are gone, and nothing is waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_read_with_privacy_mode_already_on_is_withheld() {
+    use kr_protocol::agent::AgentSnapshotResult;
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    let snapshot = a_snapshot_of_retained_entries();
+    let world = worker_answering_a_snapshot_with(&snapshot).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 79);
+
+    privacy_mode_is_turned_on(controller).await;
+    let answer = connection
+        .answer_now(ControlFrame::Request(snapshot_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let stands = connection.write_answer(connection.output(), answer).await;
+    assert!(stands, "the connection stands");
+    assert!(
+        matches!(
+            &kept.frames()[0],
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "the device is told the entries are gone: {:?}",
+        kept.frames()[0]
+    );
+    let withheld: AgentSnapshotResult = answered(kept.frames()[0].clone());
+    assert!(
+        withheld.entries.is_empty(),
+        "no entry goes while privacy mode is on: {withheld:?}"
+    );
+    assert!(withheld.history_gap, "the range is said to be gone");
+    assert_eq!(
+        withheld.continuation,
+        Nullable::null(),
+        "the cursor into the removed entries goes"
+    );
+    assert_eq!(withheld.binding, snapshot.binding);
     world.serving.abort();
 }
 
@@ -2355,6 +2426,13 @@ async fn a_voice_call_over(
     controller.voice().attach_provider(Some(std::sync::Arc::new(
         voice_provider::OfflineProvider::default(),
     )));
+    // These cases are about the write of an answer, not about how fast the session's worker is
+    // reached: its first link can take longer than the stated wait on a busy machine.
+    *controller.voice_budgets.lock().expect("the voice budgets") =
+        crate::service::voice_actions::VoiceBudgets {
+            read: std::time::Duration::from_secs(120),
+            ..crate::service::voice_actions::VoiceBudgets::STATED
+        };
     let device_id = connection.device.device_id;
     let coordinator = controller.voice().coordinator();
     let revision = controller.policy().authority_revision();
@@ -2456,7 +2534,7 @@ async fn a_voice_context_written_after<Between: std::future::Future<Output = ()>
     kept.frames()[0].clone()
 }
 
-/// The refusal a context that privacy mode moved under is given.
+/// The words and code of the refusal a context that privacy mode moved under is given.
 fn a_context_refused_as_moved(frame: &kr_protocol::envelope::ControlFrame) {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
@@ -2522,6 +2600,16 @@ async fn a_voice_context_is_refused_when_privacy_mode_starts_before_it_is_sent()
         privacy_mode_is_turned_on(controller)
     })
     .await;
+    assert!(
+        matches!(
+            &frame,
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(_),
+                ..
+            })
+        ),
+        "no context goes once privacy mode has moved: {frame:?}"
+    );
     a_context_refused_as_moved(&frame);
     world.serving.abort();
 }
@@ -2625,6 +2713,16 @@ async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes
         privacy_mode_is_turned_off(controller)
     })
     .await;
+    assert!(
+        matches!(
+            &frame,
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(_),
+                ..
+            })
+        ),
+        "no context goes once privacy mode has moved: {frame:?}"
+    );
     a_context_refused_as_moved(&frame);
     world.serving.abort();
 }
@@ -2647,6 +2745,16 @@ async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes
         privacy_mode_is_turned_on(controller).await;
     })
     .await;
+    assert!(
+        matches!(
+            &frame,
+            kr_protocol::envelope::ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: kr_protocol::envelope::Outcome::Error(_),
+                ..
+            })
+        ),
+        "no context goes once privacy mode has moved: {frame:?}"
+    );
     a_context_refused_as_moved(&frame);
     world.serving.abort();
 }
@@ -2661,8 +2769,8 @@ async fn worker_answering_a_receipt() -> crate::service::a_close_a_worker_never_
     let world = answering_worker(
         Arc::new(move |request: &kr_protocol::envelope::Request| {
             match request.method.method()? {
-                // The daemon passes a worker's answer on as it came, so any answer stands for
-                // the receipt here.
+                // The case answers with an empty value: the daemon passes a worker's answer on as
+                // it came, and an answer with no receipt member is not changed by the removal.
                 Method::ActionRead => Some(ParamsValue::empty()),
                 _ => None,
             }
