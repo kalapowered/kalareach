@@ -10508,11 +10508,15 @@ async fn stand_the_writer_in_a_look(
     release
 }
 
+/// What a step run on a thread or a task sent, waited for up to [`SOON`] with a bound of the
+/// standard library's own, or nothing where the step had not answered by then. A wait on the
+/// runtime's clock could stand behind the very stop the cases below are about.
+fn answered_within_soon<T>(answered: &std::sync::mpsc::Receiver<T>) -> Option<T> {
+    answered.recv_timeout(SOON).ok()
+}
+
 /// Has `client` ask for the keys for `attachment_id` from a task of its own, and returns the end
 /// the answer arrives on.
-///
-/// A case waits on that end with a bound of the standard library's own: a wait on the runtime's
-/// clock could stand behind the very stop the case is about.
 fn acquiring(
     mut client: LocalClient,
     wired: &Wired,
@@ -10597,9 +10601,9 @@ async fn a_takeover_returns_its_epoch_while_the_writer_stands_in_a_look_at_the_f
     let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
 
     let answered = acquiring(second, &wired, challenger);
-    let taken = answered.recv_timeout(SOON);
+    let taken = answered_within_soon(&answered);
     assert!(
-        taken.is_ok(),
+        taken.is_some(),
         "the takeover was not answered while the writer stood in the look at the floor's name"
     );
     let taken = taken.expect("answered");
@@ -10660,9 +10664,9 @@ async fn a_release_of_the_keys_completes_while_the_writer_stands_in_a_look_at_th
     let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
 
     let answered = releasing(client, &wired, holder, epoch);
-    let released = answered.recv_timeout(SOON);
+    let released = answered_within_soon(&answered);
     assert!(
-        released.is_ok(),
+        released.is_some(),
         "the release was not answered while the writer stood in the look at the floor's name"
     );
     let lease = released.expect("answered").lease;
