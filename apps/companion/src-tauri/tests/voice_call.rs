@@ -8399,6 +8399,7 @@ async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leav
         let mut scene = own_scene(own_timings()).await;
         let openai = scene.openai.clone().expect("an own-key scene");
         let prepared = scene.prepared().await;
+        openai.answer_close(false);
         openai.script_hangup(
             kr_client::services::own_voice::stand_in::HangupScript::Answer(500, None),
         );
@@ -8593,6 +8594,7 @@ async fn a_call_left_to_the_host_stays_owed_past_its_grant_until_the_host_says_i
     // The host revokes the live call's grant and the provider does not confirm the closure: that is
     // no word that the call is closed. The host holds no call by the other name, and a host that
     // holds none is no word either.
+    openai.answer_close(false);
     openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Answer(500, None));
     relaunched.host_reached(this_host.0, this_host.1, connection.session());
     tokio::time::timeout(WATCHDOG, async {
