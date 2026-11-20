@@ -1855,6 +1855,124 @@ async fn a_page_a_worker_answered_is_withheld_when_privacy_mode_starts_before_it
     world.serving.abort();
 }
 
+/// A daemon whose store holds a description a model wrote of the session its worker serves.
+async fn world_holding_a_generated_description()
+-> crate::service::a_close_a_worker_never_answers::Silent {
+    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    world
+        .controller
+        .descriptions()
+        .store()
+        .publish(
+            &world.session_id,
+            &crate::describe::tests::generated(
+                "Pairing check",
+                kr_worker::privacy::PrivacyGeneration::new(0),
+            ),
+            900,
+        )
+        .expect("a description");
+    world
+}
+
+/// A device paired with a grant that reaches the whole of a session, and a connection of its own
+/// that keeps what it is written.
+fn describing_connection(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    byte: u8,
+) -> (super::RemoteConnection, std::sync::Arc<Kept>) {
+    let viewer = paired(controller, byte, |_| {});
+    let kept = Kept::watching(controller.privacy.state().clone());
+    let connection = super::RemoteConnection::for_test_writing_to(
+        controller,
+        viewer,
+        Box::new(std::sync::Arc::clone(&kept)),
+    );
+    (connection, kept)
+}
+
+fn describe_request_of(session_id: SessionId, request_id: u64) -> kr_protocol::envelope::Request {
+    device_request(
+        request_id,
+        Method::SessionDescribe,
+        &kr_protocol::describe::SessionDescribeParams { session_id },
+    )
+}
+
+/// KR-REQ-24.28: a description a model wrote of a session goes to a device whole when no change of
+/// privacy mode falls between the read and the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_description_is_written_whole_under_the_privacy_state_it_was_read_in() {
+    use kr_protocol::describe::{LabelSource, SessionDescribeResult};
+    use kr_protocol::envelope::ControlFrame;
+
+    let world = world_holding_a_generated_description().await;
+    let controller = &world.controller;
+    let (connection, kept) = describing_connection(controller, 63);
+
+    let answer = connection
+        .answer_now(ControlFrame::Request(describe_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let stands = connection.write_answer(connection.output(), answer).await;
+    assert!(stands, "the connection stands");
+    let written: SessionDescribeResult = answered(kept.frames()[0].clone());
+    assert_eq!(written.source, LabelSource::Generated, "{written:?}");
+    assert_eq!(written.title, "Pairing check", "{written:?}");
+    assert!(written.activity_text.0.is_some(), "{written:?}");
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: a description a model wrote that was read while privacy mode was off is not
+/// published after privacy mode has started, and the device is told the answer without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_description_is_withheld_when_privacy_mode_starts_before_it_is_sent() {
+    use kr_protocol::describe::{LabelSource, SessionDescribeResult};
+    use kr_protocol::envelope::ControlFrame;
+
+    let world = world_holding_a_generated_description().await;
+    let controller = &world.controller;
+    let (connection, kept) = describing_connection(controller, 64);
+
+    // Read while privacy mode is off, then held at the writer while the mode starts.
+    let answer = connection
+        .answer_now(ControlFrame::Request(describe_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let turn = connection.output.hold_the_turn().await;
+    let (stands, ()) = tokio::join!(
+        connection.write_answer(connection.output(), answer),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while connection.output.writes_queued() < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the answer is waiting for the writer");
+            privacy_mode_is_turned_on(controller).await;
+            drop(turn);
+        }
+    );
+    assert!(stands, "the connection stands");
+    let withheld: SessionDescribeResult = answered(kept.frames()[0].clone());
+    assert_eq!(
+        withheld.source,
+        LabelSource::Metadata,
+        "what a model wrote is not published once privacy mode has started: {withheld:?}"
+    );
+    assert_ne!(withheld.title, "Pairing check", "{withheld:?}");
+    assert!(withheld.activity_text.0.is_none(), "{withheld:?}");
+    assert!(withheld.provenance.0.is_none(), "{withheld:?}");
+    world.serving.abort();
+}
+
 /// A page a worker answers after the daemon published privacy mode and before the worker was told,
 /// which still holds the output that privacy mode removes, is withheld.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
