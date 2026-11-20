@@ -1346,8 +1346,6 @@ pub struct OfflineValidityPolicy {
     pub last_synchronised_at_ms: Nullable<TimestampMs>,
 }
 
-impl OfflineValidityPolicy {}
-
 /// What this host shows about the remote authority feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

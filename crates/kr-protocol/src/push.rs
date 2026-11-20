@@ -502,8 +502,6 @@ pub struct PushInstallationBinding {
     pub token_digest: Digest256,
 }
 
-impl PushInstallationBinding {}
-
 // ----- Sender authorisation -----------------------------------------------------------------
 
 /// What one sender authorisation fixes for its lifetime.
