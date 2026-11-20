@@ -1458,16 +1458,10 @@ mod tests {
             ))),
         }))
         .expect("a session");
-        for _ in 0..500 {
-            if session.connection_refusal().is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            session.connection_refusal().is_some(),
-            "the session kept the host's refusal of the connection"
-        );
+        // A host's refusal of the connection ends the session.
+        tokio::time::timeout(Duration::from_secs(5), session.closed())
+            .await
+            .expect("the session ended with the host's refusal");
         Arc::new(session)
     }
 
@@ -2063,12 +2057,12 @@ mod tests {
             "a connection the host did not admit is a loss, whatever the lease says"
         );
         let full = refused_session(ErrorCode::ResourceUnavailable).await;
-        let Outcome::Refused { request, .. } =
+        let Outcome::Refused { refusal, .. } =
             crate::connection::lease_stop_outcome(&full, &stopped)
         else {
-            panic!("a host with no room is a refusal of the connection");
+            panic!("a host with no room is a refusal");
         };
-        assert_eq!(request, Asked::Connection);
+        assert_eq!(refusal.message, crate::places::host_full_error().message);
     }
 
     /// Sets a flag when it is dropped.
