@@ -3957,25 +3957,46 @@ mod tests {
     }
 
     /// A process's children are read from that process alone: what it costs follows the one
-    /// process, however many others the host is running. The process is one that only this case
-    /// changes, which is also what lets the reading's answer be waited for.
+    /// process, however many others the host is running.
+    ///
+    /// The process read is a shell this test starts, which has one thread and one child and holds
+    /// still while it is read. The test's own process is not one: its harness starts and ends a
+    /// thread for each case, and other cases make and end threads and children of it as this one
+    /// reads, so no two readings of it need agree.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_process_s_children_are_read_from_that_process_alone() {
-        let mut held = held::Held::start();
-        let (child, _) = held.begin(0);
-        let pid = held.pid();
-        let (children, read) = super::processes_read_during(|| super::children_of(pid));
-        held.end();
-        let children = children.expect("the kernel lists the process's children");
-        assert!(
-            children.contains(&child),
-            "the child is listed: {children:?}"
+        use std::io::BufRead;
+        use std::process::Stdio;
+
+        // The shell starts a sleep, says its number, and waits for its input to close, which is
+        // when it ends the sleep and leaves.
+        let mut shell = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 >/dev/null & echo $!; read _; kill $!"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("a shell");
+        let mut said = String::new();
+        let said_so = std::io::BufReader::new(shell.stdout.take().expect("the shell's output"))
+            .read_line(&mut said);
+        let held = said.trim().parse::<u32>();
+        let shell_pid = shell.id();
+        let (children, read) = super::processes_read_during(|| super::children_of(shell_pid));
+        drop(shell.stdin.take());
+        let _ = shell.wait();
+        said_so.expect("the shell says the sleep's number");
+        let held = held.expect("the number of the sleep the shell started");
+        let children = children.expect("the kernel lists the shell's children");
+        assert_eq!(
+            children,
+            [held],
+            "the sleep is the shell's one child and is listed"
         );
         assert!(!read.is_empty(), "the reading is counted");
         assert!(
-            read.iter().all(|read| *read == pid),
-            "nothing but that process was read: {read:?}"
+            read.iter().all(|pid| *pid == shell_pid),
+            "nothing but the shell was read: {read:?}"
         );
     }
 
