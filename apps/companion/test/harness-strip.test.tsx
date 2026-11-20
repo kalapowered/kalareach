@@ -14,6 +14,7 @@ import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import { HarnessStrip, TapAwayPutsTheKeyboardAway, applyPendingReset } from '../src/harness-strip'
 import { MobileApp } from '../src/mobile/MobileApp'
+import { FAKE_CHANNEL_MESSAGES_KEY } from '../src/host/fake-channel-messages'
 import { FAKE_DRAFTS_KEY, FakeDraftStore } from '../src/host/fake-drafts'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -132,11 +133,13 @@ describe('the harness control strip', () => {
     const reload = vi.fn()
     const storage = window.localStorage
     storage.setItem(FAKE_DRAFTS_KEY, '[]')
+    storage.setItem(FAKE_CHANNEL_MESSAGES_KEY, '{}')
     storage.setItem('kr.mobile.submissions', '[]')
     open(storage, reload)
     await person.click(screen.getByRole('button', { name: 'Controls' }))
     await person.click(screen.getByRole('button', { name: 'Reset' }))
     expect(storage.getItem(FAKE_DRAFTS_KEY)).toBeNull()
+    expect(storage.getItem(FAKE_CHANNEL_MESSAGES_KEY)).toBeNull()
     expect(storage.getItem('kr.mobile.submissions')).toBeNull()
     expect(reload).toHaveBeenCalledTimes(1)
   })

@@ -2175,7 +2175,7 @@ export function fakeHost(
     deviceChannelHoldCreate: (request) => Promise.resolve(channelMessages.createHold(request)),
     deviceChannelHoldUpdate: (request) => Promise.resolve(channelMessages.updateHold(request)),
     deviceChannelHoldClear: (request) => Promise.resolve(channelMessages.clearHold(request)),
-    deviceDraftsLedgerSetAside: () => Promise.resolve({ moved: false, confirmed: false }),
+    deviceDraftsLedgerSetAside: () => Promise.resolve(channelMessages.setAside()),
 
     draftCreate: (params, subject) => {
       requireConnection()

@@ -16,6 +16,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 
 import { TapRecord, fillForTaps } from './harness-taps'
 import type { FakeHostControls, HeldMutations } from './host/fake'
+import { FAKE_CHANNEL_MESSAGES_KEY } from './host/fake-channel-messages'
 import { FAKE_DRAFTS_KEY } from './host/fake-drafts'
 import { SUBMISSIONS_KEY } from './mobile/model/store'
 
@@ -34,6 +35,7 @@ export function applyPendingReset(storage: Storage, session: Storage): void {
   if (session.getItem(RESET_KEY) === null) return
   session.removeItem(RESET_KEY)
   storage.removeItem(FAKE_DRAFTS_KEY)
+  storage.removeItem(FAKE_CHANNEL_MESSAGES_KEY)
   storage.removeItem(SUBMISSIONS_KEY)
 }
 
@@ -125,6 +127,7 @@ export function HarnessStrip({
             onClick={choose(() => {
               // Cleared now, so that nothing reads it meanwhile, and again by the next page.
               storage.removeItem(FAKE_DRAFTS_KEY)
+              storage.removeItem(FAKE_CHANNEL_MESSAGES_KEY)
               storage.removeItem(SUBMISSIONS_KEY)
               session.setItem(RESET_KEY, '1')
               reload()
