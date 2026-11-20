@@ -290,7 +290,8 @@ Core's plan uses neither field.
 A step's time starts with the step, before Cargo's preparation. One deadline covers the build of a
 `cargo` step, the listing of its tests and its run. Steps that name a budget spend it in plan order,
 by the time they take. A step with both a `timeout` and a budget is out of time at the earlier
-deadline, and at a tie the error names the `timeout`.
+deadline, and at a tie the error names the `timeout`. A command whose time is already spent when it
+is due to start is not started.
 
 When the time is spent, the report asks the step's process group to end, waits two seconds, then
 kills whatever is left of the group, whether or not the step's own process has gone. The step fails
@@ -298,20 +299,42 @@ with the error `ran out of its time limit: <n> s`, where `<n>` is the seconds of
 spent, the `timeout` or the budget. The log ends with the same words. The step has no exit status,
 and the run fails.
 
-Each later step of that budget is not run. It has no log and no exit status, and its error is
-`not run because its budget was spent by step <number>`. A step that names it in `after` is not run
-either, and its error ends `was not run, because its budget was spent by step <number>`. A step that is not
-run takes no time from its budget.
+When the budget is spent, each later step that names it is not run. It has no log and no exit status,
+and its error is `not run because its budget was spent by step <number>`. A step that names it in
+`after` is not run either, and its error ends
+`was not run, because its budget was spent by step <number>`. A step that is not run takes no time
+from its budget. A step that its own `timeout` ends before the budget is spent does not stop the
+later steps of the budget.
 
-A budget is spent in one run, and `--part` runs one part of a plan, so the steps of a budget must fall in one
-part. A plan cut into parts that puts them in more than one part, or gives a budget to a build that opens the
-plan (every part runs it), is refused before any step runs, with
+A budget is spent in one run, and `--part` runs one part of a plan, so the steps of a budget must
+fall in one part. A plan cut into parts that puts them in more than one part, or gives a budget to a
+build that opens the plan (every part runs it), is refused before any step runs, with
 ``the steps of budget `<id>` fall in more than one part: a budget's steps run in one part``.
 
 On macOS and Linux a step with a limit runs each command as the leader of a process group of its own;
-a step without a limit runs as before. A process that starts a group of its own is outside the kill.
-Playwright 1.63.0 does that for each browser, so a step that runs Playwright can leave browsers
-running when its time is spent.
+a step without a limit runs as before. The report does not reap the leader before it has ended the
+group, so the group's number is never another process's. A process of the group that holds open a
+pipe the report reads, after the command has ended, keeps the step waiting until its deadline, and
+the step then runs out of time. The kill does not reach:
+
+- a process that leaves the group by starting a session or a group of its own, or that joins another
+  group (a daemon, a job-control shell, Node's `detached`, Python's `start_new_session`);
+- a process that the command leaves in the group when it ends in its time and that holds no pipe the
+  report reads, because the kill comes only at the deadline;
+- a process that runs as another user, and a process that a service starts for the step (launchd,
+  systemd, a simulator, the adb server);
+- a process in uninterruptible sleep: it outlives the kill until its I/O ends, and when it is the
+  step's own process, the report waits for it.
+
+Ctrl-C and a closed terminal reach the report and not the step's group, so an interrupted run can
+leave a step's processes running. A process of the step that opens the terminal, for example to ask
+for a password, stops until the deadline, because the step's group is not the terminal's foreground
+group.
+
+Playwright 1.63.0 starts each browser in a session of its own, so the kill does not reach a browser.
+Playwright's test workers are in the step's group. On the request to end they start to close their
+browsers, and when they exit they kill them. A browser stays when the kill, two seconds after the
+request, ends a worker before that close is complete.
 
 ## How a test names what it proves
 
