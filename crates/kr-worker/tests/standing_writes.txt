@@ -194,7 +194,7 @@ allow crates/kr-worker/src/service.rs check_envelope contains validate
 allow crates/kr-worker/src/service.rs check_granted as_str contains
 allow crates/kr-worker/src/service.rs check_preconditions as_str get
 allow crates/kr-worker/src/service.rs holds_attachment contains expect lock
-allow crates/kr-worker/src/service.rs params_application_instance as_str
+allow crates/kr-worker/src/service.rs params_application_target as_str
 allow crates/kr-worker/src/service.rs parse as_str default get
 allow crates/kr-worker/src/service.rs question_clock now_ms
 allow crates/kr-worker/src/service.rs uncertain_outcome_in_the_way clone
