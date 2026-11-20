@@ -40,16 +40,13 @@ pub const MANIFEST: &str = "manifest.json";
 /// The readable diagnostics inside every bundle.
 pub const REPORT: &str = "report.txt";
 
-/// The prefix every content-bearing entry sits under.
-pub const CONTENT_PREFIX: &str = "content/";
-
 /// The entry holding the sessions a person selected with `--include-content`.
 pub const SESSIONS_ENTRY: &str = "content/sessions.json";
 
 /// One content-bearing entry a person selected.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Content {
-    /// The entry's name inside the archive, under [`CONTENT_PREFIX`].
+    /// The entry's name inside the archive, under `content/`.
     ///
     /// The name is written into the archive's own header, which no allowlist stands in front of,
     /// and into the manifest beside it, from this one value, so the two cannot spell one entry
