@@ -139,6 +139,74 @@ pub fn cancel_blocked_read<T>(thread: &std::thread::JoinHandle<T>) -> bool {
     }
 }
 
+/// How long a wait for a reader thread lasts, when it first asks for the read to be cancelled and
+/// how often it looks again.
+#[cfg(any(not(unix), test))]
+#[derive(Clone, Copy, Debug)]
+pub struct Schedule {
+    /// The longest the wait lasts.
+    pub wait: std::time::Duration,
+    /// How long the wait lets the thread end by itself before it first asks for its read to be
+    /// cancelled.
+    pub cancel_after: std::time::Duration,
+    /// How long the wait sleeps between two looks at the thread, which is how often a read that is
+    /// still blocked has its cancel asked again.
+    pub pause: std::time::Duration,
+}
+
+/// What a wait for a reader thread found.
+#[cfg(any(not(unix), test))]
+#[derive(Debug)]
+pub struct Waited<T> {
+    /// Whether the thread had not ended when the wait did, so that what it holds is not counted.
+    pub still_running: bool,
+    /// Whether the wait asked for a read to be cancelled and the system took the request. A read can
+    /// end by itself as the request arrives, so it does not say that the request was needed.
+    pub cancel_asked: bool,
+    /// What the thread returned, once it had ended, and nothing for a thread that was still running
+    /// or that panicked.
+    pub result: Option<T>,
+}
+
+/// Waits for `thread`, which reads the console and has been told to stop, to end, and asks `cancel`
+/// to end the read it may be blocked in, again and again, until the thread has ended or the wait
+/// is over.
+///
+/// A read of the console's text is ended by nothing the thread waits on besides, and a cancel is a
+/// request that can miss a thread between two reads, so it is repeated. The thread is joined only
+/// once it has ended: a console that does not honour the request would hold a joiner for good, and
+/// a thread still running when the wait is over is left, which the answer says.
+#[cfg(any(not(unix), test))]
+pub fn wait_for_a_blocked_reader<T>(
+    thread: std::thread::JoinHandle<T>,
+    schedule: Schedule,
+    cancel: &dyn Fn(&std::thread::JoinHandle<T>) -> bool,
+) -> Waited<T> {
+    let started = std::time::Instant::now();
+    let deadline = started + schedule.wait;
+    let cancel_from = started + schedule.cancel_after;
+    let mut cancel_asked = false;
+    while !thread.is_finished() {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Waited {
+                still_running: true,
+                cancel_asked,
+                result: None,
+            };
+        }
+        if now >= cancel_from {
+            cancel_asked |= cancel(&thread);
+        }
+        std::thread::sleep(schedule.pause);
+    }
+    Waited {
+        still_running: false,
+        cancel_asked,
+        result: thread.join().ok(),
+    }
+}
+
 #[cfg(not(unix))]
 pub use console::{ControllingTerminal, SavedModes};
 
@@ -590,5 +658,99 @@ mod console {
             windows_sys::Win32::System::Console::GetConsoleScreenBufferInfo(handle.cast(), info)
                 != 0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    use super::{Schedule, wait_for_a_blocked_reader};
+
+    fn schedule(wait: u64, cancel_after: u64) -> Schedule {
+        Schedule {
+            wait: Duration::from_millis(wait),
+            cancel_after: Duration::from_millis(cancel_after),
+            pause: Duration::from_millis(5),
+        }
+    }
+
+    /// A thread that ends by itself before the cancel is first asked is joined and has no cancel
+    /// asked.
+    #[test]
+    fn a_thread_that_ends_by_itself_is_joined_and_no_cancel_is_asked() {
+        let asked = AtomicUsize::new(0);
+        let thread = std::thread::spawn(|| 7);
+        let waited = wait_for_a_blocked_reader(thread, schedule(2_000, 1_000), &|_| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        assert!(!waited.still_running);
+        assert!(!waited.cancel_asked);
+        assert_eq!(waited.result, Some(7));
+        assert_eq!(asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// A thread blocked in a read has the cancel asked again and again, and ends once one is taken.
+    #[test]
+    fn a_blocked_thread_has_its_cancel_asked_until_it_ends() {
+        let released = Arc::new(AtomicBool::new(false));
+        let asked = AtomicUsize::new(0);
+        let blocked = Arc::clone(&released);
+        let thread = std::thread::spawn(move || {
+            while !blocked.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            "read ended"
+        });
+        let waited = wait_for_a_blocked_reader(thread, schedule(5_000, 0), &|_| {
+            // The third request is the one the read honours: the first two miss it.
+            if asked.fetch_add(1, Ordering::SeqCst) == 2 {
+                released.store(true, Ordering::SeqCst);
+            }
+            true
+        });
+        assert!(!waited.still_running);
+        assert!(waited.cancel_asked);
+        assert_eq!(waited.result, Some("read ended"));
+        assert!(asked.load(Ordering::SeqCst) >= 3);
+    }
+
+    /// The cancel is not asked before the thread has had its time to end by itself.
+    #[test]
+    fn the_first_cancel_waits_for_its_time() {
+        let (ended, wait) = mpsc::channel::<()>();
+        let asked = AtomicUsize::new(0);
+        let thread = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(Duration::from_millis(150));
+        });
+        let waited = wait_for_a_blocked_reader(thread, schedule(2_000, 1_000), &|_| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        drop(ended);
+        assert!(!waited.still_running);
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "no cancel in the first second");
+    }
+
+    /// A thread that does not end within the wait is left, and the wait says so, without joining it.
+    #[test]
+    fn a_thread_that_never_ends_is_left_when_the_wait_is_over() {
+        let release = Arc::new(AtomicBool::new(false));
+        let held = Arc::clone(&release);
+        let thread = std::thread::spawn(move || {
+            while !held.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let started = std::time::Instant::now();
+        let waited = wait_for_a_blocked_reader(thread, schedule(100, 0), &|_| false);
+        release.store(true, Ordering::SeqCst);
+        assert!(waited.still_running);
+        assert!(!waited.cancel_asked, "the system took no request");
+        assert!(waited.result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

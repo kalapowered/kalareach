@@ -919,28 +919,19 @@ impl ReaderStop {
         self.stopped
             .store(true, std::sync::atomic::Ordering::SeqCst);
         (self.wake)();
-        let started = std::time::Instant::now();
-        let deadline = started + wait;
-        let cancel_from = started + CANCEL_AFTER;
-        let mut cancel_asked = false;
-        while !self.thread.is_finished() {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return Stopped {
-                    still_running: true,
-                    cancel_asked,
-                    left: Vec::new(),
-                };
-            }
-            if now >= cancel_from {
-                cancel_asked |= (self.cancel)(&self.thread);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        let waited = crate::platform::wait_for_a_blocked_reader(
+            self.thread,
+            crate::platform::Schedule {
+                wait,
+                cancel_after: CANCEL_AFTER,
+                pause: std::time::Duration::from_millis(5),
+            },
+            &*self.cancel,
+        );
         Stopped {
-            still_running: false,
-            cancel_asked,
-            left: self.thread.join().unwrap_or_default(),
+            still_running: waited.still_running,
+            cancel_asked: waited.cancel_asked,
+            left: waited.result.unwrap_or_default(),
         }
     }
 }
