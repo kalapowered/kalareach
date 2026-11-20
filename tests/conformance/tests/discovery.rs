@@ -94,6 +94,14 @@ fn plan_text(root: &Path) -> String {
     std::fs::read_to_string(root.join("conformance").join("plan.toml")).expect("the fixture's plan")
 }
 
+/// The fixture's plan with its steps run no `cargo`: a `cargo` step runs in a workspace root the
+/// plan's manifests name, and a case that plants other manifests is about the map, not the steps.
+fn without_cargo(text: &str) -> String {
+    let words = "command = ['cargo', 'test', '--locked']";
+    assert!(text.contains(words), "the fixture's steps");
+    text.replace(words, "command = ['pnpm', 'test']")
+}
+
 fn load(root: &Path) -> Plan {
     Plan::load(root, None).unwrap_or_else(|refusal| panic!("the fixture's plan loads: {refusal}"))
 }
@@ -203,7 +211,7 @@ fn a_repository_with_no_root_manifest_maps_each_workspace_its_plan_names() {
         "{stdout}"
     );
     // Only the first manifest: the second workspace is not read.
-    let only_first = plan_text(&root).replace(
+    let only_first = without_cargo(&plan_text(&root)).replace(
         "'first/Cargo.toml', 'second/Cargo.toml'",
         "'first/Cargo.toml'",
     );
@@ -247,7 +255,7 @@ fn a_package_name_that_two_workspaces_hold_is_refused_naming_both_manifests() {
 #[test]
 fn a_manifest_that_is_absent_absolute_climbing_or_a_link_is_refused() {
     let (_directory, root) = copy("no-root-manifest");
-    let base = plan_text(&root);
+    let base = without_cargo(&plan_text(&root));
     let planted = |manifest: &str| {
         base.replace(
             "'first/Cargo.toml', 'second/Cargo.toml'",
@@ -325,7 +333,7 @@ fn a_package_belongs_to_the_workspace_cargo_names_and_a_members_manifest_is_refu
     )
     .expect("the manifest is written");
     git(&root, &["add", "-A"]);
-    let base = plan_text(&root);
+    let base = without_cargo(&plan_text(&root));
     let owners = |manifests: &str| -> (Vec<(String, String)>, Vec<String>) {
         let text = base.replace("'first/Cargo.toml', 'second/Cargo.toml'", manifests);
         let map = map_of(
@@ -427,7 +435,8 @@ fn a_copy_is_a_git_index_with_no_commit_so_its_commit_is_unknown_and_modified() 
 #[test]
 fn a_plan_that_names_no_manifest_and_no_package_maps_nothing_and_succeeds() {
     let (_directory, root) = copy("ignored-tests");
-    let empty = plan_text(&root).replace("manifests = ['Cargo.toml']", "manifests = []");
+    let empty =
+        without_cargo(&plan_text(&root)).replace("manifests = ['Cargo.toml']", "manifests = []");
     std::fs::write(root.join("conformance").join("plan.toml"), empty).expect("the plan is written");
     let (code, stdout, stderr) = program(&["map", "--root", &root.to_string_lossy()]);
     assert_eq!(code, Some(0), "{stdout}{stderr}");

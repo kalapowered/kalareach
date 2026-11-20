@@ -117,7 +117,8 @@ pub struct StepDef {
     pub after: Vec<String>,
     /// The directory it runs in, relative to the repository; the repository's root when absent. The
     /// build, the listing of the tests and the run all use it. A `cargo` step's directory is a
-    /// workspace root that `[rust] manifests` names. It is a literal path: it holds no placeholder.
+    /// workspace root that `[rust] manifests` names, whether it names the directory or not. It is a
+    /// literal path: it holds no placeholder.
     #[serde(default)]
     pub directory: Option<String>,
     /// Variables it is run with besides the plan's `[env]`; its value of a name replaces the plan's.
@@ -887,17 +888,6 @@ impl Plan {
                         "step `{id}` names the `directory` `{named}`, which {why}"
                     ));
                 }
-                let here = normal(Path::new(named));
-                if program == "cargo"
-                    && !self.rust.manifests.iter().any(|manifest| {
-                        Path::new(manifest).parent().map(normal) == Some(here.clone())
-                    })
-                {
-                    return refuse(format!(
-                        "step `{id}` runs `cargo` in `{named}`, which no `[rust] manifests` entry \
-                         is the workspace root of"
-                    ));
-                }
             }
             for operand in script_operands(&step.command) {
                 // The script is read from the step's directory, which is where it runs.
@@ -1066,6 +1056,28 @@ impl Plan {
             }
             if !manifests.insert(manifest.as_str()) {
                 return refuse(format!("`[rust] manifests` names `{manifest}` twice"));
+            }
+        }
+        // A `cargo` step runs in a workspace root the manifests name: its directory, or the
+        // repository's root when it names none.
+        for step in &self.steps {
+            if step.command.first().map(String::as_str) != Some("cargo") {
+                continue;
+            }
+            let here = normal(Path::new(step.directory.as_deref().unwrap_or_default()));
+            if !manifests
+                .iter()
+                .any(|manifest| Path::new(manifest).parent().map(normal).as_deref() == Some(&here))
+            {
+                let place = match &step.directory {
+                    Some(named) => format!("`{named}`"),
+                    None => "the repository's root".to_owned(),
+                };
+                return refuse(format!(
+                    "step `{}` runs `cargo` in {place}, which no `[rust] manifests` entry is the \
+                     workspace root of",
+                    step.id
+                ));
             }
         }
         for (key, directories) in [

@@ -22,7 +22,8 @@ group = 'rust'
 what = 'the first workspace'
 platforms = ['linux', 'macos', 'windows']
 reading = 'cargo'
-command = ['cargo', 'test', '--locked', '--manifest-path', 'first/Cargo.toml']
+directory = 'first'
+command = ['cargo', 'test', '--locked']
 
 [[step]]
 id = 'second'
@@ -30,4 +31,5 @@ group = 'rust'
 what = 'the second workspace'
 platforms = ['linux', 'macos', 'windows']
 reading = 'cargo'
-command = ['cargo', 'test', '--locked', '--manifest-path', 'second/Cargo.toml']
+directory = 'second'
+command = ['cargo', 'test', '--locked']

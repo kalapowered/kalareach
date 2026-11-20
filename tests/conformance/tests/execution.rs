@@ -290,14 +290,14 @@ fn a_runner_base_inside_a_target_directory_a_step_names_is_refused() {
             "the plan's env",
             "[env]\nCARGO_TARGET_DIR = '{root}/built'\n",
             "",
-            "",
+            "directory = 'first'\n",
             "built",
         ),
         (
             "a step's env",
             "",
             "env = { CARGO_TARGET_DIR = '{root}/built' }\n",
-            "",
+            "directory = 'first'\n",
             "built",
         ),
         (
