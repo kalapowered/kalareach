@@ -43,7 +43,17 @@ interface Entry extends StoredChannelMessage {
   readonly drafts: readonly DraftDiscardRequest[]
 }
 
-const sizeOf = (entry: Entry): number => JSON.stringify(entry).length
+const encoder = new TextEncoder()
+/** Bytes, as native code counts them: a bound on text and on a record is on UTF-8, not on UTF-16 units. */
+const bytesOf = (text: string): number => encoder.encode(text).length
+const sizeOf = (entry: Entry): number => bytesOf(JSON.stringify(entry))
+/** Whether two lists name the same drafts, as sets: an order or a repeat makes no difference. */
+const sameDrafts = (left: readonly DraftDiscardRequest[], right: readonly DraftDiscardRequest[]): boolean => {
+  const key = (each: DraftDiscardRequest): string => `${each.id}\n${each.expectedRevision}`
+  const a = new Set(left.map(key))
+  const b = new Set(right.map(key))
+  return a.size === b.size && [...a].every((each) => b.has(each))
+}
 
 /** A store of a device's channel messages. */
 export class FakeChannelMessageStore {
@@ -54,6 +64,7 @@ export class FakeChannelMessageStore {
   #unreadableHolds = { layout: 0, now: 0 }
   #damagedHolds: string[] = []
   #refuseKeeps: { code: string; message: string } | null = null
+  #refuseKeepsLeft = Infinity
   #stopAfterEntry = false
   #ledgerFaultAfterRename = false
   #unavailable = false
@@ -81,9 +92,10 @@ export class FakeChannelMessageStore {
     }
   }
 
-  /** Makes every keep refuse with `refusal` until it is cleared. */
-  refuseKeeps(refusal: { code: string; message: string } | null): void {
+  /** Makes the next `times` keeps (every keep, by default) refuse with `refusal`, until it is cleared. */
+  refuseKeeps(refusal: { code: string; message: string } | null, times = Infinity): void {
     this.#refuseKeeps = refusal
+    this.#refuseKeepsLeft = times
   }
 
   /** Makes the next keep stop after its entry is durable, as a stop of the process would: no ledger line is written. */
@@ -198,23 +210,36 @@ export class FakeChannelMessageStore {
 
   keep(request: ChannelMessageKeep, draftStore: FakeDraftStore): { readonly resumed: boolean } {
     this.calls.push({ kind: 'keep', text: request.text })
-    if (this.#refuseKeeps) refuse(this.#refuseKeeps.code, this.#refuseKeeps.message)
+    if (this.#refuseKeeps) {
+      const refusal = this.#refuseKeeps
+      this.#refuseKeepsLeft -= 1
+      if (this.#refuseKeepsLeft <= 0) this.#refuseKeeps = null
+      refuse(refusal.code, refusal.message)
+    }
     if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'the messages kept on this device could not be read')
-    if (request.text === '' || request.text.length > MAX_TEXT) {
+    if (request.text === '' || bytesOf(request.text) > MAX_TEXT) {
       refuse('INVALID_ARGUMENT', 'a message is 1 byte to 64 KiB of text')
     }
     if (request.drafts.length > 2) refuse('INVALID_ARGUMENT', 'a message names at most two drafts')
     const held = this.#entries.get(request.actionId)
     let resumed = false
     if (held !== undefined) {
-      if (held.text !== request.text || held.sessionId !== request.sessionId) {
+      if (
+        held.text !== request.text ||
+        held.sessionId !== request.sessionId ||
+        held.applicationInstanceId !== request.applicationInstanceId ||
+        held.agentBindingRevision !== request.agentBindingRevision ||
+        !sameDrafts(held.drafts, request.drafts)
+      ) {
         refuse('INVALID_ARGUMENT', 'another message is already kept under this action')
       }
       resumed = true
     } else {
       const entry: Entry = { ...request }
       const used = [...this.#entries.values()].reduce((sum, each) => sum + sizeOf(each), 0)
-      if (this.#entries.size >= this.#limits.entries || used + sizeOf(entry) > this.#limits.bytes) {
+      // A file that cannot be read still takes its place: it counts against the bound of entries.
+      const places = this.#entries.size + this.#unreadableMessages.layout + this.#unreadableMessages.now
+      if (places >= this.#limits.entries || used + sizeOf(entry) > this.#limits.bytes) {
         refuse('QUOTA_EXCEEDED', 'Channel messages is full: nothing was kept and nothing was removed')
       }
       this.#entries.set(request.actionId, entry)
