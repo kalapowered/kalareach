@@ -7,7 +7,8 @@
 // The program embeds this script and gives it on standard input. A compiler directory is a directory
 // whose own `node_modules` holds `typescript`; the first that does is used. A test call is a call of
 // `it`, `test`, `describe` or `suite`, including their modifiers (`it.skip`, `test.describe`,
-// `describe.each(table)`), whose first argument is the title. The conformance report decides which test each comment keys;
+// `describe.each(table)`), that names a test: its first argument is a string or a template, or a
+// function follows its first argument. The conformance report decides which test each comment keys;
 // this script only says where things are. It uses the compiler's parser rather than a pattern so
 // that a comment marker inside a string, a template or JSX text is never read as a comment.
 
@@ -43,6 +44,7 @@ if (!ts) {
 
 const SUITES = new Set(['describe', 'suite'])
 const TESTS = new Set(['it', 'test'])
+const NOT_TESTS = new Set(['step', 'use', 'extend', 'beforeAll', 'beforeEach', 'afterAll', 'afterEach'])
 
 // The names along a callee: `test.describe.serial` is test, describe, serial; `describe.each(t)`
 // is describe, each.
@@ -88,16 +90,19 @@ for (const file of files) {
     if (ts.isCallExpression(node) && node.arguments.length > 0) {
       const names = calleeNames(node.expression)
       const root = names?.[0]
-      const isSuite = names && (SUITES.has(root) || names.slice(1).some((name) => SUITES.has(name)))
-      const isTest = names && !isSuite && TESTS.has(root)
+      // The calls of a test file that are not tests: a hook, a step, and the fixtures a test takes.
+      const other = names?.some((name) => NOT_TESTS.has(name))
+      const isSuite = !other && names && (SUITES.has(root) || names.slice(1).some((name) => SUITES.has(name)))
+      const isTest = !other && names && !isSuite && TESTS.has(root)
       const first = node.arguments[0]
+      // A call names a test when its first argument is a string or a template, or when a function
+      // follows it: `test.skip(isMobile, 'reason')` takes a condition and is not one.
       const titled =
         first &&
         (ts.isStringLiteral(first) ||
           ts.isNoSubstitutionTemplateLiteral(first) ||
           ts.isTemplateExpression(first) ||
-          ts.isIdentifier(first) ||
-          ts.isBinaryExpression(first))
+          node.arguments.slice(1).some((argument) => ts.isArrowFunction(argument) || ts.isFunctionExpression(argument)))
       // `describe.each(table)` is itself a call whose result is called with the title.
       const table = names && ts.isCallExpression(node.expression) === false && names.includes('each')
       if ((isSuite || isTest) && titled && !table) {
