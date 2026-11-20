@@ -40,7 +40,10 @@ fn a_place_is_skipped_when_a_condition_around_it_is_false_with_test_false_and_th
         ("#[cfg(test)] #[cfg_attr(unix, path = \"x.rs\")]", false),
         // Every other name is unknown, and a place that is not false is read.
         ("#[cfg(any(test, feature = \"testing\"))]", true),
-        ("#[cfg(any(all(unix, not(target_os = \"macos\")), test))]", true),
+        (
+            "#[cfg(any(all(unix, not(target_os = \"macos\")), test))]",
+            true,
+        ),
         ("#[cfg(any(target_os = \"ios\", test))]", true),
         ("#[cfg(unix)]", true),
         ("#[cfg(windows)]", true),
@@ -62,7 +65,10 @@ fn a_place_is_skipped_when_a_condition_around_it_is_false_with_test_false_and_th
         ("#[cfg(any(false, unix,),)]", true),
         ("#[cfg(all(test, unix,),)]", false),
         ("#[cfg(true,)]", true),
-        ("#[cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]", true),
+        (
+            "#[cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]",
+            true,
+        ),
         ("#[cfg_attr(test, derive(Debug))]", true),
         (
             "#[cfg_attr(not(debug_assertions), cfg_attr(windows, windows_subsystem = \"windows\"))]",
@@ -441,7 +447,8 @@ fn an_inner_condition_of_a_file_decides_whether_the_file_is_read() {
     }
     // A file that only a declaration that is false reaches is not read, and one that a declaration
     // that is not false reaches is.
-    let folder = small_tree("#[cfg(all(test, unix))]\nmod only_by_test;\n#[cfg(unix)]\nmod by_unix;\n");
+    let folder =
+        small_tree("#[cfg(all(test, unix))]\nmod only_by_test;\n#[cfg(unix)]\nmod by_unix;\n");
     write(
         folder.path(),
         "crates/kr-sender/src/only_by_test.rs",
@@ -826,12 +833,15 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
             "use foreign::generate as new_items;\ncrate::new_items!();\n",
             "new_items",
         ),
+        ("use foreign::generate;\ncrate::generate!();\n", "generate"),
         (
-            "use foreign::generate;\ncrate::generate!();\n",
+            "mod bridge { pub use foreign::*; }\nbridge::generate!();\n",
             "generate",
         ),
-        ("mod bridge { pub use foreign::*; }\nbridge::generate!();\n", "generate"),
-        ("macro_rules! m { () => { crate::generate!(); }; }\nm!();\n", "generate"),
+        (
+            "macro_rules! m { () => { crate::generate!(); }; }\nm!();\n",
+            "generate",
+        ),
         // A macro of the crate's own name behind another crate's path is that crate's macro.
         (
             "macro_rules! mine { () => {}; }\nforeign::mine! {}\n",
@@ -1048,7 +1058,10 @@ fn a_cfg_attr_that_adds_macro_export_counts_where_the_predicate_is_not_false() {
     // A predicate the rule cannot read is its error.
     assert_eq!(
         call("#[cfg_attr(not(unix, windows), macro_export)]"),
-        Err("crates/kr-worker/src/lib.rs: the scan cannot read the condition not (unix , windows)".to_owned())
+        Err(
+            "crates/kr-worker/src/lib.rs: the scan cannot read the condition not (unix , windows)"
+                .to_owned()
+        )
     );
 }
 
@@ -1078,10 +1091,11 @@ fn definitions_of_one_macro_name_are_one_under_it_and_add_marks_and_take_none() 
     );
     assert_eq!(marks(&lib, &[]), both);
     // In a parent before `mod child;` and in the child, and in a module under `#[macro_use]`.
-    let lib = format!(
-        "{callees}macro_rules! m {{ () => {{ callee_a!() }}; }}\nmod child;\n{user}"
-    );
-    let child = [("src/child.rs", "macro_rules! m { () => { callee_b!() }; }\n")];
+    let lib = format!("{callees}macro_rules! m {{ () => {{ callee_a!() }}; }}\nmod child;\n{user}");
+    let child = [(
+        "src/child.rs",
+        "macro_rules! m { () => { callee_b!() }; }\n",
+    )];
     assert_eq!(marks(&lib, &child), both);
     let lib = format!(
         "{callees}macro_rules! m {{ () => {{ callee_a!() }}; }}\n#[macro_use]\nmod child;\n{user}"

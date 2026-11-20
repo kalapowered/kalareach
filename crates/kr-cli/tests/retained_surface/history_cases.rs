@@ -1368,9 +1368,8 @@ fn the_gate_expects_what_the_audit_reports_for_an_entry_that_is_wrong_without_ca
         entry.senders = leak(senders);
     });
     assert!(
-        expected.iter().any(|problem| problem.ends_with(
-            ": the snapshot has no reading of the item companion_tauri::Link::unread"
-        )),
+        expected.iter().any(|problem| problem
+            .ends_with(": the snapshot has no reading of the item companion_tauri::Link::unread")),
         "{expected:?}"
     );
 }
