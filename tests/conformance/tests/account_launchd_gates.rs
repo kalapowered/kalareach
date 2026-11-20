@@ -852,7 +852,7 @@ fn the_harness_selection_reading_finds_a_selection_through_the_map_and_only_that
         ),
         (
             "a path built from no name",
-            r#"let name = built_as(name); let c = profile.join("kr-controller");"#,
+            r#"let name = built_as(name); let c = profile.join("NAME");"#,
         ),
         (
             "a name that is changed after the map",
