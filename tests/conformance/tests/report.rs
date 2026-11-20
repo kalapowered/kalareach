@@ -2169,6 +2169,11 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
     };
     let document = report::run(&options, &mut |_| {}).expect("runs");
     assert!(document.steps[0].error.is_some(), "{:?}", document.steps[0]);
+    assert!(
+        document.identifiers.contains_key("KR-REQ-02.03"),
+        "{:?}",
+        document.identifiers.keys().collect::<Vec<_>>()
+    );
     let record = &document.identifiers["KR-REQ-02.03"];
     assert_eq!(record.verdict, Verdict::NotRun);
     let reason = record.tests[0].reason.as_deref().unwrap_or_default();
@@ -2219,6 +2224,13 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
         "{:?}",
         document.steps[0]
     );
+    for row in ["KR-REQ-04.03", "KR-REQ-04.07"] {
+        assert!(
+            document.identifiers.contains_key(row),
+            "{row} is not in the result: {:?}",
+            document.identifiers.keys().collect::<Vec<_>>()
+        );
+    }
     assert_eq!(
         document.identifiers["KR-REQ-04.03"].verdict,
         Verdict::Failed
@@ -2442,10 +2454,20 @@ fn passing(step: Step, target: &TargetId, tests: &[&str]) -> Executed {
 /// The result of a Linux run of every group over `map` and what its steps did: a run that selects
 /// no group lists a target that no step covers, and one that selects groups does not.
 fn assembled(plan: Plan, map: &Map, executed: &[Executed]) -> Document {
+    assembled_selecting(plan, map, executed, None)
+}
+
+/// [`assembled`] for a run that selects `groups`: it reads the targets that its steps cover.
+fn assembled_selecting(
+    plan: Plan,
+    map: &Map,
+    executed: &[Executed],
+    groups: Option<Vec<String>>,
+) -> Document {
     let options = Options {
         root: PathBuf::from("/tmp/r"),
         evidence: PathBuf::from("/tmp/e"),
-        selection: None,
+        selection: groups,
         all_terminals: false,
         platform: Platform::Linux,
         plan,
@@ -2521,6 +2543,24 @@ fn a_step_that_failed_is_the_reason_of_its_own_workspace_and_no_other() {
         let record = &document.identifiers[row].tests[0];
         assert_eq!(record.outcome, Outcome::Passed, "{record:?}");
         assert_eq!(record.reason, None, "{record:?}");
+    }
+
+    // A run that selects the group reads the targets its steps cover, so the first workspace's tests
+    // stay in the result, not run, though their step built nothing and ran nothing.
+    let ran = passing(steps[1].clone(), &beta, &["passes", "stands_down"]);
+    let document = assembled_selecting(
+        plan.clone(),
+        &map,
+        &[stopped.clone(), ran],
+        Some(vec!["rust".to_owned()]),
+    );
+    for row in ["KR-REQ-03.01", "KR-REQ-03.02"] {
+        assert!(
+            document.identifiers.contains_key(row),
+            "{row} is not in the result: {:?}",
+            document.identifiers.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(reason_of(&document, row), named);
     }
 
     // It ran and listed nothing: its tests are not run, for its own step and not for the first.
@@ -2626,24 +2666,56 @@ fn a_target_a_step_ran_that_no_step_covers_is_a_problem_and_fails_the_run() {
         "{:?}",
         covered.problems
     );
-    let mut ran = passing(step, &lib, &["a"]);
-    let beyond = passing(ran.step.clone(), &outside, &["b"]);
-    ran.binaries.extend(beyond.binaries);
-    ran.built.extend(beyond.built);
-    let document = assembled(plan, &map, &[ran]);
-    assert_eq!(
-        document
-            .problems
-            .iter()
-            .filter(|problem| problem.contains("covers it"))
-            .collect::<Vec<_>>(),
-        [
-            "step 1 built or ran p --test t, but no step of this selection covers it: the selection rule and Cargo disagree"
-        ],
-        "{:?}",
-        document.problems
-    );
-    assert!(!document.passed());
+    // The program of an uncovered target is built and run, or it is only built: each is a problem,
+    // and neither puts the target into a selection that the steps' commands decide.
+    let beyond = passing(step.clone(), &outside, &["b"]);
+    let rows = [
+        (
+            "ran",
+            Executed {
+                built: Vec::new(),
+                ..beyond.clone()
+            },
+        ),
+        (
+            "built",
+            Executed {
+                binaries: Vec::new(),
+                listed: BTreeMap::new(),
+                ..beyond
+            },
+        ),
+    ];
+    for (how, extra) in rows {
+        let mut ran = passing(step.clone(), &lib, &["a"]);
+        ran.binaries.extend(extra.binaries);
+        ran.built.extend(extra.built);
+        let document = assembled(plan.clone(), &map, &[ran.clone()]);
+        assert_eq!(
+            document
+                .problems
+                .iter()
+                .filter(|problem| problem.contains("covers it"))
+                .collect::<Vec<_>>(),
+            [
+                "step 1 built or ran p --test t, but no step of this selection covers it: the selection rule and Cargo disagree"
+            ],
+            "{how}: {:?}",
+            document.problems
+        );
+        assert!(!document.passed(), "{how}");
+        let selected =
+            assembled_selecting(plan.clone(), &map, &[ran], Some(vec!["rust".to_owned()]));
+        assert!(
+            selected.identifiers.contains_key("KR-REQ-03.01"),
+            "{how}: {:?}",
+            selected.identifiers.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !selected.identifiers.contains_key("KR-REQ-03.02"),
+            "{how}: an uncovered target is in the selection"
+        );
+    }
 }
 
 /// The command of a test is its step's own, in the directory of the test's workspace and with the
