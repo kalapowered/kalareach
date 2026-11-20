@@ -159,6 +159,9 @@ impl Tree {
     /// Reads the crates of the workspace at `root`: the repository's checkout, or a release's. A
     /// crate is `crates/*` or an application's `apps/*/src-tauri`, named by its manifest's package.
     pub fn at(root: &Path) -> Result<Self, String> {
+        // A root with `..` in it (the repository's own is `crates/kr-cli/../..`) gets the form of
+        // the module paths the scan compares its files with.
+        let root = &lexical(root);
         let mut crates = BTreeMap::new();
         let mut unreadable = Vec::new();
         let directory = root.join("crates");

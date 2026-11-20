@@ -514,16 +514,23 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
             &text,
         );
     }
-    let tree = Tree::at(folder.path()).expect("the tree");
-    let sightings = tree
-        .sightings(&|krate| krate == "kr_sender")
-        .expect("the scan");
-    let found = names(&sightings, "kr_sender");
     let expected: BTreeMap<String, Vec<SightKind>> = ["from_a", "from_beside", "from_wide"]
         .into_iter()
         .map(|name| (name.to_owned(), vec![SightKind::Names]))
         .collect();
-    assert_eq!(found, expected);
+    let scan = |root: &Path| {
+        let tree = Tree::at(root).expect("the tree");
+        let sightings = tree
+            .sightings(&|krate| krate == "kr_sender")
+            .expect("the scan");
+        names(&sightings, "kr_sender")
+    };
+    assert_eq!(scan(folder.path()), expected);
+    // The same tree through a root with `..` in it, as the repository's own root is.
+    assert_eq!(
+        scan(&folder.path().join("crates/kr-sender/../..")),
+        expected
+    );
 }
 
 #[test]
