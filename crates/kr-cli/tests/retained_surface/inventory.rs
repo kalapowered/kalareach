@@ -145,6 +145,10 @@ impl Position {
 /// stands for none.
 type Imports = BTreeMap<String, BTreeSet<Vec<String>>>;
 
+/// The macro calls of one file: its path, its imports, and the calls at item position or in a
+/// transcriber with the paths they are written as.
+type FileCalls = (String, Imports, Vec<(Position, Vec<String>)>);
+
 /// Whether the call written as `path` in a file with these imports is a macro the scan accepts (R3):
 /// the crate's own (a bare call, or one written from `crate`, `self`, `super`, `$crate` or one of its
 /// modules, of a name the crate defines), a macro of the standard library that makes no item (by its
@@ -256,7 +260,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
     // under it: what either calls is called, so a name defined twice adds marks and takes none away.
     let mut defined: BTreeSet<String> = BTreeSet::new();
     // The macros called at item position and in transcribers, with the imports of the file they are in.
-    let mut calls: Vec<(String, Imports, Vec<(Position, Vec<String>)>)> = Vec::new();
+    let mut calls: Vec<FileCalls> = Vec::new();
     let mut module_set: BTreeSet<String> = BTreeSet::new();
     let mut renames: Vec<(String, String, String)> = Vec::new();
     while let Some(visit) = todo.pop() {
