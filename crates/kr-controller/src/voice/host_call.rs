@@ -18,6 +18,7 @@ use kr_client::services::host_call::HostFuture;
 use kr_client::services::host_call::{
     HostCallControl, HostCallEvent, SidebandEnd, SidebandState, WriteRefusal,
 };
+use kr_client::services::own_voice::{DRAIN_BOUND, HANGUP_BOUND, RECOVERY_BOUND};
 use kr_client::services::voice::{VoiceCommand, VoiceContextFrame};
 use kr_client::services::voice_pacing::{MAX_START_APPENDS, call_start_appends};
 use kr_protocol::ids::{ActionId, DeviceId, VoiceSessionId};
@@ -44,8 +45,18 @@ pub const FINAL_STATUS_KEEP_MS: u64 = 10 * 60 * 1_000;
 /// host tells the end as it stands, with the close not confirmed. A threshold, not a deadline: the
 /// next tick or heartbeat after it applies it. The longest close the client runs on its own takes
 /// about 35.5 seconds, so a close that is still unreported after this long is one the host could
-/// not confirm.
+/// not confirm. The figure is the sum of the client's bounds for a close: one hangup, 15 s
+/// (`HANGUP_BOUND`) and the 0.5 s its watchdog allows beyond it; the 5 s the close waits for the
+/// provider (`DRAIN_BOUND`); the 5 s the channel is read for the provider's closure before it is
+/// let go; and the 10 s of an attachment again (`RECOVERY_BOUND`).
 pub const FINAL_STATUS_CLOSE_WAIT_MS: u64 = 60_000;
+
+// The sum of the public bounds stays inside the wait; the comment above gives the arithmetic of
+// the two private terms.
+const _: () = assert!(
+    HANGUP_BOUND.as_millis() + DRAIN_BOUND.as_millis() + RECOVERY_BOUND.as_millis()
+        < Duration::from_millis(FINAL_STATUS_CLOSE_WAIT_MS).as_millis()
+);
 
 /// The most delegations a call remembers.
 const DELEGATIONS_KEPT: usize = 64;
