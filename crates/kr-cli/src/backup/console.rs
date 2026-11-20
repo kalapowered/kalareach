@@ -12,9 +12,6 @@
 //! pseudo-console's pipe after the discard, or the console's command history; and putting the modes
 //! back or throwing the input away can fail, which nothing in a drop can say.
 
-use kr_client::shown;
-use kr_client::shown::Shown;
-
 use crate::error::{CliError, Result};
 use crate::platform::{ControllingTerminal, SavedModes};
 
@@ -36,20 +33,79 @@ impl Console {
         if !ControllingTerminal::standard_handles_are_a_console() {
             return Err(CliError::NotATerminal);
         }
-        let terminal = ControllingTerminal::open()?;
-        let saved = terminal.enter_dialogue_modes().map_err(|_| {
-            CliError::Terminal(shown!(
-                "the terminal's modes could not be read: {}",
-                Shown::io(&std::io::Error::last_os_error())
-            ))
-        })?;
+        let (terminal, saved) = hold_over(
+            ControllingTerminal::open,
+            ControllingTerminal::enter_dialogue_modes,
+        )?;
         Ok(Self { terminal, saved })
     }
+}
+
+/// Opens the console with `open` and sets its modes with `enter`. A failure of either is the
+/// person's to read as the call that failed said it: a mode that cannot be read and a mode that
+/// cannot be set are not the same fault.
+fn hold_over<T>(
+    open: impl FnOnce() -> Result<T>,
+    enter: impl FnOnce(&T) -> Result<SavedModes>,
+) -> Result<(T, SavedModes)> {
+    let terminal = open()?;
+    let saved = enter(&terminal)?;
+    Ok((terminal, saved))
 }
 
 impl Drop for Console {
     fn drop(&mut self) {
         let _ = self.terminal.put_modes_back(&self.saved);
         let _ = self.terminal.discard_input();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_client::shown::{Said as _, Shown};
+
+    use super::*;
+
+    /// A console whose modes cannot be set gives the person the words of the failed call, and one
+    /// whose modes cannot be read gives theirs; neither is changed into the other.
+    #[test]
+    fn a_console_that_cannot_be_held_says_what_its_own_call_said() {
+        let Err(set) = hold_over(
+            || Ok(()),
+            |()| {
+                Err(CliError::Terminal(Shown::said(
+                    "set the console's mode: the console refused",
+                )))
+            },
+        ) else {
+            panic!("a failed set held the console");
+        };
+        assert_eq!(
+            set.said().as_str(),
+            "set the console's mode: the console refused"
+        );
+
+        let Err(read) = hold_over(
+            || Ok(()),
+            |()| {
+                Err(CliError::Terminal(Shown::said(
+                    "read the console's mode: the console did not answer",
+                )))
+            },
+        ) else {
+            panic!("a failed read held the console");
+        };
+        assert_eq!(
+            read.said().as_str(),
+            "read the console's mode: the console did not answer"
+        );
+
+        let Err(open) = hold_over(
+            || -> Result<()> { Err(CliError::NotATerminal) },
+            |()| unreachable!("nothing is set on a console that did not open"),
+        ) else {
+            panic!("a console that did not open was held");
+        };
+        assert!(matches!(open, CliError::NotATerminal));
     }
 }
