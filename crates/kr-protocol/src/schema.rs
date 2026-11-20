@@ -278,8 +278,8 @@ use crate::voice_credential::{
 };
 use crate::voice_host::{
     VoiceContextSendParams, VoiceContextSendResult, VoiceContextState, VoiceContextStop,
-    VoiceControlArm, VoiceControlParams, VoiceControlResult, VoiceEndReason, VoiceHostCallState,
-    VoiceHostRefusal, VoiceNews, VoiceNewsItem, VoiceNote, VoiceProviderClose,
+    VoiceControlAnswer, VoiceControlArm, VoiceControlParams, VoiceControlResult, VoiceEndReason,
+    VoiceHostCallState, VoiceHostRefusal, VoiceNews, VoiceNewsItem, VoiceNote, VoiceProviderClose,
 };
 use crate::worker::{
     AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
@@ -810,6 +810,7 @@ pub fn protocol_schema() -> Value {
         "voice_control_arm" => VoiceControlArm,
         "voice_control_params" => VoiceControlParams,
         "voice_control_result" => VoiceControlResult,
+        "voice_control_answer" => VoiceControlAnswer,
         "voice_end_reason" => VoiceEndReason,
         "voice_provider_close" => VoiceProviderClose,
         "voice_host_call_state" => VoiceHostCallState,

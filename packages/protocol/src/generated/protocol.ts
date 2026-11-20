@@ -2663,6 +2663,130 @@ export type VoiceContextStop =
   | 'sideband_lost'
   | 'provider_refused'
 /**
+ * The answer to `voice.control` on the wire.
+ *
+ * The arms after the heartbeat are the ones [`VoiceControlResult`] keeps for a repeated request,
+ * with the same words, so the bytes the registry keeps of them read as either type. The heartbeat
+ * is never kept: it tells where the call stands and, once the call is over, whether the provider
+ * confirmed that it closed it.
+ */
+export type VoiceControlAnswer =
+  | {
+      heartbeat: {
+        /**
+         * The news queue overflowed since the device last heard: the call's outcomes are not
+         * all known.
+         */
+        dropped: boolean
+        /**
+         * News since `after_seq`, oldest first.
+         */
+        news: VoiceNews[]
+        /**
+         * Whether the provider's close of the call was confirmed, once `state` is `closed`;
+         * null before.
+         */
+        provider_close: VoiceProviderClose | null
+        /**
+         * Seconds until the call's own deadline, or zero.
+         */
+        remaining_seconds: number
+        /**
+         * Where the call stands.
+         */
+        state:
+          | 'open'
+          | 'recovering'
+          | 'closing'
+          | {
+              closed: {
+                /**
+                 * What ended it.
+                 */
+                reason:
+                  | 'stop'
+                  | 'deadline'
+                  | 'revocation'
+                  | 'provider_closed'
+                  | 'silence'
+                  | 'credential_removed'
+                  | 'sideband_lost'
+              }
+            }
+      }
+    }
+  | {
+      admitted: {
+        /**
+         * The note the host took, for a note.
+         */
+        note: VoiceNote | null
+      }
+    }
+  | {
+      heard: {
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        offset_ms: string
+      }
+    }
+  | 'not_heard'
+  | {
+      refused: {
+        /**
+         * Why.
+         */
+        reason:
+          | 'unknown_call'
+          | 'not_this_device'
+          | 'closing'
+          | 'not_ready'
+          | 'rate'
+          | 'too_large'
+          | 'unknown_delegation'
+          | 'already_told'
+          | 'not_supported_by_record'
+          | 'outside_grant'
+          | 'provider_refused'
+          | 'sideband_lost'
+          | 'privacy'
+          | 'busy'
+      }
+    }
+/**
+ * Whether the provider confirmed that it closed a call on the host's own key.
+ */
+export type VoiceProviderClose = 'confirmed' | 'unconfirmed'
+/**
+ * A sentence the device owes the model, by name.
+ *
+ * One variant for each fixed sentence the device tells the model today. The words are the host's:
+ * a device that names a variant cannot change what the model is told.
+ */
+export type VoiceNote =
+  | 'host_actions_available'
+  | 'host_actions_unavailable'
+  | 'speech_tainted'
+  | 'delegation_refused'
+  | 'delegation_not_sent'
+  | 'delegation_unknown'
+  | 'delegation_admitted'
+  | 'delegation_confirmation'
+  | 'delegation_not_confirmed'
+  | 'delegation_no_ceremony'
+  | 'delegation_challenge_mismatch'
+  | 'delegation_confirmation_expired'
+  | 'delegation_session_not_named'
+  | 'delegation_confirmation_dropped'
+  | 'delegation_host_refused'
+  | 'delegation_late'
+  | 'delegation_performed'
+  | 'nothing_was_done'
+  | 'host_lost'
+  | 'host_back'
+  | 'host_back_accepting'
+/**
  * What a `voice.control` asks for.
  *
  * Named by the arm, as every variant union in this protocol is.
@@ -2691,7 +2815,10 @@ export type VoiceControlArm =
          */
         delegation_id: VoiceDelegationId | null
         /**
-         * Which sentence.
+         * A sentence the device owes the model, by name.
+         *
+         * One variant for each fixed sentence the device tells the model today. The words are the host's:
+         * a device that names a variant cannot change what the model is told.
          */
         note:
           | 'host_actions_available'
@@ -2754,10 +2881,6 @@ export type VoiceControlResult =
           | {
               closed: {
                 /**
-                 * Whether the provider's close of the call was confirmed.
-                 */
-                provider_close: 'confirmed' | 'unconfirmed'
-                /**
                  * What ended it.
                  */
                 reason:
@@ -2811,34 +2934,6 @@ export type VoiceControlResult =
           | 'busy'
       }
     }
-/**
- * A sentence the device owes the model, by name.
- *
- * One variant for each fixed sentence the device tells the model today. The words are the host's:
- * a device that names a variant cannot change what the model is told.
- */
-export type VoiceNote =
-  | 'host_actions_available'
-  | 'host_actions_unavailable'
-  | 'speech_tainted'
-  | 'delegation_refused'
-  | 'delegation_not_sent'
-  | 'delegation_unknown'
-  | 'delegation_admitted'
-  | 'delegation_confirmation'
-  | 'delegation_not_confirmed'
-  | 'delegation_no_ceremony'
-  | 'delegation_challenge_mismatch'
-  | 'delegation_confirmation_expired'
-  | 'delegation_session_not_named'
-  | 'delegation_confirmation_dropped'
-  | 'delegation_host_refused'
-  | 'delegation_late'
-  | 'delegation_performed'
-  | 'nothing_was_done'
-  | 'host_lost'
-  | 'host_back'
-  | 'host_back_accepting'
 /**
  * The providers a key can be kept for.
  */
@@ -2894,10 +2989,6 @@ export type VoiceHostCallState =
   | 'closing'
   | {
       closed: {
-        /**
-         * Whether the provider's close of the call was confirmed.
-         */
-        provider_close: 'confirmed' | 'unconfirmed'
         /**
          * What ended it.
          */
@@ -3022,10 +3113,6 @@ export type VoiceNewsItem =
   | {
       ended: {
         /**
-         * Whether the provider's close of the call was confirmed.
-         */
-        provider_close: 'confirmed' | 'unconfirmed'
-        /**
          * What ended it.
          */
         reason:
@@ -3080,10 +3167,6 @@ export type VoicePrepareProvider =
         message: string
       }
     }
-/**
- * Whether the provider confirmed that it closed a call on the host's own key.
- */
-export type VoiceProviderClose = 'confirmed' | 'unconfirmed'
 /**
  * Where a call's control is reached, as the host tells the device when it starts a call.
  *
@@ -3825,6 +3908,7 @@ export interface KalaReachProtocol {
   voice_context_send_result?: VoiceContextSendResult
   voice_context_state?: VoiceContextState
   voice_context_stop?: VoiceContextStop
+  voice_control_answer?: VoiceControlAnswer
   voice_control_arm?: VoiceControlArm
   voice_control_params?: VoiceControlParams
   voice_control_result?: VoiceControlResult
@@ -32486,76 +32570,6 @@ export interface VoiceContextSendParams {
   voice_session_id: string
 }
 /**
- * Parameters of `voice.control`.
- */
-export interface VoiceControlParams {
-  /**
-   * What the device asks.
-   */
-  arm:
-    | {
-        heartbeat: {
-          /**
-           * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-           */
-          after_seq: string
-        }
-      }
-    | {
-        mute: {
-          /**
-           * Whether the microphone is muted.
-           */
-          muted: boolean
-        }
-      }
-    | {
-        note: {
-          /**
-           * The delegation it is about, for a note about a delegation.
-           */
-          delegation_id: VoiceDelegationId | null
-          /**
-           * Which sentence.
-           */
-          note:
-            | 'host_actions_available'
-            | 'host_actions_unavailable'
-            | 'speech_tainted'
-            | 'delegation_refused'
-            | 'delegation_not_sent'
-            | 'delegation_unknown'
-            | 'delegation_admitted'
-            | 'delegation_confirmation'
-            | 'delegation_not_confirmed'
-            | 'delegation_no_ceremony'
-            | 'delegation_challenge_mismatch'
-            | 'delegation_confirmation_expired'
-            | 'delegation_session_not_named'
-            | 'delegation_confirmation_dropped'
-            | 'delegation_host_refused'
-            | 'delegation_late'
-            | 'delegation_performed'
-            | 'nothing_was_done'
-            | 'host_lost'
-            | 'host_back'
-            | 'host_back_accepting'
-        }
-      }
-    | {
-        heard: {
-          /**
-           * An opaque provider delegation identifier. Correlation data, never authority.
-           */
-          delegation_id: string
-        }
-      }
-  /**
-   * The voice session the device is controlling. It is bound to the device that started it.
-   */
-  voice_session_id: string
-}
-/**
  * One item of the news a heartbeat carries.
  */
 export interface VoiceNews {
@@ -32646,10 +32660,6 @@ export interface VoiceNews {
     | {
         ended: {
           /**
-           * Whether the provider's close of the call was confirmed.
-           */
-          provider_close: 'confirmed' | 'unconfirmed'
-          /**
            * What ended it.
            */
           reason:
@@ -32666,6 +32676,79 @@ export interface VoiceNews {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   seq: string
+}
+/**
+ * Parameters of `voice.control`.
+ */
+export interface VoiceControlParams {
+  /**
+   * What the device asks.
+   */
+  arm:
+    | {
+        heartbeat: {
+          /**
+           * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+           */
+          after_seq: string
+        }
+      }
+    | {
+        mute: {
+          /**
+           * Whether the microphone is muted.
+           */
+          muted: boolean
+        }
+      }
+    | {
+        note: {
+          /**
+           * The delegation it is about, for a note about a delegation.
+           */
+          delegation_id: VoiceDelegationId | null
+          /**
+           * A sentence the device owes the model, by name.
+           *
+           * One variant for each fixed sentence the device tells the model today. The words are the host's:
+           * a device that names a variant cannot change what the model is told.
+           */
+          note:
+            | 'host_actions_available'
+            | 'host_actions_unavailable'
+            | 'speech_tainted'
+            | 'delegation_refused'
+            | 'delegation_not_sent'
+            | 'delegation_unknown'
+            | 'delegation_admitted'
+            | 'delegation_confirmation'
+            | 'delegation_not_confirmed'
+            | 'delegation_no_ceremony'
+            | 'delegation_challenge_mismatch'
+            | 'delegation_confirmation_expired'
+            | 'delegation_session_not_named'
+            | 'delegation_confirmation_dropped'
+            | 'delegation_host_refused'
+            | 'delegation_late'
+            | 'delegation_performed'
+            | 'nothing_was_done'
+            | 'host_lost'
+            | 'host_back'
+            | 'host_back_accepting'
+        }
+      }
+    | {
+        heard: {
+          /**
+           * An opaque provider delegation identifier. Correlation data, never authority.
+           */
+          delegation_id: string
+        }
+      }
+  /**
+   * The voice session the device is controlling. It is bound to the device that started it.
+   */
+  voice_session_id: string
 }
 /**
  * Parameters of `voice.credential.forget_calls`.

@@ -229,7 +229,7 @@ impl Phone {
     async fn beat(
         &self,
         voice_session_id: kr_protocol::ids::VoiceSessionId,
-    ) -> kr_protocol::voice_host::VoiceControlResult {
+    ) -> kr_protocol::voice_host::VoiceControlAnswer {
         self.raw
             .mutate(
                 Method::VoiceControl,
@@ -249,9 +249,9 @@ impl Phone {
     }
 }
 
-/// Every `provider_close` word a result carries, read from its wire form: the `ended` item and the
+/// Every `provider_close` word a result carries, read from its wire form: the one beside the
 /// `closed` state.
-fn provider_closes(result: &kr_protocol::voice_host::VoiceControlResult) -> Vec<String> {
+fn provider_closes(result: &kr_protocol::voice_host::VoiceControlAnswer) -> Vec<String> {
     fn walk(value: &serde_json::Value, found: &mut Vec<String>) {
         match value {
             serde_json::Value::Object(members) => {
@@ -1895,7 +1895,7 @@ async fn a_credential_removal_tells_the_phone_whether_the_providers_close_was_co
         let _ = remove_key(&mut daemon.control, &daemon.host).await;
 
         let answer = phone.beat(call).await;
-        let kr_protocol::voice_host::VoiceControlResult::Heartbeat { state, news, .. } = &answer
+        let kr_protocol::voice_host::VoiceControlAnswer::Heartbeat { state, news, .. } = &answer
         else {
             panic!("a heartbeat answer: {answer:?}");
         };
@@ -1913,7 +1913,6 @@ async fn a_credential_removal_tells_the_phone_whether_the_providers_close_was_co
             news.last().map(|item| &item.item),
             Some(kr_protocol::voice_host::VoiceNewsItem::Ended {
                 reason: kr_protocol::voice_host::VoiceEndReason::CredentialRemoved,
-                ..
             })
         ));
         let word = if confirmed {
@@ -1923,8 +1922,8 @@ async fn a_credential_removal_tells_the_phone_whether_the_providers_close_was_co
         };
         assert_eq!(
             provider_closes(&answer),
-            [word, word],
-            "the ended item and the closed state agree (confirmed {confirmed})"
+            [word],
+            "the word beside the closed state (confirmed {confirmed})"
         );
         daemon.host.stop().await;
     }
@@ -1934,13 +1933,13 @@ async fn a_credential_removal_tells_the_phone_whether_the_providers_close_was_co
 async fn closed_beat(
     phone: &Phone,
     voice_session_id: kr_protocol::ids::VoiceSessionId,
-) -> kr_protocol::voice_host::VoiceControlResult {
+) -> kr_protocol::voice_host::VoiceControlAnswer {
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let answer = phone.beat(voice_session_id).await;
             if matches!(
                 answer,
-                kr_protocol::voice_host::VoiceControlResult::Heartbeat {
+                kr_protocol::voice_host::VoiceControlAnswer::Heartbeat {
                     state: kr_protocol::voice_host::VoiceHostCallState::Closed { .. },
                     ..
                 }
@@ -1979,21 +1978,29 @@ async fn a_grant_replaced_for_a_paired_device_ends_its_call_as_a_revocation_and_
         .expect("the grant is replaced");
 
     let answer = closed_beat(&phone, call).await;
-    let kr_protocol::voice_host::VoiceControlResult::Heartbeat { state, news, .. } = &answer else {
+    let kr_protocol::voice_host::VoiceControlAnswer::Heartbeat {
+        state,
+        news,
+        provider_close,
+        ..
+    } = &answer
+    else {
         panic!("a heartbeat answer: {answer:?}");
     };
     assert_eq!(
         *state,
         kr_protocol::voice_host::VoiceHostCallState::Closed {
             reason: kr_protocol::voice_host::VoiceEndReason::Revocation,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed,
         }
+    );
+    assert_eq!(
+        *provider_close,
+        Nullable::some(kr_protocol::voice_host::VoiceProviderClose::Confirmed)
     );
     assert_eq!(
         news.last().map(|item| &item.item),
         Some(&kr_protocol::voice_host::VoiceNewsItem::Ended {
             reason: kr_protocol::voice_host::VoiceEndReason::Revocation,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed,
         })
     );
     daemon.host.stop().await;
@@ -2028,7 +2035,7 @@ async fn a_revoked_device_has_its_call_ended_as_a_revocation_and_its_own_control
         || {
             matches!(
                 read(),
-                kr_protocol::voice_host::VoiceControlResult::Heartbeat {
+                kr_protocol::voice_host::VoiceControlAnswer::Heartbeat {
                     state: kr_protocol::voice_host::VoiceHostCallState::Closed { .. },
                     ..
                 }
@@ -2036,21 +2043,29 @@ async fn a_revoked_device_has_its_call_ended_as_a_revocation_and_its_own_control
         },
     )
     .await;
-    let kr_protocol::voice_host::VoiceControlResult::Heartbeat { state, news, .. } = read() else {
+    let kr_protocol::voice_host::VoiceControlAnswer::Heartbeat {
+        state,
+        news,
+        provider_close,
+        ..
+    } = read()
+    else {
         panic!("the status is kept");
     };
     assert_eq!(
         state,
         kr_protocol::voice_host::VoiceHostCallState::Closed {
             reason: kr_protocol::voice_host::VoiceEndReason::Revocation,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed,
         }
+    );
+    assert_eq!(
+        provider_close,
+        Nullable::some(kr_protocol::voice_host::VoiceProviderClose::Confirmed)
     );
     assert_eq!(
         news.last().map(|item| &item.item),
         Some(&kr_protocol::voice_host::VoiceNewsItem::Ended {
             reason: kr_protocol::voice_host::VoiceEndReason::Revocation,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed,
         })
     );
 

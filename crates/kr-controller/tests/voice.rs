@@ -3431,7 +3431,7 @@ impl RawVoice {
         voice_session_id: kr_protocol::ids::VoiceSessionId,
         arm: kr_protocol::voice_host::VoiceControlArm,
     ) -> std::result::Result<
-        kr_protocol::voice_host::VoiceControlResult,
+        kr_protocol::voice_host::VoiceControlAnswer,
         kr_protocol::error::ProtocolError,
     > {
         self.raw
@@ -3456,7 +3456,7 @@ impl RawVoice {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_heartbeat_is_a_write_through_the_ordinary_path_whose_claim_is_given_back_and_a_mute_is_kept()
  {
-    use kr_protocol::voice_host::{VoiceControlArm, VoiceControlResult, VoiceHostCallState};
+    use kr_protocol::voice_host::{VoiceControlAnswer, VoiceControlArm, VoiceHostCallState};
     let (provider, voice, call) = own_key_call().await;
     let beat = ActionId::new(kr_ipc::new_uuid());
 
@@ -3470,11 +3470,12 @@ async fn a_heartbeat_is_a_write_through_the_ordinary_path_whose_claim_is_given_b
         )
         .await
         .expect("a heartbeat is answered");
-    let VoiceControlResult::Heartbeat {
+    let VoiceControlAnswer::Heartbeat {
         state,
         remaining_seconds,
         news,
         dropped,
+        provider_close,
     } = first
     else {
         panic!("a heartbeat answer");
@@ -3482,6 +3483,11 @@ async fn a_heartbeat_is_a_write_through_the_ordinary_path_whose_claim_is_given_b
     assert_eq!(state, VoiceHostCallState::Open);
     assert!(remaining_seconds > 0 && remaining_seconds <= 600);
     assert!(news.is_empty() && !dropped);
+    assert_eq!(
+        provider_close,
+        Nullable::null(),
+        "an open call names no provider close"
+    );
     // The same identifier with another payload is a first request again, not a conflict.
     let again = voice
         .control(
@@ -3493,7 +3499,7 @@ async fn a_heartbeat_is_a_write_through_the_ordinary_path_whose_claim_is_given_b
         )
         .await
         .expect("a heartbeat identifier is not kept");
-    assert!(matches!(again, VoiceControlResult::Heartbeat { .. }));
+    assert!(matches!(again, VoiceControlAnswer::Heartbeat { .. }));
 
     // A mute is kept under its identifier: a repeat is answered from the record and writes
     // nothing, and the same identifier with another payload is the claim's conflict.
@@ -3503,7 +3509,7 @@ async fn a_heartbeat_is_a_write_through_the_ordinary_path_whose_claim_is_given_b
             .control(mute, call, VoiceControlArm::Mute { muted: true })
             .await
             .expect("a mute is answered");
-        assert!(matches!(answered, VoiceControlResult::Admitted { .. }));
+        assert!(matches!(answered, VoiceControlAnswer::Admitted { .. }));
     }
     assert_eq!(
         provider.sideband().written(),
@@ -3521,7 +3527,7 @@ async fn a_heartbeat_is_a_write_through_the_ordinary_path_whose_claim_is_given_b
 /// side channel is the table's text, as instructions when it names no delegation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_note_through_the_daemon_is_written_as_the_hosts_own_words() {
-    use kr_protocol::voice_host::{VoiceControlArm, VoiceControlResult, VoiceNote};
+    use kr_protocol::voice_host::{VoiceControlAnswer, VoiceControlArm, VoiceNote};
     let (provider, voice, call) = own_key_call().await;
     let answered = voice
         .control(
@@ -3536,7 +3542,7 @@ async fn a_note_through_the_daemon_is_written_as_the_hosts_own_words() {
         .expect("a note is answered");
     assert_eq!(
         answered,
-        VoiceControlResult::Admitted {
+        VoiceControlAnswer::Admitted {
             note: Nullable::some(VoiceNote::HostActionsUnavailable)
         }
     );
@@ -3557,7 +3563,7 @@ async fn a_note_through_the_daemon_is_written_as_the_hosts_own_words() {
 async fn a_heartbeat_after_a_stop_is_answered_from_the_final_status_and_the_other_arms_are_refused()
 {
     use kr_protocol::voice_host::{
-        VoiceControlArm, VoiceControlResult, VoiceEndReason, VoiceHostCallState, VoiceHostRefusal,
+        VoiceControlAnswer, VoiceControlArm, VoiceEndReason, VoiceHostCallState, VoiceHostRefusal,
         VoiceNewsItem,
     };
     let (provider, voice, call) = own_key_call().await;
@@ -3577,7 +3583,12 @@ async fn a_heartbeat_after_a_stop_is_answered_from_the_final_status_and_the_othe
         .expect("a stop result");
     assert_eq!(provider.closed(), ["own-1"]);
 
-    let VoiceControlResult::Heartbeat { state, news, .. } = voice
+    let VoiceControlAnswer::Heartbeat {
+        state,
+        news,
+        provider_close,
+        ..
+    } = voice
         .control(
             ActionId::new(kr_ipc::new_uuid()),
             call,
@@ -3593,16 +3604,18 @@ async fn a_heartbeat_after_a_stop_is_answered_from_the_final_status_and_the_othe
     assert_eq!(
         state,
         VoiceHostCallState::Closed {
-            reason: VoiceEndReason::Stop,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed
+            reason: VoiceEndReason::Stop
         }
+    );
+    assert_eq!(
+        provider_close,
+        Nullable::some(kr_protocol::voice_host::VoiceProviderClose::Confirmed)
     );
     let ended = news.last().expect("the ended item");
     assert_eq!(
         ended.item,
         VoiceNewsItem::Ended {
-            reason: VoiceEndReason::Stop,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed
+            reason: VoiceEndReason::Stop
         }
     );
     // Nothing else is taken for a call that ended.
@@ -3616,7 +3629,7 @@ async fn a_heartbeat_after_a_stop_is_answered_from_the_final_status_and_the_othe
         .expect("a refusal is an answer");
     assert_eq!(
         mute,
-        VoiceControlResult::Refused {
+        VoiceControlAnswer::Refused {
             reason: VoiceHostRefusal::UnknownCall
         }
     );
@@ -3643,7 +3656,7 @@ async fn a_heartbeat_after_a_stop_is_answered_from_the_final_status_and_the_othe
             )
             .await
             .expect("a heartbeat for a forgotten call is answered"),
-        VoiceControlResult::Refused {
+        VoiceControlAnswer::Refused {
             reason: VoiceHostRefusal::UnknownCall
         }
     );
@@ -3687,7 +3700,7 @@ async fn voice_delegate_on_a_host_call_refuses_an_id_its_side_channel_never_hear
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_phone_not_heard_from_for_two_minutes_has_its_call_closed_by_the_hosts_tick_as_silence() {
     use kr_protocol::voice_host::{
-        HostNote, VoiceControlArm, VoiceControlResult, VoiceEndReason, VoiceHostCallState,
+        HostNote, VoiceControlAnswer, VoiceControlArm, VoiceEndReason, VoiceHostCallState,
     };
     let (provider, voice, call) = own_key_call().await;
     let module = Arc::clone(voice.host.controller().voice());
@@ -3716,7 +3729,11 @@ async fn a_phone_not_heard_from_for_two_minutes_has_its_call_closed_by_the_hosts
         "the provider was asked to close the call"
     );
 
-    let VoiceControlResult::Heartbeat { state, .. } = voice
+    let VoiceControlAnswer::Heartbeat {
+        state,
+        provider_close,
+        ..
+    } = voice
         .control(
             ActionId::new(kr_ipc::new_uuid()),
             call,
@@ -3732,9 +3749,12 @@ async fn a_phone_not_heard_from_for_two_minutes_has_its_call_closed_by_the_hosts
     assert_eq!(
         state,
         VoiceHostCallState::Closed {
-            reason: VoiceEndReason::Silence,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed
+            reason: VoiceEndReason::Silence
         }
+    );
+    assert_eq!(
+        provider_close,
+        Nullable::some(kr_protocol::voice_host::VoiceProviderClose::Confirmed)
     );
 }
 
@@ -3742,7 +3762,7 @@ async fn a_phone_not_heard_from_for_two_minutes_has_its_call_closed_by_the_hosts
 async fn beat(
     voice: &RawVoice,
     call: kr_protocol::ids::VoiceSessionId,
-) -> kr_protocol::voice_host::VoiceControlResult {
+) -> kr_protocol::voice_host::VoiceControlAnswer {
     voice
         .control(
             ActionId::new(kr_ipc::new_uuid()),
@@ -3759,7 +3779,7 @@ async fn beat(
 /// the first call's channel closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_call_of_the_same_stand_in_registers_open_after_the_first_closed() {
-    use kr_protocol::voice_host::{VoiceControlResult, VoiceHostCallState};
+    use kr_protocol::voice_host::{VoiceControlAnswer, VoiceHostCallState};
     let (provider, voice, first) = own_key_call().await;
     let _: kr_protocol::voice::VoiceStopResult = voice
         .raw
@@ -3792,7 +3812,7 @@ async fn a_second_call_of_the_same_stand_in_registers_open_after_the_first_close
         panic!("the second call runs: {:?}", started.outcome);
     };
     assert_ne!(session.voice_session_id, first);
-    let VoiceControlResult::Heartbeat { state, .. } = beat(&voice, session.voice_session_id).await
+    let VoiceControlAnswer::Heartbeat { state, .. } = beat(&voice, session.voice_session_id).await
     else {
         panic!("a heartbeat answer");
     };
@@ -3852,7 +3872,7 @@ async fn the_stand_in_shows_the_side_channel_of_the_call_it_started_last_after_t
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_revocation_keeps_the_call_closing_until_the_threshold_then_tells_it_ended() {
     use kr_protocol::voice_host::{
-        VoiceControlResult, VoiceEndReason, VoiceHostCallState, VoiceNewsItem,
+        VoiceControlAnswer, VoiceEndReason, VoiceHostCallState, VoiceNewsItem,
     };
     let (provider, voice, call) = own_key_call().await;
     let module = Arc::clone(voice.host.controller().voice());
@@ -3864,7 +3884,7 @@ async fn a_failed_revocation_keeps_the_call_closing_until_the_threshold_then_tel
         provider.closed().is_empty(),
         "the revocation failed, so the provider's call runs"
     );
-    let VoiceControlResult::Heartbeat { state, news, .. } = beat(&voice, call).await else {
+    let VoiceControlAnswer::Heartbeat { state, news, .. } = beat(&voice, call).await else {
         panic!("a heartbeat answer");
     };
     assert_eq!(state, VoiceHostCallState::Closing);
@@ -3876,21 +3896,29 @@ async fn a_failed_revocation_keeps_the_call_closing_until_the_threshold_then_tel
     );
 
     module.tick(now + 125_000 + 60_000).await;
-    let VoiceControlResult::Heartbeat { state, news, .. } = beat(&voice, call).await else {
+    let VoiceControlAnswer::Heartbeat {
+        state,
+        news,
+        provider_close,
+        ..
+    } = beat(&voice, call).await
+    else {
         panic!("a heartbeat answer");
     };
     assert_eq!(
         state,
         VoiceHostCallState::Closed {
-            reason: VoiceEndReason::Silence,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Unconfirmed
+            reason: VoiceEndReason::Silence
         }
+    );
+    assert_eq!(
+        provider_close,
+        Nullable::some(kr_protocol::voice_host::VoiceProviderClose::Unconfirmed)
     );
     assert!(matches!(
         news.last().map(|item| &item.item),
         Some(VoiceNewsItem::Ended {
-            reason: VoiceEndReason::Silence,
-            provider_close: kr_protocol::voice_host::VoiceProviderClose::Unconfirmed
+            reason: VoiceEndReason::Silence
         })
     ));
 
@@ -3908,7 +3936,7 @@ async fn a_failed_revocation_keeps_the_call_closing_until_the_threshold_then_tel
 async fn a_heartbeat_after_a_silence_end_whose_revocation_failed_writes_nothing_more_to_the_channel()
  {
     use kr_protocol::voice_host::{
-        VoiceControlArm, VoiceControlResult, VoiceHostCallState, VoiceHostRefusal,
+        VoiceControlAnswer, VoiceControlArm, VoiceHostCallState, VoiceHostRefusal,
     };
     let (provider, voice, call) = own_key_call().await;
     let module = Arc::clone(voice.host.controller().voice());
@@ -3919,7 +3947,7 @@ async fn a_heartbeat_after_a_silence_end_whose_revocation_failed_writes_nothing_
     let written = provider.sideband().written();
     assert_eq!(written.len(), 1);
 
-    let VoiceControlResult::Heartbeat { state, .. } = beat(&voice, call).await else {
+    let VoiceControlAnswer::Heartbeat { state, .. } = beat(&voice, call).await else {
         panic!("a heartbeat answer");
     };
     assert_eq!(state, VoiceHostCallState::Closing);
@@ -3932,7 +3960,7 @@ async fn a_heartbeat_after_a_silence_end_whose_revocation_failed_writes_nothing_
             )
             .await
             .expect("a refusal is an answer"),
-        VoiceControlResult::Refused {
+        VoiceControlAnswer::Refused {
             reason: VoiceHostRefusal::Closing
         }
     );

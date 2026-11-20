@@ -531,8 +531,8 @@ impl VoiceModule {
         action_id: ActionId,
         params: &kr_protocol::voice_host::VoiceControlParams,
         now_ms: u64,
-    ) -> kr_protocol::voice_host::VoiceControlResult {
-        use kr_protocol::voice_host::{VoiceControlArm, VoiceControlResult};
+    ) -> kr_protocol::voice_host::VoiceControlAnswer {
+        use kr_protocol::voice_host::{VoiceControlAnswer, VoiceControlArm};
         let call = match self
             .host_calls
             .of_device(params.voice_session_id, device_id)
@@ -548,7 +548,7 @@ impl VoiceModule {
                         after_seq.get(),
                         now_ms,
                     ),
-                    _ => VoiceControlResult::Refused { reason },
+                    _ => VoiceControlAnswer::Refused { reason },
                 };
             }
         };

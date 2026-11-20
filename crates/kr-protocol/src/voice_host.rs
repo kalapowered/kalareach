@@ -7,8 +7,9 @@
 //! * `voice.control` carries the four things a device owes the call: a heartbeat that says the
 //!   phone is still there, a mute, a fixed sentence for the model (a [`VoiceNote`]) and the
 //!   question whether the host heard a delegation. Only the heartbeat is answered with the
-//!   state of the call and the news since the device last heard; its claim is given back after the
-//!   answer, so a heartbeat is never kept.
+//!   state of the call and the news since the device last heard, and, once the call is over,
+//!   whether the provider confirmed that it closed it; its claim is given back after the answer, so
+//!   a heartbeat is never kept. The answer is a [`VoiceControlAnswer`].
 //! * `voice.context.send` hands the host a selection of context to write to the model.
 //!
 //! The device decides which sentence goes and when; the host writes the words. Every sentence a
@@ -365,6 +366,12 @@ pub enum VoiceControlArm {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VoiceControlResult {
+    // The registry keeps this whole enum, and the stored-formats lock pins every arm of it and
+    // every type it names, this one too. No host sends this arm: a heartbeat is answered with
+    // `VoiceControlAnswer::Heartbeat`. Do not change this arm, or `VoiceHostCallState`,
+    // `VoiceNews` or `VoiceNewsItem`, which it names; a new fact about a heartbeat goes on
+    // `VoiceControlAnswer`. These are line comments because a doc comment is part of the schema
+    // the lock digests.
     /// The answer to a heartbeat. Never kept.
     Heartbeat {
         /// Where the call stands.
@@ -376,6 +383,50 @@ pub enum VoiceControlResult {
         /// The news queue overflowed since the device last heard: the call's outcomes are not
         /// all known.
         dropped: bool,
+    },
+    /// The host took the mute or the note. A note names itself in the answer so a repeat can be
+    /// read without the request. Proves admission to the host's writer, not provider execution.
+    Admitted {
+        /// The note the host took, for a note.
+        note: Nullable<VoiceNote>,
+    },
+    /// The host's own side channel heard the delegation.
+    Heard {
+        /// Where in the call it was heard, in milliseconds.
+        offset_ms: U64,
+    },
+    /// The host's own side channel has not heard the delegation. Ask again under a new action.
+    NotHeard,
+    /// The host did not take it.
+    Refused {
+        /// Why.
+        reason: VoiceHostRefusal,
+    },
+}
+
+/// The answer to `voice.control` on the wire.
+///
+/// The arms after the heartbeat are the ones [`VoiceControlResult`] keeps for a repeated request,
+/// with the same words, so the bytes the registry keeps of them read as either type. The heartbeat
+/// is never kept: it tells where the call stands and, once the call is over, whether the provider
+/// confirmed that it closed it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum VoiceControlAnswer {
+    /// The answer to a heartbeat. Never kept.
+    Heartbeat {
+        /// Where the call stands.
+        state: VoiceHostCallState,
+        /// Seconds until the call's own deadline, or zero.
+        remaining_seconds: u32,
+        /// News since `after_seq`, oldest first.
+        news: Vec<VoiceNews>,
+        /// The news queue overflowed since the device last heard: the call's outcomes are not
+        /// all known.
+        dropped: bool,
+        /// Whether the provider's close of the call was confirmed, once `state` is `closed`;
+        /// null before.
+        provider_close: Nullable<VoiceProviderClose>,
     },
     /// The host took the mute or the note. A note names itself in the answer so a repeat can be
     /// read without the request. Proves admission to the host's writer, not provider execution.
@@ -476,8 +527,6 @@ pub enum VoiceHostCallState {
     Closed {
         /// What ended it.
         reason: VoiceEndReason,
-        /// Whether the provider's close of the call was confirmed.
-        provider_close: VoiceProviderClose,
     },
 }
 
@@ -589,8 +638,6 @@ pub enum VoiceNewsItem {
     Ended {
         /// What ended it.
         reason: VoiceEndReason,
-        /// Whether the provider's close of the call was confirmed.
-        provider_close: VoiceProviderClose,
     },
 }
 
@@ -714,48 +761,113 @@ mod tests {
         );
     }
 
-    fn ended(close: &str) -> serde_json::Value {
-        serde_json::json!({"ended": {"reason": "stop", "provider_close": close}})
+    fn heartbeat(state: serde_json::Value, close: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"heartbeat": {
+            "state": state,
+            "remaining_seconds": 0,
+            "news": [],
+            "dropped": false,
+            "provider_close": close,
+        }})
     }
 
-    fn closed(close: &str) -> serde_json::Value {
-        serde_json::json!({"closed": {"reason": "stop", "provider_close": close}})
+    fn closed_stop() -> serde_json::Value {
+        serde_json::json!({"closed": {"reason": "stop"}})
     }
 
     #[test]
-    fn an_ended_item_and_a_closed_state_carry_whether_the_provider_close_was_confirmed() {
+    fn a_heartbeat_tells_whether_the_provider_close_was_confirmed_beside_a_closed_state() {
         for word in ["confirmed", "unconfirmed"] {
-            let item: VoiceNewsItem = serde_json::from_value(ended(word)).expect("an ended item");
-            assert_eq!(
-                serde_json::to_value(&item).expect("it serialises"),
-                ended(word)
-            );
-            let state: VoiceHostCallState =
-                serde_json::from_value(closed(word)).expect("a closed state");
-            assert_eq!(
-                serde_json::to_value(state).expect("it serialises"),
-                closed(word)
-            );
+            let wire = heartbeat(closed_stop(), serde_json::json!(word));
+            let answer: VoiceControlAnswer =
+                serde_json::from_value(wire.clone()).expect("a heartbeat answer");
+            assert_eq!(serde_json::to_value(&answer).expect("it serialises"), wire);
         }
+        let open = heartbeat(serde_json::json!("open"), serde_json::Value::Null);
+        let answer: VoiceControlAnswer =
+            serde_json::from_value(open.clone()).expect("an open heartbeat answer");
+        assert_eq!(serde_json::to_value(&answer).expect("it serialises"), open);
     }
 
     #[test]
-    fn an_ended_item_without_the_provider_close_is_refused() {
-        let item = serde_json::json!({"ended": {"reason": "stop"}});
-        assert!(serde_json::from_value::<VoiceNewsItem>(item).is_err());
-    }
-
-    #[test]
-    fn a_closed_state_without_the_provider_close_is_refused() {
-        let state = serde_json::json!({"closed": {"reason": "stop"}});
-        assert!(serde_json::from_value::<VoiceHostCallState>(state).is_err());
+    fn a_heartbeat_without_its_provider_close_member_is_refused() {
+        let mut wire = heartbeat(closed_stop(), serde_json::json!("confirmed"));
+        wire["heartbeat"]
+            .as_object_mut()
+            .expect("a heartbeat object")
+            .remove("provider_close");
+        assert!(serde_json::from_value::<VoiceControlAnswer>(wire).is_err());
     }
 
     #[test]
     fn a_provider_close_outside_its_two_words_is_refused() {
         for word in ["maybe", "Confirmed", ""] {
-            assert!(serde_json::from_value::<VoiceNewsItem>(ended(word)).is_err());
-            assert!(serde_json::from_value::<VoiceHostCallState>(closed(word)).is_err());
+            let wire = heartbeat(closed_stop(), serde_json::json!(word));
+            assert!(serde_json::from_value::<VoiceControlAnswer>(wire).is_err());
+        }
+    }
+
+    /// The state and the news items the lock pins have no member for the provider's close.
+    #[test]
+    fn a_closed_state_and_an_ended_item_have_no_provider_close_member() {
+        let state =
+            serde_json::json!({"closed": {"reason": "stop", "provider_close": "confirmed"}});
+        assert!(serde_json::from_value::<VoiceHostCallState>(state).is_err());
+        let item = serde_json::json!({"ended": {"reason": "stop", "provider_close": "confirmed"}});
+        assert!(serde_json::from_value::<VoiceNewsItem>(item).is_err());
+        let item = serde_json::json!({"ended": {"reason": "stop"}});
+        assert!(serde_json::from_value::<VoiceNewsItem>(item).is_ok());
+    }
+
+    /// The registry keeps the bytes of a `voice.control` answer, and the lock pins the type
+    /// [`VoiceControlResult`]: each arm that is kept has one wire form in both types. The `match`
+    /// names every member of the arms, so a member added to one type alone stops the build.
+    #[test]
+    fn the_kept_arms_of_the_control_answer_have_the_wire_form_of_the_kept_control_result() {
+        fn kept_form(answer: &VoiceControlAnswer) -> Option<VoiceControlResult> {
+            match answer {
+                VoiceControlAnswer::Heartbeat {
+                    state: _,
+                    remaining_seconds: _,
+                    news: _,
+                    dropped: _,
+                    provider_close: _,
+                } => None,
+                VoiceControlAnswer::Admitted { note } => {
+                    Some(VoiceControlResult::Admitted { note: *note })
+                }
+                VoiceControlAnswer::Heard { offset_ms } => Some(VoiceControlResult::Heard {
+                    offset_ms: *offset_ms,
+                }),
+                VoiceControlAnswer::NotHeard => Some(VoiceControlResult::NotHeard),
+                VoiceControlAnswer::Refused { reason } => {
+                    Some(VoiceControlResult::Refused { reason: *reason })
+                }
+            }
+        }
+        let kept = [
+            VoiceControlAnswer::Admitted {
+                note: Nullable::some(VoiceNote::DelegationLate),
+            },
+            VoiceControlAnswer::Admitted {
+                note: Nullable::null(),
+            },
+            VoiceControlAnswer::Heard {
+                offset_ms: U64::new(1_500),
+            },
+            VoiceControlAnswer::NotHeard,
+            VoiceControlAnswer::Refused {
+                reason: VoiceHostRefusal::Closing,
+            },
+        ];
+        for answer in kept {
+            let wire = serde_json::to_value(&answer).expect("it serialises");
+            let result = kept_form(&answer).expect("a kept arm");
+            assert_eq!(serde_json::to_value(&result).expect("it serialises"), wire);
+            assert_eq!(
+                serde_json::from_value::<VoiceControlResult>(wire).expect("it reads as kept"),
+                result
+            );
         }
     }
 
