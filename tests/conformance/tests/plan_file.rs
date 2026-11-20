@@ -2,11 +2,20 @@
 
 use std::path::{Path, PathBuf};
 
-use kr_conformance::plan::Platform;
+use kr_conformance::plan::{Platform, Step};
 use kr_conformance::plan_file::Plan;
 
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+/// Core's own plan file.
+fn core_plan() -> Plan {
+    Plan::load(&repository(), None).expect("core's plan file")
+}
+
+fn selection(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
 }
 
 const HEAD: &str = "repository = 'planted'
@@ -218,9 +227,9 @@ fn a_plan_file_is_refused_for_each_fault_by_its_reason() {
 /// A script that is a link is refused, and so is one that is tracked and is not a link (accepted).
 #[test]
 fn a_script_that_is_a_link_is_refused_and_a_tracked_one_is_accepted() {
-    let directory = tempfile::tempdir().expect("a directory");
     #[cfg(unix)]
     {
+        let directory = tempfile::tempdir().expect("a directory");
         std::os::unix::fs::symlink("/bin/sh", directory.path().join("link.sh")).expect("a link");
         let text = step_with(
             "command = ['cargo', 'test']",
@@ -423,4 +432,206 @@ fn the_tables_are_not_in_the_code() {
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// What each selection of core's groups decides: whether the run reads TypeScript, selects the
+/// phone lanes' places, needs the applications, records Node and pnpm, gives the Windows reason for
+/// an unrun Rust target, and says why a TypeScript test is not run.
+#[test]
+fn every_decision_a_group_takes_is_what_core_s_file_says() {
+    let plan = core_plan();
+    let tests_of_a_phone_lane = "apps/companion/native/ios/Tests/A.swift";
+    let every = [
+        "rust",
+        "end-to-end",
+        "performance",
+        "typescript",
+        "applications",
+        "phones",
+    ];
+    for (names, typescript, phones, applications) in [
+        (vec![], false, false, false),
+        (vec!["rust"], false, false, false),
+        (vec!["end-to-end", "performance"], false, false, false),
+        (vec!["typescript"], true, false, false),
+        (vec!["phones"], false, true, false),
+        (vec!["applications"], false, false, true),
+        (vec!["rust", "typescript", "phones"], true, true, false),
+        (every.to_vec(), true, true, true),
+    ] {
+        let groups = selection(&names);
+        assert_eq!(plan.reads_typescript(&groups), typescript, "{names:?}");
+        assert_eq!(
+            plan.selects_lane_file(&groups, tests_of_a_phone_lane),
+            phones,
+            "{names:?}"
+        );
+        assert_eq!(
+            plan.selects_applications(&groups),
+            applications,
+            "{names:?}"
+        );
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            let unix = platform != Platform::Windows;
+            assert_eq!(
+                plan.uses_javascript_tools(platform, &groups),
+                typescript && unix,
+                "{platform:?} {names:?}"
+            );
+            assert_eq!(
+                plan.runs_applications(platform, &groups),
+                applications && unix,
+                "{platform:?} {names:?}"
+            );
+        }
+    }
+    let unix_only = "the end-to-end suites and the measurements drive Unix pseudo-terminals; on Windows the pseudo-console is qualified on the Windows test machine";
+    for names in [
+        &["end-to-end"][..],
+        &["performance"],
+        &["end-to-end", "rust"],
+    ] {
+        let groups = selection(names);
+        assert_eq!(
+            plan.unrun_rust_reason(Platform::Windows, &groups),
+            Some(unix_only),
+            "{names:?}"
+        );
+        assert_eq!(plan.unrun_rust_reason(Platform::Linux, &groups), None);
+        assert_eq!(plan.unrun_rust_reason(Platform::MacOs, &groups), None);
+    }
+    assert_eq!(
+        plan.unrun_rust_reason(Platform::Windows, &selection(&["rust", "typescript"])),
+        None
+    );
+    let typescript = selection(&["typescript"]);
+    assert_eq!(
+        plan.typescript_unrun_reason(Platform::Windows, &typescript),
+        "the TypeScript suites are qualified on Linux and macOS"
+    );
+    assert_eq!(
+        plan.typescript_unrun_reason(Platform::Linux, &typescript),
+        "no step of this run's selection runs the TypeScript suites"
+    );
+    // A plan whose groups carry other names reads TypeScript wherever it has a vitest step.
+    let planted = r"
+repository = 'planted'
+groups = ['unit', 'browsers', 'node']
+[unrun]
+bench = 'b'
+typescript = 't'
+[unrun.rust]
+linux = 'l'
+macos = 'm'
+windows = 'w'
+[[step]]
+id = 'unit-tests'
+group = 'unit'
+what = 'the unit tests'
+platforms = ['linux']
+reading = 'vitest'
+package = '.'
+command = ['pnpm', 'run', 'test']
+[[step]]
+id = 'build'
+group = 'node'
+what = 'a build'
+platforms = ['linux']
+reading = 'build'
+command = ['cargo', 'build']
+";
+    let plan = Plan::parse(planted, &repository()).expect("the planted plan loads");
+    let unit = selection(&["unit"]);
+    let others = selection(&["browsers", "node"]);
+    assert!(plan.reads_typescript(&unit));
+    assert!(!plan.reads_typescript(&others));
+    assert!(plan.uses_javascript_tools(Platform::Linux, &unit));
+    assert!(!plan.uses_javascript_tools(Platform::Windows, &unit));
+    assert!(!plan.uses_javascript_tools(Platform::Linux, &others));
+}
+
+/// The words each way a command is expanded gives: a captured test output, an uncaptured one, a
+/// command that already shows its output, the skips of a step, the one raw skip of the Windows
+/// startup step, and a build.
+#[test]
+fn the_one_expansion_rule_gives_the_words_the_steps_are_run_with() {
+    let plan = core_plan();
+    // Captured: the Linux workspace step. Raw skip: the Windows startup step. Uncaptured: a
+    // measurement. Structured skips: the macOS workspace step. Build: the end-to-end build.
+    for (platform, group, line) in [
+        (
+            Platform::Linux,
+            "rust",
+            "cargo test --locked --workspace --no-fail-fast -- --show-output",
+        ),
+        (
+            Platform::Windows,
+            "rust",
+            "--test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start --show-output",
+        ),
+        (
+            Platform::Linux,
+            "performance",
+            "-- --ignored --exact --nocapture attach_to_a_usable_screen",
+        ),
+        (
+            Platform::MacOs,
+            "rust",
+            "--no-fail-fast -- --show-output --skip the_helper_inside_a_container",
+        ),
+        (
+            Platform::Linux,
+            "end-to-end",
+            "cargo build --locked -p kr-worker --bin kr-worker",
+        ),
+    ] {
+        let lines: Vec<String> = plan
+            .steps(platform, &selection(&[group]), "/tmp/e", None)
+            .iter()
+            .map(Step::line)
+            .collect();
+        assert!(
+            lines.iter().any(|candidate| candidate.contains(line)),
+            "{platform:?} {group}: {line}"
+        );
+    }
+    // A command that already holds `--show-output` or `--nocapture` is left as it is.
+    let planted = format!(
+        "{HEAD}[[step]]
+id = 'shown'
+group = 'rust'
+what = 'shown already'
+platforms = ['linux']
+reading = 'cargo'
+command = ['cargo', 'test', '--', '--show-output']
+[[step]]
+id = 'live'
+group = 'rust'
+what = 'uncaptured'
+platforms = ['linux']
+reading = 'cargo'
+command = ['cargo', 'test', '--', '--nocapture']
+[[step]]
+id = 'plain'
+group = 'rust'
+what = 'a plain one'
+platforms = ['linux']
+reading = 'cargo'
+command = ['cargo', 'test']
+"
+    );
+    let plan = Plan::parse(&planted, &repository()).expect("the planted plan loads");
+    let lines: Vec<String> = plan
+        .steps(Platform::Linux, &selection(&["rust"]), "/tmp/e", None)
+        .iter()
+        .map(Step::line)
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "cargo test -- --show-output",
+            "cargo test -- --nocapture",
+            "cargo test -- --show-output"
+        ]
+    );
 }
