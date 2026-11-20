@@ -386,7 +386,7 @@ fn names_plain_daemon(value: &str) -> bool {
 /// why none of them starts the plain daemon: the held build is placed under the installed name, and
 /// a fixture or a message holds the name without running anything. A string in any other function,
 /// or beyond a listed count, is refused.
-const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 15] = [
+const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 16] = [
     (
         "crates/kr-cli/tests/bridged_session.rs",
         &[
@@ -413,6 +413,41 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 15] = [
         ],
     ),
     (
+        "crates/kr-cli/tests/login_item.rs",
+        &[
+            (
+                "Setup::layout",
+                2,
+                "a stand-in script that only records its call, placed under the installed name; nothing starts the plain build",
+            ),
+            (
+                "a_missing_or_non_executable_controller_is_refused_at_install_and_removal_works_without_it",
+                2,
+                "a stand-in script that only records its call, placed under the installed name; nothing starts the plain build",
+            ),
+            (
+                "a_path_a_desktop_entry_cannot_hold_exactly_is_refused_and_every_other_path_reads_back_whole",
+                2,
+                "a stand-in script that only records its call, placed under the installed name; nothing starts the plain build",
+            ),
+            (
+                "a_path_a_property_list_must_escape_reads_back_whole",
+                2,
+                "a stand-in script that only records its call, placed under the installed name; nothing starts the plain build",
+            ),
+            (
+                "each_stopped_state_says_what_the_next_command_does_about_it",
+                1,
+                "a stand-in script that only records its call, placed under the installed name; nothing starts the plain build",
+            ),
+            (
+                "the_command_the_login_item_stores_is_the_one_kr_gives_the_daemon_and_nothing_runs_it",
+                1,
+                "a stand-in script that only records its call, placed under the installed name; nothing starts the plain build",
+            ),
+        ],
+    ),
+    (
         "crates/kr-cli/tests/pair.rs",
         &[(
             "Host::start",
@@ -431,6 +466,21 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 15] = [
     (
         "crates/kr-cli/tests/startup.rs",
         &[
+            (
+                "kr_host_restart_refuses_before_it_stops_where_the_daemon_program_cannot_be_run",
+                1,
+                "a program placed under the installed name that cannot be run; nothing starts the plain build",
+            ),
+            (
+                "the_daemon_script_hands_over_in_a_folder_whose_name_holds_a_quote_and_a_space",
+                1,
+                "a script placed under the installed name that records its call or hands over to a stub program; nothing starts the plain build",
+            ),
+            (
+                "the_service_daemon_script_hands_over_in_a_folder_whose_name_holds_a_quote_and_a_space",
+                1,
+                "a script placed under the installed name that records its call or hands over to a stub program; nothing starts the plain build",
+            ),
             (
                 "Standalone::start_a_daemon_by_hand",
                 1,
