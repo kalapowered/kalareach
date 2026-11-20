@@ -90,8 +90,9 @@ crate::debug_fields!(PairedHost {
 /// the organisation its grant answers to.
 ///
 /// It is read from a paired-host record or from an attempt that has not yet written one, so a
-/// device that was committed while it was not listening reaches the host with the same value. It
-/// is owned, never stored and never serialised.
+/// device that was committed while it was not listening reaches the host through the same connect;
+/// `pairing` says which of the two it was read from. It is owned, never stored and never
+/// serialised.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HostCredentials {
     /// The host's device identity.

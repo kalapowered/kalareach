@@ -398,10 +398,11 @@ pub enum Standing {
     /// A host that a pairing invitation names and the device is not paired with yet: its address
     /// lookups enter the endpoint and its relays do not.
     Invited,
-    /// A host that has committed this device while it was not listening, and that the device
-    /// reaches as the identity derived for it, which no record holds yet: it enters as an invited
-    /// host does, with its address lookups and no relays, and the pool records no pairing for it,
-    /// so a recovery that does not complete leaves nothing behind. The dial is refused when the
+    /// A host that may have committed this device while it was not listening, which the device
+    /// dials as the identity derived for it before any record holds that identity: it enters as
+    /// an invited host does, with its address lookups and no relays, and the pool records no
+    /// pairing for it. A recovery that does not complete leaves the lookups and no pairing, so the
+    /// forget of a later pairing with the host takes the host out. The dial is refused when the
     /// person forgot that identity in this run.
     Recovering(DeviceId),
     /// A host the device is paired with, by the identity the host gave this device in that pairing,
@@ -550,13 +551,13 @@ impl EndpointPool {
     /// already there changes nothing, and a changed configuration for the same identity replaces
     /// what it had.
     ///
-    /// A pairing that the person forgot ([`Self::forget`]) is refused, for a [`Standing::Recovering`]
-    /// dial as for a paired one. The dial takes the host's own
-    /// lock first and looks at the pairing's mark after it holds the lock, so a dial that waited
-    /// behind a forget meets the mark, and one that the forget waits for has finished its
-    /// introduction before the forget removes the host. The lock is held through the introduction
-    /// and no longer: the connection that the caller makes with the endpoint it gets is its own,
-    /// and the pool is not asked again.
+    /// A pairing that the person forgot ([`Self::forget`]) is refused, for a
+    /// [`Standing::Recovering`] dial as for a paired one. The dial takes the host's own lock first
+    /// and looks at the pairing's mark after it holds the lock, so a dial that waited behind a
+    /// forget meets the mark, and one that the forget waits for has finished its introduction
+    /// before the forget removes the host. The lock is held through the introduction and no longer:
+    /// the connection that the caller makes with the endpoint it gets is its own, and the pool is
+    /// not asked again.
     ///
     /// A dial of a host that is already introduced, with the same services, holds the host's lock
     /// across no await but the one for the device lock, which binds the endpoint when none is open.
@@ -1394,8 +1395,8 @@ mod tests {
     /// while it was not listening dials its host with the identity derived for it before any record
     /// holds that identity, and when the host does not confirm the commitment no record ever will:
     /// the dial puts no relay into the map, and the pairing that the person later makes with the
-    /// same host and forgets takes the host out of the endpoint, with the relays and lookups that
-    /// the recovery's dial introduced, while another host stays.
+    /// same host and forgets takes the host out of the endpoint, with the relay of that pairing and
+    /// the lookups that the recovery's dial introduced, while another host stays.
     #[tokio::test]
     async fn a_recovery_that_does_not_complete_leaves_no_pairing_behind() {
         let (listener, host, serving) = host_that_closes().await;
