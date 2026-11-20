@@ -1550,6 +1550,13 @@ fn a_set_aside_whose_flush_failed_is_owed_and_completed_before_any_adoption() {
         let refusal = (window.drafts()).clone().expect_err("the call is refused");
         assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
     }
+    {
+        // The flush stays owed after a refusal: a second read is refused too.
+        let refusal = (window.drafts())
+            .clone()
+            .expect_err("the call is refused again");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
     slot.lock().expect("a lock").take();
     let read = window.drafts().expect("answers once the flush is made");
     assert_eq!(read["ledger"], "ok", "a retry shows no control");
