@@ -92,11 +92,8 @@ fn a_condition_the_rule_cannot_read_is_an_error_and_never_a_skip() {
     ] {
         assert_eq!(enabled(attributes), Err(unreadable(text)), "{attributes}");
     }
-    let sets = |text: &str| {
-        format!(
-            "lib.rs: the scan does not read a cfg_attr that sets a path or a condition ({text})"
-        )
-    };
+    let sets =
+        |text: &str| format!("lib.rs: the scan does not read a cfg_attr that sets a path ({text})");
     for (attributes, text) in [
         (
             "#[cfg_attr(unix, path = \"x.rs\")]",
@@ -106,13 +103,11 @@ fn a_condition_the_rule_cannot_read_is_an_error_and_never_a_skip() {
             "#[cfg_attr(unix, cfg_attr(windows, path = \"x.rs\"))]",
             "# [cfg_attr (unix , cfg_attr (windows , path = \"x.rs\"))]",
         ),
-        (
-            "#[cfg_attr(unix, cfg(test))]",
-            "# [cfg_attr (unix , cfg (test))]",
-        ),
     ] {
         assert_eq!(enabled(attributes), Err(sets(text)), "{attributes}");
     }
+    // A `cfg_attr` that adds a `cfg` is not read, so it only reads more.
+    assert_eq!(enabled("#[cfg_attr(unix, cfg(test))]"), Ok(true));
 }
 
 #[test]
@@ -224,7 +219,7 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         "#[cfg_attr(unix, path = \"x.rs\")]\nmod m;\n",
         &[],
         format!(
-            "{at}: the scan does not read a cfg_attr that sets a path or a condition (# [cfg_attr (unix , path = \"x.rs\")])"
+            "{at}: the scan does not read a cfg_attr that sets a path (# [cfg_attr (unix , path = \"x.rs\")])"
         ),
     );
     refuse(
@@ -553,7 +548,7 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
     assert_eq!(
         sender_names(&tree),
         Err(format!(
-            "crates/kr-sender/src/linked.rs: the scan does not read a path through a link or outside the checkout (it is {})",
+            "crates/kr-sender/src/linked.rs: the scan does not read a path through a link, with .. or from the root of the file system (it is {})",
             real.display()
         ))
     );
@@ -575,16 +570,11 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
         write(&inner, &format!("crates/{name}/src/lib.rs"), text);
     }
     write(outer.path(), "escape.rs", SENDS);
-    let escaped = std::fs::canonicalize(outer.path())
-        .expect("a path")
-        .join("escape.rs");
     let tree = tree_at(&inner).expect("the tree");
+    // A path that leaves the checkout by `..` is refused where it is written.
     assert_eq!(
         sender_names(&tree),
-        Err(format!(
-            "{0}: the scan does not read a path through a link or outside the checkout (it is {0})",
-            escaped.display()
-        ))
+        Err("crates/kr-sender/src/lib.rs: the scan does not read a path through a link, with .. or from the root of the file system (it is ../../../../escape.rs)".to_owned())
     );
 }
 
@@ -617,21 +607,40 @@ fn a_link_in_a_written_path_is_refused_where_it_stands_whatever_file_it_leads_to
     let refused = |folder: &std::path::Path, link: &str| {
         let root = std::fs::canonicalize(folder).expect("a path");
         format!(
-            "crates/kr-sender/src/lib.rs: the scan does not read a path through a link or outside the checkout ({} is a link)",
+            "crates/kr-sender/src/lib.rs: the scan does not read a path through a link, with .. or from the root of the file system ({} is a link)",
             root.join("crates/kr-sender/src").join(link).display()
         )
     };
+    let dotted = |written: &str| {
+        format!(
+            "crates/kr-sender/src/lib.rs: the scan does not read a path through a link, with .. or from the root of the file system (it is {written})"
+        )
+    };
+    // A `..` among the steps is refused where it stands, whatever file the steps lead to.
     let folder = prepare("link/../chosen.rs");
     let tree = tree_at(folder.path()).expect("the tree");
-    let text = refused(folder.path(), "link");
+    let text = dotted("link/../chosen.rs");
     assert_eq!(sender_names(&tree), Err(text.clone()));
     assert_eq!(tree.item("kr_sender", "lexical"), Lookup::Failed(text));
-    // The same file by the cancelled path and by the file system is refused all the same.
-    let folder = prepare("sibling/../chosen.rs");
+    for written in [
+        "sibling/../chosen.rs",
+        "deep/../chosen.rs",
+        "gone/../chosen.rs",
+    ] {
+        let folder = prepare(written);
+        assert_eq!(
+            sender_names(&tree_at(folder.path()).expect("the tree")),
+            Err(dotted(written)),
+            "{written}"
+        );
+    }
+    // A start at the root of the file system is refused the same way.
+    let folder = prepare("/etc/chosen.rs");
     assert_eq!(
         sender_names(&tree_at(folder.path()).expect("the tree")),
-        Err(refused(folder.path(), "sibling"))
+        Err(dotted("/etc/chosen.rs"))
     );
+    // A link among the steps with no `..`, as a folder.
     // A file that is a link, and a link at the end of the path.
     let folder = prepare("chosen.rs");
     let source = folder.path().join("crates/kr-sender/src");
@@ -641,23 +650,10 @@ fn a_link_in_a_written_path_is_refused_where_it_stands_whatever_file_it_leads_to
         sender_names(&tree_at(folder.path()).expect("the tree")),
         Err(refused(folder.path(), "chosen.rs"))
     );
-    // The same step up after a folder that is no link is read as the cancelled path.
-    let folder = prepare("deep/../chosen.rs");
+    let folder = prepare("link/chosen.rs");
     assert_eq!(
         sender_names(&tree_at(folder.path()).expect("the tree")),
-        Ok(vec!["lexical".to_owned()])
-    );
-    // After a folder that is not there it finds no file, as rustc finds none.
-    let folder = prepare("gone/../chosen.rs");
-    let root = std::fs::canonicalize(folder.path()).expect("a path");
-    assert_eq!(
-        sender_names(&tree_at(folder.path()).expect("the tree")),
-        Err(
-            "crates/kr-sender/src/lib.rs: mod chosen is at no file the scan can find (tried crates/kr-sender/src/gone/../chosen.rs)"
-                .to_owned()
-        ),
-        "{}",
-        root.display()
+        Err(refused(folder.path(), "link"))
     );
 }
 
