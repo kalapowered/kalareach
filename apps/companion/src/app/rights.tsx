@@ -16,7 +16,6 @@ import { createContext, useContext, useEffect, useState } from 'react'
 import type { ActionRight } from '@kalareach/protocol'
 
 import { useApp } from './state'
-import { follow } from '../host/port'
 
 /** What the live connection may do, and whether its host is paired with this device. */
 export interface HeldConnection {
@@ -41,9 +40,7 @@ export function useHeldConnection(): HeldConnection {
   const [own, setOwn] = useState<HeldConnection>(NOTHING_KNOWN)
   useEffect(() => {
     if (shared !== undefined) return
-    return follow(
-      (listener) => port.onConnection(listener),
-      () => port.connectionState(),
+    return port.watchConnection(
       (state) => {
         if (state.connected && state.rights !== null) rememberRights(state.rights)
         setOwn(

@@ -24,7 +24,7 @@ import { Session } from './views/Session'
 import { Setup } from './setup/Setup'
 import { KeptDrafts } from './views/KeptDrafts'
 import { useRebind } from './app/drafts'
-import { failureMessage, follow } from './host/port'
+import { failureMessage } from './host/port'
 import { useConfirmations } from './pairing/Confirmations'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
@@ -79,13 +79,10 @@ export function App(): ReactNode {
   // count the page starts with is not a replacement it saw.
   const replacements = useRef<number | null>(null)
 
-  // The state is read once the listener is registered, so no change can fall between the two, and
-  // a change heard before the read answers is at least as new as it.
+  // The port's feed gives the latest state once it has one and then each change, once and in order.
   useEffect(
     () =>
-      follow(
-        (listener) => port.onConnection(listener),
-        () => port.connectionState(),
+      port.watchConnection(
         (state) => {
           if (replacements.current !== null && state.replaced > replacements.current) {
             say(CONNECTION_REPLACED, 'pending')

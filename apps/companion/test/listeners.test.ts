@@ -113,7 +113,13 @@ describe('the desktop shell', () => {
     await registration
 
     shell.asked[0].handler({
-      payload: { stream_id: 'semantic:s-1', sequence: '4', event_type: 'node', payload: { id: 'n' } }
+      payload: {
+        stream_id: 'semantic:s-1',
+        sequence: '4',
+        event_type: 'node',
+        payload: { id: 'n' },
+        revision: 0
+      }
     })
     expect(heard).toEqual([
       { stream_id: 'semantic:s-1', sequence: '4', body: { kind: 'node', payload: { id: 'n' } } }

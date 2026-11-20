@@ -46,7 +46,6 @@ import {
   failureCode,
   failureMessage as portFailureMessage,
   failureStartAgainFor,
-  follow,
   watch
 } from '../host/port'
 import type { HostPort, VoiceCallState, VoiceClosure, Watch } from '../host/port'
@@ -640,13 +639,11 @@ export function VoiceRoute({
 
   // Whether this device is reaching the host. The backend publishes the connection's state, and
   // cancelling a turn is the one control that depends on it, so the screen follows the answer
-  // rather than assuming the connection it started with is still there. The state is read once
-  // the listener is registered, and a change heard before the read answers is the newer one.
+  // rather than assuming the connection it started with is still there. The port's feed gives the
+  // latest state once it has one and then each change, once and in order.
   useEffect(
     () =>
-      follow(
-        (listener) => port.onConnection(listener),
-        () => port.connectionState(),
+      port.watchConnection(
         (state) => {
           setHostReachable(state.connected)
           setRights(state.connected ? state.rights : null)

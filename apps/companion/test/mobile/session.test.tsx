@@ -734,6 +734,8 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     })
     expect(await screen.findByText(/This session could not be reached/)).toBeInTheDocument()
     act(() => {
+      // The connection was lost and comes back: an unchanged state is no coming back.
+      controls.setConnected(false)
       controls.setConnected(true)
     })
     await waitFor(() => {
@@ -1808,6 +1810,8 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     })
     screen.getByRole('button', { name: 'Attach again' }).focus()
     act(() => {
+      // The connection was lost and comes back: an unchanged state is no coming back.
+      controls.setConnected(false)
       controls.setConnected(true)
     })
     await waitFor(() => {

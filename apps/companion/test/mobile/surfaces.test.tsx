@@ -1130,12 +1130,15 @@ describe('the phone claims no contact before its first answer (KR-REQ-13.02)', (
     const { port } = fakeHost()
     openFromNotification({
       ...port,
-      connectionState: () =>
-        Promise.reject({
+      // The feed could read no state and heard none: the failure of that read is told.
+      watchConnection: (_show, failed) => {
+        failed({
           code: 'INTERNAL',
           message: 'The backend did not answer.',
           user_action: 'retry'
         })
+        return () => undefined
+      }
     })
     await waitFor(() => {
       expect(topBar()).toBe('The backend did not answer.')

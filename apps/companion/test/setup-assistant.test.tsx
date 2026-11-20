@@ -343,6 +343,7 @@ describe('what setup costs a person', () => {
           'deviceDrafts',
           'deviceChannelMessages',
           'connectionState',
+          'watchConnection',
           'onConnection',
           'subscribe',
           'accountStatus',

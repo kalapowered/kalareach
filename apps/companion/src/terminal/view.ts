@@ -33,6 +33,7 @@ import type { ShellLaunchResult } from '@kalareach/protocol'
 import {
   failureCode,
   failureMessage,
+  type ConnectionState,
   type HostPort,
   type LaunchPress,
   type LaunchSurfaceReading,
@@ -603,17 +604,24 @@ export function useTerminalView(
   useEffect(() => {
     let stopped = false
     let stop: (() => void) | null = null
-    void port
-      .onConnection((connection) => {
-        if (connection.connected && opening.current?.ended === true) setAttempt((count) => count + 1)
-      })
-      .then(
-        (unlisten) => {
-          if (stopped) unlisten()
-          else stop = unlisten
-        },
-        () => undefined
-      )
+    const reopen = (connection: ConnectionState): void => {
+      if (connection.connected && opening.current?.ended === true) setAttempt((count) => count + 1)
+    }
+    void port.onConnection(reopen).then(
+      (unlisten) => {
+        if (stopped) {
+          unlisten()
+          return
+        }
+        stop = unlisten
+        // The registration is told only of changes after the state it found. The connection may have
+        // come back before it was complete, while the view's open was failing, so the state it
+        // found is looked at once here.
+        const found = port.connectionLatest()
+        if (found !== null) reopen(found)
+      },
+      () => undefined
+    )
     return () => {
       stopped = true
       stop?.()

@@ -120,12 +120,15 @@ describe('nothing is claimed about the connection before a first answer (KR-REQ-
       <AppProvider
         port={{
           ...port,
-          connectionState: () =>
-            Promise.reject({
+          // The feed could read no state and heard none: the failure of that read is told.
+          watchConnection: (_show, failed) => {
+            failed({
               code: 'INTERNAL',
               message: 'The backend did not answer.',
               user_action: 'retry'
             })
+            return () => undefined
+          }
         }}
         initialPlace={NEUTRAL}
       >

@@ -25,6 +25,7 @@ import type {
   ApprovedLink,
   AttachmentHandle,
   CameraAccess,
+  ConnectionSince,
   ConnectionState,
   DroppedFile,
   GrantNotices,
@@ -36,11 +37,13 @@ import type {
   KitSaved,
   RecoveryArchive,
   OpenRequest,
+  OtherHost,
   OwnerView,
   PairingOrigin,
   PairingUnavailable,
   PairingView,
   PushView,
+  HostContact,
   HostError,
   HostInbox,
   IntakeView,
@@ -65,6 +68,7 @@ import type {
   Written
 } from './port'
 import { failureWords, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
+import { createConnectionFeed } from './connection-feed'
 
 /** The event the backend publishes each host notification on. */
 export const HOST_EVENT = 'kr://event'
@@ -157,6 +161,42 @@ type NativeInbox = Omit<HostInbox, 'refusal'> & { readonly refusal: NativeFailur
 /** A call's closure as native code answers with it, before its host failure is made the page's. */
 type NativeClosure = Omit<VoiceClosure, 'host_failure'> & { readonly host_failure: NativeFailure | null }
 
+/** How contact with a host stands as native code sends it: a refusal is a native failure. */
+type NativeContact =
+  | Exclude<HostContact, { readonly state: 'refused' }>
+  | (Omit<Extract<HostContact, { readonly state: 'refused' }>, 'refusal'> & {
+      readonly state: 'refused'
+      readonly refusal: NativeFailure
+    })
+
+/** The connection's state as native code sends it, before each refusal in it is made the page's. */
+type NativeConnection = Omit<ConnectionState, 'contact' | 'others'> & {
+  readonly contact: NativeContact
+  readonly others: readonly (Omit<OtherHost, 'contact'> & { readonly contact: NativeContact })[]
+}
+
+/** What native code answers a request for the states a page missed with. */
+type NativeSince = Omit<ConnectionSince, 'states'> & { readonly states: readonly NativeConnection[] }
+
+const receivedContact = (native: NativeContact): HostContact =>
+  native.state === 'refused' ? { ...native, refusal: receivedFailure(native.refusal) } : native
+
+/**
+ * A connection state as the page takes it in, from a read, a change or a replay alike: a blank
+ * reason is none, and the refusal of the host in use or of another host is the page's failure, with
+ * the words of what the person can do about it kept.
+ */
+function receivedPublication(native: NativeConnection): ConnectionState {
+  return receivedConnection({
+    ...native,
+    contact: receivedContact(native.contact),
+    others: native.others.map((other) => ({ ...other, contact: receivedContact(other.contact) }))
+  })
+}
+
+/** The most host events a listener holds for a state it has not yet taken in. */
+const HELD_EVENTS_MAX = 256
+
 /** What a command rejected with: a failure in native code's shape is the page's failure from here. */
 function rejected(raw: unknown): unknown {
   const native = raw as Partial<NativeFailure> | null
@@ -191,6 +231,8 @@ interface PublishedEvent {
   readonly sequence: string
   readonly event_type: string
   readonly payload: unknown
+  /** The revision of the connection state this event follows. */
+  readonly revision: number
 }
 
 /** Builds the desktop port. */
@@ -200,26 +242,69 @@ export function tauriPort(): HostPort {
   // host, or one that comes while there is none, was on its way when the host changed, and is not the
   // new host's.
   let host: string | null | undefined
-  // How many times the connection has said something. An answer to a read made before that does not
-  // overwrite what the connection said since.
-  let said = 0
-  const heard = (state: ConnectionState): ConnectionState => {
-    said += 1
+  // The highest revision of a connection state taken in. A state below it never moves the host back.
+  let seen = 0
+  // How many choices of a host were begun, and how many are out.
+  let attempts = 0
+  let out = 0
+  /**
+   * A raw event or a replayed state. One at or above the highest seen is the connection speaking,
+   * and while a choice is out only a higher one is: an equal state may come from a read begun
+   * before the choice, and must not put the old host back.
+   */
+  const observe = (state: ConnectionState): void => {
+    if (state.revision < seen || (out > 0 && state.revision === seen)) return
+    seen = state.revision
     host = state.environment_id
-    return state
   }
+  /**
+   * The answer to a read or a choice that began when `at` choices had been made. It counts only while
+   * that is the newest choice, and then it restores the host in use after a choice that was refused
+   * or changed nothing, neither of which makes a revision.
+   */
   const learned = (at: number) => (state: ConnectionState): ConnectionState => {
-    if (said === at) host = state.environment_id
+    if (at === attempts && state.revision >= seen) {
+      seen = state.revision
+      host = state.environment_id
+    }
     return state
   }
   const ofThisHost = (published: { readonly host?: string }): boolean =>
     published.host === undefined || host === undefined || published.host === host
   /** The host is being chosen: nothing the old one sent is the new one's. */
   const choosing = (): number => {
-    said += 1
+    attempts += 1
+    out += 1
     host = null
-    return said
+    return attempts
   }
+
+  const readState = (): Promise<ConnectionState> => {
+    const at = attempts
+    return invoking<NativeConnection>('connection_state', {})
+      .then(receivedPublication)
+      .then(learned(at))
+  }
+  const readSince = (after: number): Promise<ConnectionSince> =>
+    invoking<NativeSince>('connection_since', { after }).then((since) => {
+      const states = since.states.map(receivedPublication)
+      // The page was ahead of native code, or far behind it: what it held before says nothing now.
+      if (since.resync) seen = 0
+      for (const state of states) observe(state)
+      return { revision: since.revision, states, resync: since.resync }
+    })
+  // The one feed of the connection's state: every view follows it, and a raw event is told to it only
+  // after the filter of the host in use has taken it in.
+  const feed = createConnectionFeed({
+    read: readState,
+    since: readSince,
+    listen: (heard) =>
+      listening<NativeConnection>(CONNECTION_EVENT, (native) => {
+        const state = receivedPublication(native)
+        observe(state)
+        heard(state)
+      })
+  })
 
   const call = <T,>(command: string, args: Record<string, unknown>): Promise<T> =>
     invoking<T>(command, args)
@@ -231,19 +316,22 @@ export function tauriPort(): HostPort {
    */
   const choose = (command: string, reference: string): Promise<ConnectionState> => {
     const at = choosing()
-    return call<ConnectionState>(command, { reference })
-      .then(receivedConnection)
+    return invoking<NativeConnection>(command, { reference })
+      .then(receivedPublication)
       .then(learned(at))
       .catch(async (failure: unknown) => {
-        await call<ConnectionState>('connection_state', {})
-          .then(receivedConnection)
+        await invoking<NativeConnection>('connection_state', {})
+          .then(receivedPublication)
           .then(learned(at))
           .catch(() => {
             // Nothing can say which host is in use: events are taken as they come, as before any
             // host was known.
-            if (said === at) host = undefined
+            if (attempts === at) host = undefined
           })
         throw failure
+      })
+      .finally(() => {
+        out -= 1
       })
   }
 
@@ -267,16 +355,11 @@ export function tauriPort(): HostPort {
 
   return {
     // Native code's reason can arrive blank; it is taken in as none, from a read and a change alike.
-    connectionState: () => {
-      const at = said
-      return call<ConnectionState>('connection_state', {})
-        .then(receivedConnection)
-        .then(learned(at))
-    },
-    onConnection: (listener) =>
-      listening<ConnectionState>(CONNECTION_EVENT, (state) => {
-        listener(heard(receivedConnection(state)))
-      }),
+    connectionState: readState,
+    connectionSince: readSince,
+    watchConnection: feed.watch,
+    onConnection: feed.onChange,
+    connectionLatest: feed.latest,
 
     openSession: (request: OpenRequest) =>
       call<SessionStanding>('session_open', {
@@ -576,15 +659,51 @@ export function tauriPort(): HostPort {
     recoveryExportOffline: (path, archive) =>
       call<ExportSaved>('recovery_export_offline', { path, archive }),
 
-    subscribe: (listener: (event: HostEvent) => void) =>
-      listening<PublishedEvent>(HOST_EVENT, (published) => {
+    // An event follows the connection state of its revision, and the page never shows a host's events
+    // before the state that announces the host: one that is ahead of the feed is held until the feed
+    // has applied its revision, and the feed is asked for what it is missing.
+    subscribe: (listener: (event: HostEvent) => void) => {
+      const held: PublishedEvent[] = []
+      let dropped: PublishedEvent | null = null
+      const pass = (published: PublishedEvent): void => {
         if (!ofThisHost(published)) return
         listener({
           stream_id: published.stream_id,
           sequence: published.sequence,
           body: { kind: published.event_type, payload: published.payload }
         })
-      }),
+      }
+      const release = (revision: number, resynced: boolean): void => {
+        const ahead = held.findIndex((each) => each.revision > revision)
+        const ready = held.splice(0, resynced || ahead === -1 ? held.length : ahead)
+        for (const each of ready) pass(each)
+        // The events dropped at the cap are told as one, after the ones that were kept.
+        if (dropped !== null && (ready.length > 0 || resynced)) {
+          const lost = dropped
+          dropped = null
+          pass({ ...lost, stream_id: '', sequence: '', event_type: 'resync_required', payload: null })
+        }
+      }
+      const untap = feed.onApplied(release)
+      return listening<PublishedEvent>(HOST_EVENT, (published) => {
+        if (held.length === 0 && published.revision <= feed.appliedThrough()) {
+          pass(published)
+          return
+        }
+        held.push(published)
+        if (held.length > HELD_EVENTS_MAX) dropped = held.shift() ?? dropped
+        feed.catchUp()
+      }).then(
+        (stop) => () => {
+          untap()
+          stop()
+        },
+        (failure: unknown) => {
+          untap()
+          throw failure
+        }
+      )
+    },
 
     // The backend records the paths first and then publishes them, so a path the page sees here is
     // one the backend will accept for exactly one upload.

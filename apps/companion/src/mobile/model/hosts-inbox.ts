@@ -102,9 +102,10 @@ export function useOtherHosts(): OtherHosts {
     }
     // The host in use is the connection's: a change of it is looked at at once, as the inbox's own
     // read is, and not at the next round.
-    const connection = watch([port.onConnection(both)])
+    // The first pass starts when the registration completes, so the connection it finds is the one
+    // the pass is made for.
+    const connection = watch([port.onConnection(both)], both)
     nudge.current = both
-    both()
     return () => {
       live = false
       looking.stop()

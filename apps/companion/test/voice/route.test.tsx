@@ -1881,17 +1881,29 @@ describe('whether this device is reaching the host', () => {
 
   it('shows what it read when nothing changed in between', async () => {
     const { port } = fakeHost()
+    // The first state the screen is given says the host cannot be contacted.
     show({
       ...port,
-      connectionState: () =>
-        Promise.resolve({
-          connected: false,
-          environment_id: null,
-          reason: 'this host cannot be contacted right now',
-          rights: null,
-          paired: false,
-          replaced: 0
-        })
+      watchConnection: (showState) => {
+        showState(
+          {
+            connected: false,
+            environment_id: null,
+            reason: 'this host cannot be contacted right now',
+            rights: null,
+            paired: false,
+            replaced: 0,
+            revision: 1,
+            link: 1,
+            host: { kind: 'local' },
+            contact: { state: 'out_of_contact', since_ms: 0, escalates_at_ms: 0 },
+            inbox_epoch: 0,
+            others: []
+          },
+          false
+        )
+        return () => undefined
+      }
     })
     await startCall()
 

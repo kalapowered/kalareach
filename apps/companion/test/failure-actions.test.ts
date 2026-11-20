@@ -234,6 +234,42 @@ describe('a refusal that says its own wait, and every stop of the lease', () => 
     }
   })
 
+  it('is read the same inside the connection’s state, where the refusal of the host in use and of another is a failure in a contact', async () => {
+    const rows = sent.filter((one) => one.surface === 'inbox')
+    expect(rows.length).toBeGreaterThanOrEqual(5)
+    for (const one of rows) {
+      const refused = {
+        state: 'refused',
+        refusal: native(one.code, one.message, one.user_action),
+        request: 'connection'
+      }
+      bridge.answers.set('connection_state', {
+        rejects: false,
+        value: {
+          connected: false,
+          environment_id: null,
+          reason: null,
+          rights: null,
+          paired: true,
+          replaced: 0,
+          revision: 4,
+          link: 1,
+          host: { kind: 'paired', reference: 'studio', name: 'studio' },
+          contact: refused,
+          inbox_epoch: 1,
+          others: [{ reference: 'laptop', name: 'laptop', contact: refused, inbox_epoch: 2 }]
+        }
+      })
+      const state = await tauriPort().connectionState()
+      for (const contact of [state.contact, state.others[0]?.contact]) {
+        expect(contact?.state, one.name).toBe('refused')
+        const refusal = contact?.state === 'refused' ? contact.refusal : undefined
+        expect(failureMessage(refusal), one.name).toBe(one.page)
+        expect(Object.keys(refusal ?? {}).sort(), one.name).toEqual(['code', 'line', 'message', 'retry'])
+      }
+    }
+  })
+
   it('is read the same inside the inbox’s answer, where a host’s refusal is a failure in a result', async () => {
     const rows = sent.filter((one) => one.surface === 'inbox')
     expect(rows.length).toBeGreaterThanOrEqual(5)

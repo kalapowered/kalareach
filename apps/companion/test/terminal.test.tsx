@@ -414,6 +414,7 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
 
   it('opens again when the host connection comes back after the open call itself failed', async () => {
     const { port, controls } = fakeHost()
+    controls.setConnected(false)
     // The first open is refused by the call, not by a state on the view's channel.
     let refused = false
     const failing: HostPort = {
@@ -436,6 +437,35 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
       expect(controls.terminalViews).toHaveLength(1)
     })
     expect(await screen.findByTestId('palette-provenance')).toBeInTheDocument()
+    expect(screen.queryByTestId('terminal-ended')).toBeNull()
+  })
+
+  it('opens again when the host is reached while the feed’s base read is held', async () => {
+    const { port, controls } = fakeHost()
+    controls.setConnected(false)
+    // The feed's first read of the connection is out when the host is reached.
+    const held = controls.hold('connectionState')
+    let refused = false
+    const failing: HostPort = {
+      ...port,
+      openTerminalView: (sessionId, grid, listener, opening, anchor) => {
+        if (refused) return port.openTerminalView(sessionId, grid, listener, opening, anchor)
+        refused = true
+        return Promise.reject(new Error('This session could not be reached'))
+      }
+    }
+    open(failing)
+    expect(await screen.findByTestId('terminal-ended')).toHaveTextContent(
+      'This session could not be reached'
+    )
+    expect(held.count).toBe(1)
+    act(() => {
+      controls.setConnected(true)
+    })
+    // The first state the feed has is the one that reached the host, and the view looks at it.
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
     expect(screen.queryByTestId('terminal-ended')).toBeNull()
   })
 
@@ -1485,6 +1515,8 @@ describe("the desktop's keys reach the program while the view controls it (KR-RE
       const again = screen.getByRole('button', { name: 'Attach again' })
       again.focus()
       act(() => {
+        // The connection was lost and comes back: an unchanged state is no coming back.
+        controls.setConnected(false)
         controls.setConnected(true)
       })
       await waitFor(() => {

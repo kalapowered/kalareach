@@ -17,7 +17,7 @@ import type { ActionRight } from '@kalareach/protocol'
 import { ShellConnection } from '../app/rights'
 import { useApp } from '../app/state'
 import { Toast } from '../components/ui'
-import { failureMessage, follow } from '../host/port'
+import { failureMessage } from '../host/port'
 import {
   AccountGlyph,
   AttentionGlyph,
@@ -199,14 +199,11 @@ export function MobileApp({
     }
   }, [])
 
-  // The connection is read once its listener is registered, so no change falls between the two.
-  // Each change native code publishes carries the state and its reason, so nothing is read again,
-  // and a change heard before the read answers is the newer one.
+  // The port's feed gives the latest state once it has one and then each change, once and in order.
+  // Each change carries the state and its reason, so nothing is read again.
   useEffect(
     () =>
-      follow(
-        (listener) => port.onConnection(listener),
-        () => port.connectionState(),
+      port.watchConnection(
         (state) => {
           if (state.connected && state.rights !== null) rememberRights(state.rights)
           // Contact lost is noted at the moment it is heard, and kept until it is back.

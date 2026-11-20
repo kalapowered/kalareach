@@ -17,7 +17,7 @@ import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
-import type { HostError, HostInbox, HostRow, RefusedRequest } from '../../src/host/port'
+import type { HostError, HostInbox, HostPort, HostRow, RefusedRequest } from '../../src/host/port'
 import { receivedFailure } from '../../src/host/tauri'
 import { MobileApp } from '../../src/mobile/MobileApp'
 import capacityRefusals from '../fixtures/capacity-refusals.json'
@@ -462,12 +462,44 @@ describe('the inbox of a phone paired with two hosts', () => {
     }
   })
 
+  // The first pass of the other hosts starts when the connection listener's registration completes,
+  // so the connection it begins with is the one the pass is made for.
+  it('starts the first pass of the other hosts when the registration completes, not before', async () => {
+    const { port, controls } = fakeHost()
+    controls.setPairing({ hosts: [STUDIO, LAPTOP] })
+    controls.setInboxHosts([laptopRead()])
+    let passes = 0
+    const counting: HostPort = {
+      ...port,
+      inboxHosts: () => {
+        passes += 1
+        return port.inboxHosts()
+      }
+    }
+    const complete = controls.holdRegistrations()
+    render(
+      <AppProvider port={counting}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(passes).toBe(0)
+    complete()
+    await waitFor(() => {
+      expect(rowsOf('laptop')).toHaveLength(2)
+    })
+    expect(passes).toBeGreaterThan(0)
+  })
+
   // Nothing is claimed before the host in use has answered, whatever another host has.
   it('says it is reading until the host in use has answered, though another host has', async () => {
     const { port, controls } = fakeHost()
     controls.setPairing({ hosts: [STUDIO, LAPTOP] })
     controls.setInboxHosts([laptopRead()])
-    const complete = controls.holdRegistrations()
+    // The host in use has not answered: its inbox read is held.
+    const held = controls.hold('attentionRead')
     render(
       <AppProvider port={port}>
         <MobileApp surface="ios" storage={null} />
@@ -485,7 +517,7 @@ describe('the inbox of a phone paired with two hosts', () => {
     })
     expect(screen.getByText('Reading the inbox…')).toBeInTheDocument()
     expect(screen.queryByText(/Nothing needs you/)).toBeNull()
-    complete()
+    held.release()
   })
 
   it('lists the rows of the host in use as soon as the connection says which it is, not at the next round', async () => {

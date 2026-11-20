@@ -59,8 +59,10 @@ import type {
 import type {
   ApprovedLink,
   CameraAccess,
+  ConnectionSince,
   ConnectionState,
   DroppedFile,
+  HostContact,
   HostEvent,
   HostInbox,
   HostError,
@@ -122,6 +124,7 @@ import type {
   VoiceStartRequest,
   Written
 } from './port'
+import { createConnectionFeed } from './connection-feed'
 import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
 import { openedMode } from '../theme-init'
@@ -591,6 +594,25 @@ export interface FakeHostControls {
    * contacted right now.
    */
   setConnected(connected: boolean, reason?: string): void
+  /**
+   * Sets how contact with the host in use stands, as native code does: a refusal is the host's own
+   * words, and `null` leaves it to the connection (in contact while it is live, out of contact when
+   * it is not). The change is told as a revision of its own.
+   */
+  setContact(contact: HostContact | null): void
+  /**
+   * Delivers `state` to everything listening to native code's raw events, as it is: its revision is
+   * its own and nothing is recorded. Native code can tell a page a state twice, late, or after a
+   * newer one, and this is how a test does the same.
+   */
+  tellConnection(state: ConnectionState): void
+  /**
+   * Has the next change of the connection's state be recorded and not told, as when the page misses
+   * an event: the page learns of it from the replay.
+   */
+  loseNextConnectionEvent(): void
+  /** Every state the connection went through that is still kept for a replay, oldest first. */
+  connectionHistory(): readonly ConnectionState[]
   /**
    * The host withdrew the connection and the application replaced it with one the host admits: the
    * connection state counts one more replacement, and says so to everything listening.
@@ -1605,16 +1627,63 @@ export function fakeHost(
   /** How many times a connection the host withdrew has been replaced. */
   let replacements = 0
   const hostDrafts = scriptedHostDrafts()
+  /** How contact with the host in use stands when a test said so: otherwise the connection says. */
+  let statedContact: HostContact | null = null
+  /** The revision of the newest state, and how many states are kept for a replay. */
+  let connectionRevision = 1
+  const KEPT_STATES = 256
+  let loseNext = false
+  const connectionBody = (): Omit<ConnectionState, 'revision'> => ({
+    connected,
+    environment_id: connected ? hostEnvironment : null,
+    reason: connected ? null : lostBecause,
+    rights: connected ? rights : null,
+    paired: connected && pairedDevice,
+    replaced: replacements,
+    link: 1 + replacements,
+    host: pairedDevice
+      ? { kind: 'paired', reference: 'studio-reference', name: 'Studio' }
+      : { kind: 'local' },
+    contact:
+      statedContact ??
+      (connected
+        ? { state: 'in_contact' }
+        : { state: 'out_of_contact', since_ms: 0, escalates_at_ms: 0 }),
+    inbox_epoch: pairedDevice ? 1 : 0,
+    others: []
+  })
   const connectionNow = (): ConnectionState =>
-    receivedConnection({
-      connected,
-      environment_id: connected ? hostEnvironment : null,
-      reason: connected ? null : lostBecause,
-      rights: connected ? rights : null,
-      paired: connected && pairedDevice,
-      replaced: replacements
-    })
+    receivedConnection({ ...connectionBody(), revision: connectionRevision })
+  const connectionLog: ConnectionState[] = [connectionNow()]
+  // The raw events: what native code tells the page, before the feed puts it in order.
   const connectionListeners = new Set<(state: ConnectionState) => void>()
+  /** Tells everything listening what the connection is now, if it is not what was last told. */
+  const publishConnection = (): void => {
+    const last = connectionLog[connectionLog.length - 1]
+    const unchanged = { ...receivedConnection({ ...connectionBody(), revision: 0 }) }
+    // Nothing the page sees changed: native code takes no revision for it.
+    if (last !== undefined && JSON.stringify({ ...last, revision: 0 }) === JSON.stringify(unchanged)) return
+    connectionRevision += 1
+    const state = connectionNow()
+    connectionLog.push(state)
+    if (connectionLog.length > KEPT_STATES) connectionLog.shift()
+    if (loseNext) {
+      loseNext = false
+      return
+    }
+    for (const listener of connectionListeners) listener(state)
+  }
+  const connectionSinceNow = (after: number): ConnectionSince => {
+    const oldest = connectionLog[0]?.revision ?? connectionRevision
+    if (after + 1 < oldest || after > connectionRevision) {
+      return { revision: connectionRevision, states: [connectionNow()], resync: true }
+    }
+    return {
+      revision: connectionRevision,
+      states: connectionLog.filter((state) => state.revision > after),
+      resync: false
+    }
+  }
 
   // The openings screens made: the newest of each session, what the host says of it, and what a
   // test scripted for the next opens.
@@ -1877,9 +1946,19 @@ export function fakeHost(
     })
   }
 
+  // The one feed of the connection's state, over the raw events and the replay, as the desktop port's.
+  const connectionFeed = createConnectionFeed({
+    read: () => reading('connectionState', connectionNow),
+    since: (after) => Promise.resolve(connectionSinceNow(after)),
+    listen: (heard) => register(connectionListeners, heard)
+  })
+
   const port: HostPort = {
     connectionState: () => reading('connectionState', connectionNow),
-    onConnection: (listener) => register(connectionListeners, listener),
+    connectionSince: (after) => Promise.resolve(connectionSinceNow(after)),
+    watchConnection: connectionFeed.watch,
+    onConnection: connectionFeed.onChange,
+    connectionLatest: connectionFeed.latest,
 
     openSession: (request) =>
       reading('openSession', () => {
@@ -2686,7 +2765,7 @@ export function fakeHost(
         hosts: pairing.hosts.map((host) => ({ ...host, in_use: host.reference === reference }))
       })
       connected = true
-      for (const listener of connectionListeners) listener(connectionNow())
+      publishConnection()
       return Promise.resolve(connectionNow())
     },
     inboxHosts: () =>
@@ -2704,7 +2783,7 @@ export function fakeHost(
       publishPairing({ hosts: pairing.hosts.filter((host) => host.reference !== reference) })
       if (forgotten.in_use) {
         connected = false
-        for (const listener of connectionListeners) listener(connectionNow())
+        publishConnection()
       }
       return Promise.resolve(connectionNow())
     },
@@ -3644,18 +3723,29 @@ export function fakeHost(
       }
       // A session's worker has a link of its own: losing the daemon's connection leaves it where it
       // was, and `questions.setReachable` is what takes a worker away.
-      for (const listener of connectionListeners) listener(connectionNow())
+      publishConnection()
     },
+    setContact(contact) {
+      statedContact = contact
+      publishConnection()
+    },
+    tellConnection(state) {
+      for (const listener of connectionListeners) listener(state)
+    },
+    loseNextConnectionEvent() {
+      loseNext = true
+    },
+    connectionHistory: () => [...connectionLog],
     replaceConnection() {
       replacements += 1
-      for (const listener of connectionListeners) listener(connectionNow())
+      publishConnection()
     },
     switchHost(environmentId, options) {
       hostEnvironment = environmentId
       anotherHost = true
       sessionListRefused = options?.refuseSessionList === true
       environmentListRefused = options?.refuseEnvironmentList === true
-      for (const listener of connectionListeners) listener(connectionNow())
+      publishConnection()
     },
     withoutQualifiedShell() {
       qualifiedShell = false
@@ -3728,7 +3818,7 @@ export function fakeHost(
     },
     reachAsPairedDevice() {
       pairedDevice = true
-      for (const listener of connectionListeners) listener(connectionNow())
+      publishConnection()
     },
     failNextSessionList(message) {
       sessionListFailure = message
@@ -3757,7 +3847,7 @@ export function fakeHost(
       sessionListRefused = !mayView
       attentionReadEmpty = !mayView
       sharing.asPhone()
-      for (const listener of connectionListeners) listener(connectionNow())
+      publishConnection()
     },
     changeDescriptionSetup(change) {
       descriptionSetup = { ...descriptionSetup, ...change }
@@ -3791,7 +3881,7 @@ export function fakeHost(
         held.standing = { ...held.standing, actions: next }
         tellStanding(sessionId, held.token, held.standing)
       }
-      for (const listener of connectionListeners) listener(connectionNow())
+      publishConnection()
     },
     hold(read) {
       const waiting: (() => void)[] = []

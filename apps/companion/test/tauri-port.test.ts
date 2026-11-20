@@ -365,21 +365,31 @@ describe('the desktop port and a session creation', () => {
 })
 
 describe('the desktop port and the connection state', () => {
-  const lost = (reason: string | null): ConnectionState => ({
+  const lost = (reason: string | null, revision = 1): ConnectionState => ({
     connected: false,
     environment_id: null,
     reason,
     rights: null,
     paired: false,
-    replaced: 0
+    replaced: 0,
+    revision,
+    link: 1,
+    host: null,
+    contact: { state: 'unknown' },
+    inbox_epoch: 0,
+    others: []
   })
 
-  /** What a listener registered through the port hears when native code publishes `state`. */
+  /** What a view following the port hears when native code publishes `state`. */
   async function heard(state: ConnectionState): Promise<ConnectionState[]> {
     const states: ConnectionState[] = []
-    await tauriPort().onConnection((each) => {
-      states.push(each)
-    })
+    tauriPort().watchConnection(
+      (each) => {
+        states.push(each)
+      },
+      () => undefined
+    )
+    await Promise.resolve()
     shell.handlers.get(CONNECTION_EVENT)?.({ payload: state })
     return states
   }
@@ -404,16 +414,34 @@ describe('the desktop port and the connection state', () => {
     expect(await heard(said)).toEqual([said])
 
     const live: ConnectionState = {
+      ...lost(null, 2),
       connected: true,
       environment_id: '3f1a2c40-11aa-4b2c-9d3e-000000000001',
-      reason: null,
       rights: ['session.view', 'agent.prompt'],
       paired: true,
-      replaced: 0
+      host: { kind: 'paired', reference: 'studio', name: 'Studio' },
+      contact: { state: 'in_contact' },
+      inbox_epoch: 1
     }
     shell.answers.set('connection_state', live)
     expect(await tauriPort().connectionState()).toEqual(live)
     expect(await heard(live)).toEqual([live])
+  })
+
+  it('asks native code for what the page missed above a revision, and takes in each state', async () => {
+    shell.answers.set('connection_since', {
+      revision: 3,
+      resync: false,
+      states: [lost('  ', 2), lost('the relay closed this connection', 3)]
+    })
+    const since = await tauriPort().connectionSince(1)
+    expect(shell.invoked).toEqual([{ command: 'connection_since', args: { after: 1 } }])
+    expect(since.revision).toBe(3)
+    expect(since.resync).toBe(false)
+    expect(since.states.map((state) => [state.revision, state.reason])).toEqual([
+      [2, null],
+      [3, 'the relay closed this connection']
+    ])
   })
 })
 
@@ -614,58 +642,153 @@ describe('the desktop port and a session screen’s opening', () => {
   })
 })
 
+/** The connection's state as native code publishes it, for the host of `environment` at `revision`. */
+const published = (environment: string | null, revision: number, over: Record<string, unknown> = {}) => ({
+  connected: environment !== null,
+  environment_id: environment,
+  reason: null,
+  rights: [],
+  paired: true,
+  replaced: 0,
+  revision,
+  link: 1,
+  host: environment === null ? null : { kind: 'paired', reference: environment, name: environment },
+  contact: { state: 'in_contact' },
+  inbox_epoch: environment === null ? 0 : 1,
+  others: [],
+  ...over
+})
+
+/** One host event as native code publishes it, following the state of `revision`. */
+const hostEvent = (host: string, sequence: string, revision: number) => ({
+  payload: { host, stream_id: 'session_state', sequence, event_type: 'x', payload: null, revision }
+})
+
+/** The page's end of a refusal, as native code sends it. */
+const refusal = (user_action: string) => ({
+  code: 'PERMISSION_DENIED',
+  message: 'PERMISSION_DENIED: the host would not.',
+  user_action,
+  retry: 'no_retry'
+})
+
+/** Lets every promise that is ready run. */
+async function settle(): Promise<void> {
+  for (let turn = 0; turn < 8; turn += 1) await Promise.resolve()
+}
+
+/** A port that follows the connection and hears host events, with the first state heard. */
+async function following(first: ReturnType<typeof published> = published('env-a', 1)) {
+  const port = tauriPort()
+  const heard: string[] = []
+  await port.subscribe((event) => {
+    heard.push(event.sequence)
+  })
+  port.watchConnection(
+    () => undefined,
+    () => undefined
+  )
+  await settle()
+  shell.handlers.get(CONNECTION_EVENT)?.({ payload: first })
+  return { port, heard }
+}
+
 describe('the desktop port and a host that changed', () => {
-  const at = (host: string, sequence: string) => ({
-    payload: { host, stream_id: 'session_state', sequence, event_type: 'x', payload: null }
+  it('drops an event of the host it no longer uses, and keeps the next host’s', async () => {
+    const { heard } = await following()
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 1))
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-b', 2) })
+    // An event of the earlier host that was still on its way.
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '2', 2))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '3', 2))
+    expect(heard).toEqual(['1', '3'])
   })
 
-  it('drops an event of the host it no longer uses, and keeps the next host’s', async () => {
+  it('holds an event until the state it follows has been taken in, and then takes it', async () => {
     const port = tauriPort()
     const heard: string[] = []
     await port.subscribe((event) => {
       heard.push(event.sequence)
     })
-    await port.onConnection(() => undefined)
-    const connection = (environment: string) => ({
-      payload: { connected: true, environment_id: environment, reason: null, rights: [], paired: true }
-    })
-
-    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-a'))
-    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
-    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-b'))
-    // An event of the earlier host that was still on its way.
-    shell.handlers.get(HOST_EVENT)?.(at('env-a', '2'))
-    shell.handlers.get(HOST_EVENT)?.(at('env-b', '3'))
-    expect(heard).toEqual(['1', '3'])
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 1))
+    expect(heard).toEqual([])
+    port.watchConnection(
+      () => undefined,
+      () => undefined
+    )
+    await settle()
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 1) })
+    expect(heard).toEqual(['1'])
   })
 
-  it('takes an event as it comes before any host is known', async () => {
-    const heard: string[] = []
-    await tauriPort().subscribe((event) => {
-      heard.push(event.sequence)
+  it('does not move the host back on a state older than one it has taken in', async () => {
+    const { port, heard } = await following(published('env-b', 3))
+    // A state of the earlier host arrives late.
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 2) })
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 3))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '2', 3))
+    expect(heard).toEqual(['2'])
+    // And a replay that holds earlier states does not move it back either.
+    shell.answers.set('connection_since', {
+      revision: 2,
+      resync: false,
+      states: [published('env-a', 1), published('env-a', 2)]
     })
-    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+    await port.connectionSince(0)
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '3', 3))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '4', 3))
+    expect(heard).toEqual(['2', '4'])
+  })
+
+  it('holds the host events that are ahead of the feed and asks it to catch up', async () => {
+    const { heard } = await following()
+    shell.answers.set('connection_since', { revision: 3, resync: false, states: [] })
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 3))
+    await settle()
+    expect(heard).toEqual([])
+    expect(shell.invoked.filter((each) => each.command === 'connection_since')).toEqual([
+      { command: 'connection_since', args: { after: 1 } }
+    ])
+    // The missed states come: the event is released once the feed has applied its revision.
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 2) })
+    expect(heard).toEqual([])
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 3) })
     expect(heard).toEqual(['1'])
+  })
+
+  it('holds at most 256 events and delivers one resync after the ones it kept', async () => {
+    const { heard } = await following()
+    shell.answers.set('connection_since', new Promise(() => undefined))
+    for (let sequence = 1; sequence <= 300; sequence += 1) {
+      shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', String(sequence), 2))
+    }
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 2) })
+    // The 44 oldest were dropped; the rest come in order, and the one resync comes after them.
+    expect(heard).toHaveLength(257)
+    expect(heard[0]).toBe('45')
+    expect(heard[255]).toBe('300')
+    expect(heard[256]).toBe('')
+  })
+
+  it('releases the resync together with the held events and after them', async () => {
+    const { heard } = await following()
+    shell.answers.set('connection_since', new Promise(() => undefined))
+    for (let sequence = 1; sequence <= 258; sequence += 1) {
+      shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', String(sequence), 2))
+    }
+    // While the state is not applied nothing is released, the resync included.
+    expect(heard).toEqual([])
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 2) })
+    expect(heard.slice(0, 2)).toEqual(['3', '4'])
+    expect(heard.at(-1)).toBe('')
+    expect(heard.filter((each) => each === '')).toHaveLength(1)
   })
 })
 
 describe('the desktop port and a host being chosen', () => {
-  const at = (host: string, sequence: string) => ({
-    payload: { host, stream_id: 'session_state', sequence, event_type: 'x', payload: null }
-  })
-  const connection = (environment: string | null) => ({
-    payload: { connected: environment !== null, environment_id: environment, reason: null, rights: [], paired: true }
-  })
-
   it('takes no event of the host it is leaving until the connection names the new one', async () => {
-    const port = tauriPort()
-    const heard: string[] = []
-    await port.subscribe((event) => {
-      heard.push(event.sequence)
-    })
-    await port.onConnection(() => undefined)
-    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-a'))
-    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+    const { port, heard } = await following()
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 1))
 
     // The host is chosen: the connection says nothing yet, and the old host's events are not heard.
     let answer: (state: unknown) => void = () => undefined
@@ -676,48 +799,73 @@ describe('the desktop port and a host being chosen', () => {
       })
     )
     const choosing = port.hostsUse('host-b')
-    shell.handlers.get(HOST_EVENT)?.(at('env-a', '2'))
-    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-b'))
-    shell.handlers.get(HOST_EVENT)?.(at('env-b', '3'))
-    answer(connection('env-b').payload)
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '2', 1))
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-b', 2) })
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '3', 2))
+    answer(published('env-b', 2))
     await choosing
     expect(heard).toEqual(['1', '3'])
   })
 
   it.each(['hosts_use', 'hosts_forget'] as const)(
-    'goes on taking the events of the host in use when %s is refused',
+    'goes on taking the events of the host in use when %s is refused, and restores the confirmed host',
     async (command) => {
-      const port = tauriPort()
-      const heard: string[] = []
-      await port.subscribe((event) => {
-        heard.push(event.sequence)
-      })
-      await port.onConnection(() => undefined)
-      shell.handlers.get(CONNECTION_EVENT)?.(connection('env-a'))
-      shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+      const { port, heard } = await following()
+      shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 1))
 
-      // Native code refuses the choice and changes nothing: no connection event comes.
+      // Native code refuses the choice and changes nothing: no connection event comes, and no revision.
       const refused = Promise.reject(new Error('That host is not in the list.'))
       refused.catch(() => undefined)
       shell.answers.set(command, refused)
-      shell.answers.set('connection_state', connection('env-a').payload)
+      shell.answers.set('connection_state', published('env-a', 1))
       await expect(
         command === 'hosts_use' ? port.hostsUse('host-x') : port.hostsForget('host-x')
       ).rejects.toThrow('That host is not in the list.')
 
-      shell.handlers.get(HOST_EVENT)?.(at('env-a', '2'))
+      shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '2', 1))
       expect(heard).toEqual(['1', '2'])
     }
   )
 
+  it('restores the confirmed host when the choice changed nothing and made no revision', async () => {
+    const { port, heard } = await following()
+    // Choosing the host already in use: native code answers the state it already had.
+    shell.answers.set('hosts_use', published('env-a', 1))
+    await port.hostsUse('env-a')
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 1))
+    expect(heard).toEqual(['1'])
+  })
+
+  it('applies only the newest choice’s reply when choices overlap', async () => {
+    const { port, heard } = await following()
+    let answerFirst: (state: unknown) => void = () => undefined
+    let answerSecond: (state: unknown) => void = () => undefined
+    shell.answers.set(
+      'hosts_use',
+      new Promise((resolve) => {
+        answerFirst = resolve
+      })
+    )
+    const first = port.hostsUse('host-b')
+    shell.answers.set(
+      'hosts_use',
+      new Promise((resolve) => {
+        answerSecond = resolve
+      })
+    )
+    const second = port.hostsUse('host-c')
+    answerSecond(published('env-c', 3))
+    await second
+    // The first choice's answer comes late, and names a revision that is not below the last.
+    answerFirst(published('env-b', 4))
+    await first
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '1', 1))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-c', '2', 1))
+    expect(heard).toEqual(['2'])
+  })
+
   it('takes events as they come when a choice is refused and the connection cannot say which host is in use', async () => {
-    const port = tauriPort()
-    const heard: string[] = []
-    await port.subscribe((event) => {
-      heard.push(event.sequence)
-    })
-    await port.onConnection(() => undefined)
-    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-a'))
+    const { port, heard } = await following()
 
     const refused = Promise.reject(new Error('That host is not in the list.'))
     refused.catch(() => undefined)
@@ -728,8 +876,8 @@ describe('the desktop port and a host being chosen', () => {
     await expect(port.hostsUse('host-x')).rejects.toThrow('That host is not in the list.')
 
     // Nothing says which host is in use, so nothing is dropped, as before any host was known.
-    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
-    shell.handlers.get(HOST_EVENT)?.(at('env-b', '2'))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 1))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '2', 1))
     expect(heard).toEqual(['1', '2'])
   })
 
@@ -739,7 +887,11 @@ describe('the desktop port and a host being chosen', () => {
     await port.subscribe((event) => {
       heard.push(event.sequence)
     })
-    await port.onConnection(() => undefined)
+    port.watchConnection(
+      () => undefined,
+      () => undefined
+    )
+    await settle()
     let answer: (state: unknown) => void = () => undefined
     shell.answers.set(
       'connection_state',
@@ -750,12 +902,101 @@ describe('the desktop port and a host being chosen', () => {
     const reading = port.connectionState()
     // The connection names the next host while the read is on its way, and the read then answers with
     // the host before.
-    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-b'))
-    answer(connection('env-a').payload)
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-b', 2) })
+    answer(published('env-a', 1))
     await reading
-    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
-    shell.handlers.get(HOST_EVENT)?.(at('env-b', '2'))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 2))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '2', 2))
     expect(heard).toEqual(['2'])
+  })
+
+  it('cannot be put back on the old host by a state read or told again while a choice is out', async () => {
+    const { port, heard } = await following()
+    let answerRead: (state: unknown) => void = () => undefined
+    shell.answers.set(
+      'connection_state',
+      new Promise((resolve) => {
+        answerRead = resolve
+      })
+    )
+    // A one-shot read begins, and then the host is chosen.
+    const reading = port.connectionState()
+    let answer: (state: unknown) => void = () => undefined
+    shell.answers.set(
+      'hosts_use',
+      new Promise((resolve) => {
+        answer = resolve
+      })
+    )
+    const choosing = port.hostsUse('host-b')
+    // The read answers with the state it saw before the choice, and the same state is told again.
+    answerRead(published('env-a', 1))
+    await reading
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 1) })
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 1))
+    expect(heard).toEqual([])
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-b', 2) })
+    answer(published('env-b', 2))
+    await choosing
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '2', 2))
+    expect(heard).toEqual(['2'])
+  })
+})
+
+describe('the desktop port and a refusal in the connection state', () => {
+  const refused = (user_action: string) => ({
+    state: 'refused',
+    refusal: refusal(user_action),
+    request: 'connection'
+  })
+
+  it('makes the refusal of the host in use the page’s failure with the action’s words, from a read, a change, a choice and a replay', async () => {
+    const port = tauriPort()
+    const said = published('env-a', 2, { contact: refused('sign_in') })
+    const line = 'the host would not. Sign in to your account.'
+    const contactOf = (state: { readonly contact: unknown }) => state.contact as { state: string; refusal: { line: string } }
+
+    shell.answers.set('connection_state', said)
+    expect(contactOf(await port.connectionState()).refusal.line).toBe(line)
+
+    shell.answers.set('hosts_use', said)
+    expect(contactOf(await port.hostsUse('x')).refusal.line).toBe(line)
+    shell.answers.set('hosts_forget', said)
+    expect(contactOf(await port.hostsForget('x')).refusal.line).toBe(line)
+
+    shell.answers.set('connection_since', { revision: 2, resync: false, states: [said] })
+    const replay = await port.connectionSince(1)
+    expect(contactOf(replay.states[0] as never).refusal.line).toBe(line)
+
+    const told: { contact: unknown }[] = []
+    port.watchConnection(
+      (each) => {
+        told.push(each)
+      },
+      () => undefined
+    )
+    await settle()
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: said })
+    expect(contactOf(told[0] as never).refusal.line).toBe(line)
+  })
+
+  it('keeps the action’s words of another host’s refusal', async () => {
+    const port = tauriPort()
+    const said = published('env-a', 2, {
+      others: [
+        { reference: 'b', name: 'B', contact: refused('pair_again'), inbox_epoch: 3 },
+        { reference: 'c', name: 'C', contact: { state: 'out_of_contact', since_ms: 5, escalates_at_ms: 9 }, inbox_epoch: 1 }
+      ]
+    })
+    shell.answers.set('connection_state', said)
+    const state = await port.connectionState()
+    const [b, c] = state.others
+    expect(b?.contact).toMatchObject({
+      state: 'refused',
+      request: 'connection',
+      refusal: { line: expect.stringContaining('Pair this device with the host again.') as unknown }
+    })
+    expect(c?.contact).toEqual({ state: 'out_of_contact', since_ms: 5, escalates_at_ms: 9 })
   })
 })
 

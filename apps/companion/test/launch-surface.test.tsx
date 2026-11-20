@@ -502,7 +502,17 @@ describe('what a read is taken to say', () => {
                     message: 'The shell did not register the listener.',
                     user_action: 'retry'
                   })
-                : port.onConnection(listener)
+                : port.onConnection(listener),
+            // The shell's own follow of the connection could not be registered either: the rights
+            // are not known.
+            watchConnection: (_show, failed) => {
+              failed({
+                code: 'INTERNAL',
+                message: 'The shell did not register the listener.',
+                user_action: 'retry'
+              })
+              return () => undefined
+            }
           }}
           initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane }}
         >

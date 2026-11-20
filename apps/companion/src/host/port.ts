@@ -191,6 +191,63 @@ export interface ConnectionState {
    * before, so the page says so each time this grows.
    */
   readonly replaced: number
+  /**
+   * The number of this state: each change of what is shown here takes the next, so a state at or
+   * below one already taken in is one the page has seen, and one above the next is a gap.
+   */
+  readonly revision: number
+  /** The number of the installed connection, which a new connection or a replacement moves. */
+  readonly link: number
+  /** The host in use, when there is one. */
+  readonly host: HostLabel | null
+  /** How contact with the host in use stands. */
+  readonly contact: HostContact
+  /**
+   * What the page shows of the host in use is valid only under this epoch. It is 0 when no host is
+   * in use.
+   */
+  readonly inbox_epoch: number
+  /** The other hosts that hold an outcome: one that refused or was lost when it was left. */
+  readonly others: readonly OtherHost[]
+}
+
+/** What the host in use is, as the page names it. */
+export type HostLabel =
+  | { readonly kind: 'local' }
+  | { readonly kind: 'paired'; readonly reference: string; readonly name: string }
+
+/**
+ * How contact with one host stands. `unknown` is nothing known: no attempt has ended, or the host on
+ * this computer was never reached. `refused` is the host answering and refusing, in its own words,
+ * and is not a loss; `out_of_contact` is the host not being reached, since when this device's clock
+ * says and when the loss reaches its next level.
+ */
+export type HostContact =
+  | { readonly state: 'unknown' }
+  | { readonly state: 'in_contact' }
+  | { readonly state: 'refused'; readonly refusal: HostError; readonly request: RefusedRequest }
+  | { readonly state: 'out_of_contact'; readonly since_ms: number; readonly escalates_at_ms: number }
+
+/** A host that is not the one in use and holds an outcome. */
+export interface OtherHost {
+  /** What the page names the host by. */
+  readonly reference: string
+  /** What people call the host. */
+  readonly name: string
+  readonly contact: HostContact
+  /** What the page shows of this host's inbox is valid only under this epoch. */
+  readonly inbox_epoch: number
+}
+
+/**
+ * What the page missed since a revision. With `resync` set the page was further behind than native
+ * code keeps, or ahead of it, and `states` holds the whole current state alone, to take as a new base.
+ */
+export interface ConnectionSince {
+  /** The revision native code stands at. */
+  readonly revision: number
+  readonly states: readonly ConnectionState[]
+  readonly resync: boolean
 }
 
 /**
@@ -1885,11 +1942,31 @@ export interface HostPort {
   /** Whether a host connection is live, and why not when it is not. */
   connectionState(): Promise<ConnectionState>
   /**
-   * Calls `listener` with the connection's state each time native code publishes it. Resolves once
-   * the listener is registered, with the function that stops it: a state read after that cannot
-   * miss a change.
+   * What the connection's state went through above `after`, in order, or its whole current state
+   * when the page is further behind than native code keeps.
+   */
+  connectionSince(after: number): Promise<ConnectionSince>
+  /**
+   * Follows the connection's state: `show` is given the latest state once the port has one and then
+   * every revision after it, each once and in order, and `failed` is given the failure when the port
+   * can read no state and has heard none. The returned function stops following, and no call is made
+   * after it. A view that follows its state uses this and reads nothing itself.
+   */
+  watchConnection(
+    show: (state: ConnectionState, resynced: boolean) => void,
+    failed: (failure: unknown) => void
+  ): () => void
+  /**
+   * Calls `listener` when what a view's reads depend on changes: the host, whether it is connected,
+   * its environment, the rights, whether it is paired, a replacement or a new connection. It is not
+   * called for the host's contact, for the reason, for the other hosts or for the inbox's epoch, and
+   * never for the state the registration finds. Resolves once the port has a state, from a read or
+   * from the first change it hears, with the function that stops the listener: a read made after
+   * that cannot miss a change. A failed read of the first state does not reject it.
    */
   onConnection(listener: (state: ConnectionState) => void): Promise<() => void>
+  /** The latest state the port has taken in, or null before it has one. */
+  connectionLatest(): ConnectionState | null
 
   /**
    * Opens a session for a screen and says what the host decided it may do. A refusal is the host's
@@ -2654,7 +2731,7 @@ export interface HostPort {
   /**
    * Tells `listener` each event the host publishes. Resolves, with the function that stops it,
    * once the listener is registered: nothing published before then reaches it. The connection's
-   * own changes are `onConnection`'s.
+   * own changes are the connection feed's (`watchConnection`).
    */
   subscribe(listener: (event: HostEvent) => void): Promise<() => void>
 
