@@ -140,8 +140,9 @@ pub const DRAFT_REVISIONS_STORE: &str = "draft-revisions";
 ///
 /// Such a release keeps that revision in no column of the journal: a journal at that version is one
 /// it cannot take as it is, and what it records for a prompt that names a draft is the one the
-/// rollback states the limit of. A release that reads that version, as one does that reads the
-/// journal through it, is not one of them, and neither is one that lists no transfers journal.
+/// rollback states the limit of, when the release also lists no store of binding revisions. A
+/// release that reads that version, as one does that reads the journal through it, is not one of
+/// them, and neither is one that lists no transfers journal.
 #[must_use]
 pub fn reads_the_journal_below_the_column(target: &ReleaseManifest) -> Option<&ReleaseStore> {
     target
