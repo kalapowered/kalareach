@@ -1783,6 +1783,10 @@ const LIST: &[Listed] = &[
                 1,
             ),
             (
+                "`KR_TEST_ARTIFACTS_DIR`, `CARGO_TERM_COLOR`, `KR_CONFORMANCE_STEP`, `KR_CONFORMANCE_RECORDS`,",
+                1,
+            ),
+            (
                 "`KR_TEST_ARTIFACTS_DIR` and collected into the CI artifact store. The landing workflow",
                 1,
             ),
@@ -1931,6 +1935,11 @@ const LIST: &[Listed] = &[
             ),
         ],
     ),
+    // The loader refuses a plan that sets the name: the report sets it for each step.
+    lines(
+        "tests/conformance/src/plan_file.rs",
+        &[(r#"if upper == "KR_TEST_ARTIFACTS_DIR" {"#, 1)],
+    ),
     // The report passes the checked evidence directory to each step it starts.
     lines(
         "tests/conformance/src/run.rs",
@@ -1992,6 +2001,11 @@ const LIST: &[Listed] = &[
             r#".env("KR_TEST_ARTIFACTS_DIR", self.path("tmp/evidence"))"#,
             1,
         )],
+    ),
+    // The case that holds a plan to refuse the names the report sets lists this one among them.
+    lines(
+        "tests/conformance/tests/plan_file.rs",
+        &[(r#""KR_TEST_ARTIFACTS_DIR","#, 1)],
     ),
     // The case sets the variable for the program it starts, under the temporary folder.
     lines(
