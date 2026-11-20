@@ -57,6 +57,10 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 # The server half: a terminal started with `--remote` upgrades its connection to a WebSocket.
 tokio-websockets = { workspace = true, features = ["server"] }
+# The text of a message into a channel is folded and its format characters dropped before it is
+# checked for text shaped like a channel tag.
+unicode-general-category.workspace = true
+unicode-normalization.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # The terminal is this host's own pseudo-console, because the pipe modes its boundaries need cannot
