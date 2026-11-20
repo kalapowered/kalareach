@@ -110,6 +110,9 @@ pub fn wait_until_a_worker_is_found_unnamed(
 /// a directory to remove.
 pub struct Tree {
     launches: Arc<Launches>,
+    /// Whether the tree's end removes the jobs registered for it with the service manager. A tree
+    /// made by [`Tree::without_service_manager`] never calls one.
+    service_manager: bool,
     // Declared last: the directory is removed after every field above has let go of its files.
     tree: Option<TempHost>,
 }
@@ -179,7 +182,17 @@ impl Tree {
         Self {
             tree: Some(TempHost::create()),
             launches: Arc::default(),
+            service_manager: true,
         }
+    }
+
+    /// Makes this tree end without calling the service manager: its end still closes the
+    /// daemon's workers and reports what it could not end, but it neither lists nor removes any
+    /// job. For a case that starts no job of its own and must reach no manager of the account.
+    #[must_use]
+    pub fn without_service_manager(mut self) -> Self {
+        self.service_manager = false;
+        self
     }
 
     /// Creates a fresh tree whose state root is the tree's directory `state_name`.
@@ -190,6 +203,7 @@ impl Tree {
                 state_name,
             )),
             launches: Arc::default(),
+            service_manager: true,
         }
     }
 
@@ -241,7 +255,11 @@ impl Drop for Tree {
         unresolved.extend(end_what_the_daemon_started(&tree.environment(), launched));
         // Then every job registered for the tree. A worker still inside one did not complete its
         // own closure, is reported above, and is ended by its service manager as the job goes.
-        let jobs_left = remove_jobs(&tree);
+        let jobs_left = if self.service_manager {
+            remove_jobs(&tree)
+        } else {
+            Vec::new()
+        };
         if unresolved.is_empty() && jobs_left.is_empty() {
             return;
         }
