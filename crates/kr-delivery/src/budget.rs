@@ -171,26 +171,6 @@ impl Budget {
         self.refilled_at_ms = now_ms;
     }
 
-    /// Returns how many whole notifications the burst allowance has left.
-    #[must_use]
-    pub fn burst_available(&self) -> u64 {
-        if self.burst_scaled <= 0 {
-            0
-        } else {
-            (self.burst_scaled / SCALE) as u64
-        }
-    }
-
-    /// Returns how many whole notifications the sustained allowance has left.
-    #[must_use]
-    pub fn sustained_available(&self) -> u64 {
-        if self.sustained_scaled <= 0 {
-            0
-        } else {
-            (self.sustained_scaled / SCALE) as u64
-        }
-    }
-
     /// Decides what happens to one notification, and spends whatever it spends.
     ///
     /// `fresh_update` is asked for an identifier only when a new attention update is opened, so a
@@ -290,6 +270,24 @@ pub fn collapse_id(secret: &[u8; 32], group: &str) -> CollapseId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Budget {
+        fn burst_available(&self) -> u64 {
+            if self.burst_scaled <= 0 {
+                0
+            } else {
+                (self.burst_scaled / SCALE) as u64
+            }
+        }
+
+        fn sustained_available(&self) -> u64 {
+            if self.sustained_scaled <= 0 {
+                0
+            } else {
+                (self.sustained_scaled / SCALE) as u64
+            }
+        }
+    }
 
     fn update(byte: u8) -> NotificationId {
         NotificationId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
