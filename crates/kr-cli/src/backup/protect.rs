@@ -510,8 +510,10 @@ mod tests {
         /// What the open to read gives.
         read: &'static str,
         ours: bool,
-        /// The list the thread holds when it is read.
-        holds: List,
+        /// The list the thread holds whatever was set on it, for a thread changed by another
+        /// program; none for a thread that holds what was set on it, and holds another list
+        /// until one is set.
+        holds: Option<List>,
     }
 
     fn the_list_set() -> List {
@@ -523,7 +525,7 @@ mod tests {
             write: "opened",
             read: "opened",
             ours: true,
-            holds: the_list_set(),
+            holds: None,
         }
     }
 
@@ -658,15 +660,22 @@ mod tests {
             Ok(self.behaviour_of(*thread).ours)
         }
 
-        fn set_thread_list(&mut self, thread: &u32, _list: &[Entry]) -> io::Result<()> {
+        fn set_thread_list(&mut self, thread: &u32, list: &[Entry]) -> io::Result<()> {
             self.call("set thread")?;
             self.log.push(format!("set {thread}"));
+            self.set_threads.insert(*thread, list.to_vec());
             Ok(())
         }
 
         fn thread_list(&mut self, thread: &u32) -> io::Result<List> {
             self.log.push(format!("read {thread}"));
-            Ok(self.behaviour_of(*thread).holds)
+            Ok(self.behaviour_of(*thread).holds.unwrap_or_else(|| {
+                // A thread holds what was set on it, and another list until then.
+                self.set_threads
+                    .get(thread)
+                    .cloned()
+                    .unwrap_or_else(|| vec![allow(&ACCOUNT, 0x001F_FFFF)])
+            }))
         }
 
         fn debugger_present(&mut self) -> bool {
@@ -681,20 +690,18 @@ mod tests {
             .unwrap_or_else(|| panic!("{call} was not made: {log:?}"))
     }
 
-    /// The calls come in the order of the module's text, and each list is the one that was
-    /// meant: the owner and the account only, with the process, thread and token masks.
+    /// The calls come in the order of the module's text, and each list that is passed to the system
+    /// is the one that was meant: the owner and the account only, with the process, thread and
+    /// token masks, each compared whole with the entries written out here.
     #[test]
     fn the_lists_are_set_in_order_and_each_is_the_one_that_was_meant() {
         let mut fake = Fake::new();
         fake.threads = vec![10];
-        let log_of = |fake: Fake| {
-            let mut kept = None;
-            let held = apply(Recorder(&mut kept, fake));
-            assert!(held.is_ok(), "the protection holds");
-            drop(held);
-            kept.expect("the log")
+        let Ok(held) = apply(fake) else {
+            panic!("the protection was meant to hold");
         };
-        let log = log_of(fake);
+        let fake = held._calls;
+        let log = fake.log.clone();
         let order = [
             "suppress",
             "open token",
@@ -712,29 +719,37 @@ mod tests {
         ];
         let mut at = 0;
         for call in order {
-            let found = log[at..]
-                .iter()
-                .position(|logged| logged == call)
-                .unwrap_or_else(|| panic!("{call} comes after position {at}: {log:?}"));
-            at += found + 1;
+            let found = log[at..].iter().position(|logged| logged == call);
+            assert!(found.is_some(), "{call} comes after position {at}: {log:?}");
+            at += found.unwrap_or(0) + 1;
         }
 
-        let threads = thread_list(&ACCOUNT);
-        assert_eq!(threads.len(), 2);
-        assert!(threads.iter().all(|entry| entry.mask == THREAD_MASK));
-        assert_eq!(threads[0].account, OWNER_RIGHTS.to_vec());
-        assert_eq!(threads[1].account, ACCOUNT.to_vec());
+        // What each list passed to the system holds, entry by entry: type, flags, mask and account.
+        let thread = vec![
+            allow(&OWNER_RIGHTS, 0x0012_0800),
+            allow(&ACCOUNT, 0x0012_0800),
+        ];
+        assert_eq!(fake.set.get("default"), Some(&thread));
+        assert_eq!(fake.set_threads.get(&10), Some(&thread));
+        assert_eq!(
+            fake.set.get("token"),
+            Some(&vec![
+                allow(&OWNER_RIGHTS, 0x0002_0000),
+                allow(&ACCOUNT, 0x0002_0008),
+                allow(&SYSTEM, 0x0002_0008),
+            ]),
+            "the owner may only read the list; the account and the system query and read it"
+        );
+        assert_eq!(
+            fake.set.get("process"),
+            Some(&vec![
+                allow(&OWNER_RIGHTS, 0x0012_1001),
+                allow(&ACCOUNT, 0x0012_1001),
+            ]),
+            "wait, ask, end, read the list"
+        );
         assert_eq!(THREAD_MASK, 0x0012_0800, "wait, ask, read the list");
         assert_eq!(PROCESS_MASK, 0x0012_1001, "wait, ask, end, read the list");
-        let token = token_list(&ACCOUNT);
-        assert_eq!(token.len(), 3);
-        assert_eq!(
-            token[0].mask, READ_CONTROL,
-            "the owner may only read the list"
-        );
-        assert_eq!(token[1].mask, TOKEN_QUERY | READ_CONTROL);
-        assert_eq!(token[2].account, SYSTEM.to_vec());
-        assert_eq!(token[2].mask, TOKEN_QUERY | READ_CONTROL);
     }
 
     /// Hands the fake's log out once the protection is done with it.
@@ -808,8 +823,10 @@ mod tests {
             let mut fake = Fake::new();
             fake.fails = Some(failing);
             let mut kept = None;
-            let result = apply(Recorder(&mut kept, fake));
-            let words = refusal_words_of(result);
+            let Err(refusal) = apply(Recorder(&mut kept, fake)) else {
+                panic!("{failing}: the protection held although a call failed");
+            };
+            let words = refusal.words();
             assert!(
                 words.starts_with(
                     "the recovery kit is not made because the access lists of this process could \
@@ -823,13 +840,6 @@ mod tests {
                 !log.iter().any(|logged| logged == later),
                 "{failing} stopped the calls: {log:?}"
             );
-        }
-    }
-
-    fn refusal_words_of<C: Calls>(result: Result<Protected<C>, Refusal>) -> String {
-        match result {
-            Ok(_) => panic!("the protection was meant to refuse"),
-            Err(refusal) => refusal.words(),
         }
     }
 
@@ -847,7 +857,10 @@ mod tests {
             let mut fake = Fake::new();
             fake.reads_as.insert(name, other());
             let mut kept = None;
-            let words = refusal_words_of(apply(Recorder(&mut kept, fake)));
+            let Err(refusal) = apply(Recorder(&mut kept, fake)) else {
+                panic!("{name}: the protection held although the list read back other than set");
+            };
+            let words = refusal.words();
             assert_eq!(
                 words,
                 format!(
@@ -873,6 +886,7 @@ mod tests {
             11,
             Behaviour {
                 write: "denied",
+                holds: Some(the_list_set()),
                 ..ordinary()
             },
         );
@@ -887,11 +901,14 @@ mod tests {
             11,
             Behaviour {
                 write: "denied",
-                holds: vec![allow(&ACCOUNT, 0x001F_FFFF)],
+                holds: Some(vec![allow(&ACCOUNT, 0x001F_FFFF)]),
                 ..ordinary()
             },
         );
-        let words = refusal_words_of(apply(fake));
+        let Err(refusal) = apply(fake) else {
+            panic!("a thread that reads back another list was protected");
+        };
+        let words = refusal.words();
         assert!(words.ends_with("a thread's list was not as set"), "{words}");
 
         let mut fake = Fake::new();
@@ -903,7 +920,10 @@ mod tests {
                 ..ordinary()
             },
         );
-        let words = refusal_words_of(apply(fake));
+        let Err(refusal) = apply(fake) else {
+            panic!("a thread that refuses both opens was protected");
+        };
+        let words = refusal.words();
         assert!(words.contains("os error 5"), "{words}");
     }
 
@@ -924,7 +944,7 @@ mod tests {
             11,
             Behaviour {
                 ours: false,
-                holds: Vec::new(),
+                holds: Some(Vec::new()),
                 ..ordinary()
             },
         );
@@ -948,11 +968,14 @@ mod tests {
         fake.behaviour.insert(
             12,
             Behaviour {
-                holds: vec![allow(&OWNER_RIGHTS, 0x001F_FFFF)],
+                holds: Some(vec![allow(&OWNER_RIGHTS, 0x001F_FFFF)]),
                 ..ordinary()
             },
         );
-        let words = refusal_words_of(apply(fake));
+        let Err(refusal) = apply(fake) else {
+            panic!("a thread that reads back another list at the second pass was protected");
+        };
+        let words = refusal.words();
         assert!(words.ends_with("a thread's list was not as set"), "{words}");
     }
 
@@ -1051,7 +1074,10 @@ mod tests {
         let mut fake = Fake::new();
         fake.debugger = true;
         let mut kept = None;
-        let words = refusal_words_of(apply(Recorder(&mut kept, fake)));
+        let Err(refusal) = apply(Recorder(&mut kept, fake)) else {
+            panic!("a debugger was attached and the protection held");
+        };
+        let words = refusal.words();
         assert_eq!(
             words,
             "the recovery kit is not made because a debugger is attached to this process"

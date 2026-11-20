@@ -1675,6 +1675,10 @@ async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     // The kit was printed with its fingerprint above; what the interrupt says is what follows it.
+    assert!(
+        shown.contains("The command stopped while the setup was under way"),
+        "the command said it was interrupted under way: {shown}"
+    );
     let said = shown
         .rsplit_once("The command stopped while the setup was under way")
         .expect("the interrupt is said")
@@ -1719,6 +1723,10 @@ async fn an_interrupt_during_a_replacement_voids_the_new_kit_only_by_the_earlier
         .expect("the commit is on its thread");
     window.type_bytes(&[0x03]);
     let shown = window.wait_for("kr ended");
+    assert!(
+        shown.contains("The command stopped while the setup was under way"),
+        "the command said it was interrupted under way: {shown}"
+    );
     let said = shown
         .rsplit_once("The command stopped while the setup was under way")
         .expect("the interrupt is said")
@@ -2754,6 +2762,10 @@ async fn ctrl_break_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     window.send_break(&rig);
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(
+        shown.contains("The command stopped while the setup was under way"),
+        "the command said it was interrupted under way: {shown}"
+    );
     let said = shown
         .rsplit_once("The command stopped while the setup was under way")
         .expect("the interrupt is said")
@@ -2913,25 +2925,25 @@ impl Drop for Control {
     }
 }
 
-/// Asserts that an open was refused for want of access.
+/// The system's answer to an open of a thread that no longer exists.
 #[cfg(windows)]
-fn refused(what: &str, result: Result<std::os::windows::io::OwnedHandle, u32>) {
-    assert_eq!(
-        result.map(|_| ()),
-        Err(setup_console::ACCESS_DENIED),
-        "{what} is refused with ERROR_ACCESS_DENIED"
-    );
-}
+const ERROR_INVALID_PARAMETER: u32 = 87;
 
-/// Asserts that an open was granted.
+/// The opens that take a thread over, with what each asks for.
 #[cfg(windows)]
-fn granted(what: &str, result: Result<std::os::windows::io::OwnedHandle, u32>) {
-    assert!(
-        result.is_ok(),
-        "{what} is granted, and the system said {:?}",
-        result.err()
-    );
-}
+const TAKEOVER: [(&str, u32); 5] = [
+    ("its context", setup_console::rights::THREAD_GET_CONTEXT),
+    (
+        "setting its context",
+        setup_console::rights::THREAD_SET_CONTEXT,
+    ),
+    (
+        "suspending it",
+        setup_console::rights::THREAD_SUSPEND_RESUME,
+    ),
+    ("ending it", setup_console::rights::THREAD_TERMINATE),
+    ("rewriting its list", setup_console::rights::WRITE_DAC),
+];
 
 /// `setup` waiting at its first question, as a program of the same account sees it: its
 /// identifier, with the removal of this program's own debug privilege said first.
@@ -2955,30 +2967,58 @@ fn first_thread_of(pid: u32) -> setup_console::Thread {
         .unwrap_or_else(|| panic!("the process {pid} has a thread whose creation time can be read"))
 }
 
+/// The threads of `pid` made after `mark`, waited for: the command writes its question before it
+/// makes the thread that reads the answer, so a list taken at the moment the question shows can
+/// miss it. Empty when none appears within the window's deadline.
+#[cfg(windows)]
+fn threads_made_after(pid: u32, mark: u64) -> Vec<setup_console::Thread> {
+    let started = Instant::now();
+    loop {
+        let later: Vec<_> = setup_console::threads_of(pid)
+            .into_iter()
+            .filter(|thread| thread.created > mark)
+            .collect();
+        if !later.is_empty() || started.elapsed() >= LIVENESS_DEADLINE {
+            return later;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whether the thread `thread` of `pid` has ended since it was listed: an open of it then gives the
+/// system's answer for a thread that does not exist, which is no refusal and no grant.
+#[cfg(windows)]
+fn has_ended(pid: u32, thread: u32) -> bool {
+    !setup_console::threads_of(pid)
+        .iter()
+        .any(|listed| listed.id == thread)
+}
+
 /// The process of a command that waits at a question refuses a program of the account the opens
 /// that read its memory, copy its handles or rewrite its list, and grants the one a supervisor
 /// needs; a plain program of the account grants all four.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_process_of_a_command_at_a_question_refuses_the_opens_that_read_or_take_it() {
-    use setup_console::{open_process, rights};
+    use setup_console::{ACCESS_DENIED, open_process, rights};
 
     let (_rig, _window, pid) = setup_at_its_first_question().await;
-    refused(
-        "the open for reading memory",
-        open_process(pid, rights::PROCESS_VM_READ),
-    );
-    refused(
-        "the open for copying a handle",
-        open_process(pid, rights::PROCESS_DUP_HANDLE),
-    );
-    refused(
-        "the open for rewriting the list",
-        open_process(pid, rights::WRITE_DAC),
-    );
-    granted(
-        "the open for a query",
-        open_process(pid, rights::PROCESS_QUERY_LIMITED),
+    for (what, right) in [
+        ("reading memory", rights::PROCESS_VM_READ),
+        ("copying a handle", rights::PROCESS_DUP_HANDLE),
+        ("rewriting the list", rights::WRITE_DAC),
+    ] {
+        assert_eq!(
+            open_process(pid, right).map(|_| ()),
+            Err(ACCESS_DENIED),
+            "the open for {what} is refused with ERROR_ACCESS_DENIED"
+        );
+    }
+    let queried = open_process(pid, rights::PROCESS_QUERY_LIMITED);
+    assert!(
+        queried.is_ok(),
+        "the open for a query is granted, and the system said {:?}",
+        queried.err()
     );
 
     let control = Control::start();
@@ -3001,26 +3041,27 @@ async fn the_process_of_a_command_at_a_question_refuses_the_opens_that_read_or_t
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_token_of_a_command_at_a_question_refuses_the_opens_that_change_what_it_allows() {
-    use setup_console::{open_process, open_thread, open_token, rights};
+    use setup_console::{ACCESS_DENIED, open_process, open_thread, open_token, rights};
 
     let (_rig, mut window, pid) = setup_at_its_first_question().await;
     let process = open_process(pid, rights::PROCESS_QUERY_LIMITED).expect("a query of the process");
-    granted(
-        "the token open for a query",
-        open_token(&process, rights::TOKEN_QUERY),
+    let queried = open_token(&process, rights::TOKEN_QUERY);
+    assert!(
+        queried.is_ok(),
+        "the token open for a query is granted, and the system said {:?}",
+        queried.err()
     );
-    refused(
-        "the token open for its default list",
-        open_token(&process, rights::TOKEN_ADJUST_DEFAULT),
-    );
-    refused(
-        "the token open for a copy",
-        open_token(&process, rights::TOKEN_DUPLICATE),
-    );
-    refused(
-        "the token open for its list",
-        open_token(&process, rights::WRITE_DAC),
-    );
+    for (what, right) in [
+        ("its default list", rights::TOKEN_ADJUST_DEFAULT),
+        ("a copy", rights::TOKEN_DUPLICATE),
+        ("its list", rights::WRITE_DAC),
+    ] {
+        assert_eq!(
+            open_token(&process, right).map(|_| ()),
+            Err(ACCESS_DENIED),
+            "the token open for {what} is refused with ERROR_ACCESS_DENIED"
+        );
+    }
 
     let control = Control::start();
     let plain =
@@ -3044,59 +3085,52 @@ async fn the_token_of_a_command_at_a_question_refuses_the_opens_that_change_what
     let after_the_tries = setup_console::now();
     window.type_line("yes");
     window.wait_for("type the last 8 symbols of its seed line");
-    let later: Vec<_> = setup_console::threads_of(pid)
-        .into_iter()
-        .filter(|thread| thread.created > after_the_tries)
-        .collect();
+    let later = threads_made_after(pid, after_the_tries);
     assert!(
         !later.is_empty(),
         "this case could not make its condition: no thread of kr was made after the tries"
     );
     for thread in later {
-        refused(
-            "the open of a later thread for its context",
-            open_thread(thread.id, rights::THREAD_GET_CONTEXT),
-        );
-        refused(
-            "the open of a later thread for its list",
-            open_thread(thread.id, rights::WRITE_DAC),
-        );
+        for (what, right) in [
+            ("its context", rights::THREAD_GET_CONTEXT),
+            ("its list", rights::WRITE_DAC),
+        ] {
+            let opened = open_thread(thread.id, right);
+            if opened.as_ref().err() == Some(&ERROR_INVALID_PARAMETER) && has_ended(pid, thread.id)
+            {
+                continue;
+            }
+            assert_eq!(
+                opened.map(|_| ()),
+                Err(ACCESS_DENIED),
+                "the open of a later thread for {what} is refused with ERROR_ACCESS_DENIED"
+            );
+        }
     }
 }
 
-/// Each thread that a program of the account opens for the rights that take it over is refused, for
-/// the thread the command made first and, in the next test, for one made at a later question; a
-/// plain program's threads grant them all.
-#[cfg(windows)]
-fn assert_a_thread_refuses_the_takeover(thread: u32) {
-    use setup_console::{open_thread, rights};
-
-    for (what, right) in [
-        ("its context", rights::THREAD_GET_CONTEXT),
-        ("setting its context", rights::THREAD_SET_CONTEXT),
-        ("suspending it", rights::THREAD_SUSPEND_RESUME),
-        ("ending it", rights::THREAD_TERMINATE),
-        ("rewriting its list", rights::WRITE_DAC),
-    ] {
-        refused(
-            &format!("the open of thread {thread} for {what}"),
-            open_thread(thread, right),
-        );
-    }
-    granted(
-        &format!("the open of thread {thread} for a query"),
-        open_thread(thread, rights::THREAD_QUERY_LIMITED),
-    );
-}
-
-/// The thread that ran the protection refuses the opens that take a thread over.
+/// The thread that ran the protection refuses the opens that take a thread over; a plain
+/// program's threads grant them.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_thread_of_a_command_at_a_question_refuses_the_opens_that_take_it_over() {
-    use setup_console::{open_thread, rights};
+    use setup_console::{ACCESS_DENIED, open_thread, rights};
 
     let (_rig, _window, pid) = setup_at_its_first_question().await;
-    assert_a_thread_refuses_the_takeover(first_thread_of(pid).id);
+    let first = first_thread_of(pid).id;
+    for (what, right) in TAKEOVER {
+        assert_eq!(
+            open_thread(first, right).map(|_| ()),
+            Err(ACCESS_DENIED),
+            "the open of thread {first} for {what} is refused with ERROR_ACCESS_DENIED"
+        );
+    }
+    let queried = open_thread(first, rights::THREAD_QUERY_LIMITED);
+    assert!(
+        queried.is_ok(),
+        "the open of thread {first} for a query is granted, and the system said {:?}",
+        queried.err()
+    );
 
     let control = Control::start();
     for thread in setup_console::threads_of(control.pid()) {
@@ -3114,19 +3148,37 @@ async fn the_first_thread_of_a_command_at_a_question_refuses_the_opens_that_take
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_thread_made_after_the_protection_refuses_the_opens_that_take_it_over() {
+    use setup_console::{ACCESS_DENIED, open_thread, rights};
+
     let (_rig, mut window, pid) = setup_at_its_first_question().await;
     let before = setup_console::now();
     window.type_line("yes");
     window.wait_for("type the last 8 symbols of its seed line");
-    let later: Vec<_> = setup_console::threads_of(pid)
-        .into_iter()
-        .filter(|thread| thread.created > before)
-        .collect();
+    let later = threads_made_after(pid, before);
     assert!(
         !later.is_empty(),
         "this case could not make its condition: no thread of kr was made after the first answer"
     );
     for thread in later {
-        assert_a_thread_refuses_the_takeover(thread.id);
+        for (what, right) in TAKEOVER {
+            let opened = open_thread(thread.id, right);
+            if opened.as_ref().err() == Some(&ERROR_INVALID_PARAMETER) && has_ended(pid, thread.id)
+            {
+                continue;
+            }
+            assert_eq!(
+                opened.map(|_| ()),
+                Err(ACCESS_DENIED),
+                "the open of thread {} for {what} is refused with ERROR_ACCESS_DENIED",
+                thread.id
+            );
+        }
+        let queried = open_thread(thread.id, rights::THREAD_QUERY_LIMITED);
+        assert!(
+            queried.is_ok() || has_ended(pid, thread.id),
+            "the open of thread {} for a query is granted, and the system said {:?}",
+            thread.id,
+            queried.err()
+        );
     }
 }
