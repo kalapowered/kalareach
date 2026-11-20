@@ -14,7 +14,8 @@ import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
-import { PURCHASE_WORDS, type AccountView } from '../src/model/account'
+import type { AccountView } from '../src/model/account'
+import { PURCHASE_WORDS } from './purchase-words'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
