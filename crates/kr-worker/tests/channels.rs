@@ -2982,14 +2982,29 @@ async fn kr_req_12_26_text_in_the_form_of_a_channel_tag_is_refused() {
 }
 
 /// KR-REQ-12.26: a message and an approval use separate paths on one channel. With an approval
-/// pending, a verified message is written and the approval is still pending and unclaimed, still
-/// holding the application's own identifier; its verdict then goes out, and the message's frame is
-/// unchanged.
+/// pending, a verified message is written and the approval is still pending and unclaimed: its
+/// record is the one it was, and what the decoder stored for it, the request as the application
+/// sent it and the application's own identifier, is the same bytes before and after the message.
+/// Its verdict then goes out.
 #[tokio::test]
 async fn kr_req_12_26_a_prompt_and_an_approval_use_separate_paths() {
     let broker = memory_broker();
     let (_package, mut channel, resource) = channel_with_a_relayed_approval(&broker).await;
     let pending = relayed(&broker, 2, "abcde").expect("recorded");
+    let inspect = || {
+        broker
+            .inspect_approval(
+                &kr_protocol::agent::AgentApprovalInspectParams {
+                    subject: kr_worker::broker::subject(session(), instance(2)),
+                    resource_id: pending.resource_id,
+                },
+                &kr_worker::history_filter::HistoryFilter::new(
+                    kr_worker::history_filter::ViewerScope::owner(),
+                ),
+            )
+            .expect("the approval is inspectable")
+    };
+    let before = inspect();
 
     let ended = broker
         .agent_prompt(
@@ -3021,6 +3036,17 @@ async fn kr_req_12_26_a_prompt_and_an_approval_use_separate_paths() {
         after, pending,
         "the approval's own record is the one it was before the message"
     );
+    let inspected = inspect();
+    assert_eq!(
+        inspected.decoding.source_bytes.as_slice(),
+        before.decoding.source_bytes.as_slice(),
+        "the request's original bytes are the ones the decoder stored before the message"
+    );
+    assert_eq!(
+        inspected.decoding.upstream_request_id, before.decoding.upstream_request_id,
+        "the application's own identifier is the one it was"
+    );
+    assert_eq!(inspected.decoding.upstream_request_id.as_str(), "\"abcde\"");
 
     let answered = carried(
         &broker,
