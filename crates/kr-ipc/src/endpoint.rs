@@ -261,8 +261,12 @@ mod platform {
     use tokio::net::{UnixListener, UnixStream};
 
     use crate::error::{IpcError, Result};
+    use crate::listen::{ListenRefusal, ListenStep, ObjectKind};
     use crate::paths::Endpoint;
     use crate::peer::PeerIdentity;
+
+    #[cfg(target_vendor = "apple")]
+    mod apple;
 
     #[derive(Debug)]
     pub(super) struct Listener {
@@ -281,11 +285,14 @@ mod platform {
             // to end, which is not the answer either: that bind should be told the address is
             // taken.
             let guard = EndpointGuard::take(&path)?;
-            replace_stale_socket(&path)?;
-            let inner =
-                UnixListener::bind(&path).map_err(|error| IpcError::socket("bind", error))?;
-            set_owner_only(&path)?;
-            let identity = socket_identity(&path)?;
+            let text = endpoint.as_text();
+            replace_stale_socket(&path, &text)?;
+            let inner = UnixListener::bind(&path)
+                .map_err(|error| refused(&text, ListenStep::Bind, &error))?;
+            set_owner_only(&path)
+                .map_err(|error| refused_by(&text, ListenStep::Permissions, &error))?;
+            let identity = socket_identity(&path)
+                .map_err(|error| refused_by(&text, ListenStep::Inspect, &error))?;
             drop(guard);
             Ok(Self {
                 inner,
@@ -331,36 +338,57 @@ mod platform {
     /// is refused proves the previous owner is gone. Any other failure — a permission error, an
     /// exhausted descriptor table, a full backlog — proves nothing at all, and unlinking on those
     /// would let one process delete another's live endpoint.
-    fn replace_stale_socket(path: &std::path::Path) -> Result<()> {
+    fn replace_stale_socket(path: &std::path::Path, text: &str) -> Result<()> {
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(IpcError::io("inspect", path, error)),
+            Err(error) => return Err(refused(text, ListenStep::Inspect, &error)),
         };
         if !metadata.file_type().is_socket() {
-            return Err(IpcError::UntrustedFile {
-                path: path.to_path_buf(),
-                reason: "an endpoint address is occupied by something that is not a socket",
-            });
+            return Err(IpcError::listen(
+                text,
+                ListenRefusal::NotASocket {
+                    object: ObjectKind::of(metadata.file_type()),
+                },
+            ));
         }
-        match probe(path)? {
+        match probe(path, text)? {
             // Something answered, or its backlog was full, which only a live listener has. Either
             // way the address belongs to a running process.
-            Probe::Listening => Err(IpcError::socket(
-                "bind",
-                std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    "another process is listening on this endpoint",
-                ),
-            )),
-            Probe::Abandoned => {
-                std::fs::remove_file(path).map_err(|error| IpcError::io("replace", path, error))
-            }
+            Probe::Listening { pid } => Err(IpcError::listen(text, ListenRefusal::Held { pid })),
+            Probe::Abandoned => std::fs::remove_file(path).map_err(|error| {
+                IpcError::listen(
+                    text,
+                    ListenRefusal::NotRemoved {
+                        os: error.raw_os_error().unwrap_or_default(),
+                    },
+                )
+            }),
         }
     }
 
+    /// A refusal of a step, from the error the system gave.
+    fn refused(text: &str, operation: ListenStep, error: &std::io::Error) -> IpcError {
+        IpcError::listen(
+            text,
+            ListenRefusal::Other {
+                operation,
+                os: error.raw_os_error(),
+            },
+        )
+    }
+
+    /// A refusal of a step, from a failure of this crate's own that carries the system's error.
+    fn refused_by(text: &str, operation: ListenStep, error: &IpcError) -> IpcError {
+        let os = match error {
+            IpcError::Io { source, .. } | IpcError::Socket { source, .. } => source.raw_os_error(),
+            _ => None,
+        };
+        IpcError::listen(text, ListenRefusal::Other { operation, os })
+    }
+
     enum Probe {
-        Listening,
+        Listening { pid: Option<u32> },
         Abandoned,
     }
 
@@ -369,24 +397,50 @@ mod platform {
     /// The connection is made on a non-blocking socket, so a listener whose backlog is full
     /// answers immediately instead of holding this call. For a Unix socket that is the whole
     /// bound: there is no network round trip to time out.
-    fn probe(path: &std::path::Path) -> Result<Probe> {
-        let socket = super::stream_socket().map_err(|error| IpcError::socket("probe", error))?;
+    fn probe(path: &std::path::Path, text: &str) -> Result<Probe> {
+        let failed = |error: std::io::Error| refused(text, ListenStep::Probe, &error);
+        let socket = super::stream_socket().map_err(failed)?;
         // `SOCK_NONBLOCK` is a Linux extension, so the mode is set on the descriptor instead.
         rustix::io::ioctl_fionbio(&socket, true)
-            .map_err(|error| IpcError::socket("probe", std::io::Error::from(error)))?;
+            .map_err(|error| failed(std::io::Error::from(error)))?;
         let address = rustix::net::SocketAddrUnix::new(path)
-            .map_err(|error| IpcError::socket("probe", std::io::Error::from(error)))?;
+            .map_err(|error| failed(std::io::Error::from(error)))?;
         match rustix::net::connect(&socket, &address) {
-            // Connected, or the handshake is still in progress against a listener that exists.
-            Ok(()) | Err(rustix::io::Errno::INPROGRESS) => Ok(Probe::Listening),
+            // Connected: the kernel says which process listens.
+            Ok(()) => Ok(Probe::Listening {
+                pid: peer_process(&socket),
+            }),
+            // The handshake is still in progress against a listener that exists.
+            Err(rustix::io::Errno::INPROGRESS) => Ok(Probe::Listening { pid: None }),
             // A full backlog is a live listener that is busy, never an abandoned address.
-            Err(rustix::io::Errno::AGAIN) => Ok(Probe::Listening),
+            Err(rustix::io::Errno::AGAIN) => Ok(Probe::Listening { pid: None }),
             // Refused means the socket file outlived the process that bound it.
             Err(rustix::io::Errno::CONNREFUSED) => Ok(Probe::Abandoned),
             // Anything else proves nothing, and unlinking on it would let one process delete
             // another's live endpoint.
-            Err(error) => Err(IpcError::socket("probe", std::io::Error::from(error))),
+            Err(error) => Err(failed(std::io::Error::from(error))),
         }
+    }
+
+    /// The process on the other end of a connected local socket, where the kernel says.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_process(socket: &std::os::fd::OwnedFd) -> Option<u32> {
+        rustix::net::sockopt::socket_peercred(socket)
+            .ok()
+            .and_then(|credentials| u32::try_from(credentials.pid.as_raw_nonzero().get()).ok())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn peer_process(socket: &std::os::fd::OwnedFd) -> Option<u32> {
+        use std::os::fd::AsFd as _;
+
+        apple::peer_process(socket.as_fd())
+    }
+
+    /// Other Unix systems give no process.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    fn peer_process(_socket: &std::os::fd::OwnedFd) -> Option<u32> {
+        None
     }
 
     /// The exclusive right to change one endpoint address.
@@ -555,6 +609,7 @@ mod platform {
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
     use crate::error::{IpcError, Result};
+    use crate::listen::{ListenRefusal, ListenStep};
     use crate::paths::{AccessListRefusal, Endpoint, check_access_list};
     use crate::peer::PeerIdentity;
 
@@ -597,19 +652,28 @@ mod platform {
         /// through [`super::Listener::bind_with_access_list`] with a widened list, to prove the
         /// listener's account check independently of the list the operating system enforces.
         pub(super) fn bind_with_descriptor(endpoint: &Endpoint, descriptor: &str) -> Result<Self> {
-            let name = endpoint
-                .as_text()
+            let text = endpoint.as_text();
+            let failed = |error: &std::io::Error| {
+                IpcError::listen(
+                    text.as_str(),
+                    ListenRefusal::Other {
+                        operation: ListenStep::Bind,
+                        os: error.raw_os_error(),
+                    },
+                )
+            };
+            let name = text
+                .as_str()
                 .to_ns_name::<GenericNamespaced>()
-                .map_err(|error| IpcError::socket("bind", error))?;
+                .map_err(|error| failed(&error))?;
             let descriptor = SecurityDescriptor::deserialize(
                 &widestring::U16CString::from_str(descriptor).map_err(|_| {
-                    IpcError::socket(
-                        "bind",
-                        std::io::Error::other("the access-control list is not valid text"),
-                    )
+                    failed(&std::io::Error::other(
+                        "the access-control list is not valid text",
+                    ))
                 })?,
             )
-            .map_err(|error| IpcError::socket("bind", error))?;
+            .map_err(|error| failed(&error))?;
             let inner = ListenerOptions::new()
                 .name(name)
                 .security_descriptor(descriptor)
@@ -624,13 +688,9 @@ mod platform {
                     if error.kind() == std::io::ErrorKind::PermissionDenied
                         || error.raw_os_error() == Some(ERROR_PIPE_BUSY.cast_signed())
                     {
-                        IpcError::socket(
-                            "bind (the name is held by another pipe, or its list refuses this \
-                             account)",
-                            error,
-                        )
+                        IpcError::listen(text.as_str(), ListenRefusal::NameTaken)
                     } else {
-                        IpcError::socket("bind", error)
+                        failed(&error)
                     }
                 })?;
             Ok(Self { inner })
@@ -943,3 +1003,6 @@ mod platform {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
