@@ -1433,6 +1433,121 @@ fn a_step_of_the_execution_model_is_refused_for_each_fault_by_its_reason() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// The command of a step that reads the output of `cargo test` is read the way Cargo reads its
+/// flags, and one the report cannot read is refused with its own reason. A step that reads no
+/// output of `cargo test`, or that runs another program, is not held to it, and each flag that
+/// `cargo test --help` lists loads.
+#[test]
+fn a_cargo_test_step_whose_flags_the_report_cannot_read_is_refused_for_each_fault_by_its_reason() {
+    let root = repository();
+    let command = |words: &str| step_adding("", &format!("[{words}]"));
+    let refused: &[(&str, &str, &str)] = &[
+        (
+            "a manifest path",
+            "'cargo', 'test', '--manifest-path', 'other/Cargo.toml'",
+            "step `one` gives `--manifest-path`: the step's directory is its workspace, and `-p` and `--workspace` choose the packages in it",
+        ),
+        (
+            "a manifest path in its short form",
+            "'cargo', 'test', '-m', 'other/Cargo.toml'",
+            "step `one` gives `--manifest-path`",
+        ),
+        (
+            "an unstable flag",
+            "'cargo', 'test', '-Z', 'unstable-options'",
+            "step `one` gives `-Z`, an unstable flag that can change which targets Cargo selects and that the report does not read",
+        ),
+        (
+            "an exclusion without the workspace",
+            "'cargo', 'test', '--exclude', 'b'",
+            "step `one` gives `--exclude` without `--workspace`, which Cargo refuses",
+        ),
+        (
+            "an exclusion beside a package",
+            "'cargo', 'test', '-p', 'a', '--exclude', 'b'",
+            "step `one` gives `--exclude` without `--workspace`",
+        ),
+        (
+            "a flag that is not one of Cargo's",
+            "'cargo', 'test', '--workspace', '--nope'",
+            "step `one` gives `--nope`, which is not a flag of `cargo test`: the report reads only the flags it knows",
+        ),
+        (
+            "a package flag with no value",
+            "'cargo', 'test', '-p'",
+            "step `one` gives `--package` without a value",
+        ),
+        (
+            "a target flag whose value is another flag",
+            "'cargo', 'test', '--test', '--lib'",
+            "step `one` gives `--test` without a value",
+        ),
+        (
+            "a package with a version",
+            "'cargo', 'test', '-p', 'a@0.1.0'",
+            "step `one` names the package `a@0.1.0`: give a package by its name, or by a pattern of `*`, `?` and `[...]` that matches names",
+        ),
+        (
+            "a pattern with a class that is never closed",
+            "'cargo', 'test', '-p', 'a[b'",
+            "step `one` names the pattern `a[b`, which has a `[` that no `]` closes",
+        ),
+        (
+            "the documentation tests beside a library",
+            "'cargo', 'test', '--doc', '--lib'",
+            "step `one` gives `--doc` with another flag that selects targets, which Cargo refuses",
+        ),
+        (
+            "a command that is not `cargo test`",
+            "'cargo', 'build', '-p', 'a'",
+            "step `one` reads the output of `cargo test` and its command is not `cargo test`",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, words, reason) in refused {
+        match Plan::parse(&command(words), &root) {
+            Ok(_) => wrong.push(format!("{name}: the loader refused nothing")),
+            Err(refusal) if refusal.to_string().contains(reason) => {}
+            Err(refusal) => wrong.push(format!(
+                "{name}: refused as `{refusal}`, which lacks `{reason}`"
+            )),
+        }
+    }
+    for words in [
+        "'cargo', 'test'",
+        "'cargo', 'test', '--locked', '-p', 'a', '--features', 'f', '--', '--nocapture'",
+        "'cargo', 'test', '--locked', '--workspace', '--exclude', 'b*', '--no-fail-fast'",
+        "'cargo', 'test', '--all', '--exclude=b'",
+        "'cargo', 'test', '-pa', '-p=b', '--package=c'",
+        "'cargo', 'test', '--lib', '--bin=x', '--test', 't', '--bench', 'm', '--example', 'e'",
+        "'cargo', 'test', '--bins', '--tests', '--benches', '--examples', '--all-targets'",
+        "'cargo', 'test', '--doc', '--no-fail-fast'",
+        "'cargo', 'test', '-F', 'f', '--all-features', '--no-default-features', '--release', '--profile', 'ci'",
+        "'cargo', 'test', '-qr', '-vv', '-j', '4', '--target', 'x86_64-unknown-linux-gnu', '--timings=html'",
+        "'cargo', 'test', '--offline', '--frozen', '--ignore-rust-version', '--color', 'never', 'a_name_filter'",
+        "'cargo', 'test', '-p', 'a', '--', '--manifest-path', '--bogus', '-Z'",
+    ] {
+        let text = command(words);
+        if let Err(refusal) = Plan::parse(&text, &root) {
+            wrong.push(format!("{words}: refused as `{refusal}`"));
+        }
+    }
+    // A step that reads nothing of `cargo test` is not held to its flags.
+    for (reading, words) in [(
+        "build",
+        "'cargo', 'build', '-Z', 'unstable-options', '--manifest-path', 'x/Cargo.toml'",
+    )] {
+        let text = step_with(
+            "reading = 'cargo'\ncommand = ['cargo', 'test']",
+            &format!("reading = '{reading}'\ncommand = [{words}]"),
+        );
+        if let Err(refusal) = Plan::parse(&text, &root) {
+            wrong.push(format!("a {reading} step: refused as `{refusal}`"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A `cargo` step runs in a workspace root that `[rust] manifests` names: the directory the step
 /// names or, when it names none, the repository's root. A step of another program is not held to
 /// it, and a root named with a `.` in its path is the same root.
