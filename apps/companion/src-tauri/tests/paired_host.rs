@@ -1664,6 +1664,44 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
     host.stop().await;
 }
 
+/// KR-REQ-18.01: a choice whose step stops part of the way, after the owner accepted it, is told in
+/// the approved words, and the connection's state names the host chosen, which is what the words
+/// send the person to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_that_stops_part_of_the_way_is_told_so_and_the_state_names_the_host_chosen() {
+    use companion_tauri::contact::HostLabel;
+    use companion_tauri::state::testing::ChoicePoint;
+
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let chosen = companion
+        .device()
+        .host_by_reference(&two.references.1)
+        .expect("the second host is listed");
+    let mut hold = state.hold_the_choice_at(ChoicePoint::BeforeCleanup);
+    let handle = companion.app.handle().clone();
+    let choosing =
+        tokio::spawn(async move { companion_tauri::hosts::use_host(&handle, chosen).await });
+    hold.reached().await;
+    hold.stop();
+
+    let stopped = choosing.await.expect("the choice ran");
+    let Err(failure) = stopped else {
+        panic!("a choice whose step stopped is not an answer");
+    };
+    assert_eq!(
+        failure.message,
+        "the choice of host stopped part of the way; the connection's state shows which host is in use"
+    );
+    assert!(
+        matches!(&state.connection_state().host, Some(HostLabel::Paired { reference, .. }) if *reference == two.references.1),
+        "the state names the host chosen: {:?}",
+        state.connection_state()
+    );
+    two.stop().await;
+}
+
 /// KR-REQ-18.01: a host that refuses and then answers is told refused and then in contact, as the
 /// next revision, with nothing between. The publisher is held on the choice's publication while the
 /// refusal and the recovery are both committed, so both wait in the log: each is told as it was

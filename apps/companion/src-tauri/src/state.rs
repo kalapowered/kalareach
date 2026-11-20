@@ -760,7 +760,16 @@ pub mod testing {
     #[derive(Debug)]
     pub struct Hold {
         reached: oneshot::Receiver<()>,
-        release: mpsc::Sender<()>,
+        release: mpsc::Sender<Release>,
+    }
+
+    /// What a hold tells the step that waits at it.
+    #[derive(Clone, Copy, Debug)]
+    enum Release {
+        /// Go on.
+        Go,
+        /// Stop, as a panic in the step would stop it.
+        Stop,
     }
 
     impl Hold {
@@ -771,13 +780,19 @@ pub mod testing {
 
         /// Lets the waiting step go on.
         pub fn release(self) {
-            let _ = self.release.send(());
+            let _ = self.release.send(Release::Go);
+        }
+
+        /// Stops the waiting step: it leaves the wait through `std::panic::resume_unwind`, as a
+        /// panic in that step would leave it, with no panic message of its own.
+        pub fn stop(self) {
+            let _ = self.release.send(Release::Stop);
         }
     }
 
     /// One place a step can be paused at.
     #[derive(Debug, Default)]
-    pub(super) struct Place(Mutex<Option<(oneshot::Sender<()>, mpsc::Receiver<()>)>>);
+    pub(super) struct Place(Mutex<Option<(oneshot::Sender<()>, mpsc::Receiver<Release>)>>);
 
     impl Place {
         fn set(&self) -> Hold {
@@ -798,7 +813,9 @@ pub mod testing {
             let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
             if let Some((reached, released)) = held {
                 let _ = reached.send(());
-                let _ = super::blocking(|| released.recv());
+                if let Ok(Release::Stop) = super::blocking(|| released.recv()) {
+                    std::panic::resume_unwind(Box::new("the held step was stopped"));
+                }
             }
         }
     }
