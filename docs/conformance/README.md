@@ -322,7 +322,8 @@ group or not, keeps the step waiting while it holds the pipe. If it still holds 
 deadline, the step runs out of time and the report closes the pipe. The kill does not reach:
 
 - a process that leaves the group by starting a session or a group of its own, or that joins another
-  group (a daemon, a job-control shell, Node's `detached`, Python's `start_new_session`);
+  group (a daemon, a job-control shell, Node's `detached`, Python's `start_new_session`); when the
+  step's own process joins another group, the report waits for it to end;
 - a process that the command leaves in the group when it ends in its time and that holds no pipe the
   report reads, because the kill comes only at the deadline;
 - a process that the report has no permission to signal (one that runs as another user, for
@@ -332,9 +333,10 @@ deadline, the step runs out of time and the report closes the pipe. The kill doe
   step's own process, the report waits for it.
 
 Ctrl-C and a closed terminal reach the report and not the step's group, so an interrupted run can
-leave a step's processes running. An interactive command in the step's group stops when it reads
-the controlling terminal, for example to ask for a password, because the group is not the
-terminal's foreground group; it stays stopped until the deadline.
+leave a step's processes running. An interactive command in the step's group that reads the
+controlling terminal, for example to ask for a password, stops the group, because the group is not
+the terminal's foreground group, and the group stays stopped until the deadline. When the step's own
+process has ended, or the command ignores or blocks the stop signal, the read fails at once instead.
 
 Playwright 1.63.0 starts each browser in a session of its own, so the kill does not reach a browser.
 Playwright's test workers are in the step's group. On the request to end they start to close their
