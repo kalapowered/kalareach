@@ -259,7 +259,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
         let real = std::fs::canonicalize(&path).map_err(|error| format!("{at}: {error}"))?;
         if real != path || !path.starts_with(root) {
             return Err(format!(
-                "{at}: the scan does not read a path through a link or outside the checkout (it is {})",
+                "{at}: the scan does not read a path through a link, with .. or from the root of the file system (it is {})",
                 real.display()
             ));
         }
@@ -439,16 +439,28 @@ impl Reader<'_> {
     /// written and finds no file.
     fn explicit_path(&mut self, written: &str) -> PathBuf {
         let joined = self.path_base.join(written);
+        // A `..` or a start at the root of the file system leaves the folder the path is written in.
+        if Path::new(written).components().any(|step| {
+            matches!(
+                step,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            self.error.get_or_insert(format!(
+                "{}: the scan does not read a path through a link, with .. or from the root of the file system (it is {written})",
+                self.at
+            ));
+            return joined;
+        }
         let mut walked = self.path_base.clone();
         for step in Path::new(written).components() {
             walked.push(step);
-            if matches!(step, std::path::Component::ParentDir) {
-                continue;
-            }
             match std::fs::symlink_metadata(&walked) {
                 Ok(found) if found.file_type().is_symlink() => {
                     self.error = Some(format!(
-                        "{}: the scan does not read a path through a link or outside the checkout ({} is a link)",
+                        "{}: the scan does not read a path through a link, with .. or from the root of the file system ({} is a link)",
                         self.at,
                         walked.display()
                     ));

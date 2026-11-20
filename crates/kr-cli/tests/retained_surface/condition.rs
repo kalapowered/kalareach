@@ -6,7 +6,7 @@
 //! `not(not(test))` are skipped, and `any(test, feature = "testing")`, `not(test)` and `windows` are
 //! read. An unknown predicate reads as product code: the rule adds a sighting where a configuration
 //! may not build it, and never drops one. A predicate that does not parse, and a `cfg_attr` that
-//! would add a `cfg` or a `path`, is an error and is never skipped.
+//! would add a `path`, is an error and is never skipped.
 
 use quote::ToTokens as _;
 use syn::parse::ParseStream;
@@ -36,9 +36,9 @@ pub fn enabled(attrs: &[Attribute], at: &str) -> Result<bool, String> {
             let listed = attribute
                 .parse_args_with(parse_metas)
                 .map_err(|_| unreadable(at, &attribute.to_token_stream().to_string()))?;
-            if sets.is_none() && sets_path_or_condition(&listed) {
+            if sets.is_none() && sets_path(&listed) {
                 sets = Some(format!(
-                    "{at}: the scan does not read a cfg_attr that sets a path or a condition ({})",
+                    "{at}: the scan does not read a cfg_attr that sets a path ({})",
                     attribute.to_token_stream()
                 ));
             }
@@ -104,16 +104,14 @@ fn added_by(
     Ok(found)
 }
 
-/// Whether the attributes a `cfg_attr` adds (after its predicate) set a path or a condition,
-/// looking into a `cfg_attr` it holds.
-fn sets_path_or_condition(listed: &Punctuated<Meta, Token![,]>) -> bool {
+/// Whether the attributes a `cfg_attr` adds (after its predicate) set a path, looking into a
+/// `cfg_attr` it holds.
+fn sets_path(listed: &Punctuated<Meta, Token![,]>) -> bool {
     listed.iter().skip(1).any(|meta| match meta {
         Meta::List(list) if list.path.is_ident("cfg_attr") => list
             .parse_args_with(parse_metas)
-            .map_or(true, |inner| sets_path_or_condition(&inner)),
-        _ => ["cfg", "path"]
-            .iter()
-            .any(|name| meta.path().is_ident(name)),
+            .map_or(true, |inner| sets_path(&inner)),
+        _ => meta.path().is_ident("path"),
     })
 }
 

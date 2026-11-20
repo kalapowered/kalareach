@@ -628,7 +628,7 @@ const MODULE_LIB: &str = r##"
 #[cfg(test)]
 #[path = "wide/send.rs"]
 mod test_support;
-#[path = "wide/../wide/send.rs"]
+#[path = "wide/send.rs"]
 mod sender;
 #[cfg(test)]
 #[path = "dots/../only_tests.rs"]
@@ -670,7 +670,7 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
     let folder = small_tree(MODULE_LIB);
     let sends = |name: &str, method: &str| format!("fn {name}() {{ let _ = Method::{method}; }}\n");
     for (path, text) in [
-        // Reached by a test declaration with the plain path and by a product one with dots.
+        // Reached by a test declaration and by a product one.
         ("wide/send.rs", sends("from_wide", "AgentTurnCancel")),
         // Reached by a test declaration whose path has dots: nothing else reaches it.
         ("only_tests.rs", sends("from_only_tests", "AgentTurnCancel")),
