@@ -489,8 +489,15 @@ export class DraftBook {
   readonly #byLocal = new Map<string, string>()
   /** Prompts that ended as of unknown outcome, until the host says what became of them. */
   readonly #unknowns = new Map<string, Flight>()
-  /** Prompts being handed over to the channel store, by the submission's local identity, with the first final state said meanwhile. */
-  readonly #handovers = new Map<string, { readonly flight: Flight; late: InputState | null }>()
+  /**
+   * Prompts being handed over to the channel store, by the submission's local identity, with the
+   * first final state said meanwhile and the number of sends made when it was said: a failed keep
+   * applies that receipt to the sends of that moment, never to one made after it.
+   */
+  readonly #handovers = new Map<
+    string,
+    { readonly flight: Flight; late: { readonly state: InputState; readonly upTo: number } | null }
+  >()
   /** Submissions whose text this device kept apart, whole, in its store of channel messages. */
   readonly #kept = new Set<string>()
   /** Work that waits for the store to have been read. */
@@ -861,7 +868,7 @@ export class DraftBook {
     if (this.#kept.has(localId)) return
     const handover = this.#handovers.get(localId)
     if (handover !== undefined) {
-      if (outcome !== 'unknown' && handover.late === null) handover.late = state
+      if (outcome !== 'unknown' && handover.late === null) handover.late = { state, upTo: this.#sends }
       return
     }
     const key = this.#byLocal.get(localId)
@@ -1316,8 +1323,21 @@ export class DraftBook {
       this.#byLocal.set(localId, flight.id)
     }
     flight.endedAs = 'unknown'
-    await this.#end(flight, 'unknown', localId)
-    if (late !== null && localId !== undefined) this.sendSettled(localId, late)
+    // The end is told after the receipt that came meanwhile is applied, in this same turn: nothing
+    // another send does in between sees a prompt that is ended and not yet settled.
+    const told = flight.onEnded
+    flight.onEnded = undefined
+    try {
+      await this.#end(flight, 'unknown', localId)
+      const outcome = late === null ? null : sendOutcomeOf(late.state)
+      if (late !== null && localId !== undefined && (outcome === 'taken' || outcome === 'refused')) {
+        this.#byLocal.delete(localId)
+        this.#unknowns.delete(flight.id)
+        if (outcome === 'taken') await this.#takenLate(flight, late.upTo)
+      }
+    } finally {
+      told?.(this.#holding(flight))
+    }
   }
 
   /**

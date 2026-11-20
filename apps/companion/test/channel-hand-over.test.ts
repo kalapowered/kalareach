@@ -245,6 +245,36 @@ describe('a message handed over to the channel store', () => {
     }
   })
 
+  it('applies a receipt that came during a failed keep to the sends of that moment, and to none made after it', async () => {
+    const of = world()
+    of.messages.refuseKeeps({ code: 'RESOURCE_UNAVAILABLE', message: 'refused' })
+    const { book, token } = await pressed(of)
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const inner = keeping(of)
+    const told: (string | null)[] = []
+    book.endSend(token, 'handed_over', LOCAL, (id) => told.push(id), async (held) => {
+      await gate
+      return inner(held)
+    })
+    // The host says it took the first message, and the person sends the same words again before the keep answers.
+    book.sendSettled(LOCAL, 'applied')
+    type(book, MAIN, 'the message')
+    const later = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    release()
+    await book.settled()
+    await later.claimed
+    // The first prompt's end is told once, after its receipt was applied; the later send is not done by it.
+    expect(told).toEqual([null])
+    book.endSend(later, 'refused', 'local-later')
+    await book.settled()
+    expect(book.draft(MAIN).text).toBe('the message')
+    expect(of.drafts.all().map((draft) => draft.text)).toEqual(['the message'])
+  })
+
   it('still keeps a message whose words another prompt of the composer was applied for', async () => {
     const of = world()
     const book = await opened(of)
