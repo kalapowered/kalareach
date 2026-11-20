@@ -44,6 +44,26 @@ fn a_place_is_read_when_some_configuration_without_test_enables_every_condition_
             "#[cfg(any(all(unix, not(target_os = \"macos\")), test))]",
             true,
         ),
+        // Each platform is one the rule tries, and each has its own atoms.
+        ("#[cfg(target_os = \"macos\")]", true),
+        ("#[cfg(target_os = \"linux\")]", true),
+        ("#[cfg(target_os = \"windows\")]", true),
+        ("#[cfg(target_os = \"ios\")]", true),
+        ("#[cfg(target_os = \"android\")]", true),
+        (
+            "#[cfg(all(windows, target_family = \"windows\", target_vendor = \"pc\"))]",
+            true,
+        ),
+        (
+            "#[cfg(all(unix, target_vendor = \"unknown\", not(target_os = \"linux\")))]",
+            true,
+        ),
+        ("#[cfg(all(unix, mobile, target_vendor = \"apple\"))]", true),
+        (
+            "#[cfg(all(unix, desktop, target_vendor = \"apple\"))]",
+            true,
+        ),
+        ("#[cfg(target_os = \"freebsd\")]", false),
         // One atom has one value in a configuration.
         ("#[cfg(all(feature = \"a\", not(feature = \"a\")))]", false),
         ("#[cfg(all(feature = \"a\", feature = \"b\"))]", true),
@@ -153,30 +173,20 @@ fn sender_names(tree: &Tree) -> Result<Vec<String>, String> {
         .map(|sightings| sightings.into_iter().map(|found| found.name).collect())
 }
 
-/// The error the scan of `kr_sender` gives for a tree made of `lib` and `files`, and the error the
-/// index of the same crate gives for a lookup.
-fn refused(lib: &str, files: &[(&str, &str)]) -> (String, String) {
+/// What the scan of `kr_sender` gives for a tree made of `lib` and `files`, and what a lookup in the
+/// same crate gives: the cases hold both to an error where the tree is refused.
+fn scanned(lib: &str, files: &[(&str, &str)]) -> (Result<Vec<String>, String>, Lookup) {
     let folder = small_tree(lib);
     for (path, text) in files {
         write(folder.path(), &format!("crates/kr-sender/{path}"), text);
     }
     let tree = Tree::at(folder.path()).expect("the tree");
-    let scan = tree
-        .sightings(&|krate| krate == "kr_sender")
-        .expect_err("a refusal");
-    let Lookup::Failed(lookup) = tree.item("kr_sender", "anything") else {
-        panic!("a lookup that failed");
-    };
-    (scan, lookup)
+    (sender_names(&tree), tree.item("kr_sender", "anything"))
 }
 
-/// The names the scan finds in a tree made of `lib` and `files`, where it has no error.
-fn read_names(lib: &str, files: &[(&str, &str)]) -> Vec<String> {
-    let folder = small_tree(lib);
-    for (path, text) in files {
-        write(folder.path(), &format!("crates/kr-sender/{path}"), text);
-    }
-    sender_names(&Tree::at(folder.path()).expect("the tree")).expect("a scan")
+/// What the scan finds in a tree made of `lib` and `files`.
+fn read_names(lib: &str, files: &[(&str, &str)]) -> Result<Vec<String>, String> {
+    scanned(lib, files).0
 }
 
 const SENDS: &str = "pub fn sends() { let _ = Method::AgentTurnCancel; }\n";
@@ -231,9 +241,9 @@ fn a_declared_file_that_does_not_parse_is_an_error_where_an_undeclared_one_is_no
 fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
     let at = "crates/kr-sender/src/lib.rs";
     let refuse = |lib: &str, files: &[(&str, &str)], text: String| {
-        let (scan, lookup) = refused(lib, files);
-        assert_eq!(scan, text, "{lib}");
-        assert_eq!(lookup, text, "{lib}");
+        let (scan, lookup) = scanned(lib, files);
+        assert_eq!(scan, Err(text.clone()), "{lib}");
+        assert_eq!(lookup, Lookup::Failed(text), "{lib}");
     };
     refuse(
         "pub fn f() { #[path = \"x.rs\"] mod inner; }\n",
@@ -330,12 +340,12 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         "use kr_protocol::Method::{self as M};",
         "fn f() { use kr_protocol::Method::*; }",
     ] {
-        let (scan, _) = refused(&format!("{import}\n"), &[]);
+        let (scan, _) = scanned(&format!("{import}\n"), &[]);
         assert_eq!(
             scan,
-            format!(
+            Err(format!(
                 "{at}: a use of Method::* or of Method under another name; the scan reads Method::<Variant> only"
-            ),
+            )),
             "{import}"
         );
     }
@@ -346,7 +356,7 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
             "[package]\nname = \"kr-sender\"\nversion = \"0.0.0\"\n"
         )
     };
-    let (scan, _) = refused(
+    let (scan, _) = scanned(
         "pub fn quiet() {}\n",
         &[(
             "Cargo.toml",
@@ -355,7 +365,7 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
     );
     assert_eq!(
         scan,
-        "crates/kr-sender/Cargo.toml: the target path build/x.rs is not src/lib.rs, src/main.rs, src/bin/*.rs or src/bin/*/main.rs"
+        Err("crates/kr-sender/Cargo.toml: the target path build/x.rs is not src/lib.rs, src/main.rs, src/bin/*.rs or src/bin/*/main.rs".to_owned())
     );
     let folder = small_tree("pub fn quiet() {}\n");
     std::fs::remove_file(folder.path().join("crates/kr-sender/src/lib.rs")).expect("a file");
@@ -364,6 +374,29 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
     assert_eq!(
         sender_names(&tree),
         Err("kr_sender: no crate root under src".to_owned())
+    );
+}
+
+#[test]
+fn an_inner_condition_of_a_file_decides_whether_the_file_is_read() {
+    let files = [
+        (
+            "src/windows_only.rs",
+            "#![cfg(windows)]\nfn from_windows() { let _ = Method::AgentTurnCancel; }\n",
+        ),
+        (
+            "src/tested.rs",
+            "#![cfg(test)]\nfn from_tested() { let _ = Method::AgentTurnSteer; }\ninclude!(\"x.rs\");\n",
+        ),
+        // The condition of the file holds for each item in it: no configuration is both.
+        (
+            "src/mixed.rs",
+            "#![cfg(unix)]\n#[cfg(windows)]\nfn from_both() { let _ = Method::AgentPromptQueue; }\nfn from_unix() { let _ = Method::AgentTurnCancel; }\n",
+        ),
+    ];
+    assert_eq!(
+        read_names("mod windows_only;\nmod tested;\nmod mixed;\n", &files),
+        Ok(vec!["from_unix".to_owned(), "from_windows".to_owned()])
     );
 }
 
@@ -378,12 +411,23 @@ fn a_form_that_no_configuration_without_test_builds_is_not_refused() {
         #[cfg(test)]\nmod t { macro_rules! make { ($n:ident) => { mod $n; }; } use kr_protocol::Method::*; }\n\
         #[cfg(test)]\nthing! { pub struct S; }\n\
         #[cfg(all(test, unix))]\nmacro_rules! m { () => {}; }\n\
-        macro_rules! m { () => {}; }\n";
-    assert_eq!(read_names(lib, &[]), Vec::<String>::new());
+        macro_rules! m { () => {}; }\n\
+        pub struct S;\n\
+        impl S {\n\
+            #[cfg(test)]\nfn g() { include!(\"x.rs\"); }\n\
+            #[cfg(test)]\nconst C: u8 = { include!(\"x.rs\") };\n\
+            #[cfg(test)]\nunlisted_in_impl!();\n\
+        }\n\
+        pub trait T {\n\
+            #[cfg(test)]\nfn h() { include!(\"x.rs\"); }\n\
+            #[cfg(test)]\nconst D: u8 = { include!(\"x.rs\") };\n\
+            #[cfg(test)]\nunlisted_in_trait!();\n\
+        }\n";
+    assert_eq!(read_names(lib, &[]), Ok(Vec::<String>::new()));
     // A module with a body in a function is no declaration of a file, and a macro defined in the
     // crate may be called at item position.
     let lib = "pub fn f() { mod inner { pub fn g() {} } }\nmacro_rules! make { () => { pub fn made() { let _ = Method::AgentTurnCancel; } }; }\nmake!();\n";
-    assert_eq!(read_names(lib, &[]), vec!["macro:make".to_owned()]);
+    assert_eq!(read_names(lib, &[]), Ok(vec!["macro:make".to_owned()]));
 }
 
 #[test]
@@ -505,16 +549,16 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
         // By its own name and by a path to it, as the source writes them.
         let lib =
             format!("{name}! {{ static X: u8 = 0; }}\ntokio::{name}! {{ static Y: u8 = 0; }}\n");
-        assert_eq!(read_names(&lib, &[]), Vec::<String>::new(), "{name}");
+        assert_eq!(read_names(&lib, &[]), Ok(Vec::<String>::new()), "{name}");
     }
 }
 
 #[test]
 fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
-    let (scan, lookup) = refused("tokio::unlisted! { static X: u8 = 0; }\n", &[]);
+    let (scan, lookup) = scanned("tokio::unlisted! { static X: u8 = 0; }\n", &[]);
     let text = "crates/kr-sender/src/lib.rs: unlisted! is called at item position, is not defined in kr_sender and is not one the scan accepts".to_owned();
-    assert_eq!(scan, text);
-    assert_eq!(lookup, text);
+    assert_eq!(scan, Err(text.clone()));
+    assert_eq!(lookup, Lookup::Failed(text));
 }
 
 #[test]
@@ -522,16 +566,16 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
     let at = "kr_sender";
     // A macro that is expanded and calls a macro through a metavariable.
     let lib = "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\nfn uses() { meta!(Method::AgentTurnCancel); }\n";
-    let (scan, _) = refused(lib, &[]);
+    let (scan, _) = scanned(lib, &[]);
     assert_eq!(
         scan,
-        format!(
+        Err(format!(
             "{at}: the macro meta calls a macro through a metavariable, which the scan cannot follow"
-        )
+        ))
     );
     // The same macro that nothing calls with a sighting is not followed, so nothing is refused.
     let lib = "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\nfn uses() { meta!(x); }\n";
-    assert_eq!(read_names(lib, &[]), vec!["macro:meta".to_owned()]);
+    assert_eq!(read_names(lib, &[]), Ok(vec!["macro:meta".to_owned()]));
     // A call with a sighting to a macro another crate of the scan exports.
     let folder = small_tree("fn f() { shared!(Method::AgentTurnCancel); }\n");
     write(
@@ -576,16 +620,16 @@ fn two_private_definitions_of_one_macro_in_different_files_are_merged_by_name() 
     let tree = Tree::at(folder.path()).expect("the tree");
     let found = tree
         .sightings(&|krate| krate == "kr_sender")
-        .expect("a scan");
+        .map(|found| super::walker_cases::names(&found, "kr_sender"));
     // What either `m` calls is expanded when the call of `m` holds a sighting: the calls of the
     // two definitions are taken under their one name.
     assert_eq!(
-        super::walker_cases::names(&found, "kr_sender"),
-        BTreeMap::from([
+        found,
+        Ok(BTreeMap::from([
             ("macro:callee_a".to_owned(), vec![SightKind::Expands]),
             ("macro:callee_b".to_owned(), vec![SightKind::Expands]),
             ("macro:m".to_owned(), vec![SightKind::Expands]),
             ("user".to_owned(), vec![SightKind::Names]),
-        ])
+        ]))
     );
 }
