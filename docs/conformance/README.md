@@ -395,9 +395,7 @@ A Rust test that no step ran is not run, and its reason is the first of these th
   plan's text for benchmarks, then `, and` and that sentence, and the reason of a group that runs
   nothing on the platform follows the sentence after a `;`.
 
-The last two sentences replace the platform's general `[unrun.rust]` line, which the loader still
-requires and the report no longer reads. A step in a directory is named `cd <directory> && <command>`
-in these reasons.
+A step in a directory is named `cd <directory> && <command>` in these reasons.
 
 A target that a step built or ran and that no step of the selection covers is a problem of the
 result: `step <number> built or ran <target>, but no step of this selection covers it: the selection

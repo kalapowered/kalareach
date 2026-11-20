@@ -27,10 +27,6 @@ held = false
 [unrun]
 bench = 'b'
 typescript = 't'
-[unrun.rust]
-linux = 'l'
-macos = 'm'
-windows = 'w'
 ";
 
 const STEP: &str = "[[step]]
@@ -63,13 +59,13 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
         ),
         (
             "an unknown key among the unrun reasons",
-            with("").replacen("[unrun.rust]", "bogus = 'x'\n[unrun.rust]", 1),
+            with("bogus = 'x'\n"),
             "unknown field `bogus`",
         ),
         (
-            "an unknown key among the unrun reasons of Rust",
-            with("bogus = 'x'\n"),
-            "unknown field `bogus`",
+            "the table of Rust reasons that the plan no longer reads",
+            with("[unrun.rust]\nlinux = 'l'\n"),
+            "unknown field `rust`",
         ),
         (
             "an unknown key in an excluded package",
@@ -141,21 +137,6 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
                 "reading = 'cargo'\nskips_from = 'applications'",
             ),
             "step `one` skips from the applications and the plan has no `[applications]`",
-        ),
-        (
-            "an unrun reason of Rust that says nothing",
-            with("").replace("linux = 'l'", "linux = ''"),
-            "`[unrun]` has no `rust.linux` reason",
-        ),
-        (
-            "an unrun reason of Rust on macOS that says nothing",
-            with("").replace("macos = 'm'", "macos = ''"),
-            "`[unrun]` has no `rust.macos` reason",
-        ),
-        (
-            "an unrun reason of Rust on Windows that is blank",
-            with("").replace("windows = 'w'", "windows = ' '"),
-            "`[unrun]` has no `rust.windows` reason",
         ),
         (
             "an unrun reason of the benchmarks that is blank",
@@ -384,11 +365,6 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "an `[ignored_runs]` table with no `held`",
             with("").replace("held = false\n", ""),
             "missing field `held`",
-        ),
-        (
-            "an unrun reason that lacks a platform",
-            with("").replace("windows = 'w'\n", ""),
-            "missing field `windows`",
         ),
         (
             "a manifest named twice",
@@ -2143,10 +2119,6 @@ held = false
 [unrun]
 bench = 'b'
 typescript = 't'
-[unrun.rust]
-linux = 'l'
-macos = 'm'
-windows = 'w'
 [[step]]
 id = 'unit-tests'
 group = 'unit'
