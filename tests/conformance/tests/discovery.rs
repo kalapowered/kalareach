@@ -127,6 +127,36 @@ fn program(arguments: &[&str]) -> (Option<i32>, String, String) {
     )
 }
 
+/// Like [`program`], run in `directory`.
+fn program_in(directory: &Path, arguments: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_kr-conformance"))
+        .args(arguments)
+        .current_dir(directory)
+        .output()
+        .expect("the program runs");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Plants a compiler in `directory` of the copy at `root`: a package that re-exports the installed
+/// one, with `version` as its own when that is given.
+fn plant_compiler(root: &Path, directory: &str, version: Option<&str>) {
+    let package = root.join(directory).join("node_modules").join("typescript");
+    std::fs::create_dir_all(&package).expect("a package directory");
+    std::fs::write(root.join(directory).join("package.json"), "{}").expect("a manifest");
+    let installed = compiler().join("node_modules").join("typescript");
+    let entry = match version {
+        None => format!("module.exports = require({installed:?})\n"),
+        Some(version) => format!(
+            "module.exports = Object.assign(Object.create(require({installed:?})), {{ version: {version:?} }})\n"
+        ),
+    };
+    std::fs::write(package.join("index.js"), entry).expect("an entry");
+}
+
 fn sources(map: &Map, row: &str) -> Vec<String> {
     map.keys
         .get(&identifier(row))
@@ -399,6 +429,52 @@ fn the_directories_the_plan_names_for_scripts_and_lanes_are_the_ones_read() {
     );
 }
 
+/// A plan with no `[typescript]` table reads the scripts and the lane files it names: a repository
+/// with Kotlin, Swift or Java lanes and no TypeScript still says where they are.
+#[test]
+fn a_plan_with_no_typescript_table_reads_the_scripts_and_lanes_it_names() {
+    let (_directory, root) = copy("ignored-tests");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("typescript-only");
+    for (directory, file) in [("scripts", "note.sh"), ("mobile", "Screen.kt")] {
+        std::fs::create_dir_all(root.join(directory)).expect("a directory");
+        std::fs::copy(
+            fixture.join(directory).join(file),
+            root.join(directory).join(file),
+        )
+        .expect("a file");
+    }
+    git(&root, &["add", "-A"]);
+    let named = plan_text(&root).replacen(
+        "groups = ['rust']\n",
+        "groups = ['rust']\nscripts = ['scripts']\nlane_directories = ['mobile']\n",
+        1,
+    );
+    assert!(!named.contains("[typescript]"), "{named}");
+    let references = |text: &str| -> Map {
+        map_of(
+            &root,
+            Plan::parse(text, &root).expect("a planted plan"),
+            None,
+            false,
+        )
+    };
+    let map = references(&named);
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    assert!(map.references.contains_key(&identifier("KR-REQ-05.03")));
+    assert!(map.references.contains_key(&identifier("KR-REQ-05.04")));
+    std::fs::write(root.join("conformance").join("plan.toml"), &named).expect("the plan");
+    let (code, stdout, stderr) = program(&["map", "--root", &root.to_string_lossy()]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    let map = references(
+        &plan_text(&root).replace("scripts = ['scripts']\nlane_directories = ['mobile']\n", ""),
+    );
+    assert!(!map.references.contains_key(&identifier("KR-REQ-05.03")));
+    assert!(!map.references.contains_key(&identifier("KR-REQ-05.04")));
+}
+
 /// No source of the TypeScript reading names the directory this crate was built in: the compiler
 /// comes from the tree that is read, or from the directory the command line gives.
 #[test]
@@ -440,6 +516,37 @@ fn a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names() {
         program(&["map", "--root", &root.to_string_lossy(), "--typescript"]);
     assert_eq!(code, Some(2), "{stdout}{stderr}");
     assert!(stdout.contains("pnpm install"), "{stdout}");
+}
+
+/// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: the root may
+/// be given as a relative path, and the compiler the plan names in the tree is still found.
+#[test]
+#[ignore = "reads TypeScript with the packages' own compiler, which `pnpm install --frozen-lockfile` installs; the report's typescript group runs it"]
+fn a_relative_root_finds_the_compiler_the_plan_names() {
+    let (_directory, root) = copy("typescript-only");
+    plant_compiler(&root, "vendor", None);
+    git(&root, &["add", "-A"]);
+    let named = plan_text(&root).replace("compiler_from = []", "compiler_from = ['vendor']");
+    std::fs::write(root.join("conformance").join("plan.toml"), named).expect("the plan");
+    let name = root
+        .file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned();
+    for (from, argument) in [
+        (root.clone(), ".".to_owned()),
+        (root.clone(), "./".to_owned()),
+        (root.parent().expect("a parent").to_path_buf(), name.clone()),
+        (root.join("web"), "..".to_owned()),
+    ] {
+        let (code, stdout, stderr) =
+            program_in(&from, &["map", "--root", &argument, "--typescript"]);
+        assert_eq!(code, Some(0), "--root {argument}: {stdout}{stderr}");
+        assert!(
+            stdout.contains("identifiers keyed to") && stdout.contains("; 0 refused; 0 problems"),
+            "--root {argument}: {stdout}"
+        );
+    }
 }
 
 /// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: a call is a
@@ -523,17 +630,7 @@ fn every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edite
     assert!(!map.keys.contains_key(&identifier("KR-REQ-05.01")));
     // The compiler the tree names, found in the tree: a package of the copy that re-exports the
     // installed one.
-    let package = root.join("vendor").join("node_modules").join("typescript");
-    std::fs::create_dir_all(&package).expect("a package directory");
-    std::fs::write(root.join("vendor").join("package.json"), "{}").expect("a manifest");
-    std::fs::write(
-        package.join("index.js"),
-        format!(
-            "module.exports = require({:?})\n",
-            compiler().join("node_modules").join("typescript")
-        ),
-    )
-    .expect("an entry");
+    plant_compiler(&root, "vendor", None);
     git(&root, &["add", "-A"]);
     let named = base.replace("compiler_from = []", "compiler_from = ['vendor']");
     let map = mapped(&named, None);

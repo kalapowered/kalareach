@@ -6,6 +6,9 @@ repository = 'kalareach'
 groups = ['rust', 'end-to-end', 'performance', 'typescript', 'applications', 'phones']
 list_table_rows = true
 
+scripts = ['scripts']
+lane_directories = ['apps', 'packages']
+
 [rust]
 manifests = ['Cargo.toml']
 
@@ -30,8 +33,6 @@ skip_directories = [
     'playwright-report',
     '.vite',
 ]
-scripts = ['scripts']
-lane_directories = ['apps', 'packages']
 
 [applications]
 lock = 'tests/conformance/applications.lock'

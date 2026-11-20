@@ -62,7 +62,7 @@ pub struct PackageVersion {
     pub version: String,
 }
 
-/// The terminal profile the host presents, as its committed fixture states it.
+/// The terminal profile the host presents, as the file the plan names states it.
 #[derive(Clone, Debug, Serialize)]
 pub struct TerminalProfile {
     /// The profile's name and revision.

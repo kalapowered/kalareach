@@ -298,7 +298,7 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
                 "command = ['cargo', 'test']",
                 "command = ['bash', 'scripts/*.sh']",
             ),
-            "step `one` runs the script `scripts/*.sh`, which does not exist",
+            "step `one` runs the script `scripts/*.sh`, which holds a pattern character",
         ),
         (
             "a script spelled other than the index holds it",
@@ -418,6 +418,26 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "missing field `windows`",
         ),
         (
+            "a manifest named twice",
+            with("").replace("manifests = []", "manifests = ['Cargo.toml', 'Cargo.toml']"),
+            "`[rust] manifests` names `Cargo.toml` twice",
+        ),
+        (
+            "a directory left out that is a path",
+            with("[typescript]\npackages = []\nskip_directories = ['web/generated']\n"),
+            "`[typescript] skip_directories` names `web/generated`, which is not the name of one directory",
+        ),
+        (
+            "a directory left out that is a path with backslashes",
+            with("[typescript]\npackages = []\nskip_directories = ['web\\generated']\n"),
+            "`[typescript] skip_directories` names `web\\generated`, which is not the name of one directory",
+        ),
+        (
+            "a directory left out that has no name",
+            with("[typescript]\npackages = []\nskip_directories = ['']\n"),
+            "`[typescript] skip_directories` names ``, which is not the name of one directory",
+        ),
+        (
             "TypeScript packages that are not a directory",
             with("[typescript]\npackages = ['packages/no-such-package']\n"),
             "`[typescript] packages` names `packages/no-such-package`, which is not a directory of the repository",
@@ -440,6 +460,145 @@ fn a_plan_file_is_refused_for_each_fault_by_its_reason() {
             Err(refusal) => wrong.push(format!(
                 "{name}: refused as `{refusal}`, which lacks `{reason}`"
             )),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A plan that names `operand` under `key`, with a step so that its group is used.
+fn naming(key: &str, operand: &str) -> String {
+    let top = |line: &str| {
+        HEAD.replacen(
+            "groups = ['rust']\n",
+            &format!("groups = ['rust']\n{line}\n"),
+            1,
+        )
+    };
+    let text = match key {
+        "scripts" | "lane_directories" => top(&format!("{key} = ['{operand}']")),
+        "[rust] manifests" => HEAD.replace("manifests = []", &format!("manifests = ['{operand}']")),
+        "[terminal_profile] path" => with(&format!("[terminal_profile]\npath = '{operand}'\n")),
+        "[typescript] packages" => with(&format!("[typescript]\npackages = ['{operand}']\n")),
+        "[typescript] compiler_from" => with(&format!(
+            "[typescript]\npackages = []\ncompiler_from = ['{operand}']\n"
+        )),
+        _ => unreachable!("{key}"),
+    };
+    format!("{text}{STEP}")
+}
+
+/// A repository of its own that holds `dir/file.txt` and `dir/sub`, and, where a link can be made,
+/// `dirlink` (to a directory elsewhere), `insidelink` (to `dir`) and `filelink` (to `dir/file.txt`);
+/// and, elsewhere, `sub` and `file.txt`.
+fn tree_with_links() -> (tempfile::TempDir, tempfile::TempDir) {
+    let repository = tempfile::tempdir().expect("a directory");
+    let elsewhere = tempfile::tempdir().expect("a directory");
+    std::fs::create_dir_all(repository.path().join("dir").join("sub")).expect("a directory");
+    std::fs::write(repository.path().join("dir").join("file.txt"), "").expect("a file");
+    std::fs::create_dir_all(elsewhere.path().join("sub")).expect("a directory");
+    std::fs::write(elsewhere.path().join("file.txt"), "").expect("a file");
+    #[cfg(unix)]
+    {
+        let link = |target: &Path, name: &str| {
+            std::os::unix::fs::symlink(target, repository.path().join(name)).expect("a link");
+        };
+        link(elsewhere.path(), "dirlink");
+        link(Path::new("dir"), "insidelink");
+        link(Path::new("dir/file.txt"), "filelink");
+    }
+    (repository, elsewhere)
+}
+
+/// Each key of the plan that names a path of the repository is refused with its own reason for each
+/// way a path goes wrong: it is absent, it is the other kind of place, it is absolute, it holds
+/// `..` or a pattern character, it is a link, or a link on its way leads out of the repository. A
+/// path that a link inside the repository reaches inside it is accepted.
+#[test]
+fn a_key_that_names_a_path_is_refused_with_its_reason_for_each_way_a_path_goes_wrong() {
+    let (repository, _elsewhere) = tree_with_links();
+    let root = repository.path();
+    let directory_keys = [
+        "scripts",
+        "lane_directories",
+        "[typescript] packages",
+        "[typescript] compiler_from",
+    ];
+    let file_keys = ["[rust] manifests", "[terminal_profile] path"];
+    let mut wrong = Vec::new();
+    let mut check = |key: &str, operand: &str, why: Option<&str>| {
+        let outcome = Plan::parse(&naming(key, operand), root);
+        let key_name = key.rsplit_once(' ').map_or(key, |(_, name)| name);
+        match (why, outcome) {
+            (None, Ok(_)) => {}
+            (None, Err(refusal)) => {
+                wrong.push(format!("{key} `{operand}`: refused as `{refusal}`"));
+            }
+            (Some(why), Ok(_)) => {
+                wrong.push(format!("{key} `{operand}`: nothing refused, wanted {why}"));
+            }
+            (Some(why), Err(refusal)) => {
+                let wanted = format!("names `{operand}`, which {why}");
+                if !(refusal.0.contains(&wanted) && refusal.0.contains(key_name)) {
+                    wrong.push(format!(
+                        "{key} `{operand}`: refused as `{refusal}`, wanted {why}"
+                    ));
+                }
+            }
+        }
+    };
+    // The ways a path goes wrong in the text, and the two that depend on what the key names: a
+    // path that is absent, and a path that is the other kind of place.
+    let ways = |absent: (&str, &'static str), other_kind: (&str, &'static str)| {
+        vec![
+            (absent.0.to_owned(), absent.1),
+            (other_kind.0.to_owned(), other_kind.1),
+            ("/dir".to_owned(), "is not a relative path"),
+            ("dir\\x".to_owned(), "is not a relative path"),
+            ("dir/../dir".to_owned(), "holds `..`"),
+            ("d*r".to_owned(), "holds a pattern character"),
+            ("d?r".to_owned(), "holds a pattern character"),
+            ("[dir".to_owned(), "holds a pattern character"),
+            ("dir]".to_owned(), "holds a pattern character"),
+        ]
+    };
+    for key in directory_keys {
+        check(key, "dir", None);
+        let not_a_directory = "is not a directory of the repository";
+        for (operand, why) in ways(
+            ("missing", not_a_directory),
+            ("dir/file.txt", not_a_directory),
+        ) {
+            check(key, &operand, Some(why));
+        }
+        #[cfg(unix)]
+        {
+            check(key, "dirlink", Some("is a link"));
+            check(key, "insidelink", Some("is a link"));
+            check(
+                key,
+                "dirlink/sub",
+                Some("leads out of the repository through a link"),
+            );
+            check(key, "insidelink/sub", None);
+        }
+    }
+    for key in file_keys {
+        check(key, "dir/file.txt", None);
+        for (operand, why) in ways(
+            ("dir/missing.txt", "does not exist"),
+            ("dir", "is not a regular file"),
+        ) {
+            check(key, &operand, Some(why));
+        }
+        #[cfg(unix)]
+        {
+            check(key, "filelink", Some("is a link"));
+            check(
+                key,
+                "dirlink/file.txt",
+                Some("leads out of the repository through a link"),
+            );
+            check(key, "insidelink/file.txt", None);
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -515,8 +674,10 @@ fn a_script_must_be_a_regular_file_that_the_index_holds_under_that_name() {
         ("untracked.sh", "is not a tracked file of the repository"),
         ("gone.sh", "does not exist"),
     ];
+    // The file named `*.sh` exists where a name may hold `*`; the pattern is refused before any
+    // file is looked for, so the refusal is the same where it does not.
+    refusals.push(("*.sh", "holds a pattern character"));
     if cfg!(unix) {
-        refusals.push(("*.sh", "is not a tracked file of the repository"));
         refusals.push(("link.sh", "is a link"));
     }
     let command = |operand: &str| {
