@@ -144,6 +144,16 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "`[unrun]` has no `rust.linux` reason",
         ),
         (
+            "an unrun reason of Rust on macOS that says nothing",
+            with("").replace("macos = 'm'", "macos = ''"),
+            "`[unrun]` has no `rust.macos` reason",
+        ),
+        (
+            "an unrun reason of Rust on Windows that is blank",
+            with("").replace("windows = 'w'", "windows = ' '"),
+            "`[unrun]` has no `rust.windows` reason",
+        ),
+        (
             "an unrun reason of the benchmarks that is blank",
             with("").replace("bench = 'b'", "bench = '  '"),
             "`[unrun]` has no `bench` reason",
@@ -193,6 +203,13 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "an ignored run by hand that says not why",
             with(
                 "[[ignored_run]]\npackage = 'p'\ntarget = '--lib'\n[ignored_run.runs]\nkind = 'by_hand'\nwhy = ''\n",
+            ),
+            "the `[[ignored_run]]` of `p` `--lib` has no `why`",
+        ),
+        (
+            "an ignored run of nothing that says not why",
+            with(
+                "[[ignored_run]]\npackage = 'p'\ntarget = '--lib'\n[ignored_run.runs]\nkind = 'nowhere'\nwhy = ''\n",
             ),
             "the `[[ignored_run]]` of `p` `--lib` has no `why`",
         ),
@@ -293,7 +310,15 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
                 "command = ['cargo', 'test']",
                 "command = ['cargo', 'test', '--', '--show-output']",
             ),
-            "step `one` holds `--show-output`, which the loader adds",
+            "step `one` holds `--show-output`, which the loader adds and a plan file does not write",
+        ),
+        (
+            "a command that shows its output as it is written and holds the word the loader adds",
+            step_with(
+                "command = ['cargo', 'test']",
+                "command = ['cargo', 'test', '--', '--nocapture', '--show-output']",
+            ),
+            "step `one` holds `--show-output`, which the loader adds and a plan file does not write",
         ),
         (
             "a placeholder outside the plan's",
@@ -433,15 +458,20 @@ fn git(root: &Path, arguments: &[&str]) {
 
 /// A repository of its own whose index holds `tracked.sh` and `gone.sh`, with `gone.sh` removed
 /// from the tree, `untracked.sh` beside them and, where a name may hold `*`, a file named `*.sh`
-/// that the index does not hold.
+/// that the index does not hold and, where a link can be made, `link.sh`, a link that the index
+/// holds.
 fn planted_repository() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("a directory");
     let root = directory.path();
     for name in ["tracked.sh", "gone.sh", "untracked.sh"] {
         std::fs::write(root.join(name), "").expect("a file");
     }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("tracked.sh", root.join("link.sh")).expect("a link");
     git(root, &["init", "-q"]);
     git(root, &["add", "tracked.sh", "gone.sh"]);
+    #[cfg(unix)]
+    git(root, &["add", "link.sh"]);
     std::fs::remove_file(root.join("gone.sh")).expect("the file is removed from the tree");
     #[cfg(unix)]
     std::fs::write(root.join("*.sh"), "").expect("a file named as a wildcard");
@@ -463,6 +493,7 @@ fn a_script_must_be_a_regular_file_that_the_index_holds_under_that_name() {
     ];
     if cfg!(unix) {
         refusals.push(("*.sh", "is not a tracked file of the repository"));
+        refusals.push(("link.sh", "is a link"));
     }
     let command = |operand: &str| {
         step_with(
@@ -497,10 +528,12 @@ fn a_script_must_be_a_regular_file_that_the_index_holds_under_that_name() {
 }
 
 /// A root that Git cannot read is not taken for a root without the script: the loader says that it
-/// cannot check the script, with the first line of what Git wrote.
+/// cannot check the script, with the first line of what Git wrote. The root holds a `.git` file that
+/// is not one, so that Git cannot read it whichever work tree holds the temporary folder.
 #[test]
 fn a_script_is_not_checked_in_a_root_that_git_cannot_read() {
     let directory = tempfile::tempdir().expect("a directory");
+    std::fs::write(directory.path().join(".git"), "not a gitfile\n").expect("a file");
     std::fs::write(directory.path().join("x.sh"), "").expect("a file");
     let text = step_with("command = ['cargo', 'test']", "command = ['bash', 'x.sh']");
     let refusal = Plan::parse(&text, directory.path()).expect_err("git cannot read the root");
