@@ -26,7 +26,8 @@
 #      directory, so that it lists every archive the install needs as `FILE SIZE SHA256`; the
 #      archives of DIR (a directory a cache step restored) that match the list in name, size and
 #      SHA-256 are copied to apt's archive directory, and the others are printed as dropped and
-#      fetched again. apt itself accepts a cached archive by its size alone.
+#      fetched again. apt itself accepts a cached archive by its size alone, so a copy that an
+#      earlier attempt made and this attempt's list no longer matches is removed first.
 #   4. `apt-get install --download-only`, bound by the time left. Exit 0 ends the attempts.
 #   A failed attempt prints its number, its status (124 means that a bound cut it) and the last
 #   three lines of its output, waits 10 s times its number (at most 60 s, never past the deadline)
@@ -240,13 +241,25 @@ list_archives() {
 }
 
 # seed_archives: copies each listed archive that DIR holds, and that matches its name, size and
-# hash, to apt's archive directory.
+# hash, to apt's archive directory. An archive that an earlier attempt copied stays only while it
+# still matches this attempt's list, since a later index can list the same name with other bytes of
+# the same size, which apt accepts as it is: the copy is removed, by the name the list gives, and
+# DIR's archive is checked against this list like any other.
 seed_archives() {
   local file size hash
   [ -d "$archive" ] || return 0
   while read -r file size hash; do
     case "$file" in */* | '') continue ;; esac
-    if grep -qxF -- "$file" "$work/seeded.txt" || grep -qxF -- "$file" "$work/dropped.txt"; then
+    if grep -qxF -- "$file" "$work/seeded.txt"; then
+      if valid_file "$size" "$hash" "$cache_dir/$file"; then
+        continue
+      fi
+      echo "apt-install: removed $file, the list names other bytes"
+      sudo rm -f -- "$cache_dir/$file"
+      grep -vxF -- "$file" "$work/seeded.txt" > "$work/seeded.next" || true
+      mv -- "$work/seeded.next" "$work/seeded.txt"
+    fi
+    if grep -qxF -- "$file" "$work/dropped.txt"; then
       continue
     fi
     [ -e "$archive/$file" ] || [ -L "$archive/$file" ] || continue

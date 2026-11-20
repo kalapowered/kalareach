@@ -54,6 +54,7 @@ case "$action" in
   ok | drop | consume) ;;
   fail) echo "E: the $phase failed"; exit 100 ;;
   fail-slow) "$REAL_SLEEP" 1; echo "E: the $phase failed"; exit 100 ;;
+  fail-replace) cp "$rig"/replacement/* "$rig/pool/"; echo "E: the $phase failed"; exit 100 ;;
   warn:*)
     n=${action#warn:}
     while [ "$n" -gt 0 ]; do
@@ -1069,6 +1070,65 @@ fn an_archive_with_the_right_size_and_other_bytes_is_dropped_fetched_again_and_s
         summary(&outcome)
     );
     assert_eq!(output_of(&rig, "save"), Some("false".to_owned()));
+}
+
+/// An archive copied from the directory in one attempt is checked against the list of the next. A
+/// download that fails, and then an index that lists the same name and size with other bytes, would
+/// leave apt holding the old bytes, which it installs as they are: the script removes them and
+/// apt fetches the listed ones.
+#[test]
+fn an_archive_copied_in_one_attempt_is_checked_against_the_list_of_the_next() {
+    let rig = Rig::new();
+    pool(
+        &rig,
+        &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")],
+    );
+    assert_eq!(archive_run(&rig, &["tmux", "fuse3"]).status, 0);
+    new_runner(&rig);
+    // The first attempt copies both archives and its download fails; the mirror then lists other
+    // bytes of the same size under tmux's name.
+    fs::create_dir_all(rig.path("replacement")).expect("a folder for the other bytes");
+    fs::write(rig.path("replacement/tmux_1.0_all.deb"), "tmux BYTES").expect("other bytes");
+    rig.plan("download", &["fail-replace", "ok"]);
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    let installed = fs::read(rig.path("archives/tmux_1.0_all.deb")).expect("the archive apt holds");
+    assert_eq!(
+        String::from_utf8_lossy(&installed),
+        "tmux BYTES",
+        "apt holds the bytes the second list names: {}{}",
+        outcome.stdout,
+        outcome.stderr
+    );
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(
+        rig.phases(),
+        [
+            "update", "list", "download", "update", "list", "download", "install"
+        ]
+    );
+    assert!(
+        outcome
+            .stdout
+            .contains("apt-install: removed tmux_1.0_all.deb"),
+        "{}",
+        outcome.stdout
+    );
+    assert_eq!(rig.lines("fetched.log"), ["tmux_1.0_all.deb"]);
+    assert!(
+        summary(&outcome).starts_with(
+            "apt-install: packages=2 archives=2 seeded=1 fetched=1 dropped=1 attempts=2 "
+        ),
+        "{}",
+        summary(&outcome)
+    );
+    let mut expected = vec![manifest_line(&rig, "tmux"), manifest_line(&rig, "fuse3")];
+    expected.sort();
+    assert_eq!(manifest(&rig), expected);
+    assert_eq!(
+        fs::read(cache(&rig).join("tmux_1.0_all.deb")).expect("a saved archive"),
+        b"tmux BYTES"
+    );
+    assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
 }
 
 /// The new directory is made of the list and not of the old directory: a file that is no longer
