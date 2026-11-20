@@ -7986,9 +7986,25 @@ impl WorkerService {
             // The dispatch marker is committed before the effect. A stop whose marker cannot be
             // written proceeds on the worker's current authority and reports volatile durability,
             // for the same reason its acceptance did; anything else is refused before it happens.
-            if let Err(error) =
-                journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())
-            {
+            // A message carried on a channel is marked as a channel's with its marker, so that a
+            // restart before its end settles it as a channel end and not as an unknown that holds
+            // the actor's later messages for good.
+            let channel_mark = match &prepared {
+                Some(Prepared::Upstream(handoff)) => handoff.channel_mark(),
+                _ => None,
+            };
+            let marked = match channel_mark {
+                Some(provenance) => journal.mark_dispatching_for_channel(
+                    actor_id.clone(),
+                    mutation.action_id,
+                    provenance,
+                    kr_ipc::now_ms(),
+                ),
+                None => {
+                    journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())
+                }
+            };
+            if let Err(error) = marked {
                 if !volatile_permitted {
                     // A marker that was not written leaves nothing executable behind it. The
                     // admission is abandoned here, so the operation it authorised cannot be
@@ -13392,6 +13408,18 @@ pub struct UpstreamHandoff {
 }
 
 impl UpstreamHandoff {
+    /// The provenance to mark the receipt of a message with when its dispatch marker is
+    /// committed, when the transport it was admitted for is a channel's.
+    ///
+    /// A channel's operation ends as a channel end whenever it ends unknown, so a receipt that a
+    /// restart settles between the marker and the end is one too.
+    fn channel_mark(&self) -> Option<kr_protocol::broker::ActionProvenance> {
+        (matches!(self.kind, UpstreamKind::Mutation)
+            && self.admitted.provenance()
+                == kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse)
+            .then_some(kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse)
+    }
+
     /// Gives the admission up without transmitting.
     ///
     /// A dispatch marker this host could not write leaves no executable permit behind it: what
