@@ -90,6 +90,18 @@ mod tests {
     }
 
     #[test]
+    fn a_scratch_directory_is_not_made_over_a_directory_that_exists_and_that_stays() {
+        let base = tempfile::tempdir().expect("a directory");
+        let evidence = tempfile::tempdir().expect("a directory");
+        let held = path_in(base.path());
+        std::fs::create_dir(&held).expect("a directory that is there already");
+        std::fs::write(held.join("file"), "x").expect("a file");
+        let error = Scratch::make(held.clone(), evidence.path()).expect_err("refused");
+        assert!(error.contains("could not be made"), "{error}");
+        assert!(held.join("file").is_file());
+    }
+
+    #[test]
     fn a_scratch_directory_inside_the_evidence_directory_is_refused_and_not_made() {
         let evidence = tempfile::tempdir().expect("a directory");
         let path = path_in(evidence.path());
