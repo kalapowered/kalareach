@@ -478,11 +478,12 @@ mod tests {
     use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
 
     struct Fixture {
-        temp: kr_ipc::testing::TempHost,
         path: PathBuf,
         /// Open while a case writes grants, and closed before an undo replaces the registry: a
         /// file that a connection holds open cannot be removed or renamed over on Windows.
         directory: Option<GrantDirectory>,
+        /// Declared last, so that it is removed after the connection above it is closed.
+        temp: kr_ipc::testing::TempHost,
     }
 
     fn fixture() -> Fixture {
