@@ -98,12 +98,40 @@ jobs:
       # and installs from what it fetched. The deadlines are 30, 5, 5, 5 and 10 minutes, 55 in all,
       # and the ssh, tmux and fuse3 steps usually run no apt at all. A run whose Test step takes its
       # 225 minutes and whose mirror is slow in every step can pass the job's 360 minutes by what
-      # the steps after it have left. This step's deadline is 30 minutes.
+      # the steps after it have left. This step's deadline is 30 minutes. The companion job installs
+      # the same list, and the two lists stay equal so that the two jobs share one set of archives.
+      # The archives are kept in the Actions cache: a run on a runner whose mirror is slow then
+      # fetches what has changed and not the whole set. apt accepts a cached archive by its size
+      # alone, so the script copies one only when its SHA-256 matches the package index and fetches
+      # it again when it does not. The restore never has an exact hit, so it takes the newest entry
+      # of the prefix; a run on the default branch saves the entry under the digest of its manifest
+      # when that differs from the one restored or an archive was repaired. No cache step reaches
+      # release-tree.yml, which builds what the release workflow seals.
+      - name: Restore the desktop packages' archives
+        id: desktop-archives
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/desktop
+          key: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-
+
       - name: Install the desktop build dependencies
+        id: desktop-install
         run: |
-          bash scripts/apt-install.sh --deadline 1800 \
+          bash scripts/apt-install.sh --deadline 1800 --archive ~/.cache/kalareach/apt/desktop \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev desktop-file-utils python3-gi
+
+      - name: Save the desktop packages' archives
+        if: github.ref == 'refs/heads/main' && steps.desktop-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/desktop
+          key: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-${{ steps.desktop-install.outputs.entry }}
 
       # Two suites start a private sshd of their own on a loopback port and reach it with the real
       # ssh: a remote shell's terminal database in the worker's tests, and an SSH host's
@@ -1724,9 +1752,29 @@ jobs:
       # fetched, never vendored. The fish package is a Rust shell built through
       # CMake, and its own build turns the message catalogues with gettext. The install goes
       # through scripts/apt-install.sh, with a deadline of 15 minutes.
+      - name: Restore the shells packages' archives
+        id: shells-archives
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/shells
+          key: apt-v1-shells-ubuntu-24.04-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-v1-shells-ubuntu-24.04-${{ runner.arch }}-
+
       - name: Install the shells' build dependencies
+        id: shells-install
         run: |
-          bash scripts/apt-install.sh --deadline 900 libncurses-dev cmake gettext
+          bash scripts/apt-install.sh --deadline 900 --archive ~/.cache/kalareach/apt/shells libncurses-dev cmake gettext
+
+      - name: Save the shells packages' archives
+        if: github.ref == 'refs/heads/main' && steps.shells-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/shells
+          key: apt-v1-shells-ubuntu-24.04-${{ runner.arch }}-${{ steps.shells-install.outputs.entry }}
 
       # The PSReadLine package refuses a PowerShell that a published advisory affects, so this job
       # runs it under a release at or above that bound, whichever one the runner image carries.
@@ -2553,13 +2601,35 @@ jobs:
 
       # What the desktop shell links against on Linux: the WebView, its dependencies and the
       # window toolkit. macOS has its own in the system. The install goes through
-      # scripts/apt-install.sh, with a deadline of 30 minutes.
+      # scripts/apt-install.sh, with a deadline of 30 minutes. The rust job installs the same list,
+      # and the two stay equal so that the two jobs share one set of archives.
+      - name: Restore the desktop packages' archives
+        id: desktop-archives
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/desktop
+          key: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-
+
       - name: Install the desktop build dependencies
+        id: desktop-install
         if: runner.os == 'Linux'
         run: |
-          bash scripts/apt-install.sh --deadline 1800 \
+          bash scripts/apt-install.sh --deadline 1800 --archive ~/.cache/kalareach/apt/desktop \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
             libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      - name: Save the desktop packages' archives
+        if: github.ref == 'refs/heads/main' && runner.os == 'Linux' && steps.desktop-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/desktop
+          key: apt-v1-desktop-ubuntu-24.04-${{ runner.arch }}-${{ steps.desktop-install.outputs.entry }}
 
       - name: Restore the cargo cache
         uses: ./.github/actions/cargo-cache-restore
@@ -2639,9 +2709,30 @@ jobs:
       # pinned release's dry run prints against the indexes the script has just updated, with a
       # deadline of an hour: the 104 MB it needed at that rate take 53 minutes. The browsers
       # themselves come from Playwright's own host, in the step after.
-      - name: Install the system packages of the browsers
+      - name: Restore the browsers' system packages' archives
+        id: playwright-archives
         if: runner.os == 'Linux'
-        run: bash scripts/apt-install.sh --deadline 3600 --names-from scripts/playwright-system-packages.sh
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/playwright
+          key: apt-v1-playwright-ubuntu-24.04-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-v1-playwright-ubuntu-24.04-${{ runner.arch }}-
+
+      - name: Install the system packages of the browsers
+        id: playwright-install
+        if: runner.os == 'Linux'
+        run: bash scripts/apt-install.sh --deadline 3600 --archive ~/.cache/kalareach/apt/playwright --names-from scripts/playwright-system-packages.sh
+
+      - name: Save the browsers' system packages' archives
+        if: github.ref == 'refs/heads/main' && runner.os == 'Linux' && steps.playwright-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/playwright
+          key: apt-v1-playwright-ubuntu-24.04-${{ runner.arch }}-${{ steps.playwright-install.outputs.entry }}
 
       - name: Install the browsers the end-to-end run drives
         run: pnpm -C apps/companion exec playwright install chromium webkit
