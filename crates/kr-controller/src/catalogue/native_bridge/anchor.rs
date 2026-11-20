@@ -341,7 +341,9 @@ impl Anchor {
     /// write ends. The kernel refuses to remove a folder that holds anything, so a file kept in it
     /// stays. Between the two trades the place holds the new contents and the displaced file is in
     /// the folder; it is removed only where it is the checked file. Where it cannot be put back it
-    /// is kept there, and the refusal names where.
+    /// is kept there, and the refusal names where: the path the folder had when this write opened
+    /// it. Another process that renames the folder afterwards leaves the file in the folder, but
+    /// that path then no longer reaches it.
     pub(crate) fn write(
         &self,
         path: &Path,

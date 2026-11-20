@@ -6341,6 +6341,62 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.01: a file kept in the private folder stays in it when another process renames
+    /// the folder. The path the refusal names is the one the folder had when the write opened it,
+    /// so it no longer reaches the file, and the file is where the renamed folder is.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_file_stays_in_its_folder_when_another_process_renames_the_folder() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        walk.write(&place, b"one", 0o600, None).expect("a new file");
+        let at = place.clone();
+        anchor::publish_pause::once(move |_| {
+            std::fs::write(&at, b"theirs").expect("another process writes the file");
+        });
+        let (at, home) = (place.clone(), tree.home());
+        anchor::trade_pause::once(move |_| {
+            let folders = temporary_entries(&home);
+            std::fs::rename(&folders[0], home.join("moved-folder")).expect("renames the folder");
+            std::fs::write(home.join("third.json"), b"third").expect("another process writes");
+            std::fs::rename(home.join("third.json"), &at).expect("it is put at the place");
+        });
+        let refused = walk
+            .write(&place, b"two", 0o600, Some(digest_of(b"one")))
+            .expect_err("the place does not hold the checked file");
+        let ControllerError::PermissionDenied { detail } = &refused else {
+            panic!("{refused}");
+        };
+        let named = Path::new(
+            detail
+                .split("so it is kept as ")
+                .nth(1)
+                .expect("the refusal names a path"),
+        );
+        assert!(
+            !named.exists(),
+            "the path it names no longer reaches the file: {named:?}"
+        );
+        let moved: Vec<PathBuf> = std::fs::read_dir(tree.home().join("moved-folder"))
+            .expect("the renamed folder")
+            .map(|entry| entry.expect("an entry").path())
+            .collect();
+        assert_eq!(moved.len(), 1, "one file stays in the folder: {moved:?}");
+        assert_eq!(
+            std::fs::read(&moved[0]).ok().as_deref(),
+            Some(&b"third"[..]),
+            "the file that was kept"
+        );
+        assert_eq!(
+            named.file_name(),
+            moved[0].file_name(),
+            "the path names it by its name in the folder"
+        );
+    }
+
     /// KR-REQ-11.01: a file where a folder is needed and a folder where a file is to be written
     /// stop the installation before anything is written, by the walk's approved words.
     #[cfg(unix)]
