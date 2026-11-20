@@ -5,7 +5,7 @@
 //! from the WebView except through the commands, and a command returns protocol values rather than
 //! handles: there is nothing the page can keep and use later.
 
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, TryLockError};
 
 use kr_client::Session;
 use kr_protocol::error::ErrorCode;
@@ -128,10 +128,7 @@ impl AppState {
     pub fn choose_host(&self, reason: &str, start: impl FnOnce() -> Result<Started>) -> Result<()> {
         #[cfg(feature = "testing")]
         self.pauses.before_gate.wait();
-        let _gate = self
-            .choice_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate = self.lock_choice_gate();
         #[cfg(feature = "testing")]
         self.pauses.before_start.wait();
         let started = start()?;
@@ -149,13 +146,26 @@ impl AppState {
         Ok(())
     }
 
+    /// Takes the lock a choice of host is made under. A free lock is taken at once. One that is held
+    /// is waited for through [`blocking`], so the task that waits does not keep its worker from the
+    /// tasks of the same runtime, nor the runtime's timers and I/O, which go with a worker that
+    /// waits in a plain lock.
+    fn lock_choice_gate(&self) -> MutexGuard<'_, ()> {
+        match self.choice_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => blocking(|| {
+                self.choice_gate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            }),
+        }
+    }
+
     /// Runs `work` under the lock a choice of host is made under, so that it is done before a
     /// choice or a forget that is under way, or after it, and never in the middle of one.
     pub fn under_the_choice_gate<T>(&self, work: impl FnOnce() -> T) -> T {
-        let _gate = self
-            .choice_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate = self.lock_choice_gate();
         work()
     }
 
@@ -177,10 +187,7 @@ impl AppState {
         reason: &str,
         forget: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        let _gate = self
-            .choice_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _gate = self.lock_choice_gate();
         forget()?;
         let forgotten = self.contact.forget(host, reason);
         if forgotten.value {
@@ -726,6 +733,21 @@ impl Default for AppState {
     }
 }
 
+/// Runs `wait`, which blocks the thread, so that it keeps no worker of the runtime from the
+/// runtime's other tasks: on a multi-threaded runtime `block_in_place` moves them to another worker.
+/// On a runtime with one thread, where `block_in_place` panics, and with no runtime at all, the
+/// thread blocks.
+fn blocking<T>(wait: impl FnOnce() -> T) -> T {
+    let multi_threaded = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+        runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    });
+    if multi_threaded {
+        tokio::task::block_in_place(wait)
+    } else {
+        wait()
+    }
+}
+
 /// Seams the application's own suites act through.
 #[cfg(feature = "testing")]
 pub mod testing {
@@ -770,22 +792,13 @@ pub mod testing {
 
         /// Waits here when a suite paused this place, once. A step that waits here is a plain
         /// function, which a command calls from a task of Tauri's multi-threaded runtime, or a
-        /// suite calls from a thread of its own, and it cannot await. On a multi-threaded runtime
-        /// the wait goes through `block_in_place`, which moves the thread's other tasks to another
-        /// worker, so a held step does not starve the runtime's other tasks. On a runtime with one
-        /// thread, where `block_in_place` panics, and with no runtime at all, the thread blocks.
+        /// suite calls from a thread of its own, and it cannot await, so it waits as the choice
+        /// gate does ([`super::blocking`]).
         pub(super) fn wait(&self) {
             let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
             if let Some((reached, released)) = held {
                 let _ = reached.send(());
-                let multi_threaded = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
-                    runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-                });
-                if multi_threaded {
-                    let _ = tokio::task::block_in_place(|| released.recv());
-                } else {
-                    let _ = released.recv();
-                }
+                let _ = super::blocking(|| released.recv());
             }
         }
     }
@@ -972,5 +985,46 @@ mod tests {
                 )))
                 .is_ok()
         );
+    }
+
+    /// A task that takes the choice gate while a choice holds it leaves its worker to the runtime's
+    /// other tasks. The runtime has one worker: a task that blocked it would stop every other task
+    /// of the runtime, and its timers and I/O with them.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_task_that_waits_for_the_choice_gate_leaves_its_worker_to_the_runtime() {
+        use std::time::Duration;
+
+        let state = Arc::new(AppState::new());
+        let mut hold = state.hold_the_choice_at(testing::ChoicePoint::BeforeStart);
+        // A choice that holds the gate, on a thread of its own, as the application runs one.
+        let choosing = std::thread::spawn({
+            let state = Arc::clone(&state);
+            move || {
+                state.choose_host("reaching", || {
+                    Err(CommandError::local_failure("the choice is not made"))
+                })
+            }
+        });
+        hold.reached().await;
+        let waiting = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { state.under_the_choice_gate(|| ()) }
+        });
+        // This thread is not a worker: it lets the task reach the gate and wait there, and then
+        // looks for a task that only a free worker can run.
+        std::thread::sleep(Duration::from_millis(300));
+        let other = tokio::spawn(async {});
+        let ran = (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(25));
+            other.is_finished()
+        });
+        assert!(
+            ran,
+            "a task that waits for the choice gate keeps the runtime's only worker from its other tasks"
+        );
+        hold.release();
+        assert!(choosing.join().expect("the choice ended").is_err());
+        waiting.await.expect("the task took the gate");
     }
 }
