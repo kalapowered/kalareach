@@ -1594,11 +1594,13 @@ async fn a_choice_made_with_a_stale_pairing_changes_nothing() {
     host.stop().await;
 }
 
-/// KR-REQ-18.01: a choice that is resolved and then waits for the choice gate while the host it names
-/// is forgotten is refused when it gets the gate: no choice, no revision, and the host in use, the
-/// device's own record of it and its connection stand.
+/// KR-REQ-13.08: a choice that is resolved and then waits before the choice gate while the host it
+/// names is forgotten and paired again is refused when it gets the gate: the pairing it names is not
+/// the one this computer holds. No choice, no revision, and no host in use, in the device's own
+/// record or in the connection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_choice_that_waits_at_the_gate_across_a_forget_is_refused_when_it_gets_it() {
+async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refused_when_it_gets_it()
+{
     use companion_tauri::state::testing::ChoicePoint;
 
     let owner = DeviceKeys::generate().expect("keys");
@@ -1612,35 +1614,52 @@ async fn a_choice_that_waits_at_the_gate_across_a_forget_is_refused_when_it_gets
         .host_by_reference(&the_host(companion))
         .expect("the pairing is listed");
     let state = companion.app.state::<companion_tauri::AppState>();
-    let session = state.session().expect("connected");
 
-    // The choice has found the pairing and holds the gate, before it asks the device again.
-    let mut hold = state.hold_the_choice_at(ChoicePoint::BeforeStart);
+    // The choice has found the pairing it names, and waits before it takes the gate.
+    let mut hold = state.hold_the_choice_at(ChoicePoint::BeforeGate);
     let handle = companion.app.handle().clone();
     let choosing = tokio::spawn({
         let current = current.clone();
         async move { companion_tauri::hosts::use_host(&handle, current).await }
     });
     hold.reached().await;
+    // The phone forgets the host, and is paired with it again. A host does not pair an endpoint it
+    // already holds a second time, so the pairing's own record is written: the same host, and
+    // another identity this device has with it.
+    companion_tauri::hosts::forget_host(companion.app.handle(), &current)
+        .await
+        .expect("the host is forgotten");
+    let paired_again = kr_client::pairing::paired::PairedHost {
+        device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [42; 16],
+        )),
+        ..current.clone()
+    };
     companion
         .device()
-        .forget_host(current.host_device_id)
-        .expect("the host is forgotten");
-    let revision = state.contact_owner().revision();
+        .pairing()
+        .hosts
+        .record(paired_again)
+        .expect("the pairing is recorded again");
+    let before = state.connection_state();
     let in_use = companion.device().host_in_use().map(|host| host.device_id);
     hold.release();
 
     let refused = choosing.await.expect("the choice ran");
     assert!(refused.is_err(), "the choice names a pairing that is gone");
-    assert_eq!(state.contact_owner().revision(), revision, "no revision");
+    assert_eq!(
+        state.connection_state(),
+        before,
+        "no revision and no host in use"
+    );
     assert_eq!(
         companion.device().host_in_use().map(|host| host.device_id),
         in_use,
         "the device's own record of the host in use"
     );
     assert!(
-        Arc::ptr_eq(&state.session().expect("still connected"), &session),
-        "the connection installed stands"
+        state.session().is_err(),
+        "no connection is installed by the choice"
     );
     host.stop().await;
 }

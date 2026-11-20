@@ -126,6 +126,8 @@ impl AppState {
     ///
     /// Returns what `start` returns, and then nothing has changed.
     pub fn choose_host(&self, reason: &str, start: impl FnOnce() -> Result<Started>) -> Result<()> {
+        #[cfg(feature = "testing")]
+        self.pauses.before_gate.wait();
         let _gate = self
             .choice_gate
             .lock()
@@ -792,6 +794,7 @@ pub mod testing {
     #[derive(Debug, Default)]
     pub(super) struct Pauses {
         pub(super) device_read: Place,
+        pub(super) before_gate: Place,
         pub(super) before_start: Place,
         pub(super) before_cleanup: Place,
         pub(super) after_replacement: Place,
@@ -800,6 +803,8 @@ pub mod testing {
     /// Where in the making of a choice of host a step is paused.
     #[derive(Clone, Copy, Debug)]
     pub enum ChoicePoint {
+        /// Before the choice gate is taken: the choice is resolved and holds nothing.
+        BeforeGate,
         /// Inside the choice gate, before the choice is made ready.
         BeforeStart,
         /// Inside the choice gate, after the owner has accepted the choice and before the sessions
@@ -823,10 +828,12 @@ pub mod testing {
             self.pauses.after_replacement.set()
         }
 
-        /// Pauses the next choice of a host at `point`, with the choice gate held.
+        /// Pauses the next choice of a host at `point`; the choice gate is held at every point but
+        /// the first.
         #[must_use]
         pub fn hold_the_choice_at(&self, point: ChoicePoint) -> Hold {
             match point {
+                ChoicePoint::BeforeGate => self.pauses.before_gate.set(),
                 ChoicePoint::BeforeStart => self.pauses.before_start.set(),
                 ChoicePoint::BeforeCleanup => self.pauses.before_cleanup.set(),
             }
