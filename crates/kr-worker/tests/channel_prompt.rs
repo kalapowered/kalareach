@@ -192,12 +192,78 @@ fn a_package_without_a_writable_prompt_shape_has_no_event_shape() {
         "a route toward the host"
     );
 
+    // An identifier path that is, holds or is held by the text's place or the host's members: an
+    // event carries no identifier, so the table cannot write the event whole. The tables are built
+    // here and not through a package, so the derivation is asked directly.
+    for (name, identifier) in [
+        ("params", path(&["params"])),
+        ("params.content", path(&["params", "content"])),
+        ("params.meta", path(&["params", "meta"])),
+        ("params.meta.id", path(&["params", "meta", "id"])),
+    ] {
+        let mut changed = table.clone();
+        changed.request_id_path = identifier;
+        assert!(
+            ChannelEventShape::derive(&actions, &changed).is_none(),
+            "an identifier path at {name}"
+        );
+    }
+
     // A method the table writes anywhere but `method`.
     let mut changed = table.clone();
     changed.method_path = path(&["verb"]);
     assert!(
         ChannelEventShape::derive(&actions, &changed).is_none(),
         "a method path that is not `method`"
+    );
+}
+
+/// KR-REQ-12.26: the package's own validation refuses a prompt action whose route runs towards the
+/// host, which is why the derivation is asked directly for that arm above. The same package, laid
+/// out again with the channel event's route reversed, is valid before and refused after.
+#[test]
+fn a_route_toward_the_host_is_refused_by_the_packages_own_validation() {
+    use kr_worker::broker::connectors::fixture;
+
+    let original = Package::laid_out();
+    let directory = std::fs::read_dir(original.root.join("packages"))
+        .expect("the package's folder")
+        .next()
+        .expect("one package")
+        .expect("an entry")
+        .path();
+    let table: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.join("connector.json")).expect("the table"),
+    )
+    .expect("the table is JSON");
+    let validated_with = |direction: &str| {
+        let mut table = table.clone();
+        let route = table["routes"]
+            .as_array_mut()
+            .expect("routes")
+            .iter_mut()
+            .find(|route| route["wire_name"] == CHANNEL_EVENT_WIRE_NAME)
+            .expect("the table routes the channel event");
+        route["direction"] = serde_json::Value::String(direction.to_owned());
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let source = fixture::package_with_connector(
+            root.path(),
+            std::path::Path::new(fixture::FORWARDER),
+            &fixture::Shape::claude_code(),
+            serde_json::to_string(&table).expect("encodes"),
+        )
+        .expect("the package is written");
+        kr_plugin_sdk::validate::validate_package_directory(&source.package_dir).report
+    };
+    let kept = validated_with("host_to_upstream");
+    assert!(
+        kept.is_valid(),
+        "the package as declared is valid: {kept:?}"
+    );
+    let reversed = validated_with("upstream_to_host");
+    assert!(
+        !reversed.is_valid(),
+        "a package whose channel event runs towards the host is refused"
     );
 }
 
