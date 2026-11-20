@@ -292,6 +292,8 @@ pub struct OwnKeyStandIn {
     sidebands:
         std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<StandInSideband>>>,
     started: std::sync::atomic::AtomicUsize,
+    /// The identifier of the call it started last.
+    latest: std::sync::Mutex<Option<String>>,
     report: std::sync::Mutex<CloseReport>,
 }
 
@@ -303,12 +305,17 @@ impl OwnKeyStandIn {
 
     /// The side channel of the call it started last.
     pub fn sideband(&self) -> std::sync::Arc<StandInSideband> {
+        let latest = self
+            .latest
+            .lock()
+            .expect("the latest call")
+            .clone()
+            .expect("a call was started, so a side channel is shown");
         let sidebands = self.sidebands.lock().expect("the side channels");
         std::sync::Arc::clone(
             sidebands
-                .values()
-                .next_back()
-                .expect("a call was started, so a side channel is shown"),
+                .get(&latest)
+                .expect("the latest call has its side channel"),
         )
     }
 
@@ -389,6 +396,7 @@ impl VoiceProviderService for OwnKeyStandIn {
             .lock()
             .expect("the side channels")
             .insert(call_id.clone(), std::sync::Arc::default());
+        *self.latest.lock().expect("the latest call") = Some(call_id.clone());
         Box::pin(async move {
             Ok(VoiceStart::StartedOwn(Box::new(
                 kr_client::services::voice::OwnSession {
