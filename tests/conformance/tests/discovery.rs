@@ -66,7 +66,13 @@ fn copy_into(from: &Path, to: &Path, skip: &dyn Fn(&str) -> bool) {
 /// every file. No commit is made, so a case that reads the commit gets `unknown`.
 fn copy_without(name: &str, skip: &dyn Fn(&str) -> bool) -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().expect("a directory");
-    let root = directory.path().canonicalize().expect("the copy's root");
+    // Where paths resolve through links (macOS's temporary directory is one) Cargo names files by
+    // the resolved path; on Windows a resolved path carries a `\\?\` prefix that Cargo does not.
+    let root = if cfg!(windows) {
+        directory.path().to_path_buf()
+    } else {
+        directory.path().canonicalize().expect("the copy's root")
+    };
     copy_into(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
@@ -407,6 +413,16 @@ fn a_lock_that_is_absent_is_a_problem_of_the_map() {
     assert_eq!(code, Some(2), "{stdout}{stderr}");
 }
 
+/// A copy is a Git index with no commit: its commit is `unknown` and its tracked files differ from
+/// it. A case that makes a result from a copy states that, or commits the copy.
+#[test]
+fn a_copy_is_a_git_index_with_no_commit_so_its_commit_is_unknown_and_modified() {
+    let (_directory, root) = copy("ignored-tests");
+    let commit = kr_conformance::identity::commit(&root);
+    assert_eq!(commit.id, "unknown");
+    assert!(commit.modified);
+}
+
 /// A plan that names no manifest and no package has nothing to read, which is not an error.
 #[test]
 fn a_plan_that_names_no_manifest_and_no_package_maps_nothing_and_succeeds() {
@@ -507,19 +523,38 @@ fn the_directories_the_plan_names_for_scripts_and_lanes_are_the_ones_read() {
         "a lane file"
     );
 
-    let map = references(&base.replace("scripts = ['scripts']", "scripts = []"));
-    assert!(
-        !map.references.contains_key(&identifier("KR-REQ-05.03")),
-        "no script is read"
-    );
-    assert!(map.references.contains_key(&identifier("KR-REQ-05.04")));
-
-    let map = references(&base.replace("lane_directories = ['mobile']", "lane_directories = []"));
-    assert!(map.references.contains_key(&identifier("KR-REQ-05.03")));
-    assert!(
-        !map.references.contains_key(&identifier("KR-REQ-05.04")),
-        "no lane file is read"
-    );
+    // Each key emptied, and each key removed: absent means none.
+    for (edit, name) in [
+        (
+            base.replace("scripts = ['scripts']", "scripts = []"),
+            "emptied",
+        ),
+        (base.replace("scripts = ['scripts']\n", ""), "removed"),
+    ] {
+        let map = references(&edit);
+        assert!(
+            !map.references.contains_key(&identifier("KR-REQ-05.03")),
+            "no script is read: the key is {name}"
+        );
+        assert!(map.references.contains_key(&identifier("KR-REQ-05.04")));
+    }
+    for (edit, name) in [
+        (
+            base.replace("lane_directories = ['mobile']", "lane_directories = []"),
+            "emptied",
+        ),
+        (
+            base.replace("lane_directories = ['mobile']\n", ""),
+            "removed",
+        ),
+    ] {
+        let map = references(&edit);
+        assert!(map.references.contains_key(&identifier("KR-REQ-05.03")));
+        assert!(
+            !map.references.contains_key(&identifier("KR-REQ-05.04")),
+            "no lane file is read: the key is {name}"
+        );
+    }
 }
 
 /// A plan with no `[typescript]` table reads the scripts and the lane files it names: a repository
@@ -588,12 +623,10 @@ fn a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names() {
     let map = map_of(&root, load(&root), Some(&compiler()), true);
     assert!(map.problems.is_empty(), "{:?}", map.problems);
     assert_eq!(sources(&map, "KR-REQ-05.01"), ["web/forms.test.ts:3"]);
-    assert!(
-        map.typescript_version
-            .as_deref()
-            .is_some_and(|version| version.starts_with(|first: char| first.is_ascii_digit())),
-        "the compiler's version is recorded: {:?}",
-        map.typescript_version
+    assert_eq!(
+        map.typescript_version.as_deref(),
+        Some(installed_version().as_str()),
+        "the compiler's version is the installed package's"
     );
     let (code, stdout, stderr) = program(&[
         "map",
@@ -711,8 +744,9 @@ fn a_relative_root_finds_the_compiler_the_plan_names() {
 }
 
 /// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: a call is a
-/// test only when its first argument is a string or a template, or a function follows it. A condition that `test.skip` takes, a step, the fixtures' `use` and `extend` and the four
-/// hooks are not tests.
+/// test only when its first argument is a string or a template, or a function follows it. A
+/// condition that `test.skip` takes, a step, the fixtures' `use` and `extend` and the four hooks,
+/// with a title or with none, are not tests.
 #[test]
 #[ignore = "reads TypeScript with the packages' own compiler, which `pnpm install --frozen-lockfile` installs; the report's typescript group runs it"]
 fn a_typescript_call_is_a_test_only_when_it_names_one() {
@@ -745,6 +779,10 @@ fn a_typescript_call_is_a_test_only_when_it_names_one() {
             false,
         ),
         ("a step", "a step inside a test", false),
+        ("a hook with a title", "a hook before all", false),
+        ("a hook with a title", "a hook before each", false),
+        ("a hook with a title", "a hook after all", false),
+        ("a hook with a title", "a hook after each", false),
     ] {
         assert_eq!(named(text), is_a_call, "{form}");
     }
@@ -797,6 +835,28 @@ fn every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edite
     let map = mapped(&named, None);
     assert!(map.problems.is_empty(), "{:?}", map.problems);
     assert_eq!(sources(&map, "KR-REQ-05.01"), ["web/forms.test.ts:3"]);
+    // Each optional key removed alone is the same as an empty one: no directory is left out, and
+    // no compiler directory is named.
+    let map = mapped(
+        &base.replace("skip_directories = ['node_modules', 'generated']\n", ""),
+        Some(&compiler()),
+    );
+    assert_eq!(
+        sources(&map, "KR-REQ-05.02"),
+        ["web/generated/built.test.ts:3"],
+        "no directory is left out"
+    );
+    let map = mapped(&base.replace("compiler_from = []\n", ""), Some(&compiler()));
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    assert_eq!(sources(&map, "KR-REQ-05.01"), ["web/forms.test.ts:3"]);
+    let map = mapped(&base.replace("compiler_from = []\n", ""), None);
+    assert!(
+        map.problems
+            .iter()
+            .any(|problem| problem.contains("no directory names one")),
+        "no compiler directory is named: {:?}",
+        map.problems
+    );
     // None named and none given: the tree has no compiler to read with.
     let map = mapped(&base, None);
     assert!(

@@ -438,6 +438,11 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "`[typescript] skip_directories` names ``, which is not the name of one directory",
         ),
         (
+            "a `[typescript]` table with no packages",
+            with("[typescript]\ncompiler_from = []\n"),
+            "missing field `packages`",
+        ),
+        (
             "TypeScript packages that are not a directory",
             with("[typescript]\npackages = ['packages/no-such-package']\n"),
             "`[typescript] packages` names `packages/no-such-package`, which is not a directory of the repository",

@@ -17,4 +17,8 @@ describe('every form of a call', () => {
   test.beforeEach(async () => {})
   test.afterAll(async () => {})
   test.afterEach(async () => {})
+  test.beforeAll('a hook before all', async () => {})
+  test.beforeEach('a hook before each', async () => {})
+  test.afterAll('a hook after all', async () => {})
+  test.afterEach('a hook after each', async () => {})
 })
