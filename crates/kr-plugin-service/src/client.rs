@@ -1676,12 +1676,6 @@ fn protocol_error(body: &ResponseBody) -> ServiceError {
     }
 }
 
-/// Returns the binding identifier a notice concerns.
-#[must_use]
-pub fn notice_binding(notice: &Notice) -> BindingId {
-    BindingId::new(notice.binding_id())
-}
-
 /// Returns a fresh binding identifier.
 #[must_use]
 pub fn new_binding_id() -> BindingId {
@@ -1728,15 +1722,5 @@ mod tests {
     #[test]
     fn two_binding_identifiers_are_distinct() {
         assert_ne!(new_binding_id(), new_binding_id());
-    }
-
-    #[test]
-    fn a_notice_names_the_binding_it_belongs_to() {
-        let binding_id = new_binding_id();
-        let notice = Notice::Disabled {
-            binding_id: binding_id.get(),
-            reason: "three faults".to_owned(),
-        };
-        assert_eq!(notice_binding(&notice), binding_id);
     }
 }

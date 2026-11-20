@@ -16,9 +16,6 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{PluginId, PluginName};
 use crate::version::VersionRange;
 
-/// Maximum length of a match token, such as a file stem or a package name.
-pub const MAX_MATCH_TOKEN_LEN: usize = 128;
-
 /// An operating system a package supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
