@@ -18,21 +18,6 @@ use crate::contract::qualification::{
     IntegrationLoss, IntegrationPhase, LossOutcome, ShellKind, phase_after,
 };
 
-/// Returns the root-integration methods, read from the protocol's own registry.
-///
-/// The list is not written out here. Section 23 puts each method in exactly one group, and the
-/// registry is where that is recorded; a second copy of the five names would be a second answer to
-/// a question the protocol has already settled, and it would go stale the first time a method
-/// joined the group.
-#[must_use]
-pub fn root_methods() -> Vec<Method> {
-    Method::ALL
-        .iter()
-        .copied()
-        .filter(|method| is_root_method(*method))
-        .collect()
-}
-
 /// Returns true when a method belongs to the root-integration group.
 #[must_use]
 pub fn is_root_method(method: Method) -> bool {
@@ -318,9 +303,10 @@ mod tests {
 
     #[test]
     fn the_root_methods_are_the_registrys_own_group() {
-        let names: Vec<&str> = root_methods()
+        let names: Vec<&str> = Method::ALL
             .iter()
             .map(|method| method.as_str())
+            .filter(|name| is_root_method_name(name))
             .collect();
         assert_eq!(
             names,
@@ -332,9 +318,6 @@ mod tests {
                 "root.command.accepted",
             ]
         );
-        for name in &names {
-            assert!(is_root_method_name(name));
-        }
         // The launch is authorised by the host and reaches the worker from a client, so it is not
         // in this group however closely it is bound to the same fence.
         assert!(!is_root_method_name("shell.launch"));
