@@ -799,6 +799,54 @@ fn a_typescript_test_that_a_windows_run_selects_is_not_run_and_says_where_it_is_
     );
 }
 
+/// KR-REQ-29.01, the part about reproducible commands and the identity of a run: the version of the
+/// compiler that read the map is in the result's toolchain, as the document and as JSON, and the
+/// field is left out when no TypeScript was read.
+#[test]
+fn the_result_records_the_compiler_version_the_map_was_read_with_and_leaves_it_out_when_none_read()
+{
+    let assembled = |version: Option<&str>| {
+        let map = Map {
+            typescript_version: version.map(str::to_owned),
+            ..Map::default()
+        };
+        let groups = vec!["rust".to_owned()];
+        let options = Options {
+            root: PathBuf::from("/tmp/r"),
+            evidence: PathBuf::from("/tmp/e"),
+            selection: Some(groups.clone()),
+            all_terminals: false,
+            platform: Platform::Linux,
+            plan: core_plan(),
+            typescript_compiler: None,
+            applications: None,
+            lister: PathBuf::from("/tmp/l"),
+            environment: Vec::new(),
+            part: None,
+            runner_base: PathBuf::new(),
+        };
+        let document = report::assemble(
+            &options,
+            &groups,
+            &map,
+            &[],
+            Gathered::default(),
+            "2026-09-26T00:00:00Z".to_owned(),
+        );
+        let json = serde_json::to_value(&document).expect("serialises");
+        (document.run.toolchain.typescript, json)
+    };
+    let (version, json) = assembled(Some("9.9.9"));
+    assert_eq!(version.as_deref(), Some("9.9.9"));
+    assert_eq!(json["run"]["toolchain"]["typescript"], "9.9.9", "{json}");
+    let (version, json) = assembled(None);
+    assert_eq!(version, None);
+    assert!(
+        json["run"]["toolchain"].get("typescript").is_none(),
+        "{json}"
+    );
+}
+
 /// KR-REQ-29.01, the part about machine-readable results: a run over a tree that ignores nothing
 /// reports every identifier it keys with a verdict and, for each test that keys it, the outcome; a
 /// test keyed twice is recorded once, by its own comment.
