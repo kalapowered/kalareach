@@ -6748,14 +6748,18 @@ mod tests {
     }
 
     /// KR-REQ-11.01: on macOS a removal is refused before it takes anything away when a recorded
-    /// skill file has an allow entry. A document with an entry is refused earlier still, by the
-    /// check of the documents an installation cannot carry the protection of.
+    /// skill file has an allow entry. The entry is on a skill file that is recorded after another
+    /// one, so the check made before the first removal is what refuses it: the removal's own check
+    /// of that file would come only after the first file was taken. A document with an entry is
+    /// refused earlier still, by the check of the documents an installation cannot carry the
+    /// protection of.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_recorded_file_with_an_allow_entry_is_refused_before_any_removal() {
+        const LATER_SKILL_FILE: &str = ".amp/skills/kalareach-contact/TOOLS.md";
         let tree = Tree::create();
         let installer = amp_installed(&tree);
-        let file = tree.home().join(SKILL_FILE);
+        let file = tree.home().join(LATER_SKILL_FILE);
         let _entry = Restriction(file.clone());
         exacl::setfacl(
             &[&file],
@@ -6772,7 +6776,7 @@ mod tests {
             .expect_err("a file with an allow entry is refused");
         assert!(
             matches!(&refused, ControllerError::PermissionDenied { detail }
-                if detail.contains(SKILL_FILE) && detail.contains(FILE_ENTRY_REMOVING)),
+                if detail.contains(LATER_SKILL_FILE) && detail.contains(FILE_ENTRY_REMOVING)),
             "{refused}"
         );
         assert_eq!(
