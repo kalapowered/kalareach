@@ -5981,3 +5981,266 @@ async fn kr_req_12_18_a_typed_prompt_that_ended_unknown_still_holds_the_next_pro
         .count();
     assert_eq!(carried, 1, "nothing second reached the upstream");
 }
+
+/// One `agent.prompt.queue` of `text` on the channel tests' instance, in `window`.
+fn queue_mutation(
+    host: &Host,
+    request_id: u64,
+    window: kr_protocol::ids::ActionWindowId,
+    text: &str,
+) -> MutationRequest {
+    MutationRequest {
+        request_id: RequestId::new(request_id),
+        method: Method::AgentPromptQueue.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::some(instance()),
+            agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: window,
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&AgentPromptParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            draft_id: Nullable::null(),
+            text: Nullable::some(PromptText::new(text).expect("valid")),
+        })
+        .expect("encodes"),
+    }
+}
+
+/// The sender identifier a channel tells the application for one actor: the first sixteen
+/// hexadecimal digits of the digest of the actor's identifier, computed here with the digest
+/// itself and not with the host's own function.
+fn sender_id_of(actor: &kr_protocol::ids::ActorId) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(actor.as_str().as_bytes())
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// How many result rows the journal's file holds for one action.
+fn result_rows(host: &Host, action_id: kr_protocol::ids::ActionId) -> i64 {
+    rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal's file opens")
+        .query_row(
+            "SELECT COUNT(*) FROM results WHERE action_id = ?1",
+            [action_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the results are counted")
+}
+
+/// KR-REQ-12.26: a message a client queues on a Channels session goes out as the application's
+/// message with the sender the host verified, and ends as an outcome nobody can establish: the
+/// receipt reads unknown and holds no result, its provenance is a channel's, a second connection
+/// reads the same receipt, and the sender's identifier is the digest of the receipt's own actor.
+/// A paired device's message goes out as the device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_a_channel_prompt_is_unknown_after_the_write_and_never_applied() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+    let window = client.action_window().action_window_id.clone();
+
+    let mutation = queue_mutation(&host, 60, window, "hello from the owner");
+    let action_id = mutation.action_id;
+    let Outcome::Error(error) = send(&mut client, mutation).await else {
+        panic!("a message on a channel ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    let held = receipt(&mut client, action_id).await;
+    assert_eq!(held.state, ReceiptState::Unknown, "never applied");
+    assert_eq!(result_rows(&host, action_id), 0, "no result is held");
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel",
+            "params": {
+                "content": "hello from the owner",
+                "meta": { "sender": "local_user", "sender_id": sender_id_of(&held.actor_id) },
+            },
+        })
+    );
+    assert_eq!(
+        stored_provenance(&host, action_id).as_deref(),
+        Some("authenticated_hook_response"),
+        "a message written on a channel records a channel's provenance"
+    );
+    let mut second = cli(&host).await;
+    assert_eq!(
+        receipt(&mut second, action_id).await.state,
+        ReceiptState::Unknown,
+        "a second connection reads the same receipt"
+    );
+
+    let mut daemon = daemon(&host).await;
+    let phone = queue_mutation(
+        &host,
+        61,
+        kr_protocol::ids::ActionWindowId::new("forwarded").expect("a window"),
+        "hello from the phone",
+    );
+    let error = forward_as_device(
+        &mut daemon,
+        &phone,
+        &[kr_protocol::rights::ActionRight::AgentPrompt],
+    )
+    .await
+    .expect_err("a message on a channel ends as an outcome nobody can establish");
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel",
+            "params": {
+                "content": "hello from the phone",
+                "meta": { "sender": "paired_device", "sender_id": "8dea4a0a91fb8dda" },
+            },
+        })
+    );
+    assert_eq!(
+        receipt_of_the_device(&mut daemon, phone.action_id)
+            .await
+            .state,
+        ReceiptState::Unknown
+    );
+}
+
+/// KR-REQ-12.26: a message that ended unknown does not hold the next one: a second message with a
+/// new action identifier from the same actor to the same session is admitted and written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_a_second_message_is_admitted_after_the_first_ended_unknown() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+    for (request_id, text) in [(60, "first"), (61, "second")] {
+        let window = client.action_window().action_window_id.clone();
+        let mutation = queue_mutation(&host, request_id, window, text);
+        let action_id = mutation.action_id;
+        let Outcome::Error(error) = send(&mut client, mutation).await else {
+            panic!("{text} ends as an outcome nobody can establish");
+        };
+        assert_eq!(
+            error.code,
+            ErrorCode::OutcomeUnknown,
+            "{text} is admitted: {error:?}"
+        );
+        assert_eq!(
+            channel.next().await["params"]["content"],
+            text,
+            "{text} is written"
+        );
+        assert_eq!(
+            receipt(&mut client, action_id).await.state,
+            ReceiptState::Unknown
+        );
+    }
+}
+
+/// KR-REQ-12.26: a message whose write was still waiting when the channel ended is unknown and
+/// never applied or refused. The writer is held; the message is queued and its receipt reads
+/// dispatching; the channel ends and the writer is let go; the receipt reads unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_a_prompt_whose_write_failed_after_admission_is_unknown_not_applied() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+    let mut watcher = cli(&host).await;
+    let (arrived, release) = host.service.broker().pause_before_channel_write();
+
+    let window = client.action_window().action_window_id.clone();
+    let mutation = queue_mutation(&host, 60, window, "held at the write");
+    let action_id = mutation.action_id;
+    client
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("writes the mutation");
+    let reached = tokio::time::timeout(LIVENESS_DEADLINE, arrived).await;
+    assert!(
+        matches!(reached, Ok(Ok(_))),
+        "the writer reached the message: {reached:?}"
+    );
+    assert_eq!(
+        receipt(&mut watcher, action_id).await.state,
+        ReceiptState::Dispatching,
+        "the message is queued and not yet written"
+    );
+
+    drop(channel);
+    let _ = release.send(());
+    let outcome = loop {
+        match client.recv().await.expect("the worker answers") {
+            ControlFrame::Response(response) => break response.outcome,
+            ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    };
+    let Outcome::Error(error) = outcome else {
+        panic!("a message whose write was cut ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut watcher, action_id).await.state,
+        ReceiptState::Unknown,
+        "never applied and never refused"
+    );
+}
+
+/// KR-REQ-12.26: a prompt to a typed upstream needs no sender identity: a caller that entered as a
+/// workflow, with no device and no grant, is admitted and carried by the typed transport as it
+/// was, and the admission keeps the typed transport's provenance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_a_prompt_to_a_typed_rpc_upstream_needs_no_sender_identity() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let broker = host.service.broker();
+    let caller = kr_worker::broker::Caller {
+        actor_id: kr_protocol::ids::ActorId::new("automation-1").expect("valid"),
+        grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::Workflow,
+        device_id: None,
+    };
+    let params = AgentPromptParams {
+        target: AgentMutationTarget {
+            subject: subject(host.session_id, instance()),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        draft_id: Nullable::null(),
+        text: Nullable::some(PromptText::new("run the checks").expect("valid")),
+    };
+    let admitted = broker
+        .admit_prompt(&caller, &params, false, TimestampMs::new(5))
+        .expect("a typed upstream admits it");
+    assert_eq!(
+        admitted.provenance(),
+        kr_protocol::broker::ActionProvenance::UpstreamTypedRpc
+    );
+    broker
+        .dispatch_mutation(&admitted, TimestampMs::new(5))
+        .expect("the typed transport takes it")
+        .settled()
+        .await
+        .expect("and answers");
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
