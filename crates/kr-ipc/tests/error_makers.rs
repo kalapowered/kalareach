@@ -50,7 +50,7 @@ use kr_ipc::error::ErrorSource;
 const ROOTS: [&str; 2] = ["crates", "apps"];
 
 /// The variants of the error.
-const VARIANTS: [&str; 22] = [
+const VARIANTS: [&str; 23] = [
     "Io",
     "Socket",
     "DirectoryNotOwnerOnly",
@@ -67,6 +67,7 @@ const VARIANTS: [&str; 22] = [
     "HostRefused",
     "EnvironmentPrefixCollision",
     "UntrustedFile",
+    "Listen",
     "RightNotForwarded",
     "UnretainedLevel",
     "NotInLevel",
@@ -76,7 +77,12 @@ const VARIANTS: [&str; 22] = [
 ];
 
 /// The constructors that make a variant, as they are called.
-const CONSTRUCTORS: [(&str, &str); 3] = [("io", "Io"), ("socket", "Socket"), ("stream", "Socket")];
+const CONSTRUCTORS: [(&str, &str); 4] = [
+    ("io", "Io"),
+    ("socket", "Socket"),
+    ("stream", "Socket"),
+    ("listen", "Listen"),
+];
 
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")

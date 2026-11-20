@@ -60,6 +60,7 @@ use std::path::Path;
 use kr_cbor::CborError;
 use kr_crypto::CryptoError;
 use kr_ipc::IpcError;
+use kr_ipc::listen::{ListenRefusal, Part};
 use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::FrameError;
 use kr_transport::TransportError;
@@ -353,6 +354,7 @@ impl Shown {
                 *received,
                 *expected
             ),
+            IpcError::Listen { endpoint, refusal } => Self::listen(endpoint, refusal, None),
             IpcError::UntrustedFile { path, reason } => {
                 crate::shown!("{}: {}", Self::host_path(path), *reason)
             }
@@ -828,6 +830,31 @@ impl Shown {
             })
             .collect::<Vec<_>>();
         Self::decided(assemble(start, &pieces, std::path::MAIN_SEPARATOR_STR))
+    }
+
+    /// What a refused bind says: the class's words from `kr-ipc`, filled with the address as
+    /// [`Self::host_path`] says it and the parts the class lists, and the words that tell the
+    /// person what to do next when the caller gives them and the class has an instruction.
+    ///
+    /// The words are the ones every other speaker of the refusal says, since `kr-ipc` writes them
+    /// once; a case holds this reducer and the host's composer equal for every class.
+    #[must_use]
+    pub fn listen(endpoint: &str, refusal: &ListenRefusal, then: Option<&'static str>) -> Self {
+        let words = refusal.words();
+        let mut said = vec![Self::host_path(Path::new(endpoint))];
+        for part in refusal.parts() {
+            said.push(match part {
+                Part::Words(words) => Self::said(words),
+                Part::Number(number) => Self::decided(number.to_string()),
+                Part::Os(os) => Self::io(&std::io::Error::from_raw_os_error(os)),
+            });
+        }
+        let parts: Vec<&dyn Plain> = said.iter().map(|part| part as &dyn Plain).collect();
+        let sentence = Self::compose(words.template, &parts);
+        match (words.joiner, then) {
+            (Some(joiner), Some(then)) => Self::decided(format!("{sentence}{joiner}{then}")),
+            _ => sentence,
+        }
     }
 
     /* ---------------------------------------------------------------------- */
@@ -1686,6 +1713,65 @@ mod tests {
         assert_eq!(holes("{0}"), None);
         assert_eq!(holes("{:?}"), None);
         assert_eq!(holes("a lone }"), None);
+    }
+
+    /// The command line and the host say the same words for every class of refusal: the class's
+    /// template is written once in `kr-ipc`, and the two speakers fill it from the same parts.
+    #[test]
+    fn the_cli_and_the_host_say_the_same_words_for_every_class() {
+        use kr_ipc::listen::{ListenStep, ObjectKind};
+
+        let mut classes = vec![
+            ListenRefusal::Held { pid: Some(4242) },
+            ListenRefusal::Held { pid: None },
+            ListenRefusal::LockHeld,
+            ListenRefusal::Unanswered,
+            ListenRefusal::NotRemoved { os: 13 },
+            ListenRefusal::NameTaken,
+            ListenRefusal::Occupied,
+            ListenRefusal::Other {
+                operation: ListenStep::Permissions,
+                os: None,
+            },
+        ];
+        for object in [
+            ObjectKind::File,
+            ObjectKind::Directory,
+            ObjectKind::Link,
+            ObjectKind::Other,
+        ] {
+            classes.push(ListenRefusal::NotASocket { object });
+        }
+        for operation in [
+            ListenStep::Inspect,
+            ListenStep::Probe,
+            ListenStep::Lock,
+            ListenStep::Bind,
+        ] {
+            classes.push(ListenRefusal::Other {
+                operation,
+                os: Some(2),
+            });
+        }
+        // Names the tree writes, so the command line says the path whole.
+        let endpoint = "/run/r.sock";
+        for refusal in classes {
+            let host = refusal.said(endpoint);
+            assert_eq!(
+                Shown::listen(endpoint, &refusal, None).as_str(),
+                host,
+                "{refusal:?}"
+            );
+            assert_eq!(
+                Shown::listen(endpoint, &refusal, Some("run the command again")).as_str(),
+                refusal.said_then(endpoint, "run the command again"),
+                "{refusal:?}"
+            );
+            // The error the bind returns says the same, through the reducer of a local failure.
+            let error = IpcError::listen(endpoint, refusal.clone());
+            assert_eq!(Shown::ipc(&error).as_str(), host, "{refusal:?}");
+            assert_eq!(error.to_string(), host, "{refusal:?}");
+        }
     }
 
     #[test]

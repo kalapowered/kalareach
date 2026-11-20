@@ -75,6 +75,7 @@ pub mod identity;
 #[cfg(all(unix, not(any(target_os = "ios", target_os = "android"))))]
 pub mod inheritance;
 pub mod install;
+pub mod listen;
 #[cfg(windows)]
 pub mod memory_limit;
 pub mod paths;

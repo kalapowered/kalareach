@@ -83,14 +83,13 @@ crates/kr-ipc/src/endpoint.rs | Connection::peer | PeerUnknown | 2 | own | own |
 crates/kr-ipc/src/endpoint.rs | Connection::writability | Socket | 1 | stream | own | greeting+request | agrees
 crates/kr-ipc/src/endpoint.rs | EndpointGuard::take | Io | 2 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | Listener::accept | Socket | 3 | stream | own | - | agrees
-crates/kr-ipc/src/endpoint.rs | Listener::bind | Socket | 1 | stream | own | - | agrees
-crates/kr-ipc/src/endpoint.rs | Listener::bind_with_descriptor | Socket | 5 | stream | own | - | agrees
-crates/kr-ipc/src/endpoint.rs | probe | Socket | 4 | connect | closure+own | - | by-kind
-crates/kr-ipc/src/endpoint.rs | replace_stale_socket | Io | 2 | own | own | - | agrees
-crates/kr-ipc/src/endpoint.rs | replace_stale_socket | Socket | 1 | stream | own | - | agrees
-crates/kr-ipc/src/endpoint.rs | replace_stale_socket | UntrustedFile | 1 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | Listener::bind_with_descriptor | Listen | 2 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | refused | Listen | 1 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | refused_by | Listen | 1 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | replace_stale_socket | Listen | 3 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | set_owner_only | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | socket_identity | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/error.rs | IpcError::listen | Listen | 1 | own | own | - | agrees
 crates/kr-ipc/src/error.rs | IpcError::#[from] | Frame | 1 | conversion | closure+own | greeting+request | differs   # a frame codec failure turned in by ? or into: the decode of what arrived (closure), the encode of this side's request (own)
 crates/kr-ipc/src/error.rs | IpcError::from | Frame | 1 | conversion | closure+own | request | differs   # a codec failure: the encode of this side's frame (own) and a decode of a retained value (closure)
 crates/kr-ipc/src/error.rs | IpcError::from | NotInLevel | 1 | conversion | own | request | agrees   # the encode of this side's frame names a field that is not in the level
@@ -152,6 +151,6 @@ crates/kr-ipc/src/starter.rs | read_claim | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/starter.rs | take_claim | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/verify.rs | IpcError::from | IdentityUnavailable | 1 | conversion | own | - | agrees   # the verification of a worker's identity
 crates/kr-plugin-service/src/client.rs | write_offered | PeerClosed | 2 | stream | closure | - | agrees
-crates/kr-shell-integration/src/host/endpoint.rs | occupied | Socket | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
+crates/kr-shell-integration/src/host/endpoint.rs | occupied | Listen | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-shell-integration/src/host/startup.rs | EntryRecord::hold | Io | 1 | own | own | - | agrees
 crates/kr-shell-integration/src/host/terminal_profile/record.rs | ProfileRecord::hold | Io | 1 | own | own | - | agrees

@@ -233,11 +233,21 @@ fn spare_basename() -> String {
     format!("b{short}")
 }
 
-/// Returns whether a bind failed because a live listener already holds the address.
+/// Returns whether a bind failed because a listener may already hold the address, which asks for
+/// another name: a listener answered, its lock file is held, or nothing could say that one has
+/// ended. A pipe name that exists on Windows is not told from a pipe another account made first,
+/// so it asks for no other name there.
 fn occupied(error: &kr_ipc::IpcError) -> bool {
+    use kr_ipc::listen::ListenRefusal;
+
     matches!(
         error,
-        kr_ipc::IpcError::Socket { source, .. } if source.kind() == std::io::ErrorKind::AddrInUse
+        kr_ipc::IpcError::Listen {
+            refusal: ListenRefusal::Held { .. }
+                | ListenRefusal::LockHeld
+                | ListenRefusal::Unanswered,
+            ..
+        }
     )
 }
 

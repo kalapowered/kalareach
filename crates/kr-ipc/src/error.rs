@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use kr_protocol::error::{ErrorCode, ProtocolError};
 
+use crate::listen::ListenRefusal;
+
 /// A local IPC failure.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -134,6 +136,17 @@ pub enum IpcError {
         /// Bytes the frame declared.
         expected: usize,
     },
+    /// A local endpoint could not be bound, and why.
+    ///
+    /// The refusal is read from the evidence of the bind; its words are the class's own
+    /// ([`ListenRefusal::said`]), which start with the endpoint.
+    #[error("{}", .refusal.said(.endpoint))]
+    Listen {
+        /// The address, as text.
+        endpoint: String,
+        /// Why the bind was refused.
+        refusal: ListenRefusal,
+    },
     /// A published file is not one this host may act on.
     #[error("{path}: {reason}")]
     UntrustedFile {
@@ -208,6 +221,14 @@ pub enum ErrorSource {
 }
 
 impl IpcError {
+    /// Builds the refusal of a bind.
+    pub fn listen(endpoint: impl Into<String>, refusal: ListenRefusal) -> Self {
+        Self::Listen {
+            endpoint: endpoint.into(),
+            refusal,
+        }
+    }
+
     /// Builds a filesystem failure.
     pub fn io(operation: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::Io {
@@ -243,8 +264,12 @@ impl IpcError {
             Self::Socket { source, .. } if carries_account_refusal(source) => {
                 ErrorCode::PermissionDenied
             }
+            Self::Listen { refusal, .. } if refusal.is_refusal_to_act() => {
+                ErrorCode::PermissionDenied
+            }
             Self::Io { .. }
             | Self::Socket { .. }
+            | Self::Listen { .. }
             | Self::IdentityUnavailable { .. }
             | Self::HostRefused { .. } => ErrorCode::ResourceUnavailable,
             Self::DirectoryNotOwnerOnly { .. }
@@ -326,6 +351,7 @@ impl IpcError {
             | Self::PeerUnknown { .. }
             | Self::PeerAccountRejected { .. }
             | Self::EnvironmentPrefixCollision { .. }
+            | Self::Listen { .. }
             | Self::UntrustedFile { .. }
             | Self::RightNotForwarded(_)
             | Self::UnretainedLevel { .. }
