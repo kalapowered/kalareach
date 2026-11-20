@@ -79,6 +79,11 @@ impl VoiceActor {
 /// made under the state then in force.
 const CONTEXT_READS: usize = 3;
 
+/// What a device is told when privacy mode changed while its context was read or while the answer
+/// waited to be written: no context was sent.
+pub(crate) const CONTEXT_MOVED: &str =
+    "privacy mode changed while the context was read, so none was sent; ask again";
+
 /// The environment's voice service.
 #[derive(Debug)]
 pub struct VoiceModule {
@@ -272,9 +277,10 @@ impl VoiceModule {
     /// observed, and privacy mode removes both when it is enabled. A reading is made after the
     /// state is noted, and it is given only if privacy mode is still in that state when it ends:
     /// otherwise it is made again, under the state now in force, which carries neither while
-    /// privacy mode is on. A device's answer is checked once, when the read ends, and privacy mode
-    /// can be enabled between that check and the write; an answer the privacy state keeps moving
-    /// under is refused for the device to ask again.
+    /// privacy mode is on. A device's answer is checked when the read ends and again where the
+    /// frame is written, which holds the privacy state the read began under: a state that has
+    /// moved by then replaces the frame with the same refusal ([`CONTEXT_MOVED`]). An answer the
+    /// privacy state keeps moving under is refused for the device to ask again.
     async fn context_unmoved(
         &self,
         device_id: DeviceId,
@@ -293,8 +299,7 @@ impl VoiceModule {
         }
         Err(ControllerError::Refused {
             code: ErrorCode::ResourceUnavailable,
-            detail: "privacy mode changed while the context was read, so none was sent; ask again"
-                .to_owned(),
+            detail: CONTEXT_MOVED.to_owned(),
         })
     }
 
