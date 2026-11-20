@@ -154,6 +154,12 @@ fn a_repository_with_no_root_manifest_maps_each_workspace_its_plan_names() {
     assert_eq!(sources(&map, "KR-REQ-03.02"), ["first/tests/flow.rs:5"]);
     assert_eq!(sources(&map, "KR-REQ-04.01"), ["second/tests/flow.rs:1"]);
     assert_eq!(sources(&map, "KR-REQ-04.02"), ["second/tests/flow.rs:5"]);
+    let workspaces: Vec<(&str, &str)> = map
+        .packages
+        .iter()
+        .map(|package| (package.name.as_str(), package.workspace.as_str()))
+        .collect();
+    assert_eq!(workspaces, [("alpha", "first"), ("beta", "second")]);
     let (code, stdout, stderr) = program(&["map", "--root", &root.to_string_lossy()]);
     assert_eq!(code, Some(0), "{stdout}{stderr}");
     assert!(
@@ -413,6 +419,13 @@ fn a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names() {
     let map = map_of(&root, load(&root), Some(&compiler()), true);
     assert!(map.problems.is_empty(), "{:?}", map.problems);
     assert_eq!(sources(&map, "KR-REQ-05.01"), ["web/forms.test.ts:3"]);
+    assert!(
+        map.typescript_version
+            .as_deref()
+            .is_some_and(|version| version.starts_with(|first: char| first.is_ascii_digit())),
+        "the compiler's version is recorded: {:?}",
+        map.typescript_version
+    );
     let (code, stdout, stderr) = program(&[
         "map",
         "--root",

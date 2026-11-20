@@ -21,7 +21,7 @@ use kr_conformance::libtest::{Binary, Outcome as LibtestOutcome};
 use kr_conformance::map::Key;
 use kr_conformance::map::{self, Binding, Declarations, Map, Place, TypeScriptRead};
 use kr_conformance::plan::{self, Platform, Reading, Step};
-use kr_conformance::plan_file::{IgnoredRun, Plan, Runs};
+use kr_conformance::plan_file::{IgnoredRun, Plan, Runs, TerminalProfileFile};
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Stopped, Verdict};
 use kr_conformance::run::Executed;
 use kr_conformance::workspace::{TargetId, TargetKind};
@@ -116,6 +116,20 @@ fn run_step_through(
     arguments: &[&str],
     lister: PathBuf,
 ) -> Result<(Document, tempfile::TempDir), Stopped> {
+    let plan = Plan::of_steps(
+        "rust",
+        vec![Step::cargo("rust", "the tree's tests", arguments)],
+    );
+    run_plan_through(name, plan, lister)
+}
+
+/// Runs the report over `name` with `plan`, `lister` being the program Cargo runs each test binary
+/// through.
+fn run_plan_through(
+    name: &str,
+    plan: Plan,
+    lister: PathBuf,
+) -> Result<(Document, tempfile::TempDir), Stopped> {
     let evidence = tempfile::Builder::new()
         .prefix("kr-conformance-evidence.")
         .tempdir()
@@ -131,10 +145,7 @@ fn run_step_through(
         platform: Platform::current(),
         typescript_compiler: None,
         applications: None,
-        plan: Plan::of_steps(
-            "rust",
-            vec![Step::cargo("rust", "the tree's tests", arguments)],
-        ),
+        plan,
         lister,
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -144,6 +155,41 @@ fn run_step_through(
         runner_base: base.path().to_path_buf(),
     };
     report::run(&options, &mut |_| {}).map(|document| (document, evidence))
+}
+
+/// KR-REQ-29.01, the part about reproducible commands and the identity of a run: the terminal
+/// profile of a result is read from the file the plan names, relative to the tested root, and a
+/// file that is not there gives `unknown`.
+#[test]
+fn the_terminal_profile_of_a_result_is_what_the_file_the_plan_names_holds() {
+    let step = || {
+        vec![Step::cargo(
+            "rust",
+            "the tree's tests",
+            &["test", "--locked"],
+        )]
+    };
+    for (path, profile, term) in [
+        ("profile.json", "xterm-test/1", "xterm-256color"),
+        ("absent.json", "unknown", "unknown"),
+    ] {
+        let plan = Plan {
+            terminal_profile: Some(TerminalProfileFile {
+                path: path.to_owned(),
+            }),
+            ..Plan::of_steps("rust", step())
+        };
+        let (document, _evidence) = run_plan_through("forms", plan, lister())
+            .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+        let recorded = document
+            .run
+            .terminal_profile
+            .expect("the plan names a file");
+        assert_eq!(
+            (recorded.profile.as_str(), recorded.term.as_str()),
+            (profile, term)
+        );
+    }
 }
 
 /// KR-REQ-29.01, the part about mapping tests to acceptance identifiers: a key written in each
