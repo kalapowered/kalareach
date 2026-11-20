@@ -47,10 +47,10 @@ use std::ops::ControlFlow;
 
 use kr_project::{OpenedRepository, RestrictedProfile};
 use kr_protocol::changeset::{
-    AffectedVersion, ApplyOutcomeClass, CapturePolicy, CapturedPath, ChangeSetVersionRecord,
-    ContentOrigin, DestinationClass, DiffApplyResult, DiffEntry, DiffReadResult, ExpectedReference,
-    FileGrant, MAX_CHANGESET_ENTRIES, PathClass, PathConflict, PathProgress, PathProgressState,
-    Provenance, RecoveryObjects, ReferenceOutcome, SourceConsistency, VersionRef,
+    AffectedVersion, ApplyOutcomeClass, CapturedPath, ChangeSetVersionRecord, ContentOrigin,
+    DestinationClass, DiffApplyResult, DiffEntry, DiffReadResult, ExpectedReference, FileGrant,
+    MAX_CHANGESET_ENTRIES, PathClass, PathConflict, PathProgress, PathProgressState, Provenance,
+    RecoveryObjects, ReferenceOutcome, SourceConsistency, VersionRef,
 };
 use kr_protocol::ids::{ActionId, WorkspaceId};
 use kr_protocol::project::{ChangeKind, ContentClass, InclusionChoice, InclusionPolicy};
@@ -3753,35 +3753,6 @@ pub fn read_apply(service: &ChangeSetService, action_id: ActionId) -> Result<Dif
         detail: row.detail,
         decided_at_ms: row.decided_at_ms.unwrap_or(row.started_at_ms),
     })
-}
-
-/// The policy a version is captured under when the capture is of a whole destination.
-///
-/// Exposed so a caller that wants the same reading a recovery object is taken under can ask for
-/// it, rather than guessing which classes a "before" version holds.
-#[must_use]
-pub fn destination_policy() -> (InclusionPolicy, CapturePolicy) {
-    let inclusion = InclusionPolicy {
-        dirty_files: InclusionChoice::Include,
-        untracked_files: InclusionChoice::Include,
-        submodules: InclusionChoice::Include,
-        binary_files: InclusionChoice::Include,
-        generated_artefacts: InclusionChoice::Include,
-    };
-    (
-        inclusion,
-        CapturePolicy {
-            inclusion,
-            grant: FileGrant {
-                included_paths: Vec::new(),
-                excluded_paths: Vec::new(),
-                secret_rules_applied: true,
-            },
-            quiescence_declared: false,
-            quiescence_held: false,
-            required_consistency: Nullable(None),
-        },
-    )
 }
 
 #[cfg(test)]

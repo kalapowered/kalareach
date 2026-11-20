@@ -1864,26 +1864,6 @@ impl Store {
         Ok(())
     }
 
-    /// Takes one action's claim away, for an effect that decided nothing this host should keep.
-    ///
-    /// A preflight conflict is the case this exists for: section 14 says it returns
-    /// `DRAFT_CONFLICT` with **no KR writes**, so the claim that was taken to arbitrate it is
-    /// given back rather than recorded as an outcome.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn release_action(&self, actor_id: &ActorId, action_id: Uuid) -> Result<()> {
-        self.connection
-            .execute(
-                "DELETE FROM actions WHERE actor_id = ?1 AND action_id = ?2
-                   AND result IS NULL AND error_code IS NULL",
-                params![actor_id.as_str(), action_id.as_bytes().to_vec()],
-            )
-            .map_err(ChangeSetError::store)?;
-        Ok(())
-    }
-
     /// Returns one action's claim when it is open, for a recovery that has to settle it.
     ///
     /// # Errors
@@ -2104,28 +2084,6 @@ impl Store {
             }
             Ok(())
         })
-    }
-
-    /// Records one path as planned, before anything is attempted for it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn plan_path(&self, action_id: ActionId, path: &str) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT OR REPLACE INTO apply_progress
-                   (action_id, path, state, before_digest, after_digest, detail)
-                 VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
-                params![
-                    uuid_bytes(action_id.get()),
-                    path,
-                    progress_text(PathProgressState::Planned),
-                    "this host recorded that it was going to write this path",
-                ],
-            )
-            .map_err(ChangeSetError::store)?;
-        Ok(())
     }
 
     /// Replaces one path's progress with the outcome this host established.
@@ -2410,21 +2368,6 @@ impl Store {
             )
             .map_err(ChangeSetError::store)?;
         transaction.commit().map_err(ChangeSetError::store)
-    }
-
-    /// Records the staging directory one apply's validated content went through.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn set_staged_name(&self, action_id: ActionId, name: Option<&str>) -> Result<()> {
-        self.connection
-            .execute(
-                "UPDATE applies SET staged_name = ?2 WHERE action_id = ?1",
-                params![uuid_bytes(action_id.get()), name],
-            )
-            .map_err(ChangeSetError::store)?;
-        Ok(())
     }
 
     /// Returns one apply.
