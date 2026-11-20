@@ -182,16 +182,6 @@ pub struct RecordedIdentity {
 }
 
 impl RecordedIdentity {
-    /// Returns the identity a record holds when it carries no filesystem: what a record written
-    /// before filesystem identities were recorded holds.
-    #[must_use]
-    pub const fn without_filesystem(object: ObjectIdentity) -> Self {
-        Self {
-            object,
-            filesystem: None,
-        }
-    }
-
     /// Returns the identity that the three stored parts make.
     #[must_use]
     pub const fn from_parts(device: u64, file_id: u64, filesystem: Option<FilesystemId>) -> Self {

@@ -42,15 +42,6 @@ pub const fn wire_identity(identity: ObjectIdentity) -> FilesystemIdentity {
     }
 }
 
-/// Returns the internal form of one filesystem identity.
-#[must_use]
-pub const fn object_identity(identity: FilesystemIdentity) -> ObjectIdentity {
-    ObjectIdentity {
-        device: identity.device.get(),
-        file_id: identity.file_id.get(),
-    }
-}
-
 /// What one repository's two identities are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RepositoryIdentity {
@@ -268,7 +259,6 @@ pub struct OpenedRepository {
     own_dir: AuthorisedDirectory,
     identity: RepositoryIdentity,
     git_dir_path: PathBuf,
-    own_dir_path: PathBuf,
     top_level: PathBuf,
     audit: ConfigurationAudit,
     /// Where Git's search for this repository stops, given to every invocation against it: the
@@ -491,7 +481,6 @@ impl OpenedRepository {
                 own_dir,
                 identity,
                 git_dir_path,
-                own_dir_path,
                 top_level,
                 audit,
                 ceiling,
@@ -537,7 +526,6 @@ impl OpenedRepository {
     ) -> Result<(Self, GitDirOutcome)> {
         let top_level = found.work_tree.display_path().to_path_buf();
         let git_dir_path = found.common_dir.display_path().to_path_buf();
-        let own_dir_path = found.git_dir.display_path().to_path_buf();
         let settled_git_dir = match git_dir {
             Some(rule) => rule.decide(&found.work_tree, &found.common_dir, &top_level)?,
             None => GitDirOutcome::Undecided,
@@ -574,7 +562,6 @@ impl OpenedRepository {
                 own_dir: found.git_dir,
                 identity,
                 git_dir_path,
-                own_dir_path,
                 top_level,
                 audit,
                 ceiling,
@@ -751,17 +738,6 @@ impl OpenedRepository {
     #[must_use]
     pub const fn own_dir(&self) -> &AuthorisedDirectory {
         &self.own_dir
-    }
-
-    /// Returns **this working tree's own** Git directory, which a split repository keeps apart
-    /// from the one every worktree of it shares.
-    ///
-    /// The same path as [`Self::git_dir_path`] in an ordinary repository, and a different one in a
-    /// linked worktree or a repository that was made with the two apart. A caller excluding a
-    /// repository's administrative data has to know both, because both hold it.
-    #[must_use]
-    pub fn own_dir_path(&self) -> &Path {
-        &self.own_dir_path
     }
 
     /// Returns what this repository's configuration named.
@@ -1561,8 +1537,14 @@ pub(crate) mod tests {
         // A record made before filesystems were recorded is decided by its numbers, and takes the
         // filesystem the repository is found on.
         let before = RecordedRepository {
-            git_dir: RecordedIdentity::without_filesystem(recorded_now.git_dir.object),
-            work_tree: RecordedIdentity::without_filesystem(recorded_now.work_tree.object),
+            git_dir: RecordedIdentity {
+                object: recorded_now.git_dir.object,
+                filesystem: None,
+            },
+            work_tree: RecordedIdentity {
+                object: recorded_now.work_tree.object,
+                filesystem: None,
+            },
         };
         assert_eq!(
             opened.require_identity(before).expect("made before"),
@@ -1646,7 +1628,6 @@ pub(crate) mod tests {
         let wire = wire_identity(identity);
         assert_eq!(wire.device.get(), 16_777_234);
         assert_eq!(wire.file_id.get(), 92_143_887);
-        assert_eq!(object_identity(wire), identity);
     }
 
     /// KR-REQ-14.27: a reference update that Git may have made is not reported as one it refused.
