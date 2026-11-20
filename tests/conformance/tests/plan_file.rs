@@ -684,28 +684,37 @@ fn a_plan_option_without_a_path_is_a_usage_error_for_map_and_run() {
     }
 }
 
-/// No constant or static of the plan or the report holds a step, a table row or a reason, and the
-/// code names none of the groups that carry behaviour: the plan file is the one place for both.
+/// No constant or static of the harness's sources holds a step, a table row or a reason, no code
+/// outside a test builds a step by hand, and the code names none of the groups that carry
+/// behaviour: the plan file is the one place for all three.
 #[test]
 fn the_tables_are_not_in_the_code() {
-    // The names of two variables, the schema's version, and the two `const fn` of `Platform`.
+    // The names of two variables, the schema's version, the two `const fn` of `Platform`, the
+    // loader's own constants, and the reach and the characters the ignored-test reader holds.
     let kept = [
         "SECRET_STORE_VARIABLE",
         "APPLICATIONS_VARIABLE",
         "SCHEMA",
         "current",
         "name",
+        "PLAN_PATH",
+        "PROGRAMS",
+        "PLACEHOLDERS",
+        "HELPER_REACH",
+        "UNREAD",
     ];
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut found = Vec::new();
-    for file in ["plan.rs", "report.rs"] {
+    for file in [
+        "plan.rs",
+        "report.rs",
+        "plan_file.rs",
+        "main.rs",
+        "ignored.rs",
+    ] {
         let text = std::fs::read_to_string(source.join(file)).expect("the source");
         for (index, line) in text.lines().enumerate() {
-            let words: Vec<&str> = line
-                .trim_start()
-                .trim_start_matches("pub ")
-                .split_whitespace()
-                .collect();
+            let words: Vec<&str> = without_visibility(line).split_whitespace().collect();
             let (Some(&("const" | "static")), rest) = (words.first(), &words[1.min(words.len())..])
             else {
                 continue;
@@ -738,8 +747,31 @@ fn the_tables_are_not_in_the_code() {
                 }
             }
         }
+        // Only a test builds a step by hand: the code takes its steps from the plan file.
+        let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+        for (index, line) in code.lines().enumerate() {
+            if line.contains("Step::cargo(") && !line.trim_start().starts_with("//") {
+                found.push(format!(
+                    "{}:{}: builds a step outside the plan file",
+                    path.display(),
+                    index + 1
+                ));
+            }
+        }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// The line without its visibility: `pub`, `pub(crate)`, `pub(super)` or `pub(in path)`.
+fn without_visibility(line: &str) -> &str {
+    let line = line.trim_start();
+    match line.strip_prefix("pub") {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        Some(rest) if rest.starts_with('(') => rest
+            .split_once(')')
+            .map_or(line, |(_, after)| after.trim_start()),
+        _ => line,
+    }
 }
 
 /// What each selection of core's groups decides: whether the run reads TypeScript, selects the
