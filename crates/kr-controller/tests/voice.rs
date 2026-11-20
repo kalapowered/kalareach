@@ -3799,6 +3799,52 @@ async fn a_second_call_of_the_same_stand_in_registers_open_after_the_first_close
     assert_eq!(state, VoiceHostCallState::Open);
 }
 
+/// The stand-in shows the side channel of the call it started last, also from the tenth call on,
+/// when the identifier `own-10` sorts before `own-9`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stand_in_shows_the_side_channel_of_the_call_it_started_last_after_ten_calls() {
+    use kr_client::services::host_call::{HostCallControl as _, SidebandState};
+    let (provider, voice, mut call) = own_key_call().await;
+    for _ in 1..10 {
+        let _: kr_protocol::voice::VoiceStopResult = voice
+            .raw
+            .mutate(
+                Method::VoiceStop,
+                ActionId::new(kr_ipc::new_uuid()),
+                voice.target.clone(),
+                &kr_protocol::voice::VoiceStopParams {
+                    voice_session_id: call,
+                },
+            )
+            .await
+            .expect("the call is stopped")
+            .to_typed()
+            .expect("a stop result");
+        let started: kr_protocol::voice::VoiceStartResult = voice
+            .raw
+            .mutate(
+                Method::VoiceStart,
+                ActionId::new(kr_ipc::new_uuid()),
+                voice.target.clone(),
+                &voice.start,
+            )
+            .await
+            .expect("the next call is created")
+            .to_typed()
+            .expect("a start result");
+        let VoiceStartOutcome::Started { session } = started.outcome else {
+            panic!("the next call runs: {:?}", started.outcome);
+        };
+        call = session.voice_session_id;
+    }
+    assert_eq!(provider.closed().len(), 9, "nine calls were stopped");
+    assert_eq!(
+        provider.sideband().state(),
+        SidebandState::Ready,
+        "the tenth call's side channel is the one shown"
+    );
+}
+
 /// The host ends a call whose phone went silent, and the revocation of its grant fails: the
 /// session and the grant stay and the provider's call runs. The host holds the call as closing,
 /// tells it ended once the wait for the provider's report is over, and a later close of the call
