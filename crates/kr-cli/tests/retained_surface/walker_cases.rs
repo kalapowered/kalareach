@@ -252,6 +252,31 @@ impl Holder {
     #[cfg(all(test, unix))]
     fn test_member(&self) { let _ = Method::AgentTurnCancel; }
 }
+struct Quiet;
+impl Quiet {
+    #[cfg(test)]
+    const Q: Method = Method::AgentTurnCancel;
+    #[cfg(all(test, unix))]
+    via_impl!(Method::AgentTurnSteer);
+    #[cfg(test)]
+    fn only_tests(&self) {}
+    #[cfg(all(test, unix))]
+    fn also_tests(&self) {}
+    fn product_method(&self) {}
+}
+#[cfg(windows)]
+mod only_windows {
+    #[cfg(unix)]
+    fn never() { let _ = Method::AgentTurnCancel; }
+}
+fn outer() {
+    #[cfg(test)]
+    fn hidden() { let _ = Method::AgentTurnCancel; }
+}
+fn outer_live() {
+    #[cfg(unix)]
+    fn shown() { let _ = Method::AgentTurnCancel; }
+}
 trait Sends {
     fn default_method(&self) { let _ = Method::AgentTurnSteer; }
     #[cfg(test)]
@@ -417,6 +442,7 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("raw", vec![Names]),
         ("Holder::in_method", vec![Names]),
         ("Holder", vec![Names]),
+        ("outer_live", vec![Names]),
         ("Sends", vec![Names]),
         ("in_inline", vec![Request]),
         ("builds_request", vec![Request]),
@@ -491,6 +517,15 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
             .digest,
         root_before
     );
+    // The index holds what some configuration without `test` builds, at every position: a method
+    // only test code defines, and an item under an inline module whose condition contradicts its own.
+    for name in ["never", "only_tests", "also_tests", "Quiet::only_tests"] {
+        assert_eq!(tree.item("kr_sender", name), Lookup::Absent, "{name}");
+    }
+    assert!(matches!(
+        tree.item("kr_sender", "product_method"),
+        Lookup::Found(_)
+    ));
     // The two unnamed invocations of one file are one sighting whose text is both.
     let shown = tree
         .source("kr_sender", "unnamed! invocation @lib.rs")
