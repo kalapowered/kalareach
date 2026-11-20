@@ -405,20 +405,22 @@ pub enum Stopped {
 }
 
 /// The directories a step of `options` builds in that are known from the options, the steps and the
-/// environment: the repository, which holds the build directories the plan's scripts name, the
-/// target directory the options or the report's environment give, and the one each step is given by
-/// its own variables or the plan's (`steps` carry both). A relative one lies below the directory its
-/// step runs in. A target directory set in Cargo's configuration file is not named.
+/// environment: the repository, which holds the build directories the plan's scripts name, and the
+/// target directory each step's Cargo is given. A step's own variables (the plan's are among them)
+/// replace the options', and a name in neither is the report's environment's. A relative target
+/// directory lies below the directory its step runs in. A target directory set in Cargo's
+/// configuration file is not named.
 fn build_directories(options: &Options, steps: &[plan::Step]) -> Vec<PathBuf> {
-    let given = options
-        .environment
-        .iter()
-        .find(|(name, _)| name == "CARGO_TARGET_DIR")
-        .map(|(_, value)| std::ffi::OsString::from(value))
-        .or_else(|| std::env::var_os("CARGO_TARGET_DIR"));
-    let mut directories = directories_built_in(&options.root, given.as_deref());
+    let mut directories = vec![options.root.clone()];
     for step in steps {
-        if let Some((_, target)) = step.env.iter().find(|(name, _)| name == "CARGO_TARGET_DIR") {
+        let given = options
+            .environment
+            .iter()
+            .chain(&step.env)
+            .rfind(|(name, _)| name == "CARGO_TARGET_DIR")
+            .map(|(_, value)| std::ffi::OsString::from(value))
+            .or_else(|| std::env::var_os("CARGO_TARGET_DIR"));
+        if let Some(target) = given {
             let built = options.root.join(&step.directory).join(target);
             if !directories.contains(&built) {
                 directories.push(built);
@@ -426,14 +428,6 @@ fn build_directories(options: &Options, steps: &[plan::Step]) -> Vec<PathBuf> {
         }
     }
     directories
-}
-
-/// The repository and the target directory `given`, which a step reads from the repository: a
-/// relative one lies below it.
-fn directories_built_in(root: &Path, given: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
-    std::iter::once(root.to_path_buf())
-        .chain(given.map(|target| root.join(target)))
-        .collect()
 }
 
 /// The groups a run selects: those it names, or every group of the plan.
@@ -1977,21 +1971,6 @@ fn reproducing(runs: &[RunRecord]) -> Option<&RunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_relative_target_directory_is_read_from_the_repository_a_step_runs_in() {
-        let root = Path::new("/work/repository");
-        let given = |target: &str| directories_built_in(root, Some(std::ffi::OsStr::new(target)));
-        assert_eq!(
-            given("target"),
-            [
-                PathBuf::from("/work/repository"),
-                PathBuf::from("/work/repository/target")
-            ]
-        );
-        assert_eq!(given("/cache/target")[1], PathBuf::from("/cache/target"));
-        assert_eq!(directories_built_in(root, None).len(), 1);
-    }
 
     #[test]
     fn the_last_line_counts_one_failed_step_in_the_singular() {

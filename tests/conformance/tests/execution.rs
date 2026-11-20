@@ -52,20 +52,39 @@ fn copy_into(from: &Path, to: &Path) {
     }
 }
 
-/// A copy of the fixture `name` in a directory of its own, made a Git repository whose index holds
-/// every file the copy has when this returns.
-fn copy(name: &str) -> (tempfile::TempDir, PathBuf) {
-    let directory = tempfile::tempdir().expect("a directory");
-    let root = directory.path().canonicalize().expect("the copy's root");
+/// A copy of the fixture `name` at `root`, made a Git repository whose index holds every file the
+/// copy has when this returns.
+fn copy_to(name: &str, root: &Path) {
     copy_into(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join(name),
-        &root,
+        root,
     );
-    git(&root, &["init", "-q"]);
-    git(&root, &["add", "-A"]);
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+}
+
+/// A copy of the fixture `name` in a directory of its own, made a Git repository whose index holds
+/// every file the copy has when this returns.
+fn copy(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = directory.path().canonicalize().expect("the copy's root");
+    copy_to(name, &root);
+    (directory, root)
+}
+
+/// A copy of the fixture `name` as `tree` in a directory of its own, which holds nothing else: the
+/// repository has a sibling directory outside it.
+fn copy_beside(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = directory
+        .path()
+        .canonicalize()
+        .expect("the case's directory")
+        .join("tree");
+    copy_to(name, &root);
     (directory, root)
 }
 
@@ -320,34 +339,60 @@ fn a_run_makes_in_the_evidence_only_the_logs_and_the_directories_of_its_outputs(
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: a directory a step builds in is a directory
-/// the report's own program is not copied into, whether the plan's `[env]` or the step's `env` names
-/// it, and a relative one is read from the step's own directory.
+/// the report's own program is not copied into, whichever way the step is given it: by the plan's
+/// `[env]`, by the step's `env` or by the options the program was started with, absolute or
+/// relative, and a relative one is read from the step's own directory. Each target directory lies
+/// outside the repository, so that only the step's variables, and not the repository the guard
+/// holds in any case, can name it.
 #[test]
 fn a_runner_base_inside_a_target_directory_a_step_names_is_refused() {
-    for (name, plan_env, step_env, directory, target) in [
+    let absolute = "'{built}'";
+    let relative = "'../../built'";
+    for (name, plan_env, step_env, from_options) in [
         (
-            "the plan's env",
-            "[env]\nCARGO_TARGET_DIR = '{root}/built'\n",
-            "",
-            "directory = 'first'\n",
-            "built",
+            "the plan's env, absolute",
+            format!("[env]\nCARGO_TARGET_DIR = {absolute}\n"),
+            String::new(),
+            None,
         ),
         (
-            "a step's env",
-            "",
-            "env = { CARGO_TARGET_DIR = '{root}/built' }\n",
-            "directory = 'first'\n",
-            "built",
+            "the plan's env, relative to the step's directory",
+            format!("[env]\nCARGO_TARGET_DIR = {relative}\n"),
+            String::new(),
+            None,
         ),
         (
-            "a relative one, read from the step's directory",
-            "",
-            "env = { CARGO_TARGET_DIR = 'built' }\n",
-            "directory = 'first'\n",
-            "first/built",
+            "a step's env, absolute",
+            String::new(),
+            format!("env = {{ CARGO_TARGET_DIR = {absolute} }}\n"),
+            None,
+        ),
+        (
+            "a step's env, relative to the step's directory",
+            String::new(),
+            format!("env = {{ CARGO_TARGET_DIR = {relative} }}\n"),
+            None,
+        ),
+        (
+            "the options' variable, absolute",
+            String::new(),
+            String::new(),
+            Some("{built}"),
+        ),
+        (
+            "the options' variable, relative to the step's directory",
+            String::new(),
+            String::new(),
+            Some("../../built"),
         ),
     ] {
-        let (_directory, root) = copy("no-root-manifest");
+        // The repository is `tree` in a directory of its own, so that `built`, beside it, is
+        // outside it, and `../../built` from the step's directory `tree/first` is that directory.
+        let (case, root) = copy_beside("no-root-manifest");
+        let built = case.path().canonicalize().expect("the case").join("built");
+        let inside = built.join("work");
+        std::fs::create_dir_all(&inside).expect("a directory inside the target directory");
+        let built_text = built.to_string_lossy().replace('\\', "/");
         let text = plan_of(
             &["first/Cargo.toml", "second/Cargo.toml"],
             &format!(
@@ -357,32 +402,47 @@ group = 'rust'
 what = 'the first workspace'
 platforms = ['linux', 'macos', 'windows']
 reading = 'cargo'
-{directory}{step_env}command = ['cargo', 'test', '--locked']
+directory = 'first'
+{step_env}command = ['cargo', 'test', '--locked']
 "
-            ),
+            )
+            .replace("{built}", &built_text),
         );
         git(&root, &["add", "-A"]);
         let plan = Plan::parse(&text, &root)
             .unwrap_or_else(|refusal| panic!("{name}: the plan loads: {refusal}"));
-        let inside = root.join(target).join("work");
-        std::fs::create_dir_all(&inside).expect("a directory inside the target directory");
         let evidence = tempfile::Builder::new()
             .prefix("kr-conformance-evidence.")
             .tempdir()
             .expect("an evidence directory");
         let mut options = options(&root, plan, evidence.path(), &inside);
         options.environment.clear();
+        if let Some(value) = from_options {
+            options.environment.push((
+                "CARGO_TARGET_DIR".to_owned(),
+                value.replace("{built}", &built_text),
+            ));
+        }
         match report::run(&options, &mut |_| {}) {
             Err(Stopped::PrivateCopy(problem)) => {
-                assert!(problem.contains("where a step builds"), "{name}: {problem}");
+                assert!(
+                    problem.contains("where a step builds")
+                        && problem.contains(&built.to_string_lossy().into_owned()),
+                    "{name}: {problem}"
+                );
             }
             other => panic!("{name}: the run was not stopped by the copy: {other:?}"),
         }
+        assert!(
+            std::fs::read_dir(&inside)
+                .expect("the base")
+                .next()
+                .is_none(),
+            "{name}: the report's program was copied into the base"
+        );
     }
 }
 
-/// KR-REQ-29.01, the part about reproducible commands: what a step's output names is what the
-/// report reads, so a Vitest step and a lane step each name theirs, and core's plan does so too.
 #[test]
 fn the_vitest_and_lane_steps_of_cores_plan_each_name_their_output() {
     let text = std::fs::read_to_string(
