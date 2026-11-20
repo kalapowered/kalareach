@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kr_conformance::plan_file::Plan;
 use kr_conformance::report;
 
 fn repository() -> PathBuf {
@@ -73,12 +74,10 @@ fn every_program_is_pinned_has_cases_and_says_why_it_does_not_run_where_it_does_
             "{id} has its cases"
         );
     }
-    let recorded = report::lock_applications(
-        &repository(),
-        "tests/conformance/applications.lock",
-        "windows",
-    )
-    .expect("reads the lock");
+    let plan = Plan::load(&repository(), None).expect("core's plan file");
+    let lock = &plan.applications.as_ref().expect("the plan's lock").lock;
+    let recorded =
+        report::lock_applications(&repository(), lock, "windows").expect("reads the lock");
     assert_eq!(recorded.len(), programs.len());
     assert!(
         recorded
