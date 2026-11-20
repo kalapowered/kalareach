@@ -411,6 +411,62 @@ fn the_digest_of_a_name_only_the_scan_gives_moves_on_a_token() {
     assert_ne!(call.1, before.1);
 }
 
+const MODULE_LIB: &str = r##"
+#[cfg(test)]
+#[path = "wide/send.rs"]
+mod test_support;
+#[path = "wide/../wide/send.rs"]
+mod sender;
+#[cfg(test)]
+#[path = "dots/../only_tests.rs"]
+mod only_tests;
+#[cfg(test)]
+mod a;
+#[path = "a.rs"]
+mod b;
+#[cfg(test)]
+#[path = "folder"]
+mod holder { mod nested; }
+"##;
+
+#[test]
+fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_path_is_written() {
+    let folder = small_tree(MODULE_LIB);
+    let sends = |name: &str, method: &str| format!("fn {name}() {{ let _ = Method::{method}; }}\n");
+    for (path, text) in [
+        // Reached by a test declaration with the plain path and by a product one with dots.
+        ("wide/send.rs", sends("from_wide", "AgentTurnCancel")),
+        // Reached by a test declaration whose path has dots: nothing else reaches it.
+        ("only_tests.rs", sends("from_only_tests", "AgentTurnCancel")),
+        // Declared by a test module and by a product module with a `#[path]`: its own modules are
+        // beside it for the second and in a folder of its name for the first.
+        (
+            "a.rs",
+            format!("mod child;\n{}", sends("from_a", "AgentTurnSteer")),
+        ),
+        ("a/child.rs", sends("from_a_child", "AgentTurnCancel")),
+        ("child.rs", sends("from_beside", "AgentTurnSteer")),
+        // Under an inline module whose `#[path]` is a folder, which a test attribute marks.
+        ("folder/nested.rs", sends("from_nested", "AgentTurnCancel")),
+    ] {
+        write(
+            folder.path(),
+            &format!("crates/kr-sender/src/{path}"),
+            &text,
+        );
+    }
+    let tree = Tree::at(folder.path()).expect("the tree");
+    let sightings = tree
+        .sightings(&|krate| krate == "kr_sender")
+        .expect("the scan");
+    let found = names(&sightings, "kr_sender");
+    let expected: BTreeMap<String, Vec<SightKind>> = ["from_a", "from_beside", "from_wide"]
+        .into_iter()
+        .map(|name| (name.to_owned(), vec![SightKind::Names]))
+        .collect();
+    assert_eq!(found, expected);
+}
+
 #[test]
 fn a_root_lookup_in_a_crate_that_is_absent_or_unreadable_says_so_and_a_failed_follow_says_why() {
     let folder = small_tree("pub fn present() { kr_worker::nothing_of_this_name(); }\n");
