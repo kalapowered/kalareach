@@ -358,6 +358,8 @@ impl Anchor {
                 path.display()
             )));
         };
+        #[cfg(test)]
+        walked_pause::run(path);
         let mode = match parent.fetch(place.name, MAX_FILE_BYTES).map_err(storage)? {
             Fetched::Absent if replaces.is_none() => default_mode,
             Fetched::File(read) if replaces == Some(digest_of(&read.bytes)) => read.mode,
@@ -692,6 +694,32 @@ pub(crate) mod private_pause {
 
     pub(crate) fn run(path: &Path) {
         if let Some(then) = BEFORE_OPEN.with(|before| before.borrow_mut().take()) {
+            then(path);
+        }
+    }
+}
+
+/// What the unit tests run in a write right after its walk to the place's folder, to make the change
+/// another process could make to that folder's name in between. The hook is given the place's path.
+#[cfg(test)]
+pub(crate) mod walked_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static AFTER_WALK: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a write on this thread has walked to its folder.
+    #[cfg(unix)]
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        AFTER_WALK.with(|after| *after.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(path: &Path) {
+        if let Some(then) = AFTER_WALK.with(|after| after.borrow_mut().take()) {
             then(path);
         }
     }

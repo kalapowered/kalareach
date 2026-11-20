@@ -6397,6 +6397,437 @@ mod tests {
         );
     }
 
+    /// Sets the permission bits of `path`.
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("sets a mode");
+    }
+
+    /// The installer for the declared word `amp`, and the folder it keeps its skill in, made.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn amp_installer_with_folder(tree: &Tree) -> (Installer, PathBuf) {
+        let target = declared(
+            Some(
+                json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+            ),
+            &[".amp", "skills"],
+        );
+        let folder = tree.home().join(".amp/skills/kalareach-contact");
+        std::fs::create_dir_all(&folder).expect("the folder");
+        (
+            tree.installer().with_declaration(Some(target), Vec::new()),
+            folder,
+        )
+    }
+
+    /// What the installer says of `folder` before the marker, and what a write of a new file into it
+    /// says, in that order.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn judge_the_folder(
+        tree: &Tree,
+        installer: &Installer,
+        folder: &Path,
+    ) -> [(&'static str, Result<()>); 2] {
+        let before = installer.check(&params(amp(), InstallScope::User));
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let at_the_write = walk.write(&folder.join("SKILL.md"), b"one", 0o644, None);
+        [
+            ("before the marker", before),
+            ("at the write", at_the_write),
+        ]
+    }
+
+    /// The words of a folder refused for its write bit.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const FOLDER_WRITE_BIT: &str = "because the folder it is in lets its group or every user \
+        change what is in it, so nothing is written there";
+
+    /// KR-REQ-11.01: a write judges the folder it walked to, read through the handle it holds. A
+    /// folder another process swaps for a different one at the same name after the walk changes
+    /// nothing: an open folder is refused whatever stands at its name afterwards, and a closed one
+    /// is written into wherever its name has gone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_swapped_for_another_after_the_walk_is_judged_by_the_folder_that_was_walked() {
+        for opened in [true, false] {
+            let tree = Tree::create();
+            let folder = tree.home().join("shared");
+            let moved = tree.home().join("moved-aside");
+            std::fs::create_dir(&folder).expect("a folder");
+            let (held, swapped) = if opened {
+                (0o757, 0o755)
+            } else {
+                (0o755, 0o757)
+            };
+            set_mode(&folder, held);
+            let (at, aside) = (folder.clone(), moved.clone());
+            anchor::walked_pause::once(move |_| {
+                std::fs::rename(&at, &aside).expect("moves the folder aside");
+                std::fs::create_dir(&at).expect("puts another folder at its name");
+                set_mode(&at, swapped);
+            });
+            let walk = anchor::Anchor::open(&tree.home())
+                .expect("opens")
+                .expect("a root");
+            let place = folder.join("doc.json");
+            let written = walk.write(&place, b"one", 0o600, None);
+            if opened {
+                let refused = written.expect_err("the folder that was walked is open");
+                assert!(
+                    matches!(&refused, ControllerError::PermissionDenied { detail }
+                        if detail.contains("lets its group or every user change what is in it")),
+                    "{refused}"
+                );
+                assert!(!moved.join("doc.json").exists(), "nothing is written");
+            } else {
+                written.expect("the folder that was walked is closed");
+                assert_eq!(
+                    std::fs::read(moved.join("doc.json")).expect("a file"),
+                    b"one",
+                    "the file is in the folder that was walked"
+                );
+            }
+            assert!(
+                !place.exists(),
+                "nothing is written at the name of the folder that took its place"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: a folder that its group can change is refused before the marker and at the
+    /// write, nothing is written and no temporary entry stands.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_its_group_can_change_is_refused_before_the_marker_and_at_the_write() {
+        let tree = Tree::create();
+        let (installer, folder) = amp_installer_with_folder(&tree);
+        // On Linux a group of the user's own is the user-private group unless it is another one.
+        let Some(group) = crate::catalogue::files::another_group(&tree.home()).or_else(|| {
+            cfg!(target_os = "macos").then(|| {
+                use std::os::unix::fs::MetadataExt as _;
+                std::fs::metadata(&folder).expect("the folder").gid()
+            })
+        }) else {
+            println!("this user belongs to one group only, so the group case runs as a decision");
+            return;
+        };
+        std::os::unix::fs::chown(&folder, None, Some(group))
+            .expect("the folder is given a group of this user's");
+        set_mode(&folder, 0o775);
+        for (when, outcome) in judge_the_folder(&tree, &installer, &folder) {
+            let refused = outcome.expect_err(when);
+            assert!(
+                matches!(&refused, ControllerError::PermissionDenied { detail }
+                    if detail.contains(FOLDER_WRITE_BIT) && detail.ends_with("so nothing is written there")),
+                "{when}: {refused}"
+            );
+        }
+        let left: Vec<_> = std::fs::read_dir(&folder).expect("the folder").collect();
+        assert!(left.is_empty(), "nothing stands in the folder: {left:?}");
+    }
+
+    /// KR-REQ-11.01: a folder that every user can change is refused before the marker and at the
+    /// write, nothing is written and no temporary entry stands.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_every_user_can_change_is_refused_before_the_marker_and_at_the_write() {
+        let tree = Tree::create();
+        let (installer, folder) = amp_installer_with_folder(&tree);
+        set_mode(&folder, 0o757);
+        for (when, outcome) in judge_the_folder(&tree, &installer, &folder) {
+            let refused = outcome.expect_err(when);
+            assert!(
+                matches!(&refused, ControllerError::PermissionDenied { detail }
+                    if detail.contains(FOLDER_WRITE_BIT) && detail.ends_with("so nothing is written there")),
+                "{when}: {refused}"
+            );
+        }
+        let left: Vec<_> = std::fs::read_dir(&folder).expect("the folder").collect();
+        assert!(left.is_empty(), "nothing stands in the folder: {left:?}");
+    }
+
+    /// KR-REQ-11.01: on macOS a folder with an allow entry is refused whether the entry applies to
+    /// the folder or is only passed on to the files made in it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_folder_with_an_allow_entry_is_refused_whether_it_applies_or_is_passed_on() {
+        for flags in [
+            None,
+            Some(exacl::Flag::FILE_INHERIT | exacl::Flag::ONLY_INHERIT),
+        ] {
+            let tree = Tree::create();
+            let (installer, folder) = amp_installer_with_folder(&tree);
+            // Declared after the tree, so it is dropped first however the test ends.
+            let _entry = Restriction(folder.clone());
+            exacl::setfacl(
+                &[&folder],
+                &[exacl::AclEntry::allow_group(
+                    "everyone",
+                    exacl::Perm::READ,
+                    flags,
+                )],
+                None,
+            )
+            .expect("an allow entry");
+            for (when, outcome) in judge_the_folder(&tree, &installer, &folder) {
+                let refused = outcome.expect_err(when);
+                assert!(
+                    matches!(&refused, ControllerError::PermissionDenied { detail }
+                        if detail.contains("because the folder it is in has an allow entry for an account not known to be yours, so nothing is written there") && detail.ends_with("so nothing is written there")),
+                    "{when}: {refused}"
+                );
+            }
+            let left: Vec<_> = std::fs::read_dir(&folder).expect("the folder").collect();
+            assert!(left.is_empty(), "nothing stands in the folder: {left:?}");
+        }
+    }
+
+    /// KR-REQ-11.01: a write stages in the folder of its place, in a regular file that has the mode
+    /// the published file is to have, and not in a folder of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_stages_in_a_regular_file_beside_its_place_that_has_the_staged_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(bool, u32)>::new()));
+        let (found, home) = (std::rc::Rc::clone(&seen), tree.home());
+        anchor::publish_pause::once(move |_| {
+            *found.borrow_mut() = temporary_entries(&home)
+                .iter()
+                .map(|entry| {
+                    let metadata = std::fs::symlink_metadata(entry).expect("it is there");
+                    (metadata.is_file(), metadata.permissions().mode() & 0o777)
+                })
+                .collect();
+        });
+        walk.write(&place, b"one", 0o640, None).expect("a new file");
+        assert_eq!(
+            *seen.borrow(),
+            [(true, 0o640)],
+            "one temporary entry stands beside the place: a regular file of the staged mode"
+        );
+    }
+
+    /// KR-REQ-11.01: on macOS a new file carries what its folder passes on to the files made in it:
+    /// the entry the folder gives is on the published file, marked as inherited.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_file_carries_the_entries_its_folder_passes_to_files() {
+        let tree = Tree::create();
+        let shared = tree.home().join("shared");
+        std::fs::create_dir(&shared).expect("a folder");
+        let _entry = Restriction(shared.clone());
+        exacl::setfacl(
+            &[&shared],
+            &[exacl::AclEntry::deny_group(
+                "everyone",
+                exacl::Perm::READ,
+                Some(exacl::Flag::FILE_INHERIT | exacl::Flag::ONLY_INHERIT),
+            )],
+            None,
+        )
+        .expect("an entry the folder passes to files");
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = shared.join("doc.json");
+        walk.write(&place, b"one", 0o644, None).expect("a new file");
+        let entries = exacl::getfacl(&place, None).expect("its list");
+        assert_eq!(
+            entries.len(),
+            1,
+            "the file has the one inherited entry: {entries:?}"
+        );
+        assert!(!entries[0].allow, "{entries:?}");
+        assert_eq!(entries[0].perms, exacl::Perm::READ, "{entries:?}");
+        assert!(
+            entries[0].flags.contains(exacl::Flag::INHERITED),
+            "{entries:?}"
+        );
+    }
+
+    /// The words of a replacement refused for the copy's owner, group or list.
+    #[cfg(unix)]
+    const COPY_DIFFERS: &str = "cannot be replaced safely, because a new file in its folder would \
+        not have the owner, group and access list of the file it replaces, so nothing is written \
+        there";
+
+    /// What replacing `place`, which holds `b"one"`, with `b"two"` says.
+    #[cfg(unix)]
+    fn replace_one_with_two(tree: &Tree, place: &Path) -> Result<()> {
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        walk.write(place, b"two", 0o600, Some(digest_of(b"one")))
+    }
+
+    /// KR-REQ-11.01: a file of another group than the one a new file would have is not replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_with_another_group_than_the_file_it_replaces_is_refused() {
+        let tree = Tree::create();
+        let Some(group) = crate::catalogue::files::another_group(&tree.home()) else {
+            println!("this user belongs to one group only, so the group case runs as a decision");
+            return;
+        };
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        walk.write(&place, b"one", 0o600, None).expect("a new file");
+        std::os::unix::fs::chown(&place, None, Some(group)).expect("another group of this user's");
+        let refused = replace_one_with_two(&tree, &place).expect_err("the replacement is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(COPY_DIFFERS)),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&place).expect("a file"), b"one", "unchanged");
+        let left = temporary_entries(&tree.home());
+        assert!(left.is_empty(), "no temporary entry stands: {left:?}");
+    }
+
+    /// KR-REQ-11.01: on macOS a file with an entry of its own is not replaced by a copy that has
+    /// none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_replacement_of_a_file_with_an_entry_of_its_own_is_refused() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        walk.write(&place, b"one", 0o600, None).expect("a new file");
+        let _entry = Restriction(place.clone());
+        exacl::setfacl(
+            &[&place],
+            &[exacl::AclEntry::deny_group(
+                "everyone",
+                exacl::Perm::DELETE,
+                None,
+            )],
+            None,
+        )
+        .expect("an entry of its own");
+        let refused = replace_one_with_two(&tree, &place).expect_err("the replacement is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(COPY_DIFFERS)),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&place).expect("a file"), b"one", "unchanged");
+        let left = temporary_entries(&tree.home());
+        assert!(left.is_empty(), "no temporary entry stands: {left:?}");
+    }
+
+    /// KR-REQ-11.01: on Linux a file with a POSIX access list is not replaced by a copy that has
+    /// none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replacement_of_a_file_with_a_posix_list_is_refused() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        walk.write(&place, b"one", 0o640, None).expect("a new file");
+        // Version 2, then the entries: owner rw, user 65534 r, group r, mask r, other none.
+        let mut list = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 6_u16, u32::MAX),
+            (0x02, 4, 65534),
+            (0x04, 4, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            list.extend(tag.to_le_bytes());
+            list.extend(permissions.to_le_bytes());
+            list.extend(id.to_le_bytes());
+        }
+        if rustix::fs::setxattr(
+            &place,
+            "system.posix_acl_access",
+            &list,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_err()
+        {
+            println!("this file system keeps no POSIX lists, so there is nothing to compare");
+            return;
+        }
+        let refused = replace_one_with_two(&tree, &place).expect_err("the replacement is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(COPY_DIFFERS)),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&place).expect("a file"), b"one", "unchanged");
+        let left = temporary_entries(&tree.home());
+        assert!(left.is_empty(), "no temporary entry stands: {left:?}");
+    }
+
+    /// KR-REQ-11.01: a file that every user can change is not replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_every_user_can_change_is_not_replaced() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        walk.write(&place, b"one", 0o600, None).expect("a new file");
+        set_mode(&place, 0o602);
+        let refused = replace_one_with_two(&tree, &place).expect_err("the replacement is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains("cannot be replaced safely, because it lets its group or every user change it, so nothing is written there")),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&place).expect("a file"), b"one", "unchanged");
+        let left = temporary_entries(&tree.home());
+        assert!(left.is_empty(), "no temporary entry stands: {left:?}");
+    }
+
+    /// KR-REQ-11.01: on macOS a file with an allow entry is not replaced.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_with_an_allow_entry_is_not_replaced() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        walk.write(&place, b"one", 0o600, None).expect("a new file");
+        let _entry = Restriction(place.clone());
+        exacl::setfacl(
+            &[&place],
+            &[exacl::AclEntry::allow_group(
+                "everyone",
+                exacl::Perm::READ,
+                None,
+            )],
+            None,
+        )
+        .expect("an allow entry");
+        let refused = replace_one_with_two(&tree, &place).expect_err("the replacement is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains("cannot be replaced safely, because it has an allow entry for an account not known to be yours, so nothing is written there")),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&place).expect("a file"), b"one", "unchanged");
+        let left = temporary_entries(&tree.home());
+        assert!(left.is_empty(), "no temporary entry stands: {left:?}");
+    }
+
     /// KR-REQ-11.01: a file where a folder is needed and a folder where a file is to be written
     /// stop the installation before anything is written, by the walk's approved words.
     #[cfg(unix)]
