@@ -1779,12 +1779,11 @@ fn called_macros(stream: &TokenStream, out: &mut BTreeSet<String>) {
     for (at, tree) in flat.iter().enumerate() {
         match tree {
             TokenTree::Group(group) => called_macros(&group.stream(), out),
-            TokenTree::Ident(ident) => {
+            TokenTree::Ident(ident)
                 if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
-                    && matches!(flat.get(at + 2), Some(TokenTree::Group(_)))
-                {
-                    out.insert(ident.to_string());
-                }
+                    && matches!(flat.get(at + 2), Some(TokenTree::Group(_))) =>
+            {
+                out.insert(ident.to_string());
             }
             _ => {}
         }
