@@ -5145,7 +5145,18 @@ mod session_work {
         route.hook(10, SESSION_STARTED);
         route.hook(20, TURN_ENDED);
         let subject = the_hook_turn(&first);
-        let before = review_when(&mut control, &subject, |_| true).await;
+        let deadline = Instant::now() + PATIENCE;
+        let before = loop {
+            let reviews = owner_reviews(&mut control, first.session_id).await;
+            if let Some(state) = reviews.iter().find(|state| state.subject == subject) {
+                break state.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no review for the turn: {reviews:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
 
         // The page the worker's journal gives for the turn, read the way the worker reads it.
         let journal = kr_worker::journal::Journal::open_read_only(first.journal_path.clone())
