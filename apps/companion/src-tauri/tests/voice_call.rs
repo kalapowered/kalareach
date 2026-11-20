@@ -7900,6 +7900,9 @@ const MANAGER: [ActionRight; 3] = [
 /// What a person is told when the host lost its connection to OpenAI, could not restore it and did
 /// not confirm that it closed the call.
 const HOST_UNCONFIRMED_WORDS: &str = "The call has ended on this phone. The host could not confirm that OpenAI closed the call, so the call may keep running on your OpenAI account until OpenAI ends it.";
+/// What a person is told when the host was asked and never told the phone that OpenAI closed the
+/// call: a stop that may have reached it, or a host that holds no such call.
+const HOST_UNHEARD_WORDS: &str = "The call has ended on this phone. This phone did not hear from the host that OpenAI closed the call, so the call may keep running on your OpenAI account until OpenAI ends it.";
 const LEFT_TO_HOST_WORDS: &str = "The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it.";
 
 /// What a person is told when the host did not answer for two minutes and then said, in its answer to
@@ -8178,7 +8181,9 @@ async fn a_host_that_does_not_confirm_a_close_leaves_an_own_key_call_to_the_host
             ended["ended"]["broker"], "left_to_host",
             "(signed in: {signed}) {ended}"
         );
-        assert_eq!(ended["ended"]["words"], LEFT_TO_HOST_WORDS, "{ended}");
+        // The stop was sent and its answer never came, so it may have reached the host: the phone
+        // promises nothing of the host's own rule.
+        assert_eq!(ended["ended"]["words"], HOST_UNHEARD_WORDS, "{ended}");
         assert!(scene.platform.count("stop") >= 1, "the media is stopped");
         let owed: Vec<&serde_json::Value> = ended["owed"]
             .as_array()
@@ -8377,7 +8382,7 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
                 "a call the host settled is not owed as left to it: {owed_kinds:?}"
             );
         } else {
-            assert_eq!(ended["ended"]["words"], LEFT_TO_HOST_WORDS, "{ended}");
+            assert_eq!(ended["ended"]["words"], HOST_UNHEARD_WORDS, "{ended}");
             assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
             assert!(
                 owed_kinds.iter().any(|kind| kind == "host_close"),
@@ -8452,8 +8457,8 @@ async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leav
         assert!(
             ended["ended"]["words"]
                 .as_str()
-                .is_some_and(|words| words.ends_with(LEFT_TO_HOST_WORDS)),
-            "the call is said to be left to the host ({cause}): {ended}"
+                .is_some_and(|words| words.ends_with(HOST_UNCONFIRMED_WORDS)),
+            "the call is said to be left to the host, which could not confirm the close ({cause}): {ended}"
         );
         let owed_kinds: Vec<&str> = ended["owed"]
             .as_array()
@@ -8969,7 +8974,7 @@ async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_throu
             // clause that ends the setup is ended by a full stop where the next sentence follows.
             assert_eq!(
                 words,
-                format!("{mismatch}. {LEFT_TO_HOST_WORDS}"),
+                format!("{mismatch}. {HOST_UNHEARD_WORDS}"),
                 "{ended}"
             );
         }
@@ -9041,6 +9046,72 @@ async fn a_person_who_ends_a_call_the_host_swept_unheard_is_not_told_it_is_left_
     assert!(
         !owed_kinds_of(&ended).contains(&"host_close".to_owned()),
         "nothing is left to the host: {ended}"
+    );
+    scene.stop_host().await;
+}
+
+/// A call the host ended and swept out of its list before this phone's stop reached it, with the
+/// close at the provider not confirmed, is not a closed call: the stop finds no call, the phone asks
+/// for the host's final status, hears that the host could not confirm the close, and leaves the call
+/// to the host in the host's own words, with the notice kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_that_finds_no_call_at_a_host_whose_close_was_unconfirmed_leaves_the_call_to_the_host()
+ {
+    // The host's beats are far apart: its news of the sweep does not reach the phone before the stop.
+    let timings = Timings {
+        host_beat: Some(Duration::from_secs(60)),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    // The host loses its connection to OpenAI and cannot restore it, and its own hang-up is lost.
+    for _ in 0..2 {
+        openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Lost);
+    }
+    for _ in 0..200 {
+        openai.fail_attach(kr_client::services::own_voice::AttachFault::Unavailable);
+    }
+    openai.drop_socket();
+    // The host's sweep, run at once in place of at its tick, until the call is out of its list.
+    let voice = scene.host().controller().voice();
+    tokio::time::timeout(WATCHDOG, async {
+        while voice.coordinator().live_sessions() != 0 {
+            voice.tick(now_ms()).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host's sweep took the call out of its list");
+
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("the end the person asked for", |state| {
+            state["ended"]["cause"] == "requested"
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "not_held", "{ended}");
+    assert_eq!(
+        ended["ended"]["words"],
+        format!("You ended the call. {HOST_UNCONFIRMED_WORDS}"),
+        "{ended}"
+    );
+    assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+    assert_eq!(
+        ended["owed"]
+            .as_array()
+            .and_then(|owed| owed.iter().find(|each| each["kind"] == "host_close"))
+            .map(|each| each["words"].clone()),
+        Some(json!(HOST_UNCONFIRMED_WORDS)),
+        "the call is owed to the host with the host's own words: {ended}"
     );
     scene.stop_host().await;
 }

@@ -57,7 +57,7 @@ use kr_protocol::voice::{
     VoiceDelegationId, VoiceDelegationOutcome, VoiceSessionControl, VoiceSessionDescriptor,
     VoiceStartOutcome, VoiceStartParams, VoiceStartResult,
 };
-use kr_protocol::voice_host::{VoiceContextState, VoiceEndReason, VoiceNote};
+use kr_protocol::voice_host::{VoiceContextState, VoiceNote};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
@@ -70,19 +70,20 @@ mod note_tests;
 use self::context::{ContextProgress, ContextSend};
 use self::control::{CallControl, CallNews, ControlFeed, Said};
 use super::advice::MuteAdvice;
-use super::cause::Cause;
+use super::cause::{Cause, HOST_FOUND_CLOSED, HOST_SILENT_SETTLED, unsettled_words};
 use super::delegation::{Cause as Why, Frozen, Gate, Record, Told};
 use super::host::{
     CallHost, Delivered, Exchange, Handover, HostReach, Pairing, ask_again, hand_over, has_ended,
-    revoke,
+    revoke_over,
 };
 use super::host_control::{
-    ContextQueued, HostControl, HostEnding, HostLimits, HostNews, HostSendError, SessionLink,
+    CloseEvidence, CloseWord, ContextQueued, HostControl, HostEnding, HostLimits, HostNews,
+    HostSendError, PollLimits, SessionLink, final_close_word,
 };
 use super::provider;
 use super::view::{DelegationRow, EndedView, HostEnd, OwedView, ProblemKind, VoiceCallState};
 use super::{
-    CallProvider, Closed, Cmd, NoteKey, ServiceCall, Shared, StartRequest, Started, now_ms,
+    CallProvider, Closed, Cmd, NoteKey, ServiceCall, Shared, StartRequest, Started, Timings, now_ms,
 };
 use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::connection::Unopened;
@@ -605,12 +606,32 @@ fn write_failed_attempt(why: AttemptFailure) {
 }
 
 /// What the end of a call makes of one piece of the control's news while the control closes: the
-/// end is kept, a failed attempt is written down as it is while the call runs, and the rest is let go.
-fn note_while_closing(news: CallNews, last: &mut Option<ControlEnd>) {
+/// end is kept, a failed attempt is written down as it is while the call runs, the host's word of
+/// the provider's close is offered to the evidence, and the rest is let go.
+fn note_while_closing(news: CallNews, last: &mut Option<ControlEnd>, evidence: &CloseEvidence) {
     match news {
         CallNews::Service(ControlNews::Ended(end)) => *last = Some(end),
         CallNews::Service(ControlNews::AttemptFailed(why)) => write_failed_attempt(why),
+        CallNews::Host(HostNews::Ended(HostEnding::Reason { provider_close, .. })) => {
+            evidence.offer(provider_close);
+        }
         CallNews::Service(_) | CallNews::Host(_) => {}
+    }
+}
+
+/// Reads to its end what a stopped host control had told, so that the word of the provider's close
+/// that it held is in the evidence before the end is recorded. A drain that does not end within
+/// `within` is aborted and then awaited, so that nothing of it runs on after the final read.
+async fn collect_close_evidence(
+    draining: Option<tokio::task::JoinHandle<Option<ControlEnd>>>,
+    within: Duration,
+) {
+    let Some(mut draining) = draining else {
+        return;
+    };
+    if tokio::time::timeout(within, &mut draining).await.is_err() {
+        draining.abort();
+        let _ = draining.await;
     }
 }
 
@@ -2838,11 +2859,20 @@ impl Owner {
             // A call the host controls is closed by the host when the grant is revoked.
             _ => None,
         };
-        let draining = self.control_events.take().map(|mut events| {
+        // What the host says of the provider's close, from wherever it comes before the end is
+        // recorded: the cause, the news read while the call closes, and the look for the final
+        // status. The first word stands.
+        let evidence = CloseEvidence::default();
+        if let Cause::Host(HostEnding::Reason { provider_close, .. }) = &cause {
+            evidence.offer(*provider_close);
+        }
+        let own_key_call = self.descriptor.as_ref().is_some_and(is_host_controlled);
+        let mut draining = self.control_events.take().map(|mut events| {
+            let evidence = evidence.clone();
             tokio::spawn(async move {
                 let mut last = None;
                 while let Some(news) = events.next().await {
-                    note_while_closing(news, &mut last);
+                    note_while_closing(news, &mut last, &evidence);
                 }
                 last
             })
@@ -2864,21 +2894,36 @@ impl Owner {
         let toward_host = async {
             match (host, descriptor) {
                 (Some(host), Some(descriptor)) => Some(
-                    stop_at_host(
+                    stop_and_read(
                         &reach,
                         &host,
                         descriptor.voice_session_id,
-                        timings.host_within,
+                        timings,
+                        own_key_call,
+                        &evidence,
                     )
                     .await,
                 ),
                 _ => None,
             }
         };
-        let (closed_locally, host_end) = tokio::join!(local, toward_host);
+        let (closed_locally, stopped) = tokio::join!(local, toward_host);
         self.events = None;
         self.media_stopped = Some(closed_locally);
-        let host_end = host_end.unwrap_or(HostEnd::NotNeeded);
+        let stopped = stopped.unwrap_or(Stopped {
+            end: HostEnd::NotNeeded,
+            may_have_reached: false,
+        });
+        let host_end = stopped.end;
+        // Everything the host's control had told is read before the word is: the control is
+        // stopped, its feed ends, and the drain is given the time a host is given to answer.
+        if own_key_call {
+            if let Some(CallControl::Host(control)) = &self.control {
+                control.stop();
+            }
+            collect_close_evidence(draining.take(), timings.host_within).await;
+        }
+        let word = CloseWord::of(evidence.get());
         let closed = Closed {
             local: closed_locally,
             host: host_end.clone(),
@@ -2888,11 +2933,12 @@ impl Owner {
         // by the host when the grant is revoked, and a host that did not confirm it is left to.
         // By the control the host's descriptor names, not the provider the person was shown: a
         // call the host controls is closed through the host whichever was asked for.
-        let own_key_call = self.descriptor.as_ref().is_some_and(is_host_controlled);
         let needs_broker = self.descriptor.is_some() && !own_key_call;
-        // A call the host lost is left to it, and so is a call that the host did not say it closed.
-        let host_lost = matches!(cause, Cause::Host(HostEnding::NotKnown(_)));
-        let left_to_host = own_key_call && (host_lost || !host_closed_the_call(&cause, &host_end));
+        // A call that the host did not say it closed is left to it, whatever ended the call.
+        let left = own_key_call
+            .then(|| unsettled_words(word, &host_end, stopped.may_have_reached))
+            .flatten();
+        let left_to_host = left.is_some();
         // A request written to the host and not answered may have been carried out, and the aftermath
         // never says nothing was done.
         let unsettled = shows_requests_unsettled(
@@ -2913,11 +2959,11 @@ impl Owner {
             )],
             _ => Vec::new(),
         };
-        if let (true, Some(descriptor), Some(host)) = (left_to_host, &self.descriptor, &self.host) {
+        if let (Some(words), Some(descriptor), Some(host)) = (left, &self.descriptor, &self.host) {
             owed.push(OwedView::left_to_host(
                 descriptor.voice_session_id,
                 owed_until(descriptor.closes_at_ms.get()),
-                cause.left_to_host_words(),
+                words,
                 host,
             ));
         }
@@ -2939,7 +2985,7 @@ impl Owner {
                 state.ended = Some(EndedView {
                     owner: id,
                     cause: cause.word().to_owned(),
-                    words: ended_words(&cause, left_to_host, unsettled, news_lost),
+                    words: ended_words(&cause, left, unsettled, news_lost),
                     closed_locally,
                     host: host_end.clone(),
                     broker: if needs_broker {
@@ -3149,23 +3195,6 @@ fn provider_for(control: &VoiceSessionControl) -> CallProvider {
     }
 }
 
-/// Whether the end of a call on the host's own key says that the host closed the call at the
-/// provider. A host that ended the call for a reason closed it, but not one that lost the provider's
-/// side channel and could not restore it: it could not confirm the closure either, and only its
-/// answer to the stop, with the provider's confirmation, says that it has since closed the call.
-/// Any other end is read by the host's answer to the stop. This is the one place where an end is read
-/// as confirmed or unconfirmed: the reasons are recorded by the host before it closes the call at the
-/// provider, and the news carries no confirmation.
-fn host_closed_the_call(cause: &Cause, host_end: &HostEnd) -> bool {
-    match cause {
-        Cause::Host(HostEnding::Reason(VoiceEndReason::SidebandLost)) => {
-            host_end.confirms_closure()
-        }
-        Cause::Host(HostEnding::Reason(_)) => true,
-        _ => host_end.closes_the_call(),
-    }
-}
-
 /// Whether the end says that a request that was spoken may or may not have been carried out: on a
 /// call that acts on speech, a request written to the host that has no answer, or news of the host
 /// that overflowed, because what the call did is then not all known. A call that does not act on
@@ -3175,23 +3204,23 @@ fn shows_requests_unsettled(accepting: bool, unanswered: bool, news_lost: bool) 
 }
 
 /// What an end says: the cause's words, then what it leaves to the host when the call is left to
-/// it, then what it leaves unsettled when a request may have been carried out, then that the host's
-/// news overflowed when it did, on any call. A cause whose words another sentence follows is given
-/// as a sentence, so that a setup clause is ended by a full stop there and nowhere else.
-fn ended_words(cause: &Cause, left_to_host: bool, unsettled: bool, news_lost: bool) -> String {
+/// it (`left` is the words of that), then what it leaves unsettled when a request may have been
+/// carried out, then that the host's news overflowed when it did, on any call. A cause whose words
+/// another sentence follows is given as a sentence, so that a setup clause is ended by a full stop
+/// there and nowhere else. A host that was not heard from, or could not find the call, says its own
+/// closing sentence, whether the host has since said it closed the call or not.
+fn ended_words(cause: &Cause, left: Option<&str>, unsettled: bool, news_lost: bool) -> String {
     let more = unsettled || news_lost;
-    let mut said = match cause {
+    let mut said = match (cause, left) {
         // These causes are already the closing sentence.
-        Cause::Host(HostEnding::NotKnown(_)) => cause.words(),
-        Cause::Host(HostEnding::Silent) if !left_to_host => {
-            super::cause::HOST_SILENT_SETTLED.to_owned()
+        (Cause::Host(HostEnding::NotKnown(_)), None) => HOST_FOUND_CLOSED.to_owned(),
+        (Cause::Host(HostEnding::Silent), None) => HOST_SILENT_SETTLED.to_owned(),
+        (Cause::Host(HostEnding::NotKnown(_) | HostEnding::Silent), Some(words)) => {
+            words.to_owned()
         }
-        Cause::Host(HostEnding::Silent) => cause.words(),
-        _ if left_to_host => {
-            format!("{} {}", cause.sentence(), cause.left_to_host_words())
-        }
-        _ if more => cause.sentence(),
-        _ => cause.words(),
+        (_, Some(words)) => format!("{} {words}", cause.sentence()),
+        (_, None) if more => cause.sentence(),
+        (_, None) => cause.words(),
     };
     if unsettled {
         said = format!("{said} {REQUESTS_UNSETTLED}");
@@ -3293,33 +3322,83 @@ pub(super) fn owed_until(closes_at_ms: u64) -> u64 {
     closes_at_ms.saturating_add(MAX_CLOCK_SKEW_MS)
 }
 
-/// Asks `host` to revoke the call's grant, over a connection to that host.
-pub(super) async fn stop_at_host(
+/// What a stop at the host came to.
+pub(super) struct Stopped {
+    /// The host's answer, or why there was none.
+    pub end: HostEnd,
+    /// Whether the stop may have reached the host: it was written, or may have been. A stop whose
+    /// connection was not opened or whose request was not composed never did.
+    pub may_have_reached: bool,
+}
+
+/// Asks `host` to revoke the call's grant, over a connection to that host, and, for a call the host
+/// controls whose close the stop did not confirm, looks for the host's final status of the call on
+/// the same connection, offering the provider's close it holds to `evidence`. A host that held no
+/// such call after the call ended, or revoked the grant without the provider's confirmation, may
+/// have the word. A stop that was refused or not sent asks no more, and a call the voice service
+/// controls is never asked about: the host has no final status for it.
+///
+/// The longest this takes is the connection's reconnection, the stop, and the look, each within its
+/// own bound: about 80 seconds with the bounds the device keeps.
+pub(super) async fn stop_and_read(
     reach: &Arc<dyn HostReach>,
     host: &CallHost,
     voice_session_id: VoiceSessionId,
-    within: Duration,
-) -> HostEnd {
+    timings: Timings,
+    host_controlled: bool,
+    evidence: &CloseEvidence,
+) -> Stopped {
+    let not_sent = |words| Stopped {
+        end: HostEnd::NotTold { words },
+        may_have_reached: false,
+    };
     let session = if has_ended(&host.session).await {
-        match tokio::time::timeout(within, reach.session_to(&host.paired, Some(&host.session)))
-            .await
+        match tokio::time::timeout(
+            timings.host_within,
+            reach.session_to(&host.paired, Some(&host.session)),
+        )
+        .await
         {
             Ok(Ok(session)) => session,
-            Ok(Err(unopened)) => {
-                return HostEnd::NotTold {
-                    words: not_reached_words(&unopened),
-                };
-            }
-            Err(_) => {
-                return HostEnd::NotTold {
-                    words: "The host could not be reached in time.".to_owned(),
-                };
-            }
+            Ok(Err(unopened)) => return not_sent(not_reached_words(&unopened)),
+            Err(_) => return not_sent("The host could not be reached in time.".to_owned()),
         }
     } else {
         Arc::clone(&host.session)
     };
-    revoke(&session, host.environment_id, voice_session_id, within).await
+    let asked = revoke_over(
+        &session,
+        host.environment_id,
+        voice_session_id,
+        timings.host_within,
+    )
+    .await;
+    let may_hold_the_word = matches!(
+        asked.end,
+        HostEnd::NotHeld { .. }
+            | HostEnd::Revoked {
+                broker_notified: false,
+                ..
+            }
+    );
+    if host_controlled && may_hold_the_word && evidence.get().is_none() {
+        let link = SessionLink::new(session, host.environment_id);
+        final_close_word(
+            &link,
+            voice_session_id,
+            evidence,
+            PollLimits {
+                beat: timings.final_status_beat,
+                within: timings.final_status_within,
+                request_within: timings.host_within,
+            },
+        )
+        .await;
+    }
+    Stopped {
+        end: asked.end,
+        may_have_reached: asked.may_have_reached,
+    }
 }
 
 /// What a person is told when a connection to the host was not opened to stop the call, by the
@@ -3534,6 +3613,27 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
+    /// The host's news that ends the control, read while the call closes, offers the host's word of
+    /// the provider's close to the evidence, and the first word stands; the rest of the host's news
+    /// offers nothing.
+    #[test]
+    fn the_hosts_end_read_while_the_call_closes_offers_its_word_and_the_first_word_stands() {
+        let evidence = CloseEvidence::default();
+        let mut last = None;
+        super::note_while_closing(CallNews::Host(HostNews::Dropped), &mut last, &evidence);
+        assert_eq!(evidence.get(), None);
+        let ended = |provider_close| {
+            CallNews::Host(HostNews::Ended(HostEnding::Reason {
+                reason: VoiceEndReason::Deadline,
+                provider_close,
+            }))
+        };
+        super::note_while_closing(ended(VoiceProviderClose::Unconfirmed), &mut last, &evidence);
+        super::note_while_closing(ended(VoiceProviderClose::Confirmed), &mut last, &evidence);
+        assert_eq!(evidence.get(), Some(VoiceProviderClose::Unconfirmed));
+        assert_eq!(last, None);
+    }
+
     /// Each failed attempt to attach the control is written down once, as its kind and a fixed
     /// sentence, whatever the kind: the line has two fields, so it can hold nothing of the exchange.
     /// An attempt that fails while the call is being ended is written down too, and the end the
@@ -3542,19 +3642,31 @@ mod tests {
     fn a_failed_attempt_is_written_down_by_its_kind_and_nothing_else() {
         let written = Written::default();
         let mut last = None;
+        let evidence = CloseEvidence::default();
         tracing::subscriber::with_default(written.clone(), || {
             super::write_failed_attempt(AttemptFailure::TokenService);
             super::note_while_closing(
                 CallNews::Service(ControlNews::AttemptFailed(AttemptFailure::ServerError)),
                 &mut last,
+                &evidence,
             );
-            super::note_while_closing(CallNews::Service(ControlNews::Detached), &mut last);
+            super::note_while_closing(
+                CallNews::Service(ControlNews::Detached),
+                &mut last,
+                &evidence,
+            );
             super::note_while_closing(
                 CallNews::Service(ControlNews::Ended(ControlEnd::Unreachable)),
                 &mut last,
+                &evidence,
             );
         });
         assert_eq!(last, Some(ControlEnd::Unreachable));
+        assert_eq!(
+            evidence.get(),
+            None,
+            "the service's news is no word of the provider's close"
+        );
         let lines = written.0.lock().expect("the record").clone();
         let said = |kind: &str| {
             BTreeMap::from([
@@ -3667,6 +3779,7 @@ mod tests {
     }
 
     use super::*;
+    use kr_protocol::voice_host::{VoiceEndReason, VoiceProviderClose};
 
     /// A delegation the host did not confirm is worded as the host's on a call the host controls,
     /// and as the voice service's on a call it holds; every other cause is worded the same on both.
@@ -3722,16 +3835,16 @@ mod tests {
         let news = "This phone did not receive all of the host's news about the call, so some of what the call did may not be shown.";
         // A call that does not act on speech: the sentence of its own, and none about a request.
         assert_eq!(
-            ended_words(&Cause::Requested, false, false, true),
+            ended_words(&Cause::Requested, None, false, true),
             format!("You ended the call. {news}")
         );
         // A call that acts on speech: the sentence about a request, then the sentence of its own.
         assert_eq!(
-            ended_words(&Cause::Requested, false, true, true),
+            ended_words(&Cause::Requested, None, true, true),
             format!("You ended the call. {REQUESTS_UNSETTLED} {news}")
         );
         assert_eq!(
-            ended_words(&Cause::Requested, false, false, false),
+            ended_words(&Cause::Requested, None, false, false),
             "You ended the call."
         );
     }
@@ -3881,45 +3994,6 @@ mod tests {
         );
     }
 
-    /// A host that ended a call for a reason closed it, but not one that lost the provider's side
-    /// channel and could not restore it: that end says nothing of a closure, and only the provider's
-    /// confirmation in the host's answer to the stop does. Any other end is read by the answer,
-    /// where a host that holds no such call is read as having closed it.
-    #[test]
-    fn a_lost_side_channel_is_a_closed_call_only_when_the_provider_confirms_it() {
-        let revoked = |broker_notified| HostEnd::Revoked {
-            fence: crate::commands::VoiceFence::NotOwed,
-            broker_notified,
-        };
-        let not_held = HostEnd::NotHeld {
-            words: String::new(),
-        };
-        let lost = Cause::Host(HostEnding::Reason(VoiceEndReason::SidebandLost));
-        assert!(host_closed_the_call(&lost, &revoked(true)));
-        assert!(!host_closed_the_call(&lost, &revoked(false)));
-        assert!(
-            !host_closed_the_call(&lost, &not_held),
-            "a host that holds no such call after it lost the channel did not say it closed it"
-        );
-        assert!(!host_closed_the_call(&lost, &HostEnd::NotNeeded));
-        for reason in [
-            VoiceEndReason::Stop,
-            VoiceEndReason::Deadline,
-            VoiceEndReason::Revocation,
-            VoiceEndReason::ProviderClosed,
-            VoiceEndReason::Silence,
-            VoiceEndReason::CredentialRemoved,
-        ] {
-            let ended = Cause::Host(HostEnding::Reason(reason));
-            assert!(host_closed_the_call(&ended, &revoked(false)), "{reason:?}");
-            assert!(host_closed_the_call(&ended, &not_held), "{reason:?}");
-        }
-        // Any other end is read by the answer.
-        assert!(host_closed_the_call(&Cause::Requested, &not_held));
-        assert!(host_closed_the_call(&Cause::Requested, &revoked(true)));
-        assert!(!host_closed_the_call(&Cause::Requested, &revoked(false)));
-    }
-
     /// The host's news of its send governs a reply that failed and a call that ended before the
     /// reply came, as it governs a reply that came late: a send that is done or stopped is not
     /// restored to a problem, and its stopped notice is not replaced.
@@ -3977,6 +4051,36 @@ mod tests {
         assert!(Opened::Given.applies_after(Some(&send)));
     }
 
+    /// A host that could not find the call, or was not heard from, says its own closing sentence:
+    /// the one that leaves the call to it when nothing says it is closed, and the one that says it
+    /// was closed when the host has since said so.
+    #[test]
+    fn a_host_that_was_lost_or_not_heard_says_its_own_closing_sentence() {
+        let lost = Cause::Host(HostEnding::NotKnown(
+            kr_protocol::voice_host::VoiceHostRefusal::UnknownCall,
+        ));
+        let silent = Cause::Host(HostEnding::Silent);
+        assert_eq!(
+            ended_words(&lost, None, false, false),
+            crate::voice::cause::HOST_FOUND_CLOSED
+        );
+        assert_eq!(
+            ended_words(&silent, None, false, false),
+            crate::voice::cause::HOST_SILENT_SETTLED
+        );
+        for cause in [&lost, &silent] {
+            assert_eq!(
+                ended_words(cause, Some(crate::voice::cause::HOST_UNHEARD), false, false),
+                crate::voice::cause::HOST_UNHEARD,
+                "the sentence that leaves the call to the host stands alone"
+            );
+            assert_eq!(
+                ended_words(cause, Some(crate::voice::cause::LEFT_TO_HOST), false, true),
+                format!("{} {NEWS_LOST}", crate::voice::cause::LEFT_TO_HOST)
+            );
+        }
+    }
+
     /// A setup clause is ended by a full stop where another sentence follows it, and only there:
     /// alone it has none, a clause that already ends in one gets no second, and the causes that are
     /// sentences are joined as they stand.
@@ -3987,46 +4091,54 @@ mod tests {
         let step = Cause::Step(mismatch.to_owned());
         let left = crate::voice::cause::LEFT_TO_HOST;
         // Alone: nothing is added.
-        assert_eq!(ended_words(&step, false, false, false), clause);
+        assert_eq!(ended_words(&step, None, false, false), clause);
         // Before the sentence that leaves the call to the host.
         assert_eq!(
-            ended_words(&step, true, false, false),
+            ended_words(&step, Some(left), false, false),
             "The call could not be set up on this device: the host started the call on another provider than the one this device showed, so the call was ended. The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it."
         );
         // Before the sentence for a request that may have been carried out.
         assert_eq!(
-            ended_words(&step, false, true, false),
+            ended_words(&step, None, true, false),
             format!("{clause}. {REQUESTS_UNSETTLED}")
         );
         // Before both.
         assert_eq!(
-            ended_words(&step, true, true, false),
+            ended_words(&step, Some(left), true, false),
             format!("{clause}. {left} {REQUESTS_UNSETTLED}")
         );
         // A clause that ends in a full stop already gets no second one.
         let stopped = Cause::Step("the service said no.".to_owned());
         assert_eq!(
-            ended_words(&stopped, true, false, false),
+            ended_words(&stopped, Some(left), false, false),
             format!("The call could not be set up on this device: the service said no. {left}")
         );
         // A host that lost its connection to OpenAI has tried to close the call and does not try
         // again: its end says only that it could not confirm the closure.
-        let lost = Cause::Host(HostEnding::Reason(VoiceEndReason::SidebandLost));
+        let lost = Cause::Host(HostEnding::Reason {
+            reason: VoiceEndReason::SidebandLost,
+            provider_close: VoiceProviderClose::Unconfirmed,
+        });
         assert_eq!(
-            ended_words(&lost, true, false, false),
+            ended_words(
+                &lost,
+                Some(crate::voice::cause::HOST_UNCONFIRMED),
+                false,
+                false
+            ),
             "The host lost its connection to OpenAI and could not restore it, so the call was ended. The call has ended on this phone. The host could not confirm that OpenAI closed the call, so the call may keep running on your OpenAI account until OpenAI ends it."
         );
         assert_eq!(
-            ended_words(&lost, false, false, false),
+            ended_words(&lost, None, false, false),
             "The host lost its connection to OpenAI and could not restore it, so the call was ended."
         );
         // A cause that is a sentence is joined as it stands.
         assert_eq!(
-            ended_words(&Cause::NativeFailed, true, true, false),
+            ended_words(&Cause::NativeFailed, Some(left), true, false),
             format!("The connection to the voice provider failed. {left} {REQUESTS_UNSETTLED}")
         );
         assert_eq!(
-            ended_words(&Cause::NativeFailed, false, false, false),
+            ended_words(&Cause::NativeFailed, None, false, false),
             "The connection to the voice provider failed."
         );
     }

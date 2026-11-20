@@ -276,9 +276,77 @@ async fn a_heartbeat_the_host_refuses_and_a_closed_call_end_the_control_with_the
     assert_eq!(next(&mut events).await, HostNews::Dropped);
     assert_eq!(
         next(&mut events).await,
-        HostNews::Ended(HostEnding::Reason(VoiceEndReason::ProviderClosed))
+        HostNews::Ended(HostEnding::Reason {
+            reason: VoiceEndReason::ProviderClosed,
+            provider_close: VoiceProviderClose::Confirmed,
+        })
     );
     assert!(events.next().await.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_closed_heartbeat_tells_the_providers_close_on_the_ended_item_and_on_the_state_alone() {
+    let ended_item = |seq| VoiceNews {
+        seq: U64::new(seq),
+        item: VoiceNewsItem::Ended {
+            reason: VoiceEndReason::Deadline,
+        },
+    };
+    let closed = |news: Vec<VoiceNews>, provider_close| {
+        Script::new([Step::Answer(VoiceControlAnswer::Heartbeat {
+            state: VoiceHostCallState::Closed {
+                reason: VoiceEndReason::Deadline,
+            },
+            remaining_seconds: 0,
+            news,
+            dropped: false,
+            provider_close,
+        })])
+    };
+    let told = |word| {
+        HostNews::Ended(HostEnding::Reason {
+            reason: VoiceEndReason::Deadline,
+            provider_close: word,
+        })
+    };
+    // The word is the heartbeat's own, so the same item is told by the word beside it, and a state
+    // that carries no item is told by it as well. A word that is missing is no confirmation.
+    for (news, word, expected) in [
+        (
+            vec![ended_item(1)],
+            Nullable::some(VoiceProviderClose::Confirmed),
+            VoiceProviderClose::Confirmed,
+        ),
+        (
+            vec![ended_item(1)],
+            Nullable::some(VoiceProviderClose::Unconfirmed),
+            VoiceProviderClose::Unconfirmed,
+        ),
+        (
+            Vec::new(),
+            Nullable::some(VoiceProviderClose::Confirmed),
+            VoiceProviderClose::Confirmed,
+        ),
+        (
+            Vec::new(),
+            Nullable::some(VoiceProviderClose::Unconfirmed),
+            VoiceProviderClose::Unconfirmed,
+        ),
+        (
+            Vec::new(),
+            Nullable::null(),
+            VoiceProviderClose::Unconfirmed,
+        ),
+    ] {
+        let (_control, mut events) =
+            HostControl::open(closed(news, word), voice_session(), limits());
+        assert_eq!(
+            next(&mut events).await,
+            HostNews::Attached { reattached: false }
+        );
+        assert_eq!(next(&mut events).await, told(expected));
+        assert!(events.next().await.is_none());
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -385,4 +453,142 @@ async fn a_context_send_is_queued_with_its_identity_or_refused_with_the_hosts_re
         Err(HostSendError::Refused(Some(VoiceHostRefusal::Busy)))
     );
     control.stop();
+}
+
+fn poll_limits() -> PollLimits {
+    PollLimits {
+        beat: Duration::from_secs(1),
+        within: Duration::from_secs(40),
+        request_within: Duration::from_secs(20),
+    }
+}
+
+fn closing_beat() -> Step {
+    Step::Answer(VoiceControlAnswer::Heartbeat {
+        state: VoiceHostCallState::Closing,
+        remaining_seconds: 0,
+        news: Vec::new(),
+        dropped: false,
+        provider_close: Nullable::null(),
+    })
+}
+
+fn closed_beat(word: VoiceProviderClose) -> Step {
+    Step::Answer(VoiceControlAnswer::Heartbeat {
+        state: VoiceHostCallState::Closed {
+            reason: VoiceEndReason::Stop,
+        },
+        remaining_seconds: 0,
+        news: vec![VoiceNews {
+            seq: U64::new(1),
+            item: VoiceNewsItem::Ended {
+                reason: VoiceEndReason::Stop,
+            },
+        }],
+        dropped: false,
+        provider_close: Nullable::some(word),
+    })
+}
+
+fn acknowledges_nothing(script: &Script) -> bool {
+    script.seen().iter().all(|(_, params)| {
+        matches!(
+            &params.arm,
+            VoiceControlArm::Heartbeat { after_seq } if after_seq.get() == 0
+        )
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_for_the_final_status_asks_again_while_the_host_closes_and_offers_the_word_it_holds()
+{
+    for word in [
+        VoiceProviderClose::Confirmed,
+        VoiceProviderClose::Unconfirmed,
+    ] {
+        let script = Script::new([closing_beat(), closing_beat(), closed_beat(word)]);
+        let evidence = CloseEvidence::default();
+        final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+        assert_eq!(evidence.get(), Some(word));
+        assert_eq!(
+            script.seen().len(),
+            3,
+            "asked again until the host's status was final"
+        );
+        assert!(
+            acknowledges_nothing(&script),
+            "the look acknowledges nothing, so the status stays for later reads"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_asks_again_after_a_request_that_was_not_sent_or_whose_answer_was_lost() {
+    let script = Script::new([
+        Step::Fail(LinkError::NotSent),
+        Step::Fail(LinkError::Unknown),
+        closed_beat(VoiceProviderClose::Confirmed),
+    ]);
+    let evidence = CloseEvidence::default();
+    final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+    assert_eq!(evidence.get(), Some(VoiceProviderClose::Confirmed));
+    assert_eq!(script.seen().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_ends_with_no_word_when_the_host_holds_no_such_call_or_refuses_or_does_not_answer() {
+    let ends = [
+        Step::Answer(VoiceControlAnswer::Refused {
+            reason: VoiceHostRefusal::UnknownCall,
+        }),
+        Step::Fail(LinkError::Refused("no".to_owned())),
+        Step::Answer(VoiceControlAnswer::NotHeard),
+        Step::Hang,
+    ];
+    for step in ends {
+        let script = Script::new([step]);
+        let evidence = CloseEvidence::default();
+        final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+        assert_eq!(evidence.get(), None);
+        assert_eq!(script.seen().len(), 1, "no second request");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_is_cut_at_its_bound_whatever_the_request_that_is_waiting_then_is_doing() {
+    // The host is still closing the call at every look until the last, which begins at 39 seconds
+    // and is never answered: it would be given 20 seconds more, and is cut at 40.
+    let mut steps: Vec<Step> = (0..39).map(|_| closing_beat()).collect();
+    steps.push(Step::Hang);
+    let script = Script::new(steps);
+    let evidence = CloseEvidence::default();
+    let began = Instant::now();
+    final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+    assert_eq!(evidence.get(), None);
+    assert_eq!(script.seen().len(), 40);
+    assert_eq!(began.elapsed(), Duration::from_secs(40));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_ends_at_its_next_turn_when_the_news_has_offered_the_word_meanwhile() {
+    let evidence = CloseEvidence::default();
+    // A word that was in the evidence before the look began needs no request at all.
+    let known = Script::new([closing_beat()]);
+    evidence.offer(VoiceProviderClose::Confirmed);
+    final_close_word(&*known, voice_session(), &evidence, poll_limits()).await;
+    assert!(known.seen().is_empty());
+
+    let evidence = CloseEvidence::default();
+    let script = Script::new([closing_beat(), closing_beat()]);
+    let heard = evidence.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        heard.offer(VoiceProviderClose::Unconfirmed);
+    });
+    final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+    assert_eq!(script.seen().len(), 1, "the second request was not needed");
+    assert_eq!(evidence.get(), Some(VoiceProviderClose::Unconfirmed));
+    // The first word stands: a later offer changes nothing.
+    evidence.offer(VoiceProviderClose::Confirmed);
+    assert_eq!(evidence.get(), Some(VoiceProviderClose::Unconfirmed));
 }

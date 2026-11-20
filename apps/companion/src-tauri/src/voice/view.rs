@@ -281,15 +281,6 @@ impl HostEnd {
             }
         )
     }
-
-    /// Whether the host's answer to the stop that ends a call leaves nothing for the host to close:
-    /// it confirmed the closure, or it holds no call of this device by that name, which at the end
-    /// of a call is read as the host's own end of it. A call that was left to the host is settled
-    /// by `confirms_closure` alone.
-    #[must_use]
-    pub const fn closes_the_call(&self) -> bool {
-        self.confirms_closure() || matches!(self, Self::NotHeld { .. })
-    }
 }
 
 impl OwedView {
@@ -538,46 +529,34 @@ mod tests {
         assert_eq!(kinds, [OwedView::HOST_CLOSE, "revocation"], "{kinds:?}");
     }
 
-    /// The host's answer to the stop that ends a call says the call is closed when the provider
-    /// confirmed it or the host holds no such call: a revoked grant with the closure unconfirmed does
-    /// not. A call left to the host is settled by the provider's confirmation alone.
+    /// The host's answer to the stop that ends a call confirms the closure only when it revoked the
+    /// grant and the provider confirmed it: a revoked grant with the closure unconfirmed does not,
+    /// and neither does a host that holds no such call, which has not said that the provider closed
+    /// it.
     #[test]
-    fn a_revoked_grant_is_a_closed_call_only_when_the_provider_confirmed_it() {
+    fn a_revoked_grant_confirms_the_closure_only_when_the_provider_confirmed_it() {
         let revoked = |broker_notified| HostEnd::Revoked {
             fence: VoiceFence::NotOwed,
             broker_notified,
         };
-        assert!(revoked(true).closes_the_call());
-        assert!(!revoked(false).closes_the_call());
         assert!(revoked(false).settles(), "the grant is gone either way");
         assert!(revoked(true).confirms_closure());
         assert!(!revoked(false).confirms_closure());
-        assert!(
-            HostEnd::NotHeld {
-                words: String::new()
-            }
-            .closes_the_call()
-        );
+        let words = String::new();
         assert!(
             !HostEnd::NotHeld {
-                words: String::new()
+                words: words.clone()
             }
-            .confirms_closure(),
-            "a host that holds no such call has not said that the provider closed it"
+            .confirms_closure()
         );
         assert!(
             !HostEnd::Refused {
-                words: String::new()
+                words: words.clone()
             }
-            .closes_the_call()
+            .confirms_closure()
         );
-        assert!(
-            !HostEnd::NotTold {
-                words: String::new()
-            }
-            .closes_the_call()
-        );
-        assert!(!HostEnd::NotNeeded.closes_the_call());
+        assert!(!HostEnd::NotTold { words }.confirms_closure());
+        assert!(!HostEnd::NotNeeded.confirms_closure());
     }
 
     /// Each problem a call met is kept: a later one of another kind is beside the first and does not

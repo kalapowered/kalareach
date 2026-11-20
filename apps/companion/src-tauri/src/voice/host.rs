@@ -204,6 +204,27 @@ pub async fn revoke(
     voice_session_id: VoiceSessionId,
     within: Duration,
 ) -> HostEnd {
+    revoke_over(session, environment_id, voice_session_id, within)
+        .await
+        .end
+}
+
+/// What a stop asked of the host came to.
+pub(super) struct Asked {
+    /// What came of it.
+    pub end: HostEnd,
+    /// Whether the stop may have reached the host. A request that was not composed did not; one
+    /// that was written, or may have been, did, whatever came back.
+    pub may_have_reached: bool,
+}
+
+/// [`revoke`], and whether the stop may have reached the host.
+pub(super) async fn revoke_over(
+    session: &Arc<Session>,
+    environment_id: EnvironmentId,
+    voice_session_id: VoiceSessionId,
+    within: Duration,
+) -> Asked {
     let params = kr_protocol::voice::VoiceStopParams { voice_session_id };
     // Each stop is an action of its own, under an identity this function owns: one that is dropped
     // when the host does not answer in time is settled, so that stops asked again and again of a
@@ -223,8 +244,11 @@ pub async fn revoke(
     {
         Ok(composed) => composed,
         Err(error) => {
-            return HostEnd::NotTold {
-                words: error.to_string(),
+            return Asked {
+                end: HostEnd::NotTold {
+                    words: error.to_string(),
+                },
+                may_have_reached: false,
             };
         }
     };
@@ -234,7 +258,7 @@ pub async fn revoke(
         settling.settle().await;
         sent
     };
-    match tokio::time::timeout(within, asking).await {
+    let end = match tokio::time::timeout(within, asking).await {
         Err(_) => HostEnd::NotTold {
             words: format!(
                 "The host was asked to revoke the call's grant and has not answered in {} \
@@ -265,6 +289,10 @@ pub async fn revoke(
         Ok(Err(error)) => HostEnd::NotTold {
             words: error.to_string(),
         },
+    };
+    Asked {
+        end,
+        may_have_reached: true,
     }
 }
 

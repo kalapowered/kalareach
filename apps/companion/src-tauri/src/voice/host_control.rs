@@ -36,7 +36,7 @@ use kr_protocol::voice::VoiceDelegationId;
 use kr_protocol::voice_host::{
     VoiceContextSendParams, VoiceContextSendResult, VoiceContextState, VoiceControlAnswer,
     VoiceControlArm, VoiceControlParams, VoiceEndReason, VoiceHostCallState, VoiceHostRefusal,
-    VoiceNewsItem, VoiceNote,
+    VoiceNewsItem, VoiceNote, VoiceProviderClose,
 };
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
@@ -258,13 +258,126 @@ pub(super) enum HostNews {
 /// How a host control ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostEnding {
-    /// The host said the call is over, and why.
-    Reason(VoiceEndReason),
+    /// The host said the call is over, why, and whether OpenAI confirmed that it closed the
+    /// call. The word is the host's own, from the heartbeat that told the end.
+    Reason {
+        /// Why the call ended.
+        reason: VoiceEndReason,
+        /// Whether OpenAI confirmed that the call closed.
+        provider_close: VoiceProviderClose,
+    },
     /// The host does not know the call for this device: it was restarted, or the call is another
     /// device's.
     NotKnown(VoiceHostRefusal),
     /// No heartbeat was answered for as long as the host waits before it begins to close the call.
     Silent,
+}
+
+/// What this phone heard of the provider's close of a call on the host's own key, from the first
+/// word that held one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CloseWord {
+    /// The host said OpenAI confirmed that the call is closed.
+    Confirmed,
+    /// The host said it did not learn that OpenAI closed the call.
+    Unconfirmed,
+    /// The host said nothing of it to this phone.
+    Unheard,
+}
+
+impl CloseWord {
+    /// The word of what was heard, if anything was.
+    pub(super) const fn of(heard: Option<VoiceProviderClose>) -> Self {
+        match heard {
+            Some(VoiceProviderClose::Confirmed) => Self::Confirmed,
+            Some(VoiceProviderClose::Unconfirmed) => Self::Unconfirmed,
+            None => Self::Unheard,
+        }
+    }
+}
+
+/// The host's word of the provider's close of one call, shared by everything that can hear it
+/// while the call ends. The first word stands: the host's final status is one word, so every
+/// offer agrees. No word offered is no evidence, and `Unheard` is read from that at the end.
+#[derive(Clone, Debug, Default)]
+pub(super) struct CloseEvidence {
+    word: Arc<std::sync::Mutex<Option<VoiceProviderClose>>>,
+}
+
+impl CloseEvidence {
+    /// Records `word` unless the evidence already holds one.
+    pub(super) fn offer(&self, word: VoiceProviderClose) {
+        self.word
+            .lock()
+            .expect("the evidence lock is not poisoned")
+            .get_or_insert(word);
+    }
+
+    /// The word heard so far, if any.
+    pub(super) fn get(&self) -> Option<VoiceProviderClose> {
+        *self.word.lock().expect("the evidence lock is not poisoned")
+    }
+}
+
+/// The bounds of the look for a final status.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PollLimits {
+    /// Between two looks while the host still closes the call.
+    pub beat: Duration,
+    /// How long the whole look may take, counted from its start, whatever each request does.
+    pub within: Duration,
+    /// How long one request is given to answer.
+    pub request_within: Duration,
+}
+
+/// Asks the host for the final status of a call it ended, and offers the provider's close that the
+/// status holds to `evidence`. The request acknowledges nothing, so the status stays for later
+/// reads. A host that is still closing the call, or a request that was not sent or whose answer
+/// was lost, is asked again after `beat`; a host that holds no such call, refuses, answers in
+/// another shape, or does not answer a request in time, is not. The look as a whole is cut at
+/// `limits.within`, whatever a request is doing then. What was offered meanwhile, by news that
+/// reached the owner, ends it too.
+pub(super) async fn final_close_word(
+    link: &dyn HostLink,
+    voice_session_id: VoiceSessionId,
+    evidence: &CloseEvidence,
+    limits: PollLimits,
+) {
+    let look = async {
+        loop {
+            if evidence.get().is_some() {
+                return;
+            }
+            let params = VoiceControlParams {
+                voice_session_id,
+                arm: VoiceControlArm::Heartbeat {
+                    after_seq: U64::new(0),
+                },
+            };
+            let action_id = ActionId::new(kr_ipc::new_uuid());
+            match tokio::time::timeout(limits.request_within, link.control(action_id, &params))
+                .await
+            {
+                Ok(Ok(VoiceControlAnswer::Heartbeat {
+                    state: VoiceHostCallState::Closed { .. },
+                    provider_close,
+                    ..
+                })) => {
+                    evidence.offer(provider_close.0.unwrap_or(VoiceProviderClose::Unconfirmed));
+                    return;
+                }
+                // Still closing: asked again below. A call that is not closing yet is no better.
+                Ok(
+                    Ok(VoiceControlAnswer::Heartbeat { .. })
+                    | Err(LinkError::NotSent | LinkError::Unknown),
+                ) => {}
+                // The host holds no such call, refused, answered another shape, or did not answer.
+                Ok(Ok(_) | Err(LinkError::Refused(_))) | Err(_) => return,
+            }
+            tokio::time::sleep(limits.beat).await;
+        }
+    };
+    let _ = tokio::time::timeout(limits.within, look).await;
 }
 
 /// What a host control tells, read by its owner.
@@ -491,8 +604,12 @@ async fn heartbeats(
                 state,
                 news,
                 dropped,
+                provider_close,
                 ..
             })) => {
+                // A closed call's heartbeat says whether the provider confirmed the close. A word
+                // that is missing is no confirmation.
+                let provider_close = provider_close.0.unwrap_or(VoiceProviderClose::Unconfirmed);
                 missed = 0;
                 last_heard = Instant::now();
                 if !answered_before || detached {
@@ -540,7 +657,10 @@ async fn heartbeats(
                         },
                         VoiceNewsItem::Ended { reason } => {
                             ended = true;
-                            HostNews::Ended(HostEnding::Reason(reason))
+                            HostNews::Ended(HostEnding::Reason {
+                                reason,
+                                provider_close,
+                            })
                         }
                     };
                     if told.send(item).await.is_err() {
@@ -550,7 +670,11 @@ async fn heartbeats(
                 if let VoiceHostCallState::Closed { reason } = state
                     && !ended
                 {
-                    let _ = told.send(HostNews::Ended(HostEnding::Reason(reason))).await;
+                    let ending = HostEnding::Reason {
+                        reason,
+                        provider_close,
+                    };
+                    let _ = told.send(HostNews::Ended(ending)).await;
                     return;
                 }
                 if ended {

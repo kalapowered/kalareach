@@ -1,9 +1,10 @@
 //! Why a call ends, and what a person is told about it.
 
 use kr_client::services::voice_control::ControlEnd;
-use kr_protocol::voice_host::{HOST_CLIENT_ABSENT_SECONDS, VoiceEndReason};
+use kr_protocol::voice_host::{HOST_CLIENT_ABSENT_SECONDS, VoiceEndReason, VoiceProviderClose};
 
-use super::host_control::HostEnding;
+use super::host_control::{CloseWord, HostEnding};
+use super::view::HostEnd;
 
 /// What a person is told when a call on the host's own key has ended on this phone and the host has
 /// not confirmed that it closed the call at the provider: the host's own absence rule decides
@@ -12,12 +13,24 @@ pub(super) const LEFT_TO_HOST: &str = "The call has ended on this phone. This ho
     the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm \
     that, the call may keep running on your OpenAI account until OpenAI ends it.";
 
-/// What a person is told when a call on the host's own key has ended and the host, which lost its
-/// connection to OpenAI and could not restore it, did not confirm that it closed the call: the host
-/// has already tried to close it, and nothing of a running host tries again.
+/// What a person is told when a call on the host's own key has ended and the host did not confirm
+/// that it closed the call, whether it lost its connection to OpenAI or its hang-up was not
+/// confirmed.
 pub(super) const HOST_UNCONFIRMED: &str = "The call has ended on this phone. The host could not \
     confirm that OpenAI closed the call, so the call may keep running on your OpenAI account until \
     OpenAI ends it.";
+
+/// What a person is told when a call on the host's own key has ended and the host never told this
+/// phone that OpenAI closed the call, though the host was asked: it holds no such call, it refused
+/// the stop, or the stop may not have reached it.
+pub(super) const HOST_UNHEARD: &str = "The call has ended on this phone. This phone did not hear \
+    from the host that OpenAI closed the call, so the call may keep running on your OpenAI \
+    account until OpenAI ends it.";
+
+/// What a person is told when this phone could not find the call at the host and the host has since
+/// said that OpenAI closed it.
+pub(super) const HOST_FOUND_CLOSED: &str = "This phone could not find the call at the host, so the \
+    call ended on this phone. The host has since said that OpenAI closed the call.";
 
 /// What a person is told when this phone heard nothing from the host for as long as the host waits
 /// before it closes a call, and the host has since said, in its answer to the stop, that the call is
@@ -80,13 +93,34 @@ impl Cause {
                 ControlEnd::Unreachable => "service_unreachable",
             },
             Self::Host(end) => match end {
-                HostEnding::Reason(VoiceEndReason::Deadline) => "deadline",
-                HostEnding::Reason(VoiceEndReason::Stop) => "host_stopped",
-                HostEnding::Reason(VoiceEndReason::Revocation) => "host_revoked",
-                HostEnding::Reason(VoiceEndReason::ProviderClosed) => "provider_closed",
-                HostEnding::Reason(VoiceEndReason::Silence) => "host_silence",
-                HostEnding::Reason(VoiceEndReason::CredentialRemoved) => "key_removed",
-                HostEnding::Reason(VoiceEndReason::SidebandLost) => "host_sideband_lost",
+                HostEnding::Reason {
+                    reason: VoiceEndReason::Deadline,
+                    ..
+                } => "deadline",
+                HostEnding::Reason {
+                    reason: VoiceEndReason::Stop,
+                    ..
+                } => "host_stopped",
+                HostEnding::Reason {
+                    reason: VoiceEndReason::Revocation,
+                    ..
+                } => "host_revoked",
+                HostEnding::Reason {
+                    reason: VoiceEndReason::ProviderClosed,
+                    ..
+                } => "provider_closed",
+                HostEnding::Reason {
+                    reason: VoiceEndReason::Silence,
+                    ..
+                } => "host_silence",
+                HostEnding::Reason {
+                    reason: VoiceEndReason::CredentialRemoved,
+                    ..
+                } => "key_removed",
+                HostEnding::Reason {
+                    reason: VoiceEndReason::SidebandLost,
+                    ..
+                } => "host_sideband_lost",
                 HostEnding::NotKnown(_) => "host_lost_call",
                 HostEnding::Silent => "host_silent",
             },
@@ -144,26 +178,41 @@ impl Cause {
                 }
             },
             Self::Host(end) => match end {
-                HostEnding::Reason(VoiceEndReason::Deadline) => {
-                    "The call reached its time limit.".to_owned()
-                }
-                HostEnding::Reason(VoiceEndReason::Stop) => "The host ended the call.".to_owned(),
-                HostEnding::Reason(VoiceEndReason::Revocation) => {
-                    "The host ended the call because this device's grant for it was revoked."
-                        .to_owned()
-                }
-                HostEnding::Reason(VoiceEndReason::ProviderClosed) => {
-                    "OpenAI closed the call.".to_owned()
-                }
-                HostEnding::Reason(VoiceEndReason::Silence) => {
-                    "The host ended the call because it had not heard from this device for two \
+                HostEnding::Reason {
+                    reason: VoiceEndReason::Deadline,
+                    ..
+                } => "The call reached its time limit.".to_owned(),
+                HostEnding::Reason {
+                    reason: VoiceEndReason::Stop,
+                    ..
+                } => "The host ended the call.".to_owned(),
+                HostEnding::Reason {
+                    reason: VoiceEndReason::Revocation,
+                    ..
+                } => "The host ended the call because this device's grant for it was revoked."
+                    .to_owned(),
+                HostEnding::Reason {
+                    reason: VoiceEndReason::ProviderClosed,
+                    provider_close: VoiceProviderClose::Unconfirmed,
+                } => "The host's connection to the call at OpenAI ended.".to_owned(),
+                HostEnding::Reason {
+                    reason: VoiceEndReason::ProviderClosed,
+                    ..
+                } => "OpenAI closed the call.".to_owned(),
+                HostEnding::Reason {
+                    reason: VoiceEndReason::Silence,
+                    ..
+                } => "The host ended the call because it had not heard from this device for two \
                      minutes."
-                        .to_owned()
-                }
-                HostEnding::Reason(VoiceEndReason::CredentialRemoved) => {
-                    "The OpenAI key on the host was removed, so the call was ended.".to_owned()
-                }
-                HostEnding::Reason(VoiceEndReason::SidebandLost) => {
+                    .to_owned(),
+                HostEnding::Reason {
+                    reason: VoiceEndReason::CredentialRemoved,
+                    ..
+                } => "The OpenAI key on the host was removed, so the call was ended.".to_owned(),
+                HostEnding::Reason {
+                    reason: VoiceEndReason::SidebandLost,
+                    ..
+                } => {
                     "The host lost its connection to OpenAI and could not restore it, so the call \
                      was ended."
                         .to_owned()
@@ -205,18 +254,158 @@ impl Cause {
         }
     }
 
-    /// What a call left to the host is left to, in words, by how this end came about: a host that
-    /// lost its connection to OpenAI has tried to close the call and does not try again, and any
-    /// other end waits for the host's own rule about a phone it has not heard from.
-    pub(super) const fn left_to_host_words(&self) -> &'static str {
-        match self {
-            Self::Host(HostEnding::Reason(VoiceEndReason::SidebandLost)) => HOST_UNCONFIRMED,
-            _ => LEFT_TO_HOST,
-        }
-    }
-
     /// Whether the voice service closed the call itself, so asking it to again is not needed.
     pub const fn service_closed(&self) -> bool {
         matches!(self, Self::Control(ControlEnd::Closed { .. }))
+    }
+}
+
+/// Whether a call on the host's own key is closed: the host said OpenAI confirmed the close, in the
+/// news that ended the call or in its final status, or its answer to this phone's stop did. The
+/// cause of the end never enters. This is the one place where an end is read as confirmed or not.
+pub(super) fn host_closed_the_call(word: CloseWord, host_end: &HostEnd) -> bool {
+    word == CloseWord::Confirmed || host_end.confirms_closure()
+}
+
+/// What a call on the host's own key is left to, in words, when the host did not say it closed
+/// it, by what this phone heard and what the stop came to; nothing when the call is closed.
+/// `may_have_reached` says whether the stop may have reached the host, which a stop that was not
+/// sent never did.
+pub(super) fn unsettled_words(
+    word: CloseWord,
+    host_end: &HostEnd,
+    may_have_reached: bool,
+) -> Option<&'static str> {
+    if host_closed_the_call(word, host_end) {
+        return None;
+    }
+    Some(match (word, host_end) {
+        // The host said it could not confirm, or answered the stop and confirmed nothing.
+        (CloseWord::Unconfirmed, _) | (_, HostEnd::Revoked { .. }) => HOST_UNCONFIRMED,
+        // The host was asked and said nothing of the close.
+        (_, HostEnd::NotHeld { .. } | HostEnd::Refused { .. }) => HOST_UNHEARD,
+        (_, HostEnd::NotTold { .. }) if may_have_reached => HOST_UNHEARD,
+        // The host was not asked: its own rule about a phone it has not heard from decides.
+        _ => LEFT_TO_HOST,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn revoked(broker_notified: bool) -> HostEnd {
+        HostEnd::Revoked {
+            fence: crate::commands::VoiceFence::NotOwed,
+            broker_notified,
+        }
+    }
+
+    fn words() -> String {
+        String::new()
+    }
+
+    /// A call is closed when the host said OpenAI confirmed the close, or the host's answer to the
+    /// stop did; nothing else says so, whatever answer came to the stop and whatever ended the call.
+    #[test]
+    fn a_call_is_closed_only_when_the_host_said_that_openai_confirmed_it() {
+        let stops = [
+            (revoked(true), true),
+            (revoked(false), false),
+            (HostEnd::NotHeld { words: words() }, false),
+            (HostEnd::Refused { words: words() }, false),
+            (HostEnd::NotTold { words: words() }, false),
+            (HostEnd::NotNeeded, false),
+        ];
+        for (stop, confirms) in &stops {
+            assert!(
+                host_closed_the_call(CloseWord::Confirmed, stop),
+                "a confirmed word settles the call under {stop:?}"
+            );
+            for word in [CloseWord::Unconfirmed, CloseWord::Unheard] {
+                assert_eq!(
+                    host_closed_the_call(word, stop),
+                    *confirms,
+                    "{word:?} settles the call only when the stop confirms it: {stop:?}"
+                );
+            }
+        }
+    }
+
+    /// What a call is left to is worded by what was heard and what the stop came to: a settled call
+    /// is left to nobody; a word of not confirmed, or a revoked grant with nothing heard, is the
+    /// host's own failure to confirm; a host that was asked and said nothing of the close is not
+    /// heard from; and only a stop that was not sent leaves the host's own rule.
+    #[test]
+    fn what_a_call_is_left_to_is_worded_by_the_word_and_by_the_stop() {
+        let not_told = HostEnd::NotTold { words: words() };
+        let not_held = HostEnd::NotHeld { words: words() };
+        let refused = HostEnd::Refused { words: words() };
+        for may in [false, true] {
+            assert_eq!(unsettled_words(CloseWord::Confirmed, &not_held, may), None);
+            assert_eq!(
+                unsettled_words(CloseWord::Unheard, &revoked(true), may),
+                None
+            );
+            for stop in [
+                &not_held,
+                &refused,
+                &not_told,
+                &revoked(false),
+                &HostEnd::NotNeeded,
+            ] {
+                assert_eq!(
+                    unsettled_words(CloseWord::Unconfirmed, stop, may),
+                    Some(HOST_UNCONFIRMED),
+                    "{stop:?}"
+                );
+            }
+            assert_eq!(
+                unsettled_words(CloseWord::Unheard, &revoked(false), may),
+                Some(HOST_UNCONFIRMED)
+            );
+            assert_eq!(
+                unsettled_words(CloseWord::Unheard, &not_held, may),
+                Some(HOST_UNHEARD)
+            );
+            assert_eq!(
+                unsettled_words(CloseWord::Unheard, &refused, may),
+                Some(HOST_UNHEARD)
+            );
+            assert_eq!(
+                unsettled_words(CloseWord::Unheard, &HostEnd::NotNeeded, may),
+                Some(LEFT_TO_HOST)
+            );
+        }
+        assert_eq!(
+            unsettled_words(CloseWord::Unheard, &not_told, false),
+            Some(LEFT_TO_HOST),
+            "a stop that was not sent leaves the host's own rule"
+        );
+        assert_eq!(
+            unsettled_words(CloseWord::Unheard, &not_told, true),
+            Some(HOST_UNHEARD),
+            "a stop that may have reached the host does not"
+        );
+    }
+
+    /// A close the host tells as the provider's, with no confirmation, is not "OpenAI closed the
+    /// call": the host's connection to it ended.
+    #[test]
+    fn a_provider_closed_end_the_host_could_not_confirm_is_not_said_to_be_openais_close() {
+        let ended = |provider_close| {
+            Cause::Host(HostEnding::Reason {
+                reason: VoiceEndReason::ProviderClosed,
+                provider_close,
+            })
+        };
+        assert_eq!(
+            ended(VoiceProviderClose::Confirmed).words(),
+            "OpenAI closed the call."
+        );
+        assert_eq!(
+            ended(VoiceProviderClose::Unconfirmed).words(),
+            "The host's connection to the call at OpenAI ended."
+        );
     }
 }

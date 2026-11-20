@@ -108,6 +108,13 @@ pub struct Timings {
     /// How long a host that controls a call may go without answering before the device ends its
     /// media: the host begins to close the call when it has not heard from the device for this long.
     pub host_silent: Duration,
+    /// Between two looks for the host's final status of a call it ended, while the host still closes
+    /// it.
+    pub final_status_beat: Duration,
+    /// How long, from its start, the look for the host's final status of a call may take, whatever
+    /// a request is doing then. With the reconnection and the stop, each within `host_within`, the
+    /// longest a call takes to end at the host is about 80 seconds.
+    pub final_status_within: Duration,
 }
 
 impl Default for Timings {
@@ -132,6 +139,8 @@ impl Default for Timings {
             host_beat: None,
             host_miss: Duration::from_secs(10),
             host_silent: Duration::from_secs(u64::from(HOST_CLIENT_ABSENT_SECONDS)),
+            final_status_beat: Duration::from_secs(1),
+            final_status_within: Duration::from_secs(40),
         }
     }
 }
@@ -1030,11 +1039,21 @@ impl Shared {
                 None => false,
             }
         };
+        // No feed outlived the owner, so the evidence is the look for the final status alone.
+        let evidence = host_control::CloseEvidence::default();
         let toward_host = async {
             match (&kept.host, kept.voice_session_id) {
-                (Some(host), Some(id)) => {
-                    Some(owner::stop_at_host(&kept.reach, host, id, self.timings.host_within).await)
-                }
+                (Some(host), Some(id)) => Some(
+                    owner::stop_and_read(
+                        &kept.reach,
+                        host,
+                        id,
+                        self.timings,
+                        kept.provider == CallProvider::OwnKey,
+                        &evidence,
+                    )
+                    .await,
+                ),
                 _ => None,
             }
         };
@@ -1046,12 +1065,16 @@ impl Shared {
                 view.running = false;
             }
         }
-        let (closed_locally, host_end) = tokio::join!(local, toward_host);
-        let toward_host_asked = host_end.is_some();
+        let (closed_locally, stopped) = tokio::join!(local, toward_host);
+        let toward_host_asked = stopped.is_some();
+        let may_have_reached = stopped
+            .as_ref()
+            .is_some_and(|stopped| stopped.may_have_reached);
+        let word = host_control::CloseWord::of(evidence.get());
         let mut owed = Vec::new();
         // A start the host was not heard to answer may have made a call, so it is not a host that
         // was never asked: it has said nothing.
-        let host_end = host_end.unwrap_or_else(|| {
+        let host_end = stopped.map(|stopped| stopped.end).unwrap_or_else(|| {
             if kept.pending_start.is_some() {
                 HostEnd::NotTold {
                     words: "The host never said whether it created the call.".to_owned(),
@@ -1089,7 +1112,7 @@ impl Shared {
             (None, end)
                 if kept.provider == CallProvider::OwnKey && kept.grant_until_ms.is_some() =>
             {
-                if end.closes_the_call() {
+                if cause::host_closed_the_call(word, end) {
                     "closed_by_host"
                 } else {
                     "left_to_host"
@@ -1112,18 +1135,20 @@ impl Shared {
         ) {
             owed.push(OwedView::revocation(words, id, until_ms, host));
         }
+        // What the call is left to, in words, by the answer the owner wrote when it wrote one.
+        let left_words = cause::unsettled_words(
+            word,
+            written.as_ref().unwrap_or(&host_end),
+            may_have_reached,
+        )
+        .unwrap_or(cause::LEFT_TO_HOST);
         if let (true, Some(until_ms), Some(id), Some(host)) = (
             broker == "left_to_host",
             kept.grant_until_ms,
             kept.voice_session_id,
             &kept.host,
         ) {
-            owed.push(OwedView::left_to_host(
-                id,
-                until_ms,
-                cause::LEFT_TO_HOST,
-                host,
-            ));
+            owed.push(OwedView::left_to_host(id, until_ms, left_words, host));
         }
         if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
             owed.push(OwedView::start_unknown(
@@ -1155,9 +1180,9 @@ impl Shared {
                             // the owner had written to the host went with the owner.
                             words: match (broker == "left_to_host", accepts) {
                                 (true, true) => {
-                                    format!("{} {}", cause::LEFT_TO_HOST, owner::REQUESTS_UNSETTLED)
+                                    format!("{left_words} {}", owner::REQUESTS_UNSETTLED)
                                 }
-                                (true, false) => cause::LEFT_TO_HOST.to_owned(),
+                                (true, false) => left_words.to_owned(),
                                 (false, true) => format!(
                                     "This device's call stopped working, so the call was ended. {}",
                                     owner::REQUESTS_UNSETTLED
