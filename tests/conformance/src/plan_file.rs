@@ -486,6 +486,13 @@ fn fill(text: &str, values: &Values<'_>, output: &str) -> String {
     filled
 }
 
+/// Whether `text` holds a placeholder of the plan, as the plan wrote it.
+fn holds_placeholder(text: &str) -> bool {
+    ["{evidence}", "{scratch}", "{root}", "{output}"]
+        .iter()
+        .any(|placeholder| text.contains(placeholder))
+}
+
 /// The step's output with its placeholders given their values.
 fn output_of(definition: &StepDef, values: &Values<'_>) -> Option<String> {
     definition
@@ -497,7 +504,7 @@ fn output_of(definition: &StepDef, values: &Values<'_>) -> Option<String> {
 /// The variables a step is run with on `platform`: the plan's, then its own, which replace them
 /// where `platform` takes the names as one variable, each value with its placeholders given their
 /// values. They come in the order of their names. The second list names the variables whose value
-/// held a placeholder.
+/// holds a placeholder, whether or not the value given to it differs.
 fn environment_of(
     platform: Platform,
     plan: &Plan,
@@ -515,11 +522,10 @@ fn environment_of(
     let environment = merged
         .into_iter()
         .map(|(name, value)| {
-            let filled = fill(value, values, output);
-            if filled != *value {
+            if holds_placeholder(value) {
                 placeholders.push(name.clone());
             }
-            (name.clone(), filled)
+            (name.clone(), fill(value, values, output))
         })
         .collect();
     (environment, placeholders)
@@ -1489,6 +1495,13 @@ impl Plan {
                         .unwrap_or_default(),
                     env,
                     placeholder_env,
+                    placeholder_words: definition
+                        .command
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, word)| holds_placeholder(word))
+                        .map(|(index, _)| index)
+                        .collect(),
                     output,
                     reading: match definition.reading {
                         ReadingKind::Cargo => Reading::Cargo,

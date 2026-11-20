@@ -43,6 +43,7 @@ fn zeroing(path: &Path) -> Step {
         timeout: None,
         budget: None,
         placeholder_env: Vec::new(),
+        placeholder_words: Vec::new(),
     }
 }
 
