@@ -531,35 +531,44 @@ impl Reader<'_> {
         }
     }
 
-    /// The path a `#[path]` names, as the file system reads it: the path written, joined to the
-    /// folder it is relative to, is resolved as a whole before its `.` and `..` are cancelled, so
-    /// that a step up after a link is the link's parent. A path that resolves elsewhere than the
-    /// cancelled one is refused; one that is not there is left as written, and finds no file.
-    fn explicit_path(&mut self, written: PathBuf) -> PathBuf {
-        let cancelled = normalised(&written);
-        match std::fs::canonicalize(&written) {
-            Ok(real) if real != cancelled => {
-                self.error = Some(format!(
-                    "{}: the scan does not read a path through a link or outside the checkout (it is {})",
-                    self.at,
-                    real.display()
-                ));
-                cancelled
+    /// The path a `#[path]` names: the string written, taken from the folder it is relative to, with
+    /// its steps up cancelled. No step of the string leads through a link, whatever file the link
+    /// leads to: the steps are taken one by one, each looked at as the file system holds it, and a
+    /// link is refused where it stands. A path that stops at a folder that is not there is left as
+    /// written and finds no file.
+    fn explicit_path(&mut self, written: &str) -> PathBuf {
+        let joined = self.path_base.join(written);
+        let mut walked = self.path_base.clone();
+        for step in Path::new(written).components() {
+            walked.push(step);
+            if matches!(step, std::path::Component::ParentDir) {
+                continue;
             }
-            Ok(_) => cancelled,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                written
-            }
-            Err(error) => {
-                self.error = Some(format!("{}: {error}", written.display()));
-                cancelled
+            match std::fs::symlink_metadata(&walked) {
+                Ok(found) if found.file_type().is_symlink() => {
+                    self.error = Some(format!(
+                        "{}: the scan does not read a path through a link or outside the checkout ({} is a link)",
+                        self.at,
+                        walked.display()
+                    ));
+                    break;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return joined;
+                }
+                Err(error) => {
+                    self.error = Some(format!("{}: {error}", walked.display()));
+                    break;
+                }
             }
         }
+        normalised(&joined)
     }
 
     fn call(&mut self, path: &syn::Path) {
@@ -680,7 +689,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                     // The folder of an inline module with a `#[path]` is that path, taken from the
                     // file's folder, and holds the modules inside it.
                     let inside = match &explicit {
-                        Some(path) => self.explicit_path(self.path_base.join(path)),
+                        Some(path) => self.explicit_path(path),
                         None => self.modules.join(&name),
                     };
                     let outer_base = std::mem::replace(&mut self.path_base, inside.clone());
@@ -700,7 +709,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                 }
                 None => {
                     let (candidates, explicit) = match explicit {
-                        Some(path) => (vec![self.explicit_path(self.path_base.join(path))], true),
+                        Some(path) => (vec![self.explicit_path(&path)], true),
                         None => (
                             vec![
                                 self.modules.join(format!("{name}.rs")),

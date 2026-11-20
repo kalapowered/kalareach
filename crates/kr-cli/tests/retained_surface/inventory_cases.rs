@@ -590,7 +590,7 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
 }
 
 #[test]
-fn a_step_up_after_a_link_in_a_path_is_the_links_parent_and_is_refused() {
+fn a_link_in_a_written_path_is_refused_where_it_stands_whatever_file_it_leads_to() {
     let written = |path: &str| format!("#[path = \"{path}\"]\nmod chosen;\n");
     let prepare = |path: &str| {
         let folder = small_tree(&written(path));
@@ -608,18 +608,40 @@ fn a_step_up_after_a_link_in_a_path_is_the_links_parent_and_is_refused() {
         );
         let source = folder.path().join("crates/kr-sender/src");
         std::fs::create_dir_all(source.join("deep/inner")).expect("a folder");
+        std::fs::create_dir_all(source.join("beside")).expect("a folder");
         std::os::unix::fs::symlink(source.join("deep/inner"), source.join("link")).expect("a link");
+        // A link to a folder beside the file's own: its parent is the file's folder, so the step up
+        // after it cancels to the file the file system finds too.
+        std::os::unix::fs::symlink(source.join("beside"), source.join("sibling")).expect("a link");
         folder
     };
+    let refused = |folder: &std::path::Path, link: &str| {
+        let root = std::fs::canonicalize(folder).expect("a path");
+        format!(
+            "crates/kr-sender/src/lib.rs: the scan does not read a path through a link or outside the checkout ({} is a link)",
+            root.join("crates/kr-sender/src").join(link).display()
+        )
+    };
     let folder = prepare("link/../chosen.rs");
-    let root = std::fs::canonicalize(folder.path()).expect("a path");
     let tree = tree_at(folder.path()).expect("the tree");
-    let text = format!(
-        "crates/kr-sender/src/lib.rs: the scan does not read a path through a link or outside the checkout (it is {})",
-        root.join("crates/kr-sender/src/deep/chosen.rs").display()
-    );
+    let text = refused(folder.path(), "link");
     assert_eq!(sender_names(&tree), Err(text.clone()));
     assert_eq!(tree.item("kr_sender", "lexical"), Lookup::Failed(text));
+    // The same file by the cancelled path and by the file system is refused all the same.
+    let folder = prepare("sibling/../chosen.rs");
+    assert_eq!(
+        sender_names(&tree_at(folder.path()).expect("the tree")),
+        Err(refused(folder.path(), "sibling"))
+    );
+    // A file that is a link, and a link at the end of the path.
+    let folder = prepare("chosen.rs");
+    let source = folder.path().join("crates/kr-sender/src");
+    std::fs::rename(source.join("chosen.rs"), source.join("real.rs")).expect("a rename");
+    std::os::unix::fs::symlink(source.join("real.rs"), source.join("chosen.rs")).expect("a link");
+    assert_eq!(
+        sender_names(&tree_at(folder.path()).expect("the tree")),
+        Err(refused(folder.path(), "chosen.rs"))
+    );
     // The same step up after a folder that is no link is read as the cancelled path.
     let folder = prepare("deep/../chosen.rs");
     assert_eq!(
