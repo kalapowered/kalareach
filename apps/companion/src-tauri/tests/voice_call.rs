@@ -8725,25 +8725,44 @@ async fn stops_asked_again_of_a_host_that_does_not_answer_leave_nothing_unresolv
             },
             Kept::at(&directory),
         );
-        scene.link.hold_next_request(HostMethod::VoiceStop);
-        relaunched.host_reached(this_host.0, this_host.1, session.clone());
-        scene.link.until_request_held().await;
-        assert!(
-            !session.submitted_actions().await.is_empty(),
-            "round {round}: the stop that is held is on the connection's book"
-        );
+        let revocation_owed =
+            || ids(&relaunched).contains(&("revocation".to_owned(), Some(revocation.to_string())));
+        // The revocation is settled only if the host answers it within `host_within`: a host that is
+        // slower leaves it owed, and the device asks again when the host is reached again. Each
+        // asking is one more go at the same event: a stop that is held and given up, and the
+        // revocation asked after it.
         tokio::time::timeout(WATCHDOG, async {
-            while ids(&relaunched)
-                .contains(&("revocation".to_owned(), Some(revocation.to_string())))
-            {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+            loop {
+                let carried = scene.link.sent(HostMethod::VoiceStop);
+                scene.link.hold_next_request(HostMethod::VoiceStop);
+                relaunched.host_reached(this_host.0, this_host.1, session.clone());
+                scene.link.until_request_held().await;
+                assert!(
+                    !session.submitted_actions().await.is_empty(),
+                    "round {round}: the stop that is held is on the connection's book"
+                );
+                // The asking is over when the revocation is settled, or when the stop asked after the
+                // held one has been carried to the host and given up, leaving nothing on the book.
+                loop {
+                    if !revocation_owed() {
+                        return;
+                    }
+                    if scene.link.sent(HostMethod::VoiceStop) > carried
+                        && session.submitted_actions().await.is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                scene.link.release_request();
             }
         })
         .await
         .expect("the stop was given up and the revocation asked after it was settled");
+        let book = until_the_book(&session, <[_]>::is_empty).await;
         assert!(
-            session.submitted_actions().await.is_empty(),
-            "round {round}: a stop the host did not answer in time is not left unresolved"
+            book.is_empty(),
+            "round {round}: a stop the host did not answer in time is not left unresolved: {book:?}"
         );
         assert_eq!(
             ids(&relaunched),
