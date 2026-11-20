@@ -32,6 +32,7 @@ use std::rc::Rc;
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens as _;
 use syn::visit::Visit;
+use syn::visit_mut::VisitMut;
 
 use super::condition::Condition;
 use super::inventory::{self, Inventory};
@@ -794,6 +795,10 @@ impl CrateIndex {
             if let syn::Item::Impl(block) = item {
                 for inner in &block.items {
                     if let syn::ImplItem::Fn(method) = inner {
+                        // A method that no configuration without `test` builds is not defined.
+                        if within.within(&method.attrs, file)?.is_none() {
+                            continue;
+                        }
                         self.push_method(
                             method,
                             file,
@@ -919,6 +924,137 @@ impl CrateIndex {
 
 /// The module a file is: `scalars` for `src/scalars.rs` and `src/scalars/mod.rs`, `crate` for the
 /// root.
+fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(member) => &member.attrs,
+        syn::ImplItem::Fn(member) => &member.attrs,
+        syn::ImplItem::Type(member) => &member.attrs,
+        syn::ImplItem::Macro(member) => &member.attrs,
+        _ => &[],
+    }
+}
+
+fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(member) => &member.attrs,
+        syn::TraitItem::Fn(member) => &member.attrs,
+        syn::TraitItem::Type(member) => &member.attrs,
+        syn::TraitItem::Macro(member) => &member.attrs,
+        _ => &[],
+    }
+}
+
+/// Takes the items that no configuration without `test` builds out of a copy of a node: the items
+/// nested in its blocks and modules, and the members of the impl blocks and traits among them. The
+/// condition rule decides each, with the condition around the node.
+struct Strip<'a> {
+    condition: Condition,
+    at: &'a str,
+    error: Option<String>,
+}
+
+impl Strip<'_> {
+    fn keeps(&mut self, attrs: &[syn::Attribute]) -> Option<Condition> {
+        if self.error.is_some() {
+            return None;
+        }
+        match self.condition.within(attrs, self.at) {
+            Ok(inner) => inner,
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
+    }
+
+    fn under<T>(&mut self, inner: Condition, node: &mut T, visit: impl FnOnce(&mut Self, &mut T)) {
+        let outer = std::mem::replace(&mut self.condition, inner);
+        visit(self, node);
+        self.condition = outer;
+    }
+}
+
+impl VisitMut for Strip<'_> {
+    fn visit_block_mut(&mut self, block: &mut syn::Block) {
+        let mut kept = Vec::new();
+        for mut statement in std::mem::take(&mut block.stmts) {
+            if let syn::Stmt::Item(item) = &mut statement {
+                let Some(inner) = self.keeps(item_attrs(item)) else {
+                    continue;
+                };
+                self.under(inner, item, |strip, item| strip.visit_item_mut(item));
+            } else {
+                self.visit_stmt_mut(&mut statement);
+            }
+            kept.push(statement);
+        }
+        block.stmts = kept;
+    }
+
+    fn visit_item_mod_mut(&mut self, module: &mut syn::ItemMod) {
+        if let Some((_, items)) = &mut module.content {
+            let mut kept = Vec::new();
+            for mut item in std::mem::take(items) {
+                let Some(inner) = self.keeps(item_attrs(&item)) else {
+                    continue;
+                };
+                self.under(inner, &mut item, |strip, item| strip.visit_item_mut(item));
+                kept.push(item);
+            }
+            *items = kept;
+        }
+    }
+
+    fn visit_item_impl_mut(&mut self, block: &mut syn::ItemImpl) {
+        let mut kept = Vec::new();
+        for mut member in std::mem::take(&mut block.items) {
+            let Some(inner) = self.keeps(impl_item_attrs(&member)) else {
+                continue;
+            };
+            self.under(inner, &mut member, |strip, member| {
+                strip.visit_impl_item_mut(member);
+            });
+            kept.push(member);
+        }
+        block.items = kept;
+    }
+
+    fn visit_item_trait_mut(&mut self, block: &mut syn::ItemTrait) {
+        let mut kept = Vec::new();
+        for mut member in std::mem::take(&mut block.items) {
+            let Some(inner) = self.keeps(trait_item_attrs(&member)) else {
+                continue;
+            };
+            self.under(inner, &mut member, |strip, member| {
+                strip.visit_trait_item_mut(member);
+            });
+            kept.push(member);
+        }
+        block.items = kept;
+    }
+}
+
+/// A copy of `node` without its nested items that no configuration without `test` builds, read
+/// under `within`, the condition around the node.
+fn stripped<T: Clone>(
+    node: &T,
+    within: &Condition,
+    file: &str,
+    visit: impl FnOnce(&mut Strip<'_>, &mut T),
+) -> Result<T, String> {
+    let mut strip = Strip {
+        condition: within.clone(),
+        at: file,
+        error: None,
+    };
+    let mut copy = node.clone();
+    visit(&mut strip, &mut copy);
+    match strip.error {
+        Some(error) => Err(error),
+        None => Ok(copy),
+    }
+}
+
 fn module_of(source: &Path, file: &Path) -> String {
     let relative = file.strip_prefix(source).unwrap_or(file);
     let stem = relative
@@ -1660,7 +1796,14 @@ impl Scanner {
             let Some(within) = condition.within(item_attrs(item), file)? else {
                 continue;
             };
-            let text = || without_docs(item.to_token_stream());
+            // The item's tokens, without the nested items that no configuration builds.
+            let text = || -> Result<TokenStream, String> {
+                let kept = stripped(item, &within, file, |strip, node| {
+                    strip.visit_item_mut(node)
+                })?;
+                Ok(without_docs(kept.to_token_stream()))
+            };
+            let plain = || without_docs(item.to_token_stream());
             match item {
                 syn::Item::Mod(module) => {
                     if let Some((_, inner)) = &module.content {
@@ -1668,29 +1811,32 @@ impl Scanner {
                     }
                 }
                 syn::Item::Use(_) => {
-                    self.scan_only_body(format!("use:{under_src}"), file, text());
+                    self.scan_only_body(format!("use:{under_src}"), file, plain());
                 }
                 syn::Item::Impl(block) => {
                     let owner = type_name(&block.self_ty);
                     for inner in &block.items {
+                        let Some(member) = within.within(impl_item_attrs(inner), file)? else {
+                            continue;
+                        };
                         match inner {
-                            syn::ImplItem::Fn(method)
-                                if within.within(&method.attrs, file)?.is_some() =>
-                            {
+                            syn::ImplItem::Fn(method) => {
+                                let kept = stripped(method, &member, file, |strip, node| {
+                                    strip.visit_impl_item_fn_mut(node);
+                                })?;
                                 self.body(
                                     format!("{owner}::{}", method.sig.ident),
-                                    without_docs(method.to_token_stream()),
+                                    without_docs(kept.to_token_stream()),
                                 );
                             }
-                            syn::ImplItem::Const(constant)
-                                if within.within(&constant.attrs, file)?.is_some() =>
-                            {
-                                let tokens = without_docs(constant.to_token_stream());
+                            syn::ImplItem::Const(constant) => {
+                                let kept = stripped(constant, &member, file, |strip, node| {
+                                    strip.visit_impl_item_const_mut(node);
+                                })?;
+                                let tokens = without_docs(kept.to_token_stream());
                                 self.impl_item(&owner, file, under_src, tokens);
                             }
-                            syn::ImplItem::Macro(call)
-                                if within.within(&call.attrs, file)?.is_some() =>
-                            {
+                            syn::ImplItem::Macro(call) => {
                                 let tokens = without_docs(call.to_token_stream());
                                 self.impl_item(&owner, file, under_src, tokens);
                             }
@@ -1702,24 +1848,20 @@ impl Scanner {
                     let mut kept = definition.clone();
                     let mut keep = Vec::new();
                     for member in &definition.items {
-                        let attrs: &[syn::Attribute] = match member {
-                            syn::TraitItem::Fn(member) => &member.attrs,
-                            syn::TraitItem::Const(member) => &member.attrs,
-                            syn::TraitItem::Type(member) => &member.attrs,
-                            syn::TraitItem::Macro(member) => &member.attrs,
-                            _ => &[],
-                        };
-                        keep.push(within.within(attrs, file)?.is_some());
+                        keep.push(within.within(trait_item_attrs(member), file)?.is_some());
                     }
                     let mut keep = keep.into_iter();
                     kept.items.retain(|_| keep.next().unwrap_or(true));
+                    let kept = stripped(&kept, &within, file, |strip, node| {
+                        strip.visit_item_trait_mut(node);
+                    })?;
                     self.body(
                         definition.ident.to_string(),
                         without_docs(kept.to_token_stream()),
                     );
                 }
                 syn::Item::Macro(call) => {
-                    let kinds = kinds_of(&text());
+                    let kinds = kinds_of(&plain());
                     if let (Some(name), true) = (&call.ident, call.mac.path.is_ident("macro_rules"))
                     {
                         self.macro_rules.insert(name.to_string());
@@ -1750,31 +1892,31 @@ impl Scanner {
                             self.scan_only_body(
                                 format!("{macro_name}! invocation @{under_src}"),
                                 file,
-                                text(),
+                                plain(),
                             );
                         }
                     }
                 }
                 syn::Item::Fn(definition) => {
-                    self.body(definition.sig.ident.to_string(), text());
+                    self.body(definition.sig.ident.to_string(), text()?);
                 }
                 syn::Item::Struct(definition) => {
-                    self.body(definition.ident.to_string(), text());
+                    self.body(definition.ident.to_string(), text()?);
                 }
                 syn::Item::Enum(definition) => {
-                    self.body(definition.ident.to_string(), text());
+                    self.body(definition.ident.to_string(), text()?);
                 }
                 syn::Item::Union(definition) => {
-                    self.body(definition.ident.to_string(), text());
+                    self.body(definition.ident.to_string(), text()?);
                 }
                 syn::Item::Type(definition) => {
-                    self.body(definition.ident.to_string(), text());
+                    self.body(definition.ident.to_string(), text()?);
                 }
                 syn::Item::Const(definition) => {
-                    self.body(definition.ident.to_string(), text());
+                    self.body(definition.ident.to_string(), text()?);
                 }
                 syn::Item::Static(definition) => {
-                    self.body(definition.ident.to_string(), text());
+                    self.body(definition.ident.to_string(), text()?);
                 }
                 _ => {}
             }

@@ -405,6 +405,20 @@ fn an_inner_condition_of_a_file_decides_whether_the_file_is_read() {
         read_names("mod windows_only;\nmod tested;\nmod mixed;\n", &files),
         Ok(vec!["from_unix".to_owned(), "from_windows".to_owned()])
     );
+    // The index holds the same: the file's condition holds for each item in it there too.
+    let folder = small_tree("mod windows_only;\nmod tested;\nmod mixed;\n");
+    for (path, text) in files {
+        write(folder.path(), &format!("crates/kr-sender/{path}"), text);
+    }
+    let tree = tree_at(folder.path()).expect("the tree");
+    assert_eq!(tree.item("kr_sender", "from_both"), Lookup::Absent);
+    assert_eq!(tree.item("kr_sender", "from_tested"), Lookup::Absent);
+    for name in ["from_unix", "from_windows"] {
+        assert!(
+            matches!(tree.item("kr_sender", name), Lookup::Found(_)),
+            "{name}"
+        );
+    }
 }
 
 #[test]
