@@ -1148,6 +1148,9 @@ fn build_first(
     let mut executables = BTreeMap::new();
     let mut outputs = Vec::new();
     let mut compiled = Vec::new();
+    // The targets of the map by the file they are built from, made when the first test program is
+    // met.
+    let mut sources: Option<BTreeMap<(PathBuf, String), TargetId>> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -1180,11 +1183,10 @@ fn build_first(
             continue;
         };
         let name = message["target"]["name"].as_str().unwrap_or_default();
-        let target = packages
-            .iter()
-            .flat_map(|package| &package.targets)
-            .find(|target| target.src_path == Path::new(source) && target.id.name == name)
-            .map(|target| target.id.clone());
+        let target = sources
+            .get_or_insert_with(|| targets_by_source(packages))
+            .get(&(resolved(Path::new(source)), name.to_owned()))
+            .cloned();
         if let Some(target) = target {
             executables.insert(file_name(executable), target.clone());
             if !built.contains(&target) {
@@ -1209,6 +1211,25 @@ fn build_first(
         );
     }
     Ok((built, executables))
+}
+
+/// `path` as the file system resolves it, so that two spellings of one file are equal: one with a
+/// link on the way, and on Windows the `\\?\` form that a canonical path has and the working
+/// directory a build runs in does not. A path that cannot be resolved stays as it is.
+fn resolved(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The targets of `packages` by the file each is built from, as [`resolved`] spells it, and its
+/// name. The first target of a file and a name is the one kept.
+fn targets_by_source(packages: &[Package]) -> BTreeMap<(PathBuf, String), TargetId> {
+    let mut by_source = BTreeMap::new();
+    for target in packages.iter().flat_map(|package| &package.targets) {
+        by_source
+            .entry((resolved(&target.src_path), target.id.name.clone()))
+            .or_insert_with(|| target.id.clone());
+    }
+    by_source
 }
 
 /// What a compile of a crate of this tree was, for deciding whether two of them could have run
