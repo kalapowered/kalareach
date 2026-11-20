@@ -47,7 +47,7 @@ use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, QuestionId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
     Question, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionReadParams,
-    QuestionReadResult, QuestionResolveResult, QuestionState, SOMETHING_ELSE_CHOICE,
+    QuestionReadResult, QuestionResolveResult, SOMETHING_ELSE_CHOICE,
 };
 use kr_protocol::receipt::{ActionReadParams, ActionReadResult, Receipt};
 use kr_protocol::scalars::Nullable;
@@ -2053,17 +2053,11 @@ async fn read<T: kr_protocol::wire::WireMessage>(
         })
 }
 
-/// Returns whether a question is still waiting for somebody.
-#[must_use]
-pub const fn is_pending(question: &Question) -> bool {
-    matches!(question.state, QuestionState::Pending)
-}
-
 #[cfg(test)]
 mod tests {
     use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
     use kr_protocol::ids::{ApplicationInstanceId, ConnectionId, QuestionRevision, SessionEpoch};
-    use kr_protocol::question::{QuestionKind, QuestionSource};
+    use kr_protocol::question::{QuestionKind, QuestionSource, QuestionState};
     use kr_protocol::scalars::{TimestampMs, Uuid};
 
     use super::*;

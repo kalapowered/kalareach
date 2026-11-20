@@ -25,7 +25,7 @@
 //!   as the session.
 
 use kr_client::projection::paint::{Comparison, Keyboard, Window};
-use kr_client::projection::{Applied, Projection, Refusal};
+use kr_client::projection::{Applied, Projection};
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::projection::ProjectionEvent;
@@ -241,20 +241,6 @@ impl ProjectedDisplay {
         (self.frames, self.installs)
     }
 
-    /// The hyperlink covering one canonical cell, as inert metadata.
-    ///
-    /// Reconnection restores these so a later click still works. Nothing here activates anything:
-    /// a scheme that would launch an external application needs a policy of the client's own before
-    /// anything happens, and this is only the lookup.
-    #[must_use]
-    pub fn hyperlink_at(
-        &self,
-        row: u64,
-        column: u64,
-    ) -> Option<&kr_protocol::projection::ProjectedHyperlink> {
-        self.projection.screen()?.hyperlink_at(row, column)
-    }
-
     /// The sentence a person is shown when the projection could not carry everything.
     ///
     /// `None` when it carried all of it. The count is what makes it a report rather than a warning:
@@ -428,15 +414,6 @@ fn report(losses: Comparison, degraded: bool) -> Option<Shown> {
 /// Renders a count with the right form of its noun.
 fn plural(count: usize, one: &'static str, many: &'static str) -> Shown {
     shown!("{} {}", count, if count == 1 { one } else { many })
-}
-
-/// Whether a refusal means the screen is gone rather than merely stale.
-#[must_use]
-pub const fn discards_the_screen(refusal: Refusal) -> bool {
-    matches!(
-        refusal,
-        Refusal::BaseMismatch | Refusal::WrongGeneration | Refusal::NoScreen
-    )
 }
 
 #[cfg(test)]
