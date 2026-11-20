@@ -1066,12 +1066,10 @@ async fn supervise<R: Runtime>(
                     // admit the connection is a loss. One the host ended needs no word to the
                     // person.
                     if stopped != LeaseStop::ConnectionEnded {
-                        let unopened =
-                            Unopened::of_link(crate::lease::failed_on(&session, &stopped));
                         drop(owner.lease_stopped(
                             choice,
                             &session,
-                            Outcome::of(&unopened),
+                            lease_stop_outcome(&session, &stopped),
                             &stopped.to_string(),
                         ));
                     }
@@ -1089,6 +1087,14 @@ async fn supervise<R: Runtime>(
         ended.await;
     }
     session
+}
+
+/// What a stop of the lease reads as for the owner: the refusal the session kept from the host,
+/// when it kept one, and otherwise the reason the lease stopped.
+pub(crate) fn lease_stop_outcome(session: &Session, stopped: &LeaseStop) -> Outcome {
+    Outcome::of(&Unopened::of_link(crate::lease::failed_on(
+        session, stopped,
+    )))
 }
 
 /// Keeps the connection to the host on this machine, as the application's host: it is reached, and

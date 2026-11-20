@@ -1355,11 +1355,13 @@ mod tests {
     use super::*;
     use crate::connection::{HostWords, NotReached, Standing};
 
-    /// A connection that takes every frame and never answers one, and says when it is closed.
+    /// A connection that takes every frame and never answers one, and says when it is closed. It
+    /// sends one frame first when it is given one.
     #[derive(Debug)]
     struct Silent {
         id: ConnectionId,
         closed: Arc<AtomicBool>,
+        first: std::sync::Mutex<Option<ControlFrame>>,
     }
 
     impl ControlTransport for Silent {
@@ -1402,7 +1404,17 @@ mod tests {
         }
 
         fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
-            Box::pin(std::future::pending())
+            let first = self
+                .first
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            Box::pin(async move {
+                match first {
+                    Some(frame) => Ok(Some(frame)),
+                    None => std::future::pending().await,
+                }
+            })
         }
 
         fn revoke_streams(&self) {}
@@ -1418,6 +1430,7 @@ mod tests {
         let session = Session::start(Arc::new(Silent {
             id: ConnectionId::new(Uuid::from_bytes([byte; 16])),
             closed: Arc::clone(&closed),
+            first: std::sync::Mutex::new(None),
         }))
         .expect("a session");
         let connection = Connection::assembled(
@@ -1428,6 +1441,34 @@ mod tests {
             None,
         );
         (connection, closed)
+    }
+
+    /// A session whose host refused the connection with `code`: the first error the host answered
+    /// with request identifier zero, which the session keeps.
+    async fn refused_session(code: kr_protocol::error::ErrorCode) -> Arc<Session> {
+        let refusal = kr_protocol::error::ProtocolError::new(code, "the host will not have it");
+        let session = Session::start(Arc::new(Silent {
+            id: ConnectionId::new(Uuid::from_bytes([30; 16])),
+            closed: Arc::new(AtomicBool::new(false)),
+            first: std::sync::Mutex::new(Some(ControlFrame::Response(
+                kr_protocol::envelope::Response {
+                    request_id: kr_protocol::ids::RequestId::new(0),
+                    outcome: kr_protocol::envelope::Outcome::Error(refusal),
+                },
+            ))),
+        }))
+        .expect("a session");
+        for _ in 0..500 {
+            if session.connection_refusal().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            session.connection_refusal().is_some(),
+            "the session kept the host's refusal of the connection"
+        );
+        Arc::new(session)
     }
 
     fn host(byte: u8) -> DeviceId {
@@ -1996,6 +2037,101 @@ mod tests {
         assert!(refused.is_err());
         assert_eq!(state.connection_state(), before);
         assert_eq!(state.contact_owner().revision(), before.revision);
+    }
+
+    #[tokio::test]
+    async fn a_kept_not_admitted_lease_stop_reads_lost() {
+        use kr_client::organisation::LeaseStop;
+        use kr_protocol::error::ErrorCode;
+
+        // The same stop of the lease, as it reads with no refusal kept and with one the host sent.
+        let stopped = LeaseStop::SignIn;
+        let plain = connection(40).0.session();
+        assert!(
+            matches!(
+                crate::connection::lease_stop_outcome(&plain, &stopped),
+                Outcome::Refused { .. }
+            ),
+            "a lease that could not be given is a refusal in its words"
+        );
+        let not_admitted = refused_session(ErrorCode::PermissionDenied).await;
+        assert!(
+            matches!(
+                crate::connection::lease_stop_outcome(&not_admitted, &stopped),
+                Outcome::Lost
+            ),
+            "a connection the host did not admit is a loss, whatever the lease says"
+        );
+        let full = refused_session(ErrorCode::ResourceUnavailable).await;
+        let Outcome::Refused { request, .. } =
+            crate::connection::lease_stop_outcome(&full, &stopped)
+        else {
+            panic!("a host with no room is a refusal of the connection");
+        };
+        assert_eq!(request, Asked::Connection);
+    }
+
+    /// Sets a flag when it is dropped.
+    struct EndedFlag(Arc<AtomicBool>);
+
+    impl Drop for EndedFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A task that never ends by itself, and the flag that says it was ended.
+    fn endless_task() -> (tauri::async_runtime::JoinHandle<()>, Arc<AtomicBool>) {
+        let ended = Arc::new(AtomicBool::new(false));
+        let flag = EndedFlag(Arc::clone(&ended));
+        let task = tauri::async_runtime::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        });
+        (task, ended)
+    }
+
+    /// Whether `ended` is set within five seconds.
+    async fn ended_soon(ended: &AtomicBool) -> bool {
+        for _ in 0..500 {
+            if ended.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        ended.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_second_task_for_one_choice_is_returned_to_be_ended() {
+        let owner = ContactOwner::new();
+        let choice = owner.choose(&Target::Local, "reaching").value;
+        let (first, first_ended) = endless_task();
+        drop(owner.set_task(choice, first));
+        let (second, second_ended) = endless_task();
+        let mut returned = None;
+        let counted = dropped_under_the_guard(|| {
+            returned = Some(owner.set_task(choice, second));
+        });
+        assert_eq!(
+            counted, 0,
+            "the replaced handle is not dropped under the guard"
+        );
+        drop(returned);
+        assert!(
+            ended_soon(&first_ended).await,
+            "the first task is ended when what the second one replaced is released"
+        );
+        assert!(
+            !second_ended.load(Ordering::SeqCst),
+            "the second task is the choice's task and keeps running"
+        );
+        // The next choice ends it.
+        drop(owner.choose(&paired(1, 2), "another"));
+        assert!(
+            ended_soon(&second_ended).await,
+            "the next choice ends the task it replaces"
+        );
     }
 
     #[tokio::test]
