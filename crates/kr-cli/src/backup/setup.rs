@@ -23,7 +23,7 @@
 //! * However the dialogue ends, the terminal's modes are put back with the input still waiting
 //!   discarded, so text pasted past a line never reaches the shell or its history. On Windows
 //!   this holds for the endings that run the guard's drop and for input already in the console's
-//!   queue ([`super::console`]).
+//!   queue (`super::console`).
 //!
 //! # How a setup ends
 //!
