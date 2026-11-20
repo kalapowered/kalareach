@@ -4680,6 +4680,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "keyring",
+ "keyring-core",
  "kr-cbor",
  "kr-flush",
  "kr-protocol",
