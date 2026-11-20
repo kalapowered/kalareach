@@ -288,6 +288,14 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "step `one` runs the script `./scripts/android-unit-tests.sh`, which is not spelled the way the repository's index holds it (`scripts/android-unit-tests.sh`)",
         ),
         (
+            "a command that holds the word the loader adds",
+            step_with(
+                "command = ['cargo', 'test']",
+                "command = ['cargo', 'test', '--', '--show-output']",
+            ),
+            "step `one` holds `--show-output`, which the loader adds",
+        ),
+        (
             "a placeholder outside the plan's",
             step_with(
                 "command = ['cargo', 'test']",
@@ -947,16 +955,9 @@ fn the_one_expansion_rule_gives_the_words_the_steps_are_run_with() {
             "{platform:?} {group}: {line}"
         );
     }
-    // A command that already holds `--show-output` or `--nocapture` is left as it is.
+    // A command that shows its output as it is written, with `--nocapture`, is left as it is.
     let planted = format!(
         "{HEAD}[[step]]
-id = 'shown'
-group = 'rust'
-what = 'shown already'
-platforms = ['linux']
-reading = 'cargo'
-command = ['cargo', 'test', '--', '--show-output']
-[[step]]
 id = 'live'
 group = 'rust'
 what = 'uncaptured'
@@ -980,10 +981,6 @@ command = ['cargo', 'test']
         .collect();
     assert_eq!(
         lines,
-        [
-            "cargo test -- --show-output",
-            "cargo test -- --nocapture",
-            "cargo test -- --show-output"
-        ]
+        ["cargo test -- --nocapture", "cargo test -- --show-output"]
     );
 }

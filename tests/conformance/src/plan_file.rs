@@ -355,9 +355,9 @@ impl Default for Unrun {
 ///
 /// A `cargo test` that leaves each test's output captured is given `--show-output` after a `--`
 /// that is added when the command has none. One that shows the output as it is written, with
-/// `--nocapture`, or that already holds `--show-output`, is left as it is. Then each of `skips` is
-/// added as `--skip <name>`, after a `--` when the command still has none. A `--skip` the command
-/// already holds stays as it is written.
+/// `--nocapture`, is left as it is, and a plan file does not write `--show-output` itself. Then each
+/// of `skips` is added as `--skip <name>`, after a `--` when the command still has none. A `--skip`
+/// the command already holds stays as it is written.
 #[must_use]
 pub fn expand(
     definition: &StepDef,
@@ -372,9 +372,7 @@ pub fn expand(
     if words.first().map(String::as_str) == Some("cargo")
         && words.get(1).map(String::as_str) == Some("test")
         && definition.reading == ReadingKind::Cargo
-        && !words
-            .iter()
-            .any(|word| word == "--nocapture" || word == "--show-output")
+        && !words.iter().any(|word| word == "--nocapture")
     {
         if !words.iter().any(|word| word == "--") {
             words.push("--".to_owned());
@@ -571,6 +569,16 @@ impl Plan {
                     ));
                 }
             }
+            if expand(step, "", &[])
+                .iter()
+                .filter(|word| *word == "--show-output")
+                .count()
+                > 1
+            {
+                return refuse(format!(
+                    "step `{id}` holds `--show-output`, which the loader adds"
+                ));
+            }
             for operand in script_operands(&step.command) {
                 if let Some(why) = operand_refused(root, operand) {
                     return refuse(format!(
@@ -709,9 +717,19 @@ impl Plan {
 
     /// A plan of `steps` only, for a tree that is not a repository with a plan file: every step
     /// runs on every platform, in one group named `group`, and a test no step runs is not run for
-    /// one reason.
+    /// one reason. Each command is taken as a plan file holds it, and the steps are expanded when
+    /// the plan is asked for them.
+    ///
+    /// # Panics
+    ///
+    /// When a step carries skips: a skip names its reason, which only a plan file holds.
+    #[doc(hidden)]
     #[must_use]
     pub fn of_steps(group: &str, steps: Vec<Step>) -> Self {
+        assert!(
+            steps.iter().all(|step| step.skips.is_empty()),
+            "a plan of steps holds no skips"
+        );
         let reason = "no step of this run's selection runs this target on this platform";
         Self {
             repository: "test".to_owned(),

@@ -95,22 +95,13 @@ pub struct Step {
 }
 
 impl Step {
-    /// A `cargo` command of `group`, described as `what`.
-    ///
-    /// A `cargo test` that leaves each test's output captured is given `--show-output`, which
-    /// prints what every test that passed wrote, under its name: that is where a test that returned
-    /// early says so, and where the report reads it. One that shows the output as it is written,
-    /// with `--nocapture`, is left as it is.
+    /// A `cargo` command of `group`, described as `what`, with the words as a plan file holds them:
+    /// the words the loader adds to a command are not written here (see
+    /// [`crate::plan_file::expand`]).
     #[must_use]
     pub fn cargo(group: &str, what: &str, arguments: &[&str]) -> Self {
         let mut command = vec!["cargo".to_owned()];
         command.extend(arguments.iter().map(|argument| (*argument).to_owned()));
-        if arguments.first() == Some(&"test") && !arguments.contains(&"--nocapture") {
-            if !arguments.contains(&"--") {
-                command.push("--".to_owned());
-            }
-            command.push("--show-output".to_owned());
-        }
         Self {
             group: group.to_owned(),
             what: what.to_owned(),
@@ -491,24 +482,6 @@ mod tests {
                 .count(),
             first.skips.len()
         );
-    }
-
-    #[test]
-    fn a_test_step_shows_what_its_passing_tests_wrote_unless_it_shows_it_as_written() {
-        let line = |arguments: &[&str]| Step::cargo("rust", "x", arguments).line();
-        assert_eq!(
-            line(&["test", "--locked", "--workspace"]),
-            "cargo test --locked --workspace -- --show-output"
-        );
-        assert_eq!(
-            line(&["test", "-p", "a", "--", "--test-threads=1"]),
-            "cargo test -p a -- --test-threads=1 --show-output"
-        );
-        assert_eq!(
-            line(&["test", "-p", "a", "--", "--nocapture"]),
-            "cargo test -p a -- --nocapture"
-        );
-        assert_eq!(line(&["build", "-p", "a"]), "cargo build -p a");
     }
 
     #[test]
