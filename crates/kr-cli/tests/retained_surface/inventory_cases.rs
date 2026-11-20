@@ -277,6 +277,29 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
             "{at}: the scan does not read a module declared in a macro (mod m; in the tokens of other!)"
         ),
     );
+    // `include!` in the tokens of a macro, in a definition's transcriber or in another call's
+    // arguments, and a module made by a repetition.
+    for lib in [
+        "macro_rules! load { () => { include!(\"send.rs\"); }; }\nload!();\n",
+        "macro_rules! load { () => { std::include!(\"send.rs\"); }; }\n",
+        "other! { include!(\"x.rs\"); }\n",
+    ] {
+        refuse(lib, &[], format!("{at}: the scan does not read include!"));
+    }
+    refuse(
+        "macro_rules! make { ($($n:ident)*) => { mod $($n)*; }; }\nmake!(hidden);\n",
+        &[],
+        format!(
+            "{at}: the scan does not read a module declared in a macro (mod $(...); in the tokens of macro_rules!)"
+        ),
+    );
+    refuse(
+        "other! { mod $($n)*; }\n",
+        &[],
+        format!(
+            "{at}: the scan does not read a module declared in a macro (mod $(...); in the tokens of other!)"
+        ),
+    );
     refuse(
         "#[path = concat!(\"a\", \".rs\")]\nmod m;\n",
         &[],
@@ -325,6 +348,22 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         "#[macro_use]\nmod other;\nmacro_rules! m { () => {}; }\n",
         &[("src/other.rs", "macro_rules! m { () => {}; }\n")],
         twice("crates/kr-sender/src/lib.rs, crates/kr-sender/src/other.rs"),
+    );
+    // A definition in a file whose module declaration is reached from the file of another: the
+    // parent's definition before `mod child;` stays in scope in the child, and the child's can hide
+    // it, whether the child is declared in the parent or further down.
+    refuse(
+        "macro_rules! m { () => {}; }\nmod child;\n",
+        &[("src/child.rs", "macro_rules! m { () => {}; }\n")],
+        twice("crates/kr-sender/src/lib.rs, crates/kr-sender/src/child.rs"),
+    );
+    refuse(
+        "macro_rules! m { () => {}; }\nmod a;\n",
+        &[
+            ("src/a.rs", "mod b;\n"),
+            ("src/a/b.rs", "macro_rules! m { () => {}; }\n"),
+        ],
+        twice("crates/kr-sender/src/lib.rs, crates/kr-sender/src/a/b.rs"),
     );
     // An item-position macro that nothing defines.
     refuse(
@@ -608,30 +647,99 @@ fn a_manifest_names_a_target_and_a_procedural_macro_crate_is_refused() {
 
 #[test]
 fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
-    for name in [
-        "thread_local",
-        "task_local",
-        "bindgen",
-        "compile_error",
-        "ios_plugin_binding",
-        "debug_as_display",
-        "debug_as_name",
-        "debug_fields",
-        "display_as_said",
+    // Each family by the provider that makes it safe, as the source writes it: bare, by a path, and
+    // by a `use` line that gives the name (with a rename).
+    for call in [
+        "thread_local! { static X: u8 = 0; }",
+        "std::thread_local! { static X: u8 = 0; }",
+        "tokio::task_local! { static X: u8; }",
+        "wasmtime::component::bindgen!({ path: \"x.wit\" });",
+        "compile_error!(\"no\");",
+        "std::compile_error!(\"no\");",
+        "core::compile_error!(\"no\");",
+        "tauri::ios_plugin_binding!(init_plugin_x);",
+        "kr_client::debug_as_display!(E);",
+        "kr_client::debug_as_name!(E);",
+        "kr_client::debug_fields!(E { a });",
+        "kr_client::display_as_said!(E);",
+        "use tokio::task_local;\ntask_local! { static X: u8; }",
+        "use wasmtime::component::bindgen;\nbindgen!({ path: \"x.wit\" });",
+        "use wasmtime::component;\ncomponent::bindgen!({ path: \"x.wit\" });",
+        "use kr_client::{debug_fields as shown};\nshown!(E { a });",
+        "use schemars::json_schema;\nmacro_rules! schema { () => { json_schema!({}) }; }",
+        "macro_rules! schema { () => { schemars::json_schema!({}) }; }",
     ] {
-        // By its own name and by a path to it, as the source writes them.
-        let lib =
-            format!("{name}! {{ static X: u8 = 0; }}\ntokio::{name}! {{ static Y: u8 = 0; }}\n");
-        assert_eq!(read_names(&lib, &[]), Ok(Vec::<String>::new()), "{name}");
+        assert_eq!(
+            read_names(&format!("{call}\n"), &[]),
+            Ok(Vec::<String>::new()),
+            "{call}"
+        );
     }
+    // The macros of the standard library that the transcribers of the workspace call, bare and by a
+    // path, and the crate's own, bare and by a path to its own modules and its root.
+    let lib = "mod inner;\nmacro_rules! own { () => {}; }\nmacro_rules! uses {\n    ($x:expr) => {\n        assert_eq!($x, 1);\n        core::matches!($x, 1);\n        std::format!(\"{}\", $x);\n        stringify!($x);\n        own!();\n        $crate::own!();\n        crate::own!();\n        inner::inside!();\n        vec![0];\n    };\n}\n";
+    let files = [("src/inner.rs", "macro_rules! inside { () => {}; }\n")];
+    assert_eq!(read_names(lib, &files), Ok(Vec::<String>::new()));
 }
 
 #[test]
 fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
-    let (scan, lookup) = scanned("tokio::unlisted! { static X: u8 = 0; }\n", &[]);
-    let text = "crates/kr-sender/src/lib.rs: unlisted! is called at item position, is not defined in kr_sender and is not one the scan accepts".to_owned();
-    assert_eq!(scan, Err(text.clone()));
-    assert_eq!(lookup, Lookup::Failed(text));
+    let text = |name: &str| {
+        format!(
+            "crates/kr-sender/src/lib.rs: {name}! is called at item position, is not defined in kr_sender and is not one the scan accepts"
+        )
+    };
+    for (lib, name) in [
+        ("tokio::unlisted! { static X: u8 = 0; }", "unlisted"),
+        // A family name from a provider that is not its own, bare where it has no bare form, and
+        // through an import that names another provider or a glob.
+        ("foreign::bindgen!({});", "bindgen"),
+        ("tokio::bindgen!({});", "bindgen"),
+        ("bindgen!({});", "bindgen"),
+        ("task_local! { static X: u8; }", "task_local"),
+        ("std::task_local! { static X: u8; }", "task_local"),
+        (
+            "foreign::thread_local! { static X: u8 = 0; }",
+            "thread_local",
+        ),
+        ("json_schema!({});", "json_schema"),
+        ("use schemars::*;\njson_schema!({});", "json_schema"),
+        (
+            "use foreign::json_schema;\njson_schema!({});",
+            "json_schema",
+        ),
+        ("kr_worker::debug_fields!(E { a });", "debug_fields"),
+        // A macro of the crate's own name behind another crate's path is that crate's macro.
+        (
+            "macro_rules! mine { () => {}; }\nforeign::mine! {}\n",
+            "mine",
+        ),
+        // The transcribers of a definition, at any depth.
+        (
+            "macro_rules! m { () => { other::generate!(); }; }\nm!();\n",
+            "generate",
+        ),
+        (
+            "macro_rules! m { () => { generate!(); }; }\nm!();\n",
+            "generate",
+        ),
+        (
+            "macro_rules! m { () => { macro_rules! n { () => { deep::generate!(); }; } }; }\n",
+            "generate",
+        ),
+        (
+            "macro_rules! m { () => { vec![other::generate!()]; }; }\n",
+            "generate",
+        ),
+        (
+            "fn f() { macro_rules! local { () => { other::generate!(); }; } }\n",
+            "generate",
+        ),
+    ] {
+        let (scan, lookup) = scanned(lib, &[]);
+        assert_eq!(scan, Err(text(name)), "{lib}");
+        assert_eq!(lookup, Lookup::Failed(text(name)), "{lib}");
+    }
 }
 
 #[test]
@@ -674,6 +782,128 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
     );
     let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(tree.sightings(&|_| true).map(|found| found.len()), Ok(1));
+    // The refusal over the crates, for a macro the other crate exports under `name`.
+    let across = |lib: &str, name: &str| {
+        let folder = small_tree(lib);
+        write(
+            folder.path(),
+            "crates/kr-worker/src/lib.rs",
+            &format!("#[macro_export]\nmacro_rules! {name} {{ ($m:expr) => {{ $m }}; }}\n"),
+        );
+        let tree = tree_at(folder.path()).expect("the tree");
+        tree.sightings(&|_| true).map(|found| found.len())
+    };
+    let refused = |name: &str| {
+        Err(format!(
+            "kr_sender: {name}! is called with a sighting and kr_worker exports it; the scan does not follow it across crates"
+        ))
+    };
+    // A call reached only through the transcribers of a macro that is expanded: `fwd` is called
+    // with the sighting, and what it calls is the other crate's.
+    let lib = "use schemars::json_schema;\nmacro_rules! fwd { ($x:expr) => { json_schema!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "json_schema"), refused("json_schema"));
+    // The same macro that nothing calls with a sighting is not followed.
+    let lib = "use schemars::json_schema;\nmacro_rules! fwd { ($x:expr) => { json_schema!($x) }; }\nfn f() { fwd!(1); let _ = Method::AgentTurnSteer; }\n";
+    assert_eq!(across(lib, "json_schema"), Ok(1));
+    // A path of the other crate names its macro whatever this crate defines under the same name;
+    // a bare call is this crate's own.
+    let lib = "macro_rules! shared { ($m:expr) => { $m }; }\nfn f() { kr_worker::shared!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "shared"), refused("shared"));
+    let lib = "macro_rules! shared { ($m:expr) => { $m }; }\nfn f() { shared!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "shared"), Ok(2));
+    let lib = "macro_rules! shared { ($m:expr) => { $m }; }\nfn f() { crate::shared!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "shared"), Ok(2));
+}
+
+#[test]
+fn a_macro_defined_in_a_function_body_is_a_macro_of_its_own() {
+    use SightKind::{Expands, Names};
+    let folder = small_tree(
+        "fn f() {\n    macro_rules! inner { ($m:expr) => { $m }; }\n    inner!(Method::AgentTurnCancel);\n}\n#[cfg(test)]\nfn hidden() {\n    macro_rules! gone { () => {}; }\n}\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
+    let found = tree
+        .sightings(&|krate| krate == "kr_sender")
+        .map(|found| super::walker_cases::names(&found, "kr_sender"));
+    assert_eq!(
+        found,
+        Ok(BTreeMap::from([
+            ("f".to_owned(), vec![Names]),
+            ("macro:inner".to_owned(), vec![Expands]),
+        ]))
+    );
+    // Its rules are an item, whose source holds the definition; one that no build holds is not.
+    let source = tree
+        .source("kr_sender", "macro:inner")
+        .expect("a lookup")
+        .expect("a source");
+    assert!(source.text.contains("macro_rules"), "{}", source.text);
+    assert!(matches!(
+        tree.item("kr_sender", "macro:inner"),
+        Lookup::Found(_)
+    ));
+    assert_eq!(tree.item("kr_sender", "macro:gone"), Lookup::Absent);
+}
+
+#[test]
+fn a_cfg_attr_that_adds_macro_export_or_macro_use_counts_where_some_configuration_enables_it() {
+    // Two sibling modules define `m`: they are accepted while each is private, and refused when
+    // one definition's scope reaches beyond its module.
+    let define = "macro_rules! m { () => {}; }\n";
+    let hides = |result: Result<Vec<String>, String>| {
+        result.is_err_and(|error| {
+            error.starts_with(
+                "kr_sender: the macro m is defined twice where one definition can hide the other (",
+            )
+        })
+    };
+    let siblings = |lib: &str, a: &str| {
+        read_names(
+            lib,
+            &[("src/a.rs", &format!("{a}{define}")), ("src/b.rs", define)],
+        )
+    };
+    let none = Ok(Vec::<String>::new());
+    for attribute in [
+        "#[macro_export]",
+        "#[cfg_attr(unix, macro_export)]",
+        "#[cfg_attr(not(test), macro_export)]",
+        "#[cfg_attr(unix, cfg_attr(not(test), macro_export))]",
+    ] {
+        let found = siblings("mod a;\nmod b;\n", &format!("{attribute}\n"));
+        assert!(hides(found), "{attribute}");
+    }
+    for attribute in [
+        "#[cfg_attr(test, macro_export)]",
+        "#[cfg_attr(all(unix, test), macro_export)]",
+        "#[cfg_attr(unix, cfg_attr(test, macro_export))]",
+        "#[cfg_attr(unix, allow(unused))]",
+    ] {
+        assert_eq!(
+            siblings("mod a;\nmod b;\n", &format!("{attribute}\n")),
+            none,
+            "{attribute}"
+        );
+    }
+    // `macro_use` on the declaration of a module whose file defines it.
+    let files = [("src/a.rs", define), ("src/b.rs", define)];
+    for attribute in [
+        "#[macro_use]",
+        "#[cfg_attr(unix, macro_use)]",
+        "#[cfg_attr(not(test), macro_use)]",
+    ] {
+        let found = read_names(&format!("{attribute}\nmod a;\nmod b;\n"), &files);
+        assert!(hides(found), "{attribute}");
+    }
+    assert_eq!(
+        read_names("#[cfg_attr(test, macro_use)]\nmod a;\nmod b;\n", &files),
+        none
+    );
+    // A predicate the rule cannot read is its error.
+    assert_eq!(
+        siblings("mod a;\nmod b;\n", "#[cfg_attr(some_atom, macro_export)]\n"),
+        Err("crates/kr-sender/src/a.rs: the scan cannot read the condition some_atom".to_owned())
+    );
 }
 
 #[test]
