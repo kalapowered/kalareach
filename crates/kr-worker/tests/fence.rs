@@ -545,7 +545,7 @@ async fn wired_holding_fences(
         Bridging {
             clock: Arc::clone(clock),
             fence_hold: gate.map(|gate| FenceHold::Gate(gate.clone())),
-            hello_abi: "zle-5.9",
+            ..Bridging::on_a_clock_of_its_own()
         },
         |_| {},
     )
@@ -560,15 +560,20 @@ struct Bridging {
     fence_hold: Option<FenceHold>,
     /// The editor ABI the reference shell's hello declares. The worker supports `zle-5.9`.
     hello_abi: &'static str,
+    /// The continuous clock the terminal's writer reads to decide whether the authority of what it
+    /// writes has ended.
+    shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
 }
 
 impl Bridging {
     /// A clock of its own that the case moves, and every fence written as soon as the writer has it.
+    /// The writer reads the machine's own continuous clock.
     fn on_a_clock_of_its_own() -> Self {
         Self {
             clock: Arc::new(kr_transport::clock::ManualClock::new()),
             fence_hold: None,
             hello_abi: "zle-5.9",
+            shared_clock: Arc::new(kr_ipc::clock::SystemSharedClock),
         }
     }
 }
@@ -626,11 +631,7 @@ async fn wired_built(
         ));
     }
     let runtime = Arc::new(
-        SessionRuntime::start(
-            session,
-            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
-        )
-        .expect("starts the runtime"),
+        SessionRuntime::start(session, bridging.shared_clock).expect("starts the runtime"),
     );
 
     let expectation = WorkerExpectation {
@@ -2105,8 +2106,7 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
         true,
         Bridging {
             clock: Arc::clone(&clock),
-            fence_hold: None,
-            hello_abi: "zle-5.9",
+            ..Bridging::on_a_clock_of_its_own()
         },
         |config| config.worker_profile = WorkerProfile::DesktopBound,
     ));
@@ -10472,8 +10472,14 @@ fn with_a_floor(config: &mut SessionConfig) {
         .with_floor(Arc::new(kr_ipc::floor::SharedFloor::in_process(0)));
 }
 
-/// The same, with an application that sets its terminal to take input as it comes and then reads
+/// Gives a session an application that sets its terminal to take input as it comes and then reads
 /// none of it, so a terminal that has taken what it has room for takes no more.
+fn over_an_application_that_does_not_read(config: &mut SessionConfig) {
+    config.shell =
+        kr_worker::testing::posix_script("stty raw -echo; printf 'kr-ready\\n'; sleep 120");
+}
+
+/// The same, with a floor.
 async fn wired_with_a_floor_over_an_application_that_does_not_read() -> Wired {
     wired_built(
         ShellMode::Managed,
@@ -10481,8 +10487,7 @@ async fn wired_with_a_floor_over_an_application_that_does_not_read() -> Wired {
         Bridging::on_a_clock_of_its_own(),
         |config| {
             with_a_floor(config);
-            config.shell =
-                kr_worker::testing::posix_script("stty raw -echo; printf 'kr-ready\\n'; sleep 120");
+            over_an_application_that_does_not_read(config);
         },
     )
     .await
@@ -10857,16 +10862,15 @@ fn more_than_the_terminal_takes() -> Vec<u8> {
     b"fill-the-terminal\n".repeat(4096)
 }
 
-/// Fills the terminal with `holder`'s bytes until the writer waits for room, and stands the writer
-/// in the look it makes there. Returns the end that lets the look go, and what the writer still
-/// owes the terminal.
+/// Fills the terminal with `holder`'s bytes, whose authority ends as `authority` says, until the
+/// writer waits for room. Returns what the writer still owes the terminal.
 ///
-/// The batch carries a UTC end an hour away, so the look answers that the deadline has not passed.
 /// The writer is waiting for room once what it owes has stopped falling.
-async fn stand_the_writer_waiting_for_room_in_a_look(
+fn fill_the_terminal_until_the_writer_waits_for_room(
     wired: &Wired,
     holder: AttachmentId,
-) -> (std::sync::mpsc::Sender<()>, usize) {
+    authority: kr_worker::session::InputAuthority,
+) -> usize {
     let ready = std::time::Instant::now() + SOON;
     while !contains(&retained(&wired.runtime.session()), b"kr-ready")
         && std::time::Instant::now() < ready
@@ -10888,10 +10892,7 @@ async fn stand_the_writer_waiting_for_room_in_a_look(
                 epoch,
                 0,
                 &bytes,
-                kr_worker::session::InputAuthority {
-                    boot_ms: None,
-                    utc_ms: Some(kr_ipc::now_ms().get() + 3_600_000),
-                },
+                authority,
                 std::time::Instant::now(),
             )
             .expect("accepted");
@@ -10914,6 +10915,26 @@ async fn stand_the_writer_waiting_for_room_in_a_look(
         owed > 0 && owed < bytes.len(),
         "the terminal took some of the bytes and not all of them: {owed} of {} are owed",
         bytes.len()
+    );
+    owed
+}
+
+/// Fills the terminal with `holder`'s bytes until the writer waits for room, and stands the writer
+/// in the look it makes there. Returns the end that lets the look go, and what the writer still
+/// owes the terminal.
+///
+/// The batch carries a UTC end an hour away, so the look answers that the deadline has not passed.
+async fn stand_the_writer_waiting_for_room_in_a_look(
+    wired: &Wired,
+    holder: AttachmentId,
+) -> (std::sync::mpsc::Sender<()>, usize) {
+    let owed = fill_the_terminal_until_the_writer_waits_for_room(
+        wired,
+        holder,
+        kr_worker::session::InputAuthority {
+            boot_ms: None,
+            utc_ms: Some(kr_ipc::now_ms().get() + 3_600_000),
+        },
     );
     let time = Arc::clone(wired.runtime.session().time());
     let (arrived, release) = time.arm_floor_look_stall(0);
@@ -11002,6 +11023,113 @@ async fn a_takeover_returns_its_epoch_while_the_writer_waiting_for_room_stands_i
         queued.load(std::sync::atomic::Ordering::Acquire),
         0,
         "the writer settled the first holder's batch"
+    );
+    wired.close().await;
+}
+
+/// A session whose writer reads the continuous clock `clock`, which only the case moves, over an
+/// application that reads none of its input.
+async fn wired_on_a_clock_over_an_application_that_does_not_read(
+    clock: &kr_ipc::clock::ManualSharedClock,
+) -> Wired {
+    wired_built(
+        ShellMode::Managed,
+        true,
+        Bridging {
+            shared_clock: Arc::new(clock.clone()),
+            ..Bridging::on_a_clock_of_its_own()
+        },
+        over_an_application_that_does_not_read,
+    )
+    .await
+}
+
+/// How many bytes of a lease's input the terminal has taken so far.
+fn lease_bytes_the_terminal_has_taken(wired: &Wired) -> usize {
+    wired
+        .runtime
+        .input()
+        .terminal_writes()
+        .into_iter()
+        .filter(|write| write.of_a_lease)
+        .map(|write| write.bytes.len())
+        .sum()
+}
+
+/// KR-REQ-07.77, KR-REQ-07.79, KR-REQ-07.83: a batch whose authority ends on the continuous clock
+/// while the writer waits for room in a terminal that has none is given up: nothing more of it is
+/// written, what it still owed is settled, and its lease is left owing nothing for it.
+///
+/// The batch carries no UTC end, so the writer makes no look at storage, and no lease changes, so
+/// no fence ends the batch. The one thing that can end it while it waits is the end of its authority
+/// on the continuous clock, which the writer asks about each time the terminal still has no room.
+/// The clock is the case's own and moves only when the case moves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Unix terminal stops taking input while the application is not reading, which makes the writer wait for room; a Windows pseudo-console takes it at once"
+)]
+async fn a_batch_whose_authority_ends_while_the_writer_waits_for_room_is_given_up() {
+    const AUTHORITY_ENDS_AT_MS: u64 = 60_000;
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    let wired = wired_on_a_clock_over_an_application_that_does_not_read(&clock).await;
+    let holder = wired.holder();
+    let challenger = AttachmentId::new(kr_ipc::new_uuid());
+    let params = terminal(wired.session_id);
+    wired
+        .runtime
+        .session()
+        .attach(&params, params.requested.clone(), challenger)
+        .expect("attaches");
+    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let sent = more_than_the_terminal_takes().len();
+
+    // The clock reads zero, so the batch has a minute of authority left while the writer waits.
+    let owed = fill_the_terminal_until_the_writer_waits_for_room(
+        &wired,
+        holder,
+        kr_worker::session::InputAuthority {
+            boot_ms: Some(AUTHORITY_ENDS_AT_MS),
+            utc_ms: None,
+        },
+    );
+    let taken = sent - owed;
+    assert_eq!(
+        lease_bytes_the_terminal_has_taken(&wired),
+        taken,
+        "the terminal has taken what the batch is short of"
+    );
+
+    // The end of the authority passes with the writer waiting for room.
+    clock.advance(Duration::from_millis(AUTHORITY_ENDS_AT_MS + 1_000));
+    let settled = std::time::Instant::now() + SOON;
+    while queued.load(std::sync::atomic::Ordering::Acquire) != 0
+        && std::time::Instant::now() < settled
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        queued.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the writer gave the batch up once its authority had ended while it waited for room"
+    );
+    assert_eq!(
+        lease_bytes_the_terminal_has_taken(&wired),
+        taken,
+        "nothing more of the batch reached the terminal after its authority ended"
+    );
+
+    // The writer released what it gave up against the lease, so a takeover has none of it to count
+    // as lost.
+    let acquired = wired
+        .runtime
+        .session()
+        .acquire_input(challenger, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("the takeover takes the keys");
+    assert_eq!(
+        acquired.discarded_bytes.get(),
+        0,
+        "the lease owes nothing for a batch the writer gave up"
     );
     wired.close().await;
 }
