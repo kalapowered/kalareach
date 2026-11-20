@@ -5867,38 +5867,48 @@ async fn a_rollback_to_a_release_without_the_store_of_binding_revisions_states_t
                 .collect(),
         )
     };
-    let (host, one, _two, archive) =
-        host_to_update_between(without(), Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)).await;
-    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
-    assert!(output.status.success(), "kr host update: {said}");
-    let output = host.run(&host.store.stable(Program::Kr), &["host", "rollback"]);
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    assert!(output.status.success(), "kr host rollback: {text}");
-    assert!(
-        text.contains(
-            "records a prompt that names a draft written for an application under the binding \
-             revision in force at the prompt, not the one the draft was written under; this \
-             rollback ended no draft"
-        ),
-        "{text}"
-    );
-    let _ = one;
+    // One host at a time: a host holds one of the places the harness gives each case for its host,
+    // and a case that holds more than the places there are waits for itself.
+    {
+        let (host, _one, _two, archive) =
+            host_to_update_between(without(), Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2))
+                .await;
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        assert!(output.status.success(), "kr host update: {said}");
+        let output = host.run(&host.store.stable(Program::Kr), &["host", "rollback"]);
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "kr host rollback: {text}");
+        assert!(
+            text.contains(
+                "records a prompt that names a draft written for an application under the binding \
+                 revision in force at the prompt, not the one the draft was written under; this \
+                 rollback ended no draft"
+            ),
+            "{text}"
+        );
+    }
 
     // The control: the release before lists the store, and the rollback says nothing of the limit.
-    let (host, _one, _two, archive) = host_to_update().await;
-    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
-    assert!(output.status.success(), "kr host update: {said}");
-    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
-    assert!(output.status.success(), "kr host rollback: {said}");
-    assert_eq!(said["draft_limit"], false, "{said}");
+    {
+        let (host, _one, _two, archive) = host_to_update().await;
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        assert!(output.status.success(), "kr host update: {said}");
+        let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+        assert!(output.status.success(), "kr host rollback: {said}");
+        assert_eq!(said["draft_limit"], false, "{said}");
+    }
+
     // And the one that lacks it says so in the JSON too.
-    let (host, _one, _two, archive) =
-        host_to_update_between(without(), Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)).await;
-    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
-    assert!(output.status.success(), "kr host update: {said}");
-    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
-    assert!(output.status.success(), "kr host rollback: {said}");
-    assert_eq!(said["draft_limit"], true, "{said}");
+    {
+        let (host, _one, _two, archive) =
+            host_to_update_between(without(), Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2))
+                .await;
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        assert!(output.status.success(), "kr host update: {said}");
+        let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+        assert!(output.status.success(), "kr host rollback: {said}");
+        assert_eq!(said["draft_limit"], true, "{said}");
+    }
 }
 
 /// KR-REQ-26.10: a rollback is refused, naming the document, when the configuration document is at a
