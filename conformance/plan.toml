@@ -2205,6 +2205,19 @@ why = '''each of these cases shows a fault that is still open: a close stops lat
 
 [[ignored_run]]
 package = 'kr-cli'
+target = '--test startup'
+cases = [
+    'a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why',
+    'a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon',
+    'a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for',
+]
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for'
+
+[[ignored_run]]
+package = 'kr-cli'
 target = '--test startup_windows'
 cases = [
     'the_daemon_the_task_starts_is_in_none_of_the_callers_jobs',
