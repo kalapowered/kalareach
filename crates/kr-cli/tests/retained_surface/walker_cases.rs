@@ -369,7 +369,7 @@ fn sender_tree() -> tempfile::TempDir {
         ),
         (
             "y.rs",
-            "mod grand;\n#[cfg(test)]\nmod t;\nfn from_y() { let _ = Method::AgentTurnSteer; }\n",
+            "mod grand;\n#[cfg(test)]\nmod t;\nfn from_y() { let _ = Method::AgentTurnSteer; }\n#[doc = \"agent.turn.cancel\"]\nuse std::fmt::Debug;\n#[doc = \"agent.turn.steer\"]\nidle!();\n",
         ),
         (
             "grand.rs",
