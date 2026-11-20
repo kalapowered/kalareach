@@ -2146,15 +2146,47 @@ fn end_to_end_drift(plan: &Plan) -> Result<(), String> {
         .filter_map(|(target, _)| target.split_once(':'))
         .map(|(package, suite)| (package.to_owned(), suite.to_owned()))
         .collect();
-    let steps: Vec<(Step, (String, String))> = plan
-        .steps(Platform::Linux, &["end-to-end".to_owned()], "/tmp/e", None)
-        .into_iter()
-        .filter(|step| step.reading == Reading::Cargo)
-        .filter_map(|step| {
-            let suite = (word_after(&step, "-p")?, word_after(&step, "--test")?);
-            Some((step, suite))
-        })
-        .collect();
+    // Each Linux step of the group is the build of the worker that the network suite launches, held
+    // to its whole command, or a suite: no step passes unread.
+    let worker_build = [
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "kr-worker",
+        "--bin",
+        "kr-worker",
+    ];
+    let mut steps: Vec<(Step, (String, String))> = Vec::new();
+    let mut builds = 0;
+    for step in plan.steps(Platform::Linux, &["end-to-end".to_owned()], "/tmp/e", None) {
+        if step.reading == Reading::Build {
+            if step.command != worker_build {
+                return Err(format!(
+                    "the end-to-end build step runs {:?}, not {worker_build:?}",
+                    step.command
+                ));
+            }
+            builds += 1;
+            continue;
+        }
+        match (word_after(&step, "-p"), word_after(&step, "--test")) {
+            (Some(package), Some(suite)) if step.reading == Reading::Cargo => {
+                steps.push((step, (package, suite)));
+            }
+            _ => {
+                return Err(format!(
+                    "the end-to-end step `{}` is neither the build of the worker nor a suite: {:?}",
+                    step.what, step.command
+                ));
+            }
+        }
+    }
+    if builds != 1 {
+        return Err(format!(
+            "the end-to-end group has {builds} build steps of the worker, not one"
+        ));
+    }
     let planned: Vec<(String, String)> = steps.iter().map(|(_, suite)| suite.clone()).collect();
     if planned != listed {
         return Err(format!(
@@ -2367,18 +2399,25 @@ fn performance_drift(plan: &Plan) -> Result<(), String> {
             Some((format!("{kind} {target}"), name.to_owned()))
         })
         .collect();
-    let measurements: Vec<(Step, (String, String))> = plan
+    // Each Linux step that selects a test by its exact name is a measurement of a test or a bench
+    // target: none passes unread.
+    let mut measurements: Vec<(Step, (String, String))> = Vec::new();
+    for step in plan
         .steps(Platform::Linux, &["performance".to_owned()], "/tmp/e", None)
         .into_iter()
         .filter(|step| step.command.iter().any(|word| word == "--exact"))
-        .filter_map(|step| {
-            let (kind, target) = word_after(&step, "--test")
-                .map(|target| ("test", target))
-                .or_else(|| word_after(&step, "--bench").map(|target| ("bench", target)))?;
-            let measurement = (format!("{kind} {target}"), step.command.last()?.clone());
-            Some((step, measurement))
-        })
-        .collect();
+    {
+        let target = word_after(&step, "--test")
+            .map(|target| ("test", target))
+            .or_else(|| word_after(&step, "--bench").map(|target| ("bench", target)));
+        let (Some((kind, target)), Some(name)) = (target, step.command.last().cloned()) else {
+            return Err(format!(
+                "the performance step `{}` selects by `--exact` and names no test or bench target: {:?}",
+                step.what, step.command
+            ));
+        };
+        measurements.push((step, (format!("{kind} {target}"), name)));
+    }
     let planned: Vec<(String, String)> = measurements
         .iter()
         .map(|(_, measurement)| measurement.clone())
@@ -2550,6 +2589,64 @@ fn each_drift_case_fails_against_a_planted_edit_of_a_copy_of_the_file() {
     let refused = performance_drift(&ignored)
         .expect_err("a measurement that runs its ignored tests no longer");
     assert!(refused.contains("the measurement"), "{refused}");
+
+    // A step that the guards cannot parse is refused, not skipped: a suite with no `--test`, a
+    // build of the worker that is not the plan's own, and a measurement with no target.
+    let mut loose = plan.clone();
+    let at = step_of(&loose, "end-to-end", "--test-threads=1");
+    let mut extra = loose.steps[at].clone();
+    extra.command = [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "kr-worker",
+        "--",
+        "--test-threads=1",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    loose.steps.push(extra);
+    let refused = end_to_end_drift(&loose).expect_err("an end-to-end step that is no suite");
+    assert!(
+        refused.contains("is neither the build of the worker nor a suite"),
+        "{refused}"
+    );
+
+    let mut built = plan.clone();
+    let at = step_of(&built, "end-to-end", "build");
+    built.steps[at]
+        .command
+        .retain(|word| word != "--bin" && word != "kr-worker");
+    let refused =
+        end_to_end_drift(&built).expect_err("a build of the worker that is not the plan's");
+    assert!(
+        refused.contains("the end-to-end build step runs"),
+        "{refused}"
+    );
+
+    let mut targetless = plan.clone();
+    let at = step_of(&targetless, "performance", "--exact");
+    let mut extra = targetless.steps[at].clone();
+    extra.command = [
+        "cargo",
+        "test",
+        "--locked",
+        "--release",
+        "-p",
+        "kr-worker",
+        "--",
+        "--exact",
+        "x",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    targetless.steps.push(extra);
+    let refused = performance_drift(&targetless).expect_err("a measurement with no target");
+    assert!(
+        refused.contains("names no test or bench target"),
+        "{refused}"
+    );
 
     let mut moved = plan.clone();
     let at = step_of(&moved, "performance", "--ignored");
