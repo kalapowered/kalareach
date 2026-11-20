@@ -226,8 +226,9 @@ is a directory of the repository when the plan loads.
 
 A step runs with the plan's `[env]` and its own `env`, and its value of a name replaces the plan's.
 Every name in `env`, in `[env]` and in `needs` has to be a variable name. On Windows, names that
-differ only by case are one variable, so a step's `PATH` replaces the plan's `Path`. The loader
-refuses the names the report sets for each step, in any case, in `env` and in `[env]`:
+differ only by case are one variable, so a step's `PATH` replaces the plan's `Path`, and the loader
+refuses two names of one table that differ only by case, in `env` and in `[env]`, on every platform.
+The loader refuses the names the report sets for each step, in any case, in `env` and in `[env]`:
 `KR_TEST_ARTIFACTS_DIR`, `CARGO_TERM_COLOR`, `KR_CONFORMANCE_STEP`, `KR_CONFORMANCE_RECORDS`,
 `KR_CONFORMANCE_OWN_HARNESS` and `CARGO_TARGET_<triple>_RUNNER`.
 

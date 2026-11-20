@@ -1001,6 +1001,55 @@ fn a_variable_the_report_sets_for_each_step_is_refused_in_the_plan_and_in_a_step
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A plan's `[env]` and a step's `env` each hold one name for one variable: two names of one table
+/// that differ only by case are refused on every platform, the pair named in the order the table
+/// keeps it. Names that differ by more than case load, and so do a plan's name and a step's that
+/// differ only by case: the step's replaces the plan's where the platform takes them as one.
+#[test]
+fn two_names_of_one_table_that_differ_only_by_case_are_refused_in_the_plan_and_in_a_step() {
+    let in_step = |names: &str| {
+        with(&STEP.replace(
+            "command = ['cargo', 'test']",
+            &format!("env = {{ {names} }}\ncommand = ['cargo', 'test']"),
+        ))
+    };
+    for (place, text) in [
+        (
+            "`[env]`",
+            with(&format!("[env]\nLOUD = 'a'\nLoud = 'b'\n{STEP}")),
+        ),
+        ("step `one`", in_step("LOUD = 'a', Loud = 'b'")),
+    ] {
+        let words = format!("{place} gives `LOUD` and `Loud`, which differ only by case");
+        match Plan::parse(&text, &repository()) {
+            Ok(_) => panic!("{place}: the loader refused nothing"),
+            Err(refusal) => assert!(
+                refusal.to_string().contains(&words),
+                "{place}: refused as `{refusal}`, which lacks `{words}`"
+            ),
+        }
+    }
+    for (name, text) in [
+        (
+            "two names of one table that differ by more than case",
+            with(&format!("[env]\nLOUD = 'a'\nLOUDER = 'b'\n{STEP}")),
+        ),
+        (
+            "a name of the plan and a name of a step that differ only by case",
+            with(&format!(
+                "[env]\nLOUD = 'a'\n{}",
+                STEP.replace(
+                    "command = ['cargo', 'test']",
+                    "env = { Loud = 'b' }\ncommand = ['cargo', 'test']"
+                )
+            )),
+        ),
+    ] {
+        let loaded = Plan::parse(&text, &repository());
+        assert!(loaded.is_ok(), "{name}: {loaded:?}");
+    }
+}
+
 /// A step's `directory` is refused with its own reason for each way a path goes wrong, as the keys
 /// that name a path are: it is absent, it is a file, it is absolute or holds `..` or a pattern
 /// character, it is a link, or a link on its way leads out of the repository. A directory that a
