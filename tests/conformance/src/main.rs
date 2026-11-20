@@ -295,7 +295,7 @@ fn run(root: PathBuf, plan: Plan, evidence_directory: &std::path::Path, asked: A
             eprintln!("kr-conformance: refused: {problem}");
             return ExitCode::from(2);
         }
-        Err(Stopped::PrivateCopy(problem)) => {
+        Err(Stopped::PrivateCopy(problem) | Stopped::Scratch(problem)) => {
             eprintln!("kr-conformance: refused, no step was run: {problem}");
             return ExitCode::from(2);
         }

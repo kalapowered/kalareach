@@ -212,6 +212,32 @@ The files that the map names are relative to the tested root, with one exception
 
 A group that no step uses is refused. The identifier grammar is compiled into the program and holds three bounds only (30 sections, 35 acceptance rows, 10 performance rows), so a tool release does not prove which revision of the specification a repository cites.
 
+### How a step runs
+
+A step runs in its `directory`: a path relative to the repository, which is the repository's root
+when the plan names none. The build of a `cargo test` step, the listing of its tests and its run all
+use that directory, and a script the step runs is looked up there. A `cargo` step's directory has to
+be the root of a workspace that `[rust] manifests` names. A directory is a literal path: it holds no
+placeholder, no `..`, is not absolute, and has to be a directory of the repository when the plan loads.
+
+A step is run with the plan's `[env]` and its own `env`; its value of a name replaces the plan's.
+A name in `env`, in `[env]` or in `needs` has to be a variable name.
+
+The placeholders are `{evidence}` (the evidence directory), `{root}` (the repository), `{scratch}`
+and `{output}` (the step's own output). `{scratch}` is a directory the run makes for itself under
+the temporary directory it keeps its own files in, never inside the evidence directory, and removes
+when the run ends. The placeholders are filled in a step's `command`, in the values of `env` and
+`[env]` and in `output`, and nowhere else: a reason or a witness line stays as it is written. `{output}`
+is not filled in `[env]`, because it belongs to one step. A path a placeholder stands for has forward
+slashes on every platform. Any other word in braces is refused when the plan loads.
+
+A step that writes a file for the report to read names it as its `output`, below
+`{evidence}/conformance/` (a directory, for a JUnit lane), and passes it to its tool as `{output}`
+in its command or in one of its variables. A Vitest step and a lane step each name one, and the
+report reads that file and no word of the command. The run makes the directory that holds the output
+before the step runs; the tool makes the output. Two outputs may not be equal or nested, and an
+output may not be in `logs` or be `result.json`, which are the report's own.
+
 ## How a test names what it proves
 
 ### The identifiers

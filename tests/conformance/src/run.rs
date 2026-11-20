@@ -1,7 +1,7 @@
 //! Runs the plan's steps and keeps what each produced.
 //!
-//! Every step runs from the repository's root with its output in a log of its own under the
-//! evidence directory, `KR_TEST_ARTIFACTS_DIR` naming that directory, so what a test records beside
+//! Every step runs in its directory, the repository's root unless the plan names another, with its
+//! output in a log of its own under the evidence directory, `KR_TEST_ARTIFACTS_DIR` naming that directory, so what a test records beside
 //! its verdict lands with the result. A `cargo test` step is built once with `--no-run` first,
 //! which is how the report learns which package and target each test binary is: two packages can
 //! both have a test target called `fixtures`, and only the executable tells them apart. The calls
@@ -72,12 +72,15 @@ pub struct Executed {
     pub observation: Option<crate::observe::Observed>,
 }
 
-/// Where a step runs: the repository it runs from, the evidence directory, and the variables it
-/// is run with beyond the report's own environment.
+/// Where a step runs: the repository, the directory of it the step runs in, the evidence
+/// directory, and the variables it is run with beyond the report's own environment.
 #[derive(Clone, Copy, Debug)]
 pub struct Place<'a> {
     /// The repository.
     pub root: &'a Path,
+    /// The directory the step runs in, which its build, the listing of its tests and its run all
+    /// use: the repository's root, or a directory of it.
+    pub directory: &'a Path,
     /// The evidence directory.
     pub evidence: &'a Path,
     /// Further variables.
@@ -91,7 +94,7 @@ impl Place<'_> {
         let mut command = Command::new(&words[0]);
         command
             .args(&words[1..])
-            .current_dir(self.root)
+            .current_dir(self.directory)
             .env("KR_TEST_ARTIFACTS_DIR", self.evidence)
             .env("CARGO_TERM_COLOR", "never")
             .envs(self.environment.iter().map(|(name, value)| (name, value)));
@@ -145,6 +148,19 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         .find(|name| std::env::var_os(name).is_none())
     {
         executed.error = Some(format!("{missing} is not set, and this step reads it"));
+        return executed;
+    }
+    // The step's output is the file or the directory its tool makes, so the directory that holds it
+    // is made here, and the output itself is left to the tool.
+    if let Some(parent) = step
+        .output
+        .as_deref()
+        .and_then(|output| Path::new(output).parent())
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        executed.error = Some(format!(
+            "the directory of the step's output could not be made: {error}"
+        ));
         return executed;
     }
     let started = Instant::now();
@@ -238,28 +254,18 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
             }
         }
         Reading::Build => {}
-        Reading::Vitest { .. } => {
-            let report = step
-                .command
-                .iter()
-                .find_map(|word| word.strip_prefix("--outputFile.json="))
-                .map(PathBuf::from);
-            match report.map(|path| vitest::read(&path, place.root)) {
-                Some(Ok(results)) => executed.vitest = Some(results),
-                Some(Err(error)) => executed.error = Some(error),
-                None => executed.error = Some("the step names no JSON report".to_owned()),
-            }
-        }
+        Reading::Vitest { .. } => match step.output.as_deref() {
+            Some(path) => match vitest::read(Path::new(path), place.root) {
+                Ok(results) => executed.vitest = Some(results),
+                Err(error) => executed.error = Some(error),
+            },
+            None => executed.error = Some("the step names no output".to_owned()),
+        },
         Reading::Lane(tests) => {
-            let results = step
-                .command
-                .iter()
-                .find_map(|word| word.strip_prefix("--results="))
-                .map(PathBuf::from);
-            let read = match (results, tests) {
-                (Some(path), Tests::Junit) => lane::read_junit(&path),
-                (Some(path), Tests::Xcode) => lane::read_xcode(&path),
-                (None, _) => Err("the step names no place for its results".to_owned()),
+            let read = match (step.output.as_deref(), tests) {
+                (Some(path), Tests::Junit) => lane::read_junit(Path::new(path)),
+                (Some(path), Tests::Xcode) => lane::read_xcode(Path::new(path)),
+                (None, _) => Err("the step names no output".to_owned()),
             };
             match read.and_then(|cases| {
                 lane::agree_with_exit(executed.exit, &cases)?;

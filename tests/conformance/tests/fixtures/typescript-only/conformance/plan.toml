@@ -31,4 +31,5 @@ what = "the web package's tests"
 platforms = ['linux', 'macos']
 reading = 'vitest'
 package = 'web'
-command = ['pnpm', '-C', 'web', 'test']
+output = '{evidence}/conformance/web.json'
+command = ['pnpm', '-C', 'web', 'test', '--outputFile.json={output}']

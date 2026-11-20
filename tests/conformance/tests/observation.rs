@@ -37,6 +37,9 @@ fn shell(what: &str, script: &str, arguments: &[&Path]) -> Step {
         reading: Reading::Build,
         filter: None,
         skips: Vec::new(),
+        directory: String::new(),
+        env: Vec::new(),
+        output: None,
     }
 }
 
