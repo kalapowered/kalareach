@@ -1159,6 +1159,20 @@ mod shutdown_tests {
         directory
     }
 
+    /// A run directory of this test's own whose path is short enough for the sockets below it: on
+    /// macOS below `/private/tmp`, whose per-user temporary directory is long, and elsewhere below
+    /// the system's temporary directory.
+    fn short_run_directory() -> PathBuf {
+        let base = if cfg!(target_os = "macos") {
+            PathBuf::from("/private/tmp")
+        } else {
+            std::fs::canonicalize(std::env::temp_dir()).expect("the temporary directory")
+        };
+        let root = base.join(format!("kt-{}", &kr_ipc::new_uuid().to_string()[..8]));
+        std::fs::create_dir_all(&root).expect("a short run directory");
+        root
+    }
+
     /// A host over a run's tree with no daemon started.
     fn host_over(run: &Run) -> Host<'_> {
         let paths = HostPaths::new(run.root().join("r"), run.root().join("s"))
@@ -1181,13 +1195,37 @@ mod shutdown_tests {
         }
     }
 
-    /// The text the host's stop gives for a daemon that ended with a failure.
-    fn error_of_a_failing_daemon(host: &Host<'_>) -> String {
-        let child = Command::new("/bin/sleep")
-            .arg("30")
+    /// Starts `program` with `arguments` as a process that an interrupt ends, and returns it once it
+    /// has said it is ready, which it says after it has set the interrupt back to its default and
+    /// before it runs the program: none is sent before then. A process that was started in the
+    /// background of a shell with no job control, as a run on the build box is, has the interrupt
+    /// ignored; a signal that is ignored when a program starts stays ignored in each program it
+    /// runs, and a shell cannot set it back with `trap`.
+    fn started_for_an_interrupt(program: &str, arguments: &[&str]) -> std::process::Child {
+        use std::io::BufRead as _;
+        let mut child = Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                r#"$SIG{INT} = "DEFAULT"; $| = 1; print "ready\n"; exec { $ARGV[0] } @ARGV;"#,
+                program,
+            ])
+            .args(arguments)
             .stdin(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn()
-            .expect("a process to stand for the daemon");
+            .expect("a process for the interrupt to end");
+        let mut said = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("the process's output"))
+            .read_line(&mut said)
+            .expect("the process says it is ready");
+        assert_eq!(said, "ready\n", "the process is ready");
+        child
+    }
+
+    /// The text the host's stop gives for a daemon that ended with a failure: a `sleep` stands for
+    /// the daemon, and the interrupt ends it.
+    fn error_of_a_failing_daemon(host: &Host<'_>) -> String {
+        let child = started_for_an_interrupt("/bin/sleep", &["30"]);
         let identity = host
             .run
             .record_child(child.id(), "the control daemon")
@@ -1283,11 +1321,7 @@ mod shutdown_tests {
     #[test]
     fn a_control_socket_that_is_not_the_one_the_daemon_bound_is_not_run_against() {
         use std::os::unix::net::UnixListener;
-        let root = std::path::PathBuf::from(format!(
-            "/private/tmp/kt-{}",
-            &kr_ipc::new_uuid().to_string()[..8]
-        ));
-        std::fs::create_dir_all(&root).expect("a short run directory");
+        let root = short_run_directory();
         let (run, mark) = host_with_a_kr(&root);
         run.note_placed(Path::new("b/kr"))
             .expect("the placed kr is recorded");
@@ -1544,11 +1578,10 @@ mod shutdown_tests {
             use std::sync::atomic::AtomicUsize;
             let run = host.run;
             // A process that stands for the daemon: the interrupt ends it well.
-            let child = Command::new("/bin/sh")
-                .args(["-c", "trap 'exit 0' INT; while :; do /bin/sleep 1; done"])
-                .stdin(Stdio::null())
-                .spawn()
-                .expect("a process to stand for the daemon");
+            let child = started_for_an_interrupt(
+                "/bin/sh",
+                &["-c", "trap 'exit 0' INT; while :; do /bin/sleep 1; done"],
+            );
             let identity = run
                 .record_child(child.id(), "the control daemon")
                 .expect("the process's identity");
@@ -1739,11 +1772,7 @@ mod shutdown_tests {
     /// the daemon, the worker and what runs beneath it, which the run recorded, are ended.
     #[test]
     fn a_rewritten_identity_and_another_hosts_socket_are_never_connected_to_when_the_host_stops() {
-        let root = PathBuf::from(format!(
-            "/private/tmp/kt-{}",
-            &kr_ipc::new_uuid().to_string()[..8]
-        ));
-        std::fs::create_dir_all(&root).expect("a short run directory");
+        let root = short_run_directory();
         let (run, mark) = host_with_a_connecting_kr(&root);
         run.note_placed(Path::new("b/kr"))
             .expect("the placed kr is recorded");
@@ -1763,11 +1792,7 @@ mod shutdown_tests {
     #[test]
     fn a_rewritten_identity_and_another_hosts_socket_are_never_connected_to_when_the_host_is_dropped()
      {
-        let root = PathBuf::from(format!(
-            "/private/tmp/kt-{}",
-            &kr_ipc::new_uuid().to_string()[..8]
-        ));
-        std::fs::create_dir_all(&root).expect("a short run directory");
+        let root = short_run_directory();
         let (run, mark) = host_with_a_connecting_kr(&root);
         run.note_placed(Path::new("b/kr"))
             .expect("the placed kr is recorded");
