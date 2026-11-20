@@ -1163,16 +1163,12 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
 }
 
 /// One line for each package the document names reduced ownership for, saying that no launch reads
-/// it and what a launch whose profile records it gives up.
+/// it.
 ///
 /// Section 7 allows the profile only where it is explicitly selected. A launch takes its ownership
 /// from the profile it is given, and every profile this host writes records full, so a person who
-/// wrote the entry is told that nothing acts on it. They are also told what a launch
-/// under the profile gives up on Windows, where jobs hold agents: the agent is held by a job of its
-/// own instead of the session's, its processes are tracked by start identity, and the session's
-/// closure never reads its ownership coverage as complete. The program a command route starts runs
-/// in the shell's own job and has no such profile, so the line says that too. The packages are
-/// names the person wrote in their own document, which they asked this command to show.
+/// wrote the entry is told that nothing acts on it. The packages are names the person wrote in
+/// their own document, which they asked this command to show.
 fn reduced_agent_lines(value: &kr_protocol::hostinfo::EffectiveValue) -> Vec<Line> {
     if value.key != kr_protocol::hostinfo::configuration::AGENTS_OWNERSHIP_KEY
         || value.class() != kr_protocol::hostinfo::export::ContentClass::Name
@@ -1185,9 +1181,7 @@ fn reduced_agent_lines(value: &kr_protocol::hostinfo::EffectiveValue) -> Vec<Lin
         .filter_map(|entry| entry.strip_suffix("=reduced"))
         .map(|package| {
             stdout_line!(
-                "  agents {}: reduced ownership is recorded and no launch on this host reads it; on \
-                 Windows a launch whose profile records reduced is tracked by start identity and \
-                 its closure never reads complete, and the command route has no such profile",
+                "  agents {}: reduced ownership is recorded and no launch on this host reads it",
                 Asked::text(Request::Diagnostics, package)
             )
         })
