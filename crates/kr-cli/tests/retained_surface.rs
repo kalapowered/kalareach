@@ -45,6 +45,8 @@ mod probes;
 mod public_majors;
 #[path = "retained_surface/walker.rs"]
 mod walker;
+#[path = "retained_surface/walker_cases.rs"]
+mod walker_cases;
 
 use walker::{Depth, Followed, Tree};
 
@@ -638,7 +640,8 @@ fn a_name_behind_another_crate_that_cannot_be_followed_is_an_error() {
         .expect("the copy")
         .follow("kr_protocol", &["opaque_id"])
         .err()
-        .expect("an error");
+        .expect("an error")
+        .to_string();
     assert!(error.contains("kr_cbor::nothing_of_this_name"), "{error}");
 }
 
@@ -665,7 +668,8 @@ fn a_serde_path_behind_another_crate_that_cannot_be_followed_is_an_error() {
         .expect("the copy")
         .follow("kr_protocol", &["ForwardedMutation"])
         .err()
-        .expect("an error");
+        .expect("an error")
+        .to_string();
     assert!(error.contains("kr_cbor::nothing_of_this_name"), "{error}");
 }
 
