@@ -1277,6 +1277,55 @@ async fn the_file_is_new_owner_only_and_whole() {
     assert_eq!(names, vec![std::ffi::OsString::from("session.json")]);
 }
 
+/// On Windows the file is owner-only whatever list its folder passes down. The folder here grants
+/// Authenticated Users to everything made in it, as a data drive does, and the file still reads
+/// back as a file this host wrote: its list names the account and its owner and no one else.
+///
+/// KR-REQ-25.25, the part about the destination, on Windows.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_file_exported_where_its_folder_grants_another_account_is_owner_only_and_whole() {
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 7, &[]),
+        page(0, b"abc"),
+        end(3),
+        privacy(false, 7, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let directory = tempfile::tempdir().expect("a directory");
+    let granted = std::process::Command::new("icacls.exe")
+        .arg(directory.path())
+        .args(["/grant", "*S-1-5-11:(OI)(CI)(R)"])
+        .output()
+        .expect("icacls starts");
+    assert!(
+        granted.status.success(),
+        "the folder grants Authenticated Users: {}",
+        String::from_utf8_lossy(&granted.stdout)
+    );
+    let path = directory.path().join("session.json");
+    write(&path, &exported).expect("writes");
+    let read = kr_ipc::paths::read_owner_only_file(&path, 1 << 20);
+    assert_eq!(
+        read.as_ref().ok().and_then(Option::as_deref),
+        Some(exported.document.as_slice()),
+        "the file holds what was composed and is one this host reads back: {read:?}"
+    );
+    let access = kr_ipc::paths::FileAccess::of(&path).expect("reads who can reach the file");
+    assert!(
+        !format!("{access:?}").contains("S-1-5-11"),
+        "the file names no account its folder grants: {access:?}"
+    );
+    let names: Vec<_> = std::fs::read_dir(directory.path())
+        .expect("lists")
+        .map(|entry| entry.expect("an entry").file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("session.json")]);
+}
+
 /// An export never replaces a file and never writes through a link: a name that is taken, whether
 /// by a file or by a link to one, is refused before the output is read and again where the file is
 /// made, and what was there is untouched.
