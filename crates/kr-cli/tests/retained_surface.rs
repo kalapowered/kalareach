@@ -44,6 +44,8 @@ mod condition;
 mod history;
 #[path = "retained_surface/history_cases.rs"]
 mod history_cases;
+#[path = "retained_surface/history_gate.rs"]
+mod history_gate;
 #[path = "retained_surface/inventory.rs"]
 mod inventory;
 #[path = "retained_surface/inventory_cases.rs"]
@@ -866,6 +868,41 @@ fn copy_directory(from: &Path, to: &Path) {
             .is_some_and(|extension| extension == "rs")
         {
             std::fs::copy(entry.path(), &target).expect("a file");
+        }
+    }
+}
+// PROBE-BEGIN
+#[test]
+#[ignore = "scratch probe, never committed"]
+fn zz_probe_platform_files() {
+    let root = std::fs::canonicalize(repository()).expect("a root");
+    let mut crates = Vec::new();
+    for entry in std::fs::read_dir(root.join("crates")).expect("crates") {
+        crates.push(entry.expect("entry").path());
+    }
+    if let Ok(applications) = std::fs::read_dir(root.join("apps")) {
+        for entry in applications {
+            crates.push(entry.expect("entry").path().join("src-tauri"));
+        }
+    }
+    crates.sort();
+    for dir in crates {
+        let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else { continue };
+        let Some(name) = text
+            .lines()
+            .skip_while(|line| line.trim() != "[package]")
+            .find_map(|line| line.trim().strip_prefix("name = "))
+            .map(|name| name.trim_matches('"').replace('-', "_"))
+        else {
+            continue;
+        };
+        match inventory::read(&name, &dir, &dir.join("src"), &root, &[]) {
+            Ok(found) => {
+                for file in &found.files {
+                    println!("PLAT {name} {}", file.strip_prefix(&root).unwrap_or(file).display());
+                }
+            }
+            Err(error) => println!("PLATERROR {name} {error}"),
         }
     }
 }
