@@ -59,17 +59,17 @@ kr-ipc = { workspace = true, features = ["testing"] }
 kr-protocol = { workspace = true, features = ["testing"] }
 # The store's tests write the release manifests every process of a release reads at its start.
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 
 # The workspace forbids unsafe code, which a crate that asks the kernel directly cannot honour. This
-# crate denies it instead and allows it in exactly seventeen modules, each of which says why:
+# crate denies it instead and allows it in exactly eighteen modules, each of which says why:
 # `clock::windows` (the interrupt-time counter), `paths::windows` (owner-only access-control lists),
 # `paths::account` (the system's account database, which a directory-service account is only in),
 # `identity::process_times` (a process's creation time, whether it has exited, and ending it),
 # `identity::macos_signal` (a process's version on macOS, and signalling a process by it),
 # `identity::macos_listing` (the processes of a group or a terminal on macOS),
 # `identity::boot_records` (the kernel's process list and its boot counter),
-# `floor::platform` (the shared mapping of the clock floor's file and the atomics on it, on each
+# `endpoint::platform::apple` (the process behind a connected local socket and whether a volume gives an object number out again, on Apple systems), `floor::platform` (the shared mapping of the clock floor's file and the atomics on it, on each
 # platform), `starter::windows` (the launch pipe, a process's facts and a child created
 # suspended), `framed::pipe_probe` (what has become of a named pipe's other end),
 # `framed::readiness` (a connection's own descriptor registered with the runtime's reactor),
