@@ -93,6 +93,10 @@ fn start(placed: &Placed) -> Launch {
 async fn kr_req_12_18_each_registered_hook_observes_and_answers_neutrally() {
     let placed = Placed::new();
     let mut launch = start(&placed);
+    let notices = std::sync::Arc::new(kr_worker::notices::SessionNotices::default());
+    launch
+        .broker
+        .set_session_notices(std::sync::Arc::clone(&notices));
     let events = [
         (
             session_start(FIRST_THREAD, "startup"),
@@ -163,6 +167,20 @@ async fn kr_req_12_18_each_registered_hook_observes_and_answers_neutrally() {
             }
             _ => assert_eq!(report.thread, ThreadChange::Unchanged),
         }
+        // The end of a turn from the real forwarder, which the kernel recorded starting after the
+        // session's start, is the one report that completes a turn.
+        let queued = notices.front();
+        if event == ObservedEvent::TurnEnded {
+            assert_eq!(
+                queued,
+                Some(kr_protocol::attention::SessionEventNotice::TurnCompleted {
+                    turn_id: kr_protocol::ids::AgentTurnId::new(FIRST_THREAD).expect("valid"),
+                }),
+                "a turn's end the launched application's hook reports completes the turn"
+            );
+            notices.taken();
+        }
+        assert_eq!(notices.front(), None, "{event:?} queues no further notice");
         cursors.push(report.cursor);
     }
     assert!(
