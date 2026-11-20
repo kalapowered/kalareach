@@ -3887,7 +3887,7 @@ fn run_case_in(
             panic!("{why}");
         }
         Err(why) => {
-            eprintln!("skipping the {leg} leg: {why}");
+            eprintln!("skipping: the {leg} leg: {why}");
             return;
         }
     };

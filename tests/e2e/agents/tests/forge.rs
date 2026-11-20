@@ -16,9 +16,9 @@ use kr_ipc::testing::PrivateTempDir;
 /// backend listens on, the forging launcher at `b/kr-hook` and a stand-in for the real launcher at
 /// `b/h/kr-hook`.
 struct Scene {
-    _directory: PrivateTempDir,
     root: PathBuf,
     listener: UnixListener,
+    _directory: PrivateTempDir,
 }
 
 fn write_private(path: &Path, text: &str) {
@@ -55,9 +55,9 @@ impl Scene {
         std::fs::write(&real, "#!/bin/sh\necho \"real:$*\"\n").expect("the stand-in launcher");
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).expect("mode");
         Self {
-            _directory: directory,
             root,
             listener,
+            _directory: directory,
         }
     }
 

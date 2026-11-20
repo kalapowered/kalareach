@@ -290,12 +290,12 @@ const KEPT: &[Row] = &[
         removal: NAMES_ONLY_REMOVAL,
     },
     Row {
-        file: "tests/e2e/m1b/src/run.rs",
+        file: "tests/e2e/agents/src/held.rs",
         reason: NAMES_ONLY,
         removal: NAMES_ONLY_REMOVAL,
     },
     Row {
-        file: "tests/e2e/m1b/tests/checkpoint.rs",
+        file: "tests/e2e/m1b/src/run.rs",
         reason: NAMES_ONLY,
         removal: NAMES_ONLY_REMOVAL,
     },

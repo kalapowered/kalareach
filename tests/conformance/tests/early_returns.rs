@@ -212,29 +212,20 @@ const ALLOWED: &[Allowed] = &[
         reason: "the child half of a case, whose output the half that started it reads",
     },
     Allowed {
+        path: "tests/support/codex-stand-in/src/keyboard.rs",
+        said: "{line}",
+        reason: "the stand-in terminal's own output line, written where no keyboard is read, as the \
+                 program it stands in writes it",
+    },
+    Allowed {
         path: "tests/support/codex-stand-in/src/server.rs",
         said: "stand-in: ",
         reason: "the stand-in program's own error line before it ends",
     },
     Allowed {
         path: "tests/support/codex-stand-in/src/terminal.rs",
-        said: "Error: remote app server",
-        reason: "the stand-in program's own error line, as the program it stands in writes it",
-    },
-    Allowed {
-        path: "tests/support/codex-stand-in/src/terminal.rs",
-        said: "Error: the server refused",
-        reason: "the stand-in program's own error line, as the program it stands in writes it",
-    },
-    Allowed {
-        path: "tests/support/codex-stand-in/src/terminal.rs",
         said: "stand-in: ",
         reason: "the stand-in program's own error line before it ends",
-    },
-    Allowed {
-        path: "tests/support/codex-stand-in/src/terminal.rs",
-        said: "TUI: holding the answer to ",
-        reason: "the stand-in program's trace line before it reads its next request",
     },
 ];
 
