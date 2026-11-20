@@ -1921,7 +1921,9 @@ mod tests {
         }
     }
 
-    /// A hook the application started on a platform that keeps no forward-only record of a start.
+    /// A hook the application started whose start has no forward-only record: Linux, macOS and
+    /// Windows keep one, so this is a build for another platform. Its identity's source here is
+    /// only a label; no source names such a platform.
     fn unrecorded(id: ApplicationInstanceId, pid: u64) -> BridgeProcess {
         BridgeProcess {
             identity: ProcessStartIdentity::new(

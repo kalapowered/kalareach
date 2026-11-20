@@ -1927,11 +1927,14 @@ mod tests {
 
         /// `Stop`, which Qoder CLI runs when the main agent has finished responding with no tool
         /// call pending, reports that a turn ended in its thread, with no detail, whatever else
-        /// the payload carries. Its reference does not say whether `Stop` runs when the person
-        /// interrupts. No released package registers `Stop` yet. On `Stop` exit code 2 makes the
-        /// agent go on, and the forwarder never exits 2: a valid run answers `{}` and exits 0,
-        /// after an operational error or a timeout too, a command line it refuses exits 64 and a
-        /// forwarder that cannot hold its release exits 1.
+        /// the payload carries. The hooks reference at docs.qoder.com/cli/hooks says so under
+        /// `Stop`, read 2026-11-20, and its `Stop` input (the common fields, `stop_hook_active`
+        /// and `last_assistant_message`) is the payload the forwarder reads, `session_id` and
+        /// `hook_event_name` among them. That reference does not say whether `Stop` runs when the
+        /// person interrupts. No released package registers `Stop` yet. On `Stop` exit code 2
+        /// makes the agent go on, and the forwarder never exits 2: a valid run answers `{}` and
+        /// exits 0, after an operational error or a timeout too, and a command line it refuses
+        /// exits 64, or 1 when it also cannot hold its release.
         #[test]
         fn a_stop_event_reports_that_a_turn_ended() {
             let payload = serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",

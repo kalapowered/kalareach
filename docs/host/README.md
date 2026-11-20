@@ -9658,27 +9658,30 @@ thread and advances the binding revision, even when it is the thread already sel
 resume is a new selection; a thread continuing after a compaction changes nothing; a thread ending
 leaves none selected. Reports are placed by when the kernel recorded the application starting each
 hook, on a clock that only moves forward (Linux's start ticks since boot, macOS's absolute time at
-the fork); a bridge whose record the platform keeps but will not give up is not admitted. Two hooks
-from one tick are not placed against each other. The newest report decides the thread. An older
-report whose hook started after, or in the same tick as, the report that began the binding's current
-revision, and that shows the thread changing there, advances the binding to a new revision of what
-the newest report says, since a question bound to the old revision may have been asked across that
-change; an older one from before the revision began changes nothing. A report that cannot be placed
-against the newest, and that would change the binding whichever came first (a start always would),
-leaves no thread vouched for, leaves the thread the binding had so nothing bound to it survives, and
-suspends rich mutations until a report whose hook started in a later tick settles it. That
-suspension is the bridge's own: lifting a suspension placed for another reason does not lift it, and
-it lifts no other. Every observation goes into the instance's observed history.
+the fork, Windows's interrupt time at the process's creation); a bridge whose record the platform
+keeps but will not give up is not admitted. Two hooks from one tick are not placed against each
+other. The newest report decides the thread. An older report whose hook started after, or in the
+same tick as, the report that began the binding's current revision, and that shows the thread
+changing there, advances the binding to a new revision of what the newest report says, since a
+question bound to the old revision may have been asked across that change; an older one from before
+the revision began changes nothing. A report that cannot be placed against the newest, and that
+would change the binding whichever came first (a start always would), leaves no thread vouched for,
+leaves the thread the binding had so nothing bound to it survives, and suspends rich mutations until
+a report whose hook started in a later tick settles it. That suspension is the bridge's own: lifting
+a suspension placed for another reason does not lift it, and it lifts no other. Every observation
+goes into the instance's observed history.
 
 The end of a turn that Claude Code or Qoder CLI reports (their `Stop` hook) is a completed turn, and
-so review work, only when this host can vouch for it: the hook is the launched application
-process's own, the selected thread is verified and is the one the report names, and the hook
-started strictly after the report that began the binding's current revision, by the clock above. A
-missing start time on either side refuses it, so a platform with no process start record, such as
-Windows, gets no turn notice from the hook route. A `Stop` that is applied after a later start or
-end of the thread gives none either. The turn is named by its thread, so each end of one thread is
-a later version of the same turn and new review work, and a frame that the hook sends twice is
-told from a second end by nothing here: it is one more version, never a second item.
+so review work, only when this host can vouch for it: the hook is the launched application process's
+own, the selected thread is verified and is the one the report names, and the hook started strictly
+after the report that began the binding's current revision, by the clock above. A missing start time
+on either side refuses it. Linux, macOS and Windows keep the record, so only a build for another
+platform loses turn notices this way. A `Stop` that is applied after a later start or end of the
+thread gives none either. No released package registers `Stop` yet, so no turn notice comes from the
+hook route until one does. A `Stop` that another hook blocks still gives a notice, and the agent
+continues. The turn is named by its thread, so each end of one thread is a later version of the same
+turn and new review work, and a frame that the hook sends twice is told from a second end by nothing
+here: it is one more version, never a second item.
 
 A contact question records, when it is asked, the thread the bridge vouches is selected and its
 revision. The hook's report of a finished call names the call by its request identifier, and only a

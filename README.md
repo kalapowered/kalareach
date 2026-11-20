@@ -25,7 +25,7 @@ This is both a Cargo and a pnpm workspace.
 | Path | What it holds |
 | --- | --- |
 | `crates/kr-cbor` | The KR-CBOR-1 codec: canonical encoding, strict decoding, digests and signing input |
-| `crates/kr-protocol` | Wire types, the method authority table, error codes and the JSON Schema generator |
+| `crates/kr-protocol` | Wire types, the attention rule set, the method authority table, error codes and the JSON Schema generator |
 | `crates/kr-ipc` | Local typed-frame inter-process communication: directories, peer credentials, descriptors and identity proofs |
 | `crates/kr-worker` | The session worker: pseudo-terminal, canonical grid, lifecycle, attachments, input lease and receipt journal |
 | `crates/kr-controller` | The control daemon: registry, create admission, worker supervision, the local service and the network |
@@ -46,7 +46,7 @@ This is both a Cargo and a pnpm workspace.
 | `crates/kr-transfer` | The transfer service: uploads, verified downloads, handle-based filesystem authority and bounded previews |
 | `crates/kr-project` | The project service: repositories, workspaces, the restricted Git execution profile and staged publish |
 | `crates/kr-changeset` | The change-set service: immutable captured versions, their content store, independent materialisations and the apply outcome classes |
-| `crates/kr-attention` | The attention engine: the rule set, quiet hours and escalation, review and visit acknowledgements, and the feature store they are rebuilt from |
+| `crates/kr-attention` | The attention engine: quiet hours and escalation, review and visit acknowledgements, and the feature store they are rebuilt from |
 | `crates/kr-automation` | The automation engine: workflow definitions, runs, causal budgets and admission |
 | `crates/kr-delivery` | The delivery producer: the delivery journal, notification previews, the push outbox and external notification destinations |
 | `crates/kr-describe` | The description service: deterministic session titles, the scheduler and resource policy for one shared CPU-only inference process per environment, its signed model profiles and inference seam, and the names, pins and provenance store, with no model runtime |
