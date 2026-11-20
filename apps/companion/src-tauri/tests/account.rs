@@ -201,6 +201,7 @@ fn invoke_in(
         ])
         .build(mock_context(noop_assets()))
         .expect("an application on the mock runtime");
+    companion_tauri::contact::serve(app.handle());
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
         .expect("a window");
@@ -606,6 +607,7 @@ fn the_application_reports_the_managed_services_it_holds_a_client_of() {
     let app = mock_builder()
         .build(mock_context(noop_assets()))
         .expect("an application on the mock runtime");
+    companion_tauri::contact::serve(app.handle());
     let held = companion_tauri::services::held_by(app.handle(), &account).into_clients();
     let token = AccountToken::new("a-stub-access-token").expect("a token");
     tauri::async_runtime::block_on(async {

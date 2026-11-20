@@ -219,6 +219,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("export_semantic_json", None),
     ("export_asciicast", None),
     ("connection_state", None),
+    ("connection_since", None),
     // The account: this device signing in through the system browser. None is a host method and
     // none takes an address; the page asks, and is told where it stands.
     ("account_status", None),
@@ -733,6 +734,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         export_semantic_json,
         export_asciicast,
         connection_state,
+        connection_since,
         account_status,
         account_sign_in,
         account_sign_in_for_recovery,
@@ -2860,7 +2862,7 @@ pub async fn hosts_use<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     reference: String,
-) -> Result<crate::connection::ConnectionState> {
+) -> Result<crate::contact::Publication> {
     let host = state
         .device()?
         .host_by_reference(&reference)
@@ -2968,7 +2970,7 @@ pub async fn hosts_forget<R: tauri::Runtime>(
     state: State<'_, AppState>,
     calls: State<'_, crate::voice::Calls>,
     reference: String,
-) -> Result<crate::connection::ConnectionState> {
+) -> Result<crate::contact::Publication> {
     let host = state
         .device()?
         .host_by_reference(&reference)
@@ -3261,8 +3263,16 @@ pub async fn setup_open_settings(
 
 /// Whether this application holds a host connection, and why not when it does not.
 #[tauri::command]
-pub fn connection_state(state: State<'_, AppState>) -> crate::connection::ConnectionState {
+pub fn connection_state(state: State<'_, AppState>) -> crate::contact::Publication {
     state.connection_state()
+}
+
+/// What the page missed of the connection's changes since the revision `after`: each change above
+/// it, in order, or the whole current state alone when the page is further behind than the owner
+/// keeps.
+#[tauri::command]
+pub fn connection_since(state: State<'_, AppState>, after: u64) -> crate::contact::Since {
+    state.contact_owner().since(after)
 }
 
 /// Opens a raw terminal view of one session, `columns` by `rows` cells, and returns its handle.
@@ -3894,6 +3904,7 @@ mod tests {
             .invoke_handler(handler)
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
+        crate::contact::serve(app.handle());
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("a window");
@@ -4059,6 +4070,7 @@ mod tests {
         "export_semantic_json",
         "export_asciicast",
         "connection_state",
+        "connection_since",
         "account_status",
         "account_sign_in",
         "account_sign_in_cancel",
@@ -4182,6 +4194,7 @@ mod tests {
                 "agent_action_settle",
                 "choose_export_destination",
                 "connection_state",
+                "connection_since",
                 "export_asciicast",
                 "export_semantic_json",
                 "import_remote_image",

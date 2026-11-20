@@ -13,11 +13,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::pairing::paired::PairedHost;
-use tauri::{AppHandle, Emitter as _, Manager as _, Runtime};
+use tauri::{AppHandle, Manager as _, Runtime};
 
-use crate::connection::{self, Attempt, CONNECTION_EVENT, Connection, ConnectionState};
+use crate::connection::{self, Attempt, Connection};
+use crate::contact::{Publication, Target};
+use crate::device::hosts::{UNNAMED_HOST, reference_of};
 use crate::error::{CommandError, Result};
-use crate::state::AppState;
+use crate::state::{AppState, Started};
 
 /// How long [`use_host`] waits for the first attempt before it answers with where things stand.
 const FIRST_ATTEMPT_WITHIN: Duration = Duration::from_secs(60);
@@ -33,36 +35,44 @@ const FIRST_ATTEMPT_WITHIN: Duration = Duration::from_secs(60);
 ///
 /// Returns a local failure when this computer's pairing records could not be opened or the choice
 /// could not be kept.
-pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Result<ConnectionState> {
+pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Result<Publication> {
     let state = app.state::<AppState>();
     let device = state.device()?;
     let (first, reached) = tokio::sync::oneshot::channel();
     // One step: the host chosen before is let go, this choice is kept, and the task that keeps its
     // connection starts, so no task of an earlier choice can put its connection back.
+    let handle = app.clone();
     state.choose_host(
         "this application is reaching the host you chose",
-        |choice| {
-            // The host was found before this lock was taken, and it can have been forgotten since:
-            // a record forgotten while this choice waited is not one to connect to.
-            if !device.is_paired_with(host.host_device_id)? {
+        move || {
+            // The host was found before the gate was taken, and it can have been forgotten since,
+            // or paired again, which gives this device another identity with it: a record that
+            // is not the one this choice names is not one to connect to.
+            if device.paired_as(host.host_device_id)? != Some(host.device_id) {
                 return Err(unknown_host());
             }
             device.use_host(host.host_device_id)?;
-            Ok(tauri::async_runtime::spawn(keep(
-                app.clone(),
-                host,
-                choice,
-                Some(first),
-            )))
+            Ok(Started {
+                target: target_of(&host),
+                spawn: Box::new(move |choice| {
+                    tauri::async_runtime::spawn(keep(handle, host, choice, Some(first)))
+                }),
+            })
         },
     )?;
-    // The page is told at once that the host it was talking to is no longer the one in use.
-    let now = state.connection_state();
-    #[cfg(feature = "testing")]
-    crate::told::tap(app, CONNECTION_EVENT, &now);
-    let _ = app.emit(CONNECTION_EVENT, now);
     let _ = tokio::time::timeout(FIRST_ATTEMPT_WITHIN, reached).await;
     Ok(state.connection_state())
+}
+
+/// The host a choice names, as the owner holds it: the identity the host has, the one it gave this
+/// device in the pairing, what the page names it by and what people call it.
+fn target_of(host: &PairedHost) -> Target {
+    Target::Paired {
+        host: host.host_device_id,
+        pairing: host.device_id,
+        reference: reference_of(host),
+        name: host.name.clone().unwrap_or_else(|| UNNAMED_HOST.to_owned()),
+    }
 }
 
 /// Forgets `host`: this computer no longer lists it, uses it or tries it, and says where that
@@ -87,13 +97,11 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
 ///
 /// Returns a local failure when this computer's pairing records could not be changed, and then the
 /// host is still listed.
-pub async fn forget_host<R: Runtime>(
-    app: &AppHandle<R>,
-    host: &PairedHost,
-) -> Result<ConnectionState> {
+pub async fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> Result<Publication> {
     let state = app.state::<AppState>();
     let device = state.device()?;
     state.forget_host(
+        host.host_device_id,
         "no host is in use: you forgot the one this application was reaching",
         || device.forget_host(host.host_device_id),
     )?;
@@ -104,10 +112,6 @@ pub async fn forget_host<R: Runtime>(
             .requests()
             .forget_host(&crate::device::hosts::reference_of(host));
     }
-    let now = state.connection_state();
-    #[cfg(feature = "testing")]
-    crate::told::tap(app, CONNECTION_EVENT, &now);
-    let _ = app.emit(CONNECTION_EVENT, now);
     // What is kept of a host's notifications goes with the host. The host's own destination stays
     // until its owner removes this device: only the host revokes an authorisation it holds.
     if let Some(desk) = state.push() {
@@ -153,18 +157,19 @@ pub fn resume<R: Runtime>(app: &AppHandle<R>) {
     };
     // The host is read inside the step that makes the choice, so a choice the person made a moment
     // earlier is not replaced by the one read before it.
+    let handle = app.clone();
     let _ = state.choose_host(
         "this application is reaching the host you chose",
-        |choice| {
+        move || {
             let host = device
                 .host_in_use()
                 .ok_or_else(CommandError::not_connected)?;
-            Ok(tauri::async_runtime::spawn(keep(
-                app.clone(),
-                host,
-                choice,
-                None,
-            )))
+            Ok(Started {
+                target: target_of(&host),
+                spawn: Box::new(move |choice| {
+                    tauri::async_runtime::spawn(keep(handle, host, choice, None))
+                }),
+            })
         },
     );
 }
@@ -187,7 +192,7 @@ async fn keep<R: Runtime>(
             };
             match crate::places::as_the_main_link(Connection::paired(&device, &host)).await {
                 Ok(connection) => Attempt::Reached(connection),
-                Err(error) => Attempt::Failed(error.into_error()),
+                Err(error) => Attempt::Failed(error),
             }
         }
     })

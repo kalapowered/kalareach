@@ -286,6 +286,7 @@ impl Computer {
             ])
             .build(mock_context(noop_assets()))
             .expect("an application on the mock runtime");
+        companion_tauri::contact::serve(app.handle());
         if let Some(clients) = clients {
             app.state::<AppState>().sync_clients_replaced(clients);
         }

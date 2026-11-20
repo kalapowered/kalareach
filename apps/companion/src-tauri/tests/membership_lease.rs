@@ -3191,3 +3191,142 @@ async fn a_stranded_member_whose_host_restarted_presents_again_and_is_served() {
     rig.reads().expect("the restarted host serves the device");
     rig.host_holds_the_newest_lease().await;
 }
+
+/// What the page was told of the connection and its contact, in order, as the state of contact each
+/// state held.
+fn contacts_told(rig: &Rig) -> Vec<String> {
+    rig.companion()
+        .told_connection()
+        .iter()
+        .map(|state| {
+            state["contact"]["state"]
+                .as_str()
+                .expect("a contact state")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// KR-REQ-17.53: a lease the organisation ends is a refusal in the organisation's words, told when
+/// the connection is removed and before the application's next attempt: the host is not lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_stop_reads_refused_with_its_words_before_the_next_attempt() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    // The next dial is held, so that nothing is told but what the stop and the end of the
+    // connection make.
+    rig.control.hold_own();
+    rig.signing.removes(ACCOUNT);
+    rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
+    rig.waits.passes();
+
+    let ended = rig.down_because("not a member").await;
+    assert!(ended["contact"].is_object(), "{ended}");
+    assert_eq!(ended["contact"]["state"], "refused", "{ended}");
+    assert!(
+        ended["contact"]["refusal"]["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("not a member")),
+        "the organisation's words: {ended}"
+    );
+    // The connection's end follows the stop, and tells nothing more: no second event, no loss.
+    rig.companion().told_everything().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let told = contacts_told(&rig);
+    assert!(!told.contains(&"out_of_contact".to_owned()), "{told:?}");
+    assert_eq!(
+        told.iter().filter(|state| *state == "refused").count(),
+        1,
+        "{told:?}"
+    );
+}
+
+/// KR-REQ-17.53: an account that signed out ends the connection in the account's words, which is a
+/// refusal this device made, and no loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_departure_reads_refused_in_the_accounts_words_and_is_no_loss() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    rig.control.hold_own();
+
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
+    rig.waits.passes();
+    let ended = rig.down_because("sign in").await;
+    assert!(ended["contact"].is_object(), "{ended}");
+    assert_eq!(ended["contact"]["state"], "refused", "{ended}");
+    assert!(
+        ended["contact"]["refusal"]["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("sign in")),
+        "{ended}"
+    );
+    rig.companion().told_everything().await;
+    let told = contacts_told(&rig);
+    assert!(!told.contains(&"out_of_contact".to_owned()), "{told:?}");
+}
+
+/// KR-REQ-19.08: a refusal the connection kept is told as the host's own: its bound is a host in
+/// contact that refused, and a refusal for another reason is a connection lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_the_session_kept_reads_host_full_in_contact_or_not_admitted_lost() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let view = rig
+        .companion()
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let reference = view["hosts"][0]["reference"]
+        .as_str()
+        .expect("a host")
+        .to_owned();
+
+    rig.control
+        .refuse_the_connection(Some(ErrorCode::ResourceUnavailable));
+    let full = rig
+        .companion()
+        .call("hosts_use", json!({ "reference": reference }))
+        .expect("the choice is made");
+    assert!(full["contact"].is_object(), "{full}");
+    assert_eq!(
+        full["contact"]["state"], "refused",
+        "the host's bound is a refusal: {full}"
+    );
+
+    rig.control
+        .refuse_the_connection(Some(ErrorCode::PermissionDenied));
+    let lost = rig
+        .companion()
+        .call("hosts_use", json!({ "reference": reference }))
+        .expect("the choice is made");
+    assert_eq!(
+        lost["contact"]["state"], "out_of_contact",
+        "a refusal for another reason is a connection lost: {lost}"
+    );
+}
+
+/// KR-REQ-17.53: a lease that stops is let go: the connection is closed after the stop is reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lease_arm_closes_the_session_after_every_stop() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    rig.control.hold_own();
+    let closed = rig.control.closed();
+
+    rig.signing.removes(ACCOUNT);
+    rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
+    rig.waits.passes();
+    rig.down_because("not a member").await;
+    tokio::time::timeout(WATCHDOG, async {
+        while rig.control.closed() <= closed {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the connection is closed once the stop is reported");
+}

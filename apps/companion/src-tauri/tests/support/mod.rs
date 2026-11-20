@@ -792,6 +792,7 @@ impl Companion {
                 companion_tauri::commands::hosts_forget,
                 companion_tauri::commands::inbox_hosts,
                 companion_tauri::commands::connection_state,
+                companion_tauri::commands::connection_since,
                 companion_tauri::commands::session_list,
                 companion_tauri::commands::session_read,
                 companion_tauri::commands::session_describe,
@@ -852,6 +853,7 @@ impl Companion {
         )
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("an application");
+        companion_tauri::contact::serve(app.handle());
         // The calls ask the application how this device is paired, as the application's own start
         // tells them.
         {
@@ -2780,5 +2782,38 @@ pub fn unpaired_phone_controlled(host: &Host, control: &Arc<LinkControl>) -> Pho
         secrets,
         room,
         data,
+    }
+}
+
+impl Companion {
+    /// What the page was told of the connection, in the order it was told: each state as the page
+    /// received it.
+    pub fn told_connection(&self) -> Vec<serde_json::Value> {
+        self.connection
+            .texts()
+            .iter()
+            .map(|text| serde_json::from_str(text).expect("a connection state"))
+            .collect()
+    }
+
+    /// Waits until the page has been told the revision the owner stands at, so that nothing the
+    /// application changed is still on its way.
+    pub async fn told_everything(&self) {
+        use tauri::Manager as _;
+
+        let state = self.app.state::<companion_tauri::AppState>();
+        let revision = state.contact_owner().revision();
+        tokio::time::timeout(WATCHDOG, async {
+            while self
+                .told_connection()
+                .last()
+                .map(|told| told["revision"].as_u64())
+                != Some(Some(revision))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the publisher tells the last change");
     }
 }

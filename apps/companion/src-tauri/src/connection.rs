@@ -23,9 +23,10 @@ use kr_protocol::rights::ActionRight;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter as _, Manager as _, Runtime};
 
+use crate::contact::{Adopt, Outcome, Reach, STATE_FIRST_WITHIN, Target, Wrote};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
-use crate::state::AppState;
+use crate::state::{AppState, Started};
 
 /// How long a connection to a paired host, and the question that follows it, may take.
 pub(crate) const CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
@@ -787,12 +788,13 @@ impl ConnectionState {
 ///
 /// # Errors
 ///
-/// Returns the failure when there is no controller to reach, when its endpoint belongs to another
-/// user, or when the two builds share no protocol major.
-pub async fn connect_local() -> Result<Connection> {
-    Ok(connect_local_once().await?.reopening(Arc::new(|| {
-        Box::pin(async { connect_local_once().await.map_err(Unopened::Unreached) })
-    })))
+/// Returns why there was no connection: no controller to reach or its endpoint belonging to
+/// another user ([`Unopened::Unreached`]), or the controller refusing the connection, as when the
+/// two builds share no protocol major ([`Unopened::Refused`]).
+pub async fn connect_local() -> std::result::Result<Connection, Unopened> {
+    Ok(connect_local_once()
+        .await?
+        .reopening(Arc::new(|| Box::pin(connect_local_once()))))
 }
 
 /// Connects to the controller that listens at `endpoint`, in place of the one this machine's paths
@@ -805,34 +807,58 @@ pub async fn connect_local() -> Result<Connection> {
 /// # Errors
 ///
 /// As [`connect_local`], bar the paths.
-pub async fn connect_local_at(endpoint: &Endpoint) -> Result<Connection> {
+#[cfg(feature = "testing")]
+pub async fn connect_local_at(endpoint: &Endpoint) -> std::result::Result<Connection, Unopened> {
     let endpoint = endpoint.clone();
     Ok(dial_local(&endpoint).await?.reopening(Arc::new(move || {
         let endpoint = endpoint.clone();
-        Box::pin(async move { dial_local(&endpoint).await.map_err(Unopened::Unreached) })
+        Box::pin(async move { dial_local(&endpoint).await })
     })))
 }
 
 /// One connection to the controller on this machine, that cannot be opened again from.
-async fn connect_local_once() -> Result<Connection> {
-    let paths = kr_ipc::paths::HostPaths::discover()
-        .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
+async fn connect_local_once() -> std::result::Result<Connection, Unopened> {
+    let absent = |error: &dyn std::fmt::Display| {
+        Unopened::Unreached(CommandError::unavailable(format!(
+            "no host on this machine: {error}"
+        )))
+    };
+    let paths = kr_ipc::paths::HostPaths::discover().map_err(|error| absent(&error))?;
     let environment_id = paths
         .open_environment_id()
-        .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
+        .map_err(|error| absent(&error))?;
     let endpoint = paths
         .environment(environment_id)
         .controller_endpoint()
-        .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
+        .map_err(|error| absent(&error))?;
     dial_local(&endpoint).await
 }
 
 /// One connection to the controller at `endpoint`, that cannot be opened again from.
-async fn dial_local(endpoint: &Endpoint) -> Result<Connection> {
-    let transport = kr_client::ipc::IpcTransport::connect_app(endpoint, build_id()?)
+async fn dial_local(endpoint: &Endpoint) -> std::result::Result<Connection, Unopened> {
+    let build = build_id().map_err(Unopened::Unreached)?;
+    let transport = kr_client::ipc::IpcTransport::connect_app(endpoint, build)
         .await
-        .map_err(absent_host)?;
-    Connection::over(transport)
+        .map_err(of_local_dial)?;
+    Connection::over(transport).map_err(Unopened::Unreached)
+}
+
+/// What a failed dial of the controller on this machine says. A reply of the controller's (it
+/// refused the connection, or answered with something this build cannot take) is a refusal of the
+/// connection; an end, a path that is not there and a fault of this side's own are a host that was
+/// not reached.
+fn of_local_dial(error: kr_client::error::ClientError) -> Unopened {
+    use kr_ipc::error::ErrorSource;
+
+    match error {
+        kr_client::error::ClientError::Ipc(ipc) if ipc.comes_from() == ErrorSource::Reply => {
+            Unopened::Refused(
+                Asked::Connection,
+                CommandError::from(kr_client::error::ClientError::Ipc(ipc)),
+            )
+        }
+        other => Unopened::Unreached(absent_host(other)),
+    }
 }
 
 /// Names the ordinary case of no host running before it reaches the window.
@@ -860,9 +886,17 @@ pub enum Attempt {
     /// The host answered, and this is the connection to it.
     Reached(Connection),
     /// The host did not answer, and why.
-    Failed(CommandError),
+    Failed(Unopened),
     /// There is nothing to keep a connection to, so the task that keeps it ends.
     Nothing,
+}
+
+/// A connection the keeper supervises: the one the owner holds, the receiver of its events that
+/// was taken before it was installed, and the revision its installation was published as.
+struct Supervised {
+    connection: Connection,
+    events: tokio::sync::broadcast::Receiver<kr_protocol::envelope::Notification>,
+    revision: u64,
 }
 
 /// Keeps a connection to a host for `choice`: reaches it with `attempt`, forwards what it
@@ -871,8 +905,11 @@ pub enum Attempt {
 /// The pause between attempts is the client library's reconnect backoff (section 23): jittered
 /// exponential from 250 ms to 30 seconds, starting over once a connection has been stable. `first`
 /// is told once the first attempt has ended either way. The task ends as soon as another host is
-/// chosen: it installs a connection, or records that it has none, only while its own choice is the
-/// one in force.
+/// chosen: the owner takes a connection, or a record that there is none, only while this choice is
+/// the one in force.
+///
+/// When the connection it supervised has ended and the owner holds another, a replacement the
+/// host on this machine admitted, the keeper supervises that one and does not dial.
 pub async fn keep<R, A, F>(
     app: AppHandle<R>,
     choice: u64,
@@ -884,109 +921,170 @@ pub async fn keep<R, A, F>(
     F: std::future::Future<Output = Attempt> + Send,
 {
     let mut backoff = kr_client::reconnect::ReconnectLoop::new();
+    // The connection supervised last, which the owner may still hold.
+    let mut last: Option<Arc<Session>> = None;
     loop {
-        let state = app.state::<AppState>();
+        let owner = Arc::clone(app.state::<AppState>().contact_owner());
+        let mut next = None;
         match attempt().await {
             Attempt::Nothing => return,
             Attempt::Reached(connection) => {
-                let session = connection.session();
+                let kept = connection.clone();
                 // Before the connection is announced to anything, so that nothing the host sends
                 // on it can come before the subscription: an event sent to a connection nobody
                 // listens on yet is lost to the page.
-                let events = session.events();
-                let environment_id = connection.environment_id();
-                let paired_host = match connection.standing() {
-                    Standing::Paired { host, .. } => Some(host.host_device_id),
-                    Standing::Owner => None,
-                };
-                // A host whose grant answers to an organisation holds this device's lease only while
-                // the device keeps it fresh.
-                let leased = match connection.standing() {
-                    Standing::Paired { host, .. }
-                        if host.proposed_grant.organisation.as_ref().is_some() =>
-                    {
-                        Some((**host).clone())
+                let events = connection.session().events();
+                let reached = owner.reached(choice, last.as_ref(), connection);
+                match reached.value {
+                    Reach::Reached => {
+                        next = Some(Supervised {
+                            connection: kept,
+                            events,
+                            revision: reached.revision,
+                        });
                     }
-                    _ => None,
-                };
-                if !state.connected_for(choice, connection) {
-                    return;
-                }
-                let now = state.connection_state();
-                #[cfg(feature = "testing")]
-                crate::told::tap(&app, CONNECTION_EVENT, &now);
-                let _ = app.emit(CONNECTION_EVENT, now);
-                // A host that is reached again is asked once more for what a call left owed it.
-                if let (Some(host), Some(calls)) =
-                    (paired_host, app.try_state::<crate::voice::Calls>())
-                {
-                    calls.host_reached(host, environment_id, Arc::clone(&session));
-                }
-                if let Some(first) = first.take() {
-                    let _ = first.send(());
-                }
-                // The lease is kept for as long as the connection lasts, in this task: when the
-                // person chooses another host or forgets this one, the task ends and the lease is
-                // no longer kept. When something only a person can mend stops it, the connection
-                // says so and ends, and the next attempt presents the lease first and says the
-                // same until it is mended.
-                let leased = leased.and_then(|host| {
-                    let device = state.device().ok()?;
-                    let desk = device.leases()?.clone();
-                    let key = *device
-                        .pairing()
-                        .paired_identity_for(&host)
-                        .authorisation
-                        .public();
-                    Some((desk, host, key))
-                });
-                // A connection that did not last is not a recovery: a host that accepts and then
-                // closes is waited for as one that does not answer.
-                backoff.connected();
-                let ended =
-                    forward_events(app.clone(), Arc::clone(&session), environment_id, events);
-                tokio::pin!(ended);
-                if let Some((desk, host, key)) = leased {
-                    let kept = desk.keep(&session, &host, key);
-                    tokio::select! {
-                        () = &mut ended => {}
-                        stopped = kept => {
-                            if let Some(stopped) = stopped {
-                                // A connection whose lease is not kept is let go, so the next one
-                                // presents it first. One the host ended needs no word to the person.
-                                if stopped != LeaseStop::ConnectionEnded
-                                    && state.disconnected_for(choice, stopped.to_string())
-                                {
-                                    let now = state.connection_state();
-                                    #[cfg(feature = "testing")]
-                                    crate::told::tap(&app, CONNECTION_EVENT, &now);
-                                    let _ = app.emit(CONNECTION_EVENT, now);
-                                }
-                                session.close();
-                            }
-                            // The connection is closed or closing, and ends the way any does.
-                            ended.await;
-                        }
-                    }
-                } else {
-                    ended.await;
+                    Reach::StaleChoice(_) => return,
+                    Reach::SlotBusy(_) => {}
                 }
             }
-            Attempt::Failed(error) => {
-                if !state.disconnected_for(choice, error.message) {
+            Attempt::Failed(unopened) => {
+                let outcome = Outcome::of(&unopened);
+                let reason = unopened.into_error().message;
+                if owner.failed(choice, last.as_ref(), outcome, &reason).value == Wrote::StaleChoice
+                {
                     return;
                 }
-                let now = state.connection_state();
-                #[cfg(feature = "testing")]
-                crate::told::tap(&app, CONNECTION_EVENT, &now);
-                let _ = app.emit(CONNECTION_EVENT, now);
                 if let Some(first) = first.take() {
                     let _ = first.send(());
                 }
             }
         }
+        if let Some(supervised) = next {
+            last = Some(supervise(&app, choice, supervised, &mut first, &mut backoff).await);
+        }
+        // A replacement admitted while this connection was supervised is supervised as it is, and
+        // the owner is asked again when that one ends.
+        loop {
+            match owner.adopt(choice, last.as_ref()) {
+                Adopt::Stale => return,
+                Adopt::None => break,
+                Adopt::Candidate {
+                    connection,
+                    events,
+                    revision,
+                } => {
+                    let supervised = Supervised {
+                        connection,
+                        events,
+                        revision,
+                    };
+                    last =
+                        Some(supervise(&app, choice, supervised, &mut first, &mut backoff).await);
+                }
+            }
+        }
         tokio::time::sleep(backoff.disconnected()).await;
     }
+}
+
+/// Supervises one connection the owner holds until it ends, and returns its session.
+async fn supervise<R: Runtime>(
+    app: &AppHandle<R>,
+    choice: u64,
+    supervised: Supervised,
+    first: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    backoff: &mut kr_client::reconnect::ReconnectLoop,
+) -> Arc<Session> {
+    let state = app.state::<AppState>();
+    let owner = Arc::clone(state.contact_owner());
+    let Supervised {
+        connection,
+        events,
+        revision,
+    } = supervised;
+    let session = connection.session();
+    let environment_id = connection.environment_id();
+    let paired_host = match connection.standing() {
+        Standing::Paired { host, .. } => Some(host.host_device_id),
+        Standing::Owner => None,
+    };
+    // A host whose grant answers to an organisation holds this device's lease only while the
+    // device keeps it fresh.
+    let leased = match connection.standing() {
+        Standing::Paired { host, .. } if host.proposed_grant.organisation.as_ref().is_some() => {
+            Some((**host).clone())
+        }
+        _ => None,
+    };
+    drop(connection);
+    // The state that announces the connection comes before what the host sends on it. The wait is a
+    // bound on a delay, not an authority: every event carries the revision it follows, and the
+    // page holds an event until it has applied that revision.
+    let _ = owner.emitted_through(revision, STATE_FIRST_WITHIN).await;
+    // A host that is reached again is asked once more for what a call left owed it.
+    if let (Some(host), Some(calls)) = (paired_host, app.try_state::<crate::voice::Calls>()) {
+        calls.host_reached(host, environment_id, Arc::clone(&session));
+    }
+    if let Some(first) = first.take() {
+        let _ = first.send(());
+    }
+    // The lease is kept for as long as the connection lasts, in this task: when the person chooses
+    // another host or forgets this one, the task ends and the lease is no longer kept. When
+    // something only a person can mend stops it, the connection says so and ends, and the next
+    // attempt presents the lease first and says the same until it is mended.
+    let leased = leased.and_then(|host| {
+        let device = state.device().ok()?;
+        let desk = device.leases()?.clone();
+        let key = *device
+            .pairing()
+            .paired_identity_for(&host)
+            .authorisation
+            .public();
+        Some((desk, host, key))
+    });
+    // A connection that did not last is not a recovery: a host that accepts and then closes is
+    // waited for as one that does not answer.
+    backoff.connected();
+    let ended = forward_events(
+        app.clone(),
+        Arc::clone(&session),
+        environment_id,
+        events,
+        revision,
+    );
+    tokio::pin!(ended);
+    if let Some((desk, host, key)) = leased {
+        let kept = desk.keep(&session, &host, key);
+        tokio::select! {
+            () = &mut ended => {}
+            stopped = kept => {
+                if let Some(stopped) = stopped {
+                    // A stop is typed where it happens, in the words of why: an account that left
+                    // or a lease that could not be given is a refusal, and a host that did not
+                    // admit the connection is a loss. One the host ended needs no word to the
+                    // person.
+                    if stopped != LeaseStop::ConnectionEnded {
+                        let unopened =
+                            Unopened::of_link(crate::lease::failed_on(&session, &stopped));
+                        drop(owner.lease_stopped(
+                            choice,
+                            &session,
+                            Outcome::of(&unopened),
+                            &stopped.to_string(),
+                        ));
+                    }
+                    // A connection whose lease is not kept is let go, so the next one presents it
+                    // first, after every stop that is reported.
+                    session.close();
+                }
+                // The connection is closed or closing, and ends the way any does.
+                ended.await;
+            }
+        }
+    } else {
+        ended.await;
+    }
+    session
 }
 
 /// Keeps the connection to the host on this machine, as the application's host: it is reached, and
@@ -1004,10 +1102,13 @@ where
     let handle = app.clone();
     app.state::<AppState>().choose_host(
         "this application is reaching the host on this machine",
-        |choice| {
-            Ok(tauri::async_runtime::spawn(keep(
-                handle, choice, None, attempt,
-            )))
+        move || {
+            Ok(Started {
+                target: Target::Local,
+                spawn: Box::new(move |choice| {
+                    tauri::async_runtime::spawn(keep(handle, choice, None, attempt))
+                }),
+            })
         },
     )
 }
@@ -1034,6 +1135,10 @@ pub struct PublishedEvent {
     pub event_type: String,
     /// The payload, as JSON.
     pub payload: serde_json::Value,
+    /// The revision of the connection state this event follows: the page holds the event until it
+    /// has applied that revision, so it never sees a host's first events before the state that
+    /// announces the host.
+    pub revision: u64,
 }
 
 /// Reads an event payload into the shape the page reads.
@@ -1072,6 +1177,7 @@ pub async fn forward_events<R: Runtime>(
     session: Arc<Session>,
     host: EnvironmentId,
     mut events: tokio::sync::broadcast::Receiver<kr_protocol::envelope::Notification>,
+    revision: u64,
 ) {
     let host = host.to_string();
     // The question of whether the host withdrew this connection, while one is out: one at a time.
@@ -1105,8 +1211,10 @@ pub async fn forward_events<R: Runtime>(
                 continue;
             }
             () = session.closed() => {
-                let state = app.state::<AppState>();
                 // An account that left ended it, and says so: not that the connection was lost.
+                // The end is typed where it is seen: an end this device made, or a refusal the
+                // session kept, is a refusal in its words, and any other end is a loss from this
+                // moment.
                 let why = session
                     .transport()
                     .ended_by_this_device()
@@ -1114,11 +1222,15 @@ pub async fn forward_events<R: Runtime>(
                         || "the connection to this host ended".to_owned(),
                         |end| end.error.message,
                     );
-                state.disconnected_from(&session, why);
-                let now = state.connection_state();
-                #[cfg(feature = "testing")]
-                crate::told::tap(&app, CONNECTION_EVENT, &now);
-                let _ = app.emit(CONNECTION_EVENT, now);
+                let unopened = Unopened::of_link(crate::lease::failed_on(
+                    &session,
+                    &LeaseStop::ConnectionEnded,
+                ));
+                drop(app.state::<AppState>().contact_owner().ended(
+                    &session,
+                    Outcome::of(&unopened),
+                    &why,
+                ));
                 return;
             }
         };
@@ -1130,6 +1242,7 @@ pub async fn forward_events<R: Runtime>(
                     stream_id: notification.stream_id.to_string(),
                     sequence: notification.sequence.to_string(),
                     event_type: notification.event_type.to_string(),
+                    revision,
                 };
                 if app.emit(HOST_EVENT, published).is_err() {
                     return;
@@ -1148,6 +1261,7 @@ pub async fn forward_events<R: Runtime>(
                             sequence: String::new(),
                             event_type: "resync_required".to_owned(),
                             payload: serde_json::Value::Null,
+                            revision,
                         },
                     )
                     .is_err()

@@ -162,7 +162,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 68] = [
+const EXCEPTIONS: [Exception; 70] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -288,6 +288,20 @@ const EXCEPTIONS: [Exception; 68] = [
         needle: CATEGORY,
         lines: 1,
         reason: "gives a command error the retry hint of the code it is made with; it chooses no words",
+    },
+    Exception {
+        file: "connection.rs",
+        function: "of_local_dial",
+        needle: "Asked::Connection",
+        lines: 1,
+        reason: "tells a reply of the controller on this machine, which refused the connection or answered with what this build cannot take, as the refusal of the connection; it reads the reply's source and no code",
+    },
+    Exception {
+        file: "contact.rs",
+        function: "of",
+        needle: "Asked::Connection",
+        lines: 2,
+        reason: "the one classification of a connection that was not opened: the host's bound and this computer's budget are refusals of the connection in their own words; it reads no code",
     },
     Exception {
         file: "inbox.rs",

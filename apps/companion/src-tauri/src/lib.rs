@@ -31,6 +31,7 @@ pub mod agent;
 pub mod bound;
 pub mod commands;
 pub mod connection;
+pub mod contact;
 pub mod device;
 /// The checks a debug build runs on a phone for what the device keeps for itself.
 #[cfg(debug_assertions)]
@@ -128,6 +129,9 @@ pub fn run() {
                     );
                 }
             }
+            // The one task that tells the page each change of the connection, in order, before any
+            // choice of host can make one.
+            contact::serve(app.handle());
             open_main_window(app.handle())?;
             // A debug build on a phone reads the request a probe left. A run of a whole call
             // names the voice service and the account it uses, and they are managed here, before

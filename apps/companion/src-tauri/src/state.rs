@@ -5,14 +5,14 @@
 //! from the WebView except through the commands, and a command returns protocol values rather than
 //! handles: there is nothing the page can keep and use later.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use kr_client::Session;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::EnvironmentId;
 
-use crate::connection::{Connection, ConnectionState, Standing};
+use crate::connection::{Connection, Standing};
+use crate::contact::{ContactOwner, Publication, Target};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::owner::Owner;
@@ -33,8 +33,12 @@ pub enum RecordsNotOpen {
 /// The backend's long-lived state.
 #[derive(Debug)]
 pub struct AppState {
-    connection: Arc<RwLock<Option<Connection>>>,
-    reason: RwLock<Option<String>>,
+    /// Which host the commands go to, the connection to it and how contact with each host stands.
+    contact: Arc<ContactOwner>,
+    /// Held across the device step of a choice or a forget, so that two are made one after the
+    /// other and what the device records is never at odds with the choice the owner holds. It holds
+    /// no fact.
+    choice_gate: Mutex<()>,
     device: OnceLock<Arc<Device>>,
     /// Why the pairing records are not open, when they are not.
     records_failure: RwLock<Option<RecordsNotOpen>>,
@@ -58,21 +62,15 @@ pub struct AppState {
     paired_links: Arc<crate::standing::PairedLinks>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
-    supervision: Mutex<Supervision>,
-    /// How many withdrawn connections have been replaced since this application started.
-    replaced: Arc<AtomicU64>,
 }
 
-/// The task that keeps the connection to the host the commands go to, and which choice of host it
-/// belongs to.
-///
-/// Each choice has a number. A task installs a connection, or records that it has none, only while
-/// its own choice is the current one, so a task that was ended after it had already reached the
-/// host can never put that host's connection back.
-#[derive(Debug, Default)]
-struct Supervision {
-    choice: u64,
-    task: Option<tauri::async_runtime::JoinHandle<()>>,
+/// A choice of host that has been made ready: the host it is for, and what starts the task that
+/// keeps its connection once the choice has its number.
+pub struct Started {
+    /// The host the choice is for.
+    pub target: Target,
+    /// Starts the task for the choice number it is given.
+    pub spawn: Box<dyn FnOnce(u64) -> tauri::async_runtime::JoinHandle<()> + Send>,
 }
 
 impl AppState {
@@ -80,10 +78,8 @@ impl AppState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            connection: Arc::new(RwLock::new(None)),
-            reason: RwLock::new(Some(
-                "this application has not reached a host yet".to_owned(),
-            )),
+            contact: Arc::new(ContactOwner::new()),
+            choice_gate: Mutex::new(()),
             device: OnceLock::new(),
             records_failure: RwLock::new(None),
             opening_records: Mutex::new(()),
@@ -104,122 +100,79 @@ impl AppState {
             paired_links: Arc::new(crate::standing::PairedLinks::default()),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
-            supervision: Mutex::new(Supervision::default()),
-            replaced: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Makes a new choice of host: ends the task of the choice before it, records that there is no
-    /// connection while the new host is reached, and starts the task `start` makes for the new
-    /// choice's number.
+    /// The owner of every host's contact.
+    #[must_use]
+    pub const fn contact_owner(&self) -> &Arc<ContactOwner> {
+        &self.contact
+    }
+
+    /// Makes a new choice of host: `start` makes the choice ready (it may write the device's
+    /// records), the host chosen before is let go, and the task `start` made ready is begun for the
+    /// new choice's number and kept.
     ///
-    /// All of it happens under one lock, so two choices made at once are made one after the other
-    /// and the later one stands, and what `start` records about the choice (which host is in use)
-    /// is never at odds with the task that keeps its connection.
+    /// The choice gate is held for all of it, so two choices made at once are made one after the
+    /// other and the later one stands. The task begins after the owner has accepted the choice, so
+    /// its first write finds its choice current.
     ///
     /// # Errors
     ///
     /// Returns what `start` returns, and then nothing has changed.
-    pub fn choose_host(
-        &self,
-        reason: &str,
-        start: impl FnOnce(u64) -> Result<tauri::async_runtime::JoinHandle<()>>,
-    ) -> Result<()> {
-        let mut supervision = self
-            .supervision
+    pub fn choose_host(&self, reason: &str, start: impl FnOnce() -> Result<Started>) -> Result<()> {
+        let _gate = self
+            .choice_gate
             .lock()
-            .expect("the supervision lock is not poisoned");
-        let choice = supervision.choice + 1;
-        let task = start(choice)?;
-        supervision.choice = choice;
-        if let Some(before) = supervision.task.replace(task) {
-            before.abort();
-        }
-        // The host in use is told as changed first, and the sessions opened on the host before are
-        // let go with it, and the tokens that opened them are forgotten, after: a call that read
-        // the host before the change then finds the generation moved when it hands its link over.
-        self.disconnected(reason);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let started = start()?;
+        let chosen = self.contact.choose(&started.target, reason);
+        let choice = chosen.value;
+        let task = (started.spawn)(choice);
+        let stale = self.contact.set_task(choice, task);
+        // The sessions opened on the host before are let go with it, and the tokens that opened
+        // them are forgotten, after the owner tells the host changed: a call that read the host
+        // before the change then finds the generation moved when it hands its link over.
         self.paired_links.close_all();
+        drop((chosen.disposal, stale));
         Ok(())
     }
 
-    /// Forgets a host under the lock a choice of host is made under, and ends the connection to it
-    /// when it was the one in use.
+    /// Forgets the host `host` under the lock a choice of host is made under, and ends the
+    /// connection to it when it was the one in use.
     ///
-    /// `forget` removes this computer's record of the host and says whether it was the host in
-    /// use. It runs inside the lock, so a choice made at the same time is made before it or after
-    /// it, and what it reports is what the task in force is for. When the host was in use its task
-    /// ends and no host is: the task of the choice may have been in the middle of reaching the
-    /// host, and its result is dropped because its choice is no longer the current one.
+    /// `forget` removes this computer's record of the host. It runs inside the lock, so a choice
+    /// made at the same time is made before it or after it. The owner drops what it holds of the
+    /// host, and when the host was in use its task ends and no host is: the task of the choice may
+    /// have been in the middle of reaching the host, and its result is dropped because its choice
+    /// is no longer the current one.
     ///
     /// # Errors
     ///
     /// Returns what `forget` returns, and then nothing has changed.
-    pub fn forget_host(&self, reason: &str, forget: impl FnOnce() -> Result<bool>) -> Result<()> {
-        let mut supervision = self
-            .supervision
+    pub fn forget_host(
+        &self,
+        host: kr_protocol::ids::DeviceId,
+        reason: &str,
+        forget: impl FnOnce() -> Result<bool>,
+    ) -> Result<()> {
+        let _gate = self
+            .choice_gate
             .lock()
-            .expect("the supervision lock is not poisoned");
-        if forget()? {
-            supervision.choice += 1;
-            if let Some(task) = supervision.task.take() {
-                task.abort();
-            }
-            self.disconnected(reason);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        forget()?;
+        let forgotten = self.contact.forget(host, reason);
+        if forgotten.value {
             self.paired_links.close_all();
         }
         Ok(())
     }
 
-    /// Whether `choice` is still the choice of host in force.
-    fn current(supervision: &Supervision, choice: u64) -> bool {
-        supervision.choice == choice
-    }
-
-    /// Records a live connection made for `choice`, unless another host has been chosen since.
-    /// Returns whether it was kept.
-    pub fn connected_for(&self, choice: u64, connection: Connection) -> bool {
-        let supervision = self
-            .supervision
-            .lock()
-            .expect("the supervision lock is not poisoned");
-        if !Self::current(&supervision, choice) {
-            return false;
-        }
-        self.connected(connection);
-        true
-    }
-
-    /// Records that `choice` has no connection and why, unless another host has been chosen since.
-    /// Returns whether it was recorded.
-    pub fn disconnected_for(&self, choice: u64, reason: impl Into<String>) -> bool {
-        let supervision = self
-            .supervision
-            .lock()
-            .expect("the supervision lock is not poisoned");
-        if !Self::current(&supervision, choice) {
-            return false;
-        }
-        self.disconnected(reason);
-        true
-    }
-
-    /// Records a live connection.
+    /// Installs a live connection with no host in use, for a suite that holds a connection of its
+    /// own making.
+    #[cfg(feature = "testing")]
     pub fn connected(&self, connection: Connection) {
-        *self.reason.write().expect("the state lock is not poisoned") = None;
-        *self
-            .connection
-            .write()
-            .expect("the state lock is not poisoned") = Some(connection);
-    }
-
-    /// Records that there is no connection, and why.
-    pub fn disconnected(&self, reason: impl Into<String>) {
-        *self
-            .connection
-            .write()
-            .expect("the state lock is not poisoned") = None;
-        *self.reason.write().expect("the state lock is not poisoned") = Some(reason.into());
+        drop(self.contact.install(connection));
     }
 
     /// The session every command goes through.
@@ -229,9 +182,8 @@ impl AppState {
     /// Returns `HOST_NOT_CONFIGURED` when there is no connection, which is the same answer the
     /// interface gets for a host that went away.
     pub fn session(&self) -> Result<Arc<Session>> {
-        self.connection
-            .read()
-            .expect("the state lock is not poisoned")
+        self.contact
+            .held()
             .as_ref()
             .map(Connection::session)
             .ok_or_else(CommandError::not_connected)
@@ -243,11 +195,7 @@ impl AppState {
     ///
     /// Returns `HOST_NOT_CONFIGURED` when there is no connection.
     pub fn connection(&self) -> Result<Connection> {
-        self.connection
-            .read()
-            .expect("the state lock is not poisoned")
-            .clone()
-            .ok_or_else(CommandError::not_connected)
+        self.contact.held().ok_or_else(CommandError::not_connected)
     }
 
     /// Replaces the connection `session` is with one the host admits, when it is the one held to
@@ -266,12 +214,7 @@ impl AppState {
     /// does not. The other takes its place, and the withdrawn one is ended, which the supervision
     /// takes up in turn.
     pub async fn replace_if_withdrawn(&self, session: &Arc<Session>) {
-        let held = self
-            .connection
-            .read()
-            .expect("the state lock is not poisoned")
-            .clone();
-        let Some(connection) = held else {
+        let Some(connection) = self.contact.held() else {
             return;
         };
         // Only the connection to the host on this machine is replaced. A host this device is paired
@@ -287,48 +230,14 @@ impl AppState {
     /// What replaces a withdrawn connection held to the host on this machine.
     #[must_use]
     pub fn replacer(&self) -> crate::connection::Replacer {
-        let held = Arc::clone(&self.connection);
-        let replaced = Arc::clone(&self.replaced);
+        let owner = Arc::clone(&self.contact);
         Arc::new(move |withdrawn, fresh| {
-            let mut held = held.write().expect("the state lock is not poisoned");
-            // Only the connection that was refused is replaced: one installed since is the host's
-            // to have admitted.
-            if held
-                .as_ref()
-                .is_some_and(|connection| Arc::ptr_eq(&connection.session(), withdrawn))
-            {
-                *held = Some(fresh);
-                // Counted with the swap, so a reader that finds the new connection finds the count
-                // that goes with it, and before the withdrawn connection ends, since its end is
-                // what tells the page the connection changed.
-                replaced.fetch_add(1, Ordering::SeqCst);
-                drop(held);
-                withdrawn.close();
-            }
+            // The receiver is taken before the connection is installed, so that nothing the host
+            // sends on it before the keeper takes it up is lost. The withdrawn session is closed
+            // when the owner's answer is dropped, after the swap and outside the owner.
+            let events = fresh.session().events();
+            drop(owner.replaced(withdrawn, fresh, events));
         })
-    }
-
-    /// Records that the connection `session` belongs to has ended, and why, unless a newer
-    /// connection has already taken its place. The comparison and the removal are one step.
-    pub fn disconnected_from(&self, session: &Arc<Session>, reason: impl Into<String>) {
-        let removed = {
-            let mut held = self
-                .connection
-                .write()
-                .expect("the state lock is not poisoned");
-            if held
-                .as_ref()
-                .is_some_and(|connection| Arc::ptr_eq(&connection.session(), session))
-            {
-                *held = None;
-                true
-            } else {
-                false
-            }
-        };
-        if removed {
-            *self.reason.write().expect("the state lock is not poisoned") = Some(reason.into());
-        }
     }
 
     /// The identity the host gave this device, the environment and the session of one connection,
@@ -342,10 +251,7 @@ impl AppState {
     pub fn paired_snapshot(
         &self,
     ) -> Result<(kr_protocol::ids::DeviceId, EnvironmentId, Arc<Session>)> {
-        let held = self
-            .connection
-            .read()
-            .expect("the state lock is not poisoned");
+        let held = self.contact.held();
         let connection = held.as_ref().ok_or_else(CommandError::not_connected)?;
         match connection.standing() {
             Standing::Paired { device_id, .. } => Ok((
@@ -371,13 +277,11 @@ impl AppState {
     ///
     /// Opened sessions have connections of their own, so they do not wait for the main one. With
     /// no connection and no host in use the application is on its own machine, where a session's
-    /// worker is reached by its descriptor.
+    /// worker is reached by its descriptor. The device is asked after the owner has answered, so
+    /// the owner is never held while the device's records are read.
     #[must_use]
     pub fn paired_context(&self) -> Option<PairedContext> {
-        let held = self
-            .connection
-            .read()
-            .expect("the state lock is not poisoned");
+        let held = self.contact.held();
         let device = self.device.get()?;
         match held.as_ref().map(Connection::standing) {
             Some(Standing::Owner) => None,
@@ -398,40 +302,17 @@ impl AppState {
     ///
     /// Returns `HOST_NOT_CONFIGURED` when there is no connection.
     pub fn environment_id(&self) -> Result<EnvironmentId> {
-        self.connection
-            .read()
-            .expect("the state lock is not poisoned")
+        self.contact
+            .held()
             .as_ref()
             .map(Connection::environment_id)
             .ok_or_else(CommandError::not_connected)
     }
 
-    /// What the interface is told about the connection.
+    /// What the interface is told about the connection, as the revision it stands at.
     #[must_use]
-    pub fn connection_state(&self) -> ConnectionState {
-        let held = self
-            .connection
-            .read()
-            .expect("the state lock is not poisoned");
-        let replaced = self.replaced.load(Ordering::SeqCst);
-        match held.as_ref() {
-            Some(connection) => ConnectionState {
-                replaced,
-                ..ConnectionState::of(connection)
-            },
-            None => ConnectionState {
-                connected: false,
-                environment_id: None,
-                reason: self
-                    .reason
-                    .read()
-                    .expect("the state lock is not poisoned")
-                    .clone(),
-                rights: None,
-                paired: false,
-                replaced,
-            },
-        }
+    pub fn connection_state(&self) -> Publication {
+        self.contact.snapshot()
     }
 
     /// Records this computer as a device that pairs, once it has been opened, and the platform it

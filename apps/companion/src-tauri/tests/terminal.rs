@@ -88,6 +88,7 @@ impl Page {
         )
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("an application");
+        companion_tauri::contact::serve(app.handle());
         let windows = labels
             .iter()
             .map(|label| {

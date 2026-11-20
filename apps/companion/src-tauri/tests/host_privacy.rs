@@ -235,6 +235,7 @@ impl Scene {
             .manage(state)
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
+        companion_tauri::contact::serve(app.handle());
         let seam = ConnectedHosts::new(app.handle().clone());
         Self {
             host,

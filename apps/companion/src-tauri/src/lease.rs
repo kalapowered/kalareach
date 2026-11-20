@@ -344,7 +344,7 @@ impl LeaseDesk {
 /// The host's refusal is read at every stop, and not only at one that comes after the host was
 /// asked to take the lease: a connection the host refused at its admission is refused whatever the
 /// keeper was doing when it stopped, as when it was still asking the organisation's service.
-fn failed_on(session: &Session, stop: &LeaseStop) -> LinkError {
+pub(crate) fn failed_on(session: &Session, stop: &LeaseStop) -> LinkError {
     if *stop == LeaseStop::ConnectionEnded
         && let Some(end) = session.transport().ended_by_this_device()
     {

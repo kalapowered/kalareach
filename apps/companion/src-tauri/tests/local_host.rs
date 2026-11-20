@@ -260,6 +260,7 @@ impl Host {
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
+        companion_tauri::contact::serve(app.handle());
         if link == Link::Made {
             let transport = IpcTransport::connect(&endpoint, build_id)
                 .await
@@ -858,8 +859,11 @@ struct EndsTheKeeper<'a>(tauri::State<'a, companion_tauri::AppState>);
 
 impl Drop for EndsTheKeeper<'_> {
     fn drop(&mut self) {
-        let _ = self.0.choose_host("a case is over", |_| {
-            Ok(tauri::async_runtime::spawn(async {}))
+        let _ = self.0.choose_host("a case is over", || {
+            Ok(companion_tauri::state::Started {
+                target: companion_tauri::contact::Target::Local,
+                spawn: Box::new(|_| tauri::async_runtime::spawn(async {})),
+            })
         });
     }
 }
@@ -889,8 +893,8 @@ async fn a_connection_to_the_host_is_taken_up_again_when_it_ends() {
         async move {
             // The host does not answer the first two times.
             if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
-                return Attempt::Failed(companion_tauri::CommandError::unavailable(
-                    "the host did not answer",
+                return Attempt::Failed(companion_tauri::connection::Unopened::Unreached(
+                    companion_tauri::CommandError::unavailable("the host did not answer"),
                 ));
             }
             match connect_local_at(&endpoint).await {
@@ -1117,7 +1121,8 @@ async fn a_host_that_refuses_the_hello_or_speaks_another_major_is_not_connected_
         let stand_in = StandIn::bind(&endpoint, tree.environment_id(), answer);
         let failure = connect_local_at(&endpoint)
             .await
-            .expect_err("a host that does not admit the application is not connected to");
+            .expect_err("a host that does not admit the application is not connected to")
+            .into_error();
         assert_eq!(stand_in.hellos(), 1, "the stand-in was the host reached");
         let told = match answer {
             Hello::Refused => "the host refused the connection",
@@ -1546,4 +1551,198 @@ async fn the_setup_card_shows_the_size_first_and_cancels_and_disables_on_the_hos
         })
         .await;
     assert!(!stopped.enabled && !stopped.can_cancel, "{stopped:?}");
+}
+
+/// The milliseconds since the epoch, as this computer's clock says.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_millis(),
+    )
+    .expect("a time that fits")
+}
+
+/// The application keeping its connection to the host at `endpoint`, with the application's own
+/// way of connecting to it. The keeper ends with the value returned.
+fn keeping_the_host_at(host: &Host, endpoint: kr_ipc::paths::Endpoint) -> EndsTheKeeper<'_> {
+    use companion_tauri::connection::{Attempt, connect_local_at, reach_host_on_this_machine};
+
+    reach_host_on_this_machine(host.app.handle(), move || {
+        let endpoint = endpoint.clone();
+        async move {
+            match connect_local_at(&endpoint).await {
+                Ok(connection) => Attempt::Reached(connection),
+                Err(error) => Attempt::Failed(error),
+            }
+        }
+    })
+    .expect("the choice of the host is made");
+    EndsTheKeeper(host.app.state::<companion_tauri::AppState>())
+}
+
+/// The state the application tells about its connection, once it satisfies `wanted`.
+async fn state_where(host: &Host, wanted: impl Fn(&Value) -> bool) -> Value {
+    eventually(
+        "the application's state is the one the case waits for",
+        || {
+            let state = serde_json::to_value(
+                host.app
+                    .state::<companion_tauri::AppState>()
+                    .connection_state(),
+            )
+            .expect("a state");
+            wanted(&state).then_some(state)
+        },
+    )
+    .await
+}
+
+/// An endpoint that nothing listens at, and the tree that keeps it.
+fn an_endpoint_nobody_listens_at() -> (kr_ipc::testing::TempHost, kr_ipc::paths::Endpoint) {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    (tree, endpoint)
+}
+
+/// KR-REQ-23.22: a host on this machine that refuses the hello is a host that answered and refused,
+/// and is told as that, not as a host out of contact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_host_that_refuses_the_hello_reads_refused() {
+    let host = Host::start_unconnected().await;
+    let (tree, endpoint) = an_endpoint_nobody_listens_at();
+    let _stand_in = StandIn::bind(&endpoint, tree.environment_id(), Hello::Refused);
+    let _keeper = keeping_the_host_at(&host, endpoint);
+
+    let state = state_where(&host, |state| state["contact"]["state"] != "unknown").await;
+    assert!(state["contact"].is_object(), "{state}");
+    assert_eq!(state["contact"]["state"], "refused", "{state}");
+    assert_eq!(state["contact"]["request"], "connection", "{state}");
+    assert!(
+        state["contact"]["refusal"]["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("the host refused the connection")),
+        "{state}"
+    );
+    assert_eq!(state["connected"], false, "{state}");
+}
+
+/// KR-REQ-23.22: a host on this machine that was never reached is not lost: it reads unknown, and
+/// its reason is the one the application has always given.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_host_never_reached_reads_unknown_with_todays_reason() {
+    let host = Host::start_unconnected().await;
+    let (_tree, endpoint) = an_endpoint_nobody_listens_at();
+    let _keeper = keeping_the_host_at(&host, endpoint);
+
+    let state = state_where(&host, |state| {
+        state["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no host on this machine"))
+    })
+    .await;
+    assert!(state["contact"].is_object(), "{state}");
+    assert_eq!(state["contact"]["state"], "unknown", "{state}");
+    assert_eq!(state["connected"], false, "{state}");
+}
+
+/// KR-REQ-23.22: a refusal does not stay once the host is not there to refuse: the host on this
+/// machine, never reached, reads unknown again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_hello_then_an_absent_socket_reads_unknown() {
+    let host = Host::start_unconnected().await;
+    let (tree, endpoint) = an_endpoint_nobody_listens_at();
+    let stand_in = StandIn::bind(&endpoint, tree.environment_id(), Hello::Refused);
+    let _keeper = keeping_the_host_at(&host, endpoint);
+    let refused = state_where(&host, |state| state["contact"]["state"] == "refused").await;
+    assert_eq!(refused["contact"]["state"], "refused", "{refused}");
+
+    drop(stand_in);
+    let absent = state_where(&host, |state| {
+        state["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no host on this machine"))
+    })
+    .await;
+    assert_eq!(absent["contact"]["state"], "unknown", "{absent}");
+}
+
+/// KR-REQ-23.22: a refused hello is not a reach: a choice of another host and back does not make
+/// the host on this machine one that was lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_hello_does_not_set_ever_reached() {
+    let host = Host::start_unconnected().await;
+    let (tree, endpoint) = an_endpoint_nobody_listens_at();
+    let stand_in = StandIn::bind(&endpoint, tree.environment_id(), Hello::Refused);
+    let keeper = keeping_the_host_at(&host, endpoint.clone());
+    state_where(&host, |state| state["contact"]["state"] == "refused").await;
+    drop(keeper);
+    drop(stand_in);
+    let _keeper = keeping_the_host_at(&host, endpoint);
+    let state = state_where(&host, |state| {
+        state["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no host on this machine"))
+    })
+    .await;
+    assert_eq!(state["contact"]["state"], "unknown", "{state}");
+}
+
+/// KR-REQ-23.22: the host on this machine, reached and then gone, reads out of contact from the end
+/// of the connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_host_reached_and_then_absent_reads_out_of_contact_from_the_end() {
+    let host = Host::start_unconnected().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let _keeper = keeping_the_host_at(&host, host.endpoint());
+    let first = eventually("the host is reached", || state.session().ok()).await;
+    let before = now_ms();
+    first.close();
+    let lost = state_where(&host, |state| state["contact"]["state"] == "out_of_contact").await;
+    let since = lost["contact"]["since_ms"].as_u64().expect("a start");
+    assert!(
+        since >= before,
+        "the loss starts when the connection ended: {lost}"
+    );
+    assert!(since <= now_ms(), "{lost}");
+}
+
+/// KR-REQ-23.22: a host on this machine that was reached stays one that was reached across a choice
+/// of another host: when it is gone after that, it is lost and not unknown.
+#[tokio::test(flavor = "multi_thread")]
+async fn ever_reached_survives_a_choice_of_another_host() {
+    let host = Host::start_unconnected().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let keeper = keeping_the_host_at(&host, host.endpoint());
+    eventually("the host is reached", || state.session().ok()).await;
+    drop(keeper);
+    // Another host is chosen, and then the host on this machine is chosen again, at an endpoint
+    // where nothing listens.
+    let other = kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+    state
+        .choose_host("another host", || {
+            Ok(companion_tauri::state::Started {
+                target: companion_tauri::contact::Target::Paired {
+                    host: other,
+                    pairing: other,
+                    reference: "another".to_owned(),
+                    name: "another host".to_owned(),
+                },
+                spawn: Box::new(|_| tauri::async_runtime::spawn(async {})),
+            })
+        })
+        .expect("another host is chosen");
+    let (_tree, absent) = an_endpoint_nobody_listens_at();
+    let _keeper = keeping_the_host_at(&host, absent);
+    let lost = state_where(&host, |state| {
+        state["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no host on this machine"))
+    })
+    .await;
+    assert_eq!(lost["contact"]["state"], "out_of_contact", "{lost}");
 }

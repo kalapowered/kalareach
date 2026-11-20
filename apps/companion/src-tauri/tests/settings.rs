@@ -556,6 +556,7 @@ impl Computer {
             ])
             .build(mock_context(noop_assets()))
             .expect("an application on the mock runtime");
+        companion_tauri::contact::serve(app.handle());
         // What the application's start does, over this computer's records.
         app.state::<AppState>().keep_under(self.data.path());
         if let Some(clients) = clients {

@@ -23,9 +23,10 @@ use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use serde_json::json;
 use support::{
-    Companion, LinkControl, NoOwner, StubIntake, WATCHDOG, pair, phone_paired_with,
+    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, pair, phone_paired_with,
     unpaired_phone_controlled,
 };
+use tauri::Manager as _;
 
 /// This computer paired with `host` as a device holding `rights`, and the data directory its
 /// records live in.
@@ -1230,4 +1231,398 @@ async fn forgetting_a_host_that_is_not_in_use_leaves_the_commands_going_to_the_o
         .expect("the host in use still answers");
     first.stop().await;
     second.stop().await;
+}
+
+/// The milliseconds since the epoch, as this computer's clock says.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_millis(),
+    )
+    .expect("a time that fits")
+}
+
+/// What the page was told of the connection, as (connected, contact state, revision), in the
+/// order it was told.
+fn told_states(companion: &Companion) -> Vec<(bool, String, u64)> {
+    companion
+        .connection
+        .texts()
+        .iter()
+        .map(|text| {
+            let state: serde_json::Value = serde_json::from_str(text).expect("a state");
+            (
+                state["connected"].as_bool().expect("connected"),
+                state["contact"]["state"]
+                    .as_str()
+                    .expect("a contact state")
+                    .to_owned(),
+                state["revision"].as_u64().expect("a revision"),
+            )
+        })
+        .collect()
+}
+
+/// Starts a host that comes back at its own address, and the phone paired with it.
+async fn a_host_that_comes_back_and_its_phone() -> (net_support::Host, Phone) {
+    let owner = DeviceKeys::generate().expect("keys");
+    let settings = kr_controller::service::net::config::NetworkSettings {
+        endpoint: net_support::loopback(),
+        ..kr_controller::service::net::config::NetworkSettings::default()
+    };
+    let mut host = Host::start_with_settings(&owner, settings).await;
+    host.comes_back_at_its_address();
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    (host, phone)
+}
+
+/// KR-REQ-18.01: each accepted change of the connection is told to the page once and in order, as
+/// the next revision, whether the host is reached, lost or reached again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_accepted_change_is_told_once() {
+    let (host, phone) = a_host_that_comes_back_and_its_phone().await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    let stopped = host.shut_down().await;
+    connection(companion, false).await;
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let state = connection(companion, true).await;
+
+    // The publisher tells the last change a moment after the command reports it.
+    let revision = state["revision"].as_u64().expect("a revision");
+    tokio::time::timeout(WATCHDOG, async {
+        while told_states(companion).last().map(|told| told.2) != Some(revision) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the last change is told");
+
+    let told = told_states(companion);
+    let revisions: Vec<u64> = told.iter().map(|each| each.2).collect();
+    assert_eq!(
+        revisions,
+        (1..=revisions.len() as u64).collect::<Vec<_>>(),
+        "each accepted change is told once, as the next revision: {told:?}"
+    );
+    let at = |connected: bool, contact: &str, after: usize| {
+        told.iter()
+            .skip(after)
+            .position(|each| each.0 == connected && each.1 == contact)
+            .map(|found| found + after)
+    };
+    let reached = at(true, "in_contact", 0).expect("the host is reached");
+    let lost = at(false, "out_of_contact", reached).expect("the host is lost after");
+    at(true, "in_contact", lost).expect("the host is reached again after");
+    host.stop().await;
+}
+
+/// KR-REQ-18.01: a connection that ends reads out of contact from the end, and not from the next
+/// attempt that fails after the pause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_ends_reads_out_of_contact_from_the_end() {
+    let (host, phone) = a_host_that_comes_back_and_its_phone().await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    let before = now_ms();
+    let stopped = host.shut_down().await;
+    let lost = connection(companion, false).await;
+    let after = now_ms();
+    assert_eq!(lost["contact"]["state"], "out_of_contact", "{lost}");
+    let since = lost["contact"]["since_ms"].as_u64().expect("a start");
+    assert!(
+        (before..=after).contains(&since),
+        "the loss starts when the connection ended, between {before} and {after}: {lost}"
+    );
+    assert_eq!(
+        lost["contact"]["escalates_at_ms"],
+        json!(since + kr_protocol::attention_rule::HOST_CONTACT_ESCALATION_MS),
+        "{lost}"
+    );
+    drop(stopped);
+}
+
+/// Two hosts this phone is paired with, the first in use, and the dials the phone makes governed.
+struct Two {
+    first: Host,
+    second: Host,
+    phone: Phone,
+    control: Arc<LinkControl>,
+    references: (String, String),
+}
+
+async fn two_hosts() -> Two {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    connection(&phone.companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    let view = phone
+        .companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let reference = |at: usize| {
+        view["hosts"][at]["reference"]
+            .as_str()
+            .expect("a reference")
+            .to_owned()
+    };
+    let references = (reference(0), reference(1));
+    Two {
+        first,
+        second,
+        phone,
+        control,
+        references,
+    }
+}
+
+impl Two {
+    /// Chooses the host `reference` names, and returns the state once the first attempt has ended.
+    fn uses(&self, reference: &str) -> serde_json::Value {
+        self.phone
+            .companion
+            .call("hosts_use", json!({ "reference": reference }))
+            .expect("the choice is made")
+    }
+
+    async fn stop(self) {
+        self.first.stop().await;
+        self.second.stop().await;
+    }
+}
+
+/// KR-REQ-18.01: a host that refuses the connection at admission is in contact and has refused;
+/// it is not out of contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_refuses_the_connection_reads_refused_not_out_of_contact() {
+    let two = two_hosts().await;
+    two.control
+        .refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
+    let state = two.uses(&two.references.0);
+    assert!(state["contact"].is_object(), "{state}");
+    assert_eq!(state["connected"], false, "{state}");
+    assert_eq!(state["contact"]["state"], "refused", "{state}");
+    assert_eq!(state["contact"]["request"], "connection", "{state}");
+    assert!(
+        state["contact"]["refusal"]["message"].is_string(),
+        "{state}"
+    );
+    assert_eq!(state["host"]["kind"], "paired", "{state}");
+    two.stop().await;
+}
+
+/// KR-REQ-18.01: a host left behind by a choice keeps its loss, and chosen again it reads out of
+/// contact at once, with the start it had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chosen_host_that_holds_a_loss_reads_out_of_contact_at_once() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    two.control.unreachable(true);
+    let lost = two.uses(&two.references.0);
+    assert_eq!(lost["contact"]["state"], "out_of_contact", "{lost}");
+    let since = lost["contact"]["since_ms"].as_u64().expect("a start");
+    two.control.unreachable(false);
+    two.uses(&two.references.1);
+    connection(companion, true).await;
+    let left_behind = companion
+        .call("connection_state", json!({}))
+        .expect("the state");
+    assert_eq!(
+        left_behind["others"][0]["contact"]["since_ms"], since,
+        "the host left behind keeps its loss: {left_behind}"
+    );
+
+    two.control.unreachable(true);
+    let before = two.phone.companion.told_connection().len();
+    two.uses(&two.references.0);
+    companion.told_everything().await;
+    let told = companion.told_connection();
+    let chosen = told[before..]
+        .iter()
+        .find(|state| state["host"]["reference"] == json!(two.references.0))
+        .expect("the choice is told");
+    assert_eq!(
+        chosen["contact"]["state"], "out_of_contact",
+        "the first state told of the chosen host already holds its loss: {chosen}"
+    );
+    assert_eq!(chosen["contact"]["since_ms"], since, "{chosen}");
+    two.stop().await;
+}
+
+/// KR-REQ-18.01: a host that is forgotten while it is not in use leaves no record of its loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forgotten_host_that_was_not_in_use_leaves_no_record() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    two.control.unreachable(true);
+    two.uses(&two.references.0);
+    two.control.unreachable(false);
+    two.uses(&two.references.1);
+    connection(companion, true).await;
+    let before = companion
+        .call("connection_state", json!({}))
+        .expect("the state");
+    assert_eq!(
+        before["others"][0]["contact"]["state"], "out_of_contact",
+        "the host left behind holds its loss: {before}"
+    );
+
+    let forgotten = companion
+        .call("hosts_forget", json!({ "reference": two.references.0 }))
+        .expect("the host is forgotten");
+    assert_eq!(forgotten["others"], json!([]), "{forgotten}");
+    assert_eq!(
+        forgotten["connected"], true,
+        "the host in use is untouched: {forgotten}"
+    );
+    two.stop().await;
+}
+
+/// KR-REQ-18.01: a choice made from a listing whose pairing is no longer the one this computer holds
+/// with that host (the host was forgotten and paired again, which gives the device another identity
+/// there) changes nothing: no choice, no revision, and the host in use and the device's own record
+/// stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_made_with_a_stale_pairing_changes_nothing() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let current = companion
+        .device()
+        .host_by_reference(&the_host(companion))
+        .expect("the pairing is listed");
+    // The listing the choice was made from names another pairing with the same host.
+    let mut stale = current.clone();
+    stale.device_id =
+        kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([42; 16]));
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let revision = state.contact_owner().revision();
+    let in_use = companion.device().host_in_use().map(|host| host.device_id);
+
+    let refused = companion_tauri::hosts::use_host(companion.app.handle(), stale).await;
+    assert!(refused.is_err(), "the stale choice is refused");
+    assert_eq!(state.contact_owner().revision(), revision, "no revision");
+    assert_eq!(
+        companion.device().host_in_use().map(|host| host.device_id),
+        in_use,
+        "the device's own record of the host in use"
+    );
+    assert!(state.connection_state().connected, "the host in use stands");
+    host.stop().await;
+}
+
+/// KR-REQ-18.01: a host that refuses and then answers is told refused and then in contact, as the
+/// next revision, with nothing between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_followed_by_recovery_is_told_in_order() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    two.control
+        .refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
+    two.uses(&two.references.0);
+    two.control.refuse(None);
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let told = told_states(companion);
+    let refused = told
+        .iter()
+        .position(|each| !each.0 && each.1 == "refused")
+        .expect("the refusal is told");
+    let recovered = told[refused + 1].clone();
+    assert!(recovered.0 && recovered.1 == "in_contact", "{told:?}");
+    assert_eq!(
+        recovered.2,
+        told[refused].2 + 1,
+        "the next revision: {told:?}"
+    );
+    two.stop().await;
+}
+
+/// KR-REQ-18.01: dials that fail again and again keep the start of the loss, and tell it once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_failed_dials_keep_the_loss_start() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    two.control.unreachable(true);
+    two.uses(&two.references.0);
+    // Longer than the first pauses of the reconnect backoff, so that several dials fail.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    companion.told_everything().await;
+    let losses: Vec<serde_json::Value> = companion
+        .told_connection()
+        .into_iter()
+        .filter(|state| state["contact"]["state"] == "out_of_contact")
+        .collect();
+    assert_eq!(losses.len(), 1, "one loss is told once: {losses:?}");
+    two.stop().await;
+}
+
+/// KR-REQ-18.01: two changes that are committed while the publisher is held are told in the order of
+/// their revisions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_emit_does_not_reorder() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let contact = Arc::clone(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .contact_owner(),
+    );
+    let release = contact.hold_the_publisher();
+    drop(contact.choose(&companion_tauri::contact::Target::Local, "first change"));
+    drop(contact.choose(&companion_tauri::contact::Target::Local, "second change"));
+    let _ = release.send(());
+    companion.told_everything().await;
+    let revisions: Vec<u64> = told_states(companion).iter().map(|each| each.2).collect();
+    assert!(
+        revisions.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "{revisions:?}"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-18.01: what the page missed is answered, in order, by the command that replays it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connection_since_replays_what_the_page_missed() {
+    let (host, phone) = a_host_that_comes_back_and_its_phone().await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let told = told_states(companion);
+    let replay = companion
+        .call("connection_since", json!({ "after": 0 }))
+        .expect("the replay");
+    let revisions: Vec<u64> = replay["states"]
+        .as_array()
+        .expect("states")
+        .iter()
+        .map(|state| state["revision"].as_u64().expect("a revision"))
+        .collect();
+    assert_eq!(
+        revisions,
+        told.iter().map(|each| each.2).collect::<Vec<_>>(),
+        "the replay is what was told"
+    );
+    assert_eq!(replay["resync"], false, "{replay}");
+    let after = told.last().expect("a state").2;
+    let none = companion
+        .call("connection_since", json!({ "after": after }))
+        .expect("the replay");
+    assert_eq!(none["states"], json!([]), "{none}");
+    host.stop().await;
 }

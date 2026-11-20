@@ -2652,8 +2652,11 @@ struct EndsTheKeeper<'a>(tauri::State<'a, AppState>);
 
 impl Drop for EndsTheKeeper<'_> {
     fn drop(&mut self) {
-        let _ = self.0.choose_host("a case is over", |_| {
-            Ok(tauri::async_runtime::spawn(async {}))
+        let _ = self.0.choose_host("a case is over", || {
+            Ok(companion_tauri::state::Started {
+                target: companion_tauri::contact::Target::Local,
+                spawn: Box::new(|_| tauri::async_runtime::spawn(async {})),
+            })
         });
     }
 }
@@ -2813,13 +2816,45 @@ async fn told_connection(
     ))
 }
 
-/// The application's own keeping of its connection to the host on this machine, with this rig's
-/// host in place of the user's: the connection is reached, and reached again when it ends. When
-/// `tells` is given, the host says what it says to the connection the application keeps.
+/// What a case does to the dials the keeper makes: holds them, fails them, and counts them.
+#[derive(Default)]
+struct Dials {
+    held: std::sync::atomic::AtomicBool,
+    failing: std::sync::atomic::AtomicBool,
+    made: std::sync::atomic::AtomicUsize,
+}
+
+impl Dials {
+    fn made(&self) -> usize {
+        self.made.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn hold(&self, held: bool) {
+        self.held.store(held, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn fail(&self, failing: bool) {
+        self.failing
+            .store(failing, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 async fn keeps_its_connection<'r>(
     rig: &'r Rig,
     reopens: Arc<std::sync::atomic::AtomicUsize>,
     tells: Option<&Arc<Tells>>,
+) -> EndsTheKeeper<'r> {
+    keeper_with(rig, reopens, tells, None).await
+}
+
+/// The application's own keeping of its connection to the host on this machine, with this rig's
+/// host in place of the user's: the connection is reached, and reached again when it ends. When
+/// `tells` is given, the host says what it says to the connection the application keeps.
+async fn keeper_with<'r>(
+    rig: &'r Rig,
+    reopens: Arc<std::sync::atomic::AtomicUsize>,
+    tells: Option<&Arc<Tells>>,
+    dials: Option<Arc<Dials>>,
 ) -> EndsTheKeeper<'r> {
     use companion_tauri::connection::Attempt;
 
@@ -2829,7 +2864,19 @@ async fn keeps_its_connection<'r>(
         let endpoint = endpoint.clone();
         let reopens = Arc::clone(&reopens);
         let tells = tells.clone();
+        let dials = dials.clone();
         async move {
+            if let Some(dials) = &dials {
+                while dials.held.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                dials.made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if dials.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Attempt::Failed(companion_tauri::connection::Unopened::Unreached(
+                        companion_tauri::CommandError::unavailable("no dial reaches the host"),
+                    ));
+                }
+            }
             // Another connection is slow to open, as one to a host that is busy is: refusals that
             // come while it is being opened meet a question that is already out.
             let reopen: companion_tauri::connection::Reopen = Arc::new({
@@ -2851,7 +2898,9 @@ async fn keeps_its_connection<'r>(
             };
             match reached {
                 Ok(connection) => Attempt::Reached(connection.reopening(reopen)),
-                Err(error) => Attempt::Failed(error),
+                Err(error) => {
+                    Attempt::Failed(companion_tauri::connection::Unopened::Unreached(error))
+                }
             }
         }
     })
@@ -3994,4 +4043,306 @@ async fn a_host_forgotten_while_the_view_asks_it_is_not_shown() {
             .all(|host| host["reference"] != reference),
         "the forgotten host is not shown: {shown}"
     );
+}
+
+/// A connection the host withdrew, replaced as it is when the application is refused on it, with a
+/// keeper whose dials `dials` governs. Returns the keeper, the connection the host withdrew and the
+/// one that replaced it.
+async fn a_replaced_connection<'r>(
+    rig: &'r Rig,
+    dials: &Arc<Dials>,
+) -> (
+    EndsTheKeeper<'r>,
+    Arc<kr_client::Session>,
+    Arc<kr_client::Session>,
+) {
+    use kr_protocol::hostinfo::HostInfoResult;
+    use kr_protocol::method::Method;
+
+    rig.host_polls().await;
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let keeper = keeper_with(rig, reopens, None, Some(Arc::clone(dials))).await;
+    let state = rig.app.app.state::<AppState>();
+    let first = state.session().expect("connected");
+    the_host_narrows_its_rights_ceiling(rig).await;
+    let refused = first
+        .read::<_, HostInfoResult>(Method::HostInfo, &json!({}))
+        .await;
+    assert!(
+        refused.is_err(),
+        "the host refuses a connection it withdrew"
+    );
+    let second = eventually("the application holds a connection the host admits", || {
+        state
+            .session()
+            .ok()
+            .filter(|session| !Arc::ptr_eq(session, &first))
+    })
+    .await;
+    (keeper, first, second)
+}
+
+/// Waits until what the page was told satisfies `wanted`, and returns what it was told.
+async fn told_until(rig: &Rig, wanted: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let told = rig.app.told_connection();
+            if wanted(&told) {
+                return told;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the page is told what the case waits for")
+}
+
+/// The state the page was told, without its revision: two told states that differ in nothing the
+/// page shows are the same.
+fn shown(state: &Value) -> Value {
+    let mut state = state.clone();
+    state.as_object_mut().expect("a state").remove("revision");
+    state
+}
+
+/// KR-REQ-23.22: the replacement of a connection the host withdrew is told once, by the count the
+/// state carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_tells_its_own_change_once() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, _first, _second) = a_replaced_connection(&rig, &dials).await;
+    rig.app.told_everything().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let told = rig.app.told_connection();
+    assert_eq!(
+        told.iter().filter(|state| state["replaced"] == 1).count(),
+        1,
+        "{told:?}"
+    );
+}
+
+/// KR-REQ-23.22: the end of the session a replacement closed changes nothing the page sees: the
+/// replacement was told when it was made, and no later state repeats it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_end_of_a_replaced_session_changes_nothing() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, first, _second) = a_replaced_connection(&rig, &dials).await;
+    tokio::time::timeout(Duration::from_secs(30), first.closed())
+        .await
+        .expect("the withdrawn session ends");
+    rig.app.told_everything().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let told = rig.app.told_connection();
+    let after = told
+        .iter()
+        .position(|state| state["replaced"] == 1)
+        .expect("the replacement is told");
+    assert_eq!(told.len(), after + 1, "nothing is told after it: {told:?}");
+    for pair in told.windows(2) {
+        assert_ne!(
+            shown(&pair[0]),
+            shown(&pair[1]),
+            "a state told twice: {told:?}"
+        );
+    }
+    assert_eq!(told[after]["connected"], true, "{told:?}");
+}
+
+/// KR-REQ-23.22: the keeper supervises the replacement: when it ends while the next dial is held,
+/// the end is told, from the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_keeper_supervises_the_replacement() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, first, second) = a_replaced_connection(&rig, &dials).await;
+    tokio::time::timeout(Duration::from_secs(30), first.closed())
+        .await
+        .expect("the withdrawn session ends");
+    dials.hold(true);
+    rig.app.told_everything().await;
+    let before = now_ms();
+    second.close();
+    let told = told_until(&rig, |told| {
+        told.last().is_some_and(|state| state["connected"] == false)
+    })
+    .await;
+    let ended = told.last().expect("a state");
+    assert_eq!(ended["contact"]["state"], "out_of_contact", "{ended}");
+    assert!(
+        ended["contact"]["since_ms"].as_u64().expect("a start") >= before,
+        "{ended}"
+    );
+    dials.hold(false);
+}
+
+/// KR-REQ-23.22: a replacement is taken up and no other connection is dialled for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_makes_no_redundant_dial() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, first, _second) = a_replaced_connection(&rig, &dials).await;
+    tokio::time::timeout(Duration::from_secs(30), first.closed())
+        .await
+        .expect("the withdrawn session ends");
+    // Longer than the first pause of the reconnect backoff, with its jitter.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert_eq!(
+        dials.made(),
+        1,
+        "the one dial that reached the host on this machine"
+    );
+}
+
+/// KR-REQ-23.22: a dial that fails while a replacement is live writes nothing: the replacement
+/// stays the connection held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_dial_beside_a_live_replacement_writes_nothing() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, first, second) = a_replaced_connection(&rig, &dials).await;
+    tokio::time::timeout(Duration::from_secs(30), first.closed())
+        .await
+        .expect("the withdrawn session ends");
+    dials.fail(true);
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let state = rig.app.app.state::<AppState>();
+    assert!(
+        Arc::ptr_eq(&state.session().expect("still connected"), &second),
+        "the replacement is still the connection held"
+    );
+    assert!(state.connection_state().connected);
+}
+
+/// KR-REQ-23.22: a dial that reaches the host beside a connection that was installed meanwhile
+/// writes nothing and is given back, and the keeper keeps its choice and dials again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slot_busy_dial_returns_to_adoption_and_the_keeper_keeps_the_choice() {
+    let rig = Rig::start().await;
+    rig.host_polls().await;
+    let dials = Arc::new(Dials::default());
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _keeper = keeper_with(&rig, reopens, None, Some(Arc::clone(&dials))).await;
+    let state = rig.app.app.state::<AppState>();
+    let first = state.session().expect("connected");
+    // The dial the keeper makes after this connection ends is held while another connection is
+    // installed beside it.
+    dials.hold(true);
+    first.close();
+    eventually("the connection is gone", || {
+        state.session().is_err().then_some(())
+    })
+    .await;
+    let held = held_connection(&rig).await;
+    let made = dials.made();
+    dials.hold(false);
+    // The dial reaches the host, finds the slot taken, and is given back; the keeper dials again.
+    eventually("the keeper dials again beside the connection held", || {
+        (dials.made() > made + 1).then_some(())
+    })
+    .await;
+    assert!(
+        Arc::ptr_eq(&state.session().expect("connected"), &held.session()),
+        "the connection installed meanwhile is still the one held"
+    );
+}
+
+/// KR-REQ-23.22: a replacement that ends before the keeper takes it up reaches a typed end, and the
+/// keeper dials a new connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_that_ends_before_adoption_reaches_a_typed_end_and_a_new_dial() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, first, second) = a_replaced_connection(&rig, &dials).await;
+    second.close();
+    tokio::time::timeout(Duration::from_secs(30), first.closed())
+        .await
+        .expect("the withdrawn session ends");
+    let told = told_until(&rig, |told| {
+        let ended = told.iter().position(|state| {
+            state["connected"] == false && state["contact"]["state"] == "out_of_contact"
+        });
+        ended.is_some_and(|at| {
+            told[at..].iter().any(|state| {
+                state["connected"] == true && state["contact"]["state"] == "in_contact"
+            })
+        })
+    })
+    .await;
+    assert!(dials.made() >= 2, "a new dial: {told:?}");
+}
+
+/// KR-REQ-23.22: a live replacement is taken up and kept outside the owner: it is the connection
+/// held, no dial is made for it, and its end is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_replacement_is_adopted_and_supervised_outside_the_owner() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, first, second) = a_replaced_connection(&rig, &dials).await;
+    tokio::time::timeout(Duration::from_secs(30), first.closed())
+        .await
+        .expect("the withdrawn session ends");
+    dials.hold(true);
+    let state = rig.app.app.state::<AppState>();
+    assert!(Arc::ptr_eq(&state.session().expect("held"), &second));
+    assert_eq!(dials.made(), 1);
+    second.close();
+    told_until(&rig, |told| {
+        told.last().is_some_and(|last| last["connected"] == false)
+    })
+    .await;
+    assert_eq!(
+        dials.made(),
+        1,
+        "the dial is held, and none was made for the replacement"
+    );
+    dials.hold(false);
+}
+
+/// KR-REQ-23.22: a replacement that has ended when the keeper takes it up is taken up all the
+/// same, and its end is typed by the supervision, not by a test of liveness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_already_ended_replacement_is_adopted_and_its_end_is_typed_by_the_closed_arm() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    dials.hold(false);
+    let (_keeper, _first, second) = a_replaced_connection(&rig, &dials).await;
+    dials.hold(true);
+    second.close();
+    let before = now_ms();
+    let told = told_until(&rig, |told| {
+        told.last().is_some_and(|last| last["connected"] == false)
+    })
+    .await;
+    let ended = told.last().expect("a state");
+    assert_eq!(ended["contact"]["state"], "out_of_contact", "{ended}");
+    assert_eq!(
+        ended["reason"], "the connection to this host ended",
+        "the closed arm's own words: {ended}"
+    );
+    assert!(ended["contact"]["since_ms"].as_u64().expect("a start") + 5_000 >= before);
+    dials.hold(false);
+}
+
+/// KR-REQ-23.22: the replacer closes the session it withdrew once the connection is swapped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_replacer_closes_the_withdrawn_session_after_the_swap() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, first, _second) = a_replaced_connection(&rig, &dials).await;
+    tokio::time::timeout(Duration::from_secs(30), first.closed())
+        .await
+        .expect("the withdrawn session is closed by the swap");
+}
+
+/// The milliseconds since the epoch, as this computer's clock says.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after the epoch")
+            .as_millis(),
+    )
+    .expect("a time that fits")
 }

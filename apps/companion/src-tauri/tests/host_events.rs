@@ -141,6 +141,7 @@ mod window {
                 test = true
             ))
             .expect("the check's application builds");
+        companion_tauri::contact::serve(app.handle());
         // The check's own verdict. The window loop's return value is not it: on macOS the loop
         // returns 0 whatever code the application exits with, so a failed check would pass.
         let verdict = Arc::new(AtomicI32::new(1));
@@ -346,6 +347,9 @@ mod window {
             Arc::clone(&session),
             host,
             events,
+            tauri::Manager::state::<companion_tauri::AppState>(app)
+                .contact_owner()
+                .revision(),
         ));
         wait_for("the page hearing both events", || heard(&window).len() >= 2).map_err(
             |failure| {
@@ -359,7 +363,8 @@ mod window {
             },
         )?;
         // Each event names the host it came from, which the page drops events of a host it no
-        // longer uses by.
+        // longer uses by, and the revision of the connection state it follows (none was published
+        // here, so 0).
         let expected = vec![
             json!({
                 "host": host.to_string(),
@@ -367,6 +372,7 @@ mod window {
                 "sequence": "0",
                 "event_type": "session.state",
                 "payload": { "state": "live", "cursor": 42, "changed": [true, null] },
+                "revision": 0,
             }),
             json!({
                 "host": host.to_string(),
@@ -374,6 +380,7 @@ mod window {
                 "sequence": "1",
                 "event_type": "session.output",
                 "payload": null,
+                "revision": 0,
             }),
         ];
         let received = heard(&window);

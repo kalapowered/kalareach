@@ -289,6 +289,7 @@ fn invoke(account: &Arc<Account>, command: &str, args: Value) -> Value {
         ])
         .build(mock_context(noop_assets()))
         .expect("an application on the mock runtime");
+    companion_tauri::contact::serve(app.handle());
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
         .expect("a window");

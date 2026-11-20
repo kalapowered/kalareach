@@ -399,7 +399,11 @@ async fn start<R: Runtime>(
         .first()
         .cloned()
         .unwrap_or_else(|| kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string());
-    let environment = app.state::<AppState>().connection_state().environment_id;
+    let environment = app
+        .state::<AppState>()
+        .connection_state()
+        .environment_id
+        .clone();
     let allowed = commands::voice_allow(
         app.state(),
         Subject::default(),

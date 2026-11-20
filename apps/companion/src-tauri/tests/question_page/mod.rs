@@ -48,6 +48,7 @@ impl Page {
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
+        companion_tauri::contact::serve(app.handle());
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("a window");
