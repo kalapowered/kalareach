@@ -70,6 +70,8 @@ web="${KR_WEB_TREE:-}"
 
 # shellcheck source=scripts/lib/artifacts-dir.sh
 . "$here/scripts/lib/artifacts-dir.sh"
+# shellcheck source=scripts/lib/host-program.sh
+. "$here/scripts/lib/host-program.sh"
 kr_artifacts_dir
 artefacts="$kr_artifacts/push-device-$platform"
 shots="${KR_PUSH_SHOTS:-/tmp/kr-push-phone}"
@@ -220,7 +222,7 @@ PY
 start_harness() { # <peer>
     KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SECONDS=1500 \
         KR_PUSH_GATEWAY="$gateway_origin" KR_PUSH_FCM_PORT="$fcm_port" KR_PUSH_TOKEN="$token" \
-        "$harness_exe" --ignored --exact a_phone_registers_with_a_gateway_and_is_delivered_to_through_it --nocapture \
+        host_start "$harness_exe" --ignored --exact a_phone_registers_with_a_gateway_and_is_delivered_to_through_it --nocapture \
         >"$artefacts/harness.log" 2>&1 &
     harness_pid=$!
     local waited=0

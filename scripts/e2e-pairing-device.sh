@@ -96,6 +96,8 @@ esac
 
 # shellcheck source=scripts/lib/artifacts-dir.sh
 . "$here/scripts/lib/artifacts-dir.sh"
+# shellcheck source=scripts/lib/host-program.sh
+. "$here/scripts/lib/host-program.sh"
 kr_artifacts_dir
 artefacts="$kr_artifacts/pairing-device-$platform"
 shots="${KR_PAIRING_SHOTS:-/tmp/kr-pair-phone}"
@@ -234,6 +236,7 @@ print(found)
 PY
 )"
     [ -n "$harness_exe" ] && [ -x "$harness_exe" ] || { say "the host left no executable"; return 2; }
+    harness_exe="$(host_install "$harness_exe" pairing_device)" || { say "the host could not be installed"; return 2; }
 }
 
 # Starts the host, which reaches the phone as `peer`, and waits until it is up.
@@ -243,7 +246,7 @@ start_harness() { # <peer> [<peer of the other service>]
     # of its own, the test thread and the runtime's workers, is given a larger stack.
     RUST_MIN_STACK=67108864 \
         KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SERVICE_PEER="${2:-$1}" KR_HARNESS_SECONDS=2400 \
-        "$harness_exe" --ignored --exact a_phone_scans_pairs_and_confirms_against_a_real_host --nocapture \
+        host_start "$harness_exe" --ignored --exact a_phone_scans_pairs_and_confirms_against_a_real_host --nocapture \
         >"$artefacts/harness.log" 2>&1 &
     harness_pid=$!
     local waited=0
