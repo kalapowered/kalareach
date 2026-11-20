@@ -271,9 +271,11 @@ fn an_agent_named_for_reduced_ownership_is_reported_as_read_by_no_launch() {
     let chosen = lines_of(&document);
     for package in ["kalareach/codex", "kalareach/qoder-cli"] {
         assert!(
-            chosen.iter().any(|line| line.trim_start().starts_with(&format!(
-                "agents {package}: reduced ownership is recorded and no launch on this host reads it"
-            )) && line.contains("; on Windows a launch whose profile records reduced")),
+            chosen.iter().any(|line| line.trim_start()
+                == format!(
+                    "agents {package}: reduced ownership is recorded and no launch on this host \
+                     reads it"
+                )),
             "{package}: {chosen:?}"
         );
     }

@@ -944,10 +944,8 @@ document is refused if a key is not a `publisher/plugin` identifier, if an owner
 packages, so a malformed key is never read as no choice. `kr doctor` reports the choice as the value
 `agents.ownership`, whose effect it gives as applying to nothing, and prints one line for each
 package the document chooses `reduced` for: `reduced ownership is recorded and no launch on this
-host reads it; on Windows a launch whose profile records reduced is tracked by start identity and
-its closure never reads complete, and the command route has no such profile`. An export carries the
-package names by their class and length. Every profile this host writes records `full`, so no edit
-to this section changes a launch on this host.
+host reads it`. An export carries the package names by their class and length. Every profile this
+host writes records `full`, so no edit to this section changes a launch on this host.
 
 `descriptions` holds the owner's two settings for session descriptions: `enabled`, on unless the
 document turns it off, and `on_battery`, off unless the document turns it on. `kr doctor` reports
@@ -2136,9 +2134,9 @@ Where the job cannot be created, cannot hold what it must, or does not hold the 
 fails by name**: no session is silently given a weaker boundary instead. Section 7's other permitted
 outcome, an explicitly selected reduced-ownership execution profile, belongs to an agent and not to
 a session: no session is given one, and an agent runs under one only where its launch profile
-records `ownership` as `reduced`. A GUI resource that has to outlive the session is created outside
-the job and is never ended by closing one. *A vendor's own sandbox*, below, says what an agent's sandbox needs of these
-jobs.
+records `ownership` as `reduced`, which no profile this host writes does. A GUI resource that has
+to outlive the session is created outside the job and is never ended by closing one. *A vendor's
+own sandbox*, below, says what an agent's sandbox needs of these jobs.
 
 A closure says what it could not establish. A job that stops answering, a process the operating
 system will not describe, and a termination the kernel refused are each carried into the closure
@@ -9511,8 +9509,7 @@ interpreter, whose identity is not the program's. The path to the program and it
 joined into one command line by the one quoting rule this host writes every command line with, and
 the command line is never passed to a shell. The process is created suspended and put into two jobs
 by the creation itself: the session's job, which ends it with the session, and a job of its own,
-which lists everything it starts. An agent launched under reduced ownership is put into a job of its
-own alone, as *A vendor's own sandbox* says. The worker asks the kernel whether each job holds the process
+which lists everything it starts. The worker asks the kernel whether each job holds the process
 before its first instruction runs. The process receives three handles and no others: a pipe for its
 standard input, a pipe for its standard output, and the null device for its standard error. This
 host keeps the other ends of the pipes. The pipe ends are made inheritable only for the call that
