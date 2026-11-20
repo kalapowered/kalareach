@@ -90,8 +90,8 @@ blocked, and the store held no flagged file.
 
 ## The files that sign
 
-They are under `~/.config/kalareach-secrets/apple`, mode 0600, and the script refuses to run when
-one is missing or has another mode:
+They are under `~/.config/kalareach-secrets/apple` (`KR_APPLE_DIR` names another directory), mode
+0600, and the script refuses to run when one is missing or has another mode:
 
 | File | What it is |
 | --- | --- |
