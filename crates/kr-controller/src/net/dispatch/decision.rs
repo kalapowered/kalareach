@@ -239,7 +239,13 @@ impl RemoteConnection {
                             &asked.acting.grant.history,
                         )
                         .into_owned(),
-                        None => without_its_output(&shown, asked.shown_as),
+                        // An answer kept from an earlier submission carries the result of an
+                        // action. A device that is not shown it is told that the outcome is not
+                        // shown: a refusal of a page would tell it that the action did not happen.
+                        None => match asked.answers(&frame) {
+                            Answers::Kept(_) => failure(request_id, super::outcome_not_shown()),
+                            _ => without_its_output(&shown, asked.shown_as),
+                        },
                     };
                     (std::borrow::Cow::Owned(held_back), None)
                 }
