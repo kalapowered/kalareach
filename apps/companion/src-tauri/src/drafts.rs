@@ -31,10 +31,12 @@
 //!   A discard that ends, even in another window's change, takes its entry out.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kr_client::ClientError;
 use kr_client::drafts::{Draft, DraftError, DraftStore, DraftTarget, SyncCheckpoint};
+use kr_flush::{NameKind, flush_directory};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, DeviceId, DraftId, DraftRevision, EnvironmentId,
@@ -66,12 +68,186 @@ fn removals_file(data: &Path) -> PathBuf {
 /// whether or not the file lock tells one handle of a process from another.
 static LEDGER_GATE: Mutex<()> = Mutex::new(());
 
-/// What a ledger file holds: nothing when it is not there or cannot be read.
-fn read_removals(file: &Path) -> Vec<DiscardParams> {
-    std::fs::read(file)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// What reading the ledger found.
+#[derive(Debug)]
+pub(crate) enum Ledger {
+    /// The removals it holds: none when there is no file.
+    Whole(Vec<DiscardParams>),
+    /// The file could not be read at all: an I/O error, a directory at its name.
+    Unreadable(std::io::Error),
+    /// Bytes were read that are not a list of removals.
+    Damaged,
+}
+
+/// What the page is told of the ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerState {
+    /// Absent, or read and parsed.
+    Ok,
+    /// Any read error. Nothing writes over it and the page reads it again later.
+    Unreadable,
+    /// Bytes were read and do not parse: the one state a person can set aside.
+    Damaged,
+}
+
+/// Whether the drafts' sources are all known. A draft whose source is unknown may be the text of a
+/// message that was sent, so none is put in a composer by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sources {
+    /// Every place a draft's removal could be owed was read.
+    Known,
+    /// One could not be read.
+    Unknown,
+}
+
+/// What a ledger file holds. A file that is not there is an empty ledger; one that cannot be read
+/// or parsed is neither, and nothing is ever written over it.
+fn read_ledger(file: &Path) -> Ledger {
+    match std::fs::read(file) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_or(Ledger::Damaged, Ledger::Whole),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ledger::Whole(Vec::new()),
+        Err(error) => Ledger::Unreadable(error),
+    }
+}
+
+impl Ledger {
+    /// The state the page is told.
+    pub(crate) const fn state(&self) -> LedgerState {
+        match self {
+            Self::Whole(_) => LedgerState::Ok,
+            Self::Unreadable(_) => LedgerState::Unreadable,
+            Self::Damaged => LedgerState::Damaged,
+        }
+    }
+}
+
+/// Why a write of a file did not complete, and whether the name was already given.
+#[derive(Debug)]
+pub(crate) struct PublishFault {
+    /// True once the rename was made: the new bytes may be what every reader now sees.
+    pub renamed: bool,
+    /// What failed.
+    pub error: std::io::Error,
+}
+
+/// Puts `bytes` in place under the name `to`, whole or not at all, and proves the name durable:
+/// they are written beside it under a name of their own (owner-only, flushed), `before_rename` is
+/// run, the name is given by a rename, and the directory is flushed. Every error is returned,
+/// and one made after the rename says so, because the file is then in place whatever the caller
+/// concludes.
+///
+/// The caller holds the lock that no other writer of `to` can pass.
+pub(crate) fn publish(
+    to: &Path,
+    bytes: &[u8],
+    before_rename: impl FnOnce() -> std::io::Result<()>,
+) -> std::result::Result<(), PublishFault> {
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+
+    let before = |error| PublishFault {
+        renamed: false,
+        error,
+    };
+    let directory = to
+        .parent()
+        .ok_or_else(|| before(std::io::Error::other("a file with no directory")))?;
+    let name = to
+        .file_name()
+        .ok_or_else(|| before(std::io::Error::other("a path with no file name")))?
+        .to_string_lossy();
+    let staged = directory.join(format!(
+        "{name}.staged-{}-{}",
+        std::process::id(),
+        STAGED.fetch_add(1, Ordering::Relaxed)
+    ));
+    kr_client::drafts::write_whole(&staged, bytes).map_err(before)?;
+    if let Err(error) =
+        before_rename().and_then(|()| kr_flush::retry_while_held(|| std::fs::rename(&staged, to)))
+    {
+        let _ = std::fs::remove_file(&staged);
+        return Err(before(error));
+    }
+    flush_directory(directory, NameKind::File).map_err(|error| PublishFault {
+        renamed: true,
+        error,
+    })
+}
+
+/// Removes `path` and proves its absence durable. A file that is not there is already removed, and
+/// the directory is flushed all the same: the removal may be one another process made and did not
+/// finish proving.
+pub(crate) fn remove_durably(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("a path with no directory"))?;
+    flush_directory(directory, NameKind::File)
+}
+
+/// What a change of the ledger did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Change {
+    /// The ledger already held what the change would write.
+    Unchanged,
+    /// The ledger was written and put in place.
+    Published,
+}
+
+/// Why a change of the ledger did not complete.
+#[derive(Debug)]
+pub(crate) struct RemovalFault {
+    /// True once the ledger was renamed into place, or already held the lines: it may be what a
+    /// reader sees now, and may delete the only other copy of a text.
+    pub renamed: bool,
+    /// What failed.
+    pub error: CommandError,
+}
+
+/// The ledger's two locks, held until it is dropped.
+pub(crate) struct LedgerLocked<'a> {
+    data: PathBuf,
+    _gate: MutexGuard<'a, ()>,
+    _lock: std::fs::File,
+}
+
+impl LedgerLocked<'_> {
+    /// What the ledger holds now.
+    pub(crate) fn read(&self) -> Ledger {
+        read_ledger(&removals_file(&self.data))
+    }
+
+    /// The ledger's file.
+    pub(crate) fn file(&self) -> PathBuf {
+        removals_file(&self.data)
+    }
+
+    /// The application data directory the ledger is in.
+    pub(crate) fn data(&self) -> &Path {
+        &self.data
+    }
+
+    /// Puts `removals` in place as the whole ledger.
+    pub(crate) fn publish(
+        &self,
+        removals: &[DiscardParams],
+    ) -> std::result::Result<(), PublishFault> {
+        let bytes = serde_json::to_vec(removals).map_err(|error| PublishFault {
+            renamed: false,
+            error: std::io::Error::other(error),
+        })?;
+        publish(&self.file(), &bytes, || {
+            crate::channel_messages::reach(
+                &self.data,
+                crate::channel_messages::Point::LedgerBeforeRename,
+            )
+        })
+    }
 }
 
 /// A host: the environment its sessions live in, and what the person calls it.
@@ -120,6 +296,10 @@ pub struct DraftDesk {
     opened: Mutex<Option<DraftStore>>,
     /// Who keeps the drafts in step, once there is one.
     watch: std::sync::OnceLock<Arc<dyn DraftWatch>>,
+    /// Whether the data directory's entry for the ledger is not yet proved durable, after a
+    /// set-aside replaced it. The proof is the first step of every read of the drafts and every
+    /// change of the ledger.
+    flush_owed: AtomicBool,
 }
 
 impl std::fmt::Debug for DraftDesk {
@@ -168,11 +348,16 @@ impl DraftDesk {
 
     /// Every draft stored here, and how many files in the store could not be read.
     ///
+    /// A ledger that cannot be read makes the sources unknown: its removals are not known, so a
+    /// draft may be the text of a prompt the host took.
+    ///
     /// # Errors
     ///
     /// Returns why the store cannot be used.
     pub fn read(&self) -> Result<Stored> {
         let listing = self.store()?.list().map_err(failure)?;
+        let ledger = self.ledger();
+        let state = ledger.state();
         Ok(Stored {
             drafts: listing
                 .drafts
@@ -188,52 +373,86 @@ impl DraftDesk {
                 })
                 .collect(),
             unreadable: listing.unreadable.len(),
-            pending_removals: self.removals(),
+            pending_removals: match ledger {
+                Ledger::Whole(removals) => removals,
+                _ => Vec::new(),
+            },
+            sources: if state == LedgerState::Ok {
+                Sources::Known
+            } else {
+                Sources::Unknown
+            },
+            ledger: state,
         })
     }
 
-    /// The removals the page recorded and has not finished. A ledger that cannot be read is an
-    /// empty one: it only ever names drafts that are still stored, and nothing is lost by it.
-    fn removals(&self) -> Vec<DiscardParams> {
+    /// What the ledger holds now, read without a lock: a reader sees the list before a change or
+    /// the one after it, and never half of one.
+    pub(crate) fn ledger(&self) -> Ledger {
         let Some(data) = self
             .data
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
         else {
-            return Vec::new();
+            return Ledger::Whole(Vec::new());
         };
-        read_removals(&removals_file(&data))
+        read_ledger(&removals_file(&data))
     }
 
-    /// Changes the ledger as one step that no other writer, in this application or in another
-    /// window of it, can come between: the ledger is read, `change` is made to it, and it is
-    /// written whole under a name of its own and then put in place, so that a crash leaves the one
-    /// before or the one after and never half of one. Nothing is written when `change` says it
-    /// changed nothing.
-    fn change_removals(&self, change: impl FnOnce(&mut Vec<DiscardParams>) -> bool) -> Result<()> {
-        use std::io::Write as _;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        static STAGED: AtomicU64 = AtomicU64::new(0);
-
-        let data = self
-            .data
+    /// The application data directory, once it is known.
+    pub(crate) fn data(&self) -> Option<PathBuf> {
+        self.data
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .ok_or_else(|| {
-                CommandError::unsupported("removals cannot be kept: there is no place for them")
-            })?;
+    }
+
+    /// Notes that the data directory's entry for the ledger has to be proved durable.
+    pub(crate) fn owe_flush(&self) {
+        self.flush_owed.store(true, Ordering::SeqCst);
+    }
+
+    /// Makes the flush a set-aside owes, if one is owed: the first step of every read of the drafts
+    /// and every change of the ledger, so that nothing relies on a ledger whose name is not yet on
+    /// disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the data directory cannot be flushed; the flush stays owed.
+    pub(crate) fn settle_owed_flush(&self) -> Result<()> {
+        if !self.flush_owed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let Some(data) = self.data() else {
+            return Ok(());
+        };
+        flush_directory(&data, NameKind::File).map_err(|error| {
+            CommandError::new(
+                ErrorCode::StorageUnavailable,
+                format!("the removals still to be made cannot yet be proved durable: {error}"),
+            )
+        })?;
+        self.flush_owed.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Takes the ledger's two locks: the gate, so that two windows of one process never change it
+    /// at once, and the file lock, which tells another process from this one. The owed flush is made
+    /// first.
+    pub(crate) fn lock_ledger(&self) -> Result<LedgerLocked<'_>> {
+        let data = self.data().ok_or_else(|| {
+            CommandError::unsupported("removals cannot be kept: there is no place for them")
+        })?;
         let unavailable = |error: std::io::Error| {
             CommandError::local_failure(format!(
                 "the removals still to be made cannot be kept: {error}"
             ))
         };
-        let _gate = LEDGER_GATE.lock().unwrap_or_else(PoisonError::into_inner);
+        let gate = LEDGER_GATE.lock().unwrap_or_else(PoisonError::into_inner);
         std::fs::create_dir_all(&data).map_err(unavailable)?;
-        // The lock is on a file of its own, held until this returns: a lock on the ledger itself
-        // would go with the name it is renamed over.
+        // The lock is on a file of its own, held until the guard is dropped: a lock on the ledger
+        // itself would go with the name it is renamed over.
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -254,29 +473,66 @@ impl DraftDesk {
                 }
             }
         }
-        let file = removals_file(&data);
-        let mut removals = read_removals(&file);
+        self.settle_owed_flush()?;
+        Ok(LedgerLocked {
+            data,
+            _gate: gate,
+            _lock: lock,
+        })
+    }
+
+    /// Changes the ledger as one step that no other writer, in this application or in another
+    /// window of it, can come between: the ledger is read, `change` is made to it, and it is
+    /// written whole under a name of its own and then put in place, so that a crash leaves the one
+    /// before or the one after and never half of one. Nothing is written when `change` says it
+    /// changed nothing, and the data directory is flushed all the same, so that a ledger which
+    /// already holds the lines is proved durable before anything relies on it.
+    ///
+    /// A ledger that cannot be read or parsed is never replaced.
+    fn change_removals(
+        &self,
+        change: impl FnOnce(&mut Vec<DiscardParams>) -> bool,
+    ) -> std::result::Result<Change, RemovalFault> {
+        let locked = self.lock_ledger().map_err(|error| RemovalFault {
+            renamed: false,
+            error,
+        })?;
+        let mut removals = match locked.read() {
+            Ledger::Whole(removals) => removals,
+            Ledger::Unreadable(error) => {
+                return Err(RemovalFault {
+                    renamed: false,
+                    error: CommandError::local_failure(format!(
+                        "the removals still to be made cannot be read: {error}"
+                    )),
+                });
+            }
+            Ledger::Damaged => {
+                return Err(RemovalFault {
+                    renamed: false,
+                    error: CommandError::local_failure(
+                        "the list of removals still to be made is damaged and cannot be read",
+                    ),
+                });
+            }
+        };
         if !change(&mut removals) {
-            return Ok(());
+            flush_directory(&locked.data, NameKind::File).map_err(|error| RemovalFault {
+                renamed: true,
+                error: CommandError::local_failure(format!(
+                    "the removals still to be made cannot be proved durable: {error}"
+                )),
+            })?;
+            return Ok(Change::Unchanged);
         }
-        let bytes = serde_json::to_vec(&removals)
-            .map_err(|error| CommandError::local_failure(error.to_string()))?;
-        let staged = file.with_extension(format!(
-            "staged-{}-{}",
-            std::process::id(),
-            STAGED.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut written = std::fs::File::create(&staged).map_err(unavailable)?;
-        written.write_all(&bytes).map_err(unavailable)?;
-        written.sync_all().map_err(unavailable)?;
-        std::fs::rename(&staged, &file).map_err(unavailable)?;
-        // The rename is in the directory, which is not on disk until the directory is: a power cut
-        // between the two would otherwise lose it.
-        #[cfg(unix)]
-        if let Ok(directory) = std::fs::File::open(&data) {
-            let _ = directory.sync_all();
-        }
-        Ok(())
+        locked.publish(&removals).map_err(|fault| RemovalFault {
+            renamed: fault.renamed,
+            error: CommandError::local_failure(format!(
+                "the removals still to be made cannot be kept: {}",
+                fault.error
+            )),
+        })?;
+        Ok(Change::Published)
     }
 
     /// Records a removal the page could not make, so that a start after it finishes it.
@@ -285,14 +541,30 @@ impl DraftDesk {
     ///
     /// Returns why the ledger cannot be written.
     pub fn mark_removal(&self, removal: DiscardParams) -> Result<()> {
-        self.change_removals(|removals| {
-            // Each version of a draft is owed its own removal: one recorded later for an older
-            // version does not take the entry of a newer one.
-            removals.retain(|held| {
-                held.id != removal.id || held.expected_revision != removal.expected_revision
-            });
-            removals.push(removal);
-            true
+        self.mark_removals(&[removal])
+            .map(|_| ())
+            .map_err(|fault| fault.error)
+    }
+
+    /// Records the removals the page could not make, in one change: the ledger holds all of them or
+    /// none. Each version of a draft is owed its own removal: one recorded later for an older
+    /// version does not take the entry of a newer one, and a line already there is not written
+    /// again.
+    pub(crate) fn mark_removals(
+        &self,
+        removals: &[DiscardParams],
+    ) -> std::result::Result<Change, RemovalFault> {
+        self.change_removals(|held| {
+            let mut changed = false;
+            for removal in removals {
+                if !held.iter().any(|line| {
+                    line.id == removal.id && line.expected_revision == removal.expected_revision
+                }) {
+                    held.push(removal.clone());
+                    changed = true;
+                }
+            }
+            changed
         })
     }
 
@@ -655,6 +927,10 @@ pub struct Stored {
     pub unreadable: usize,
     /// The removals the page began and could not finish, each naming the version to remove.
     pub pending_removals: Vec<DiscardParams>,
+    /// Whether every place that can say a draft was sent was read.
+    pub sources: Sources,
+    /// What the list of removals is: readable, not readable, or damaged.
+    pub ledger: LedgerState,
 }
 
 /// One stored draft, as the page reads it.
