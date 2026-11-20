@@ -894,8 +894,8 @@ impl Installer {
 
     /// Refuses the places a package declared that this host must not write: a place inside the
     /// host's own folders, and, from the handle, a link or a file at any component below the
-    /// selected root and a folder where a file is to be written. Every place is checked before the
-    /// first write.
+    /// selected root, a folder where a file is to be written, and a folder that another user can
+    /// change. Every place is checked before the first write.
     fn check_declared_places(&self, params: &AgentToolsParams, layout: &Layout) -> Result<()> {
         if params.agent.compiled().is_some() {
             return Ok(());
@@ -946,6 +946,15 @@ impl Installer {
             .chain(documents.iter().copied())
         {
             walk.refuse_links(place, anchor::Expect::File)?;
+        }
+        // The folder that will hold each written name, where it is there, is one that only this user
+        // can change. A folder this host has still to make is judged by the handle at the write.
+        for place in files
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(documents.iter().copied())
+        {
+            walk.refuse_shared_folder(place)?;
         }
         if let Some(parent) = layout
             .configuration
@@ -6063,54 +6072,6 @@ mod tests {
         }
     }
 
-    /// KR-REQ-11.01: a file another process puts under the temporary name after the write has read
-    /// the file it is about to remove is not removed. This holds where the write removes the file
-    /// it displaced and where it takes back its own staged file.
-    #[cfg(unix)]
-    #[test]
-    fn a_file_put_under_the_temporary_name_after_its_check_is_kept() {
-        for variant in [
-            "the displaced file is removed",
-            "the staged file is taken back",
-        ] {
-            let tree = Tree::create();
-            let walk = anchor::Anchor::open(&tree.home())
-                .expect("opens")
-                .expect("a root");
-            let place = tree.home().join("doc.json");
-            walk.write(&place, b"one", 0o600, None).expect("a new file");
-            let theirs = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
-            if variant == "the staged file is taken back" {
-                let at = place.clone();
-                anchor::publish_pause::once(move |_| {
-                    std::fs::write(&at, b"changed").expect("another process writes the file");
-                });
-            }
-            let (put, home) = (std::rc::Rc::clone(&theirs), tree.home());
-            anchor::cleanup_pause::once(move |_| {
-                *put.borrow_mut() = Some(put_a_file_under_the_temporary_name(&home));
-            });
-            let written = walk.write(&place, b"two", 0o600, Some(digest_of(b"one")));
-            if variant == "the displaced file is removed" {
-                written.expect(variant);
-                assert_eq!(std::fs::read(&place).expect("a file"), b"two", "{variant}");
-            } else {
-                written.expect_err(variant);
-                assert_eq!(
-                    std::fs::read(&place).expect("a file"),
-                    b"changed",
-                    "{variant}"
-                );
-            }
-            let theirs = theirs.borrow().clone().expect("a file was put there");
-            assert_eq!(
-                std::fs::read(&theirs).ok().as_deref(),
-                Some(&b"theirs"[..]),
-                "{variant}: the file put under the temporary name is kept"
-            );
-        }
-    }
-
     /// KR-REQ-11.01: a file another process puts at the place while the names are traded is not
     /// removed as if it were the staged file. It is kept, and the refusal names where.
     #[cfg(unix)]
@@ -6166,234 +6127,6 @@ mod tests {
         assert!(
             detail.ends_with(&holding[0].display().to_string()),
             "the refusal names it: {detail}"
-        );
-    }
-
-    /// What another process does between a write's making of its private folder and its opening of
-    /// it: it moves the new folder aside and puts a folder of its own at the name, with `mode` and,
-    /// where `holding` is set, a file in it.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn replace_the_private_folder_before_it_is_opened(mode: u32, holding: bool) {
-        anchor::private_pause::once(move |folder| {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::rename(folder, folder.with_file_name("moved-aside")).expect("moves it aside");
-            std::fs::create_dir(folder).expect("another process makes a folder of its own");
-            std::fs::set_permissions(folder, std::fs::Permissions::from_mode(mode))
-                .expect("sets its mode");
-            if holding {
-                std::fs::write(folder.join("note"), b"theirs").expect("puts a file in it");
-            }
-        });
-    }
-
-    /// KR-REQ-11.01: a folder that other users can enter, put at the private folder's name before
-    /// the write opens it, is not written into. The write is refused and nothing is published; the
-    /// folder is not this write's, so it stays.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_folder_open_to_others_put_at_the_private_folders_name_is_refused_and_kept() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let tree = Tree::create();
-        let walk = anchor::Anchor::open(&tree.home())
-            .expect("opens")
-            .expect("a root");
-        let place = tree.home().join("doc.json");
-        replace_the_private_folder_before_it_is_opened(0o755, false);
-        let refused = walk
-            .write(&place, b"one", 0o600, None)
-            .expect_err("a folder other users can enter is not used");
-        assert!(
-            matches!(&refused, ControllerError::PermissionDenied { detail }
-                if detail.contains("because the temporary folder beside it is open to other users")),
-            "{refused}"
-        );
-        assert!(!place.exists(), "nothing is published");
-        let theirs = temporary_entries(&tree.home());
-        assert_eq!(theirs.len(), 1, "their folder stays: {theirs:?}");
-        assert_eq!(
-            theirs[0]
-                .metadata()
-                .expect("it is there")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755,
-            "as they made it"
-        );
-        assert_eq!(
-            std::fs::read_dir(&theirs[0]).expect("a folder").count(),
-            0,
-            "nothing was staged in it"
-        );
-    }
-
-    /// KR-REQ-11.01: a folder that already holds a file, put at the private folder's name before
-    /// the write opens it, is not written into either, even where its owner and mode would pass.
-    /// The write is refused with its own words and nothing is published; the folder and its file
-    /// stay.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_folder_holding_a_file_put_at_the_private_folders_name_is_refused_and_kept() {
-        let tree = Tree::create();
-        let walk = anchor::Anchor::open(&tree.home())
-            .expect("opens")
-            .expect("a root");
-        let place = tree.home().join("doc.json");
-        replace_the_private_folder_before_it_is_opened(0o700, true);
-        let refused = walk
-            .write(&place, b"one", 0o600, None)
-            .expect_err("a folder that holds a file is not used");
-        assert!(
-            matches!(&refused, ControllerError::PermissionDenied { detail }
-                if detail.contains("because another program put something in the temporary folder beside it")),
-            "{refused}"
-        );
-        assert!(!place.exists(), "nothing is published");
-        let theirs = temporary_entries(&tree.home());
-        assert_eq!(theirs.len(), 1, "their folder stays: {theirs:?}");
-        let held: Vec<PathBuf> = std::fs::read_dir(&theirs[0])
-            .expect("a folder")
-            .map(|entry| entry.expect("an entry").path())
-            .collect();
-        assert_eq!(held, [theirs[0].join("note")], "holding only their file");
-        assert_eq!(
-            std::fs::read(&held[0]).ok().as_deref(),
-            Some(&b"theirs"[..]),
-            "which is kept"
-        );
-    }
-
-    /// KR-REQ-11.01: on macOS the folder a write makes takes the access-list entries its parent
-    /// passes on to folders, and mode 0700 does not limit them. A write whose private folder
-    /// carries such an entry is refused, nothing is published, and the folder it made is removed.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_private_folder_that_takes_an_access_entry_from_its_parent_is_refused_and_removed() {
-        let tree = Tree::create();
-        let shared = tree.home().join("shared");
-        std::fs::create_dir(&shared).expect("a shared folder");
-        // Declared after the tree, so it is dropped first however the test ends.
-        let _entry = Restriction(shared.clone());
-        exacl::setfacl(
-            &[&shared],
-            &[exacl::AclEntry::allow_group(
-                "everyone",
-                exacl::Perm::READ
-                    | exacl::Perm::WRITE
-                    | exacl::Perm::EXECUTE
-                    | exacl::Perm::APPEND
-                    | exacl::Perm::DELETE_CHILD,
-                Some(exacl::Flag::DIRECTORY_INHERIT | exacl::Flag::ONLY_INHERIT),
-            )],
-            None,
-        )
-        .expect("gives every user a right in the folders made in it");
-        let walk = anchor::Anchor::open(&tree.home())
-            .expect("opens")
-            .expect("a root");
-        let place = shared.join("doc.json");
-        let refused = walk
-            .write(&place, b"one", 0o600, None)
-            .expect_err("a folder that others can enter is not used");
-        assert!(
-            matches!(&refused, ControllerError::PermissionDenied { detail }
-                if detail.contains("because the temporary folder beside it is open to other users")),
-            "{refused}"
-        );
-        assert!(!place.exists(), "nothing is published");
-        let left = temporary_entries(&shared);
-        assert!(
-            left.is_empty(),
-            "the folder this write made is removed: {left:?}"
-        );
-    }
-
-    /// KR-REQ-11.01: the folder a write stages in is closed to every user but its owner while the
-    /// write runs: the one temporary entry beside the place, when the staged file is about to be
-    /// published, is a folder of mode 0700.
-    #[cfg(unix)]
-    #[test]
-    fn a_write_stages_in_a_folder_only_its_owner_can_enter() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let tree = Tree::create();
-        let walk = anchor::Anchor::open(&tree.home())
-            .expect("opens")
-            .expect("a root");
-        let place = tree.home().join("doc.json");
-        let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<Vec<(bool, u32)>>));
-        let (look, home) = (std::rc::Rc::clone(&seen), tree.home());
-        anchor::publish_pause::once(move |_| {
-            let entries = temporary_entries(&home)
-                .iter()
-                .map(|entry| {
-                    let metadata = entry.symlink_metadata().expect("an entry");
-                    (metadata.is_dir(), metadata.permissions().mode() & 0o777)
-                })
-                .collect();
-            *look.borrow_mut() = Some(entries);
-        });
-        let written = walk.write(&place, b"one", 0o600, None);
-        assert!(written.is_ok(), "a private folder is used: {written:?}");
-        assert_eq!(
-            seen.borrow().as_deref(),
-            Some(&[(true, 0o700)][..]),
-            "one folder, closed to every user but its owner"
-        );
-    }
-
-    /// KR-REQ-11.01: a file kept in the private folder stays in it when another process renames
-    /// the folder. The path the refusal names is the one the folder had when the write opened it,
-    /// so it no longer reaches the file, and the file is where the renamed folder is.
-    #[cfg(unix)]
-    #[test]
-    fn a_kept_file_stays_in_its_folder_when_another_process_renames_the_folder() {
-        let tree = Tree::create();
-        let walk = anchor::Anchor::open(&tree.home())
-            .expect("opens")
-            .expect("a root");
-        let place = tree.home().join("doc.json");
-        walk.write(&place, b"one", 0o600, None).expect("a new file");
-        let at = place.clone();
-        anchor::publish_pause::once(move |_| {
-            std::fs::write(&at, b"theirs").expect("another process writes the file");
-        });
-        let (at, home) = (place.clone(), tree.home());
-        anchor::trade_pause::once(move |_| {
-            let folders = temporary_entries(&home);
-            std::fs::rename(&folders[0], home.join("moved-folder")).expect("renames the folder");
-            std::fs::write(home.join("third.json"), b"third").expect("another process writes");
-            std::fs::rename(home.join("third.json"), &at).expect("it is put at the place");
-        });
-        let refused = walk
-            .write(&place, b"two", 0o600, Some(digest_of(b"one")))
-            .expect_err("the place does not hold the checked file");
-        let ControllerError::PermissionDenied { detail } = &refused else {
-            panic!("{refused}");
-        };
-        let named = Path::new(
-            detail
-                .split("so it is kept as ")
-                .nth(1)
-                .expect("the refusal names a path"),
-        );
-        assert!(
-            !named.exists(),
-            "the path it names no longer reaches the file: {named:?}"
-        );
-        let moved: Vec<PathBuf> = std::fs::read_dir(tree.home().join("moved-folder"))
-            .expect("the renamed folder")
-            .map(|entry| entry.expect("an entry").path())
-            .collect();
-        assert_eq!(moved.len(), 1, "one file stays in the folder: {moved:?}");
-        assert_eq!(
-            std::fs::read(&moved[0]).ok().as_deref(),
-            Some(&b"third"[..]),
-            "the file that was kept"
-        );
-        assert_eq!(
-            named.file_name(),
-            moved[0].file_name(),
-            "the path names it by its name in the folder"
         );
     }
 
@@ -6770,6 +6503,40 @@ mod tests {
             "{refused}"
         );
         assert_eq!(std::fs::read(&place).expect("a file"), b"one", "unchanged");
+        let left = temporary_entries(&tree.home());
+        assert!(left.is_empty(), "no temporary entry stands: {left:?}");
+    }
+
+    /// KR-REQ-11.01: a file that another process puts at the place after the last read, holding the
+    /// contents of the checked file, is not removed as if it were that file: the replacement is
+    /// refused and that file is at its place again.
+    #[cfg(unix)]
+    #[test]
+    fn a_displaced_file_with_the_checked_contents_but_another_identity_is_put_back() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        walk.write(&place, b"one", 0o600, None).expect("a new file");
+        let (at, twin) = (place.clone(), tree.home().join("twin.json"));
+        anchor::publish_pause::once(move |_| {
+            std::fs::write(&twin, b"one").expect("a file with the same contents");
+            std::fs::rename(&twin, &at).expect("put at the place of the checked file");
+        });
+        let refused = walk
+            .write(&place, b"two", 0o600, Some(digest_of(b"one")))
+            .expect_err("another file is at the place");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains("replaces only the file it checked")),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read(&place).expect("a file"),
+            b"one",
+            "the other file is at its place"
+        );
         let left = temporary_entries(&tree.home());
         assert!(left.is_empty(), "no temporary entry stands: {left:?}");
     }

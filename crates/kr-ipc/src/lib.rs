@@ -9,6 +9,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
+//! | `access_list` | On macOS, the access-control list of an open file or directory, read through its descriptor |
 //! | [`paths`] | The owner-only runtime and state directories, endpoint names and atomic file publication |
 //! | [`identity`] | The host's boot identity, its boot epoch and a process's start identity, read from the kernel |
 //! | [`install`] | The store of installed releases, which release this process runs, and the hold that keeps it on disk |
@@ -62,6 +63,8 @@
 //! # }
 //! ```
 
+#[cfg(target_os = "macos")]
+pub mod access_list;
 pub mod background;
 pub mod client;
 pub mod clock;
