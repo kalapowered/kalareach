@@ -505,11 +505,17 @@ impl RemoteConnection {
             }
             DeviceRead::Voice => {
                 // What a call may be told of a session carries what a model wrote and what the
-                // description host observed, so it is released only under the privacy state it
-                // was read under, taken before it is read. A context read while privacy mode is on
-                // carries neither, and is written as it is.
+                // description host observed, so a context is released only under the privacy
+                // state it was read under, taken before it is read. A read begun with privacy mode
+                // on carries neither, and stands only while that same state stands: a mode that
+                // went off and on again moved it, and the context may then hold what a later state
+                // produced.
                 let read_under = if entry.method == Method::VoiceContext {
-                    match super::output::ReadUnder::now(&self.controller).await {
+                    match super::output::ReadUnder::now_carrying_none_while_private(
+                        &self.controller,
+                    )
+                    .await
+                    {
                         Ok(read_under) => Some(read_under),
                         Err(error) => return failure(request.request_id, error),
                     }
@@ -521,9 +527,7 @@ impl RemoteConnection {
                     .voice()
                     .read_frame(self.device.device_id, request)
                     .await;
-                if let (Some(asked), Some(read_under)) = (asked.as_mut(), read_under)
-                    && !read_under.was_private()
-                {
+                if let (Some(asked), Some(read_under)) = (asked.as_mut(), read_under) {
                     asked.read_under = Some(read_under);
                 }
                 answer
