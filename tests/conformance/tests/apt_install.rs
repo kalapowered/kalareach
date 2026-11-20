@@ -73,6 +73,9 @@ file_of() {
 }
 case "$phase" in
   list)
+    for argument in "$@"; do
+      case "$argument" in Dir::Cache::Archives=*) ls -A "${argument#Dir::Cache::Archives=}" >> "$rig/listed-dir.log" ;; esac
+    done
     for package in "${packages[@]}"; do
       file=$(file_of "$package")
       [ -f "$rig/pool/$file" ] || continue
@@ -553,6 +556,7 @@ fn an_update_that_fails_is_retried_with_a_longer_wait_each_time() {
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert_eq!(rig.calls("update").len(), 3);
     assert_eq!(rig.waits(), [10, 20]);
+    assert_eq!(rig.calls("install").len(), 1, "{:?}", rig.phases());
     assert!(
         outcome
             .stdout
@@ -571,6 +575,7 @@ fn a_mirror_that_fails_five_times_and_recovers_is_installed_from_on_the_sixth_at
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert_eq!(rig.calls("update").len(), 6);
     assert_eq!(rig.waits(), [10, 20, 30, 40, 50]);
+    assert_eq!(rig.calls("install").len(), 1, "{:?}", rig.phases());
     assert!(summary(&outcome).starts_with("apt-install: packages=1 attempts=6 "));
 
     let rig = Rig::new();
@@ -583,6 +588,7 @@ fn a_mirror_that_fails_five_times_and_recovers_is_installed_from_on_the_sixth_at
     let outcome = rig.run(&["--deadline", "1800", "tmux"]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert_eq!(rig.waits(), [10, 20, 30, 40, 50, 60, 60, 60]);
+    assert_eq!(rig.calls("install").len(), 1, "{:?}", rig.phases());
 }
 
 /// A download that is still running when the deadline comes is cut by `timeout` inside it, and
@@ -1039,6 +1045,11 @@ fn the_playwright_package_list_fails_on_any_other_shape() {
             "{printed:?}: {}",
             outcome.stderr
         );
+        assert!(
+            outcome.stderr.contains(printed.trim_end()),
+            "{printed:?}: {}",
+            outcome.stderr
+        );
     }
 }
 
@@ -1062,6 +1073,7 @@ fn new_runner(rig: &Rig) {
         "calls.log",
         "phases.log",
         "fetched.log",
+        "listed-dir.log",
         "sudo.log",
         "sleep.log",
         "timeout.log",
@@ -1162,7 +1174,19 @@ fn a_cold_run_with_an_archive_directory_lists_fetches_and_keeps_a_verified_set()
     assert_eq!(output_of(&rig, "digest"), Some(digest.clone()));
     assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
     assert_eq!(output_of(&rig, "entry"), Some(digest));
-    assert!(cache(&rig).join("tmux_1.0_all.deb").is_file());
+    assert!(
+        rig.path("listed-dir.log").is_file() && rig.lines("listed-dir.log").is_empty(),
+        "the listing is made against an empty directory: {:?}",
+        rig.lines("listed-dir.log")
+    );
+    for package in ["tmux", "fuse3"] {
+        let file = format!("{package}_1.0_all.deb");
+        assert_eq!(
+            fs::read(cache(&rig).join(&file)).expect("a saved archive"),
+            fs::read(rig.path("pool").join(&file)).expect("an archive of the pool"),
+            "{file}"
+        );
+    }
     assert!(!rig.path("cache/desktop.new").exists());
 }
 
@@ -1187,11 +1211,15 @@ fn a_run_that_restores_a_verified_directory_fetches_nothing_and_saves_nothing() 
         "{}",
         summary(&outcome)
     );
-    assert!(
-        outcome
-            .stdout
-            .contains("apt-install: seeded tmux_1.0_all.deb")
-    );
+    for file in ["tmux_1.0_all.deb", "fuse3_1.0_all.deb"] {
+        assert!(
+            outcome
+                .stdout
+                .contains(&format!("apt-install: seeded {file}")),
+            "{file}: {}",
+            outcome.stdout
+        );
+    }
     assert!(
         rig.lines("fetched.log").is_empty(),
         "the download fetched: {:?}",
@@ -1252,12 +1280,18 @@ fn an_archive_with_the_right_size_and_other_bytes_is_dropped_fetched_again_and_s
 
     new_runner(&rig);
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert!(
         summary(&outcome).starts_with(
             "apt-install: packages=2 archives=2 seeded=2 fetched=0 dropped=0 attempts=1 "
         ),
         "{}",
         summary(&outcome)
+    );
+    assert!(
+        rig.lines("fetched.log").is_empty(),
+        "the download fetched: {:?}",
+        rig.lines("fetched.log")
     );
     assert_eq!(output_of(&rig, "save"), Some("false".to_owned()));
 }
@@ -1386,6 +1420,27 @@ fn the_saved_directory_is_built_from_the_list_and_keeps_nothing_that_is_not_list
             .contains("-repair-77-2")
     );
     assert!(!cache(&rig).join("fuse3_1.0_all.deb").is_symlink());
+
+    // A directory where an archive is listed.
+    fs::remove_file(cache(&rig).join("tmux_1.0_all.deb")).expect("an archive");
+    fs::create_dir(cache(&rig).join("tmux_1.0_all.deb")).expect("a directory");
+    new_runner(&rig);
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        summary(&outcome)
+            .starts_with("apt-install: packages=2 archives=2 seeded=1 fetched=1 dropped=1 "),
+        "{}",
+        summary(&outcome)
+    );
+    assert!(
+        outcome
+            .stdout
+            .contains("apt-install: dropped tmux_1.0_all.deb"),
+        "{}",
+        outcome.stdout
+    );
+    assert!(cache(&rig).join("tmux_1.0_all.deb").is_file());
 }
 
 /// An archive that apt no longer holds when the install is done (apt may delete it once it is
@@ -1411,7 +1466,8 @@ fn an_archive_that_apt_no_longer_holds_is_left_out_of_the_saved_set() {
     assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
 }
 
-/// A list line with no hash is neither seeded nor saved: nothing can be checked against it.
+/// A list line with no hash is neither seeded nor saved: nothing can be checked against it. The
+/// directory holds both archives, and the plan lists tmux with no hash.
 #[test]
 fn an_archive_with_no_hash_in_the_list_is_neither_seeded_nor_saved() {
     let rig = Rig::new();
@@ -1419,18 +1475,51 @@ fn an_archive_with_no_hash_in_the_list_is_neither_seeded_nor_saved() {
         &rig,
         &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")],
     );
+    assert_eq!(archive_run(&rig, &["tmux", "fuse3"]).status, 0);
+    new_runner(&rig);
     fs::write(rig.path("nohash"), "tmux").expect("a marker");
     let outcome = archive_run(&rig, &["tmux", "fuse3"]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
     assert!(
-        summary(&outcome).contains(" archives=1 "),
+        summary(&outcome).contains(" archives=1 seeded=1 "),
         "{}",
         summary(&outcome)
     );
+    assert!(
+        !outcome.stdout.contains("seeded tmux_1.0_all.deb")
+            && outcome
+                .stdout
+                .contains("apt-install: seeded fuse3_1.0_all.deb"),
+        "{}",
+        outcome.stdout
+    );
+    assert_eq!(
+        rig.lines("fetched.log"),
+        ["tmux_1.0_all.deb"],
+        "apt fetched the archive the script did not copy"
+    );
     assert_eq!(manifest(&rig), [manifest_line(&rig, "fuse3")]);
+    assert!(!cache(&rig).join("tmux_1.0_all.deb").exists());
 }
 
-/// A failed install saves nothing and leaves the directory as it was.
+/// The names and bytes of the files of the archive directory, in order of name.
+fn cache_files(rig: &Rig) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(cache(rig))
+        .expect("the directory")
+        .map(|entry| {
+            let entry = entry.expect("an entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read(entry.path()).expect("a file"),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A failed install saves nothing: a directory that an earlier run saved is left as it was, and
+/// with no directory none is made.
 #[test]
 fn a_failed_install_saves_nothing() {
     let rig = Rig::new();
@@ -1440,6 +1529,21 @@ fn a_failed_install_saves_nothing() {
     assert_eq!(outcome.status, 100, "{}{}", outcome.stdout, outcome.stderr);
     assert_eq!(output_of(&rig, "save"), Some("false".to_owned()));
     assert!(!cache(&rig).exists());
+
+    // A directory saved by an earlier run, a changed pool and a runner that fails to install.
+    let rig = Rig::new();
+    pool(&rig, &[("tmux", "tmux bytes")]);
+    assert_eq!(archive_run(&rig, &["tmux"]).status, 0);
+    let before = cache_files(&rig);
+    assert_eq!(before.len(), 2, "an archive and its manifest");
+    pool(&rig, &[("tmux", "tmux BYTES")]);
+    new_runner(&rig);
+    rig.plan("install", &["fail"]);
+    let outcome = archive_run(&rig, &["tmux"]);
+    assert_eq!(outcome.status, 100, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(output_of(&rig, "save"), Some("false".to_owned()));
+    assert_eq!(cache_files(&rig), before);
+    assert!(!rig.path("cache/desktop.new").exists());
 }
 
 /// With an archive directory the plan of the install is the listing, and a failure of it after a
