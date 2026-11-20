@@ -659,7 +659,8 @@ pub enum ObservedEvent {
     ToolFailed,
     /// The application raised a notification.
     Notification,
-    /// The application finished a turn it ran. It does not move the thread binding.
+    /// The application finished a turn it ran. It does not move the thread binding. Where the
+    /// bridge vouches for it, it completes the turn the thread names.
     TurnEnded,
 }
 
@@ -836,6 +837,16 @@ impl crate::broker::Broker {
     /// for and suspends rich mutations. A finished tool call that asked a contact question is
     /// recorded with its thread.
     ///
+    /// A turn's end the application reports completes a turn, queued for the session's journal, when
+    /// its hook is the one the launched process started itself, the bridge vouches for the
+    /// selected thread, the thread is the one the report names, and the hook started after the
+    /// report that began the binding's current revision, as the kernel's clock recorded both. Where
+    /// the platform keeps no such record, or both fall in one tick, nothing is queued, whatever
+    /// privacy mode says of the history. An end a worker applies after a later start or end of the
+    /// thread queues nothing. The turn is named by its thread, so each end of one thread is a later
+    /// version of one subject, and a frame the hook sent twice is told from a second end by
+    /// nothing here.
+    ///
     /// The observation is recorded as history only if privacy mode was off at `admitted`, where it
     /// stood when the hook's connection was admitted, and has not been turned on or off since: a
     /// report made in privacy mode takes its entry number and is not kept, and the thread decision
@@ -891,6 +902,13 @@ impl crate::broker::Broker {
             under,
             admitted,
         )?;
+        // The turn's result is waiting to be reviewed, queued while the decision is still held.
+        if observation.event == ObservedEvent::TurnEnded
+            && let Some(turn_id) = completed_turn(instance, reporter, observation)
+            && let Some(notices) = self.session_notices.get()
+        {
+            notices.push(kr_protocol::attention::SessionEventNotice::TurnCompleted { turn_id });
+        }
         // Said to the description facts while the decision is still held, so an older report can
         // never overwrite what a newer one decided: the facts name the thread the broker vouches
         // for, and none when it vouches for none.
@@ -992,6 +1010,37 @@ fn instance_of(
         .instances
         .get_mut(&application_instance_id)
         .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))
+}
+
+/// The turn a report of a turn's end completes, under the lock the caller holds, or none when the
+/// bridge cannot vouch for the report.
+///
+/// The report has to be the application's own: its hook was started by the launched process, the
+/// thread is verified and is the one the report names, and the hook started after the report that
+/// began the binding's current revision. A hook started before it, in the same tick, or where the
+/// platform keeps no record of either start, may be a callback from an earlier binding of the
+/// same thread, so it completes nothing. The report moves no thread binding, and the turn is
+/// named by the thread, whose identifier is a turn's as well.
+fn completed_turn(
+    instance: &crate::broker::Instance,
+    reporter: &BridgeProcess,
+    observation: &Observation,
+) -> Option<kr_protocol::ids::AgentTurnId> {
+    let launched = instance.process.as_ref().map(|launched| &launched.process);
+    let direct = launched.is_some() && reporter.starter.as_ref() == launched;
+    let after_binding = reporter
+        .started
+        .zip(instance.bridge.began)
+        .is_some_and(|(ended, began)| ended > began);
+    if direct
+        && !instance.bridge.unsettled
+        && instance.thread_id.as_ref() == Some(&observation.thread)
+        && after_binding
+    {
+        kr_protocol::ids::AgentTurnId::new(observation.thread.as_str()).ok()
+    } else {
+        None
+    }
 }
 
 /// Applies one report of a thread starting, continuing or ending, under the lock the caller holds.
@@ -1576,6 +1625,195 @@ mod tests {
             kinds.iter().filter(|kind| **kind == "turn.ended").count(),
             1
         );
+    }
+
+    /// A broker holding the instances, with the queue a turn's completion is told to.
+    fn broker_noticing(
+        instances: &[ApplicationInstanceId],
+    ) -> (
+        crate::broker::Broker,
+        std::sync::Arc<crate::notices::SessionNotices>,
+    ) {
+        let broker = broker_with(instances);
+        let notices = std::sync::Arc::new(crate::notices::SessionNotices::default());
+        broker.set_session_notices(std::sync::Arc::clone(&notices));
+        (broker, notices)
+    }
+
+    /// The frame a hook sends when a turn ended in `thread`, read.
+    fn turn_end_read(thread: &str) -> Result<Observation> {
+        Observation::from_frame(
+            format!(r#"{{"kr_observation":{{"event":"turn_ended","thread":"{thread}"}}}}"#)
+                .as_bytes(),
+        )
+    }
+
+    /// The report of a turn's end in `thread`, as the worker reads it from a hook's frame.
+    fn turn_end(thread: &str) -> Observation {
+        let read = turn_end_read(thread);
+        assert!(read.is_ok(), "{read:?}");
+        read.expect("a turn's end")
+    }
+
+    /// What the queue holds when the turn `thread` named has completed.
+    fn completed(thread: &str) -> kr_protocol::attention::SessionEventNotice {
+        kr_protocol::attention::SessionEventNotice::TurnCompleted {
+            turn_id: kr_protocol::ids::AgentTurnId::new(thread).expect("valid"),
+        }
+    }
+
+    /// KR-REQ-18.01, KR-REQ-25.04: the end of a turn a hook reports, in the thread the launched
+    /// process selected and from a hook it started after that selection, queues one completed turn
+    /// named by the thread, and a thread starting queues none.
+    #[test]
+    fn a_turn_end_of_the_selected_thread_queues_one_turn_notice() {
+        let read = turn_end_read("t1");
+        assert!(read.is_ok(), "{read:?}");
+        let Ok(ended) = read else {
+            return;
+        };
+        let id = instance(1);
+        let (broker, notices) = broker_noticing(&[id]);
+        apply(&broker, id, 10, &start("t1"));
+        assert_eq!(notices.front(), None, "a thread starting completes no turn");
+        apply(
+            &broker,
+            id,
+            15,
+            &observed(ObservedEvent::ToolFinished, "t1"),
+        );
+        assert_eq!(
+            notices.front(),
+            None,
+            "a finished tool is no completed turn"
+        );
+        assert_eq!(apply(&broker, id, 20, &ended), ThreadChange::Unchanged);
+        assert_eq!(notices.front(), Some(completed("t1")));
+        notices.taken();
+        assert!(notices.is_empty(), "one end, one notice");
+    }
+
+    /// KR-REQ-18.01: a turn's end from a hook the launched process did not start itself, a child
+    /// of a program the application ran, reports that program's threads and completes nothing, and
+    /// nor does one from a hook of another instance.
+    #[test]
+    fn a_turn_end_from_a_hook_the_application_did_not_start_queues_nothing() {
+        let id = instance(1);
+        let (broker, notices) = broker_noticing(&[id, instance(2)]);
+        apply(&broker, id, 10, &start("t1"));
+        let wrong_starter = BridgeProcess {
+            starter: Some(application(instance(2))),
+            ..reporter(id, 20)
+        };
+        let no_starter = BridgeProcess {
+            starter: None,
+            ..reporter(id, 21)
+        };
+        for hook in [wrong_starter, no_starter] {
+            assert_eq!(
+                apply_as(&broker, id, &hook, &turn_end("t1")),
+                ThreadChange::Unchanged
+            );
+            assert_eq!(notices.front(), None, "{hook:?}");
+        }
+        apply(&broker, id, 22, &turn_end("t1"));
+        assert_eq!(
+            notices.front(),
+            Some(completed("t1")),
+            "the application's own"
+        );
+    }
+
+    /// KR-REQ-18.01: a turn's end completes nothing while the bridge cannot vouch for the thread,
+    /// for another thread than the selected one, or once the thread has ended.
+    #[test]
+    fn a_turn_end_completes_nothing_for_a_thread_the_bridge_does_not_vouch_for() {
+        let id = instance(1);
+        let (broker, notices) = broker_noticing(&[id]);
+        apply(&broker, id, 10, &start("t1"));
+        apply(&broker, id, 20, &turn_end("t2"));
+        assert_eq!(
+            notices.front(),
+            None,
+            "another thread than the selected one"
+        );
+        apply(&broker, id, 30, &end("t1"));
+        assert_eq!(selected(&broker, id), None);
+        apply(&broker, id, 40, &turn_end("t1"));
+        assert_eq!(notices.front(), None, "the thread has ended");
+
+        let other = instance(3);
+        let (broker, notices) = broker_noticing(&[other]);
+        apply(&broker, other, 10, &start("t1"));
+        apply(&broker, other, 10, &start("t2"));
+        assert!(
+            broker.verified_selection(other).is_none(),
+            "two starts in one tick cannot be placed, so no thread is vouched for"
+        );
+        apply(&broker, other, 30, &turn_end("t1"));
+        apply(&broker, other, 31, &turn_end("t2"));
+        assert_eq!(notices.front(), None, "no thread is vouched for");
+    }
+
+    /// KR-REQ-18.01: a turn's end from a hook that started before the report that began the
+    /// binding's revision is a callback of an earlier binding, even when the same thread has been
+    /// selected again since, and completes nothing; one that started after it completes the turn.
+    #[test]
+    fn a_turn_end_from_before_the_binding_completes_nothing_even_when_the_thread_returns() {
+        let id = instance(1);
+        let (broker, notices) = broker_noticing(&[id]);
+        apply(&broker, id, 10, &start("t1"));
+        apply(&broker, id, 30, &start("t1"));
+        apply(&broker, id, 25, &turn_end("t1"));
+        assert_eq!(
+            notices.front(),
+            None,
+            "the hook started before the selection that is current"
+        );
+        apply(&broker, id, 31, &turn_end("t1"));
+        assert_eq!(notices.front(), Some(completed("t1")));
+    }
+
+    /// KR-REQ-18.01: a turn's end whose hook started in the tick of the report that began the
+    /// binding, or whose start the platform keeps no record of, or where the binding's own start has
+    /// none, cannot be placed after the binding and completes nothing.
+    #[test]
+    fn a_turn_end_that_cannot_be_placed_after_the_binding_completes_nothing() {
+        let id = instance(1);
+        let (broker, notices) = broker_noticing(&[id]);
+        apply(&broker, id, 10, &start("t1"));
+        apply(&broker, id, 10, &turn_end("t1"));
+        assert_eq!(notices.front(), None, "the same tick");
+        apply_as(&broker, id, &unrecorded(id, 900), &turn_end("t1"));
+        assert_eq!(notices.front(), None, "no record of the hook's start");
+
+        let unplaced = instance(4);
+        let (broker, notices) = broker_noticing(&[unplaced]);
+        apply_as(&broker, unplaced, &unrecorded(unplaced, 900), &start("t1"));
+        assert_eq!(selected(&broker, unplaced).as_deref(), Some("t1"));
+        apply(&broker, unplaced, 50, &turn_end("t1"));
+        assert_eq!(notices.front(), None, "no record of the binding's start");
+    }
+
+    /// KR-REQ-18.01: a thread's identifier of the longest length a thread has names a turn, and two
+    /// ends of one thread are two notices with one name, which the controller reads as two versions
+    /// of one subject. A frame the hook sent twice is a later version as well: nothing in it tells
+    /// it from a second end.
+    #[test]
+    fn two_ends_of_one_thread_are_two_notices_with_one_name() {
+        let thread = "x".repeat(256);
+        let id = instance(1);
+        let (broker, notices) = broker_noticing(&[id]);
+        apply(&broker, id, 10, &start(&thread));
+        let ended = turn_end(&thread);
+        apply(&broker, id, 20, &ended);
+        apply(&broker, id, 30, &ended);
+        apply(&broker, id, 30, &ended);
+        for round in 0..3 {
+            assert_eq!(notices.front(), Some(completed(&thread)), "{round}");
+            notices.taken();
+        }
+        assert!(notices.is_empty());
     }
 
     #[tokio::test]
