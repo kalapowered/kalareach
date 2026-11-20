@@ -714,7 +714,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         lane: None,
         tools: Vec::new(),
         error: None,
-        blocked_by: None,
+        blocked: None,
         observation: None,
         timed_out: false,
     };
@@ -883,7 +883,7 @@ fn a_typescript_test_whose_step_was_not_run_for_a_set_up_step_is_not_run_with_it
     // The same test with its step run and the test reported: passed.
     let mut ran = blocked;
     ran.error = None;
-    ran.blocked_by = None;
+    ran.blocked = None;
     ran.exit = Some(0);
     ran.vitest = Some(
         [(

@@ -99,7 +99,7 @@ fn executed(step: Step, exit: i32, cases: Result<Vec<Case>, String>) -> Executed
         lane,
         tools: vec![("gradle".to_owned(), "8.14.3".to_owned())],
         error,
-        blocked_by: None,
+        blocked: None,
         observation: None,
         timed_out: false,
     }

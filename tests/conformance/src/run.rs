@@ -68,14 +68,22 @@ pub struct Executed {
     pub tools: Vec<(String, String)>,
     /// Why it could not be run or read, when it could not.
     pub error: Option<String>,
-    /// The number of the set-up step whose failure kept it from running, when that is why it did
-    /// not run: it has no log, no exit status and no seconds.
-    pub blocked_by: Option<usize>,
+    /// What kept it from running, when it did not run: it has no log, no exit status and no seconds.
+    pub blocked: Option<Blocked>,
     /// The programs its log says could not be run, and what their files looked like when the
     /// step ended, when it failed so.
     pub observation: Option<crate::observe::Observed>,
     /// Whether its time was spent and its processes were ended; its `error` says so.
     pub timed_out: bool,
+}
+
+/// What kept a step from running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blocked {
+    /// The set-up step of this number did not succeed, or was not run itself.
+    SetUp(usize),
+    /// The step of this number spent the budget the step names.
+    Budget(usize),
 }
 
 /// Why a step's command did not run to its end.
@@ -160,7 +168,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         lane: None,
         tools: Vec::new(),
         error: None,
-        blocked_by: None,
+        blocked: None,
         observation: None,
         timed_out: false,
     };
@@ -352,9 +360,19 @@ pub fn not_run(step: &Step, number: usize, what: &str, why: &str) -> Executed {
         error: Some(format!(
             "not run because its set-up step {number} ({what}) {why}"
         )),
-        blocked_by: Some(number),
+        blocked: Some(Blocked::SetUp(number)),
         observation: None,
         timed_out: false,
+    }
+}
+
+/// What a step that was not run is when `by`, an earlier step, spent the budget it names.
+#[must_use]
+pub fn not_run_for_budget(step: &Step, by: usize) -> Executed {
+    Executed {
+        error: Some(format!("not run because its budget was spent by step {by}")),
+        blocked: Some(Blocked::Budget(by)),
+        ..not_run(step, by, "", "")
     }
 }
 
