@@ -115,19 +115,23 @@ impl FrameSink for ControlStream {
     }
 }
 
-/// The privacy state a page of retained output was read under.
+/// The privacy state a read was made under: what the read carries is released only while that
+/// state stands, and the state is held while the bytes are handed to the stream.
 ///
-/// The page is released only while that state stands: privacy mode off, in the generation it was
-/// read in, and held while the bytes are handed to the stream. A page read with privacy mode on is
-/// never released: the daemon publishes the mode before it tells a worker to remove what it
-/// retained, so a worker can still answer with output that is about to go. Output a worker read
-/// before privacy mode started is not sent after it, however long the answer waited to be written.
+/// A read made with [`ReadUnder::now`] stands while privacy mode is off in the generation it was
+/// read in. One made while privacy mode is on is never released by it: the daemon publishes the mode
+/// before it tells a worker to remove what it retained, so a worker can still answer with output
+/// that is about to go. [`ReadUnder::now_settled`] releases a read made while the mode is on once
+/// its own session owes no removal, and [`ReadUnder::now_carrying_none_while_private`] releases one
+/// whose own code carries nothing the removal takes while the mode is on. Both stand only while the
+/// state they began under stands. Output a worker read before privacy mode started is not sent after
+/// it, however long the answer waited to be written.
 #[derive(Clone, Debug)]
 pub(super) struct ReadUnder {
     state: crate::privacy::PrivacyState,
     decided: crate::privacy::Published,
-    /// Set for a read that began while privacy mode was on and found its removal already reported
-    /// complete ([`Self::now_settled`]): such a read is released while that state stands.
+    /// Set for a read that began while privacy mode was on and is released while that same state
+    /// stands ([`Self::now_settled`], [`Self::now_carrying_none_while_private`]).
     settled: bool,
 }
 
@@ -187,8 +191,24 @@ impl ReadUnder {
         Ok(read_under)
     }
 
-    /// Takes the state the page was read under, held, when it still stands and privacy mode was
-    /// off. A change of state waits until the reading is dropped.
+    /// As [`Self::now`], for a read whose own code carries none of the text privacy mode removes
+    /// while the mode is on: one that began with the mode on is released while that same state
+    /// stands.
+    ///
+    /// Generations only go up, so a state at the write that equals the state at the start says the
+    /// mode stayed on for the whole read, and a read made under the mode carries no such text. Any
+    /// change, an off and an on again among them, leaves the read not standing.
+    pub(super) async fn now_carrying_none_while_private(
+        controller: &Controller,
+    ) -> Result<Self, kr_protocol::error::ProtocolError> {
+        let mut read_under = Self::now(controller).await?;
+        read_under.settled = read_under.decided.private;
+        Ok(read_under)
+    }
+
+    /// Takes the state the read was made under, held, when it still stands and either privacy mode
+    /// was off when the read began or the read is settled for the mode being on. A change of state
+    /// waits until the reading is dropped.
     ///
     /// It waits for nothing, so it can be asked in the poll that hands bytes to the stream: a
     /// change of state being made, or waiting to be, counts as the state having moved.
@@ -201,12 +221,7 @@ impl ReadUnder {
             .filter(|reading| reading.published() == self.decided)
     }
 
-    /// Answers whether privacy mode was on when the read began.
-    pub(super) const fn was_private(&self) -> bool {
-        self.decided.private
-    }
-
-    /// Answers whether the state the page was read under still stands, for a decision that is not
+    /// Answers whether the state the read was made under still stands, for a decision that is not
     /// the write of a byte.
     pub(super) fn stands(&self) -> bool {
         self.holding().is_some()
