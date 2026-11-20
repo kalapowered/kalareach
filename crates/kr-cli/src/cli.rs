@@ -2167,8 +2167,9 @@ pub struct ExportArguments {
     /// The closed session, by display number or identifier.
     pub session: String,
     /// The file to write. It is created new: an existing file, or a link to one, is refused and
-    /// never replaced. Its mode is 0600 on Unix; on Windows it takes the access list of the folder
-    /// it is in.
+    /// never replaced. Its mode is 0600 on Unix; on Windows it is given an access list that names
+    /// your account and the file's owner, and no one else, and a volume that keeps no access lists,
+    /// such as FAT or exFAT, is refused.
     #[arg(long)]
     pub output: PathBuf,
     /// The environment the session is in: one of this host's own, by identifier, or an enrolled

@@ -20,8 +20,10 @@
 //!   writes nothing.
 //! * **Nothing is written until the whole read has passed.** The file is made new, beside its final
 //!   name, and given its name without replacing anything: an existing file, or a link to one, is
-//!   refused, and a failure leaves no partial file. Its mode is 0600 on Unix. On Windows it takes
-//!   the access list of the folder the person named, which is theirs to choose.
+//!   refused, and a failure leaves no partial file. Its mode is 0600 on Unix. On Windows it is
+//!   given an access list that names the person's account and the file's owner, and no one else,
+//!   read back from the new file before any byte is written; a volume that keeps no access lists
+//!   is refused.
 //! * **The file says what it does not hold.** The archive keeps the session's last size and not the
 //!   sizes before it, a piece of output may have no recorded time, and it can have lost a range;
 //!   each is declared.
@@ -372,7 +374,8 @@ fn taken(path: &Path) -> CliError {
 ///
 /// The bytes are written to a file beside it and given the name without replacing anything, so a
 /// reader never finds a partial file and a name taken in the meantime is refused. The file's mode is
-/// 0600 on Unix; on Windows it takes the access list of the folder it is in.
+/// 0600 on Unix; on Windows it is given an access list that names the account and the file's owner,
+/// and no one else, and a volume that keeps no access lists is refused.
 ///
 /// # Errors
 ///
