@@ -640,6 +640,15 @@ fn set_by_the_report(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The name of `table` that sorts before `name` and differs from it only by case, so that a pair is
+/// named once, in the order the table keeps it. A name is the same in any case on Windows, and a
+/// plan that holds two of them does not say which value the variable has.
+fn differs_only_by_case<'a>(table: &'a BTreeMap<String, String>, name: &str) -> Option<&'a String> {
+    table
+        .keys()
+        .find(|held| held.as_str() < name && held.eq_ignore_ascii_case(name))
+}
+
 /// The parts of `output` below `{evidence}/conformance/`, in lower case, or why it is not a place a
 /// step may write its output, in words that follow the output's name. Each part holds ASCII
 /// letters, digits, `.`, `-` and `_` and no more, is not empty, `.` or `..` and does not end with a
@@ -861,6 +870,11 @@ impl Plan {
                     "`[env]` sets `{name}`, which the report sets for each step: {why}"
                 ));
             }
+            if let Some(other) = differs_only_by_case(&self.env, name) {
+                return refuse(format!(
+                    "`[env]` gives `{other}` and `{name}`, which differ only by case"
+                ));
+            }
             if let Some(placeholder) = placeholder_refused(value) {
                 return refuse(format!(
                     "`[env]` gives `{name}` a value that holds {placeholder}, which is not a \
@@ -930,6 +944,11 @@ impl Plan {
                 if let Some(why) = set_by_the_report(name) {
                     return refuse(format!(
                         "step `{id}` sets `{name}`, which the report sets for each step: {why}"
+                    ));
+                }
+                if let Some(other) = differs_only_by_case(&step.env, name) {
+                    return refuse(format!(
+                        "step `{id}` gives `{other}` and `{name}`, which differ only by case"
                     ));
                 }
                 if let Some(placeholder) = placeholder_refused(value) {
