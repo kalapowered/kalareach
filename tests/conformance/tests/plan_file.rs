@@ -898,6 +898,66 @@ fn execution_faults() -> Vec<(&'static str, String, &'static str)> {
             "whose part `a b.json` holds a character outside the portable set",
         ),
         (
+            "an output that is a Windows device name",
+            output("{evidence}/conformance/nul"),
+            "step `one` names the `output` `{evidence}/conformance/nul`, whose part `nul` is a name that Windows keeps for a device: `con`, `prn`, `aux`, `nul`, `com1` to `com9` and `lpt1` to `lpt9`, with or without an extension",
+        ),
+        (
+            "an output that is a device name in capitals",
+            output("{evidence}/conformance/CON"),
+            "whose part `CON` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output that is a device name in mixed case",
+            output("{evidence}/conformance/Prn"),
+            "whose part `Prn` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output that is the device aux",
+            output("{evidence}/conformance/aux"),
+            "whose part `aux` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output that is a device name with an extension",
+            output("{evidence}/conformance/NUL.json"),
+            "whose part `NUL.json` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output that is a device name with two extensions",
+            output("{evidence}/conformance/aux.tar.gz"),
+            "whose part `aux.tar.gz` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output that is the first serial port",
+            output("{evidence}/conformance/com1"),
+            "whose part `com1` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output that is the last serial port with an extension",
+            output("{evidence}/conformance/COM9.log"),
+            "whose part `COM9.log` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output that is the first printer port",
+            output("{evidence}/conformance/lpt1"),
+            "whose part `lpt1` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output that is the last printer port with an extension",
+            output("{evidence}/conformance/Lpt9.x"),
+            "whose part `Lpt9.x` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output whose directory is a device name",
+            output("{evidence}/conformance/prn/x.json"),
+            "whose part `prn` is a name that Windows keeps for a device",
+        ),
+        (
+            "an output whose file below a directory is a device name",
+            output("{evidence}/conformance/dir/Con.txt"),
+            "whose part `Con.txt` is a name that Windows keeps for a device",
+        ),
+        (
             "a Vitest reading that names no output",
             step_with("reading = 'cargo'", "reading = 'vitest'\npackage = 'p'"),
             "step `one` reads a file and names no `output`",
@@ -1324,7 +1384,8 @@ command = ['cargo', 'test']
 
 /// Each planted file of the execution model is refused with its own reason. A step whose `{output}`
 /// is held by a variable and not by a command word is accepted, and so is an output whose parts hold
-/// capitals, digits, `.`, `-` and `_`.
+/// capitals, digits, `.`, `-` and `_`, and one that only looks like a name Windows keeps for a
+/// device.
 #[test]
 fn a_step_of_the_execution_model_is_refused_for_each_fault_by_its_reason() {
     let root = repository();
@@ -1334,7 +1395,32 @@ fn a_step_of_the_execution_model_is_refused_for_each_fault_by_its_reason() {
     );
     let control = Plan::parse(&accepted, &root);
     assert!(control.is_ok(), "the control file loads: {control:?}");
+    // Names that only look like a device name: the reserved ones are those up to the first dot, and
+    // `com1` to `com9`, `lpt1` to `lpt9` and the four words are all of them.
     let mut wrong = Vec::new();
+    for part in [
+        "com0",
+        "com10.json",
+        "lpt0",
+        "lpt10",
+        "console.json",
+        "nulls",
+        "auxiliary.log",
+        "prnt",
+        "a.con",
+        "x.nul.json",
+        "con-1.json",
+        "com_1",
+    ] {
+        let path = format!("{{evidence}}/conformance/{part}");
+        let text = step_adding(
+            &format!("output = '{path}'\n"),
+            "['cargo', 'test', '{output}']",
+        );
+        if let Err(refusal) = Plan::parse(&text, &root) {
+            wrong.push(format!("{part}: refused as `{refusal}`"));
+        }
+    }
     for (name, text, reason) in execution_faults() {
         match Plan::parse(&text, &root) {
             Ok(_) => wrong.push(format!("{name}: the loader refused nothing")),
