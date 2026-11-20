@@ -1,7 +1,9 @@
 //! The cases of the condition rule and of the module inventory.
 
+use std::collections::BTreeMap;
+
 use super::condition::Condition;
-use super::walker::{Lookup, Tree};
+use super::walker::{Lookup, SightKind, Tree};
 use super::walker_cases::{small_tree, write};
 
 /// Whether some configuration without `test` enables a function written with `attributes`.
@@ -513,4 +515,77 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
     let text = "crates/kr-sender/src/lib.rs: unlisted! is called at item position, is not defined in kr_sender and is not one the scan accepts".to_owned();
     assert_eq!(scan, text);
     assert_eq!(lookup, text);
+}
+
+#[test]
+fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_is_refused() {
+    let at = "kr_sender";
+    // A macro that is expanded and calls a macro through a metavariable.
+    let lib = "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\nfn uses() { meta!(Method::AgentTurnCancel); }\n";
+    let (scan, _) = refused(lib, &[]);
+    assert_eq!(
+        scan,
+        format!(
+            "{at}: the macro meta calls a macro through a metavariable, which the scan cannot follow"
+        )
+    );
+    // The same macro that nothing calls with a sighting is not followed, so nothing is refused.
+    let lib = "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\nfn uses() { meta!(x); }\n";
+    assert_eq!(read_names(lib, &[]), vec!["macro:meta".to_owned()]);
+    // A call with a sighting to a macro another crate of the scan exports.
+    let folder = small_tree("fn f() { shared!(Method::AgentTurnCancel); }\n");
+    write(
+        folder.path(),
+        "crates/kr-worker/src/lib.rs",
+        "#[macro_export]\nmacro_rules! shared { ($m:expr) => { $m }; }\n",
+    );
+    let tree = Tree::at(folder.path()).expect("the tree");
+    assert_eq!(
+        tree.sightings(&|_| true),
+        Err("kr_sender: shared! is called with a sighting and kr_worker exports it; the scan does not follow it across crates".to_owned())
+    );
+    // The crate that exports it is not read, or the call holds no sighting: nothing is refused.
+    assert_eq!(
+        tree.sightings(&|krate| krate == "kr_sender")
+            .map(|found| found.len()),
+        Ok(1)
+    );
+    write(
+        folder.path(),
+        "crates/kr-sender/src/lib.rs",
+        "fn f() { shared!(1); }\n",
+    );
+    let tree = Tree::at(folder.path()).expect("the tree");
+    assert_eq!(tree.sightings(&|_| true), Ok(Vec::new()));
+}
+
+#[test]
+fn two_private_definitions_of_one_macro_in_different_files_are_merged_by_name() {
+    let lib = "macro_rules! callee_a { () => {}; }\nmacro_rules! callee_b { ($x:expr) => {}; }\nmod a;\nmod b;\n";
+    let folder = small_tree(lib);
+    write(
+        folder.path(),
+        "crates/kr-sender/src/a.rs",
+        "macro_rules! m { () => { callee_a!() }; }\npub fn user() { m!(Method::AgentTurnCancel); }\n",
+    );
+    write(
+        folder.path(),
+        "crates/kr-sender/src/b.rs",
+        "macro_rules! m { ($x:expr) => { callee_b!($x) }; }\n",
+    );
+    let tree = Tree::at(folder.path()).expect("the tree");
+    let found = tree
+        .sightings(&|krate| krate == "kr_sender")
+        .expect("a scan");
+    // What either `m` calls is expanded when the call of `m` holds a sighting: the calls of the
+    // two definitions are taken under their one name.
+    assert_eq!(
+        super::walker_cases::names(&found, "kr_sender"),
+        BTreeMap::from([
+            ("macro:callee_a".to_owned(), vec![SightKind::Expands]),
+            ("macro:callee_b".to_owned(), vec![SightKind::Expands]),
+            ("macro:m".to_owned(), vec![SightKind::Expands]),
+            ("user".to_owned(), vec![SightKind::Names]),
+        ])
+    );
 }
