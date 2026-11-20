@@ -6,10 +6,18 @@
 //! gate: every tag read, no scan, lookup or source that failed, a source for every sighting, and the
 //! whole run inside an hour.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
-use super::history::{audit_tags, print_report, read_history};
-use super::narrower::{Evidence, Item, Narrower, Range, Sender};
+use super::history::{
+    Report, Snapshot, Tagged, audit_tags, client_items, crates_read, none_crates, print_report,
+    read_history, version_of_tag,
+};
+use super::narrower::{
+    ABSENT, DAEMON_CRATES, Evidence, Item, Narrower, RECEIVER_CRATES, Range, Sender,
+};
 use super::walker::Lookup;
 
 const CLIENT_ITEMS: &[Item] = &[Item {
@@ -31,9 +39,10 @@ const DAEMON_ITEMS: &[Item] = &[Item {
     across: &[],
 }];
 
-/// An entry whose digests are not real: its own problems are the ones the case expects.
+/// An entry whose digests are not real: its own problems are the ones the gate expects.
 const SCRATCH: Narrower = Narrower {
-    level: "0.79",
+    // Set above the newest release tag when the gate runs: see `level_above`.
+    level: "",
     root: "the envelope a worker checks",
     recorded: "scratch",
     digest: "scratch",
@@ -79,66 +88,349 @@ const SCRATCH: Narrower = Narrower {
     accounts: &[],
 };
 
+/// The release tags as `git for-each-ref` lists them, each peeled to its commit where it is an
+/// annotated tag, in the order of releases (version, commit date, tag). This list is made apart
+/// from the reader's: it asks git for the tags, the commits and their dates and nothing else.
+pub fn listed_releases(repository: &Path) -> Result<Vec<Tagged>, String> {
+    let output = Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname:strip=2)%09%(objectname)%09%(*objectname)%09%(committerdate:unix)%09%(*committerdate:unix)",
+            "refs/tags/packages/v*",
+        ])
+        .current_dir(repository)
+        .output()
+        .map_err(|error| format!("git for-each-ref: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git for-each-ref: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut listed = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [tag, object, peeled, date, peeled_date] = fields.as_slice() else {
+            return Err(format!(
+                "git for-each-ref: a line of {} fields: {line}",
+                fields.len()
+            ));
+        };
+        let (commit, date) = if peeled.is_empty() {
+            (object, date)
+        } else {
+            (peeled, peeled_date)
+        };
+        listed.push(Tagged {
+            tag: (*tag).to_owned(),
+            commit: (*commit).to_owned(),
+            version: version_of_tag(tag).ok_or_else(|| format!("{tag} is no release tag"))?,
+            committed: date
+                .parse()
+                .map_err(|error| format!("the date of {tag}: {error}"))?,
+        });
+    }
+    listed.sort_by(|left, right| left.order().cmp(&right.order()));
+    Ok(listed)
+}
+
+/// The level above the newest release in `listed`, so that every release is below it.
+pub fn level_above(listed: &[Tagged]) -> String {
+    let newest = listed
+        .iter()
+        .map(|tagged| tagged.version)
+        .max()
+        .expect("a release");
+    if newest.major == 0 {
+        format!("0.{}", newest.minor + 1)
+    } else {
+        format!("{}", newest.major + 1)
+    }
+}
+
+/// Where the snapshots are not the tags and commits `git` lists, in the same order: a snapshot
+/// left out, added, repeated or put in place of another.
+pub fn release_problems(listed: &[Tagged], snapshots: &[Snapshot]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let read: Vec<(&str, &str)> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.at.tag.as_str(), snapshot.at.commit.as_str()))
+        .collect();
+    let wanted: Vec<(&str, &str)> = listed
+        .iter()
+        .map(|tagged| (tagged.tag.as_str(), tagged.commit.as_str()))
+        .collect();
+    if read.len() != wanted.len() {
+        problems.push(format!(
+            "{} snapshots for {} release tags",
+            read.len(),
+            wanted.len()
+        ));
+    }
+    for (at, (found, expected)) in read.iter().zip(&wanted).enumerate() {
+        if found != expected {
+            problems.push(format!(
+                "snapshot {at} is {} at {}, the tags give {} at {}",
+                found.0, found.1, expected.0, expected.1
+            ));
+        }
+    }
+    let distinct: BTreeSet<&(&str, &str)> = read.iter().collect();
+    if distinct.len() != read.len() {
+        problems.push("a release is read twice".to_owned());
+    }
+    problems
+}
+
+/// Where a snapshot lacks a lookup the entry needs, holds a lookup that failed, or gives `Absent`
+/// where the entry lists no `absent` text; a source that could not be read; a sighting with no
+/// source.
+pub fn snapshot_problems(entry: &Narrower, snapshots: &[Snapshot]) -> Vec<String> {
+    let mut problems = Vec::new();
+    let items = client_items(entry);
+    let wanted_items: BTreeSet<(String, String)> = items
+        .iter()
+        .map(|item| (item.krate.to_owned(), item.name.to_owned()))
+        .collect();
+    let wanted_crates: BTreeSet<String> =
+        crates_read(entry).into_iter().map(str::to_owned).collect();
+    // A crate may be absent from a tag where one of its items is (the crate came later), where an
+    // account of it spans only some tags, and where a row that sends none reads it.
+    let may_be_absent: BTreeSet<&str> = items
+        .iter()
+        .filter(|item| item.across.iter().any(|(digest, _)| *digest == ABSENT))
+        .map(|item| item.krate)
+        .chain(entry.accounts.iter().map(|account| account.krate))
+        .chain(none_crates(entry))
+        .collect();
+    let absent_text = |item: &Item| item.across.iter().any(|(digest, _)| *digest == ABSENT);
+    for snapshot in snapshots {
+        let tag = &snapshot.at.tag;
+        let keys: BTreeSet<String> = snapshot.krates.keys().cloned().collect();
+        for krate in wanted_crates.difference(&keys) {
+            problems.push(format!("{tag}: no reading of the crate {krate}"));
+        }
+        for krate in keys.difference(&wanted_crates) {
+            problems.push(format!(
+                "{tag}: a reading of the crate {krate}, which no row names"
+            ));
+        }
+        for (krate, lookup) in &snapshot.krates {
+            match lookup {
+                Lookup::Failed(error) => {
+                    problems.push(format!("{tag}: the crate {krate}: {error}"));
+                }
+                Lookup::Absent if !may_be_absent.contains(krate.as_str()) => {
+                    problems.push(format!("{tag}: the crate {krate} is absent"));
+                }
+                _ => {}
+            }
+        }
+        let keys: BTreeSet<(String, String)> = snapshot.items.keys().cloned().collect();
+        for (krate, name) in wanted_items.difference(&keys) {
+            problems.push(format!("{tag}: no reading of the item {krate}::{name}"));
+        }
+        for (krate, name) in keys.difference(&wanted_items) {
+            problems.push(format!(
+                "{tag}: a reading of the item {krate}::{name}, which no row names"
+            ));
+        }
+        for ((krate, name), lookup) in &snapshot.items {
+            match lookup {
+                Lookup::Failed(error) => {
+                    problems.push(format!("{tag}: the item {krate}::{name}: {error}"));
+                }
+                Lookup::Absent
+                    if !items.iter().any(|item| {
+                        item.krate == krate && item.name == name && absent_text(item)
+                    }) =>
+                {
+                    problems.push(format!(
+                        "{tag}: the item {krate}::{name} is absent and the entry lists no absent text for it"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Err(error) = &snapshot.names_a_method {
+            problems.push(format!("{tag}: method.rs cannot be read: {error}"));
+        }
+        for (item, error) in &snapshot.source_errors {
+            problems.push(format!(
+                "{tag}: the source of {item:?} cannot be read: {error}"
+            ));
+        }
+        match &snapshot.sightings {
+            Err(error) => problems.push(format!("{tag}: the scan failed: {error}")),
+            Ok(sightings) => {
+                for sighting in sightings {
+                    let key = (sighting.krate.clone(), sighting.name.clone());
+                    if !snapshot.records.contains_key(&key) {
+                        problems.push(format!("{tag}: no source for {key:?}"));
+                    }
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// Where the problems the audit reported are not the ones `expected` lists, as a set of texts.
+pub fn audit_differences(report: &Report, expected: &[String]) -> Vec<String> {
+    let reported: BTreeSet<&String> = report.problems.iter().collect();
+    let wanted: BTreeSet<&String> = expected.iter().collect();
+    let mut differences = Vec::new();
+    for problem in wanted.difference(&reported) {
+        differences.push(format!("expected and not reported: {problem}"));
+    }
+    for problem in reported.difference(&wanted) {
+        differences.push(format!("reported and not expected: {problem}"));
+    }
+    if report.problems.len() != reported.len() {
+        differences.push("a problem is reported twice".to_owned());
+    }
+    differences
+}
+
+/// The problems the audit is to report for `entry` over `listed` and `snapshots`, read here again
+/// and apart from the audit: the tags come from the list `git` gave, the item texts and the
+/// sightings from the snapshots, and the rows from the entry. It calls none of the audit's
+/// functions. It holds the problems that an entry made wrong on purpose has: the range against the
+/// tag list (the count, the oldest release, the oldest release whose method.rs names one of the
+/// six), each text an item has at a tag that its row does not list, and each sighting in a client
+/// crate that no row names as an item and no account covers. A crate that a row says sends none, an
+/// unreadable method.rs, a failed lookup and a stale text are the audit's other problems: they are
+/// not expected, and each shows as a difference.
+pub fn expected_audit_problems(
+    entry: &Narrower,
+    listed: &[Tagged],
+    snapshots: &[Snapshot],
+) -> Vec<String> {
+    let said = |text: String| format!("history {}: {text}", entry.root);
+    let client = |krate: &str| !RECEIVER_CRATES.contains(&krate) && !DAEMON_CRATES.contains(&krate);
+    let at: BTreeMap<&str, &Snapshot> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.at.tag.as_str(), snapshot))
+        .collect();
+    let mut problems = Vec::new();
+    if listed.len() != entry.range.tags as usize {
+        problems.push(said(format!(
+            "the entry says {} tags and origin lists {} below the level",
+            entry.range.tags,
+            listed.len()
+        )));
+    }
+    if let Some(oldest) = listed.first()
+        && oldest.tag != entry.range.first_tag
+    {
+        problems.push(said(format!(
+            "the oldest release is {}, the entry names {}",
+            oldest.tag, entry.range.first_tag
+        )));
+    }
+    let naming = listed.iter().find(|tagged| {
+        at.get(tagged.tag.as_str())
+            .is_some_and(|snapshot| matches!(snapshot.names_a_method, Ok(true)))
+    });
+    if let Some(first) = naming
+        && first.tag != entry.range.first_tag
+    {
+        problems.push(said(format!(
+            "the oldest release whose method.rs names one of the six is {}, the entry names {}",
+            first.tag, entry.range.first_tag
+        )));
+    }
+    let rows: Vec<&Item> = entry
+        .senders
+        .iter()
+        .flat_map(|sender| sender.evidence.items())
+        .filter(|item| client(item.krate))
+        .collect();
+    let sends_none: BTreeSet<&str> = entry
+        .senders
+        .iter()
+        .filter_map(|sender| match &sender.evidence {
+            Evidence::SendsNone { crates } => Some(crates.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    for item in &rows {
+        let key = (item.krate.to_owned(), item.name.to_owned());
+        let mut seen: Vec<String> = Vec::new();
+        for tagged in listed {
+            let Some(snapshot) = at.get(tagged.tag.as_str()) else {
+                continue;
+            };
+            let digest = match snapshot.items.get(&key) {
+                Some(Lookup::Found(digest)) => digest.clone(),
+                Some(Lookup::Absent) => ABSENT.to_owned(),
+                _ => continue,
+            };
+            if seen.contains(&digest) {
+                continue;
+            }
+            if !item.across.iter().any(|(held, _)| *held == digest) {
+                problems.push(said(format!(
+                    "{}: the item {}::{} has a text ({digest}) that the entry does not list",
+                    tagged.tag, item.krate, item.name
+                )));
+            }
+            seen.push(digest);
+        }
+    }
+    for tagged in listed {
+        let Some(Ok(sightings)) = at.get(tagged.tag.as_str()).map(|s| &s.sightings) else {
+            continue;
+        };
+        for sighting in sightings {
+            let named = rows
+                .iter()
+                .any(|item| item.krate == sighting.krate && item.name == sighting.name)
+                || entry.accounts.iter().any(|account| {
+                    account.krate == sighting.krate && account.name == sighting.name
+                });
+            if client(&sighting.krate) && !sends_none.contains(sighting.krate.as_str()) && !named {
+                problems.push(said(format!(
+                    "{}: the sighting {}::{} ({:?}) is no item of a row and no account covers it",
+                    tagged.tag, sighting.krate, sighting.name, sighting.kinds
+                )));
+            }
+        }
+    }
+    problems
+}
+
 #[test]
 #[ignore = "reads every release tag; run by hand with --show-output"]
 fn the_reader_reads_every_release_tag_with_a_scratch_entry() {
     let repository = super::repository();
     let started = Instant::now();
-    let tags = std::process::Command::new("git")
-        .args(["tag", "-l", "packages/v*"])
-        .current_dir(&repository)
-        .output()
-        .expect("git tag");
-    let tags = String::from_utf8_lossy(&tags.stdout).lines().count();
-    let (expected, snapshots) = read_history(&repository, &SCRATCH)
+    let listed = listed_releases(&repository).expect("the release tags");
+    let entry = Narrower {
+        level: Box::leak(level_above(&listed).into_boxed_str()),
+        ..SCRATCH
+    };
+    let (expected, snapshots) = read_history(&repository, &entry)
         .unwrap_or_else(|error| panic!("the history of the scratch entry: {error}"));
-    let report = audit_tags(&SCRATCH, &expected, &snapshots);
+    let report = audit_tags(&entry, &expected, &snapshots);
     print_report(&report);
+    for problem in &report.problems {
+        println!("problem {problem}");
+    }
     let took = started.elapsed();
     println!(
-        "read {} releases of {tags} tags with the scratch entry in {took:?}",
-        snapshots.len()
+        "read {} releases of {} tags with the scratch entry in {took:?}",
+        snapshots.len(),
+        listed.len()
     );
-    assert_eq!(snapshots.len(), tags, "a snapshot for every tag");
-    for snapshot in &snapshots {
-        let tag = &snapshot.at.tag;
-        let sightings = snapshot
-            .sightings
-            .as_ref()
-            .unwrap_or_else(|error| panic!("{tag}: the scan failed: {error}"));
-        assert!(snapshot.names_a_method.is_ok(), "{tag}");
-        assert!(
-            snapshot.source_errors.is_empty(),
-            "{tag}: {:?}",
-            snapshot.source_errors
-        );
-        for (item, lookup) in &snapshot.items {
-            assert!(
-                !matches!(lookup, Lookup::Failed(_)),
-                "{tag}: {item:?}: {lookup:?}"
-            );
-        }
-        for (krate, lookup) in &snapshot.krates {
-            assert!(
-                !matches!(lookup, Lookup::Failed(_)),
-                "{tag}: {krate}: {lookup:?}"
-            );
-        }
-        for sighting in sightings {
-            let key = (sighting.krate.clone(), sighting.name.clone());
-            assert!(
-                snapshot.records.contains_key(&key),
-                "{tag}: no source for {key:?}"
-            );
-        }
-    }
-    // The problems are the scratch entry's own: its row, its range and what no row covers.
-    for problem in &report.problems {
-        let failed = ["the scan failed", "cannot be read", "sightings failed"]
-            .iter()
-            .any(|words| problem.contains(words));
-        assert!(!failed, "{problem}");
-    }
+    let mut problems = release_problems(&listed, &snapshots);
+    problems.extend(snapshot_problems(&entry, &snapshots));
+    problems.extend(audit_differences(
+        &report,
+        &expected_audit_problems(&entry, &listed, &snapshots),
+    ));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
     assert!(
         took < Duration::from_secs(3600),
         "{took:?} is over the hour"

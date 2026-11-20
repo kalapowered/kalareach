@@ -94,7 +94,7 @@ fn is_client(krate: &str) -> bool {
     !RECEIVER_CRATES.contains(&krate) && !DAEMON_CRATES.contains(&krate)
 }
 
-fn client_items(entry: &Narrower) -> Vec<&'static Item> {
+pub(super) fn client_items(entry: &Narrower) -> Vec<&'static Item> {
     entry
         .senders
         .iter()
@@ -103,7 +103,7 @@ fn client_items(entry: &Narrower) -> Vec<&'static Item> {
         .collect()
 }
 
-fn none_crates(entry: &Narrower) -> BTreeSet<&'static str> {
+pub(super) fn none_crates(entry: &Narrower) -> BTreeSet<&'static str> {
     entry
         .senders
         .iter()
@@ -117,7 +117,7 @@ fn none_crates(entry: &Narrower) -> BTreeSet<&'static str> {
 
 /// The crates the audit reads at a tag: those of client items, of client accounts and of the rows
 /// that send none.
-fn crates_read(entry: &Narrower) -> BTreeSet<&'static str> {
+pub(super) fn crates_read(entry: &Narrower) -> BTreeSet<&'static str> {
     let mut crates: BTreeSet<&'static str> =
         client_items(entry).iter().map(|item| item.krate).collect();
     crates.extend(
