@@ -7452,6 +7452,74 @@ async fn kr_req_12_26_a_prompt_whose_write_failed_after_admission_is_unknown_not
     );
 }
 
+/// KR-REQ-12.26: a message the channel's queue took and the writer has not written when the
+/// worker's own bound passes is a channel's end. The receipt says unknown and holds the channel's
+/// provenance, so the next message from the same actor is admitted and written, as it is after a
+/// message the writer wrote in time. The writer is held before its write, so the bound passes
+/// first and what decides is the pause, not a delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_a_prompt_still_queued_at_the_workers_bound_is_a_channel_end() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+    host.service
+        .set_upstream_deadline_for_tests(std::time::Duration::from_secs(1));
+    let (arrived, release) = host.service.broker().pause_before_channel_write();
+
+    let window = client.action_window().action_window_id.clone();
+    let first = queue_mutation(&host, 60, window.clone(), "held at the write");
+    let first_id = first.action_id;
+    let Outcome::Error(error) = send(&mut client, first).await else {
+        panic!("a message nobody wrote in time ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    let reached = tokio::time::timeout(LIVENESS_DEADLINE, arrived).await;
+    assert!(
+        matches!(reached, Ok(Ok(_))),
+        "the writer reached the message: {reached:?}"
+    );
+    let held = receipt(&mut client, first_id).await;
+    assert_eq!(held.state, ReceiptState::Unknown);
+    assert_eq!(
+        stored_provenance(&host, first_id).as_deref(),
+        Some("authenticated_hook_response"),
+        "the bound passing before the write is a channel's end"
+    );
+    let _ = release.send(());
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel",
+            "params": {
+                "content": "held at the write",
+                "meta": { "sender": "local_user", "sender_id": sender_id_of(&held.actor_id) },
+            },
+        }),
+        "the message the worker stopped waiting for is written all the same"
+    );
+
+    let second = queue_mutation(&host, 61, window, "the next message");
+    let second_id = second.action_id;
+    let Outcome::Error(error) = send(&mut client, second).await else {
+        panic!("the next message ends as an outcome nobody can establish");
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::OutcomeUnknown,
+        "the message that passed the bound does not hold the next one: {error:?}"
+    );
+    assert_eq!(
+        channel.next().await["params"]["content"],
+        "the next message",
+        "the next message is written"
+    );
+    assert_eq!(
+        receipt(&mut client, second_id).await.state,
+        ReceiptState::Unknown
+    );
+}
+
 /// KR-REQ-12.26: a prompt to a typed upstream needs no sender identity: a caller that entered as a
 /// workflow, with no device and no grant, is admitted and carried by the typed transport as it
 /// was, and the admission keeps the typed transport's provenance.

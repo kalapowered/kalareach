@@ -14459,9 +14459,13 @@ impl UpstreamHandoff {
         match self.kind {
             UpstreamKind::Mutation => {
                 let taken = self.broker.take_mutation(&self.admitted)?;
+                // The gate is kept: a channel's message that its queue took is a channel's end at
+                // whatever point the wait ends, which the receipt records as one, and not an
+                // upstream that never answered.
+                let gate = self.broker.submit_gate();
                 let pending = submit_within(
                     taken.transmission(),
-                    self.broker.submit_gate(),
+                    Arc::clone(&gate),
                     deadline,
                     self.rechecked_before_submit(),
                     None,
@@ -14469,7 +14473,10 @@ impl UpstreamHandoff {
                 .await?;
                 *late = pending.late_handle();
                 let flight = taken.submitted(pending);
-                encode(&within(deadline, flight.settled()).await??)
+                match within(deadline, flight.settled()).await {
+                    Ok(settled) => encode(&settled?),
+                    Err(unanswered) => Err(gate.give_up().map_or(unanswered, WorkerError::Broker)),
+                }
             }
             UpstreamKind::Approval => {
                 let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
@@ -14558,8 +14565,10 @@ async fn answer_within(
 /// A transport that blocks there holds that thread and nothing else. What it returns after the
 /// deadline is dropped: the call's outcome is no longer anybody's to report. What a channel's
 /// queue took is not the call's outcome, and `gate` keeps it: the decision to stop waiting is
-/// made against the gate, so an answer the queue took is reported as the channel's, and one it
-/// has not taken is never taken afterwards.
+/// made against the gate, so an answer or a message the queue took is reported as the channel's,
+/// and one it has not taken is never taken afterwards, which the caller is told: nothing was sent.
+/// A transport that queues nothing through the gate can say no more than that the upstream did not
+/// answer.
 ///
 /// `open` is the count of an action as open work of its binding. The thread holds it until its
 /// work has ended: the repeat refused the action, the call returned, or the thread never started.
@@ -14582,6 +14591,8 @@ async fn submit_within(
     // The broker's checks are asked once more on the thread that makes the call, with nothing but
     // the call after them: the hop to this thread waits for the blocking pool.
     let queueing = Arc::clone(&gate);
+    let through_gate = dispatch.queues_through_gate(&request);
+    let taking = request.taking();
     let submitting = tokio::task::spawn_blocking(move || {
         let _open = open;
         recheck(&request)?;
@@ -14597,7 +14608,16 @@ async fn submit_within(
                             .to_owned(),
                 }),
         )),
-        Err(_) => Err(gate.give_up().map_or_else(unanswered, WorkerError::Broker)),
+        Err(_) => Err(gate.give_up().map_or_else(
+            || {
+                if through_gate {
+                    WorkerError::Broker(crate::broker::SubmitGate::stopped_waiting(taking))
+                } else {
+                    unanswered()
+                }
+            },
+            WorkerError::Broker,
+        )),
     }
 }
 
@@ -14754,6 +14774,124 @@ mod tests {
             drawn.iter().any(|delay| *delay != drawn[0]),
             "and is drawn at random, so that hosts waiting on one lock do not look together"
         );
+    }
+
+    /// A transport whose call is held until the test lets it go, and which does or does not queue
+    /// through the gate it is handed.
+    #[derive(Debug)]
+    struct HeldCall {
+        through_gate: bool,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl crate::broker::UpstreamDispatch for HeldCall {
+        fn admit(&self, _request: &crate::broker::UpstreamRequest) -> crate::broker::Result<()> {
+            Ok(())
+        }
+
+        fn submit(
+            &self,
+            _request: &crate::broker::UpstreamRequest,
+        ) -> crate::broker::Result<crate::broker::PendingTransmission> {
+            let _ = self
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(30));
+            Err(crate::broker::BrokerError::UpstreamUnavailable {
+                detail: "the held call was let go".to_owned(),
+            })
+        }
+
+        fn queues_through_gate(&self, _request: &crate::broker::UpstreamRequest) -> bool {
+            self.through_gate
+        }
+    }
+
+    /// One queued message on the instance numbered 2, from the host's own account.
+    fn message_request() -> crate::broker::UpstreamRequest {
+        crate::broker::UpstreamRequest {
+            admitted: crate::broker::methods::Admitted::new(),
+            application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                kr_protocol::scalars::Uuid::from_bytes([2; 16]),
+            ),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            operation: kr_protocol::gateway::RichOperation::PromptQueue,
+            thread_id: None,
+            turn_id: None,
+            body: crate::broker::UpstreamBody::Prompt {
+                draft_id: None,
+                text: Some("hello".to_owned()),
+                sender: crate::broker::channel_prompt::PromptSender {
+                    actor_id: kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
+                    ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                    device_id: None,
+                    grant_id: None,
+                },
+            },
+        }
+    }
+
+    /// What the worker's wait for a transport's call says when the call is still running at the
+    /// deadline: a transport that queues through its gate and whose queue has not taken the message
+    /// is told it was not sent, and one that queues nothing through the gate is told only that the
+    /// upstream did not answer.
+    #[tokio::test]
+    async fn a_wait_that_ends_before_a_channels_queue_took_the_message_says_nothing_was_sent() {
+        for (through_gate, proven_unsent) in [(true, true), (false, false)] {
+            let (release, held) = std::sync::mpsc::channel();
+            let dispatch: Arc<dyn crate::broker::UpstreamDispatch> = Arc::new(HeldCall {
+                through_gate,
+                release: Mutex::new(held),
+            });
+            let outcome = super::submit_within(
+                (dispatch, message_request()),
+                Arc::new(crate::broker::SubmitGate::default()),
+                tokio::time::Instant::now() + Duration::from_millis(100),
+                |_| Ok(()),
+                None,
+            )
+            .await;
+            let Err(super::WorkerError::Broker(refusal)) = outcome else {
+                panic!("a call still running at the deadline is not an outcome");
+            };
+            assert_eq!(
+                refusal.proven_unsent(),
+                proven_unsent,
+                "queues through its gate: {through_gate}: {refusal}"
+            );
+            if proven_unsent {
+                assert!(
+                    refusal.to_string().contains(
+                        "The worker stopped waiting before the channel's queue took the message. \
+                         Nothing was sent."
+                    ),
+                    "{refusal}"
+                );
+            }
+            let _ = release.send(());
+        }
+    }
+
+    /// A queue that comes after the worker gave up refuses what it would have taken, in the words
+    /// for an answer or for a message.
+    #[test]
+    fn a_queue_that_comes_after_the_worker_gave_up_says_nothing_was_sent() {
+        for taking in ["answer", "message"] {
+            let gate = crate::broker::SubmitGate::default();
+            assert!(gate.give_up().is_none(), "nothing had queued");
+            let refusal = gate
+                .queue("detail", taking, || Ok(()))
+                .expect_err("the queue is refused");
+            assert!(refusal.proven_unsent(), "{refusal}");
+            assert!(
+                refusal.to_string().contains(&format!(
+                    "The worker stopped waiting before the channel's queue took the {taking}. \
+                     Nothing was sent."
+                )),
+                "{refusal}"
+            );
+        }
     }
 
     /// One reader's snapshot of the instance numbered `number`.
