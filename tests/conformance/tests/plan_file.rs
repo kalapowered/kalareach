@@ -873,6 +873,31 @@ fn execution_faults() -> Vec<(&'static str, String, &'static str)> {
             "which holds `..`, `.` or an empty part",
         ),
         (
+            "an output that holds a non-ASCII letter",
+            output("{evidence}/conformance/\u{c4}.json"),
+            "step `one` names the `output` `{evidence}/conformance/\u{c4}.json`, whose part `\u{c4}.json` holds a character outside the portable set: letters, digits, `.`, `-` and `_`",
+        ),
+        (
+            "an output nested below a part with a non-ASCII letter",
+            output("{evidence}/conformance/\u{e4}/child.json"),
+            "step `one` names the `output` `{evidence}/conformance/\u{e4}/child.json`, whose part `\u{e4}` holds a character outside the portable set: letters, digits, `.`, `-` and `_`",
+        ),
+        (
+            "an output whose part holds a long s that a file system takes for an s",
+            output("{evidence}/conformance/log\u{17f}/x.json"),
+            "whose part `log\u{17f}` holds a character outside the portable set",
+        ),
+        (
+            "an output whose part holds a colon",
+            output("{evidence}/conformance/a:b.json"),
+            "whose part `a:b.json` holds a character outside the portable set",
+        ),
+        (
+            "an output whose part holds a space inside it",
+            output("{evidence}/conformance/a b.json"),
+            "whose part `a b.json` holds a character outside the portable set",
+        ),
+        (
             "a Vitest reading that names no output",
             step_with("reading = 'cargo'", "reading = 'vitest'\npackage = 'p'"),
             "step `one` reads a file and names no `output`",
@@ -1249,12 +1274,13 @@ command = ['cargo', 'test']
 }
 
 /// Each planted file of the execution model is refused with its own reason. A step whose `{output}`
-/// is held by a variable and not by a command word is accepted.
+/// is held by a variable and not by a command word is accepted, and so is an output whose parts hold
+/// capitals, digits, `.`, `-` and `_`.
 #[test]
 fn a_step_of_the_execution_model_is_refused_for_each_fault_by_its_reason() {
     let root = repository();
     let accepted = step_adding(
-        "output = '{evidence}/conformance/x.json'\nenv = { WHERE = '{output}', HERE = '{root}', LATER = '{scratch}/y' }\n",
+        "output = '{evidence}/conformance/Out-1_a.2/X.json'\nenv = { WHERE = '{output}', HERE = '{root}', LATER = '{scratch}/y' }\n",
         "['cargo', 'test']",
     );
     let control = Plan::parse(&accepted, &root);
