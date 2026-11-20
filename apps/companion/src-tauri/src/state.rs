@@ -762,12 +762,24 @@ pub mod testing {
             }
         }
 
-        /// Waits here when a suite paused this place, once.
+        /// Waits here when a suite paused this place, once. A step that waits here is a plain
+        /// function, which a command calls from a task of Tauri's multi-threaded runtime, or a
+        /// suite calls from a thread of its own, and it cannot await. On a multi-threaded runtime
+        /// the wait goes through `block_in_place`, which moves the thread's other tasks to another
+        /// worker, so a held step does not starve the runtime's other tasks. On a runtime with one
+        /// thread, where `block_in_place` panics, and with no runtime at all, the thread blocks.
         pub(super) fn wait(&self) {
             let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
             if let Some((reached, released)) = held {
                 let _ = reached.send(());
-                let _ = released.recv();
+                let multi_threaded = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+                    runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+                });
+                if multi_threaded {
+                    let _ = tokio::task::block_in_place(|| released.recv());
+                } else {
+                    let _ = released.recv();
+                }
             }
         }
     }
