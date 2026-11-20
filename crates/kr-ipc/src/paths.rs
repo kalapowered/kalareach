@@ -1642,10 +1642,8 @@ mod windows {
         /// # Errors
         ///
         /// Returns [`AccessListRefusal::Unreadable`] when this process's own token cannot be read.
-        #[cfg(test)]
-        pub(crate) fn is_the_owner_only_list(
-            &self,
-        ) -> std::result::Result<bool, AccessListRefusal> {
+        #[cfg(any(test, feature = "testing"))]
+        pub fn is_the_owner_only_list(&self) -> std::result::Result<bool, AccessListRefusal> {
             let accounts = TokenAccounts::read()?;
             let user = account_in(accounts.user(), &accounts.user, usize::MAX)?;
             Ok(self.discretionary.is_the_owner_only_list(&user))
