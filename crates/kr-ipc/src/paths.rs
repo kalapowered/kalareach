@@ -2356,8 +2356,6 @@ mod windows {
             }
             Err(AccessListRefusal::Policy(_)) => false,
         };
-        #[cfg(test)]
-        let as_set = as_set && !matches!(seen, Some(tests::Seen::OtherList));
         if !as_set {
             return Err(std::io::Error::other(
                 "the access list of the new file reads back other than as set, so it cannot be made \
@@ -2453,8 +2451,6 @@ mod windows {
         pub(super) enum Seen {
             /// The volume reports that it keeps no access lists.
             NoLists,
-            /// The list reads back as another than the one set.
-            OtherList,
         }
 
         /// Run with the new file's path and the handle that created it as the check of its list
@@ -2565,10 +2561,45 @@ mod windows {
             assert_eq!(folder.names(), Vec::<String>::new(), "nothing is left");
         }
 
+        /// Changes the list of the new file at `path` as the check of its list begins: the list it
+        /// was made with and one more entry, that lets Everyone read it, set through a second
+        /// handle of the file, as a file system that alters a list would leave it.
+        fn widen_the_list(path: &Path) {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            use windows_sys::Win32::Security::{
+                PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity,
+            };
+            use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+
+            let accounts = TokenAccounts::read().expect("this process's token");
+            let list = format!(
+                "D:P(A;;GA;;;OW)(A;;GA;;;{})(A;;FR;;;WD)",
+                describe(accounts.user())
+            );
+            let built = BuiltDescriptor::parse(&list).expect("a descriptor");
+            let file = std::fs::OpenOptions::new()
+                .access_mode(READ_CONTROL | WRITE_DAC)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path)
+                .expect("the new file is opened to change its list");
+            // SAFETY: the handle is open with the right to change the list, and the descriptor
+            // lives until `built` is dropped, after the call.
+            let set = unsafe {
+                SetKernelObjectSecurity(
+                    file.as_raw_handle(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    built.0,
+                )
+            };
+            assert!(set != 0, "{}", std::io::Error::last_os_error());
+        }
+
         /// A check that refuses the new file refuses both writers before any content is written,
         /// removes the file it made, and touches nothing else: a file already at the destination
-        /// keeps its bytes and its list, and the folder holds nothing new.
-        fn refused_before_any_content(seen: Seen, words: &str) {
+        /// keeps its bytes and its list, and the folder holds nothing new. `act` acts on the
+        /// new file as the check begins, and `seen` is what the check sees in place of the file
+        /// system's answer, if anything.
+        fn refused_before_any_content(act: fn(&Path), seen: Option<Seen>, words: &str) {
             let folder = Folder::new("refused");
             let destination = folder.0.join("setting");
             crate::paths::write_owner_only_file(&destination, b"kept").expect("a file to keep");
@@ -2576,11 +2607,12 @@ mod windows {
 
             let lengths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let recorded = std::rc::Rc::clone(&lengths);
-            let _hooked = Hooked::install(move |_path, file| {
+            let _hooked = Hooked::install(move |path, file| {
                 recorded
                     .borrow_mut()
                     .push(file.metadata().map_or(u64::MAX, |metadata| metadata.len()));
-                Some(seen)
+                act(path);
+                seen
             });
 
             for (writer, write) in WRITERS {
@@ -2612,16 +2644,18 @@ mod windows {
         /// any content is written. The volume's answer is replaced here; no case makes a volume.
         #[test]
         fn a_volume_that_keeps_no_access_lists_refuses_both_writers_before_any_content() {
-            refused_before_any_content(Seen::NoLists, NO_LISTS);
+            refused_before_any_content(|_| {}, Some(Seen::NoLists), NO_LISTS);
         }
 
         /// A list that reads back other than as set refuses both writers before any content is
-        /// written. The list read back is replaced here; no case makes a file system that alters
-        /// a list.
+        /// written. The new file's own list is changed, as a file system that alters a list would
+        /// leave it, after the file is made and before the check reads it back; the comparison
+        /// itself is the product's.
         #[test]
         fn a_list_that_reads_back_other_than_set_refuses_both_writers_before_any_content() {
             refused_before_any_content(
-                Seen::OtherList,
+                widen_the_list,
+                None,
                 "the access list of the new file reads back other than as set, so it cannot be made \
                  readable by its owner alone",
             );
