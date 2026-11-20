@@ -307,8 +307,21 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let display_number = DisplayNumber::new(arguments.display);
-    let endpoint = environment.worker_endpoint(display_number)?;
-    let listener = Listener::bind(&endpoint)?;
+    // The address and its listener are made as one step, so that a worker that cannot have them
+    // says why to the daemon that waits for it, as the refusals above do, instead of ending with
+    // its reason only in its own diagnostics.
+    let (endpoint, listener) = match environment
+        .worker_endpoint(display_number)
+        .and_then(|endpoint| Listener::bind(&endpoint).map(|listener| (endpoint, listener)))
+    {
+        Ok(bound) => bound,
+        Err(error) => {
+            writer
+                .write_message(&ControlFrame::WorkerFailed(error.to_protocol_error()))
+                .await?;
+            return Err(Box::new(error));
+        }
+    };
 
     // The bridge endpoint is bound before the shell starts: its address and one-time secret travel
     // to the shell in its own environment, and a shell that started first would have neither.

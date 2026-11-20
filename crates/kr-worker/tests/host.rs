@@ -2553,6 +2553,42 @@ async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
     }
 }
 
+/// A worker that cannot listen on its address says why to the create that waits for it.
+///
+/// Something that is not a socket stands where the worker binds. The worker claims its reservation,
+/// cannot listen, and ends. Its reason used to be in its own diagnostics alone, and the create
+/// said no more than that the worker had not reported itself in time.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_cannot_listen_says_why_to_the_create_that_waits_for_it() {
+    let host = Host::create();
+    let _controller = host.start().await;
+    let address = host
+        .paths()
+        .worker_endpoint(kr_protocol::session::DisplayNumber::new(1))
+        .expect("the first worker's address fits")
+        .as_path()
+        .to_path_buf();
+    std::fs::write(&address, b"not a socket").expect("places a file where the worker binds");
+    let mut client = host.client().await;
+    let params = create_params(host.environment_id, host.temp.root());
+
+    let refused = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a worker that cannot listen serves no session");
+    assert!(
+        refused.message.contains("not a socket"),
+        "the worker's own words reach the caller: {refused}"
+    );
+}
+
 /// A managed create whose shell has no startup entry is refused by the worker as soon as it has
 /// the package, with the command that installs the entry, and the reservation it held goes back.
 ///
