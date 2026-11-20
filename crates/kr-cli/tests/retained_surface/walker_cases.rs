@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use quote::ToTokens as _;
+
 use super::repository;
 use super::walker::{Depth, Lookup, SightKind, Tree};
 
@@ -82,11 +84,9 @@ fn a_lookup_says_what_it_found_and_why_it_could_not() {
     ));
     assert!(matches!(alone(&tree, "present"), Lookup::Found(_)));
     assert_eq!(alone(&tree, "missing"), Lookup::Absent);
-    assert!(
-        matches!(
-            tree.lookup("kr_sender", &["present", "missing"], Depth::Alone),
-            Lookup::Failed(ref text) if text.contains("missing")
-        ),
+    assert_eq!(
+        tree.lookup("kr_sender", &["present", "missing"], Depth::Alone),
+        Lookup::Failed("kr_sender defines only some of present, missing; not missing".to_owned()),
         "a list of names that is only partly defined is a failure"
     );
     // A manifest that exists and names no package makes a crate that no manifest names unknown.
@@ -188,7 +188,12 @@ fn names_a_method() { let _ = Method::AgentPromptSubmit; }
 fn raw() -> &'static str { r#"agent.turn.cancel"# }
 fn names_a_right() { let _ = ActionRight::AgentApprovalRespond; }
 /// Sends `Method::AgentTurnCancel` and says "agent.turn.cancel".
+#[doc = "agent.turn.cancel"]
 fn documented() {}
+fn takes_two() { idle!(Method => AgentTurnSteer); }
+fn other_method() { let _ = Method::SessionOpen; }
+#[cfg(test)]
+mod wrapper { mod nested; }
 #[cfg(test)]
 fn under_test() { let _ = Method::AgentTurnCancel; }
 fn takes(_r: MutationRequest, _t: &ActionTarget) { let _ = Method; }
@@ -277,6 +282,10 @@ fn sender_tree() -> tempfile::TempDir {
             "fn from_grand() { let _ = Method::AgentTurnSteer; }\n",
         ),
         ("t.rs", "fn from_t() { let _ = Method::AgentTurnCancel; }\n"),
+        (
+            "wrapper/nested.rs",
+            "fn from_wrapper() { let _ = Method::AgentTurnCancel; }\n",
+        ),
         ("sub.rs", "unnamed!(\"agent.prompt.queue\");\n"),
         (
             "grouped.rs",
@@ -439,6 +448,17 @@ fn the_digest_of_a_name_only_the_scan_gives_moves_on_a_token() {
         )
     };
     let before = digests("AgentTurnCancel", "agent.turn.cancel", "agent.turn.cancel");
+    // The digest of a scan name is that of the crate, the file, the name and the text.
+    let text = syn::parse_str::<syn::ItemUse>("use kr_protocol::Method::AgentTurnCancel;")
+        .expect("a use")
+        .to_token_stream()
+        .to_string();
+    let record = format!("kr_sender crates/kr-sender/src/lib.rs use:lib.rs\n{text}\n");
+    let expected: String = kr_cbor::sha256(record.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(before.0, expected);
     let import = digests("AgentTurnSteer", "agent.turn.cancel", "agent.turn.cancel");
     assert_ne!(import.0, before.0);
     assert_eq!((&import.1, &import.2), (&before.1, &before.2));
