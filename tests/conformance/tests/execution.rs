@@ -12,7 +12,9 @@ use std::process::Command;
 
 use kr_conformance::plan::Platform;
 use kr_conformance::plan_file::Plan;
-use kr_conformance::report::{self, Document, Options, Outcome, Stopped, Verdict};
+#[cfg(unix)]
+use kr_conformance::report::Outcome;
+use kr_conformance::report::{self, Document, Options, Stopped, Verdict};
 
 const FIXED: &str = "[ignored_runs]
 held = false
@@ -97,11 +99,13 @@ fn plan_of(manifests: &[&str], rest: &str) -> String {
     )
 }
 
-/// What a run left: the result, the evidence directory and the directory the run made its own
-/// files in, both still on disk.
+/// What a run left: the result, and on Unix, where the cases that read them are run, the evidence
+/// directory and the directory the run made its own files in, both still on disk.
 struct Ran {
     document: Document,
+    #[cfg(unix)]
     evidence: tempfile::TempDir,
+    #[cfg(unix)]
     base: tempfile::TempDir,
 }
 
@@ -143,7 +147,9 @@ fn run(root: &Path, text: &str) -> Result<Ran, Stopped> {
     let options = options(root, plan, evidence.path(), base.path());
     report::run(&options, &mut |_| {}).map(|document| Ran {
         document,
+        #[cfg(unix)]
         evidence,
+        #[cfg(unix)]
         base,
     })
 }
@@ -248,6 +254,7 @@ command = ['cargo', 'test', '--locked', '--test', 'plan_env']
 }
 
 /// A plan of one `bash` script step that reads nothing, whose command is `words`.
+#[cfg(unix)]
 fn script_plan(words: &str, more: &str) -> String {
     plan_of(
         &["Cargo.toml"],
