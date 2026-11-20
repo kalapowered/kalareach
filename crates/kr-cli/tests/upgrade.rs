@@ -5008,14 +5008,21 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
 /// for an application is given no revision, so it is never sent.
 ///
 /// The suite has no bound application, so the draft is made through the transfer store of this
-/// release with the daemon stopped, the route the daemon's own create takes; the case asserts what
-/// the journal and the store beside it hold, and no answer of a daemon about a prompt. The release
-/// before's daemon then runs on the journal and changes a draft as its own `draft.update` does: its
-/// text, its revision and its time, and nothing else.
+/// release with the daemon stopped, by the store call the daemon's create makes (the case does not go
+/// through the daemon's admission or its guard); the case asserts what the journal and the store
+/// beside it hold and what the store answers for a prompt, and no answer of a daemon about a prompt.
+/// The release before's daemon then runs on the journal and changes a draft as its own
+/// `draft.update` does: its text, its revision and its time, and nothing else. The record that
+/// release makes for a prompt that names the draft, a row of `draft_prompts` and nothing more, is a
+/// fixture the case writes into the journal while that daemon is stopped; the daemon is not asked
+/// for a prompt. After the update again the record still names its session, and a prompt under
+/// another binding revision is refused and removes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_revision_for_the_update_again()
  {
-    use kr_protocol::ids::{ActorId, ApplicationInstanceId, DraftId, DraftRevision};
+    use kr_protocol::ids::{
+        ActorId, AgentBindingRevision, ApplicationInstanceId, DraftId, DraftRevision, SessionId,
+    };
     use kr_protocol::scalars::{TimestampMs, Uuid};
     use kr_protocol::transfer::DraftState;
 
@@ -5135,6 +5142,30 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
             rusqlite::params![written.get().as_bytes().to_vec()],
         )
         .expect("changes the draft as its own update does");
+    // FIXTURE, not a write of the release before's daemon: the record that release makes for a
+    // prompt that names the draft, which is a row of `draft_prompts` and nothing more, written while
+    // its daemon is stopped.
+    let session = SessionId::new(Uuid::from_bytes([0x0D; 16]));
+    rusqlite::Connection::open(&journal)
+        .expect("opens the journal")
+        .execute(
+            "INSERT INTO draft_prompts (draft_id, session_id, sent_at_ms) VALUES (?1, ?2, 3000)",
+            rusqlite::params![
+                written.get().as_bytes().to_vec(),
+                session.get().as_bytes().to_vec()
+            ],
+        )
+        .expect("writes the record of a prompt as the release before makes it");
+    let recorded = || -> Vec<u8> {
+        rusqlite::Connection::open(&journal)
+            .expect("opens the journal")
+            .query_row(
+                "SELECT session_id FROM draft_prompts WHERE draft_id = ?1",
+                rusqlite::params![written.get().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("the record of the prompt is there")
+    };
 
     // Update again with the release before's `kr`.
     let archive = host.scratch("archives").join("two-again.tar.gz");
@@ -5152,7 +5183,7 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
         "the release before's kr host update goes on: {said} {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let store = kr_transfer::store::Store::open(&journal, environment)
+    let mut store = kr_transfer::store::Store::open(&journal, environment)
         .expect("this release's store opens the journal again");
     let kept = store
         .draft(written)
@@ -5172,5 +5203,47 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
             .agent_binding_revision,
         None,
         "a draft the release before wrote for an application has no revision, and is never sent"
+    );
+
+    // The record the release before made for a prompt is still there and still names its session.
+    assert_eq!(
+        recorded(),
+        session.get().as_bytes().to_vec(),
+        "the record of the prompt still names its session after the update"
+    );
+    // The store call a daemon's prompt makes: the draft's own revision is accepted again for the same
+    // session, and a prompt under another revision is refused, in the words of the revision, with the
+    // record left where it was.
+    let again = store.record_prompt(
+        written,
+        session,
+        application,
+        AgentBindingRevision::new(7),
+        TimestampMs::new(4000),
+    );
+    assert!(
+        again.is_ok(),
+        "a prompt under the draft's own revision is accepted: {again:?}"
+    );
+    let refused = store
+        .record_prompt(
+            written,
+            session,
+            application,
+            AgentBindingRevision::new(8),
+            TimestampMs::new(4000),
+        )
+        .expect_err("a prompt under another binding revision is refused");
+    assert!(
+        matches!(&refused, kr_transfer::TransferError::DraftConflict { detail }
+        if detail.contains(
+            "written under binding revision 7 of this application and the prompt names 8"
+        )),
+        "{refused:?}"
+    );
+    assert_eq!(
+        recorded(),
+        session.get().as_bytes().to_vec(),
+        "a refused prompt removes no record"
     );
 }
