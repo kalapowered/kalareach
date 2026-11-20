@@ -26,7 +26,8 @@ use crate::lane::{self, Part};
 use crate::libtest::Outcome as LibtestOutcome;
 use crate::map::{self, Binding, Declarations, Map, Place, Reference};
 use crate::observe::{self, Observed};
-use crate::plan::{self, ApplicationsPlan, Group, Platform};
+use crate::plan::{self, ApplicationsPlan, Platform};
+use crate::plan_file::Plan;
 use crate::run::{self, Executed};
 use crate::runner_copy;
 use crate::workspace::{TargetId, TargetKind};
@@ -310,7 +311,7 @@ pub struct Document {
     /// The schema.
     pub schema: &'static str,
     /// The repository.
-    pub repository: &'static str,
+    pub repository: String,
     /// The run's identities.
     pub run: RunRecordHeader,
     /// The steps.
@@ -357,22 +358,18 @@ pub struct Options {
     /// The evidence directory, already checked.
     pub evidence: PathBuf,
     /// The groups selected, or `None` for every group.
-    pub selection: Option<Vec<Group>>,
+    pub selection: Option<Vec<String>>,
     /// Whether the whole terminal matrix was asked for.
     pub all_terminals: bool,
     /// The platform.
     pub platform: Platform,
-    /// The data-file case tables.
-    pub case_tables: &'static [plan::CaseTable],
-    /// The lanes.
-    pub lanes: &'static [plan::Lane],
-    /// The steps that run the keyed tests an ordinary run leaves out, or none where the tree is not
-    /// held to them.
-    pub ignored_runs: Option<&'static [plan::IgnoredRun]>,
+    /// The plan: the steps, tables and reasons the run takes from the repository's plan file.
+    pub plan: Plan,
+    /// Whether the tree is held to the plan's ignored-run entries: every keyed test an ordinary
+    /// run leaves out is run by an entry, and every entry is still where it says.
+    pub held_to_ignored_runs: bool,
     /// The applications the fetch step recorded, when that group runs.
     pub applications: Option<Vec<ApplicationRecord>>,
-    /// Steps to run instead of the plan's, for a tree that is not this repository.
-    pub steps: Option<Vec<plan::Step>>,
     /// Variables every step is run with, beyond the report's own environment.
     pub environment: Vec<(String, String)>,
     /// The `kr-conformance` program. The run copies it into a directory of its own, compares
@@ -424,22 +421,36 @@ fn directories_built_in(root: &Path, given: Option<&std::ffi::OsStr>) -> Vec<Pat
         .collect()
 }
 
-/// Builds the map for a run of `options`.
-#[must_use]
-pub fn map_for(options: &Options) -> Map {
-    let groups = options
+/// The groups a run selects: those it names, or every group of the plan.
+fn selected_groups(options: &Options) -> Vec<String> {
+    options
         .selection
         .clone()
-        .unwrap_or_else(|| Group::ALL.to_vec());
+        .unwrap_or_else(|| options.plan.all_groups())
+}
+
+/// Builds the map for a run of `options`, reading TypeScript when the selection does.
+#[must_use]
+pub fn map_for(options: &Options) -> Map {
+    let typescript = options.plan.reads_typescript(&selected_groups(options));
+    map_declared(options, typescript)
+}
+
+/// Builds the map for `options`, reading the plan's TypeScript packages when `typescript` says so.
+#[must_use]
+pub fn map_declared(options: &Options, typescript: bool) -> Map {
+    let plan = &options.plan;
+    let commands = plan.linux_commands();
     map::build(
         &options.root,
         &Declarations {
-            case_tables: options.case_tables,
-            lanes: options.lanes,
-            ignored_runs: options.ignored_runs,
-            typescript: groups
-                .contains(&Group::TypeScript)
-                .then_some(plan::TYPESCRIPT_PACKAGES),
+            case_tables: &plan.case_tables,
+            lanes: &plan.lanes,
+            ignored_runs: options
+                .held_to_ignored_runs
+                .then_some(plan.ignored_runs.as_slice()),
+            plan_commands: &commands,
+            typescript: typescript.then_some(plan.typescript_packages()),
             scripts: &["scripts"],
         },
     )
@@ -460,10 +471,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
     if !map.problems.is_empty() {
         return Err(Stopped::Problems(map.problems));
     }
-    let groups = options
-        .selection
-        .clone()
-        .unwrap_or_else(|| Group::ALL.to_vec());
+    let groups = selected_groups(options);
     // The report's own files are all made new for this run, so nothing an earlier run left can be
     // read as this run's: a directory that already holds a report is refused.
     let own = options.evidence.join("conformance");
@@ -512,14 +520,12 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                 })
                 .collect(),
         });
-    let steps = options.steps.clone().unwrap_or_else(|| {
-        plan::steps(
-            options.platform,
-            &groups,
-            &evidence_text,
-            applications_plan.as_ref(),
-        )
-    });
+    let steps = options.plan.steps(
+        options.platform,
+        &groups,
+        &evidence_text,
+        applications_plan.as_ref(),
+    );
     let steps = match options.part {
         Some(part) => plan::part_of(steps, part),
         None => steps,
@@ -606,7 +612,7 @@ pub struct Gathered {
 #[must_use]
 pub fn assemble(
     options: &Options,
-    groups: &[Group],
+    groups: &[String],
     map: &Map,
     executed: &[Executed],
     gathered: Gathered,
@@ -623,8 +629,8 @@ pub fn assemble(
     let mut recorded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut identifiers = BTreeMap::new();
     let mut all: BTreeSet<Identifier> = map.identifiers();
-    if options.selection.is_none() {
-        all.extend(plan::listed_rows());
+    if options.selection.is_none() && options.plan.list_table_rows {
+        all.extend(Identifier::table_rows());
     }
     let mut summary = Summary::default();
     for identifier in all {
@@ -733,8 +739,8 @@ pub fn assemble(
                 .as_ref()
                 .is_some_and(Observed::damage_seen)
         });
-    let typescript = groups.contains(&Group::TypeScript) && options.platform != Platform::Windows;
-    let mut toolchain = identity::toolchain(&options.root, typescript);
+    let javascript = options.plan.uses_javascript_tools(options.platform, groups);
+    let mut toolchain = identity::toolchain(&options.root, javascript);
     for step in executed {
         if matches!(step.step.reading, plan::Reading::Lane(_)) {
             for (name, value) in &step.tools {
@@ -755,12 +761,12 @@ pub fn assemble(
         .collect();
     packages.extend(identity::typescript_packages(
         &options.root,
-        plan::TYPESCRIPT_PACKAGES,
+        options.plan.typescript_packages(),
     ));
     packages.sort();
     Document {
         schema: SCHEMA,
-        repository: "kalareach",
+        repository: options.plan.repository.clone(),
         run: RunRecordHeader {
             started,
             finished: timestamp(),
@@ -771,7 +777,7 @@ pub fn assemble(
             terminal_profile: identity::terminal_profile(&options.root),
             packages,
             applications: options.applications.clone(),
-            selection: groups.iter().map(|group| group.name().to_owned()).collect(),
+            selection: groups.to_vec(),
             part: options
                 .part
                 .map(|(number, parts)| format!("{number}/{parts}")),
@@ -799,12 +805,16 @@ pub fn assemble(
         known_differences,
         problems,
         terminals: options.all_terminals.then(|| {
-            plan::TERMINALS
+            options
+                .plan
+                .terminals
                 .iter()
-                .map(|terminal| TerminalRecord {
-                    terminal: (*terminal).to_owned(),
-                    outcome: Outcome::NotRun,
-                    reason: plan::TERMINAL_REASON.to_owned(),
+                .flat_map(|terminals| {
+                    terminals.names.iter().map(|terminal| TerminalRecord {
+                        terminal: terminal.clone(),
+                        outcome: Outcome::NotRun,
+                        reason: terminals.reason.clone(),
+                    })
                 })
                 .collect()
         }),
@@ -832,9 +842,10 @@ fn unattributed_classes(map: &Map, options: &Options, step: &Executed) -> Vec<St
         .iter()
         .filter(|(file, _)| {
             options
+                .plan
                 .lanes
                 .iter()
-                .any(|lane| lane.reads == Some(*tests) && plan::matches(lane.files, file))
+                .any(|lane| lane.reads == Some(*tests) && plan::matches(&lane.files, file))
         })
         .map(|(_, classes)| classes)
         .collect();
@@ -884,7 +895,7 @@ fn covers(part: &Part, case: &lane::Case) -> bool {
 /// Resolves keyed places to outcomes against what ran.
 struct Resolver<'a> {
     options: &'a Options,
-    groups: &'a [Group],
+    groups: &'a [String],
     map: &'a Map,
     executed: &'a [Executed],
     /// For each target, the steps whose binaries of it ran, with those binaries.
@@ -898,7 +909,7 @@ struct Resolver<'a> {
 impl<'a> Resolver<'a> {
     fn new(
         options: &'a Options,
-        groups: &'a [Group],
+        groups: &'a [String],
         map: &'a Map,
         executed: &'a [Executed],
         known: &'a [KnownDifference],
@@ -937,8 +948,10 @@ impl<'a> Resolver<'a> {
             Place::Rust { target, .. } | Place::RustModule { target, .. } => {
                 self.ran.contains_key(target) || self.built.contains(target)
             }
-            Place::TypeScript { .. } => self.groups.contains(&Group::TypeScript),
-            Place::Lane { .. } => self.groups.contains(&Group::Phones),
+            Place::TypeScript { package, .. } => {
+                self.options.plan.selects_package(self.groups, package)
+            }
+            Place::Lane { file, .. } => self.options.plan.selects_lane_file(self.groups, file),
         }
     }
 
@@ -989,9 +1002,10 @@ impl<'a> Resolver<'a> {
         };
         let reads = self
             .options
+            .plan
             .lanes
             .iter()
-            .find(|lane| plan::matches(lane.files, file))
+            .find(|lane| plan::matches(&lane.files, file))
             .and_then(|lane| lane.reads);
         let step = reads.and_then(|reads| {
             self.executed.iter().enumerate().find(
@@ -1301,12 +1315,9 @@ impl<'a> Resolver<'a> {
     }
 
     fn unrun_reason(&self, target: &TargetId) -> String {
-        if self.options.platform == Platform::MacOs
-            && let Some((_, reason)) = plan::MACOS_EXCLUDED
-                .iter()
-                .find(|(package, _)| *package == target.package)
-        {
-            return (*reason).to_owned();
+        let plan = &self.options.plan;
+        if let Some(reason) = plan.excluded_reason(self.options.platform, &target.package) {
+            return reason.to_owned();
         }
         if let Some(stopped) = self
             .executed
@@ -1332,20 +1343,12 @@ impl<'a> Resolver<'a> {
             );
         }
         // Only the groups that run Rust targets say why a Rust target was not run.
-        let absent = self
-            .groups
-            .iter()
-            .filter(|group| matches!(group, Group::EndToEnd | Group::Performance))
-            .find_map(|group| plan::group_absent_reason(*group, self.options.platform));
+        let absent = plan.unrun_rust_reason(self.options.platform, self.groups);
+        let general = plan.unrun.rust.get(self.options.platform);
         let base = match (target.kind, absent) {
-            (TargetKind::Bench, _) => format!(
-                "a benchmark target: the performance group runs the measurements it holds, and {}",
-                plan::unrun_reason(self.options.platform)
-            ),
-            (_, Some(reason)) if self.options.platform == Platform::Windows => {
-                format!("{}; {reason}", plan::unrun_reason(self.options.platform))
-            }
-            _ => plan::unrun_reason(self.options.platform).to_owned(),
+            (TargetKind::Bench, _) => format!("{}, and {general}", plan.unrun.bench),
+            (_, Some(reason)) => format!("{general}; {reason}"),
+            _ => general.to_owned(),
         };
         match self.options.part {
             Some((number, parts)) => format!(
@@ -1440,14 +1443,15 @@ impl<'a> Resolver<'a> {
         let unreported = command(escape_pattern(title));
         if let Some(lane) = self
             .options
+            .plan
             .lanes
             .iter()
-            .find(|lane| plan::matches(lane.files, file))
+            .find(|lane| plan::matches(&lane.files, file))
         {
             return vec![record(
                 format!("{file} {title}"),
                 Outcome::NotBuilt,
-                Some(lane.reason.to_owned()),
+                Some(lane.reason.clone()),
                 Vec::new(),
                 None,
             )];
@@ -1456,8 +1460,10 @@ impl<'a> Resolver<'a> {
             matches!(&step.step.reading, plan::Reading::Vitest { directory } if directory == package)
         });
         let Some((index, step)) = step else {
-            let reason = plan::group_absent_reason(Group::TypeScript, self.options.platform)
-                .unwrap_or("no step of this run's selection runs the TypeScript suites")
+            let reason = self
+                .options
+                .plan
+                .typescript_unrun_reason(self.options.platform, self.groups)
                 .to_owned();
             return vec![record(
                 format!("{file} {title}"),
@@ -1592,9 +1598,10 @@ impl<'a> Resolver<'a> {
             let own_lane = |file: &str| match &step.step.reading {
                 plan::Reading::Lane(tests) => self
                     .options
+                    .plan
                     .lanes
                     .iter()
-                    .any(|lane| lane.reads == Some(*tests) && plan::matches(lane.files, file)),
+                    .any(|lane| lane.reads == Some(*tests) && plan::matches(&lane.files, file)),
                 _ => false,
             };
             for case in step.lane.iter().flatten() {
@@ -1804,11 +1811,12 @@ pub fn read_applications(cache: &Path) -> Result<Vec<ApplicationRecord>, String>
 /// # Errors
 ///
 /// Returns why the lock could not be read.
-pub fn lock_applications(root: &Path, family: &str) -> Result<Vec<ApplicationRecord>, String> {
-    let path = root
-        .join("tests")
-        .join("conformance")
-        .join("applications.lock");
+pub fn lock_applications(
+    root: &Path,
+    lock: &str,
+    family: &str,
+) -> Result<Vec<ApplicationRecord>, String> {
+    let path = root.join(lock);
     let text = std::fs::read_to_string(&path)
         .map_err(|error| format!("{} could not be read: {error}", path.display()))?;
     let lock: serde_json::Value = serde_json::from_str(&text)

@@ -3,8 +3,8 @@
 //!
 //! ```text
 //! kr-conformance run --root <repository> --evidence <directory> [--group <name>]...
-//!                    [--applications <cache>] [--all-terminals]
-//! kr-conformance map --root <repository> [--typescript]
+//!                    [--applications <cache>] [--all-terminals] [--plan <file>]
+//! kr-conformance map --root <repository> [--typescript] [--plan <file>]
 //! ```
 //!
 //! `scripts/run-conformance.sh` is the way in: it fetches the applications, builds this binary and
@@ -17,15 +17,16 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use kr_conformance::evidence;
-use kr_conformance::plan::{self, Group, Platform};
+use kr_conformance::plan::Platform;
+use kr_conformance::plan_file::Plan;
 use kr_conformance::report::{self, Options, Stopped};
 
 fn usage(problem: &str) -> ExitCode {
     eprintln!("kr-conformance: {problem}");
     eprintln!(
         "usage: kr-conformance run --root <repository> --evidence <directory> [--group <name>]... \
-         [--applications <cache>] [--all-terminals] [--part <number>/<parts>]\n       kr-conformance map --root <repository> \
-         [--typescript]"
+         [--applications <cache>] [--all-terminals] [--part <number>/<parts>] [--plan <file>]\n       kr-conformance map --root <repository> \
+         [--typescript] [--plan <file>]"
     );
     ExitCode::from(2)
 }
@@ -49,18 +50,17 @@ fn main() -> ExitCode {
     let mut all_terminals = false;
     let mut typescript = false;
     let mut part = None;
+    let mut plan_path = None;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
             "--root" => root = rest.next().map(PathBuf::from),
             "--evidence" => evidence_directory = rest.next().map(PathBuf::from),
             "--applications" => applications = rest.next().map(PathBuf::from),
-            "--group" => match rest.next().map(String::as_str).and_then(Group::named) {
-                Some(group) => groups.push(group),
-                None => {
-                    let names: Vec<&str> = Group::ALL.iter().map(|group| group.name()).collect();
-                    return usage(&format!("--group takes one of {}", names.join(", ")));
-                }
+            "--plan" => plan_path = rest.next().map(PathBuf::from),
+            "--group" => match rest.next() {
+                Some(group) => groups.push(group.clone()),
+                None => return usage("--group takes the name of a group of the plan"),
             },
             "--all-terminals" => all_terminals = true,
             "--part" => match rest.next().and_then(|text| parse_part(text)) {
@@ -74,14 +74,29 @@ fn main() -> ExitCode {
     let Some(root) = root else {
         return usage("--root is required");
     };
+    // The plan is read before anything runs, and the groups are checked against it.
+    let plan = match Plan::load(&root, plan_path.as_deref()) {
+        Ok(plan) => plan,
+        Err(refusal) => {
+            eprintln!("kr-conformance: refused: {refusal}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(unknown) = groups.iter().find(|group| !plan.groups.contains(group)) {
+        return usage(&format!(
+            "--group {unknown} is not a group of the plan; it has {}",
+            plan.groups.join(", ")
+        ));
+    }
     match command.as_str() {
-        "map" => map(root, typescript),
+        "map" => map(root, plan, typescript),
         "run" => {
             let Some(evidence_directory) = evidence_directory else {
                 return usage("--evidence is required");
             };
             run(
                 root,
+                plan,
                 &evidence_directory,
                 groups,
                 applications,
@@ -100,28 +115,22 @@ fn parse_part(text: &str) -> Option<(usize, usize)> {
     (1..=parts).contains(&number).then_some((number, parts))
 }
 
-fn map(root: PathBuf, typescript: bool) -> ExitCode {
+fn map(root: PathBuf, plan: Plan, typescript: bool) -> ExitCode {
     let options = Options {
         root,
         evidence: PathBuf::new(),
-        selection: Some(if typescript {
-            vec![Group::Rust, Group::TypeScript]
-        } else {
-            vec![Group::Rust]
-        }),
+        selection: Some(Vec::new()),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: plan::CASE_TABLES,
-        lanes: plan::LANES,
-        ignored_runs: Some(plan::IGNORED_RUNS),
+        plan,
+        held_to_ignored_runs: true,
         applications: None,
-        steps: None,
         environment: Vec::new(),
         lister: PathBuf::new(),
         part: None,
         runner_base: PathBuf::new(),
     };
-    let map = report::map_for(&options);
+    let map = report::map_declared(&options, typescript);
     let tests: usize = map.keys.values().map(std::collections::BTreeMap::len).sum();
     println!(
         "{} identifiers keyed to {tests} tests; {} named only outside tests; {} refused; {} problems",
@@ -151,8 +160,9 @@ fn map(root: PathBuf, typescript: bool) -> ExitCode {
 
 fn run(
     root: PathBuf,
+    plan: Plan,
     evidence_directory: &std::path::Path,
-    groups: Vec<Group>,
+    groups: Vec<String>,
     applications: Option<PathBuf>,
     all_terminals: bool,
     part: Option<(usize, usize)>,
@@ -165,10 +175,9 @@ fn run(
         }
     };
     let selection = (!groups.is_empty()).then_some(groups);
-    let runs_applications = selection
-        .as_ref()
-        .is_none_or(|groups| groups.contains(&Group::Applications));
-    let applications = match (runs_applications, applications) {
+    let selected = selection.clone().unwrap_or_else(|| plan.all_groups());
+    let platform = Platform::current();
+    let applications = match (plan.selects_applications(&selected), applications) {
         (true, Some(cache)) => match report::read_applications(&cache) {
             Ok(records) => Some(records),
             Err(problem) => {
@@ -176,13 +185,16 @@ fn run(
                 return ExitCode::from(2);
             }
         },
-        (true, None) if Platform::current() != Platform::Windows => {
+        (true, None) if plan.runs_applications(platform, &selected) => {
             return usage(
                 "the applications group needs --applications <cache>, which the fetch step wrote",
             );
         }
         // Nothing is fetched here: each program is recorded with the reason the lock gives.
-        (true, None) => match report::lock_applications(&root, Platform::current().name()) {
+        (true, None) => match plan.applications.as_ref().map_or_else(
+            || Err("the plan names no application lock".to_owned()),
+            |lock| report::lock_applications(&root, &lock.lock, platform.name()),
+        ) {
             Ok(records) => Some(records),
             Err(problem) => {
                 eprintln!("kr-conformance: {problem}");
@@ -204,11 +216,9 @@ fn run(
         selection,
         all_terminals,
         platform: Platform::current(),
-        case_tables: plan::CASE_TABLES,
-        lanes: plan::LANES,
-        ignored_runs: Some(plan::IGNORED_RUNS),
+        plan,
+        held_to_ignored_runs: true,
         applications,
-        steps: None,
         environment: Vec::new(),
         lister,
         part,

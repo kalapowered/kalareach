@@ -2495,6 +2495,19 @@ pub fn listed_rows() -> Vec<Identifier> {
 mod tests {
     use super::*;
 
+    /// The steps core's plan file gives, as the report runs them.
+    fn steps(
+        platform: Platform,
+        groups: &[Group],
+        evidence: &str,
+        applications: Option<&ApplicationsPlan>,
+    ) -> Vec<Step> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plan = crate::plan_file::Plan::load(&root, None).expect("core's plan file");
+        let names: Vec<String> = groups.iter().map(|group| group.name().to_owned()).collect();
+        plan.steps(platform, &names, evidence, applications)
+    }
+
     #[test]
     fn the_parts_of_a_plan_each_hold_the_opening_builds_and_together_every_other_step_once() {
         let step = |what: &str, reading: Reading| Step {

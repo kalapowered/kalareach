@@ -73,7 +73,12 @@ fn every_program_is_pinned_has_cases_and_says_why_it_does_not_run_where_it_does_
             "{id} has its cases"
         );
     }
-    let recorded = report::lock_applications(&repository(), "windows").expect("reads the lock");
+    let recorded = report::lock_applications(
+        &repository(),
+        "tests/conformance/applications.lock",
+        "windows",
+    )
+    .expect("reads the lock");
     assert_eq!(recorded.len(), programs.len());
     assert!(
         recorded

@@ -20,7 +20,8 @@ use kr_conformance::id::{Identifier, Refusal};
 use kr_conformance::libtest::{Binary, Outcome as LibtestOutcome};
 use kr_conformance::map::Key;
 use kr_conformance::map::{self, Binding, Declarations, Map, Place};
-use kr_conformance::plan::{self, Group, IgnoredRun, Platform, Runs, Step};
+use kr_conformance::plan::{self, Platform, Reading, Step};
+use kr_conformance::plan_file::{IgnoredRun, Plan, Runs};
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Stopped, Verdict};
 use kr_conformance::run::Executed;
 use kr_conformance::workspace::{TargetId, TargetKind};
@@ -42,13 +43,15 @@ fn identifier(text: &str) -> Identifier {
 }
 
 fn map_of(name: &str, typescript: bool) -> Map {
+    let directories = vec![".".to_owned()];
     map::build(
         &tree(name),
         &Declarations {
             case_tables: &[],
             lanes: &[],
             ignored_runs: None,
-            typescript: typescript.then_some(&["."][..]),
+            plan_commands: &[],
+            typescript: typescript.then_some(directories.as_slice()),
             scripts: &[],
         },
     )
@@ -105,14 +108,15 @@ fn run_step_through(
         root: tree(name),
         evidence: kr_conformance::evidence::check_directory(evidence.path())
             .expect("inside the temporary directory"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo("rust", "the tree's tests", arguments)]),
+        plan: Plan::of_steps(
+            "rust",
+            vec![Step::cargo("rust", "the tree's tests", arguments)],
+        ),
         lister,
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -608,7 +612,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
             source: "crates/kr-client/src/sync/keys.rs:698".to_owned(),
         },
     );
-    let steps = plan::steps(Platform::Windows, &[Group::Rust], "/tmp/e", None);
+    let steps = core_plan().steps(Platform::Windows, &rust_group(), "/tmp/e", None);
     let whole = steps
         .iter()
         .find(|step| step.what == "the client's stores and their directory flush")
@@ -619,7 +623,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         .find(|step| step.command.iter().any(|word| word == name))
         .expect("the credential store's case")
         .clone();
-    assert_eq!(switched.needs, [plan::SECRET_STORE_VARIABLE]);
+    assert_eq!(switched.needs, [plan::SECRET_STORE_VARIABLE.to_owned()]);
     let executed = |step: Step, outcome: LibtestOutcome| Executed {
         step,
         exit: Some(0),
@@ -645,14 +649,12 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
     let options = Options {
         root: PathBuf::from("/tmp/r"),
         evidence: PathBuf::from("/tmp/e"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::Windows,
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        plan: core_plan(),
+        held_to_ignored_runs: false,
         applications: None,
-        steps: None,
         lister: PathBuf::from("/tmp/l"),
         environment: Vec::new(),
         part: None,
@@ -660,7 +662,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
     };
     let document = report::assemble(
         &options,
-        &[Group::Rust],
+        &rust_group(),
         &map,
         &[
             executed(whole, LibtestOutcome::Ignored(None)),
@@ -719,30 +721,31 @@ fn held_to(runs: &[IgnoredRun]) -> Map {
         &Declarations {
             case_tables: &[],
             lanes: &[],
+            ignored_runs: Some(runs),
+            plan_commands: &core_plan().linux_commands(),
             typescript: None,
             scripts: &[],
-            ignored_runs: Some(runs),
         },
     )
 }
 
 /// The one step that runs the ignored tests of `outcomes`, which the tree's own manifest stands in
 /// for: a file with a line `line`.
-fn outcomes_run(line: &'static str) -> IgnoredRun {
+fn outcomes_run(line: &str) -> IgnoredRun {
     outcomes_entry(
         &[],
         Runs::Command {
-            file: "Cargo.toml",
-            line,
+            file: "Cargo.toml".to_owned(),
+            line: line.to_owned(),
         },
     )
 }
 
-fn outcomes_entry(cases: &'static [&'static str], runs: Runs) -> IgnoredRun {
+fn outcomes_entry(cases: &[&str], runs: Runs) -> IgnoredRun {
     IgnoredRun {
-        package: "outcomes",
-        target: "--lib",
-        cases,
+        package: "outcomes".to_owned(),
+        target: "--lib".to_owned(),
+        cases: cases.iter().map(|case| (*case).to_owned()).collect(),
         runs,
     }
 }
@@ -787,8 +790,8 @@ fn a_step_that_lost_its_command_or_has_nothing_left_to_run_stops_the_map() {
         outcomes_entry(
             &["tests::passes"],
             Runs::Command {
-                file: "Cargo.toml",
-                line: "harness = false",
+                file: "Cargo.toml".to_owned(),
+                line: "harness = false".to_owned(),
             },
         ),
     ]);
@@ -824,15 +827,18 @@ fn found_in_file(
     let runs = [outcomes_entry(
         &[],
         match names_with {
-            None => Runs::Command { file, line },
+            None => Runs::Command {
+                file: file.to_owned(),
+                line: line.to_owned(),
+            },
             Some(names_with) => Runs::Supplied {
-                file,
-                line,
-                names_with,
+                file: file.to_owned(),
+                line: line.to_owned(),
+                names_with: names_with.iter().map(|word| (*word).to_owned()).collect(),
             },
         },
     )];
-    kr_conformance::ignored::check(&map, directory.path(), &runs).problems
+    kr_conformance::ignored::check(&map, directory.path(), &runs, &[]).problems
 }
 
 const NAMES: &str =
@@ -1095,7 +1101,14 @@ fn a_command_whose_names_a_call_passes_finds_them_on_the_calls() {
 #[test]
 fn a_step_of_the_report_is_found_in_the_plan_and_a_step_nothing_runs_is_shown() {
     // A step of the report's own plan is found in the plan, with exactly its words.
-    let plan = |line| outcomes_entry(&[], Runs::Plan { line });
+    let plan = |line: &str| {
+        outcomes_entry(
+            &[],
+            Runs::Plan {
+                line: line.to_owned(),
+            },
+        )
+    };
     let applications = "cargo test --locked -p kr-conformance --test applications -- --ignored --test-threads=1 --show-output";
     let found = held_to(&[plan(applications)]);
     assert!(found.problems.is_empty(), "{:?}", found.problems);
@@ -1110,7 +1123,7 @@ fn a_step_of_the_report_is_found_in_the_plan_and_a_step_nothing_runs_is_shown() 
     let by_hand = held_to(&[outcomes_entry(
         &[],
         Runs::ByHand {
-            why: "a person does",
+            why: "a person does".to_owned(),
         },
     )]);
     assert!(
@@ -1123,7 +1136,7 @@ fn a_step_of_the_report_is_found_in_the_plan_and_a_step_nothing_runs_is_shown() 
     let nowhere = held_to(&[outcomes_entry(
         &[],
         Runs::Nowhere {
-            why: "it cannot yet",
+            why: "it cannot yet".to_owned(),
         },
     )]);
     assert!(
@@ -1137,7 +1150,14 @@ fn a_step_of_the_report_is_found_in_the_plan_and_a_step_nothing_runs_is_shown() 
 
 #[test]
 fn a_helper_is_named_beside_the_flags_that_ask_for_it() {
-    let helper = |file| outcomes_entry(&["tests::"], Runs::Helper { file });
+    let helper = |file: &str| {
+        outcomes_entry(
+            &["tests::"],
+            Runs::Helper {
+                file: file.to_owned(),
+            },
+        )
+    };
     assert!(held_to(&[helper("spawns.txt")]).problems.is_empty());
     // The flags of another spawn, far from the helper's name, do not stand for its own.
     let far = held_to(&[helper("spawns_far.txt")]);
@@ -1148,16 +1168,21 @@ fn a_helper_is_named_beside_the_flags_that_ask_for_it() {
         far.problems
     );
     // Every start of a helper needs its own flags, not only one of them.
-    let one = |file| {
+    let one = |file: &str| {
         [
-            outcomes_entry(&["tests::is_ignored"], Runs::Helper { file }),
+            outcomes_entry(
+                &["tests::is_ignored"],
+                Runs::Helper {
+                    file: file.to_owned(),
+                },
+            ),
             outcomes_entry(
                 &[
                     "tests::is_ignored_too",
                     "tests::is_ignored_for_a_reason_over_two_lines",
                 ],
                 Runs::ByHand {
-                    why: "a person does",
+                    why: "a person does".to_owned(),
                 },
             ),
         ]
@@ -1499,18 +1524,19 @@ fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_
     let options = Options {
         root: tree("late"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
+        plan: Plan::of_steps(
             "rust",
-            "the tree's tests",
-            &["test", "--locked", "-p", "late", "--no-fail-fast"],
-        )]),
+            vec![Step::cargo(
+                "rust",
+                "the tree's tests",
+                &["test", "--locked", "-p", "late", "--no-fail-fast"],
+            )],
+        ),
         lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1554,18 +1580,19 @@ fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
     let options = Options {
         root: tree("late"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
+        plan: Plan::of_steps(
             "rust",
-            "the package's tests",
-            &["test", "--locked", "-p", "racy", "--no-fail-fast"],
-        )]),
+            vec![Step::cargo(
+                "rust",
+                "the package's tests",
+                &["test", "--locked", "-p", "racy", "--no-fail-fast"],
+            )],
+        ),
         lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1596,18 +1623,19 @@ fn a_file_a_library_wrote_and_two_test_programs_read_leaves_the_listing_nothing_
     let options = Options {
         root: tree("late"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
+        plan: Plan::of_steps(
             "rust",
-            "the package's tests",
-            &["test", "--locked", "-p", "shared", "--no-fail-fast"],
-        )]),
+            vec![Step::cargo(
+                "rust",
+                "the package's tests",
+                &["test", "--locked", "-p", "shared", "--no-fail-fast"],
+            )],
+        ),
         lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1740,18 +1768,19 @@ fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
     let again = Options {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
+        plan: Plan::of_steps(
             "rust",
-            "the tree's tests",
-            &["test", "--locked", "--workspace", "--no-fail-fast"],
-        )]),
+            vec![Step::cargo(
+                "rust",
+                "the tree's tests",
+                &["test", "--locked", "--workspace", "--no-fail-fast"],
+            )],
+        ),
         lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1779,15 +1808,19 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
         selection: None,
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
-            "rust",
-            "the library's tests",
-            &["test", "--locked", "--lib"],
-        )]),
+        plan: Plan {
+            list_table_rows: true,
+            ..Plan::of_steps(
+                "rust",
+                vec![Step::cargo(
+                    "rust",
+                    "the library's tests",
+                    &["test", "--locked", "--lib"],
+                )],
+            )
+        },
         lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1834,18 +1867,19 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
     let options = Options {
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
+        plan: Plan::of_steps(
             "rust",
-            "the library's tests",
-            &["test", "--locked", "--lib"],
-        )]),
+            vec![Step::cargo(
+                "rust",
+                "the library's tests",
+                &["test", "--locked", "--lib"],
+            )],
+        ),
         lister: failing,
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1878,18 +1912,19 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
     let options = Options {
         root: tree("outcomes"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
+        plan: Plan::of_steps(
             "rust",
-            "the tree's tests, stopping at the first failure",
-            &["test", "--locked", "--workspace"],
-        )]),
+            vec![Step::cargo(
+                "rust",
+                "the tree's tests, stopping at the first failure",
+                &["test", "--locked", "--workspace"],
+            )],
+        ),
         lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1930,15 +1965,19 @@ fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_
         selection: None,
         all_terminals: true,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
-            "rust",
-            "the library's tests",
-            &["test", "--locked", "--lib"],
-        )]),
+        plan: Plan {
+            terminals: core_plan().terminals,
+            ..Plan::of_steps(
+                "rust",
+                vec![Step::cargo(
+                    "rust",
+                    "the library's tests",
+                    &["test", "--locked", "--lib"],
+                )],
+            )
+        },
         lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -1987,18 +2026,19 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
     let options = Options {
         root: tree("outcomes"),
         evidence: kr_conformance::evidence::check_directory(evidence.path()).expect("inside"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
+        plan: Plan::of_steps(
             "rust",
-            "the ignored tests alone",
-            &["test", "--locked", "--lib", "--", "--ignored"],
-        )]),
+            vec![Step::cargo(
+                "rust",
+                "the ignored tests alone",
+                &["test", "--locked", "--lib", "--", "--ignored"],
+            )],
+        ),
         lister: lister(),
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
@@ -2028,8 +2068,24 @@ fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
-#[test]
-fn the_end_to_end_group_runs_what_the_end_to_end_script_runs() {
+/// Core's own plan file.
+fn core_plan() -> Plan {
+    Plan::load(&repository(), None).expect("core's plan file")
+}
+
+/// The selection of the Rust group alone.
+fn rust_group() -> Vec<String> {
+    vec!["rust".to_owned()]
+}
+
+/// The word that follows `flag` in a step's command.
+fn word_after(step: &Step, flag: &str) -> Option<String> {
+    let at = step.command.iter().position(|word| word == flag)?;
+    step.command.get(at + 1).cloned()
+}
+
+/// What `scripts/end-to-end.sh` runs, against the plan's end-to-end steps.
+fn end_to_end_drift(plan: &Plan) -> Result<(), String> {
     let script = std::fs::read_to_string(repository().join("scripts").join("end-to-end.sh"))
         .expect("the script");
     let listed: Vec<(String, String)> = script
@@ -2039,21 +2095,30 @@ fn the_end_to_end_group_runs_what_the_end_to_end_script_runs() {
         .filter_map(|(target, _)| target.split_once(':'))
         .map(|(package, suite)| (package.to_owned(), suite.to_owned()))
         .collect();
-    let planned: Vec<(String, String)> = plan::END_TO_END_SUITES
+    let planned: Vec<(String, String)> = plan
+        .steps(Platform::Linux, &["end-to-end".to_owned()], "/tmp/e", None)
         .iter()
-        .map(|(package, suite)| ((*package).to_owned(), (*suite).to_owned()))
+        .filter(|step| step.reading == Reading::Cargo)
+        .filter_map(|step| Some((word_after(step, "-p")?, word_after(step, "--test")?)))
         .collect();
-    assert_eq!(
-        planned, listed,
-        "scripts/end-to-end.sh's suites, in its order"
-    );
-    assert!(
-        script.contains("-- --test-threads=1 $ignored"),
-        "one test at a time"
-    );
-    assert!(
-        script.contains("if [ \"$suite\" = \"network\" ]; then\n    ignored=\"--include-ignored\"")
-    );
+    if planned != listed {
+        return Err(format!(
+            "scripts/end-to-end.sh's suites, in its order: {listed:?} against the plan's {planned:?}"
+        ));
+    }
+    if !script.contains("-- --test-threads=1 $ignored") {
+        return Err("the script runs one test at a time".to_owned());
+    }
+    if !script.contains("if [ \"$suite\" = \"network\" ]; then\n    ignored=\"--include-ignored\"")
+    {
+        return Err("the script includes the ignored tests of the network suite".to_owned());
+    }
+    Ok(())
+}
+
+#[test]
+fn the_end_to_end_group_runs_what_the_end_to_end_script_runs() {
+    assert_eq!(end_to_end_drift(&core_plan()), Ok(()));
 }
 
 /// The `cargo test` commands a job of the landing workflow runs, each as one line: a folded value
@@ -2128,22 +2193,21 @@ fn without_display(command: &str) -> String {
     words.join(" ")
 }
 
-/// KR-REQ-29.01, the part about reproducible commands: the test steps the report plans for Windows
+/// KR-REQ-29.01, the part about reproducible commands: the test steps the plan holds for Windows
 /// are the tests the landing workflow's Windows job runs, its build steps are builds that job also
-/// runs, and the workspace step it plans for macOS leaves out, by name, the cases the macOS job's
+/// runs, and the workspace step it holds for macOS leaves out, by name, the cases the macOS job's
 /// workspace run leaves out.
-#[test]
-fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
+fn platform_drift(plan: &Plan) -> Result<(), String> {
     // Windows: every `cargo test` of the workflow's Windows job is a step, and every test step is
     // one; what the plan builds first, the Windows job builds too.
     let mut workflow: Vec<String> = workflow_commands("windows", "cargo test")
         .iter()
         .map(|command| without_display(command))
         .collect();
-    let (builds, tests): (Vec<Step>, Vec<Step>) =
-        plan::steps(Platform::Windows, &Group::ALL, "/tmp/e", None)
-            .into_iter()
-            .partition(|step| step.command.get(1).is_some_and(|word| word == "build"));
+    let (builds, tests): (Vec<Step>, Vec<Step>) = plan
+        .steps(Platform::Windows, &plan.all_groups(), "/tmp/e", None)
+        .into_iter()
+        .partition(|step| step.command.get(1).is_some_and(|word| word == "build"));
     let mut planned: Vec<String> = tests
         .iter()
         .map(|step| without_display(&step.line()))
@@ -2151,15 +2215,19 @@ fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
     workflow.sort();
     workflow.dedup();
     planned.sort();
-    assert_eq!(planned, workflow, "the Windows job's tests");
+    if planned != workflow {
+        return Err(format!(
+            "the Windows job's tests: {planned:?} against {workflow:?}"
+        ));
+    }
     let built = workflow_commands("windows", "cargo build");
-    assert!(!builds.is_empty());
+    if builds.is_empty() {
+        return Err("the plan builds nothing first on Windows".to_owned());
+    }
     for step in &builds {
-        assert!(
-            built.contains(&step.line()),
-            "{} among {built:?}",
-            step.line()
-        );
+        if !built.contains(&step.line()) {
+            return Err(format!("{} among {built:?}", step.line()));
+        }
     }
 
     // macOS: the workspace step leaves out what the workflow's macOS job leaves out, by name.
@@ -2174,18 +2242,28 @@ fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
         .filter(|pair| pair[0] == "--skip")
         .map(|pair| pair[1].to_owned())
         .collect();
-    let mut skipped: Vec<String> = plan::steps(Platform::MacOs, &[Group::Rust], "/tmp/e", None)[0]
+    let mut skipped: Vec<String> = plan.steps(Platform::MacOs, &rust_group(), "/tmp/e", None)[0]
         .skips
         .iter()
         .map(|(name, _)| name.clone())
         .collect();
     left_out.sort();
     skipped.sort();
-    assert_eq!(skipped, left_out, "the macOS job's workspace run");
+    if skipped != left_out {
+        return Err(format!(
+            "the macOS job's workspace run: {skipped:?} against {left_out:?}"
+        ));
+    }
+    Ok(())
 }
 
 #[test]
-fn the_performance_group_takes_what_the_performance_script_takes() {
+fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
+    assert_eq!(platform_drift(&core_plan()), Ok(()));
+}
+
+/// What `scripts/performance.sh` measures, against the plan's performance steps.
+fn performance_drift(plan: &Plan) -> Result<(), String> {
     let script = std::fs::read_to_string(repository().join("scripts").join("performance.sh"))
         .expect("the script");
     let listed: Vec<(String, String)> = script
@@ -2198,15 +2276,113 @@ fn the_performance_group_takes_what_the_performance_script_takes() {
             Some((format!("{kind} {target}"), name.to_owned()))
         })
         .collect();
-    let planned: Vec<(String, String)> = plan::MEASUREMENTS
+    let planned: Vec<(String, String)> = plan
+        .steps(Platform::Linux, &["performance".to_owned()], "/tmp/e", None)
         .iter()
-        .map(|(target, name)| ((*target).to_owned(), (*name).to_owned()))
+        .filter(|step| step.command.iter().any(|word| word == "--exact"))
+        .filter_map(|step| {
+            let (kind, target) = word_after(step, "--test")
+                .map(|target| ("test", target))
+                .or_else(|| word_after(step, "--bench").map(|target| ("bench", target)))?;
+            Some((format!("{kind} {target}"), step.command.last()?.clone()))
+        })
         .collect();
-    assert_eq!(
-        planned, listed,
-        "scripts/performance.sh's measurements, in its order"
-    );
-    assert!(script.contains("-- --ignored --exact --nocapture \"$name\""));
+    if planned != listed {
+        return Err(format!(
+            "scripts/performance.sh's measurements, in its order: {listed:?} against the plan's {planned:?}"
+        ));
+    }
+    if !script.contains("-- --ignored --exact --nocapture \"$name\"") {
+        return Err("the script runs each measurement exactly, uncaptured".to_owned());
+    }
+    Ok(())
+}
+
+#[test]
+fn the_performance_group_takes_what_the_performance_script_takes() {
+    assert_eq!(performance_drift(&core_plan()), Ok(()));
+}
+
+/// The two group names `scripts/run-conformance.sh` selects by, against the plan's groups.
+fn script_groups_drift(plan: &Plan) -> Result<(), String> {
+    let script = std::fs::read_to_string(repository().join("scripts").join("run-conformance.sh"))
+        .expect("the script");
+    let used: Vec<&str> = script
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("if selected "))
+        .filter_map(|rest| rest.split(';').next())
+        .collect();
+    if used != ["applications", "typescript"] {
+        return Err(format!("the script selects by {used:?}"));
+    }
+    for name in used {
+        if !plan.groups.iter().any(|group| group == name) {
+            return Err(format!(
+                "the script selects by {name}, which the plan has no group of"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_groups_the_conformance_script_selects_by_are_the_plans() {
+    assert_eq!(script_groups_drift(&core_plan()), Ok(()));
+}
+
+/// Each drift case fails once, against a planted edit of an in-memory copy of the file: a suite
+/// dropped from the end-to-end steps, a Windows step's command edited, a macOS skip removed, a
+/// group name edited against the script that selects by it.
+#[test]
+fn each_drift_case_fails_against_a_planted_edit_of_a_copy_of_the_file() {
+    let plan = core_plan();
+
+    let mut dropped = plan.clone();
+    let at = dropped
+        .steps
+        .iter()
+        .position(|step| {
+            step.group == "end-to-end" && step.command.iter().any(|word| word == "--test")
+        })
+        .expect("an end-to-end suite");
+    dropped.steps.remove(at);
+    assert!(end_to_end_drift(&dropped).is_err());
+
+    let mut edited = plan.clone();
+    let windows = edited
+        .steps
+        .iter_mut()
+        .find(|step| {
+            step.platforms == [Platform::Windows]
+                && step.reading == kr_conformance::plan_file::ReadingKind::Cargo
+        })
+        .expect("a Windows test step");
+    windows.command.push("--quiet".to_owned());
+    assert!(platform_drift(&edited).is_err());
+
+    let mut kept = plan.clone();
+    let macos = kept
+        .steps
+        .iter_mut()
+        .find(|step| step.platforms == [Platform::MacOs] && !step.skips.is_empty())
+        .expect("the macOS workspace step");
+    macos.skips.remove(0);
+    assert!(platform_drift(&kept).is_err());
+
+    let mut measured = plan.clone();
+    let at = measured
+        .steps
+        .iter()
+        .position(|step| {
+            step.group == "performance" && step.command.iter().any(|word| word == "--exact")
+        })
+        .expect("a measurement");
+    measured.steps.remove(at);
+    assert!(performance_drift(&measured).is_err());
+
+    let mut renamed = plan;
+    renamed.groups[3] = "javascript".to_owned();
+    assert!(script_groups_drift(&renamed).is_err());
 }
 
 /// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: a key in a
