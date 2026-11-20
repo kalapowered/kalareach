@@ -259,6 +259,12 @@ const KEPT: &[Row] = &[
         removal: NAMES_ONLY_REMOVAL,
     },
     Row {
+        file: "tests/conformance/tests/detach_status.rs",
+        reason: "it names `kr()` only inside the text of a control that its scan reads, and the one \
+                 program it starts is `git`, to list the files the repository tracks",
+        removal: "none while `kr()` appears in that text only and no other program is started",
+    },
+    Row {
         file: "crates/kr-cli/tests/support/mod.rs",
         reason: "it places copies of the programs other sources start and starts each copy once with \
                  `--version` to establish that it runs; it creates no session",
