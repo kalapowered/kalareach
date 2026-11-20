@@ -112,6 +112,9 @@ fn set_mode(console: &File, mode: u32) {
 
 /// What the helper case runs: the observer of the mode `mode`.
 pub fn observe(mode: &str) {
+    // The test program has printed the name of this case without a line end. Every line the observer
+    // says begins a row of its own, so a case reads it from the start of the row.
+    println!();
     // SAFETY: the handler is a function that lives for the whole process and touches only atomics.
     let installed = unsafe { SetConsoleCtrlHandler(Some(take_the_event), 1) };
     assert!(installed != 0, "the observer installs its handler");
@@ -193,7 +196,7 @@ fn run_kr() {
             .args(&arguments)
             .spawn()
             .expect("the observer starts kr");
-        println!("kr-observer: kr pid {}", child.id());
+        println!("{}{}", crate::KR_PID_SAID, child.id());
         child
             .wait()
             .expect("the observer waits for kr")
@@ -258,7 +261,7 @@ fn run_under_debugger(kr: &str, arguments: &[&str]) -> i32 {
         )
     };
     assert!(started != 0, "the observer starts kr as its debuggee");
-    println!("kr-observer: kr pid {}", process.dwProcessId);
+    println!("{}{}", crate::KR_PID_SAID, process.dwProcessId);
     loop {
         // SAFETY: the structure is plain data that the call fills.
         let mut event: DEBUG_EVENT = unsafe { std::mem::zeroed() };

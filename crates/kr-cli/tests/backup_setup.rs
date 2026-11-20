@@ -2451,14 +2451,47 @@ fn the_console_half_of_a_setup_window() {
     }
 }
 
-/// The identifier of the `kr` the observer started.
-#[cfg(windows)]
-fn kr_pid_of(shown: &str) -> u32 {
+/// What the observer prints before the identifier of the `kr` it started.
+const KR_PID_SAID: &str = "kr-observer: kr pid ";
+
+/// The identifier of the `kr` the observer said it started, read from where the marker stands in a
+/// line: the test program prints the name of the case it runs before the case's first line, so the
+/// observer's first line does not begin at the start of a row. No marker, or a word after it that
+/// is not an identifier, gives nothing.
+fn pid_the_observer_said(shown: &str) -> Option<u32> {
     shown
         .lines()
-        .find_map(|line| line.trim().strip_prefix("kr-observer: kr pid "))
-        .and_then(|pid| pid.trim().parse().ok())
+        .find_map(|line| line.split_once(KR_PID_SAID).map(|(_, rest)| rest))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|pid| pid.parse().ok())
+}
+
+/// The identifier of the `kr` the observer started; the case fails when the observer did not say.
+#[cfg(windows)]
+fn kr_pid_of(shown: &str) -> u32 {
+    pid_the_observer_said(shown)
         .unwrap_or_else(|| panic!("the observer said which kr it started: {shown}"))
+}
+
+/// The line as the console shows it when the test program has just printed `test <name> ... `
+/// without a line end: the observer's first line follows on the same row. A marker that is not at
+/// the start of the line is found, the first identifier is the one said, and a marker with no
+/// identifier after it says nothing.
+#[test]
+fn the_identifier_the_observer_said_is_found_after_the_test_programs_own_text() {
+    assert_eq!(
+        pid_the_observer_said(
+            "test the_console_half_of_a_setup_window ... kr-observer: kr pid 30196\nkr ended 0"
+        ),
+        Some(30196)
+    );
+    assert_eq!(
+        pid_the_observer_said("noise\nkr-observer: kr pid 7 extra\nkr-observer: kr pid 9"),
+        Some(7)
+    );
+    assert_eq!(pid_the_observer_said("kr-observer: kr pid "), None);
+    assert_eq!(pid_the_observer_said("kr-observer: kr pid seven"), None);
+    assert_eq!(pid_the_observer_said("kr-observer: ready"), None);
 }
 
 /// The way Ctrl-Break reaches a program on a console on this machine.
