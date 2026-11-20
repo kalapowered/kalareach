@@ -187,9 +187,6 @@ export interface FinishHold {
   refuse(code: string, message: string): void
 }
 
-/** The most lines a preview carries before it is cut. */
-export const PREVIEW_LINES = 40
-
 /** The screen the session shows until a test changes it. */
 export const SCREEN: readonly string[] = [
   '$ cargo test -p kr-client --test session',
