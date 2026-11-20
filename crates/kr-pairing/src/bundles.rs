@@ -102,12 +102,6 @@ impl ExchangeBudget {
         Ok(())
     }
 
-    /// Returns how many bytes the exchange has used.
-    #[must_use]
-    pub const fn used_bytes(&self) -> usize {
-        self.total_bytes
-    }
-
     fn charge(&mut self, size: usize) -> Result<()> {
         if size > MAX_PAIRING_FRAME_LEN {
             return Err(PairingError::TooLarge {
@@ -597,7 +591,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(budget.total_bytes, 0);
         assert_eq!(budget.next_outbound(16).expect("a sequence").get(), 0);
     }
 
@@ -617,7 +611,7 @@ mod tests {
             }
         }
         assert_eq!(sent, MAX_PAIRING_EXCHANGE_LEN);
-        assert_eq!(budget.used_bytes(), MAX_PAIRING_EXCHANGE_LEN);
+        assert_eq!(budget.total_bytes, MAX_PAIRING_EXCHANGE_LEN);
         assert_eq!(MAX_PAIRING_EXCHANGE_LEN, 256 * 1024);
         assert_eq!(MAX_PAIRING_FRAME_LEN, 64 * 1024);
     }
