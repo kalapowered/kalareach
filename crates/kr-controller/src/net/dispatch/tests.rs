@@ -1710,7 +1710,7 @@ async fn worker_answering_pages_with(
 }
 
 /// Turns privacy mode on at the daemon as its record does, and returns once it is published.
-async fn privacy_mode_is_turned_on(controller: &crate::service::Controller) {
+pub(super) async fn privacy_mode_is_turned_on(controller: &crate::service::Controller) {
     let privacy = std::sync::Arc::clone(&controller.privacy);
     tokio::task::spawn_blocking(move || {
         let admitted = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();

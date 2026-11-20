@@ -580,6 +580,12 @@ impl RemoteConnection {
         {
             return Err(error);
         }
+        // A repeat of this mutation can be answered from the receipt the worker kept, which carries
+        // the result that privacy mode removes from a session's receipts. The answer is released
+        // only under the privacy state it was read under, which is taken before the worker is
+        // asked.
+        let read_under =
+            super::output::ReadUnder::now_settled(&self.controller, Some(session_id)).await?;
         // The effect runs on a task that outlives this connection, for the same reason the
         // daemon's own effects do: the worker commits the intent before it answers, and a
         // cancellation here must not be what decides whether the outcome is recorded.
@@ -639,7 +645,10 @@ impl RemoteConnection {
                         return Err(outcome_not_shown());
                     }
                     match self.may_read_receipts(Some(session_id), answering, acting, validated) {
-                        Ok(read) => *asked = Some(read),
+                        Ok(mut read) => {
+                            read.read_under = Some(read_under);
+                            *asked = Some(read);
+                        }
                         Err(_) => return Err(outcome_not_shown()),
                     }
                 }

@@ -357,3 +357,56 @@ async fn a_mutation_refused_from_a_closure_record_is_not_shown_when_a_fence_land
         world.serving.abort();
     }
 }
+
+/// KR-REQ-24.28: a mutation the worker answers from a receipt it kept carries the result that
+/// privacy mode removes from a session's receipts, so it is shown only under the privacy state it
+/// was read under. Privacy mode starts while the answer waits to be written; the device is told that
+/// the outcome is not shown, and not that the action did not happen. The control: with no change
+/// the device is told what the receipt holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mutation_the_worker_answers_from_its_receipt_is_not_shown_when_privacy_mode_starts_before_it_is_sent()
+ {
+    for starts in [false, true] {
+        let world =
+            a_worker_that_answers_from_its_receipt(Arc::new(|_| Outcome::Ok(ParamsValue::empty())))
+                .await;
+        let (connection, recording) = paired_connection(&world.controller, 46, EVERY_RIGHT);
+        let prompt = a_prompt_to(&world, &connection, world.session_id);
+        let answered = connection
+            .answer_now(ControlFrame::Mutation(Box::new(prompt)))
+            .await
+            .expect("the request is answered");
+        assert!(
+            answered
+                .asked
+                .as_ref()
+                .is_some_and(|asked| asked.is_kept() && asked.read_under.is_some()),
+            "a kept answer is held to the privacy state it was read under: {:?}",
+            answered.frame()
+        );
+        if starts {
+            super::tests::privacy_mode_is_turned_on(&world.controller).await;
+        }
+        assert!(
+            connection.write_answer(connection.output(), answered).await,
+            "the connection stands"
+        );
+        let told = match &recording.frames()[0] {
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(told),
+                ..
+            }) => Some(told.code),
+            _ => None,
+        };
+        if starts {
+            assert_eq!(
+                told,
+                Some(ErrorCode::OutcomeUnknown),
+                "the outcome is not shown"
+            );
+        } else {
+            assert_eq!(told, None, "the receipt's result is shown");
+        }
+        world.serving.abort();
+    }
+}
