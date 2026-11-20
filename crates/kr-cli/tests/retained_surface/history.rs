@@ -474,10 +474,24 @@ pub fn read_history(
             version: release.version,
             committed: committed(repository, &release.commit)?,
         };
-        snapshots.push(snapshot_at(repository, entry, tagged)?);
+        snapshots.push(in_a_thread_of_its_own(|| {
+            snapshot_at(repository, entry, tagged)
+        })?);
     }
     snapshots.sort_by(|left, right| left.at.order().cmp(&right.at.order()));
     Ok((expected, snapshots))
+}
+
+/// Runs `read` in a thread of its own and gives back what it returns. With `span-locations`,
+/// proc-macro2 keeps the text of every file a thread parses behind one 32-bit offset, so a thread
+/// that parses about 4 GiB of source in all overflows it, and the 124 tags hold more than that
+/// (each file is parsed about three times for a tag). A tag read in a thread of its own gives the
+/// thread's source map back with the thread.
+fn in_a_thread_of_its_own<T: Send>(read: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| match scope.spawn(read).join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
 }
 
 /// Extracts a release's tree into a folder of this function's own, reads the entry's crates,

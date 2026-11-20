@@ -351,9 +351,9 @@ fn app_source(label: &str, file: &str, text: &str) -> Source {
     source_of("companion_tauri", &format!("{APP}/src/{file}"), label, text)
 }
 
-/// Reads the repository with the entry that lists the digests of the fixture's items, made here
-/// from their texts, and the repository's oldest tag.
-fn read(repo: &Repo) -> Read {
+/// The entry that lists the digests of the fixture's items, made here from their texts, and the
+/// repository's oldest tag.
+fn entry_of(repo: &Repo) -> Narrower {
     let lib = "lib.rs";
     let digests = [
         app_source("Link::target", lib, &target_text(1)).digest,
@@ -361,7 +361,12 @@ fn read(repo: &Repo) -> Read {
         app_source("old_builder", lib, OLD_BUILDER).digest,
         app_source("relay", lib, RELAY).digest,
     ];
-    let entry = entry(&digests, 7, leaked(repo.tags[0].clone()));
+    entry(&digests, 7, leaked(repo.tags[0].clone()))
+}
+
+/// Reads the repository with its entry.
+fn read(repo: &Repo) -> Read {
+    let entry = entry_of(repo);
     let (expected, snapshots) = read_history(repo.work.path(), &entry).expect("the history");
     Read {
         expected,
@@ -983,6 +988,50 @@ fn the_snapshots_are_read_in_the_order_of_releases_and_hold_the_apps_crate() {
             .iter()
             .all(|snapshot| snapshot.krates.get("companion_tauri")
                 == Some(&Lookup::Found(String::new())))
+    );
+}
+
+/// The offsets, in the source map of this thread, of the file that parsing `a` adds to it. The span
+/// of the one token is the whole file, and its debug text names the offsets.
+fn offsets_of_a_parse_in_this_thread() -> (u32, u32) {
+    let tokens: proc_macro2::TokenStream = "a".parse().expect("a token");
+    let span = tokens.into_iter().next().expect("one token").span();
+    let text = format!("{span:?}");
+    let inner = text
+        .strip_prefix("bytes(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("a span with byte offsets (span-locations is on): {text}"));
+    let (low, high) = inner.split_once("..").expect("two offsets");
+    (
+        low.parse().expect("a number"),
+        high.parse().expect("a number"),
+    )
+}
+
+#[test]
+fn each_tag_is_read_in_a_thread_of_its_own_so_the_source_map_that_the_files_fill_goes_with_it() {
+    // The control: a thread numbers the file it parses after the files it parsed before, which is
+    // the map that overflows at about 4 GiB, so the probe sees a file added to this thread.
+    let (_, first_end) = offsets_of_a_parse_in_this_thread();
+    let (second_start, _) = offsets_of_a_parse_in_this_thread();
+    assert_eq!(
+        second_start,
+        first_end + 1,
+        "the control: one file after the other"
+    );
+    // The reader parses the files of every tag in the fixture, and none of them is added to the map
+    // of this thread: the next file here is numbered right after the control's second file. The
+    // entry is made first, since its digests are made by parsing in this thread.
+    let repo = repo(None, None);
+    let entry = entry_of(&repo);
+    let (_, entry_end) = offsets_of_a_parse_in_this_thread();
+    let (_, snapshots) = read_history(repo.work.path(), &entry).expect("the history");
+    assert!(snapshots.len() > 1, "the fixture has several tags");
+    let (third_start, _) = offsets_of_a_parse_in_this_thread();
+    assert_eq!(
+        third_start,
+        entry_end + 1,
+        "the reader added files to the source map of the thread that called it"
     );
 }
 
