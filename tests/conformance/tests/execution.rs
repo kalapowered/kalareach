@@ -396,6 +396,50 @@ fn a_run_makes_in_the_evidence_only_the_logs_and_the_directories_of_its_outputs(
     );
 }
 
+/// KR-REQ-29.01, the part about reproducible commands: a step whose output is there before it runs
+/// is not run, because the plan's checks keep one step's output from another's only where they see
+/// it, in `output`, and a command word of an earlier step can name the same place. Here an earlier
+/// step writes the later step's output, and the later step would otherwise be read from what the
+/// earlier wrote.
+#[cfg(unix)]
+#[test]
+fn a_step_whose_output_exists_before_it_runs_is_not_run() {
+    let (_directory, root) = copy("setup-step");
+    let text = plan_of(
+        &["Cargo.toml"],
+        "[[step]]
+id = 'writer'
+group = 'rust'
+what = 'the writer'
+platforms = ['linux', 'macos', 'windows']
+reading = 'build'
+command = ['bash', 'scripts/write.sh', '{evidence}/conformance/x.txt']
+[[step]]
+id = 'owner'
+group = 'rust'
+what = 'the owner'
+platforms = ['linux', 'macos', 'windows']
+reading = 'build'
+output = '{evidence}/conformance/x.txt'
+command = ['bash', 'scripts/write.sh', '{output}']
+",
+    );
+    let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let steps = &ran.document.steps;
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert_eq!((steps[0].exit, steps[0].error.as_deref()), (Some(0), None));
+    assert_eq!(
+        (steps[1].exit, steps[1].error.as_deref()),
+        (
+            None,
+            Some(
+                "the output `conformance/x.txt` of the step was there before the step \
+                 ran, so another step or command wrote it"
+            )
+        )
+    );
+}
+
 /// KR-REQ-29.01, the part about reproducible commands: a directory a step builds in is a directory
 /// the report's own program is not copied into, whichever way the step is given it: by the plan's
 /// `[env]`, by the step's `env` or by the options the program was started with, absolute or
