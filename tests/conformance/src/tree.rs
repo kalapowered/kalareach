@@ -121,39 +121,15 @@ fn supervised(
     if Instant::now() >= deadline.at {
         return Ok(Waited::NotStarted);
     }
-    let mut child = spawn(command, capture)?;
-    watch(&mut child, deadline)
-}
-
-/// Starts `command` as the leader of a process group of its own, with its standard output a pipe
-/// when `capture`. [`watch`] supervises what it starts.
-///
-/// # Errors
-///
-/// Says why the command could not be started.
-#[cfg(unix)]
-pub fn spawn(command: &mut Command, capture: bool) -> io::Result<Child> {
     Group::prepare(command);
     if capture {
         command.stdout(Stdio::piped());
     }
-    command.spawn()
-}
-
-/// Supervises `child`, which [`spawn`] started, until its time `deadline` is spent: reads what it
-/// writes to its captured pipes, and ends its group and reaps it when the time is spent. A caller
-/// that keeps `child` owns the group's number until this returns: `child` is not reaped before the
-/// last signal this sends.
-///
-/// # Errors
-///
-/// Says why `child` could not be waited for.
-#[cfg(unix)]
-pub fn watch(child: &mut Child, deadline: Deadline) -> io::Result<Waited<Output>> {
-    let mut pipes = match Pipes::of(child) {
+    let mut child = command.spawn()?;
+    let mut pipes = match Pipes::of(&mut child) {
         Ok(pipes) => pipes,
         Err(error) => {
-            Group::end(child, &mut Pipes::none(), GRACE);
+            Group::end(&mut child, &mut Pipes::none(), GRACE);
             return Err(error);
         }
     };
@@ -165,7 +141,7 @@ pub fn watch(child: &mut Child, deadline: Deadline) -> io::Result<Waited<Output>
     while pipes.open() {
         match pipes.pass(deadline.at, Instant::now) {
             Pass::Ended => break,
-            Pass::Spent => return Ok(Waited::TimedOut(Group::ended(child, pipes))),
+            Pass::Spent => return Ok(Waited::TimedOut(Group::ended(&mut child, pipes))),
             Pass::Open(true) => {}
             Pass::Open(false) => {
                 std::thread::sleep(POLL.min(deadline.at.saturating_duration_since(Instant::now())));
@@ -178,7 +154,7 @@ pub fn watch(child: &mut Child, deadline: Deadline) -> io::Result<Waited<Output>
             Ok(None) => {
                 let now = Instant::now();
                 if now >= deadline.at {
-                    return Ok(Waited::TimedOut(Group::ended(child, pipes)));
+                    return Ok(Waited::TimedOut(Group::ended(&mut child, pipes)));
                 }
                 std::thread::sleep(POLL.min(deadline.at - now));
             }
