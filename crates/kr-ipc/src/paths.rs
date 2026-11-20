@@ -1020,11 +1020,12 @@ mod windows {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS,
-        FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO,
+        FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_FLAG_DELETE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
         FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
-        GetVolumeInformationByHandleW, OPEN_ALWAYS, READ_CONTROL, SetFileInformationByHandle,
-        WRITE_DAC,
+        FileDispositionInfoEx, GetVolumeInformationByHandleW, OPEN_ALWAYS, READ_CONTROL,
+        SetFileInformationByHandle, WRITE_DAC,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::SystemServices::{
@@ -2330,7 +2331,8 @@ mod windows {
         tests::before_the_check(path, &file);
         if let Err(error) = keeps_the_list(&file, &accounts, &user, "new file") {
             // The file is deleted through the handle that created it, not by its name: the name
-            // can have been given to another file since. It goes when the handle is closed.
+            // can have been given to another file since. Its name goes when this handle is
+            // closed, or, on a volume without that form, when its last handle is closed.
             let removal = delete_through(&file);
             drop(file);
             return Err(match removal {
@@ -2344,17 +2346,36 @@ mod windows {
         Ok(file)
     }
 
-    /// Marks the file a handle holds to be deleted when its last handle is closed. The handle has
-    /// to hold `DELETE`, which the creation of a new file asks for.
+    /// Marks the file a handle holds to be deleted. Its name goes when this handle is closed, or,
+    /// on a volume without that form, when its last handle is closed. The handle has to hold
+    /// `DELETE`, which the creation of a new file asks for.
+    ///
+    /// The mark that deletes in the form of a Unix unlink is set first, and only if that fails the
+    /// older mark, whose error is the one returned. Neither ignores the read-only attribute.
     ///
     /// # Errors
     ///
     /// Returns the operating system's error when the file cannot be marked, as for a file that
     /// carries the read-only attribute.
     fn delete_through(file: &std::fs::File) -> std::io::Result<()> {
+        let now = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        };
+        // SAFETY: the handle is open for the call, and `now` is a live structure of the size
+        // given, which the call reads and keeps no pointer to.
+        let marked_now = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfoEx,
+                (&raw const now).cast(),
+                u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO_EX>()).unwrap_or(0),
+            )
+        };
+        if marked_now != 0 {
+            return Ok(());
+        }
         let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-        // SAFETY: the handle is open for the call, and `disposition` is a live structure of the
-        // size given, which the call reads and keeps no pointer to.
+        // SAFETY: as above, for `disposition`.
         let marked = unsafe {
             SetFileInformationByHandle(
                 file.as_raw_handle(),
