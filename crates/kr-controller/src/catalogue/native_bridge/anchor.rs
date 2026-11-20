@@ -27,6 +27,46 @@ use crate::error::{ControllerError, Result};
 /// host rewrites whole.
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// What an installation was about to do where it refused: the end of a refusal says that nothing
+/// was done.
+#[derive(Clone, Copy)]
+pub(crate) enum Act {
+    /// A file was to be written.
+    Write,
+    /// A file or a folder was to be removed.
+    Remove,
+}
+
+impl Act {
+    /// What was not done, as the end of a refusal says it.
+    const fn left_undone(self) -> &'static str {
+        match self {
+            Self::Write => "written",
+            Self::Remove => "removed",
+        }
+    }
+}
+
+/// What a removal did with the file at a name it had checked.
+#[derive(Debug)]
+pub(crate) enum Taken {
+    /// The file was the one that was checked, and it is gone.
+    Removed,
+    /// Nothing stood at the name.
+    Gone,
+    /// What stood at the name was not the checked file. It was left where it was, or put back.
+    Changed,
+    /// What stood at the name was not the checked file, and it could not be put back: it is kept
+    /// under `name` in the folder that held the name, whose path was `at` when the removal walked
+    /// to it.
+    Kept {
+        /// The temporary name the file is kept under.
+        name: String,
+        /// The path that name had when the removal walked to its folder.
+        at: PathBuf,
+    },
+}
+
 /// A refusal the person is told of: the place is not one an installation may use.
 fn refused(detail: String) -> ControllerError {
     ControllerError::PermissionDenied { detail }
@@ -324,7 +364,7 @@ impl Anchor {
 
     /// Refuses the folder that holds `path`, a place below the selected root, where another user can
     /// change it. A folder that is not there yet is made by this host, and is judged at the write.
-    pub(crate) fn refuse_shared_folder(&self, path: &Path) -> Result<()> {
+    pub(crate) fn refuse_shared_folder(&self, path: &Path, act: Act) -> Result<()> {
         if self.is_root(path) {
             return Ok(());
         }
@@ -332,7 +372,7 @@ impl Anchor {
         let Some(parent) = self.parent(&place, false)? else {
             return Ok(());
         };
-        check_folder(&parent, path)
+        check_folder(&parent, path, act)
     }
 
     /// Writes `bytes` to the file at `path`: staged under a temporary name beside it, flushed, and
@@ -374,7 +414,7 @@ impl Anchor {
         };
         #[cfg(test)]
         walked_pause::run(path);
-        check_folder(&parent, path)?;
+        check_folder(&parent, path, Act::Write)?;
         let (mode, checked) = match parent.fetch(place.name, MAX_FILE_BYTES).map_err(storage)? {
             Fetched::Absent if replaces.is_none() => (default_mode, None),
             Fetched::File(read) if replaces == Some(digest_of(&read.bytes)) => {
@@ -403,37 +443,86 @@ impl Anchor {
         parent.flush().map_err(|_| not_confirmed(path))
     }
 
-    /// Removes the file at `path`; a name that is not there is already gone.
-    pub(crate) fn remove_file(&self, path: &Path) -> Result<()> {
+    /// Removes the file at `path` where it is the file the caller checked, the one whose contents
+    /// have the digest `expected`; a name that is not there is already gone.
+    ///
+    /// The folder is judged through the handle this removal holds, as a write judges it, and a
+    /// folder another user can change is refused before anything is taken. No call removes a name
+    /// only while it still names a given file, so the file is first taken out of its place under a
+    /// temporary name, only where that name is free, and read there: it is removed only where it
+    /// is the checked file, by its identity and its contents. Any other file goes back to the
+    /// name by a rename that replaces nothing, so a file another process has put at the name since
+    /// is never displaced; a file that cannot go back stays under the temporary name, and the
+    /// outcome says where.
+    pub(crate) fn remove_file(&self, path: &Path, expected: Digest256) -> Result<Taken> {
         let place = self.place(path)?;
         let Some(parent) = self.parent(&place, false)? else {
-            return Ok(());
+            return Ok(Taken::Gone);
         };
         #[cfg(test)]
         walked_pause::run(path);
+        check_folder(&parent, path, Act::Remove)?;
+        let checked = match parent.fetch(place.name, MAX_FILE_BYTES).map_err(storage)? {
+            Fetched::Absent => return Ok(Taken::Gone),
+            Fetched::File(read) if digest_of(&read.bytes) == expected => read.identity,
+            Fetched::File(_) | Fetched::NotRegular | Fetched::TooLarge => {
+                return Ok(Taken::Changed);
+            }
+        };
         #[cfg(test)]
         removal_pause::run(path);
-        match parent.remove_file(place.name) {
-            Ok(()) => parent.flush().map_err(storage),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(storage(error)),
+        let temporary = temporary_name(place.name);
+        match parent.rename_new(place.name, &parent, &temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Taken::Gone),
+            Err(error) => return Err(storage(error)),
+        }
+        #[cfg(test)]
+        trade_pause::run(path);
+        match parent.fetch(&temporary, MAX_FILE_BYTES) {
+            Ok(Fetched::File(read))
+                if read.identity.same_object(&checked) && digest_of(&read.bytes) == expected =>
+            {
+                #[cfg(test)]
+                cleanup_pause::run(path);
+                parent.remove_file(&temporary).map_err(storage)?;
+                parent.flush().map_err(storage)?;
+                Ok(Taken::Removed)
+            }
+            _ => Ok(give_back(&parent, place.name, &temporary)),
         }
     }
 
-    /// Removes the empty folder at `path`. The error says why it stayed, so the caller can report
-    /// a folder that is not empty and leave it.
-    pub(crate) fn remove_directory(&self, path: &Path) -> std::io::Result<()> {
-        let place = self
-            .place(path)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let parent = self
-            .parent(&place, false)
-            .map_err(|error| std::io::Error::other(error.to_string()))?
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+    /// Removes the empty folder at `path`; false where it stayed, which the caller reports as a
+    /// folder that is not empty and leaves. A folder another user can change is refused.
+    pub(crate) fn remove_directory(&self, path: &Path) -> Result<bool> {
+        let Ok(place) = self.place(path) else {
+            return Ok(false);
+        };
+        let Ok(Some(parent)) = self.parent(&place, false) else {
+            return Ok(false);
+        };
         #[cfg(test)]
         walked_pause::run(path);
-        parent.remove_directory(place.name)?;
-        parent.flush()
+        check_folder(&parent, path, Act::Remove)?;
+        Ok(parent
+            .remove_directory(place.name)
+            .and_then(|()| parent.flush())
+            .is_ok())
+    }
+}
+
+/// Puts a file a removal took out of `name` back, though it is not the file the removal checked,
+/// by a rename that replaces nothing: where another process has made the name again the file stays
+/// under `temporary`, which the outcome names.
+fn give_back(parent: &Dir, name: &str, temporary: &str) -> Taken {
+    match parent.rename_new(temporary, parent, name) {
+        Ok(()) => Taken::Changed,
+        Err(error) if error.kind() == ErrorKind::NotFound => Taken::Changed,
+        Err(_) => Taken::Kept {
+            name: temporary.to_owned(),
+            at: parent.join(temporary),
+        },
     }
 }
 
@@ -466,16 +555,17 @@ fn no_add(path: &Path) -> ControllerError {
 
 /// The refusal where the folder that holds a place can be changed by another user, or its access
 /// list cannot be read.
-fn folder_shared(cause: Cause, path: &Path) -> ControllerError {
+fn folder_shared(cause: Cause, path: &Path, act: Act) -> ControllerError {
     let because = match cause {
         Cause::AnotherOwner => "belongs to another user",
         Cause::WriteBit => "lets its group or every user change what is in it",
         Cause::ListEntry => "has an allow entry for an account not known to be yours",
     };
     refused(format!(
-        "{} cannot be written safely, because the folder it is in {because}, so nothing is written \
+        "{} cannot be written safely, because the folder it is in {because}, so nothing is {} \
          there",
-        path.display()
+        path.display(),
+        act.left_undone()
     ))
 }
 
@@ -494,12 +584,13 @@ fn file_shared(cause: Cause, path: &Path) -> ControllerError {
 
 /// The refusal where the access list of `subject`, the folder or the file of a place, cannot be
 /// read.
-fn unreadable(path: &Path, subject: &Path) -> ControllerError {
+fn unreadable(path: &Path, subject: &Path, act: Act) -> ControllerError {
     refused(format!(
         "{} cannot be written safely, because the installer cannot verify the access controls of \
-         {}, so nothing is written there",
+         {}, so nothing is {} there",
         path.display(),
-        subject.display()
+        subject.display(),
+        act.left_undone()
     ))
 }
 
@@ -544,6 +635,20 @@ fn kept_aside(path: &Path, name: &str, kept: &Path) -> ControllerError {
     ))
 }
 
+/// The words of a file that a removal took out of the place of a name, found not to be the file it
+/// had checked, and could not put back: it is kept as `name` in the folder that held `path`, whose
+/// path was `kept` when the removal walked to it.
+pub(crate) fn kept_while_removing(path: &Path, name: &str, kept: &Path) -> String {
+    format!(
+        "{} was replaced by another process while the installer removed it, and that file could \
+         not be put back, so it is kept as {name} in the folder that held {}; its last known \
+         path was {}",
+        path.display(),
+        path.display(),
+        kept.display()
+    )
+}
+
 /// Why a name that was free could not be given the staged file.
 fn new_name_refusal(error: std::io::Error, path: &Path) -> ControllerError {
     match error.kind() {
@@ -564,11 +669,11 @@ fn trade_refusal(error: std::io::Error, path: &Path) -> ControllerError {
 
 /// Refuses the folder `folder`, which holds the place `place`, where another user can change it,
 /// reading it through the handle this write holds.
-fn check_folder(folder: &Dir, place: &Path) -> Result<()> {
+fn check_folder(folder: &Dir, place: &Path, act: Act) -> Result<()> {
     match folder.control().map_err(storage)? {
         Control::Own => Ok(()),
-        Control::Shared(cause) => Err(folder_shared(cause, place)),
-        Control::Unreadable(_) => Err(unreadable(place, folder.path())),
+        Control::Shared(cause) => Err(folder_shared(cause, place, act)),
+        Control::Unreadable(_) => Err(unreadable(place, folder.path(), act)),
     }
 }
 
@@ -589,7 +694,7 @@ fn file_to_replace(
     match protection.control() {
         Control::Own => Ok(protection),
         Control::Shared(cause) => Err(file_shared(cause, path)),
-        Control::Unreadable(_) => Err(unreadable(path, path)),
+        Control::Unreadable(_) => Err(unreadable(path, path, Act::Write)),
     }
 }
 
@@ -602,7 +707,7 @@ fn copy_refusal(
     path: &Path,
 ) -> Option<ControllerError> {
     if matches!(copy.listing, Listing::Unreadable(_)) {
-        return Some(unreadable(path, path));
+        return Some(unreadable(path, path, Act::Write));
     }
     match existing {
         None => matches!(copy.listing, Listing::Read { allows: true, .. })
@@ -932,22 +1037,22 @@ mod tests {
     fn a_folder_a_file_and_a_copy_are_refused_in_the_words_a_person_is_shown() {
         let path = Path::new("/home/p/.amp/mcp.json");
         assert_eq!(
-            detail(folder_shared(Cause::AnotherOwner, path)),
+            detail(folder_shared(Cause::AnotherOwner, path, Act::Write)),
             "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in belongs \
              to another user, so nothing is written there"
         );
         assert_eq!(
-            detail(folder_shared(Cause::WriteBit, path)),
+            detail(folder_shared(Cause::WriteBit, path, Act::Write)),
             "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in lets its \
              group or every user change what is in it, so nothing is written there"
         );
         assert_eq!(
-            detail(folder_shared(Cause::ListEntry, path)),
+            detail(folder_shared(Cause::ListEntry, path, Act::Write)),
             "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in has an \
              allow entry for an account not known to be yours, so nothing is written there"
         );
         assert_eq!(
-            detail(unreadable(path, Path::new("/home/p/.amp"))),
+            detail(unreadable(path, Path::new("/home/p/.amp"), Act::Write)),
             "/home/p/.amp/mcp.json cannot be written safely, because the installer cannot verify \
              the access controls of /home/p/.amp, so nothing is written there"
         );
@@ -977,6 +1082,44 @@ mod tests {
             "/home/p/.amp/mcp.json cannot be replaced safely, because a new file in its folder \
              would not have the owner, group and access list of the file it replaces, so nothing \
              is written there"
+        );
+    }
+
+    /// A removal refuses a folder in the words of a write, with its own ending, and tells a file it
+    /// kept in the words a person is shown.
+    #[test]
+    fn a_removal_is_refused_and_a_kept_file_is_told_in_the_words_a_person_is_shown() {
+        let path = Path::new("/home/p/.amp/mcp.json");
+        assert_eq!(
+            detail(folder_shared(Cause::AnotherOwner, path, Act::Remove)),
+            "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in belongs \
+             to another user, so nothing is removed there"
+        );
+        assert_eq!(
+            detail(folder_shared(Cause::WriteBit, path, Act::Remove)),
+            "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in lets its \
+             group or every user change what is in it, so nothing is removed there"
+        );
+        assert_eq!(
+            detail(folder_shared(Cause::ListEntry, path, Act::Remove)),
+            "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in has an \
+             allow entry for an account not known to be yours, so nothing is removed there"
+        );
+        assert_eq!(
+            detail(unreadable(path, Path::new("/home/p/.amp"), Act::Remove)),
+            "/home/p/.amp/mcp.json cannot be written safely, because the installer cannot verify \
+             the access controls of /home/p/.amp, so nothing is removed there"
+        );
+        assert_eq!(
+            kept_while_removing(
+                path,
+                ".mcp.json.0a1b2c.kalareach",
+                Path::new("/home/p/.amp/.mcp.json.0a1b2c.kalareach")
+            ),
+            "/home/p/.amp/mcp.json was replaced by another process while the installer removed \
+             it, and that file could not be put back, so it is kept as .mcp.json.0a1b2c.kalareach \
+             in the folder that held /home/p/.amp/mcp.json; its last known path was \
+             /home/p/.amp/.mcp.json.0a1b2c.kalareach"
         );
     }
 
@@ -1028,7 +1171,7 @@ mod tests {
         for existing in [None, Some(&plain)] {
             assert_eq!(
                 said(copy_refusal(&unreadable_copy, existing, path)),
-                Some(detail(unreadable(path, path))),
+                Some(detail(unreadable(path, path, Act::Write))),
                 "a list that cannot be read"
             );
         }

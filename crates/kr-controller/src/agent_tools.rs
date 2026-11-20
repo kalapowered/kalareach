@@ -228,17 +228,19 @@ impl Fs {
         }
     }
 
-    fn remove_file(&self, path: &Path) -> Result<()> {
+    /// Removes the file at `path`. `expected` is the digest of the file the caller checked there:
+    /// a declared word's walk removes nothing else.
+    fn remove_file(&self, path: &Path, expected: Digest256) -> Result<anchor::Taken> {
         match self {
             Self::Paths => {
                 std::fs::remove_file(path).map_err(storage)?;
                 if let Some(parent) = path.parent() {
                     sync_directory(parent, NameKind::File)?;
                 }
-                Ok(())
+                Ok(anchor::Taken::Removed)
             }
-            Self::Walk(walk) => walk.remove_file(path),
-            Self::Absent(_) => Ok(()),
+            Self::Walk(walk) => walk.remove_file(path, expected),
+            Self::Absent(_) => Ok(anchor::Taken::Gone),
         }
     }
 
@@ -254,7 +256,7 @@ impl Fs {
                 }
                 Err(_) => Ok(false),
             },
-            Self::Walk(walk) => Ok(walk.remove_directory(path).is_ok()),
+            Self::Walk(walk) => walk.remove_directory(path),
             Self::Absent(_) => Ok(false),
         }
     }
@@ -954,7 +956,7 @@ impl Installer {
             .map(PathBuf::as_path)
             .chain(documents.iter().copied())
         {
-            walk.refuse_shared_folder(place)?;
+            walk.refuse_shared_folder(place, anchor::Act::Write)?;
         }
         if let Some(parent) = layout
             .configuration
@@ -1092,10 +1094,15 @@ impl Installer {
                         Some(found) if found != *digest => {
                             retained.push(format!("{path} has changed since it was installed"));
                         }
-                        Some(_) => {
-                            self.fs.remove_file(Path::new(path))?;
-                            removed.push(operation.clone());
-                        }
+                        Some(_) => match self.fs.remove_file(Path::new(path), *digest)? {
+                            anchor::Taken::Removed => removed.push(operation.clone()),
+                            anchor::Taken::Gone => retained.push(format!("{path} is already gone")),
+                            anchor::Taken::Changed => {
+                                retained.push(format!("{path} has changed since it was installed"))
+                            }
+                            anchor::Taken::Kept { name, at } => retained
+                                .push(anchor::kept_while_removing(Path::new(path), &name, &at)),
+                        },
                     }
                 }
                 ChangeOperation::AddConfigurationEntry {
@@ -1115,6 +1122,7 @@ impl Installer {
                         Removal::Kept(reason) => {
                             retained.push(format!("{entry} in {path}: {reason}"));
                         }
+                        Removal::Told(words) => retained.push(words),
                     }
                 }
                 ChangeOperation::CreateDirectory { path } => {
@@ -1344,6 +1352,13 @@ impl Installer {
                 // names a member twice among them, is refused here rather than half way through.
                 self.entry_digest_under(Path::new(path), entry_key(entry))?;
                 guard_access_controls(Path::new(path), CONFIGURATION_BY_HAND)?;
+            }
+        }
+        // The folder that holds each recorded name, where it is there, is one that only this user
+        // can change, or nothing is removed.
+        if let Fs::Walk(walk) = &self.fs {
+            for operation in &record.manifest.operations {
+                walk.refuse_shared_folder(Path::new(operation.path()), anchor::Act::Remove)?;
             }
         }
         Ok(Some(record))
@@ -1766,9 +1781,21 @@ impl Installer {
                 json::remove(&text, &members, made).map_err(|reason| not_exact(path, &reason))?;
             let empty = json::Document::read(&edited).is_ok_and(|document| document.is_empty());
             if created_document && empty {
-                // This host created the document and nothing else was ever added to it.
-                self.fs.remove_file(path)?;
-                return Ok(Removal::Removed);
+                // This host created the document and nothing else was ever added to it. It goes
+                // only while it is the file that was read.
+                let Some(checked) = replaces else {
+                    return Ok(Removal::Kept("it is already gone".to_owned()));
+                };
+                return Ok(match self.fs.remove_file(path, checked)? {
+                    anchor::Taken::Removed => Removal::Removed,
+                    anchor::Taken::Gone => Removal::Kept("it is already gone".to_owned()),
+                    anchor::Taken::Changed => {
+                        Removal::Kept("it has changed since it was installed".to_owned())
+                    }
+                    anchor::Taken::Kept { name, at } => {
+                        Removal::Told(anchor::kept_while_removing(path, &name, &at))
+                    }
+                });
             }
             self.fs.write(path, edited.as_bytes(), PRIVATE, replaces)?;
         }
@@ -2695,6 +2722,9 @@ enum Removal {
     Removed,
     /// It was left alone, for the stated reason.
     Kept(String),
+    /// It was left alone, and these words, which name the file and the entry whole, say what
+    /// became of the file.
+    Told(String),
 }
 
 /// The longest a contact tool holds a call, in seconds, plus room to answer.
@@ -5610,7 +5640,7 @@ mod tests {
             0
         );
         std::fs::write(elsewhere.join("mcp.json"), b"x").expect("a file");
-        fs.remove_file(&tree.home().join(".amp/mcp.json"))
+        fs.remove_file(&tree.home().join(".amp/mcp.json"), digest_of(b"x"))
             .expect_err("a link is not followed");
         assert!(
             elsewhere.join("mcp.json").exists(),
@@ -5700,7 +5730,7 @@ mod tests {
             !elsewhere.join(".new.json").exists(),
             "and not where the link leads"
         );
-        fs.remove_file(&document)
+        fs.remove_file(&document, digest_of(b"{}"))
             .expect("removes from the folder the walk holds");
         assert!(!moved.join(".mcp.json").exists());
         assert!(
@@ -5749,7 +5779,7 @@ mod tests {
         );
         reading
             .fs
-            .remove_file(&place)
+            .remove_file(&place, digest_of(b"{}"))
             .expect("a name below a root that is not there is already gone");
         assert!(
             elsewhere.join(".amp/mcp.json").exists(),
