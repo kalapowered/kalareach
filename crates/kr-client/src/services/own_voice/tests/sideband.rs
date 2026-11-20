@@ -1700,9 +1700,9 @@ async fn a_write_that_waits_for_the_stream_to_take_a_queue_of_pongs_and_then_fai
 }
 
 /// 512 Pings with the longest payload are read while the stream takes no write. A write is then
-/// polled: the library's readiness check flushes all 512 Pongs, and the stream holds the text. The
-/// provider closes and the write fails: the closure that came after that flush is read ahead,
-/// because the flush counted the Pings back to zero.
+/// polled: the library's readiness check flushes all 512 Pongs, the flush before the text finishes,
+/// and the stream holds the text. The provider closes and the write fails: the closure that came
+/// after that flush is read ahead, because the flush counted the Pings back to zero.
 #[tokio::test]
 async fn a_write_whose_readiness_flush_wrote_every_pong_counts_the_pings_back_and_keeps_a_closure_when_it_then_fails()
  {
@@ -1755,8 +1755,8 @@ async fn a_write_whose_readiness_flush_wrote_every_pong_counts_the_pings_back_an
 }
 
 /// 300 Pings are on the socket while the stream takes no write, and a write is polled: its
-/// readiness check has too few bytes queued to flush, and the stream holds the text. The Pongs are
-/// still owed, so the count of Pings stays where the read ahead left it.
+/// readiness check has too few bytes queued to flush, and the flush before the text waits for the
+/// stream. The Pongs are still owed, so the count of Pings stays where the read ahead left it.
 #[tokio::test]
 async fn a_write_whose_readiness_check_flushed_nothing_leaves_the_count_of_pings_as_it_was() {
     let (mut sideband, mut provider, gate) = connected().await;
@@ -1775,6 +1775,142 @@ async fn a_write_whose_readiness_check_flushed_nothing_leaves_the_count_of_pings
     assert_eq!(
         sideband.pings, 256,
         "the Pongs are owed: the count is what the read ahead took"
+    );
+}
+
+/// 512 Pings with the longest payload are read while the stream takes no write. A write is then
+/// polled: the stream takes 60,004 of the 67,072 bytes of Pongs and waits; at the next poll it
+/// takes the other 7,068, under the flush threshold, and holds the text. The provider closes and
+/// the write fails: the closure is read ahead, because the Pongs went out before the text was
+/// queued and the count went back to zero.
+#[tokio::test]
+async fn a_write_whose_pongs_go_out_across_polls_counts_the_pings_back_before_its_text_and_keeps_a_closure()
+ {
+    let (mut sideband, mut provider, gate) = connected().await;
+    let task = Wakes::new();
+    gate.set(Writes::Park);
+    pinged_in_full(&mut provider, 512).await;
+    settle().await;
+    {
+        let mut read = sideband.next();
+        assert_eq!(
+            poll_once(&mut read, &task),
+            Poll::Pending,
+            "the read waits at 512 Pings"
+        );
+    }
+    assert_eq!(
+        sideband.pings, 512,
+        "512 Pings are read, and no Pong is out"
+    );
+    // 458 whole Pongs and the next header: 60,004 bytes.
+    gate.set(Writes::PassFor(60_000));
+    let mut sending = sideband.send("{}".to_owned());
+    assert_eq!(
+        poll_once_in_full(&mut sending, &task),
+        Poll::Pending,
+        "the stream waits"
+    );
+    gate.set(Writes::PassFor(512 * (6 + 125) - 60_004));
+    assert_eq!(
+        poll_once_in_full(&mut sending, &task),
+        Poll::Pending,
+        "the stream holds the text"
+    );
+    settle().await;
+    assert_eq!(
+        pongs(&mut provider),
+        512,
+        "every Pong went out before the text"
+    );
+    said(&mut provider, &[closure()]).await;
+    settle().await;
+    gate.set(Writes::Fail);
+    assert_eq!(
+        poll_once(&mut sending, &task),
+        Poll::Ready(false),
+        "the write failed"
+    );
+    drop(sending);
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
+        "the closure that came after the Pongs went out is read ahead by the write that then failed"
+    );
+}
+
+/// No Ping is counted and the stream takes no write: the text waits with the task's waker, and the
+/// stream wakes that task.
+#[tokio::test]
+async fn a_write_whose_text_waits_is_woken_by_the_stream() {
+    let (mut sideband, _provider, gate) = connected().await;
+    let task = Wakes::new();
+    gate.set(Writes::Park);
+    let mut sending = sideband.send("{}".to_owned());
+    assert_eq!(
+        poll_once(&mut sending, &task),
+        Poll::Pending,
+        "the text waits"
+    );
+    let woken = task.count();
+    gate.set(Writes::Pass);
+    assert_eq!(
+        task.count(),
+        woken + 1,
+        "the stream woke the task of the write"
+    );
+    assert_eq!(
+        poll_once(&mut sending, &task),
+        Poll::Ready(true),
+        "the write finished"
+    );
+}
+
+/// 512 Pings and a closure come while a write's text waits. When the write finishes, its flush
+/// counts the Pings back, so the next write, which fails at once, reads the closure ahead.
+#[tokio::test]
+async fn a_write_that_read_512_pings_while_its_text_waited_counts_them_back_when_it_finishes() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    let task = Wakes::new();
+    gate.set(Writes::Park);
+    {
+        let mut sending = sideband.send("{}".to_owned());
+        assert_eq!(
+            poll_once(&mut sending, &task),
+            Poll::Pending,
+            "the text waits"
+        );
+        pinged_times(&mut provider, 512).await;
+        said(&mut provider, &[closure()]).await;
+        settle().await;
+        for _ in 0..3 {
+            gate.set(Writes::Park);
+            assert_eq!(
+                poll_once(&mut sending, &task),
+                Poll::Pending,
+                "the text still waits"
+            );
+        }
+        gate.set(Writes::Pass);
+        assert_eq!(
+            polled_to_the_end(&mut sending, &task).await,
+            Some(true),
+            "the write finished"
+        );
+    }
+    assert!(
+        sideband.ahead.is_empty(),
+        "the closure behind 512 Pings was not read while they were owed"
+    );
+    gate.set(Writes::Fail);
+    assert!(
+        !sideband.send("{}".to_owned()).await,
+        "the next write failed"
+    );
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
+        "the write that finished counted the Pings back, so the next write read the closure ahead"
     );
 }
 

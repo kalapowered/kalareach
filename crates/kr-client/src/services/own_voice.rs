@@ -2274,33 +2274,26 @@ fn reply_of(answer: Result<super::http::StatusAnswer>) -> std::result::Result<Re
 /// poll, is not read when that poll's write fails.
 const READ_AHEAD_MESSAGES: usize = 256;
 
-/// The most Pings that are read since the last full flush. The library queues a Pong for each Ping
-/// it reads and keeps the queue without a limit until a flush writes it. At this many the adapter
-/// reads no more input: the flush goes on with the task's context, and the poll waits for it.
-/// Reading goes on when a full flush has finished, whether the adapter's own flush or the one the
-/// library makes inside a write's readiness check: either writes every Pong queued.
+/// The most Pings that are read since the last flush that finished. The library queues a Pong for
+/// each Ping it reads and keeps the queue without a limit until a flush writes it. At this many
+/// the adapter reads no more input: the flush goes on with the task's context, and the poll waits
+/// for it. Reading goes on when a flush has finished, which writes every Pong queued: the flush of
+/// a read, or the one a write finishes before its text goes into the library's queue.
 const UNFLUSHED_PINGS: usize = 512;
 
 /// The stream of a side channel, whose writes can be held back. While they are, a write that the
 /// library makes by itself neither reaches the stream nor fails: it waits. A flush passes: the
 /// library flushes the stream only when no frame byte is left, so a flush holds nothing back. The
 /// hold starts and ends inside one poll of the adapter; a frame the stream does not take waits for
-/// the stream, with the waker of the task that polled. The flushes that finish are counted: the
-/// library flushes the stream only when no frame byte is left, so a flush that finished says that
-/// everything the library had queued is written.
+/// the stream, with the waker of the task that polled.
 struct HoldWrites<S> {
     inner: S,
     held: bool,
-    flushes: usize,
 }
 
 impl<S> HoldWrites<S> {
     const fn new(inner: S) -> Self {
-        Self {
-            inner,
-            held: false,
-            flushes: 0,
-        }
+        Self { inner, held: false }
     }
 }
 
@@ -2344,12 +2337,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for HoldWrites<S> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let flushed = Pin::new(&mut this.inner).poll_flush(cx);
-        if matches!(flushed, Poll::Ready(Ok(()))) {
-            this.flushes += 1;
-        }
-        flushed
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -2362,7 +2350,7 @@ struct WebSocketSideband<S = crate::wss::Io> {
     /// Messages a read ahead took, in the order they came, and not yet handed on. A closing
     /// frame or a failure the read ahead met is the last of them.
     ahead: VecDeque<SocketRead>,
-    /// Pings read since the last full flush: the library holds at most one Pong for each of them.
+    /// Pings read since the last flush that finished: the library holds a Pong for each of them.
     pings: usize,
 }
 
@@ -2434,18 +2422,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketSideband<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> SidebandSocket for WebSocketSideband<S> {
-    /// Each poll takes what is ready first, then queues the text once and flushes with the task's
-    /// own context, so a closure that comes while the write waits is read, and kept, before a
-    /// write that then fails ends the library's reading. The library flushes inside the readiness
-    /// check when its queue is long: a flush that finished there wrote every Pong queued, so the
-    /// count of Pings goes back to zero at once, and not after every readiness that succeeds.
+    /// Each poll takes what is ready first. While Pings are counted, the text goes into the
+    /// library's queue only after a flush has finished, however many polls the stream takes for
+    /// it: that flush writes every Pong queued, and the count of Pings goes back to zero when it
+    /// has. The text is then queued once and flushed with the task's own context, so a closure
+    /// that comes while the write waits is read, and kept, before a write that then fails ends
+    /// the library's reading.
     fn send(&mut self, text: String) -> TransportFuture<'_, bool> {
         use futures_util::SinkExt;
         let mut queued = Some(tokio_websockets::Message::text(text));
         Box::pin(std::future::poll_fn(move |cx| {
             self.read_ahead();
             if let Some(message) = queued.take() {
-                let flushes = self.socket.get_ref().flushes;
                 match self.socket.poll_ready_unpin(cx) {
                     Poll::Pending => {
                         queued = Some(message);
@@ -2453,8 +2441,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SidebandSocket for WebSocketSideb
                     }
                     Poll::Ready(Err(_)) => return Poll::Ready(false),
                     Poll::Ready(Ok(())) => {
-                        if self.socket.get_ref().flushes != flushes {
-                            self.pings = 0;
+                        if self.pings > 0 {
+                            match self.socket.poll_flush_unpin(cx) {
+                                Poll::Pending => {
+                                    queued = Some(message);
+                                    return Poll::Pending;
+                                }
+                                Poll::Ready(Err(_)) => return Poll::Ready(false),
+                                Poll::Ready(Ok(())) => self.pings = 0,
+                            }
                         }
                         if self.socket.start_send_unpin(message).is_err() {
                             return Poll::Ready(false);
