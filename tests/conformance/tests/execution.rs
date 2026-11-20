@@ -348,42 +348,55 @@ fn a_run_makes_in_the_evidence_only_the_logs_and_the_directories_of_its_outputs(
 fn a_runner_base_inside_a_target_directory_a_step_names_is_refused() {
     let absolute = "'{built}'";
     let relative = "'../../built'";
-    for (name, plan_env, step_env, from_options) in [
+    for (name, plan_env, step_env, from_options, platform) in [
         (
             "the plan's env, absolute",
             format!("[env]\nCARGO_TARGET_DIR = {absolute}\n"),
             String::new(),
             None,
+            Platform::current(),
         ),
         (
             "the plan's env, relative to the step's directory",
             format!("[env]\nCARGO_TARGET_DIR = {relative}\n"),
             String::new(),
             None,
+            Platform::current(),
         ),
         (
             "a step's env, absolute",
             String::new(),
             format!("env = {{ CARGO_TARGET_DIR = {absolute} }}\n"),
             None,
+            Platform::current(),
         ),
         (
             "a step's env, relative to the step's directory",
             String::new(),
             format!("env = {{ CARGO_TARGET_DIR = {relative} }}\n"),
             None,
+            Platform::current(),
+        ),
+        (
+            "a step's env, spelt in lower case, where the platform takes the names as one",
+            String::new(),
+            format!("env = {{ cargo_target_dir = {absolute} }}\n"),
+            None,
+            Platform::Windows,
         ),
         (
             "the options' variable, absolute",
             String::new(),
             String::new(),
             Some("{built}"),
+            Platform::current(),
         ),
         (
             "the options' variable, relative to the step's directory",
             String::new(),
             String::new(),
             Some("../../built"),
+            Platform::current(),
         ),
     ] {
         // The repository is `tree` in a directory of its own, so that `built`, beside it, is
@@ -416,6 +429,7 @@ directory = 'first'
             .tempdir()
             .expect("an evidence directory");
         let mut options = options(&root, plan, evidence.path(), &inside);
+        options.platform = platform;
         options.environment.clear();
         if let Some(value) = from_options {
             options.environment.push((

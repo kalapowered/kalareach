@@ -655,6 +655,36 @@ fn a_value_that_holds_the_text_of_a_placeholder_is_put_in_as_it_is_written() {
     );
 }
 
+/// A step's variable replaces the plan's of the same name, and the same name is what the platform
+/// the step is expanded for takes as one: Windows takes names that differ only by case as one
+/// variable, so there the step's `PATH` replaces the plan's `Path`; elsewhere they are two.
+#[test]
+fn a_step_variable_replaces_the_plans_of_the_name_the_platform_takes_as_the_same() {
+    let step = STEP
+        .replace("platforms = ['linux']", "platforms = ['linux', 'windows']")
+        .replace(
+            "command = ['cargo', 'test']",
+            "env = { PATH = 'step' }\ncommand = ['cargo', 'test']",
+        );
+    let plan = Plan::parse(
+        &with(&format!("[env]\nPath = 'plan'\n{step}")),
+        &repository(),
+    )
+    .expect("the plan loads");
+    let rust = selection(&["rust"]);
+    let on = |platform| {
+        plan.steps(platform, &rust, &Values::evidence("/e"), None)[0]
+            .env
+            .clone()
+    };
+    let pair = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+    assert_eq!(on(Platform::Windows), [pair("PATH", "step")]);
+    assert_eq!(
+        on(Platform::Linux),
+        [pair("PATH", "step"), pair("Path", "plan")]
+    );
+}
+
 /// A step that differs from [`STEP`] in the lines `before`, added ahead of its command, and in the
 /// command `command`, which replaces its own.
 fn step_adding(before: &str, command: &str) -> String {
