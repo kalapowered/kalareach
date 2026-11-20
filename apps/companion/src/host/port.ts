@@ -2075,7 +2075,9 @@ export interface HostPort {
   /**
    * The messages sent over a channel that confirms nothing, and the records of sends under way, as
    * this device keeps them. A read without `withText` leaves the text out. The store refuses
-   * `STORAGE_UNAVAILABLE` only when its folder cannot be read as one.
+   * `STORAGE_UNAVAILABLE` when its folder cannot be read as one and when the folder, or the data
+   * directory that holds the list of removals, cannot be made durable. A file that cannot be read
+   * now refuses nothing: it is counted apart, and the drafts' own read says so (`sources`).
    */
   deviceChannelMessages(request: { readonly withText: boolean }): Promise<ChannelMessageList>
   /** Keeps a message whole, durably, before the draft that held it is removed. */
