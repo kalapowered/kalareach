@@ -674,6 +674,56 @@ async fn a_turn_that_ended_is_in_the_journal_when_the_closure_is() {
     );
 }
 
+/// KR-REQ-18.01 and KR-REQ-14.35: a completed turn the journal refused stays queued through every
+/// retry, and the journal's recovery writes that one notice once, so the turn is one record and so
+/// one version of its review however often the writer tried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_the_journal_refused_is_written_once_when_it_recovers() {
+    let mut fixture = Fixture::new();
+    let journal = fixture
+        ._host
+        .environment()
+        .journal_database(fixture.session_id);
+    let store = rusqlite::Connection::open(journal).expect("the session's journal");
+    store
+        .execute_batch(
+            "CREATE TRIGGER refuse_host_event BEFORE INSERT ON host_events
+             BEGIN SELECT RAISE(ABORT, 'this store refused the host event'); END;",
+        )
+        .expect("the store will refuse the host event");
+    fixture
+        .session
+        .notices()
+        .push(kr_protocol::attention::SessionEventNotice::TurnCompleted {
+            turn_id: kr_protocol::ids::AgentTurnId::new("thread-1").expect("an identifier"),
+        });
+    assert!(!fixture.session.write_session_notices(), "refused");
+    assert!(!fixture.session.write_session_notices(), "refused again");
+    assert_eq!(fixture.host_events(), vec![]);
+
+    store
+        .execute_batch("DROP TRIGGER refuse_host_event;")
+        .expect("the store takes writes again");
+    assert!(
+        fixture.session.write_session_notices(),
+        "the store recovered"
+    );
+    assert!(
+        fixture.session.write_session_notices(),
+        "nothing is left to write"
+    );
+    let recorded = fixture.host_events();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.completed"],
+        "one record for the one notice: {recorded:?}"
+    );
+    assert!(fixture.session.notices().is_empty());
+}
+
 /// KR-REQ-18.01: a closure that could not carry the work the session queued says it is not
 /// durable, and the work stays queued. A journal that refuses the host event is a journal that
 /// does not hold the turn, and a reader that finds a durable closure must not take that for a
