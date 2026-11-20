@@ -29,7 +29,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Console::{
     ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, GenerateConsoleCtrlEvent,
-    GetConsoleMode, SetConsoleCtrlHandler, SetConsoleMode,
+    GetConsoleMode, GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD,
+    KEY_EVENT_RECORD_0, PeekConsoleInputW, SetConsoleCtrlHandler, SetConsoleMode,
+    WriteConsoleInputW,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -59,6 +61,8 @@ pub const RAW: &str = "KR_SETUP_OBSERVER_RAW";
 pub const NO_AUTO_RETURN: &str = "KR_SETUP_OBSERVER_NO_AUTO_RETURN";
 /// When set, the observer starts `kr` as the program it debugs.
 pub const DEBUGGED: &str = "KR_SETUP_OBSERVER_DEBUGGED";
+/// The text the observer puts into the console's input, as key records, before it starts `kr`.
+pub const TYPE_AHEAD: &str = "KR_SETUP_OBSERVER_TYPE_AHEAD";
 /// The path of a file whose appearance makes the observer send Ctrl-Break to its console.
 pub const BREAK_FILE: &str = "KR_SETUP_OBSERVER_BREAK_FILE";
 
@@ -169,6 +173,90 @@ fn break_probe() {
     }
 }
 
+/// The key records of `text` as a person's keys make them: a key down and a key up for each unit,
+/// and Enter for a line end.
+fn key_records(text: &str) -> Vec<INPUT_RECORD> {
+    const VK_RETURN: u16 = 0x0D;
+
+    let mut records = Vec::new();
+    for unit in text.encode_utf16() {
+        let unit = if unit == u16::from(b'\n') {
+            u16::from(b'\r')
+        } else {
+            unit
+        };
+        let key = match u8::try_from(unit) {
+            Ok(b'\r') => VK_RETURN,
+            Ok(byte) if byte.is_ascii_alphanumeric() => u16::from(byte.to_ascii_uppercase()),
+            _ => 0,
+        };
+        for down in [1, 0] {
+            // SAFETY: the structure is plain data for which all zeroes is a valid start.
+            let mut record: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            record.EventType = u16::try_from(KEY_EVENT).expect("a small event type");
+            record.Event.KeyEvent = KEY_EVENT_RECORD {
+                bKeyDown: down,
+                wRepeatCount: 1,
+                wVirtualKeyCode: key,
+                wVirtualScanCode: 0,
+                uChar: KEY_EVENT_RECORD_0 { UnicodeChar: unit },
+                dwControlKeyState: 0,
+            };
+            records.push(record);
+        }
+    }
+    records
+}
+
+/// Puts `text` into the console's input as key records, and reads the input back to see that they
+/// are there: the line a person typed before the command had said anything, which no program has
+/// read yet. The case that asks for this fails here, in words, when the console did not take them.
+fn type_ahead(input: &File, text: &str) {
+    let records = key_records(text);
+    let count = u32::try_from(records.len()).expect("a short line");
+    let mut written = 0_u32;
+    // SAFETY: the handle is an open console input, the buffer holds `count` records and the count
+    // written is a local.
+    let put = unsafe {
+        WriteConsoleInputW(
+            input.as_raw_handle().cast(),
+            records.as_ptr(),
+            count,
+            &raw mut written,
+        )
+    };
+    assert!(
+        put != 0 && written == count,
+        "the observer queues the typed-ahead line: {written} of {count} records written"
+    );
+    // SAFETY: the structures are plain data for which all zeroes is a valid start.
+    let mut peeked: Vec<INPUT_RECORD> = vec![unsafe { std::mem::zeroed() }; records.len() + 64];
+    let mut seen = 0_u32;
+    // SAFETY: the buffer holds the number of records the call is told, and the count is a local.
+    let peek = unsafe {
+        PeekConsoleInputW(
+            input.as_raw_handle().cast(),
+            peeked.as_mut_ptr(),
+            u32::try_from(peeked.len()).expect("a short line"),
+            &raw mut seen,
+        )
+    };
+    assert!(
+        peek != 0 && seen >= count,
+        "the observer sees the typed-ahead line in the input: {seen} of {count} records queued"
+    );
+    println!("kr-observer: typed ahead {count} records, {seen} queued");
+}
+
+/// How many input records wait in the console, as the console says.
+fn queued(input: &File) -> u32 {
+    let mut waiting = 0_u32;
+    // SAFETY: the handle is an open console input and the count is a local.
+    let asked =
+        unsafe { GetNumberOfConsoleInputEvents(input.as_raw_handle().cast(), &raw mut waiting) };
+    if asked == 0 { 0 } else { waiting }
+}
+
 fn run_kr() {
     let input = console("CONIN$");
     let output = console("CONOUT$");
@@ -185,7 +273,24 @@ fn run_kr() {
         );
     }
     let before = (mode_of(&input), mode_of(&output));
+    if let Ok(text) = std::env::var(TYPE_AHEAD) {
+        type_ahead(&input, &text);
+    }
     send_break_when_asked();
+    // The most records that waited in the console's input at any time while `kr` ran: a case that
+    // asks whether `kr` throws input away reads it, so that a case whose input never waited cannot
+    // pass for want of anything to throw away.
+    let most_queued = Arc::new(AtomicU32::new(0));
+    let watching = Arc::clone(&most_queued);
+    let watched = input.try_clone().expect("the observer watches the input");
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = Arc::clone(&done);
+    let watcher = std::thread::spawn(move || {
+        while !finished.load(Ordering::SeqCst) {
+            watching.fetch_max(queued(&watched), Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
     let kr = std::env::var(KR).expect("the observer is told which kr to run");
     let arguments = std::env::var(ARGUMENTS).unwrap_or_default();
     let arguments: Vec<&str> = arguments.lines().filter(|line| !line.is_empty()).collect();
@@ -204,10 +309,16 @@ fn run_kr() {
             .unwrap_or(-1)
     };
     let after = (mode_of(&input), mode_of(&output));
+    done.store(true, Ordering::SeqCst);
+    let _ = watcher.join();
     // The modes come first: a case that waits for the end of `kr` has them by then.
     println!(
         "kr-observer: modes before {:x}:{:x} after {:x}:{:x}",
         before.0, before.1, after.0, after.1
+    );
+    println!(
+        "kr-observer: most queued {}",
+        most_queued.load(Ordering::SeqCst)
     );
     println!("kr ended {code}");
     // A line of its own, read as a shell reads the next thing a person types.

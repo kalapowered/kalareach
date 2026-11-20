@@ -517,17 +517,22 @@ impl Window {
         );
         environment.push((setup_console::KR.to_owned(), kr().display().to_string()));
         environment.push((setup_console::ARGUMENTS.to_owned(), arguments.join("\n")));
+        // A line typed before the command runs is put into the console's input by the observer,
+        // as key records, before it starts `kr`, and read back there: written from here it could
+        // arrive after `kr` has thrown the empty queue away.
+        if !typed.is_empty() {
+            environment.push((
+                setup_console::TYPE_AHEAD.to_owned(),
+                String::from_utf8_lossy(typed).into_owned(),
+            ));
+        }
         let opened = setup_console::open(setup_console::SETUP, &environment, &rig.work);
-        let mut window = Self {
+        Self {
             terminal: opened.terminal,
             shell: opened.shell,
             typing: opened.typing,
             seen: opened.seen,
-        };
-        if !typed.is_empty() {
-            window.type_bytes(typed);
         }
-        window
     }
 
     #[cfg(unix)]
@@ -637,6 +642,24 @@ impl Window {
         }
     }
 
+    /// Waits until the window has shown one of `markers`, and returns what it has shown. It fails
+    /// when it shows none.
+    fn wait_for_either(&self, markers: &[&str]) -> String {
+        let started = Instant::now();
+        loop {
+            let shown = self.shown();
+            if markers.iter().any(|marker| shown.contains(marker)) {
+                return shown;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the window never showed any of {markers:?}: {}",
+                shown.escape_debug()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Waits until the window has shown `marker` `count` times. A question is shown again after
     /// each wrong answer, and an answer typed before it is shown again is thrown away.
     fn wait_for_nth(&self, marker: &str, count: usize) -> String {
@@ -734,6 +757,20 @@ impl Window {
         self.wait_for("Type yes when the kit is stored");
         self.type_line("yes");
     }
+}
+
+/// The most input records that the observer on Windows saw waiting in the console while `kr` ran.
+#[cfg(windows)]
+fn most_queued_of(shown: &str) -> usize {
+    shown
+        .lines()
+        .find_map(|line| {
+            line.split_once("kr-observer: most queued ")
+                .map(|(_, rest)| rest)
+        })
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("the observer said how much waited in the input: {shown}"))
 }
 
 /// What the observer on Windows said the console's two mode words were before it started `kr` and
@@ -1392,6 +1429,19 @@ async fn text_pasted_past_the_last_answer_never_reaches_the_shell() {
     // command ends.
     let after = "PASTED-AFTER-THE-ANSWER\n".repeat(25);
     window.type_bytes(format!("yes\n{after}").as_bytes());
+    // On Windows the observer counted the records that waited in the console's input while `kr`
+    // ran. A case where nothing waited behind the answer has nothing for the discard to throw away
+    // and would pass without one, so it fails in words instead.
+    #[cfg(windows)]
+    {
+        let shown = window.wait_for("kr ended 0");
+        assert!(
+            most_queued_of(&shown) >= 100,
+            "this case could not make its condition: no pasted text waited in the console's \
+             input behind the answer: {shown}"
+        );
+    }
+    #[cfg(not(windows))]
     window.wait_for("kr ended 0");
     window.type_line("marker");
     let shown = window.wait_for("first:");
@@ -2478,9 +2528,27 @@ async fn an_interrupt_at_each_question_leaves_the_next_line_to_the_shell() {
 async fn a_line_typed_before_the_question_is_shown_does_not_answer_it() {
     let rig = Rig::start().await;
     let mut window = Window::run_after_typing(&rig, &["backup", "setup"], b"yes\n");
+    // On Windows the observer queues the line as key records before it runs `kr`, and reads the
+    // queue back: a console that did not take it fails the case here, in words, and never lets the
+    // case pass with nothing typed ahead.
+    #[cfg(windows)]
+    {
+        let shown = window.wait_for_either(&["kr-observer: typed ahead", "panicked"]);
+        assert!(
+            shown.contains("kr-observer: typed ahead"),
+            "this case could not make its condition: the line was not queued before kr ran: {shown}"
+        );
+    }
     window.wait_for("Type yes to go on");
     window.type_line("no");
-    let shown = window.wait_for("kr ended");
+    // A command that took the line typed ahead for the answer shows the kit and asks for the end of
+    // the seed, where it takes the next line for a wrong end: it never ends, so the case reads the
+    // question as well as the end.
+    let shown = window.wait_for_either(&["kr ended", "type the last 8 symbols of its seed line"]);
+    assert!(
+        !shown.contains("type the last 8 symbols of its seed line"),
+        "the line typed ahead answered the first question: {shown}"
+    );
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(shown.contains("Nothing was set up."), "{shown}");
     assert!(
