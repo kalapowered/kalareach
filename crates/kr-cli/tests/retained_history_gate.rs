@@ -1543,4 +1543,35 @@ mod cases {
             ]
         );
     }
+
+    #[test]
+    fn the_oracle_counts_the_lines_of_each_literal_and_comment_and_reads_a_raw_string_by_its_own_rule()
+     {
+        // Each form that spans lines is followed by a name on the line after it, and a raw string
+        // holds a quote and a backslash that a plain string would end or escape at.
+        let lib = concat!(
+            "fn a() { r#\"say \"agent.turn.cancel\" \\\"#; }\n",
+            "fn b() { ActionRight::r#AgentTurnCancel; }\n",
+            "fn c() { \"the method agent.turn.steer is gone\"; }\n",
+            "fn d() { r#\"one\n",
+            "two\"#; Method::AgentTurnSteer; }\n",
+            "fn e() { \"one\n",
+            "two\"; Method::AgentTurnSteer; }\n",
+            "fn f() { b\"one\n",
+            "two\"; Method::AgentTurnSteer; }\n",
+            "/* one\n",
+            "two */ fn g() { Method::AgentTurnSteer; }\n",
+            "fn h() { let _ = '\"'; Method::AgentTurnSteer; }\n",
+        );
+        let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
+        let hits = oracle(folder.path()).expect("hits");
+        let at = "crates/kr-a/src/lib.rs";
+        assert_eq!(
+            lines(&hits),
+            [1, 3, 5, 7, 9, 11, 12]
+                .iter()
+                .map(|line| (at.to_owned(), *line))
+                .collect::<Vec<_>>()
+        );
+    }
 }
