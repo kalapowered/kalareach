@@ -6,38 +6,11 @@
  * in and is told where the device stands. These are the words for each place.
  *
  * Section 17 is exact about the store builds: they sign in and show usage, and carry no embedded
- * checkout, no payment form and no call to action that sends a person somewhere to buy. The rule
- * is stated here as data so a test can hold the rendered surface to it rather than trusting that
- * nobody added a button.
+ * checkout, no payment form and no call to action that sends a person somewhere to buy.
  */
 
 /** How this build reached the device. */
 export type Channel = 'app_store' | 'play' | 'independent'
-
-/** What a build's commercial surface may contain. */
-export interface CommercialSurface {
-  /** Signing in is always offered: an account is how usage is attributed. */
-  readonly signIn: true
-  /** Usage is always shown to a signed-in person. */
-  readonly usage: true
-  /** A payment form. Never, on any build. */
-  readonly checkout: false
-  /** A control whose purpose is to send the person somewhere to buy. Never. */
-  readonly purchaseCallToAction: false
-}
-
-/**
- * The surface a build has.
- *
- * The channel is taken and ignored on purpose: an independently signed Android build is under no
- * store's rule, and it still carries no payment form, because the product sells on the website and
- * a second place to buy is a second place to get it wrong. The argument stays so that the rule is
- * stated against the channel rather than assumed away.
- */
-export function commercialSurface(channel: Channel): CommercialSurface {
-  void channel
-  return { signIn: true, usage: true, checkout: false, purchaseCallToAction: false }
-}
 
 /**
  * Words a purchase surface is made of.

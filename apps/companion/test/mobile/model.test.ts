@@ -56,7 +56,7 @@ import {
   readRecord,
   writeRecord
 } from '../../src/mobile/model/store'
-import { commercialSurface, describeAccount, usageFraction } from '../../src/model/account'
+import { describeAccount, usageFraction } from '../../src/model/account'
 import { detectSurface, minimumTarget, showsBackControl, TOUCH_TARGET } from '../../src/mobile/platform'
 
 const NOW = 1_763_000_000_000
@@ -638,17 +638,6 @@ describe('recovery after suspension, termination and a network change (KR-ACC-01
 })
 
 describe('the commercial surface on a mobile build (KR-REQ-17.32)', () => {
-  it('permits signing in and showing usage, and nothing that takes money', () => {
-    for (const channel of ['app_store', 'play', 'independent'] as const) {
-      expect(commercialSurface(channel)).toEqual({
-        signIn: true,
-        usage: true,
-        checkout: false,
-        purchaseCallToAction: false
-      })
-    }
-  })
-
   it('says plainly that no account is needed for local work', () => {
     const text = describeAccount({ state: 'signed_out', outcome: null })
     expect(text).toContain('work exactly as they do with one')

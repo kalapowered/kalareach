@@ -26,8 +26,8 @@ export function Account({
 }): ReactNode {
   const { port } = useApp()
   const account = useAccount(port)
-  // Every channel signs in and shows usage, and none carries a way to pay
-  // (`commercialSurface`), so the channel changes nothing the panel draws.
+  // Every channel signs in and shows usage, and none carries a way to pay, so the channel
+  // changes nothing the panel draws.
   return (
     <div data-testid="mobile-account" data-channel={channel}>
       <AccountPanel account={account} port={port} surface={surface} />
