@@ -2,18 +2,20 @@
 //! processes it signals, when, and what it keeps of what the command wrote.
 //!
 //! Each case runs a small shell script under `kr_conformance::tree` with a deadline a few seconds
-//! away. Every process a fixture starts waits with `sleep` or `wait`; the pids a case looks at are
-//! recorded by the script in a file of the case's own, and a case that fails ends what it left.
+//! away. No case sends a signal: the signals that end what a call started are the report's own.
+//! Every process a fixture starts waits with `sleep` or `wait` and ends by itself within 61 s, so a
+//! case that fails leaves nothing after that. A call runs on a thread, and a case waits for what it
+//! gave for a bound, and leaves the thread when the call has not returned. The pids a case looks at
+//! are recorded by the script in a file of the case's own; a look by number may give a false red
+//! and never leads to an action.
 #![cfg(unix)]
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpid};
+use rustix::process::{Pid, WaitOptions, waitpid};
 
 use kr_conformance::tree::{self, Captured, Deadline, GRACE, Waited};
 
@@ -88,59 +90,33 @@ fn left_after(pids: &[String], within: Duration) -> Vec<String> {
 /// What a call that was supervised gave.
 type Call = std::io::Result<Waited<Output>>;
 
-/// What ends a group that its call did not end: it is given the group's number.
-type End = Arc<dyn Fn(Pid) + Send + Sync>;
+/// The longest a case waits for a call that it expects to return.
+const BOUND: Duration = Duration::from_secs(60);
 
-/// The controller of a fixture command: it starts `command` as the leader of a group of its own and
-/// keeps the leader, which [`tree::watch`] supervises on this thread. A watchdog sends `end` the
-/// group's number only when the call has not returned `within` a time after the start. A call that
-/// has not returned has not reaped the leader, for every wait in `watch` is the last thing it does
-/// before it returns, so the leader holds the group's number then and the signal reaches the
-/// fixture's group and no other process. The watchdog is dismissed when the call returns, and sends
-/// nothing after. Gives none when the watchdog had to send.
-fn controlled(
-    mut command: Command,
-    deadline: Deadline,
-    within: Duration,
-    end: End,
-) -> Option<Call> {
-    let mut child = match tree::spawn(&mut command, true) {
-        Ok(child) => child,
-        Err(error) => return Some(Err(error)),
-    };
-    let group = Pid::from_child(&child);
-    let (dismiss, dismissed) = std::sync::mpsc::channel::<()>();
-    let watchdog = std::thread::spawn(move || {
-        let late = dismissed.recv_timeout(within) == Err(RecvTimeoutError::Timeout);
-        if late {
-            end(group);
-        }
-        late
-    });
-    let waited = tree::watch(&mut child, deadline);
-    drop(dismiss);
-    let late = watchdog.join().expect("the watchdog");
-    (!late).then_some(waited)
+/// A call that runs on a thread of its own. The case waits for what the call gave for a bound that
+/// it chooses and, when the call has not returned, leaves the thread: it sends no signal and does
+/// not wait for it.
+struct Started(Receiver<Call>);
+
+impl Started {
+    /// What the call gave, or none when it had not returned `within`.
+    fn within(&self, within: Duration) -> Option<Call> {
+        self.0.recv_timeout(within).ok()
+    }
 }
 
-/// What ends the group of a fixture that did not end: the signal that cannot be caught.
-fn kill_the_group() -> End {
-    Arc::new(|group| {
-        let _ = kill_process_group(group, Signal::KILL);
-    })
-}
-
-/// Runs `command` under `deadline` as a controlled fixture on a thread of its own, which gives what
-/// the call returned, or none when it did not return in a minute.
-fn start(command: Command, deadline: Deadline) -> std::thread::JoinHandle<Option<Call>> {
+/// Runs `command` under `deadline`, with its standard output captured, on a thread of its own.
+fn start(mut command: Command, deadline: Deadline) -> Started {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        controlled(command, deadline, Duration::from_secs(60), kill_the_group())
-    })
+        let _ = sender.send(tree::output(&mut command, Some(deadline)));
+    });
+    Started(receiver)
 }
 
-/// [`start`], and waits for its end.
+/// [`start`], and waits for what the call gave for [`BOUND`]: none when it had not returned.
 fn run(command: Command, deadline: Deadline) -> Option<Call> {
-    start(command, deadline).join().expect("the controller")
+    start(command, deadline).within(BOUND)
 }
 
 /// What a call that returned in time gave, for a command that started.
@@ -149,81 +125,44 @@ fn returned(call: Option<Call>) -> Waited<Output> {
         .expect("a started command")
 }
 
-/// KR-REQ-29.01, the part about reproducible commands: the controller of a fixture sends nothing once
-/// its call has returned: a command that ends at once, with a watchdog that waits 2 s, and 4 s
-/// after the call, no signal was sent. A signal after the call would go to a number that the
-/// leader no longer holds.
-#[test]
-fn the_controller_of_a_fixture_sends_no_signal_after_its_call_has_returned() {
-    let sent = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&sent);
-    let end: End = Arc::new(move |_| {
-        counter.fetch_add(1, Ordering::SeqCst);
-    });
-    let call = controlled(
-        bash("exit 0", &[]),
-        deadline_in(30),
-        Duration::from_secs(2),
-        end,
-    );
-    assert!(matches!(returned(call), Waited::Done(_)));
-    std::thread::sleep(Duration::from_secs(4));
-    assert_eq!(
-        sent.load(Ordering::SeqCst),
-        0,
-        "the controller sent a signal after its call had returned"
-    );
-}
-
-/// KR-REQ-29.01, the part about reproducible commands: the controller of a fixture ends the group
-/// of a call that has not returned `within` its time, once: a command that waits 20 s under a
-/// deadline of 600 s, with a watchdog that waits 2 s, gives none and is sent one signal.
-#[test]
-fn the_controller_of_a_fixture_ends_the_group_of_a_call_that_does_not_return_once() {
-    let sent = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&sent);
-    let end: End = Arc::new(move |group| {
-        counter.fetch_add(1, Ordering::SeqCst);
-        let _ = kill_process_group(group, Signal::KILL);
-    });
-    let call = controlled(
-        bash("sleep 20", &[]),
-        deadline_in(600),
-        Duration::from_secs(2),
-        end,
-    );
-    assert!(call.is_none(), "the call returned in time");
-    assert_eq!(sent.load(Ordering::SeqCst), 1);
-}
-
 /// KR-REQ-29.01, the part about reproducible commands: when the leader was reaped by another waiter,
 /// the report's wait for it fails, and the report gives that error and signals nothing: the leader's
-/// number may be another process's. The case reaps the leader itself while a process of its group
-/// holds the pipe, and a process of the group that writes a line when it is asked to end is
-/// looked at after the grace: its file stays empty.
+/// number may be another process's. The case reaps the leader itself, by its number, behind a
+/// barrier: a process of the group holds the pipe until the case has done it, and the report reaps
+/// the leader only when every pipe has closed, so no other waiter comes first. A process of the group
+/// that writes a line when it is asked to end has its trap set before the case reaps, and its file
+/// is empty when the call returns: every signal of a call comes before its return.
 #[test]
 fn a_leader_reaped_by_another_waiter_gives_the_error_and_no_signal_is_sent() {
     let place = tempfile::tempdir().expect("a directory");
     let pids = place.path().join("pids.txt");
     let marker = place.path().join("asked.txt");
-    // The leader records its pid, and leaves a process of its group that writes `term` to the file
-    // when it is asked to end and holds no pipe, and `sleep 5`, which holds the pipe.
-    let script = "printf '%s\\n' \"$$\" > \"$1\"\n( trap 'printf \"%s\\n\" term >> \"$2\"; exit 0' TERM; sleep 20 & wait ) >/dev/null 2>&1 &\nsleep 5 &\nexit 0";
-    let began = Instant::now();
-    let call = start(bash(script, &[&pids, &marker]), deadline_in(20));
-    let leader = recorded_pids(&pids, 1);
-    let leader = Pid::from_raw(leader[0].parse().expect("a pid")).expect("a process");
-    // The report waits for the leader only when the pipe has closed, 5 s on.
-    waitpid(Some(leader), WaitOptions::empty()).expect("the leader, which this case reaps");
-    let call = call.join().expect("the controller");
-    let took = began.elapsed();
-    std::thread::sleep(GRACE + Duration::from_secs(1));
+    let release = place.path().join("release");
+    // The leader records its pid, leaves a process of its group that writes `term` to the marker
+    // when it is asked to end, holds no pipe and records `ready` when its trap is set, and a process
+    // of its group that holds the pipe until the release file exists, for 40 s at most; then it ends.
+    let script = "printf '%s\\n' \"$$\" > \"$1\"\n( trap 'printf \"%s\\n\" term >> \"$2\"; exit 0' TERM; printf '%s\\n' ready >> \"$1\"; sleep 20 & wait ) >/dev/null 2>&1 &\n( i=0; while [ ! -e \"$3\" ] && [ $i -lt 200 ]; do sleep 0.2; i=$((i+1)); done ) &\nexit 0";
+    let call = start(bash(script, &[&pids, &marker, &release]), deadline_in(20));
+    let recorded = recorded_pids(&pids, 2);
+    let leader = Pid::from_raw(recorded[0].parse().expect("a pid")).expect("a process");
+    let reaped = waitpid(Some(leader), WaitOptions::empty());
+    // The barrier is let go whatever came of the reap, so that a failed case leaves nothing.
+    std::fs::write(&release, "").expect("the release file");
+    let (reaped, status) = reaped
+        .expect("the wait for the leader")
+        .expect("the leader, which this case reaps");
+    let call = call.within(Duration::from_secs(15));
     let asked = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(reaped, leader, "the number that the wait reaped");
+    assert_eq!(
+        status.exit_status(),
+        Some(0),
+        "the leader that ended at once"
+    );
     assert!(
         matches!(call, Some(Err(_))),
         "the call gave {call:?}, not the error of a wait that failed"
     );
-    assert!(took < Duration::from_secs(15), "the call took {took:?}");
     assert_eq!(asked, "", "a signal was sent to the group");
 }
 
@@ -281,7 +220,7 @@ fn a_leader_that_ended_while_a_process_of_its_group_holds_the_pipe_is_not_reaped
         seen.push((alive(&started[0]), alive(&started[1])));
         std::thread::sleep(Duration::from_millis(100));
     }
-    let waited = returned(call.join().expect("the controller"));
+    let waited = returned(call.within(BOUND));
     let left = left_after(&started, Duration::from_secs(10));
     assert!(matches!(waited, Waited::TimedOut(_)), "{waited:?}");
     assert!(!seen.is_empty());
@@ -367,9 +306,9 @@ fn a_pipe_that_a_process_of_the_group_holds_past_the_leader_s_end_is_ended_at_th
 fn a_pipe_that_a_process_outside_the_group_holds_is_closed_when_the_call_returns() {
     let place = tempfile::tempdir().expect("a directory");
     let pids = place.path().join("pids.txt");
-    // Job control puts the background job in a group of its own.
-    let script =
-        "set -m\n(while :; do echo tick; sleep 0.2; done) &\nprintf '%s\\n' \"$!\" > \"$1\"";
+    // Job control puts the background job in a group of its own. The job ends by itself, after 250
+    // lines at the most (about 50 s), when no write to a closed pipe has ended it before.
+    let script = "set -m\n(i=0; while [ $i -lt 250 ]; do echo tick; sleep 0.2; i=$((i+1)); done) &\nprintf '%s\\n' \"$!\" > \"$1\"";
     let began = Instant::now();
     let call = run(bash(script, &[&pids]), deadline_in(2));
     let started = recorded_pids(&pids, 1);
@@ -385,6 +324,39 @@ fn a_pipe_that_a_process_outside_the_group_holds_is_closed_when_the_call_returns
     assert!(
         left.is_empty(),
         "the process that is outside the group still writes: the pipe was left open"
+    );
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a case does not wait for a call that the
+/// kill of its group cannot end. A job in a group of its own writes to the pipe until the case
+/// releases it, under a deadline that is not reached, so the call does not return, and the case
+/// has none from it within its bound and sends no signal. Once the job is released the pipe
+/// closes, and the thread that the case left gives the call's result.
+#[test]
+fn a_call_that_the_kill_of_its_group_cannot_end_is_left_at_the_bound_of_the_case() {
+    let place = tempfile::tempdir().expect("a directory");
+    let release = place.path().join("release");
+    // Job control puts the job in a group of its own. It ends when the release file exists, or by
+    // itself after 250 lines at the most (about 50 s).
+    let script = "set -m\n(i=0; while [ ! -e \"$1\" ] && [ $i -lt 250 ]; do echo tick; sleep 0.2; i=$((i+1)); done) &\nexit 0";
+    let began = Instant::now();
+    let call = start(bash(script, &[&release]), deadline_in(600));
+    let at_the_bound = call.within(Duration::from_secs(2));
+    let took = began.elapsed();
+    // The barrier is let go before the case asserts, so that a failed case leaves nothing.
+    std::fs::write(&release, "").expect("the release file");
+    let after = call.within(Duration::from_secs(30));
+    assert!(
+        at_the_bound.is_none(),
+        "the call returned: {at_the_bound:?}"
+    );
+    assert!(
+        took < Duration::from_secs(12),
+        "the case waited {took:?} for a bound of 2 s"
+    );
+    assert!(
+        matches!(after, Some(Ok(Waited::Done(_)))),
+        "the thread that the case left gave {after:?}, not the call's result"
     );
 }
 
