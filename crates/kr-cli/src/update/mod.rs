@@ -40,7 +40,8 @@
 //!
 //! `rollback` is the same switch to an older release the store keeps: it differs in where the
 //! release comes from, which is the store, and in what it requires of it, that it is older than the
-//! current release. Everything from the survey of the environments on is shared.
+//! current release. Everything from the survey of the environments on is shared, but for the
+//! rollback's lowering of a transfers journal, which comes before the check of the stores.
 //!
 //! The record of the update under way is written before each step that changes what runs, so a
 //! run that stops part way leaves what the next needs to finish it or undo it. It is let go of
@@ -2006,7 +2007,9 @@ async fn hand_over(
     }
     // Every store the target lists, read where the target's manifest says it is, before anything is
     // brought forward: a switch the target cannot read the stores for is refused with nothing
-    // changed, and every daemon it stopped is started again.
+    // switched, and every daemon it stopped is started again. A transfers journal the rollback brought
+    // back above is not undone by the refusal: the release before and the one the host stays on both
+    // read it at that version.
     {
         let published = record
             .update

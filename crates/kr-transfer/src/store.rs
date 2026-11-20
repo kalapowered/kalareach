@@ -1,8 +1,9 @@
 //! `transfers.sqlite`: the transfer journal.
 //!
-//! Write-ahead logging with full synchronisation, forward-only migrations, and every state change
-//! committed together with the outbox row that announces it. The order the rows are written in is
-//! what makes an interrupted transfer resumable:
+//! Write-ahead logging with full synchronisation, migrations that only go forward but for one step
+//! back, from the version that kept a draft's binding revision in a column, which a rollback takes,
+//! and every state change committed together with the outbox row that announces it. The order the
+//! rows are written in is what makes an interrupted transfer resumable:
 //!
 //! * An **upload** row exists before a single byte is accepted, with its declared size already
 //!   charged against the environment's budget.
@@ -763,7 +764,8 @@ impl Store {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(TransferError::store)?;
-        // Forward-only, and each step leaves the journal readable by the version it moves to.
+        // Forward-only, but for the one step back from [`COLUMN_VERSION`] below, and each step
+        // leaves the journal readable by the version it moves to.
         // `CREATE TABLE IF NOT EXISTS` above does nothing to a table that already exists, so a
         // column that a later version of the schema added is added here, and a table that a later
         // version added is made in one transaction with the move of the version, where the step

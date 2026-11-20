@@ -315,14 +315,17 @@ revision cannot be written is refused and writes nothing. A row whose draft was 
 create failed, is deleted when the journal is next opened.
 
 A journal at schema version 6 is one that a build before this one wrote while it kept the revision
-in a column of the table of drafts, which the journal no longer has and which a build at version 5
-ignores. A daemon of this build brings such a journal to version 5 when it opens it: it writes the
-revisions the column holds to the store beside the journal, in one transaction, and then moves the
-version, so a stop between the two repeats the step with the same rows. If a revision cannot be
-written, the journal stays at version 6 and the daemon does not start. `kr host rollback` takes the
-same step, before it checks the stores, for a journal that no daemon of this build has opened, when
-the release it goes to reads the journal below version 6. The step goes, with the version that the
-release lists as read through, once no supported upgrade can start from a journal at version 6.
+in a column of the table of drafts. A journal this build makes has no such column. One brought back
+from version 6 keeps the column unused, and so does one below version 6 that a build before this one
+opened, which added it; a build at version 5 ignores the column. A daemon of this build brings such
+a journal to version 5 when it opens it: it writes the revisions the column holds to the store
+beside the journal, in one transaction, and then moves the version, so a stop between the two
+repeats the step with the same rows. If a revision cannot be written, the journal stays at version 6
+and the daemon does not start; the remedy is `kr host rollback` to the release that wrote version 6,
+which reads the journal as it is. `kr host rollback` takes the same step, before it checks the
+stores, for a journal that no daemon of this build has opened, when the release it goes to reads the
+journal below version 6. The step goes, with the version that the release lists as read through,
+once no supported upgrade can start from a journal at version 6.
 
 A rollback goes to a release that reads the transfers journal below version 6 and keeps no binding
 revision for a draft. That release records a prompt that names a draft written for an application
