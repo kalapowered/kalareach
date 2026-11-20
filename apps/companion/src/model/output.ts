@@ -59,12 +59,6 @@ function held(pages: readonly OutputPage[]): number {
   return pages.reduce((total, page) => total + page.bytes.length, 0)
 }
 
-/** Whether the window reaches the oldest output the host keeps. */
-export function atOldest(window: OutputWindow): boolean {
-  const first = window.pages[0]
-  return first !== undefined && window.oldest !== null && BigInt(first.from) <= BigInt(window.oldest)
-}
-
 /**
  * Whether the window reaches where the output ended when the host last answered. A window that
  * holds nothing, once the host has said where its output ends, is at that end.
