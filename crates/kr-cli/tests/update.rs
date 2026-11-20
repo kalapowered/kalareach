@@ -710,6 +710,40 @@ async fn a_command_that_finds_no_daemon_starts_the_daemon_of_the_release_current
     host.close(&kr, &display);
 }
 
+/// Hosts that write their releases at once keep each other's daemons waiting, on macOS for the check
+/// of each new program and on Linux for the journal's commits, so a test program has only a few at
+/// a time: the system gives a number of places, no place is given beyond it, and a place given back
+/// is given again, also to a host that was waiting for one.
+#[cfg(unix)]
+#[test]
+fn a_system_whose_hosts_wait_for_each_other_gives_a_few_places_at_once() {
+    let limit =
+        HOST_CASES_AT_ONCE.expect("this system bounds the hosts a test program has at once");
+    let places = Places::new(Some(limit));
+    let mut held: Vec<Place<'_>> = (0..limit)
+        .map(|number| {
+            places
+                .try_take()
+                .unwrap_or_else(|| panic!("place {number} of {limit} is free"))
+        })
+        .collect();
+    assert!(
+        places.try_take().is_none(),
+        "no place is given beyond {limit}"
+    );
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| drop(places.take()));
+        held.pop();
+        waiting
+            .join()
+            .expect("a host that waited for a place is given one when it is given back");
+    });
+    assert!(
+        places.try_take().is_some(),
+        "a place given back is given again"
+    );
+}
+
 /// A daemon of a release starts its own release's worker with its own release's packages, and
 /// takes no other: a session it launched with another would run what the store does not hold.
 #[test]
