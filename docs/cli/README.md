@@ -1949,7 +1949,8 @@ On macOS the kernel does not describe another user's processes, and Terminal and
 each shell through the system's `login` by default, which runs as root. A worker establishes that
 such a terminal is outside its session when the terminal's shell started before the session did,
 and cannot establish it otherwise. So in a window opened after a session started, `kr pair invite
---owner` refuses while that session runs: use a window opened earlier, or end the session first.
+--owner` can refuse while that session runs, because the worker cannot always establish that the
+window is outside the session: use a window opened earlier, or end the session first.
 
 This guard exists so that an agent running in a session cannot start the ceremony by accident. It
 is not isolation from other code running under the same account, which can do anything `kr` does.
