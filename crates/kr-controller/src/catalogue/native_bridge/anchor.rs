@@ -375,6 +375,23 @@ impl Anchor {
         check_folder(&parent, path, act)
     }
 
+    /// Refuses the file at `path`, a place below the selected root, where another user can change
+    /// it, read through a descriptor opened on it. A name that is not there, or is not a regular
+    /// file, is judged where it is read.
+    pub(crate) fn refuse_shared_file(&self, path: &Path, act: Act) -> Result<()> {
+        if self.is_root(path) {
+            return Ok(());
+        }
+        let place = self.place(path)?;
+        let Some(parent) = self.parent(&place, false)? else {
+            return Ok(());
+        };
+        match parent.protection(place.name).map_err(storage)? {
+            Some(protection) => check_file(&protection, path, act),
+            None => Ok(()),
+        }
+    }
+
     /// Writes `bytes` to the file at `path`: staged under a temporary name beside it, flushed, and
     /// published from there, the folder flushed after. A file that is there keeps its permission
     /// bits; a new one gets `default_mode`. A folder, a link or a special file at the name is
@@ -447,7 +464,9 @@ impl Anchor {
     /// have the digest `expected`; a name that is not there is already gone.
     ///
     /// The folder is judged through the handle this removal holds, as a write judges it, and a
-    /// folder another user can change is refused before anything is taken. No call removes a name
+    /// folder another user can change is refused before anything is taken. So is a file another
+    /// user can change, judged through a descriptor opened on it and matched to the file that was
+    /// read, since such a user could change it where it is parked. No call removes a name
     /// only while it still names a given file, so the file is first taken out of its place under a
     /// temporary name, only where that name is free, and read there: it is removed only where it
     /// is the checked file, by its identity and its contents. Any other file goes back to the
@@ -469,6 +488,22 @@ impl Anchor {
                 return Ok(Taken::Changed);
             }
         };
+        #[cfg(test)]
+        read_pause::run(path);
+        // The file's own protection, read through a descriptor opened on the name now and matched
+        // to the file that was read: a file another user can change is not taken out of its place.
+        match parent.protection(place.name).map_err(storage)? {
+            Some(protection) if protection.identity.same_object(&checked) => {
+                check_file(&protection, path, Act::Remove)?;
+            }
+            Some(_) => return Ok(Taken::Changed),
+            None => {
+                return Ok(match parent.entry(place.name).map_err(storage)? {
+                    Entry::Absent => Taken::Gone,
+                    _ => Taken::Changed,
+                });
+            }
+        }
         #[cfg(test)]
         removal_pause::run(path);
         let temporary = temporary_name(place.name);
@@ -562,36 +597,48 @@ fn folder_shared(cause: Cause, path: &Path, act: Act) -> ControllerError {
         Cause::ListEntry => "has an allow entry for an account not known to be yours",
     };
     refused(format!(
-        "{} cannot be written safely, because the folder it is in {because}, so nothing is {} \
-         there",
+        "{} cannot be {} safely, because the folder it is in {because}, so nothing is {} there",
         path.display(),
+        act.left_undone(),
         act.left_undone()
     ))
 }
 
-/// The refusal where a file that is to be replaced can be changed by another user.
-fn file_shared(cause: Cause, path: &Path) -> ControllerError {
+/// The refusal where a file that is to be replaced or removed can be changed by another user.
+fn file_shared(cause: Cause, path: &Path, act: Act) -> ControllerError {
     let because = match cause {
         Cause::AnotherOwner => "belongs to another user",
         Cause::WriteBit => "lets its group or every user change it",
         Cause::ListEntry => "has an allow entry for an account not known to be yours",
     };
+    let done = match act {
+        Act::Write => "replaced",
+        Act::Remove => "removed",
+    };
     refused(format!(
-        "{} cannot be replaced safely, because it {because}, so nothing is written there",
-        path.display()
+        "{} cannot be {done} safely, because it {because}, so nothing is {} there",
+        path.display(),
+        act.left_undone()
     ))
 }
 
 /// The refusal where the access list of `subject`, the folder or the file of a place, cannot be
 /// read.
 fn unreadable(path: &Path, subject: &Path, act: Act) -> ControllerError {
-    refused(format!(
-        "{} cannot be written safely, because the installer cannot verify the access controls of \
-         {}, so nothing is {} there",
-        path.display(),
-        subject.display(),
-        act.left_undone()
-    ))
+    refused(match act {
+        Act::Write => format!(
+            "{} cannot be written safely, because the installer cannot verify the access \
+             controls of {}, so nothing is written there",
+            path.display(),
+            subject.display()
+        ),
+        Act::Remove => format!(
+            "{} cannot be removed safely, because the host cannot read the access list of {}, \
+             so nothing is removed there",
+            path.display(),
+            subject.display()
+        ),
+    })
 }
 
 /// The refusal where a new file would be given an allow entry by the folder it is made in.
@@ -691,10 +738,17 @@ fn file_to_replace(
     if !protection.identity.same_object(checked) {
         return Err(changed_since_checked(path));
     }
+    check_file(&protection, path, Act::Write)?;
+    Ok(protection)
+}
+
+/// Refuses the file `protection` describes, which is the file at `path`, where another user can
+/// change it or its access list cannot be read.
+fn check_file(protection: &Protection, path: &Path, act: Act) -> Result<()> {
     match protection.control() {
-        Control::Own => Ok(protection),
-        Control::Shared(cause) => Err(file_shared(cause, path)),
-        Control::Unreadable(_) => Err(unreadable(path, path, Act::Write)),
+        Control::Own => Ok(()),
+        Control::Shared(cause) => Err(file_shared(cause, path, act)),
+        Control::Unreadable(_) => Err(unreadable(path, path, act)),
     }
 }
 
@@ -940,6 +994,33 @@ pub(crate) mod removal_pause {
     }
 }
 
+/// What the unit tests run in a removal after it has read the file at a place and before it reads the
+/// protection of that file, to make the change another process could make in between. The hook is
+/// given the place's path.
+#[cfg(test)]
+pub(crate) mod read_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE_PROTECTION: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a removal on this thread has read the file it will check.
+    #[cfg(unix)]
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE_PROTECTION.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(path: &Path) {
+        if let Some(then) = BEFORE_PROTECTION.with(|before| before.borrow_mut().take()) {
+            then(path);
+        }
+    }
+}
+
 /// What the unit tests run in a write or a removal right after its walk to the place's folder, to
 /// make the change another process could make to that folder's name in between. The hook is given
 /// the place's path.
@@ -1063,17 +1144,17 @@ mod tests {
              there"
         );
         assert_eq!(
-            detail(file_shared(Cause::AnotherOwner, path)),
+            detail(file_shared(Cause::AnotherOwner, path, Act::Write)),
             "/home/p/.amp/mcp.json cannot be replaced safely, because it belongs to another user, \
              so nothing is written there"
         );
         assert_eq!(
-            detail(file_shared(Cause::WriteBit, path)),
+            detail(file_shared(Cause::WriteBit, path, Act::Write)),
             "/home/p/.amp/mcp.json cannot be replaced safely, because it lets its group or every \
              user change it, so nothing is written there"
         );
         assert_eq!(
-            detail(file_shared(Cause::ListEntry, path)),
+            detail(file_shared(Cause::ListEntry, path, Act::Write)),
             "/home/p/.amp/mcp.json cannot be replaced safely, because it has an allow entry for an \
              account not known to be yours, so nothing is written there"
         );
@@ -1085,30 +1166,45 @@ mod tests {
         );
     }
 
-    /// A removal refuses a folder in the words of a write, with its own ending, and tells a file it
-    /// kept in the words a person is shown.
+    /// A removal refuses a folder and a file in words of its own, and tells a file it kept in the
+    /// words a person is shown.
     #[test]
     fn a_removal_is_refused_and_a_kept_file_is_told_in_the_words_a_person_is_shown() {
         let path = Path::new("/home/p/.amp/mcp.json");
         assert_eq!(
             detail(folder_shared(Cause::AnotherOwner, path, Act::Remove)),
-            "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in belongs \
+            "/home/p/.amp/mcp.json cannot be removed safely, because the folder it is in belongs \
              to another user, so nothing is removed there"
         );
         assert_eq!(
             detail(folder_shared(Cause::WriteBit, path, Act::Remove)),
-            "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in lets its \
+            "/home/p/.amp/mcp.json cannot be removed safely, because the folder it is in lets its \
              group or every user change what is in it, so nothing is removed there"
         );
         assert_eq!(
             detail(folder_shared(Cause::ListEntry, path, Act::Remove)),
-            "/home/p/.amp/mcp.json cannot be written safely, because the folder it is in has an \
+            "/home/p/.amp/mcp.json cannot be removed safely, because the folder it is in has an \
              allow entry for an account not known to be yours, so nothing is removed there"
         );
         assert_eq!(
+            detail(file_shared(Cause::AnotherOwner, path, Act::Remove)),
+            "/home/p/.amp/mcp.json cannot be removed safely, because it belongs to another user, \
+             so nothing is removed there"
+        );
+        assert_eq!(
+            detail(file_shared(Cause::WriteBit, path, Act::Remove)),
+            "/home/p/.amp/mcp.json cannot be removed safely, because it lets its group or every \
+             user change it, so nothing is removed there"
+        );
+        assert_eq!(
+            detail(file_shared(Cause::ListEntry, path, Act::Remove)),
+            "/home/p/.amp/mcp.json cannot be removed safely, because it has an allow entry for an \
+             account not known to be yours, so nothing is removed there"
+        );
+        assert_eq!(
             detail(unreadable(path, Path::new("/home/p/.amp"), Act::Remove)),
-            "/home/p/.amp/mcp.json cannot be written safely, because the installer cannot verify \
-             the access controls of /home/p/.amp, so nothing is removed there"
+            "/home/p/.amp/mcp.json cannot be removed safely, because the host cannot read the \
+             access list of /home/p/.amp, so nothing is removed there"
         );
         assert_eq!(
             kept_while_removing(

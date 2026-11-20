@@ -1355,10 +1355,22 @@ impl Installer {
             }
         }
         // The folder that holds each recorded name, where it is there, is one that only this user
-        // can change, or nothing is removed.
+        // can change, and so is each file a removal deletes, a skill file or a document this host
+        // created, or nothing is removed. A document that another installation still holds is
+        // kept, and it is not checked here.
         if let Fs::Walk(walk) = &self.fs {
             for operation in &record.manifest.operations {
                 walk.refuse_shared_folder(Path::new(operation.path()), anchor::Act::Remove)?;
+                if matches!(
+                    operation,
+                    ChangeOperation::WriteFile { .. }
+                        | ChangeOperation::AddConfigurationEntry {
+                            created_document: true,
+                            ..
+                        }
+                ) {
+                    walk.refuse_shared_file(Path::new(operation.path()), anchor::Act::Remove)?;
+                }
             }
         }
         Ok(Some(record))
@@ -6249,6 +6261,8 @@ mod tests {
     #[cfg(unix)]
     pause_at!(when_read, removal_pause);
     #[cfg(unix)]
+    pause_at!(when_read_before_its_check, read_pause);
+    #[cfg(unix)]
     pause_at!(when_taken_out, trade_pause);
 
     /// Notes every place a removal or a write on this thread takes a file out of.
@@ -6300,8 +6314,8 @@ mod tests {
 
     /// The words of a folder refused for its write bit when a removal was to take place.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    const FOLDER_WRITE_BIT_REMOVING: &str = "because the folder it is in lets its group or every \
-        user change what is in it, so nothing is removed there";
+    const FOLDER_WRITE_BIT_REMOVING: &str = "cannot be removed safely, because the folder it is in \
+        lets its group or every user change what is in it, so nothing is removed there";
 
     /// KR-REQ-11.01: a file another process puts under a recorded name before the removal reads it
     /// is kept and named, and it is not even taken out of its place.
@@ -6604,6 +6618,263 @@ mod tests {
             "{refused}"
         );
         assert!(folder.exists(), "the folder stays");
+    }
+
+    /// The words of a file refused for its write bit when a removal was to take place.
+    #[cfg(unix)]
+    const FILE_WRITE_BIT_REMOVING: &str = "cannot be removed safely, because it lets its group or \
+        every user change it, so nothing is removed there";
+
+    /// The words of a file refused for an allow entry when a removal was to take place.
+    #[cfg(target_os = "macos")]
+    const FILE_ENTRY_REMOVING: &str = "cannot be removed safely, because it has an allow entry for \
+        an account not known to be yours, so nothing is removed there";
+
+    /// The files a removal takes after `amp_installed`: the skill file and the document the
+    /// installation created, which holds nothing else and so is removed whole.
+    #[cfg(unix)]
+    const RECORDED_FILES: [&str; 2] = [SKILL_FILE, ".amp/mcp.json"];
+
+    /// The recorded files of `amp_installed` that no longer stand.
+    #[cfg(unix)]
+    fn recorded_files_gone(tree: &Tree) -> Vec<&'static str> {
+        RECORDED_FILES
+            .into_iter()
+            .filter(|file| !tree.home().join(file).exists())
+            .collect()
+    }
+
+    /// KR-REQ-11.01: a removal is refused before it takes anything away when a recorded file, a
+    /// skill file or the document the installation created, is one every user can change.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_file_every_user_can_change_is_refused_before_any_removal() {
+        for shared in RECORDED_FILES {
+            let tree = Tree::create();
+            let installer = amp_installed(&tree);
+            let file = tree.home().join(shared);
+            set_mode(&file, 0o666);
+            let refused = installer
+                .remove(&params(amp(), InstallScope::User))
+                .expect_err("a file every user can change is refused");
+            assert!(
+                matches!(&refused, ControllerError::PermissionDenied { detail }
+                    if detail.contains(shared) && detail.contains(FILE_WRITE_BIT_REMOVING)),
+                "{shared}: {refused}"
+            );
+            assert_eq!(
+                recorded_files_gone(&tree),
+                Vec::<&str>::new(),
+                "{shared}: nothing was removed before the refusal"
+            );
+            set_mode(&file, 0o644);
+            installer
+                .remove(&params(amp(), InstallScope::User))
+                .expect("the same removal goes ahead where the file is not shared");
+            assert_eq!(
+                recorded_files_gone(&tree),
+                RECORDED_FILES.to_vec(),
+                "{shared}: and it takes the files away"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: a removal is refused before it takes anything away when a recorded file is one
+    /// that a group other than the user's private group can change. A document that another group
+    /// owns is refused earlier still, by the check of the documents an installation cannot carry the
+    /// protection of, so on Linux, where the case gives the file another group, only the skill file
+    /// is judged here.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_recorded_file_its_group_can_change_is_refused_before_any_removal() {
+        let files: &[&str] = if cfg!(target_os = "macos") {
+            &RECORDED_FILES
+        } else {
+            &[SKILL_FILE]
+        };
+        for &shared in files {
+            let tree = Tree::create();
+            let installer = amp_installed(&tree);
+            let file = tree.home().join(shared);
+            // On Linux a group of the user's own is the user-private group unless it is another one;
+            // on macOS no group is.
+            if cfg!(target_os = "linux") {
+                let Some(group) = crate::catalogue::files::another_group(&tree.home()) else {
+                    println!(
+                        "this user belongs to one group only, so the group case runs as a decision"
+                    );
+                    return;
+                };
+                std::os::unix::fs::chown(&file, None, Some(group))
+                    .expect("the file is given a group of this user's");
+            }
+            set_mode(&file, 0o664);
+            let refused = installer
+                .remove(&params(amp(), InstallScope::User))
+                .expect_err("a file its group can change is refused");
+            assert!(
+                matches!(&refused, ControllerError::PermissionDenied { detail }
+                    if detail.contains(shared) && detail.contains(FILE_WRITE_BIT_REMOVING)),
+                "{shared}: {refused}"
+            );
+            assert_eq!(
+                recorded_files_gone(&tree),
+                Vec::<&str>::new(),
+                "{shared}: nothing was removed before the refusal"
+            );
+            set_mode(&file, 0o644);
+            installer
+                .remove(&params(amp(), InstallScope::User))
+                .expect("the same removal goes ahead where the file is not shared");
+            assert_eq!(
+                recorded_files_gone(&tree),
+                RECORDED_FILES.to_vec(),
+                "{shared}: and it takes the files away"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: on macOS a removal is refused before it takes anything away when a recorded
+    /// skill file has an allow entry. A document with an entry is refused earlier still, by the
+    /// check of the documents an installation cannot carry the protection of.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_recorded_file_with_an_allow_entry_is_refused_before_any_removal() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let file = tree.home().join(SKILL_FILE);
+        let _entry = Restriction(file.clone());
+        exacl::setfacl(
+            &[&file],
+            &[exacl::AclEntry::allow_group(
+                "everyone",
+                exacl::Perm::READ,
+                None,
+            )],
+            None,
+        )
+        .expect("an allow entry");
+        let refused = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a file with an allow entry is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(SKILL_FILE) && detail.contains(FILE_ENTRY_REMOVING)),
+            "{refused}"
+        );
+        assert_eq!(
+            recorded_files_gone(&tree),
+            Vec::<&str>::new(),
+            "nothing was removed before the refusal"
+        );
+        exacl::setfacl(&[&file], &[], None).expect("the entry goes");
+        installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("the same removal goes ahead where the file has no entry");
+        assert_eq!(
+            recorded_files_gone(&tree),
+            RECORDED_FILES.to_vec(),
+            "and it takes the files away"
+        );
+    }
+
+    /// KR-REQ-11.01: a recorded file that another process makes changeable by every user after the
+    /// check is judged at the removal, through a descriptor opened on it, and stays where it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_made_changeable_after_the_check_is_refused_at_the_removal_of_a_file() {
+        for shared in RECORDED_FILES {
+            let tree = Tree::create();
+            let installer = amp_installed(&tree);
+            let file = tree.home().join(shared);
+            let at = file.clone();
+            when_walked_to(shared, move || set_mode(&at, 0o666));
+            let refused = installer
+                .remove(&params(amp(), InstallScope::User))
+                .expect_err("a file every user can change is refused");
+            assert!(
+                matches!(&refused, ControllerError::PermissionDenied { detail }
+                    if detail.contains(shared) && detail.contains(FILE_WRITE_BIT_REMOVING)),
+                "{shared}: {refused}"
+            );
+            assert!(file.exists(), "{shared}: the file stays");
+            assert_eq!(
+                temporary_names(file.parent().expect("a folder")),
+                Vec::<String>::new(),
+                "{shared}: nothing was taken out of its place"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: a file another process puts at a recorded name after the removal read the file
+    /// and before it read the file's protection is not the file that was read: it is not moved.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_replaced_between_its_read_and_the_check_of_its_protection_is_not_moved() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let installed = std::fs::read(&skill).expect("the installed file");
+        let parked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        note_parks(parked.clone());
+        let (at, same) = (skill.clone(), installed.clone());
+        when_read_before_its_check(SKILL_FILE, move || put_another_file(&at, &same));
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal keeps a file it did not check");
+        assert_eq!(
+            std::fs::read(&skill).ok().as_deref(),
+            Some(installed.as_slice()),
+            "the file that stands at the name is kept"
+        );
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with("SKILL.md has changed since it was installed")),
+            "{:?}",
+            result.retained
+        );
+        assert!(
+            !parked
+                .borrow()
+                .iter()
+                .any(|place| place.ends_with(SKILL_FILE)),
+            "a file that is not the checked one is not taken out of its place: {:?}",
+            parked.borrow()
+        );
+    }
+
+    /// KR-REQ-11.01: a file that is taken from its name after the removal read it and before it read
+    /// the file's protection is told as gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_gone_between_its_read_and_the_check_of_its_protection_is_told_as_gone() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let at = skill.clone();
+        when_read_before_its_check(SKILL_FILE, move || {
+            std::fs::remove_file(&at).expect("another process takes the file");
+        });
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal tells a file that is gone");
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with("SKILL.md is already gone")),
+            "{:?}",
+            result.retained
+        );
+        assert!(
+            result
+                .removed
+                .iter()
+                .all(|operation| !operation.path().ends_with("SKILL.md")),
+            "it is not counted as removed"
+        );
     }
 
     /// KR-REQ-11.01: a write judges the folder it walked to, read through the handle it holds. A
