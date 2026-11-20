@@ -805,6 +805,101 @@ fn a_typescript_test_that_a_windows_run_selects_is_not_run_and_says_where_it_is_
     );
 }
 
+/// KR-REQ-29.01, the part about results mapped to acceptance IDs with reproducible commands: a
+/// TypeScript test whose package's step was not run because a set-up step failed is not run, with
+/// the set-up step's number, and is not failed; the same test, its step run and reporting it, is
+/// passed.
+#[test]
+fn a_typescript_test_whose_step_was_not_run_for_a_set_up_step_is_not_run_with_its_number() {
+    let package = "apps/companion";
+    let file = "apps/companion/src/forms.test.ts";
+    let mut map = Map::default();
+    map.keys
+        .entry(identifier("KR-REQ-29.01"))
+        .or_default()
+        .insert(
+            Place::TypeScript {
+                package: package.to_owned(),
+                file: file.to_owned(),
+                line: 7,
+                title: "keeps its title".to_owned(),
+            },
+            Key {
+                binding: Binding::Title,
+                source: format!("{file}:7"),
+            },
+        );
+    let groups = vec!["typescript".to_owned()];
+    let step = core_plan()
+        .steps(Platform::Linux, &groups, &Values::evidence("/tmp/e"), None)
+        .into_iter()
+        .find(|step| matches!(&step.reading, Reading::Vitest { directory } if directory == package))
+        .expect("the companion's Vitest step");
+    let options = Options {
+        root: PathBuf::from("/tmp/r"),
+        evidence: PathBuf::from("/tmp/e"),
+        selection: Some(groups.clone()),
+        all_terminals: false,
+        platform: Platform::Linux,
+        plan: core_plan(),
+        typescript_compiler: None,
+        applications: None,
+        lister: PathBuf::from("/tmp/l"),
+        environment: Vec::new(),
+        part: None,
+        runner_base: PathBuf::new(),
+    };
+    let assemble = |executed: Executed| {
+        report::assemble(
+            &options,
+            &groups,
+            &map,
+            &[executed],
+            Gathered::default(),
+            "2026-11-20T00:00:00Z".to_owned(),
+        )
+    };
+    let blocked = kr_conformance::run::not_run(&step, 4, "the set-up", "exited with status 1");
+    let document = assemble(blocked.clone());
+    let record = &document.identifiers["KR-REQ-29.01"];
+    assert_eq!(record.verdict, Verdict::NotRun, "{record:?}");
+    assert_eq!(record.counts.failed, 0, "{record:?}");
+    let test = &record.tests[0];
+    assert_eq!(test.outcome, Outcome::NotRun, "{test:?}");
+    assert_eq!(
+        test.reason.as_deref(),
+        Some(
+            "the step that runs the package's tests was not run because its set-up step 4 (the \
+             set-up) exited with status 1"
+        ),
+        "{test:?}"
+    );
+    assert_eq!(test.runs.len(), 1, "{test:?}");
+    assert_eq!(
+        (test.runs[0].step, test.runs[0].outcome.clone()),
+        (1, Outcome::NotRun)
+    );
+    // The same test with its step run and the test reported: passed.
+    let mut ran = blocked;
+    ran.error = None;
+    ran.blocked_by = None;
+    ran.exit = Some(0);
+    ran.vitest = Some(
+        [(
+            (file.to_owned(), 7),
+            vec![kr_conformance::vitest::Case {
+                titles: vec!["keeps its title".to_owned()],
+                outcome: LibtestOutcome::Passed,
+            }],
+        )]
+        .into(),
+    );
+    let document = assemble(ran);
+    let record = &document.identifiers["KR-REQ-29.01"];
+    assert_eq!(record.verdict, Verdict::Passed, "{record:?}");
+    assert_eq!(record.tests[0].outcome, Outcome::Passed, "{record:?}");
+}
+
 /// KR-REQ-29.01, the part about reproducible commands and the identity of a run: the version of the
 /// compiler that read the map is in the result's toolchain, as the document and as JSON, and the
 /// field is left out when no TypeScript was read.
