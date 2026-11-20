@@ -38,10 +38,14 @@ use std::path::{Path, PathBuf};
 use kr_protocol::retained::{RETAINED, RetainedLevel};
 use serde_json::{Value, json};
 
+#[path = "retained_surface/condition.rs"]
+mod condition;
 #[path = "retained_surface/history.rs"]
 mod history;
 #[path = "retained_surface/history_cases.rs"]
 mod history_cases;
+#[path = "retained_surface/inventory_cases.rs"]
+mod inventory_cases;
 #[path = "retained_surface/narrower.rs"]
 mod narrower;
 #[path = "retained_surface/narrower_cases.rs"]

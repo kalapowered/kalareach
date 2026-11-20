@@ -34,6 +34,8 @@ use quote::ToTokens as _;
 use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
+use super::condition::Condition;
+
 /// A source tree: the repository, or a checkout of a release.
 pub struct Tree {
     root: PathBuf,
@@ -578,8 +580,18 @@ impl CrateIndex {
                 .entry(module_of(source, &path))
                 .or_default()
                 .insert(relative.clone());
+            let Some(condition) = Condition::default().within(&file.attrs, &relative)? else {
+                continue;
+            };
             let mut imports = Imports::default();
-            index.add_items(&file.items, &relative, name, &workspace, &mut imports);
+            index.add_items(
+                &file.items,
+                &relative,
+                name,
+                &workspace,
+                &mut imports,
+                &condition,
+            )?;
             index.imports.insert(relative, imports);
         }
         Ok(index)
@@ -592,11 +604,12 @@ impl CrateIndex {
         krate: &str,
         workspace: &BTreeSet<String>,
         imports: &mut Imports,
-    ) {
+        condition: &Condition,
+    ) -> Result<(), String> {
         for item in items {
-            if is_cfg_test(item) {
+            let Some(within) = condition.within(item_attrs(item), file)? else {
                 continue;
-            }
+            };
             match item {
                 syn::Item::Use(used) => {
                     use_leaves(&used.tree, &mut Vec::new(), workspace, krate, imports);
@@ -618,7 +631,7 @@ impl CrateIndex {
                             .entry(module.ident.to_string())
                             .or_default()
                             .insert(file.to_owned());
-                        self.add_items(inner, file, krate, workspace, imports);
+                        self.add_items(inner, file, krate, workspace, imports, &within)?;
                     }
                     continue;
                 }
@@ -669,6 +682,7 @@ impl CrateIndex {
                 }
             }
         }
+        Ok(())
     }
 
     fn push_method(
@@ -814,22 +828,26 @@ fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), Strin
     Ok(())
 }
 
-fn is_cfg_test(item: &syn::Item) -> bool {
-    let attrs: &[syn::Attribute] = match item {
-        syn::Item::Fn(item) => &item.attrs,
-        syn::Item::Mod(item) => &item.attrs,
-        syn::Item::Impl(item) => &item.attrs,
+/// The attributes of an item, whatever its kind.
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
         syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
         syn::Item::Static(item) => &item.attrs,
         syn::Item::Struct(item) => &item.attrs,
-        syn::Item::Enum(item) => &item.attrs,
-        syn::Item::Use(item) => &item.attrs,
-        syn::Item::Type(item) => &item.attrs,
         syn::Item::Trait(item) => &item.attrs,
-        syn::Item::Macro(item) => &item.attrs,
-        _ => return false,
-    };
-    attrs_are_cfg_test(attrs)
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        _ => &[],
+    }
 }
 
 /// Whether the attributes are exactly `#[cfg(test)]`; `cfg(any(test, ...))` is no test-only item.
@@ -1646,16 +1664,22 @@ impl Scanner {
         }
     }
 
-    fn items(&mut self, items: &[syn::Item], file: &str, under_src: &str) {
+    fn items(
+        &mut self,
+        items: &[syn::Item],
+        file: &str,
+        under_src: &str,
+        condition: &Condition,
+    ) -> Result<(), String> {
         for item in items {
-            if is_cfg_test(item) {
+            let Some(within) = condition.within(item_attrs(item), file)? else {
                 continue;
-            }
+            };
             let text = || without_docs(item.to_token_stream());
             match item {
                 syn::Item::Mod(module) => {
                     if let Some((_, inner)) = &module.content {
-                        self.items(inner, file, under_src);
+                        self.items(inner, file, under_src, &within)?;
                     }
                 }
                 syn::Item::Use(_) => {
@@ -1665,19 +1689,23 @@ impl Scanner {
                     let owner = type_name(&block.self_ty);
                     for inner in &block.items {
                         match inner {
-                            syn::ImplItem::Fn(method) if !attrs_are_cfg_test(&method.attrs) => {
+                            syn::ImplItem::Fn(method)
+                                if within.within(&method.attrs, file)?.is_some() =>
+                            {
                                 self.body(
                                     format!("{owner}::{}", method.sig.ident),
                                     without_docs(method.to_token_stream()),
                                 );
                             }
                             syn::ImplItem::Const(constant)
-                                if !attrs_are_cfg_test(&constant.attrs) =>
+                                if within.within(&constant.attrs, file)?.is_some() =>
                             {
                                 let tokens = without_docs(constant.to_token_stream());
                                 self.impl_item(&owner, file, under_src, tokens);
                             }
-                            syn::ImplItem::Macro(call) if !attrs_are_cfg_test(&call.attrs) => {
+                            syn::ImplItem::Macro(call)
+                                if within.within(&call.attrs, file)?.is_some() =>
+                            {
                                 let tokens = without_docs(call.to_token_stream());
                                 self.impl_item(&owner, file, under_src, tokens);
                             }
@@ -1687,7 +1715,8 @@ impl Scanner {
                 }
                 syn::Item::Trait(definition) => {
                     let mut kept = definition.clone();
-                    kept.items.retain(|member| {
+                    let mut keep = Vec::new();
+                    for member in &definition.items {
                         let attrs: &[syn::Attribute] = match member {
                             syn::TraitItem::Fn(member) => &member.attrs,
                             syn::TraitItem::Const(member) => &member.attrs,
@@ -1695,8 +1724,10 @@ impl Scanner {
                             syn::TraitItem::Macro(member) => &member.attrs,
                             _ => &[],
                         };
-                        !attrs_are_cfg_test(attrs)
-                    });
+                        keep.push(within.within(attrs, file)?.is_some());
+                    }
+                    let mut keep = keep.into_iter();
+                    kept.items.retain(|_| keep.next().unwrap_or(true));
                     self.body(
                         definition.ident.to_string(),
                         without_docs(kept.to_token_stream()),
@@ -1761,6 +1792,7 @@ impl Scanner {
                 _ => {}
             }
         }
+        Ok(())
     }
 }
 
@@ -1796,7 +1828,10 @@ fn scan_crate(krate: &str, source: &Path, root: &Path) -> Result<CrateScan, Stri
             .unwrap_or(path)
             .display()
             .to_string();
-        scanner.items(&parsed.items, &relative, &under_src);
+        let Some(condition) = Condition::default().within(&parsed.attrs, &relative)? else {
+            continue;
+        };
+        scanner.items(&parsed.items, &relative, &under_src, &condition)?;
     }
     for name in scanner.macro_rules.clone() {
         if scanner.expanded.contains(&name) {
