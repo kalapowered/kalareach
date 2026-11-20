@@ -252,6 +252,11 @@ impl Sends for [u8] {
     fn m(&self) { let _ = Method::AgentTurnCancel; }
     via_slice!(Method::AgentPromptQueue);
 }
+fn local() { macro_rules! check_local { (idle!(Method::AgentTurnCancel)) => {}; } }
+macro_rules! outer_fwd { ($m:expr) => { inner_fwd!($m) }; }
+fn uses_fwd() { outer_fwd!(Method::AgentTurnCancel); }
+macro_rules! d_paren ( () => { via_paren!(Method::AgentTurnSteer) } );
+macro_rules! d_brack [ () => { via_brack!(Method::AgentTurnSteer) } ];
 idle!();
 unnamed!("agent.turn.cancel");
 unnamed!("agent.turn.steer");
@@ -319,7 +324,7 @@ fn sender_tree() -> tempfile::TempDir {
         ),
         (
             "mac.rs",
-            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! via_body { ($m:expr) => { $m }; }\nmacro_rules! wrapper { ($($t:tt)*) => {}; }\nmacro_rules! inner_call { ($m:expr) => { $m }; }\nmacro_rules! via_slice { ($m:expr) => { const Y: u8 = 0; }; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\n",
+            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! via_body { ($m:expr) => { $m }; }\nmacro_rules! wrapper { ($($t:tt)*) => {}; }\nmacro_rules! inner_call { ($m:expr) => { $m }; }\nmacro_rules! via_slice { ($m:expr) => { const Y: u8 = 0; }; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\nmacro_rules! inner_fwd { ($m:expr) => { $m }; }\nmacro_rules! via_paren { () => {}; }\nmacro_rules! via_brack { () => {}; }\n",
         ),
     ] {
         write(folder.path(), &format!("{src}/{path}"), text);
@@ -389,6 +394,14 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("macro:own", vec![Names]),
         ("macro:forwards", vec![Names]),
         ("macro:check", vec![Names]),
+        ("local", vec![Names]),
+        ("uses_fwd", vec![Names]),
+        ("macro:outer_fwd", vec![Expands]),
+        ("macro:inner_fwd", vec![Expands]),
+        ("macro:d_paren", vec![Names]),
+        ("macro:via_paren", vec![Expands]),
+        ("macro:d_brack", vec![Names]),
+        ("macro:via_brack", vec![Expands]),
         ("macro:via_body", vec![Expands]),
         ("outer_made", vec![Names]),
         ("macro:wrapper", vec![Expands]),
