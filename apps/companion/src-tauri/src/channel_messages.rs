@@ -510,11 +510,16 @@ enum Parsed<T> {
 
 fn parse_message(bytes: &[u8], stem: &str) -> Parsed<MessageFile> {
     match serde_json::from_slice::<MessageFile>(bytes) {
-        Ok(file) if file.version == VERSION && file.action_id.to_string() == stem => {
+        Ok(file) if file.version == VERSION && is_name_of(&file.action_id, stem) => {
             Parsed::Whole(file)
         }
         _ => Parsed::Layout,
     }
+}
+
+/// Whether `stem` is the canonical text of `id`, the only name a message file is written under.
+fn is_name_of(id: &ActionId, stem: &str) -> bool {
+    format!("{id}") == stem
 }
 
 fn parse_hold(bytes: &[u8], stem: &str) -> Parsed<HoldFile> {
