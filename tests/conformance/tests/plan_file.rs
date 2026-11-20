@@ -254,58 +254,37 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
         ),
         (
             "a program outside the five",
-            step_with(
-                "command = ['cargo', 'test']",
-                "command = ['sh', '-c', 'true']",
-            ),
+            script_step("", "['sh', '-c', 'true']"),
             "step `one` runs `sh`, which is not one of cargo, pnpm, node, bash, python3",
         ),
         (
             "a script given by an absolute path",
-            step_with(
-                "command = ['cargo', 'test']",
-                "command = ['bash', '/bin/sh']",
-            ),
+            script_step("", "['bash', '/bin/sh']"),
             "step `one` runs the script `/bin/sh`, which is not a relative path",
         ),
         (
             "a script that leaves the repository",
-            step_with(
-                "command = ['cargo', 'test']",
-                "command = ['bash', '../x.sh']",
-            ),
+            script_step("", "['bash', '../x.sh']"),
             "step `one` runs the script `../x.sh`, which holds `..`",
         ),
         (
             "a script that is not there",
-            step_with(
-                "command = ['cargo', 'test']",
-                "command = ['bash', '-e', 'scripts/not-a-script.sh']",
-            ),
+            script_step("", "['bash', '-e', 'scripts/not-a-script.sh']"),
             "step `one` runs the script `scripts/not-a-script.sh`, which does not exist",
         ),
         (
             "a script that is a directory of tracked files",
-            step_with(
-                "command = ['cargo', 'test']",
-                "command = ['bash', 'scripts']",
-            ),
+            script_step("", "['bash', 'scripts']"),
             "step `one` runs the script `scripts`, which is not a regular file",
         ),
         (
             "a script that is a wildcard of tracked files",
-            step_with(
-                "command = ['cargo', 'test']",
-                "command = ['bash', 'scripts/*.sh']",
-            ),
+            script_step("", "['bash', 'scripts/*.sh']"),
             "step `one` runs the script `scripts/*.sh`, which holds a pattern character",
         ),
         (
             "a script spelled other than the index holds it",
-            step_with(
-                "command = ['cargo', 'test']",
-                "command = ['bash', './scripts/android-unit-tests.sh']",
-            ),
+            script_step("", "['bash', './scripts/android-unit-tests.sh']"),
             "step `one` runs the script `./scripts/android-unit-tests.sh`, which is not spelled the way the repository's index holds it (`scripts/android-unit-tests.sh`)",
         ),
         (
@@ -344,10 +323,7 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "skips on a step that does not run cargo",
             format!(
                 "{}[[step.skips]]\nname = 'a'\nreason = 'r'\n",
-                step_with(
-                    "command = ['cargo', 'test']",
-                    "command = ['bash', 'scripts/android-unit-tests.sh']"
-                )
+                script_step("", "['bash', 'scripts/android-unit-tests.sh']")
             ),
             "step `one` has a filter or skips and does not run `cargo`",
         ),
@@ -355,10 +331,7 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "a filter on a step that does not run cargo",
             format!(
                 "{}[step.filter]\nname = 'a'\nreason = 'r'\n",
-                step_with(
-                    "command = ['cargo', 'test']",
-                    "command = ['bash', 'scripts/android-unit-tests.sh']"
-                )
+                script_step("", "['bash', 'scripts/android-unit-tests.sh']")
             ),
             "step `one` has a filter or skips and does not run `cargo`",
         ),
@@ -506,7 +479,10 @@ fn naming(key: &str, operand: &str) -> String {
     // The step runs no `cargo`, so that a manifest the key names is not held to be a root.
     format!(
         "{text}{}",
-        STEP.replace("command = ['cargo', 'test']", "command = ['pnpm', 'test']")
+        STEP.replace(
+            "reading = 'cargo'\ncommand = ['cargo', 'test']",
+            "reading = 'exit'\ncommand = ['pnpm', 'test']"
+        )
     )
 }
 
@@ -691,6 +667,15 @@ fn step_adding(before: &str, command: &str) -> String {
     with(&STEP.replace(
         "command = ['cargo', 'test']",
         &format!("{before}command = {command}"),
+    ))
+}
+
+/// A step of another program than `cargo`, whose command is `command` after the lines `before`: it
+/// reads the program's exit status, since a step that reads the output of `cargo test` runs it.
+fn script_step(before: &str, command: &str) -> String {
+    with(&STEP.replace(
+        "reading = 'cargo'\ncommand = ['cargo', 'test']",
+        &format!("reading = 'exit'\n{before}command = {command}"),
     ))
 }
 
@@ -1119,7 +1104,7 @@ fn a_step_directory_is_refused_with_its_reason_for_each_way_a_path_goes_wrong() 
     let (repository, _elsewhere) = tree_with_links();
     let root = repository.path();
     let step =
-        |operand: &str| step_adding(&format!("directory = '{operand}'\n"), "['pnpm', 'test']");
+        |operand: &str| script_step(&format!("directory = '{operand}'\n"), "['pnpm', 'test']");
     let not_a_directory = "is not a directory of the repository";
     let mut refusals = vec![
         ("missing", not_a_directory),
@@ -1165,7 +1150,7 @@ fn a_script_is_looked_for_in_the_directory_the_step_runs_in() {
     git(root, &["init", "-q"]);
     git(root, &["add", "dir/here.sh", "top.sh"]);
     let step =
-        |directory: &str, script: &str| step_adding(directory, &format!("['bash', '{script}']"));
+        |directory: &str, script: &str| script_step(directory, &format!("['bash', '{script}']"));
     let in_dir = "directory = 'dir'\n";
     for (before, script) in [(in_dir, "here.sh"), ("", "top.sh")] {
         let loaded = Plan::parse(&step(before, script), root);
@@ -1434,8 +1419,8 @@ fn a_step_of_the_execution_model_is_refused_for_each_fault_by_its_reason() {
 }
 
 /// The command of a step that reads the output of `cargo test` is read the way Cargo reads its
-/// flags, and one the report cannot read is refused with its own reason. A step that reads no
-/// output of `cargo test`, or that runs another program, is not held to it, and each flag that
+/// flags, and one the report cannot read, or that is not `cargo test`, is refused with its own
+/// reason. A step that reads no output of `cargo test` is not held to it, and each flag that
 /// `cargo test --help` lists loads.
 #[test]
 fn a_cargo_test_step_whose_flags_the_report_cannot_read_is_refused_for_each_fault_by_its_reason() {
@@ -1500,6 +1485,11 @@ fn a_cargo_test_step_whose_flags_the_report_cannot_read_is_refused_for_each_faul
         (
             "a command that is not `cargo test`",
             "'cargo', 'build', '-p', 'a'",
+            "step `one` reads the output of `cargo test` and its command is not `cargo test`",
+        ),
+        (
+            "a command of another program",
+            "'pnpm', 'test'",
             "step `one` reads the output of `cargo test` and its command is not `cargo test`",
         ),
     ];
@@ -1619,19 +1609,16 @@ fn a_script_that_is_a_link_is_refused_and_a_tracked_one_is_accepted() {
     {
         let directory = tempfile::tempdir().expect("a directory");
         std::os::unix::fs::symlink("/bin/sh", directory.path().join("link.sh")).expect("a link");
-        let text = step_with(
-            "command = ['cargo', 'test']",
-            "command = ['bash', 'link.sh']",
-        );
+        let text = script_step("", "['bash', 'link.sh']");
         let refusal = Plan::parse(&text, directory.path()).expect_err("a link is refused");
         assert_eq!(
             refusal.0,
             "step `one` runs the script `link.sh`, which is a link"
         );
     }
-    let tracked = step_with(
-        "command = ['cargo', 'test']",
-        "command = ['bash', 'scripts/android-unit-tests.sh', '--results={evidence}/x']",
+    let tracked = script_step(
+        "",
+        "['bash', 'scripts/android-unit-tests.sh', '--results={evidence}/x']",
     );
     assert!(Plan::parse(&tracked, &repository()).is_ok());
 }
@@ -1689,12 +1676,7 @@ fn a_script_must_be_a_regular_file_that_the_index_holds_under_that_name() {
     if cfg!(unix) {
         refusals.push(("link.sh", "is a link"));
     }
-    let command = |operand: &str| {
-        step_with(
-            "command = ['cargo', 'test']",
-            &format!("command = ['bash', '{operand}']"),
-        )
-    };
+    let command = |operand: &str| script_step("", &format!("['bash', '{operand}']"));
     let control = Plan::parse(&command("tracked.sh"), root);
     assert!(control.is_ok(), "a tracked file loads: {control:?}");
     let mut wrong = Vec::new();
@@ -1729,7 +1711,7 @@ fn a_script_is_not_checked_in_a_root_that_git_cannot_read() {
     let directory = tempfile::tempdir().expect("a directory");
     std::fs::write(directory.path().join(".git"), "not a gitfile\n").expect("a file");
     std::fs::write(directory.path().join("x.sh"), "").expect("a file");
-    let text = step_with("command = ['cargo', 'test']", "command = ['bash', 'x.sh']");
+    let text = script_step("", "['bash', 'x.sh']");
     let refusal = Plan::parse(&text, directory.path()).expect_err("git cannot read the root");
     assert!(
         refusal.0.starts_with(
