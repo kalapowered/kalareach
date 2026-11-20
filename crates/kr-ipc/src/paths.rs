@@ -1537,6 +1537,13 @@ mod windows {
         }
     }
 
+    impl Account {
+        /// Returns the account as the pointer a security call takes, which points into this.
+        fn as_psid(&self) -> PSID {
+            self.0.as_ptr().cast_mut().cast()
+        }
+    }
+
     impl FileAccess {
         /// Reads who can reach the file an open handle holds.
         ///
@@ -2259,7 +2266,7 @@ mod windows {
         let file = create_new_file_with_descriptor(path, &descriptor)?;
         #[cfg(test)]
         tests::before_the_check(path, &file);
-        if let Err(error) = keeps_the_list(&file, &user) {
+        if let Err(error) = keeps_the_list(&file, &accounts, &user) {
             // The file is deleted through the handle that created it, not by its name: the name
             // can have been given to another file since. It goes when the handle is closed.
             let removal = delete_through(&file);
@@ -2300,9 +2307,15 @@ mod windows {
         Ok(())
     }
 
-    /// Checks that the volume of a new file keeps access lists and that the file's list reads back
-    /// as the one [`create_owner_only_file`] set, `user` being this process's user.
-    fn keeps_the_list(file: &std::fs::File, user: &Account) -> std::io::Result<()> {
+    /// Checks that the volume of a new file keeps access lists, that the file's list reads back as
+    /// the one [`create_owner_only_file`] set, `user` being this process's user, and that the file's
+    /// owner is one this process could have created it as: a share can record an account of its own
+    /// as the owner, which would make OWNER RIGHTS name that account.
+    fn keeps_the_list(
+        file: &std::fs::File,
+        accounts: &TokenAccounts,
+        user: &Account,
+    ) -> std::io::Result<()> {
         use std::os::windows::io::AsHandle as _;
 
         #[cfg(test)]
@@ -2348,7 +2361,17 @@ mod windows {
         )
         .and_then(|descriptor| read_descriptor(&descriptor));
         let as_set = match read {
-            Ok(read) => read.discretionary.is_the_owner_only_list(user),
+            Ok(read) => {
+                let owner = read.owner;
+                #[cfg(test)]
+                let owner = if matches!(seen, Some(tests::Seen::OtherOwner)) {
+                    tests::everyone()
+                } else {
+                    owner
+                };
+                read.discretionary.is_the_owner_only_list(user)
+                    && could_have_created(owner.as_psid(), accounts)
+            }
             Err(AccessListRefusal::Unreadable(detail)) => {
                 return Err(std::io::Error::other(format!(
                     "the access list of the new file could not be read back: {detail}"
@@ -2451,6 +2474,14 @@ mod windows {
         pub(super) enum Seen {
             /// The volume reports that it keeps no access lists.
             NoLists,
+            /// The file's owner reads back as Everyone, an account this process could not have
+            /// created it as.
+            OtherOwner,
+        }
+
+        /// Everyone, `S-1-1-0`.
+        pub(super) fn everyone() -> Account {
+            Account(vec![1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
         }
 
         /// Run with the new file's path and the handle that created it as the check of its list
@@ -2504,6 +2535,10 @@ mod windows {
                 crate::paths::create_new_owner_only_file,
             ),
         ];
+
+        /// The words of the refusal for a list that reads back other than as set.
+        const OTHER_THAN_SET: &str = "the access list of the new file reads back other than as set, so \
+                                      it cannot be made readable by its owner alone";
 
         /// The words of the refusal for a volume that keeps no access lists.
         const NO_LISTS: &str = "the volume does not keep access lists, so this file cannot be made \
@@ -2653,12 +2688,16 @@ mod windows {
         /// itself is the product's.
         #[test]
         fn a_list_that_reads_back_other_than_set_refuses_both_writers_before_any_content() {
-            refused_before_any_content(
-                widen_the_list,
-                None,
-                "the access list of the new file reads back other than as set, so it cannot be made \
-                 readable by its owner alone",
-            );
+            refused_before_any_content(widen_the_list, None, OTHER_THAN_SET);
+        }
+
+        /// A new file whose owner reads back as an account this process could not have created it
+        /// as, as a share that records an account of its own as the owner would give, refuses both
+        /// writers before any content is written. The owner read back is replaced here; no case
+        /// makes a share.
+        #[test]
+        fn an_owner_that_reads_back_as_another_account_refuses_both_writers_before_any_content() {
+            refused_before_any_content(|_| {}, Some(Seen::OtherOwner), OTHER_THAN_SET);
         }
 
         /// A refusal removes the file it made and no other: a file put at the temporary name after
