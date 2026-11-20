@@ -1095,27 +1095,36 @@ mod tests {
     }
 
     /// On Windows the owner-only question is asked of the file's access-control list: a floor file
-    /// that another account may write is no floor.
+    /// that another account may write is no floor. The file is made with a list of its own, so what
+    /// its directory passes down cannot widen it; the list is widened here after it is made, and the
+    /// control is the same file as it was made.
     #[cfg(windows)]
     #[test]
     fn a_floor_file_another_account_may_write_is_no_floor_on_windows() {
         let root = directory("acl");
         let environment_id = environment();
         let boot = BootEpoch::new(13);
-        // `WD` is the Everyone group; `OICI` makes every file created inside inherit the entry.
-        let wide = root.join("wide");
-        crate::paths::create_directory_with_list(&wide, "D:P(A;OICI;GA;;;OW)(A;OICI;GA;;;WD)")
-            .expect("a directory whose files everyone may write");
-        let refused = SharedFloor::create(&wide.join("utc-floor"), environment_id, boot, 0)
-            .expect_err("a floor everyone may write");
-        assert!(
-            refused.to_string().contains("grants access to"),
-            "{refused}"
-        );
-        // The control: the same file in an owner-only directory is a floor.
-        let floor = SharedFloor::create(&root.join("utc-floor"), environment_id, boot, 0)
-            .expect("an owner-only floor");
+        let path = root.join("utc-floor");
+        let floor =
+            SharedFloor::create(&path, environment_id, boot, 0).expect("an owner-only floor");
         drop(floor);
+        let floor = SharedFloor::open(&path, environment_id, boot)
+            .expect("the file as it was made is a floor");
+        drop(floor);
+        // `S-1-1-0` is the Everyone group.
+        let widened = std::process::Command::new("icacls.exe")
+            .arg(&path)
+            .args(["/grant", "*S-1-1-0:(M)"])
+            .output()
+            .expect("icacls starts");
+        assert!(
+            widened.status.success(),
+            "the floor's list is widened: {}",
+            String::from_utf8_lossy(&widened.stdout)
+        );
+        let refused =
+            SharedFloor::open(&path, environment_id, boot).expect_err("a floor everyone may write");
+        assert!(refused.reason.contains("grants access to"), "{refused}");
         std::fs::remove_dir_all(&root).expect("removed");
     }
 

@@ -2987,9 +2987,7 @@ pub use self::windows::{
 /// For this crate's own tests of files a wider list would let another account reach, and of the
 /// access reader.
 #[cfg(all(windows, test))]
-pub(crate) use self::windows::{
-    create_directory_with_list, create_file_with_descriptor, set_list_without_propagation,
-};
+pub(crate) use self::windows::{create_file_with_descriptor, set_list_without_propagation};
 
 /// Returns the current user's identifier.
 #[cfg(unix)]
