@@ -13,7 +13,7 @@
 //! libraries whose first test program fails to be listed. The runs build into a target directory
 //! of their own under the platform's temporary directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use kr_conformance::id::{Identifier, Refusal};
@@ -24,7 +24,7 @@ use kr_conformance::plan::{self, Platform, Reading, Step};
 use kr_conformance::plan_file::{IgnoredRun, Plan, Runs, TerminalProfileFile, Values};
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Stopped, Verdict};
 use kr_conformance::run::Executed;
-use kr_conformance::workspace::{TargetId, TargetKind};
+use kr_conformance::workspace::{Package, Target, TargetId, TargetKind};
 
 fn tree(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -666,7 +666,14 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         name: "kr_client".to_owned(),
     };
     let row = identifier("KR-REQ-29.01");
-    let mut map = Map::default();
+    let mut map = Map {
+        packages: vec![package_of(
+            "kr-client",
+            ".",
+            &[(TargetKind::Lib, "kr_client", true)],
+        )],
+        ..Map::default()
+    };
     map.keys.entry(row).or_default().insert(
         Place::Rust {
             target: target.clone(),
@@ -2334,6 +2341,355 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
         "the ignored test ran"
     );
     assert!(document.passed(), "nothing that ran failed");
+}
+
+/// A package of the workspace in `workspace`, with its targets: each a kind, a name and whether
+/// `cargo test` builds it when it is not asked for by name.
+fn package_of(name: &str, workspace: &str, targets: &[(TargetKind, &str, bool)]) -> Package {
+    Package {
+        name: name.to_owned(),
+        version: "0.1.0".to_owned(),
+        targets: targets
+            .iter()
+            .map(|(kind, target, tested)| Target {
+                id: target_of(name, *kind, target),
+                src_path: PathBuf::from("src/lib.rs"),
+                tested_by_default: *tested,
+                harness: true,
+                edition: "2024".to_owned(),
+            })
+            .collect(),
+        manifest: PathBuf::from("Cargo.toml"),
+        registry_crates: BTreeSet::new(),
+        dependency_names: BTreeSet::new(),
+        workspace: workspace.to_owned(),
+        workspace_members: vec![name.to_owned()],
+        workspace_default_members: vec![name.to_owned()],
+    }
+}
+
+fn target_of(package: &str, kind: TargetKind, name: &str) -> TargetId {
+    TargetId {
+        package: package.to_owned(),
+        kind,
+        name: name.to_owned(),
+    }
+}
+
+/// Keys the test `test` of `target` to `row`.
+fn key_in(map: &mut Map, row: &str, target: &TargetId, test: &str) {
+    map.keys.entry(identifier(row)).or_default().insert(
+        Place::Rust {
+            target: target.clone(),
+            name: test.to_owned(),
+        },
+        Key {
+            binding: Binding::AttachedComment,
+            source: format!("{}.rs:1", target.name),
+        },
+    );
+}
+
+/// A step that ran to its end and left nothing to read: no program ran, none was built or listed.
+fn quiet(step: Step) -> Executed {
+    Executed {
+        step,
+        exit: Some(0),
+        seconds: 0,
+        log: "conformance/logs/x.log".to_owned(),
+        binaries: Vec::new(),
+        built: Vec::new(),
+        listed: BTreeMap::new(),
+        vitest: None,
+        lane: None,
+        tools: Vec::new(),
+        error: None,
+        blocked: None,
+        observation: None,
+        timed_out: false,
+    }
+}
+
+/// A step that built the program of `target`, listed `tests` in it and ran them, each passing.
+fn passing(step: Step, target: &TargetId, tests: &[&str]) -> Executed {
+    Executed {
+        binaries: vec![(
+            Some(target.clone()),
+            Binary {
+                executable: format!("{}-0", target.name),
+                source: "src/lib.rs".to_owned(),
+                tests: tests
+                    .iter()
+                    .map(|test| ((*test).to_owned(), LibtestOutcome::Passed))
+                    .collect(),
+                ..Binary::default()
+            },
+        )],
+        built: vec![target.clone()],
+        listed: [(
+            target.clone(),
+            tests.iter().map(|test| (*test).to_owned()).collect(),
+        )]
+        .into(),
+        ..quiet(step)
+    }
+}
+
+/// The result of a Linux run of every group over `map` and what its steps did: a run that selects
+/// no group lists a target that no step covers, and one that selects groups does not.
+fn assembled(plan: Plan, map: &Map, executed: &[Executed]) -> Document {
+    let options = Options {
+        root: PathBuf::from("/tmp/r"),
+        evidence: PathBuf::from("/tmp/e"),
+        selection: None,
+        all_terminals: false,
+        platform: Platform::Linux,
+        plan,
+        typescript_compiler: None,
+        applications: None,
+        lister: PathBuf::from("/tmp/l"),
+        environment: Vec::new(),
+        part: None,
+        runner_base: PathBuf::new(),
+    };
+    report::assemble(
+        &options,
+        &rust_group(),
+        map,
+        executed,
+        Gathered::default(),
+        "2026-11-20T00:00:00Z".to_owned(),
+    )
+}
+
+/// The reason of the one test the identifier `row` keys.
+fn reason_of(document: &Document, row: &str) -> String {
+    let record = &document.identifiers[row].tests[0];
+    assert_eq!(record.outcome, Outcome::NotRun, "{record:?}");
+    record.reason.clone().unwrap_or_default()
+}
+
+/// A step that fails before it builds names only the targets its command selects in its own
+/// workspace: the other workspace's targets keep their own records, whether they ran or not.
+#[test]
+fn a_step_that_failed_is_the_reason_of_its_own_workspace_and_no_other() {
+    let root = tree("no-root-manifest");
+    let plan = Plan::load(&root, None).expect("the fixture's plan");
+    let map = map::build(
+        &root,
+        &Declarations {
+            case_tables: &[],
+            lanes: &[],
+            manifests: &[
+                "first/Cargo.toml".to_owned(),
+                "second/Cargo.toml".to_owned(),
+            ],
+            ignored_runs: None,
+            plan_commands: &[],
+            typescript: None,
+            scripts: &[],
+            lane_directories: &[],
+        },
+    );
+    let steps = plan.steps(
+        Platform::Linux,
+        &rust_group(),
+        &Values::evidence("/tmp/e"),
+        None,
+    );
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert_eq!(steps[0].directory, "first");
+    assert_eq!(steps[1].directory, "second");
+    let beta = target_of("beta", TargetKind::Test, "flow");
+    let stopped = Executed {
+        exit: Some(101),
+        error: Some("its build failed".to_owned()),
+        ..quiet(steps[0].clone())
+    };
+    let named = "no step that ran listed this target; `cd first && cargo test --locked -- --show-output` did not build (its build failed)";
+
+    // The second workspace's step ran its program: its tests pass.
+    let ran = passing(steps[1].clone(), &beta, &["passes", "stands_down"]);
+    let document = assembled(plan.clone(), &map, &[stopped.clone(), ran]);
+    assert_eq!(reason_of(&document, "KR-REQ-03.01"), named);
+    assert_eq!(reason_of(&document, "KR-REQ-03.02"), named);
+    for row in ["KR-REQ-04.01", "KR-REQ-04.02"] {
+        let record = &document.identifiers[row].tests[0];
+        assert_eq!(record.outcome, Outcome::Passed, "{record:?}");
+        assert_eq!(record.reason, None, "{record:?}");
+    }
+
+    // It ran and listed nothing: its tests are not run, for its own step and not for the first.
+    let document = assembled(plan, &map, &[stopped, quiet(steps[1].clone())]);
+    assert_eq!(reason_of(&document, "KR-REQ-03.01"), named);
+    for row in ["KR-REQ-04.01", "KR-REQ-04.02"] {
+        assert_eq!(
+            reason_of(&document, row),
+            "no step that ran listed this target, though `cd second && cargo test --locked -- --show-output` selects it"
+        );
+    }
+    let command = document.identifiers["KR-REQ-04.01"].tests[0]
+        .command
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        command.starts_with("cd second && cargo test --locked -p beta --test flow"),
+        "{command}"
+    );
+}
+
+/// A target that no step of the selection covers reads which of the two it is: its workspace holds
+/// no selected step, or it holds one whose command leaves the target out; a benchmark reads the
+/// plan's text for benchmarks first.
+#[test]
+fn a_target_no_step_covers_reads_whether_its_workspace_or_only_it_is_left_out() {
+    use TargetKind::{Bench, Lib, Test};
+    let mut map = Map {
+        packages: vec![
+            package_of(
+                "p",
+                ".",
+                &[(Lib, "p", true), (Test, "t", true), (Bench, "m", false)],
+            ),
+            package_of("q", "other", &[(Lib, "q", true)]),
+        ],
+        ..Map::default()
+    };
+    key_in(&mut map, "KR-REQ-03.01", &target_of("p", Test, "t"), "a");
+    key_in(&mut map, "KR-REQ-03.02", &target_of("q", Lib, "q"), "b");
+    key_in(&mut map, "KR-REQ-03.03", &target_of("p", Bench, "m"), "c");
+    let step = Step::cargo("rust", "the library", &["test", "--locked", "--lib"]);
+    let mut plan = Plan::of_steps("rust", vec![step.clone()]);
+    plan.unrun.bench = "a benchmark".to_owned();
+    let document = assembled(plan, &map, &[quiet(step)]);
+    assert_eq!(
+        reason_of(&document, "KR-REQ-03.01"),
+        "no step of this selection covers this target"
+    );
+    assert_eq!(
+        reason_of(&document, "KR-REQ-03.02"),
+        "no step of this selection covers this workspace"
+    );
+    assert_eq!(
+        reason_of(&document, "KR-REQ-03.03"),
+        "a benchmark, and no step of this selection covers this target"
+    );
+}
+
+/// A target that a step selects and that no listing returned reads the step that selects it.
+#[test]
+fn a_target_a_step_selects_and_no_listing_returned_names_that_step() {
+    let lib = target_of("p", TargetKind::Lib, "p");
+    let mut map = Map {
+        packages: vec![package_of("p", ".", &[(TargetKind::Lib, "p", true)])],
+        ..Map::default()
+    };
+    key_in(&mut map, "KR-REQ-03.01", &lib, "a");
+    let step = Step::cargo("rust", "every test", &["test", "--locked"]);
+    let document = assembled(
+        Plan::of_steps("rust", vec![step.clone()]),
+        &map,
+        &[quiet(step)],
+    );
+    assert_eq!(
+        reason_of(&document, "KR-REQ-03.01"),
+        "no step that ran listed this target, though `cargo test --locked` selects it"
+    );
+    assert!(document.passed(), "{:?}", document.problems);
+}
+
+/// A target that a step built or ran and that no step of the selection covers is a problem of the
+/// run: the rule the report reads commands by and Cargo disagree, and the run does not pass.
+#[test]
+fn a_target_a_step_ran_that_no_step_covers_is_a_problem_and_fails_the_run() {
+    use TargetKind::{Lib, Test};
+    let lib = target_of("p", Lib, "p");
+    let outside = target_of("p", Test, "t");
+    let mut map = Map {
+        packages: vec![package_of("p", ".", &[(Lib, "p", true), (Test, "t", true)])],
+        ..Map::default()
+    };
+    key_in(&mut map, "KR-REQ-03.01", &lib, "a");
+    key_in(&mut map, "KR-REQ-03.02", &outside, "b");
+    let step = Step::cargo("rust", "the library", &["test", "--locked", "--lib"]);
+    let plan = Plan::of_steps("rust", vec![step.clone()]);
+    let covered = assembled(plan.clone(), &map, &[passing(step.clone(), &lib, &["a"])]);
+    assert!(
+        !covered
+            .problems
+            .iter()
+            .any(|problem| problem.contains("covers it")),
+        "{:?}",
+        covered.problems
+    );
+    let mut ran = passing(step, &lib, &["a"]);
+    let beyond = passing(ran.step.clone(), &outside, &["b"]);
+    ran.binaries.extend(beyond.binaries);
+    ran.built.extend(beyond.built);
+    let document = assembled(plan, &map, &[ran]);
+    assert_eq!(
+        document
+            .problems
+            .iter()
+            .filter(|problem| problem.contains("covers it"))
+            .collect::<Vec<_>>(),
+        [
+            "step 1 built or ran p --test t, but no step of this selection covers it: the selection rule and Cargo disagree"
+        ],
+        "{:?}",
+        document.problems
+    );
+    assert!(!document.passed());
+}
+
+/// The command of a test is its step's own, in the directory of the test's workspace and with the
+/// step's features and profile and the variables that hold no placeholder; a variable that holds one
+/// is named in `needs`, as its step's set-up gave it. Where no step ran the test, the step that
+/// selects it gives the command.
+#[test]
+fn a_command_reproduces_the_step_in_its_directory_with_its_features_profile_and_variables() {
+    let lib = target_of("p", TargetKind::Lib, "p");
+    let mut map = Map {
+        packages: vec![package_of("p", "first", &[(TargetKind::Lib, "p", true)])],
+        ..Map::default()
+    };
+    key_in(&mut map, "KR-REQ-03.01", &lib, "a");
+    let step = Step {
+        directory: "first".to_owned(),
+        env: vec![
+            ("A".to_owned(), "on".to_owned()),
+            ("B".to_owned(), "two words".to_owned()),
+            ("C".to_owned(), "/e/x".to_owned()),
+        ],
+        placeholder_env: vec!["C".to_owned()],
+        needs: vec!["S".to_owned()],
+        ..Step::cargo(
+            "rust",
+            "the library",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "p",
+                "--lib",
+                "--release",
+                "--features",
+                "f,g",
+                "--profile",
+                "ci",
+                "--",
+                "--nocapture",
+            ],
+        )
+    };
+    let plan = Plan::of_steps("rust", vec![step.clone()]);
+    let expected = "cd first && A=on B='two words' cargo test --locked --release --features f,g --profile ci -p p --lib -- --nocapture --exact a";
+    for executed in [passing(step.clone(), &lib, &["a"]), quiet(step.clone())] {
+        let document = assembled(plan.clone(), &map, &[executed]);
+        let record = &document.identifiers["KR-REQ-03.01"].tests[0];
+        assert_eq!(record.command.as_deref(), Some(expected), "{record:?}");
+        assert_eq!(record.needs, ["S", "C"], "{record:?}");
+    }
 }
 
 fn repository() -> PathBuf {

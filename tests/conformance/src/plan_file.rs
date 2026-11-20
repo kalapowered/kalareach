@@ -527,24 +527,33 @@ fn output_of(definition: &StepDef, values: &Values<'_>) -> Option<String> {
 
 /// The variables a step is run with on `platform`: the plan's, then its own, which replace them
 /// where `platform` takes the names as one variable, each value with its placeholders given their
-/// values. They come in the order of their names.
+/// values. They come in the order of their names. The second list names the variables whose value
+/// held a placeholder.
 fn environment_of(
     platform: Platform,
     plan: &Plan,
     definition: &StepDef,
     values: &Values<'_>,
     output: &str,
-) -> Vec<(String, String)> {
+) -> (Vec<(String, String)>, Vec<String>) {
     let mut merged: Vec<(&String, &String)> = plan.env.iter().collect();
     for (name, value) in &definition.env {
         merged.retain(|(held, _)| !platform.same_variable(held, name));
         merged.push((name, value));
     }
     merged.sort_by(|a, b| a.0.cmp(b.0));
-    merged
+    let mut placeholders = Vec::new();
+    let environment = merged
         .into_iter()
-        .map(|(name, value)| (name.clone(), fill(value, values, output)))
-        .collect()
+        .map(|(name, value)| {
+            let filled = fill(value, values, output);
+            if filled != *value {
+                placeholders.push(name.clone());
+            }
+            (name.clone(), filled)
+        })
+        .collect();
+    (environment, placeholders)
 }
 
 /// The components of a relative path, joined with forward slashes: empty for the root.
@@ -1500,6 +1509,13 @@ impl Plan {
                         .collect(),
                 };
                 let output = output_of(definition, values);
+                let (env, placeholder_env) = environment_of(
+                    platform,
+                    self,
+                    definition,
+                    values,
+                    output.as_deref().unwrap_or_default(),
+                );
                 Some(Step {
                     id: definition.id.clone(),
                     setup: definition.setup,
@@ -1513,13 +1529,8 @@ impl Plan {
                         .as_deref()
                         .map(|directory| normal(Path::new(directory)))
                         .unwrap_or_default(),
-                    env: environment_of(
-                        platform,
-                        self,
-                        definition,
-                        values,
-                        output.as_deref().unwrap_or_default(),
-                    ),
+                    env,
+                    placeholder_env,
                     output,
                     reading: match definition.reading {
                         ReadingKind::Cargo => Reading::Cargo,

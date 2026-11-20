@@ -1189,6 +1189,32 @@ fn the_output_placeholder_in_a_step_variable_is_the_steps_output() {
     );
 }
 
+/// A step names the variables whose value held a placeholder, so that a command which reproduces one
+/// of its tests can tell the variables it repeats from those the step's own set-up gives a value.
+#[test]
+fn a_step_names_the_variables_whose_value_held_a_placeholder() {
+    let text = step_adding(
+        "env = { PLAIN = 'x', WHERE = '{evidence}/y', ALSO = 'a{evidence}' }\n",
+        "['cargo', 'test']",
+    );
+    let plan = Plan::parse(&text, &repository()).expect("a variable can hold a placeholder");
+    let steps = plan.steps(
+        Platform::Linux,
+        &selection(&["rust"]),
+        &Values::evidence("/e"),
+        None,
+    );
+    assert_eq!(
+        steps[0].env,
+        [
+            ("ALSO".to_owned(), "a/e".to_owned()),
+            ("PLAIN".to_owned(), "x".to_owned()),
+            ("WHERE".to_owned(), "/e/y".to_owned()),
+        ]
+    );
+    assert_eq!(steps[0].placeholder_env, ["ALSO", "WHERE"]);
+}
+
 /// A set-up step, `prep`, on `platforms`, and a step, `one`, that holds `after` and its own
 /// `platforms`, in a plan of one group.
 fn set_up_and_one(
