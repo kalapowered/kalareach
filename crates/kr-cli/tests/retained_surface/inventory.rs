@@ -26,9 +26,6 @@ use syn::visit::Visit;
 use super::condition;
 use super::walker::{VARIANTS, is_own_prefix, normalised, path_before, transcribers};
 
-/// The crate that defines `Method`.
-const PROTOCOL_CRATE: &str = "kr_protocol";
-
 /// The macros of other crates that product code may call at item position and in a transcriber, each
 /// with the paths that name its provider (`""` is a bare call) and why none of them can make a module
 /// file or a sender. A name from any other provider is refused.
@@ -194,8 +191,9 @@ pub struct Inventory {
     pub defined: BTreeSet<String>,
     /// The names of those that carry `#[macro_export]`.
     pub exported: BTreeSet<String>,
-    /// The files that import `Method::*` or `Method` under another name.
-    pub method_uses: Vec<String>,
+    /// Each `use` or `extern crate` that gives a name another name: the file, the name it came as and
+    /// the name it gives.
+    pub renames: Vec<(String, String, String)>,
     /// For each name a `use` gives under a name of its own (`use a::b as c`): the name it came as.
     pub imported_as: BTreeMap<String, BTreeSet<String>>,
     /// The item-position macros that nothing in the crate defines and the scan does not accept:
@@ -251,7 +249,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
     let mut calls: Vec<(String, Vec<String>)> = Vec::new();
     let mut imports: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
     let mut module_set: BTreeSet<String> = BTreeSet::new();
-    let mut method_uses = Vec::new();
+    let mut renames: Vec<(String, String, String)> = Vec::new();
     while let Some(visit) = todo.pop() {
         if !seen.insert(visit.clone()) {
             continue;
@@ -295,8 +293,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             calls: Vec::new(),
             imports: Vec::new(),
             module_names: Vec::new(),
-            method_use: false,
-            in_method_impl: false,
+            renamed: Vec::new(),
             error: None,
         };
         reader.visit_file(&parsed);
@@ -314,9 +311,12 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             imports.entry(local).or_default().insert(full);
         }
         module_set.extend(reader.module_names);
-        if reader.method_use {
-            method_uses.push(at.clone());
-        }
+        renames.extend(
+            reader
+                .renamed
+                .into_iter()
+                .map(|(old, new)| (at.clone(), old, new)),
+        );
         for declared in reader.declared {
             let mut found: Vec<&PathBuf> = Vec::new();
             for candidate in &declared.candidates {
@@ -387,13 +387,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
         defined,
         exported,
         imported_as,
-        // The protocol crate defines `Method`: it names its own variants (`Self::Variant`, a glob of
-        // them, an alias) and matches them, and is not read as a sender.
-        method_uses: if krate == PROTOCOL_CRATE {
-            Vec::new()
-        } else {
-            method_uses
-        },
+        renames,
         unaccepted: unaccepted
             .into_iter()
             .map(|(name, at)| (at, name))
@@ -418,9 +412,8 @@ struct Reader<'a> {
     imports: Vec<(String, Vec<String>)>,
     /// The modules declared.
     module_names: Vec<String>,
-    method_use: bool,
-    /// Whether the visit is inside an `impl` for `Method`.
-    in_method_impl: bool,
+    /// The names a `use` or an `extern crate` gives another name: the name it came as, and its own.
+    renamed: Vec<(String, String)>,
     error: Option<String>,
 }
 
@@ -492,6 +485,33 @@ impl Reader<'_> {
 
     /// Whether the attributes carry `#[name]`, written or added by a `cfg_attr` that some
     /// configuration enables.
+    /// Takes the renames of a `use` or an `extern crate`, and refuses one of a name the scan reads.
+    fn note_renames(&mut self, found: Vec<(String, String)>) {
+        for (old, new) in found {
+            if self.error.is_none() && (read_by_name(&old) || read_by_name(&new)) {
+                self.error = Some(format!(
+                    "{}: the scan does not read a use of {old} under another name (as {new})",
+                    self.at
+                ));
+            }
+            self.renamed.push((old, new));
+        }
+    }
+
+    /// Refuses a `type` alias of `MutationRequest` or `ActionTarget`.
+    fn refuse_alias(&mut self, alias: &syn::Ident, ty: &syn::Type) {
+        if self.error.is_none()
+            && let syn::Type::Path(path) = ty
+            && let Some(last) = path.path.segments.last()
+            && (last.ident == "MutationRequest" || last.ident == "ActionTarget")
+        {
+            self.error = Some(format!(
+                "{}: the scan does not read a type alias of {} ({alias})",
+                self.at, last.ident
+            ));
+        }
+    }
+
     fn carries(&mut self, attrs: &[syn::Attribute], name: &str) -> bool {
         match condition::carries(attrs, name, self.at) {
             Ok(found) => found,
@@ -517,7 +537,6 @@ macro_rules! gated {
 impl<'ast> Visit<'ast> for Reader<'_> {
     gated! {
         visit_item_const => visit_item_const(syn::ItemConst);
-        visit_item_extern_crate => visit_item_extern_crate(syn::ItemExternCrate);
         visit_item_fn => visit_item_fn(syn::ItemFn);
         visit_item_foreign_mod => visit_item_foreign_mod(syn::ItemForeignMod);
         visit_item_static => visit_item_static(syn::ItemStatic);
@@ -527,46 +546,32 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         visit_item_union => visit_item_union(syn::ItemUnion);
         visit_impl_item_const => visit_impl_item_const(syn::ImplItemConst);
         visit_impl_item_fn => visit_impl_item_fn(syn::ImplItemFn);
-        visit_impl_item_type => visit_impl_item_type(syn::ImplItemType);
         visit_trait_item_const => visit_trait_item_const(syn::TraitItemConst);
         visit_trait_item_fn => visit_trait_item_fn(syn::TraitItemFn);
         visit_trait_item_type => visit_trait_item_type(syn::TraitItemType);
     }
 
-    /// `<Method>::<Variant>` names the variant through the type in angle brackets.
-    fn visit_qself(&mut self, node: &'ast syn::QSelf) {
-        if node.as_token.is_none() && ends_in_method(&node.ty) {
-            self.method_use = true;
+    fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
+        if self.enter(&node.attrs) {
+            if let Some((_, rename)) = &node.rename {
+                self.note_renames(vec![(node.ident.to_string(), rename.to_string())]);
+            }
+            syn::visit::visit_item_extern_crate(self, node);
         }
-        syn::visit::visit_qself(self, node);
     }
 
-    /// An alias of `Method` names its variants under another name.
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
         if self.enter(&node.attrs) {
-            self.method_use |= ends_in_method(&node.ty);
+            self.refuse_alias(&node.ident, &node.ty);
             syn::visit::visit_item_type(self, node);
         }
     }
 
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+    fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
         if self.enter(&node.attrs) {
-            let outer = std::mem::replace(&mut self.in_method_impl, ends_in_method(&node.self_ty));
-            syn::visit::visit_item_impl(self, node);
-            self.in_method_impl = outer;
+            self.refuse_alias(&node.ident, &node.ty);
+            syn::visit::visit_impl_item_type(self, node);
         }
-    }
-
-    /// `Self::<Variant>` in an impl for `Method` is the variant by another name.
-    fn visit_path(&mut self, node: &'ast syn::Path) {
-        if self.in_method_impl
-            && let [first, second, ..] = node.segments.iter().collect::<Vec<_>>().as_slice()
-            && first.ident == "Self"
-            && VARIANTS.contains(&second.ident.to_string().as_str())
-        {
-            self.method_use = true;
-        }
-        syn::visit::visit_path(self, node);
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
@@ -696,8 +701,19 @@ impl<'ast> Visit<'ast> for Reader<'_> {
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
         if self.enter(&node.attrs) {
-            self.method_use |= renames_method(&node.tree, false);
-            use_paths(&node.tree, &mut Vec::new(), &mut self.imports);
+            let mut found = Vec::new();
+            use_paths(&node.tree, &mut Vec::new(), &mut found);
+            self.note_renames(
+                found
+                    .iter()
+                    .filter_map(|(local, full)| {
+                        full.last()
+                            .filter(|original| *original != local)
+                            .map(|original| (original.clone(), local.clone()))
+                    })
+                    .collect(),
+            );
+            self.imports.extend(found);
         }
     }
 }
@@ -723,10 +739,11 @@ fn path_attribute(attrs: &[syn::Attribute]) -> Result<Option<String>, ()> {
     Ok(None)
 }
 
-/// Whether a type is a path that ends in `Method`.
-fn ends_in_method(ty: &syn::Type) -> bool {
-    matches!(ty, syn::Type::Path(path) if path.qself.is_none()
-        && path.path.segments.last().is_some_and(|segment| segment.ident == "Method"))
+/// Whether the scan reads the name wherever it stands: a rename of it hides it.
+fn read_by_name(name: &str) -> bool {
+    ["Method", "MutationRequest", "ActionTarget", "ActionRight"].contains(&name)
+        || VARIANTS.contains(&name)
+        || ACCEPTED.iter().any(|(listed, _, _)| *listed == name)
 }
 
 /// What the inventory does not read, written in the tokens of a macro.
@@ -855,21 +872,5 @@ fn use_paths(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<(Strin
                 use_paths(item, prefix, out);
             }
         }
-    }
-}
-
-/// Whether a `use` tree imports `Method::*`, or `Method` under another name.
-fn renames_method(tree: &syn::UseTree, under_method: bool) -> bool {
-    match tree {
-        syn::UseTree::Path(path) => renames_method(&path.tree, path.ident == "Method"),
-        syn::UseTree::Group(group) => group
-            .items
-            .iter()
-            .any(|inner| renames_method(inner, under_method)),
-        syn::UseTree::Glob(_) => under_method,
-        syn::UseTree::Rename(rename) => {
-            rename.ident == "Method" || (under_method && rename.ident == "self")
-        }
-        syn::UseTree::Name(_) => false,
     }
 }
