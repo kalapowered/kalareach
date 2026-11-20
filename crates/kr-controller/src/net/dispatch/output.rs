@@ -126,6 +126,9 @@ impl FrameSink for ControlStream {
 pub(super) struct ReadUnder {
     state: crate::privacy::PrivacyState,
     decided: crate::privacy::Published,
+    /// Set for a read that began while privacy mode was on and found its removal already reported
+    /// complete ([`Self::now_settled`]): such a read is released while that state stands.
+    settled: bool,
 }
 
 impl ReadUnder {
@@ -146,7 +149,42 @@ impl ReadUnder {
                     "privacy mode's state could not be read",
                 )
             })?;
-        Ok(Self { state, decided })
+        Ok(Self {
+            state,
+            decided,
+            settled: false,
+        })
+    }
+
+    /// As [`Self::now`], for a read that is answered while privacy mode is on once its removal has
+    /// been reported complete.
+    ///
+    /// The generation and the completion are taken at the start of the read. A read that began
+    /// before the completion is never released, and one that began after it is released for as long
+    /// as the state it began under stands.
+    pub(super) async fn now_settled(
+        controller: &Controller,
+    ) -> Result<Self, kr_protocol::error::ProtocolError> {
+        let mut read_under = Self::now(controller).await?;
+        if read_under.decided.private {
+            let privacy = std::sync::Arc::clone(&controller.privacy);
+            let report = tokio::task::spawn_blocking(move || {
+                privacy.report_now(kr_protocol::scalars::TimestampMs::new(
+                    kr_ipc::now_ms().get(),
+                ))
+            })
+            .await
+            .map_err(|_| {
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::ResourceUnavailable,
+                    "privacy mode's state could not be read",
+                )
+            })?;
+            read_under.settled = report.enabled
+                && report.generation == read_under.decided.generation
+                && report.completion.is_complete();
+        }
+        Ok(read_under)
     }
 
     /// Takes the state the page was read under, held, when it still stands and privacy mode was
@@ -155,7 +193,7 @@ impl ReadUnder {
     /// It waits for nothing, so it can be asked in the poll that hands bytes to the stream: a
     /// change of state being made, or waiting to be, counts as the state having moved.
     pub(super) fn holding(&self) -> Option<crate::privacy::Reading<'_>> {
-        if self.decided.private {
+        if self.decided.private && !self.settled {
             return None;
         }
         self.state

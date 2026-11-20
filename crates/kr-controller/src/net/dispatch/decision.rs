@@ -50,11 +50,12 @@ pub(super) struct Asked {
     /// door's own stores, a service), and is written only while the standing it was checked under
     /// holds ([`Answers::Conflict`]).
     admitted: Option<Footing>,
-    /// For a page of retained output, an agent's retained entries, a context for a voice call, or
-    /// an answer with text a model wrote, the privacy state it was read under, which the answer is
-    /// released under ([`RemoteConnection::write_answer`]). A page and a snapshot read while privacy
-    /// mode is on are never released; a voice context read then carries no such text, and is not
-    /// held.
+    /// For a page of retained output, an agent's retained entries, a context for a voice call, a
+    /// receipt's result, or an answer with text a model wrote, the privacy state it was read under,
+    /// which the answer is released under ([`RemoteConnection::write_answer`]). A page and a
+    /// snapshot read while privacy mode is on are never released; a receipt read then is released
+    /// once the removal had been reported complete when the read began; a voice context read then
+    /// carries no such text, and is not held.
     pub(super) read_under: Option<ReadUnder>,
     /// For an answer with text a model wrote, the same answer without it, which is written in its
     /// place once `read_under` no longer stands.

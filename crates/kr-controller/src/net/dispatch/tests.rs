@@ -2443,6 +2443,217 @@ async fn a_voice_context_is_refused_when_privacy_mode_starts_before_it_is_sent()
     world.serving.abort();
 }
 
+/// A daemon whose session's worker answers a read of an action's receipt with a result.
+async fn worker_answering_a_receipt() -> crate::service::a_close_a_worker_never_answers::Silent {
+    use std::sync::Arc;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let recorded: fake::Recorded = Arc::default();
+    let world = answering_worker(
+        Arc::new(move |request: &kr_protocol::envelope::Request| {
+            match request.method.method()? {
+                // The daemon passes a worker's answer on as it came, so any answer stands for
+                // the receipt here.
+                Method::ActionRead => Some(ParamsValue::empty()),
+                _ => None,
+            }
+        }),
+        recorded,
+        reads_scopes(),
+    )
+    .await;
+    fake::acknowledged(&world.controller, world.session_id);
+    world
+}
+
+fn receipt_request_of(session_id: SessionId, request_id: u64) -> kr_protocol::envelope::Request {
+    device_request(
+        request_id,
+        Method::ActionRead,
+        &kr_protocol::receipt::ActionReadParams {
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            session_id: Some(session_id),
+        },
+    )
+}
+
+/// What a device that reads a receipt is written, with `between` done after the read is made and
+/// before the frame is written.
+async fn a_receipt_read_then<Between: std::future::Future<Output = ()>>(
+    world: &crate::service::a_close_a_worker_never_answers::Silent,
+    connection: &super::RemoteConnection,
+    kept: &Kept,
+    between: impl FnOnce() -> Between,
+) -> kr_protocol::envelope::ControlFrame {
+    use kr_protocol::envelope::ControlFrame;
+
+    let answer = connection
+        .answer_now(ControlFrame::Request(receipt_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let turn = connection.output.hold_the_turn().await;
+    let (stands, ()) = tokio::join!(
+        connection.write_answer(connection.output(), answer),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while connection.output.writes_queued() < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the answer is waiting for the writer");
+            between().await;
+            drop(turn);
+        }
+    );
+    assert!(stands, "the connection stands");
+    kept.frames()[0].clone()
+}
+
+fn the_refusal_of(
+    frame: &kr_protocol::envelope::ControlFrame,
+) -> &kr_protocol::error::ProtocolError {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(refusal),
+        ..
+    }) = frame
+    else {
+        panic!("the answer was not refused: {frame:?}");
+    };
+    refusal
+}
+
+fn privacy_mode_has_reported_complete(controller: &crate::service::Controller) -> bool {
+    controller
+        .privacy
+        .report_now(kr_protocol::scalars::TimestampMs::new(
+            kr_ipc::now_ms().get(),
+        ))
+        .completion
+        .is_complete()
+}
+
+/// KR-REQ-24.28: a receipt's result goes to a device whole when no change of privacy mode falls
+/// between the worker's answer and the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_is_written_whole_under_the_privacy_state_it_was_read_in() {
+    use kr_protocol::envelope::{ControlFrame, Outcome};
+
+    let world = worker_answering_a_receipt().await;
+    let (connection, kept) = describing_connection(&world.controller, 71);
+    let frame = a_receipt_read_then(&world, &connection, &kept, || async {}).await;
+    assert!(
+        matches!(
+            frame,
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{frame:?}"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: a receipt's result that a worker answered while privacy mode was off is not
+/// published after privacy mode has started: the device is told it cannot be shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_is_refused_when_privacy_mode_starts_before_it_is_sent() {
+    let world = worker_answering_a_receipt().await;
+    let controller = &world.controller;
+    let (connection, kept) = describing_connection(controller, 72);
+    let frame = a_receipt_read_then(&world, &connection, &kept, || {
+        privacy_mode_is_turned_on(controller)
+    })
+    .await;
+    let refusal = the_refusal_of(&frame);
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable
+    );
+    assert_eq!(refusal.message, "this retained output cannot be shown");
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: a receipt read while privacy mode is on and its removal had reported complete when
+/// the read began is written, so no receipt is refused for as long as the mode is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_read_after_privacy_mode_reported_complete_is_written() {
+    use kr_protocol::envelope::{ControlFrame, Outcome};
+
+    let world = worker_answering_a_receipt().await;
+    let controller = &world.controller;
+    privacy_mode_is_turned_on(controller).await;
+    // The session's worker has been told, and has said its cleanup is complete.
+    let now = kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get());
+    controller
+        .privacy
+        .note_session_live(world.session_id, now)
+        .expect("the session is live");
+    controller
+        .privacy
+        .note_answer(&kr_protocol::privacy::PrivacyGenerationAck {
+            session_id: world.session_id,
+            generation: kr_protocol::scalars::U64::new(
+                controller.privacy.state().now().generation.get(),
+            ),
+            enabled: true,
+            completion: kr_protocol::privacy::PrivacyCompletion::Complete,
+        })
+        .expect("the worker's answer is noted");
+    assert!(
+        privacy_mode_has_reported_complete(controller),
+        "the removal has reported complete before the read"
+    );
+    let (connection, kept) = describing_connection(controller, 73);
+    let frame = a_receipt_read_then(&world, &connection, &kept, || async {}).await;
+    assert!(
+        matches!(
+            frame,
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{frame:?}"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: a receipt read while privacy mode is on and its removal had not reported complete
+/// when the read began is refused, as a worker's answer made before it was told may still hold what
+/// the removal takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_read_before_privacy_mode_reported_complete_is_refused() {
+    let world = worker_answering_a_receipt().await;
+    let controller = &world.controller;
+    privacy_mode_is_turned_on(controller).await;
+    controller
+        .privacy
+        .note_session_live(
+            world.session_id,
+            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+        )
+        .expect("the session owes its removal");
+    assert!(
+        !privacy_mode_has_reported_complete(controller),
+        "the removal has not reported complete before the read"
+    );
+    let (connection, kept) = describing_connection(controller, 74);
+    let frame = a_receipt_read_then(&world, &connection, &kept, || async {}).await;
+    assert_eq!(
+        the_refusal_of(&frame).code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable
+    );
+    world.serving.abort();
+}
+
 /// A page a worker answers after the daemon published privacy mode and before the worker was told,
 /// which still holds the output that privacy mode removes, is withheld.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
