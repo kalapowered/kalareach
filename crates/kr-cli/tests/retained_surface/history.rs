@@ -92,7 +92,7 @@ pub struct Report {
     pub spans: Vec<Span>,
 }
 
-fn is_client(krate: &str) -> bool {
+pub(super) fn is_client(krate: &str) -> bool {
     !RECEIVER_CRATES.contains(&krate) && !DAEMON_CRATES.contains(&krate)
 }
 

@@ -11,13 +11,15 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use kr_protocol::hello::PackageVersion;
+
 use super::history::{
-    Report, Snapshot, Tagged, audit_tags, print_report, read_history, version_of_tag,
+    Report, Snapshot, Tagged, audit_tags, is_client, print_report, read_history, version_of_tag,
 };
 use super::narrower::{
     ABSENT, DAEMON_CRATES, Evidence, Item, Narrower, RECEIVER_CRATES, Range, Sender,
 };
-use super::walker::Lookup;
+use super::walker::{Lookup, Tree};
 
 /// Whether the crate is read as a sender: the gate holds its own copy of the rule, apart from the
 /// reader's and the audit's.
@@ -464,6 +466,65 @@ fn render_report(snapshots: &[Snapshot]) -> String {
         }
     }
     out
+}
+
+/// Reads this checkout as the reader reads a release tag, and writes the report of the one reading
+/// to the file `KR_CHECKOUT_REPORT` names, under the release name `HEAD`, for the gate to hold to
+/// what it finds in the same tree. The line it prints is the refusal census of the checkout: a
+/// refusal ends the reading, so a count means the tree is read.
+#[test]
+#[ignore = "reads this checkout; run by hand with --show-output"]
+fn the_reader_reads_this_checkout_and_writes_its_report() {
+    let repository = super::repository();
+    let started = Instant::now();
+    let tree = Tree::at(&repository).expect("this checkout is read");
+    let all = tree.sightings(&|_| true).expect("the scan of every crate");
+    let tree = tree.scoped(&|krate| is_client(krate));
+    let sightings = tree.sightings(&|krate| is_client(krate));
+    let extents = tree
+        .sighting_extents(&|krate| is_client(krate))
+        .expect("the lines of the sightings");
+    println!(
+        "this checkout: {} sightings in every crate, {} in the client crates, in {:?}",
+        all.len(),
+        sightings.as_ref().map_or(0, Vec::len),
+        started.elapsed()
+    );
+    let commit = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repository)
+        .output()
+        .expect("git runs");
+    let snapshot = Snapshot {
+        at: Tagged {
+            tag: "HEAD".to_owned(),
+            commit: String::from_utf8_lossy(&commit.stdout).trim().to_owned(),
+            version: PackageVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            },
+            committed: 0,
+        },
+        names_a_method: Ok(false),
+        krates: BTreeMap::new(),
+        items: BTreeMap::new(),
+        sightings,
+        extents,
+        records: BTreeMap::new(),
+        source_errors: BTreeMap::new(),
+    };
+    let report = render_report(&[snapshot]);
+    assert!(
+        report.contains("\tok\t"),
+        "the scan of this checkout failed: {report}"
+    );
+    assert!(
+        !report.contains("\t0\t0\n"),
+        "an extent at line 0: the tokens carry no line numbers"
+    );
+    let path = std::env::var_os("KR_CHECKOUT_REPORT").expect("KR_CHECKOUT_REPORT names the file");
+    std::fs::write(path, report).expect("the report is written");
 }
 
 #[test]

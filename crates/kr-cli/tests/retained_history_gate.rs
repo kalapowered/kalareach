@@ -1158,6 +1158,32 @@ fn the_report_of_the_reader_holds_to_what_the_gate_finds_in_every_release() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// The oracle at the head: the report of the reader for this checkout (one release, `HEAD`) holds
+/// each hit of the gate's own search of the same files.
+#[test]
+#[ignore = "reads this checkout; run by hand with --show-output after the reader has written its report"]
+fn the_report_of_the_reader_holds_to_what_the_gate_finds_in_this_checkout() {
+    let path = std::env::var_os("KR_CHECKOUT_REPORT")
+        .expect("KR_CHECKOUT_REPORT names the report the reader wrote");
+    let report =
+        parse_report(&std::fs::read_to_string(path).expect("the report")).expect("a report");
+    assert_eq!(
+        report.order,
+        ["HEAD"],
+        "the report is of this checkout alone"
+    );
+    let hits = oracle(&repository()).expect("the oracle reads this checkout");
+    let reported = &report.tags["HEAD"];
+    println!(
+        "HEAD: {} hits, {} sightings, {} scan line(s)",
+        hits.len(),
+        reported.sightings.len(),
+        reported.scans
+    );
+    let problems = tag_problems("HEAD", reported, &hits);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Cases
 // ---------------------------------------------------------------------------------------------
