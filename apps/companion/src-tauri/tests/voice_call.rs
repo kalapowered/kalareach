@@ -9284,11 +9284,12 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
                 "the unfinished context send is shown ({cause}): {ended}"
             );
         } else if cause == "provider_closure" {
-            // The provider closed the session: the host reports that it stopped before it sent any
-            // of the context, and counts no part as unconfirmed.
+            // The provider closed the session after the host's sender wrote its one append and
+            // before the provider answered it: the host's end counts that append as unconfirmed, so
+            // it reports 0 of 1 parts sent and one part unconfirmed.
             assert_eq!(
                 shown,
-                "This call was not given the host's context for its session: the host stopped before it sent any of it.",
+                "This call may not have been given all of the host's context for its session: the host sent 0 of its 1 parts and did not learn whether OpenAI took the next.",
                 "({cause}) {ended}"
             );
         } else {
