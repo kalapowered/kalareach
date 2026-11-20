@@ -23,6 +23,7 @@ import type { ActionRight } from '@kalareach/protocol'
 import type { HostPort } from '../host/port'
 import { AnnouncementScope } from '../components/announcements'
 import { closeSheets, type ToastAction, type ToastMessage } from '../components/ui'
+import { ChannelShelf } from '../model/channel-messages'
 import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
 import { QuestionForms } from '../model/question-forms'
@@ -61,6 +62,11 @@ interface AppValue {
    * layouts and every tab, so closing a tab or switching views forgets no draft.
    */
   readonly drafts: DraftBook
+  /**
+   * The messages sent over a channel that confirms nothing, and the records of sends under way, as
+   * this device keeps them apart from the drafts. Like the book, it lives above both layouts.
+   */
+  readonly channelMessages: ChannelShelf
   /** The paths the host gave for the files attached to drafts, for the person to give to an agent. */
   readonly paths: ManualPaths
   /** The answers people have begun to give, which outlive the screen that showed each. */
@@ -134,6 +140,7 @@ export function AppProvider({
   const [sessions] = useState(() => new SessionStates())
   const [openings] = useState(() => new Openings())
   const [drafts] = useState(() => new DraftBook(port))
+  const [channelMessages] = useState(() => new ChannelShelf(port))
   const [paths] = useState(() => new ManualPaths(port))
   const [questionForms] = useState(() => new QuestionForms())
   const [receiptReads] = useState(() => new ReceiptReads())
@@ -205,7 +212,13 @@ export function AppProvider({
   // The drafts kept on this device are read once, and written as the window is hidden or closed.
   // A write is also made at every change, so these two are a second chance, not the only one.
   useEffect(() => {
-    void drafts.hydrate()
+    // The shelf is first read once the book's first read has answered, whether or not it worked, so
+    // that what the shelf says about the messages and what the book says about the drafts are one
+    // moment's. It is read again at each later read of the drafts and when the window shows again.
+    void drafts.hydrate().then(() => channelMessages.refresh())
+    const reread = drafts.onReloaded(() => {
+      void channelMessages.refresh()
+    })
     const told = drafts.onNotice((words) => {
       say(words, 'pending')
     })
@@ -214,15 +227,17 @@ export function AppProvider({
     }
     const hidden = () => {
       if (document.visibilityState === 'hidden') write()
+      else void channelMessages.refresh()
     }
     window.addEventListener('pagehide', write)
     document.addEventListener('visibilitychange', hidden)
     return () => {
       told()
+      reread()
       window.removeEventListener('pagehide', write)
       document.removeEventListener('visibilitychange', hidden)
     }
-  }, [drafts, say])
+  }, [drafts, channelMessages, say])
 
   const openTab = useCallback((sessionId: string) => {
     setTabs((current) => (current.includes(sessionId) ? current : [...current, sessionId]))
@@ -281,6 +296,7 @@ export function AppProvider({
       sessions,
       openings,
       drafts,
+      channelMessages,
       paths,
       questionForms,
       receiptReads,
@@ -305,6 +321,7 @@ export function AppProvider({
       sessions,
       openings,
       drafts,
+      channelMessages,
       paths,
       questionForms,
       receiptReads,

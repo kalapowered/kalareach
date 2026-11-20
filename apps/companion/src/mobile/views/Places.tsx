@@ -10,6 +10,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import type { EnvironmentListResult, SessionListResult } from '@kalareach/protocol'
 
 import { useApp } from '../../app/state'
+import { useChannelMessages } from '../../app/channel-messages'
 import { useBook } from '../../app/drafts'
 import { useHeldConnection } from '../../app/rights'
 import { keptEntry } from '../../model/draft-book'
@@ -87,7 +88,7 @@ export function MobileSessions({
   readonly environmentId?: string | null
 }): ReactNode {
   const { port } = useApp()
-  const keptEntryLine = keptEntry(useBook())
+  const keptEntryLine = keptEntry(useBook(), useChannelMessages())
   const shared = useHeld()
   const { rights } = useHeldConnection()
   // A pairing that holds no view of a session is refused the list of sessions outright, which for

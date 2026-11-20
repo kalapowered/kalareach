@@ -116,6 +116,7 @@ import { ask } from '../model/call'
 import { describeMode } from '../model/gestures'
 import { putBack, restOn, type Position } from '../model/keyboard'
 import { admit, describeBytes, type Picked } from '../model/media'
+import { useChannelMessages } from '../../app/channel-messages'
 import { useBook } from '../../app/drafts'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
@@ -194,7 +195,7 @@ export function MobileSession({
   const camera = useCameraControl(port, say)
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
-  const keptEntryLine = keptEntry(shown)
+  const keptEntryLine = keptEntry(shown, useChannelMessages())
   const [pane, setPane] = useState<Pane>('semantic')
   // The session's agent, read from its own worker while this screen is open, into the session's
   // own store: nothing of another session is ever shown under this one.
