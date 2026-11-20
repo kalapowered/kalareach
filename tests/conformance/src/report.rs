@@ -1946,10 +1946,11 @@ fn test_options(step: &plan::Step) -> Vec<String> {
                 kept.push(word.to_owned());
                 kept.extend(operand.cloned());
             }
-        } else if word.starts_with('-') && !held(index) {
-            if !matches!(word, "--exact" | "--show-output" | "--list") {
-                kept.push(word.to_owned());
-            }
+        } else if word.starts_with('-')
+            && !held(index)
+            && !matches!(word, "--exact" | "--show-output" | "--list")
+        {
+            kept.push(word.to_owned());
         }
     }
     kept
