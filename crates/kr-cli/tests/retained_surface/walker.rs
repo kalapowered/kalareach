@@ -47,8 +47,8 @@ pub struct Tree {
     indexes: RefCell<BTreeMap<String, Rc<CrateIndex>>>,
     scans: RefCell<BTreeMap<String, Rc<CrateScan>>>,
     inventories: RefCell<BTreeMap<String, Rc<Inventory>>>,
-    /// The crates that a refusal across crates looks at (the exports a call is held to): every
-    /// crate where it is not set.
+    /// The crates that the marks of a name and the renames of a macro's name look at: every crate
+    /// where it is not set.
     scope: Option<BTreeSet<String>>,
 }
 
@@ -323,8 +323,8 @@ impl Tree {
         })
     }
 
-    /// The tree with the refusals across crates (X9) looking at the crates `include` accepts only,
-    /// as a scan of those crates does.
+    /// The tree with the macro names that a sighting marks (S4) and the renames of a macro's name
+    /// (R1) looking at the crates `include` accepts only, as a scan of those crates does.
     pub fn scoped(mut self, include: &dyn Fn(&str) -> bool) -> Self {
         self.scope = Some(
             self.crates
@@ -345,13 +345,7 @@ impl Tree {
             .manifests
             .get(krate)
             .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-        let found = inventory::read(krate, &manifest.roots, &self.root)?;
-        if let Some((at, name)) = found.unaccepted.first() {
-            return Err(format!(
-                "{at}: {name}! is called at item position, is not defined in {krate} and is not one the scan accepts"
-            ));
-        }
-        let found = Rc::new(found);
+        let found = Rc::new(inventory::read(krate, &manifest.roots, &self.root)?);
         self.inventories
             .borrow_mut()
             .insert(krate.to_owned(), Rc::clone(&found));
@@ -790,17 +784,6 @@ impl CrateIndex {
                 _ => continue,
             };
             self.push(item, file, krate, workspace, kind, names);
-            // A `macro_rules!` written inside the item (in a function's body) is a macro of its own.
-            if !matches!(item, syn::Item::Macro(_)) {
-                for rules in nested_rules(item, file)? {
-                    if let syn::Item::Macro(definition) = &rules
-                        && let Some(name) = &definition.ident
-                    {
-                        let names = vec![name.to_string()];
-                        self.push(&rules, file, krate, workspace, Kind::MacroRules, names);
-                    }
-                }
-            }
             if let syn::Item::Impl(block) = item {
                 for inner in &block.items {
                     if let syn::ImplItem::Fn(method) = inner {
@@ -1030,29 +1013,6 @@ impl VisitMut for Strip<'_> {
         }
         block.items = kept;
     }
-}
-
-/// The `macro_rules!` definitions written inside `item` (in a function's body, say) that some
-/// configuration without `test` builds, as items.
-fn nested_rules(item: &syn::Item, file: &str) -> Result<Vec<syn::Item>, String> {
-    #[derive(Default)]
-    struct Find(Vec<syn::ItemMacro>);
-    impl<'ast> Visit<'ast> for Find {
-        fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
-            if node.ident.is_some() && node.mac.path.is_ident("macro_rules") {
-                self.0.push(node.clone());
-            }
-        }
-    }
-    let mut any = Find::default();
-    any.visit_item(item);
-    if any.0.is_empty() {
-        return Ok(Vec::new());
-    }
-    let kept = stripped(item, file, |strip, node| strip.visit_item_mut(node))?;
-    let mut found = Find::default();
-    found.visit_item(&kept);
-    Ok(found.0.into_iter().map(syn::Item::Macro).collect())
 }
 
 /// A copy of `node` without its nested items that no configuration without `test` builds.
@@ -1551,11 +1511,17 @@ pub const WIRE_NAMES: [&str; 6] = [
 
 /// What the scan found in one crate.
 struct CrateScan {
+    /// The sightings of the crate's items, without the `Expands` of a `macro_rules!` that a call
+    /// marks: the names a call with a sighting marks are taken over every crate in scope.
     sightings: Vec<Sighting>,
     /// The names only a scan gives (`use:<file>`, `<macro>! invocation @<file>`), with their text.
     scan_names: BTreeMap<String, Source>,
-    /// The macros called with a sighting that this crate does not define.
-    unresolved: BTreeSet<String>,
+    /// The names of the macros called with a sighting in their own arguments.
+    sighted: BTreeSet<String>,
+    /// What the transcribers of each `macro_rules!` definition call, at any depth.
+    callees: BTreeMap<String, Callees>,
+    /// The names of the `macro_rules!` items the crate defines.
+    rules: BTreeSet<String>,
 }
 
 impl Tree {
@@ -1649,17 +1615,62 @@ impl Tree {
 
     /// The sightings of the crates `include` accepts, outside `#[cfg(test)]` and outside `tests/`.
     pub fn sightings(&self, include: &dyn Fn(&str) -> bool) -> Result<Vec<Sighting>, String> {
+        let marked = self.marked(include);
         let mut all = Vec::new();
         for krate in self.crates.keys().filter(|krate| include(krate)) {
-            all.extend(self.refused(krate, include)?.sightings.iter().cloned());
+            let scan = self.refused(krate, include)?;
+            let mut found: BTreeMap<String, BTreeSet<SightKind>> = scan
+                .sightings
+                .iter()
+                .map(|sighting| (sighting.name.clone(), sighting.kinds.clone()))
+                .collect();
+            // A `macro_rules!` whose name is marked is expanded (S4), wherever the call is.
+            for rules in scan.rules.iter().filter(|rules| marked.contains(*rules)) {
+                found
+                    .entry(format!("macro:{rules}"))
+                    .or_default()
+                    .insert(SightKind::Expands);
+            }
+            all.extend(found.into_iter().map(|(name, kinds)| Sighting {
+                krate: krate.clone(),
+                name,
+                kinds,
+            }));
         }
         Ok(all)
     }
 
+    /// The macro names a sighting marks over the crates `include` accepts (S4): the name that ends a
+    /// call with a sighting in its own arguments, and each name that the transcribers of a
+    /// definition of a marked name call, wherever the definition is. The closure only adds marks. A
+    /// crate the scan cannot read marks nothing: its own results are its refusals.
+    fn marked(&self, include: &dyn Fn(&str) -> bool) -> BTreeSet<String> {
+        let scans: Vec<Rc<CrateScan>> = self
+            .crates
+            .keys()
+            .filter(|krate| include(krate) && !self.manifests[*krate].proc_macro)
+            .filter_map(|krate| self.scan(krate).ok())
+            .collect();
+        let mut marked: BTreeSet<String> = scans
+            .iter()
+            .flat_map(|scan| scan.sighted.iter().cloned())
+            .collect();
+        let mut todo: Vec<String> = marked.iter().cloned().collect();
+        while let Some(name) = todo.pop() {
+            for callees in scans.iter().filter_map(|scan| scan.callees.get(&name)) {
+                for callee in &callees.names {
+                    if marked.insert(callee.clone()) {
+                        todo.push(callee.clone());
+                    }
+                }
+            }
+        }
+        marked
+    }
+
     /// What stops a crate from being read: the forms the inventory refuses, and the refusals of the
-    /// scan (X8 and the renames of R1), of a procedural-macro crate (X10) and of a call with a sighting
-    /// to a macro that a crate in scope exports (X9). A lookup in the crate gives none of its results while
-    /// one holds.
+    /// scan (X8 and the renames of R1) and of a procedural-macro crate (X10). A lookup in the crate
+    /// gives none of its results while one holds.
     pub fn refusals(&self, krate: &str) -> Result<(), String> {
         self.refused(krate, &|other| {
             self.scope
@@ -1669,7 +1680,8 @@ impl Tree {
         .map(|_| ())
     }
 
-    /// The scan of `krate`, where no refusal holds, with X9 over the crates `include` accepts.
+    /// The scan of `krate`, where no refusal holds, with the names marked over the crates `include`
+    /// accepts.
     fn refused(
         &self,
         krate: &str,
@@ -1694,25 +1706,17 @@ impl Tree {
                 }
             }
         }
-        for name in &scan.unresolved {
-            // A call names a macro as written, or as a `use ... as` renamed it.
-            let mut called = vec![(name.clone(), String::new())];
-            for original in imported.imported_as.get(name).into_iter().flatten() {
-                called.push((original.clone(), format!(" (imported as {name})")));
-            }
-            for other in self
-                .crates
-                .keys()
-                .filter(|other| *other != krate && include(other))
-            {
-                for (exported, how) in &called {
-                    if self.inventory(other)?.exported.contains(exported) {
-                        return Err(format!(
-                            "{krate}: {exported}! is called with a sighting{how} and {other} exports it; the scan does not follow it across crates"
-                        ));
-                    }
-                }
-            }
+        // A marked macro that calls another through a metavariable (R4) cannot be followed.
+        let marked = self.marked(include);
+        if let Some(name) = scan
+            .callees
+            .iter()
+            .find(|(name, callees)| callees.through_metavariable && marked.contains(*name))
+            .map(|(name, _)| name)
+        {
+            return Err(format!(
+                "{krate}: the macro {name} calls a macro through a metavariable, which the scan cannot follow"
+            ));
         }
         Ok(scan)
     }
@@ -1777,8 +1781,6 @@ struct Scanner {
 struct Callees {
     /// The names called.
     names: BTreeSet<String>,
-    /// The names called through a path of another crate.
-    foreign: BTreeSet<String>,
     /// Whether one is called through a metavariable (`$m!(..)`).
     through_metavariable: bool,
 }
@@ -1788,34 +1790,26 @@ struct Callees {
 struct Calls {
     /// The macros called with a sighting in their own arguments.
     sighted: BTreeSet<String>,
-    /// Those among them that a path of another crate names (`other::name!`): a definition of the
-    /// name in this crate is not the macro called.
-    foreign_sighted: BTreeSet<String>,
-    /// Every macro called, and those a path of another crate names.
+    /// Every macro called.
     all: Callees,
-    /// What the transcribers of each `macro_rules!` definition call, at any depth.
+    /// What the transcribers of each `macro_rules!` definition call, at any depth, a definition
+    /// written in a function's body included: that definition is part of the function.
     defined: BTreeMap<String, Callees>,
-    /// The `macro_rules!` definitions written in the tokens (in a function's body, say) and what
-    /// kinds of sighting each holds: those are items of their own that the scan names.
-    nested: BTreeMap<String, BTreeSet<SightKind>>,
 }
 
 impl Calls {
     /// Takes in what the transcribers of the definition `name` call.
     fn absorb(&mut self, name: String, inner: Self) {
         self.sighted.extend(inner.sighted);
-        self.foreign_sighted.extend(inner.foreign_sighted);
         for (nested, callees) in inner.defined {
             let entry = self.defined.entry(nested).or_default();
             entry.names.extend(callees.names);
-            entry.foreign.extend(callees.foreign);
             entry.through_metavariable |= callees.through_metavariable;
         }
         // Definitions of one name, which the inventory let through, are one under it: what either
         // calls is called.
         let entry = self.defined.entry(name).or_default();
         entry.names.extend(inner.all.names);
-        entry.foreign.extend(inner.all.foreign);
         entry.through_metavariable |= inner.all.through_metavariable;
     }
 }
@@ -1957,13 +1951,7 @@ impl Scanner {
                         continue;
                     }
                     if let Some(last) = call.mac.path.segments.last() {
-                        let name = last.ident.to_string();
-                        if call.mac.path.segments.len() > 1
-                            && !is_own_prefix(&call.mac.path.segments[0].ident.to_string())
-                        {
-                            self.calls.foreign_sighted.insert(name.clone());
-                        }
-                        self.calls.sighted.insert(name);
+                        self.calls.sighted.insert(last.ident.to_string());
                     }
                     calls_in(&call.mac.tokens, &mut self.calls);
                     match defined_name(&call.mac.tokens) {
@@ -2042,54 +2030,6 @@ fn scan_crate(
             .to_string();
         scanner.items(&parsed.items, &relative, &under_src)?;
     }
-    // A macro is expanded when something calls it with a sighting, and so is each macro that the
-    // transcribers of one that is expanded call: that adds marks and never takes one away.
-    let mut marked = scanner.calls.sighted.clone();
-    let mut foreign = scanner.calls.foreign_sighted.clone();
-    let mut todo: Vec<String> = marked.iter().cloned().collect();
-    while let Some(name) = todo.pop() {
-        let Some(callees) = scanner.calls.defined.get(&name) else {
-            continue;
-        };
-        if callees.through_metavariable {
-            return Err(format!(
-                "{krate}: the macro {name} calls a macro through a metavariable, which the scan cannot follow"
-            ));
-        }
-        foreign.extend(callees.foreign.iter().cloned());
-        for callee in &callees.names {
-            if marked.insert(callee.clone()) {
-                todo.push(callee.clone());
-            }
-        }
-    }
-    // A definition in a function's body is a macro of its own: it holds the sightings it writes,
-    // and is expanded when it is marked.
-    let nested = std::mem::take(&mut scanner.calls.nested);
-    for (name, kinds) in &nested {
-        scanner.sight(format!("macro:{name}"), kinds.clone());
-    }
-    let rules: BTreeSet<String> = scanner
-        .macro_rules
-        .iter()
-        .cloned()
-        .chain(nested.into_keys())
-        .collect();
-    for name in rules {
-        if marked.contains(&name) {
-            scanner.sight(
-                format!("macro:{name}"),
-                BTreeSet::from([SightKind::Expands]),
-            );
-        }
-    }
-    // The macros that nothing in this crate defines, or that another crate's path names, which a
-    // crate the scan reads may export: the call is not followed into it.
-    let unresolved: BTreeSet<String> = marked
-        .difference(&inventory.defined)
-        .cloned()
-        .chain(foreign)
-        .collect();
     let scan_names = scanner
         .scan_only
         .iter()
@@ -2120,7 +2060,9 @@ fn scan_crate(
     Ok(CrateScan {
         sightings,
         scan_names,
-        unresolved,
+        sighted: scanner.calls.sighted,
+        callees: scanner.calls.defined,
+        rules: scanner.macro_rules,
     })
 }
 
@@ -2143,11 +2085,6 @@ pub(super) fn transcribers(arms: &TokenStream) -> Vec<TokenStream> {
             },
         )
         .collect()
-}
-
-/// Whether `name` starts a path to this crate's own items (`crate::m!`, `$crate::m!`).
-pub(super) fn is_own_prefix(name: &str) -> bool {
-    matches!(name, "crate" | "$crate" | "self" | "super")
 }
 
 /// The path that the macro name at `flat[at]` is written with: the segments before it that `::`
@@ -2197,11 +2134,6 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
                         calls_in(&expansion, &mut inner);
                     }
                     calls.absorb(name.to_string(), inner);
-                    calls
-                        .nested
-                        .entry(name.to_string())
-                        .or_default()
-                        .extend(kinds_of(&arms.stream()));
                     at += 4;
                     continue;
                 }
@@ -2212,12 +2144,7 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
                     && matches!(flat.get(at + 2), Some(TokenTree::Group(_))) =>
             {
                 let name = ident.to_string();
-                let path = path_before(&flat, at);
-                let foreign = path.len() > 1 && !is_own_prefix(&path[0]);
                 calls.all.names.insert(name.clone());
-                if foreign {
-                    calls.all.foreign.insert(name.clone());
-                }
                 if at > 0
                     && matches!(&flat[at - 1], TokenTree::Punct(dollar) if dollar.as_char() == '$')
                 {
@@ -2226,9 +2153,6 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
                 if matches!(flat.get(at + 2), Some(TokenTree::Group(arguments))
                     if !kinds_of(&arguments.stream()).is_empty())
                 {
-                    if foreign {
-                        calls.foreign_sighted.insert(name.clone());
-                    }
                     calls.sighted.insert(name);
                 }
             }

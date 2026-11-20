@@ -312,7 +312,7 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         "thing! { pub struct S; }\n",
         &[],
         format!(
-            "{at}: thing! is called at item position, is not defined in kr_sender and is not one the scan accepts"
+            "{at}: thing! is called at item position, is not defined in kr_sender and is not written as one of the macros the scan accepts"
         ),
     );
     // A rename of a name the scan reads hides it: `Method`, the two types, `ActionRight`, a variant, a
@@ -766,17 +766,17 @@ fn a_refused_crate_gives_no_lookup_result_whatever_the_index_holds() {
     assert_eq!(items, [failed.clone(), failed.clone()]);
     assert_eq!(sources, [Err(text.to_owned()), Err(text.to_owned())]);
     assert_eq!(roots, [failed.clone(), failed]);
-    // A call with a sighting to a macro that another crate exports: refused where that crate is in
-    // the tree's scope, read where it is not.
+    // A macro that calls through a metavariable and that a call with a sighting in another crate marks:
+    // refused where that crate is in the tree's scope, read where it is not.
     let folder = small_tree(&format!(
-        "fn f() {{ shared!(Method::AgentTurnCancel); }}\n{existing}"
+        "macro_rules! meta {{ ($m:ident) => {{ $m!(1) }}; }}\n{existing}"
     ));
     write(
         folder.path(),
         "crates/kr-worker/src/lib.rs",
-        "#[macro_export]\nmacro_rules! shared { ($m:expr) => { $m }; }\n",
+        "fn f() { meta!(Method::AgentTurnCancel); }\n",
     );
-    let text = "kr_sender: shared! is called with a sighting and kr_worker exports it; the scan does not follow it across crates";
+    let text = "kr_sender: the macro meta calls a macro through a metavariable, which the scan cannot follow";
     let tree = tree_at(folder.path()).expect("the tree");
     let (items, sources, roots) = lookups(&tree);
     let failed = Lookup::Failed(text.to_owned());
@@ -795,7 +795,7 @@ fn a_refused_crate_gives_no_lookup_result_whatever_the_index_holds() {
 #[test]
 fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
     // Each family by the provider that makes it safe, as the source writes it: bare, by a path, and
-    // by a `use` line that gives the name (with a rename).
+    // by a `use` line of the file that gives the name.
     for call in [
         "thread_local! { static X: u8 = 0; }",
         "std::thread_local! { static X: u8 = 0; }",
@@ -826,97 +826,172 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
     let lib = "mod inner;\nmacro_rules! own { () => {}; }\nmacro_rules! uses {\n    ($x:expr) => {\n        assert_eq!($x, 1);\n        core::matches!($x, 1);\n        std::format!(\"{}\", $x);\n        stringify!($x);\n        own!();\n        $crate::own!();\n        crate::own!();\n        inner::inside!();\n        vec![0];\n    };\n}\n";
     let files = [("src/inner.rs", "macro_rules! inside { () => {}; }\n")];
     assert_eq!(read_names(lib, &files), Ok(Vec::<String>::new()));
+    // A name is accepted where its own file imports the path: another file's import of the same name
+    // from another provider does not make it a different macro there.
+    let files = [
+        (
+            "src/a.rs",
+            "use schemars::json_schema;\njson_schema!({});\n",
+        ),
+        ("src/b.rs", "use foreign::json_schema;\n"),
+    ];
+    assert_eq!(
+        read_names("mod a;\nmod b;\n", &files),
+        Ok(Vec::<String>::new())
+    );
 }
 
 #[test]
 fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
-    let text = |name: &str| {
+    let text = |name: &str, position: &str| {
         format!(
-            "crates/kr-sender/src/lib.rs: {name}! is called at item position, is not defined in kr_sender and is not one the scan accepts"
+            "crates/kr-sender/src/lib.rs: {name}! is called at {position}, is not defined in kr_sender and is not written as one of the macros the scan accepts"
         )
     };
-    for (lib, name) in [
-        ("tokio::unlisted! { static X: u8 = 0; }", "unlisted"),
+    for (lib, name, position) in [
+        (
+            "tokio::unlisted! { static X: u8 = 0; }",
+            "unlisted",
+            "item position",
+        ),
         // A family name from a provider that is not its own, bare where it has no bare form, and
         // through an import that names another provider or a glob.
-        ("foreign::bindgen!({});", "bindgen"),
-        ("tokio::bindgen!({});", "bindgen"),
-        ("bindgen!({});", "bindgen"),
-        ("task_local! { static X: u8; }", "task_local"),
-        ("std::task_local! { static X: u8; }", "task_local"),
+        ("foreign::bindgen!({});", "bindgen", "item position"),
+        ("tokio::bindgen!({});", "bindgen", "item position"),
+        ("bindgen!({});", "bindgen", "item position"),
+        (
+            "task_local! { static X: u8; }",
+            "task_local",
+            "item position",
+        ),
+        (
+            "std::task_local! { static X: u8; }",
+            "task_local",
+            "item position",
+        ),
         (
             "foreign::thread_local! { static X: u8 = 0; }",
             "thread_local",
+            "item position",
         ),
-        ("json_schema!({});", "json_schema"),
-        ("use schemars::*;\njson_schema!({});", "json_schema"),
+        ("json_schema!({});", "json_schema", "item position"),
+        (
+            "use schemars::*;\njson_schema!({});",
+            "json_schema",
+            "item position",
+        ),
         (
             "use foreign::json_schema;\njson_schema!({});",
             "json_schema",
+            "item position",
         ),
-        ("kr_worker::debug_fields!(E { a });", "debug_fields"),
+        (
+            "kr_worker::debug_fields!(E { a });",
+            "debug_fields",
+            "item position",
+        ),
+        // A name that a file imports from two providers is read as each of them.
+        (
+            "use schemars::json_schema;\nmod m { use foreign::json_schema; }\njson_schema!({});\n",
+            "json_schema",
+            "item position",
+        ),
+        // Of several refused calls the one first by name is told.
+        (
+            "zz_thing! { pub struct S; }\naa_thing! { pub struct T; }\n",
+            "aa_thing",
+            "item position",
+        ),
+        // A module of the crate named like a listed provider is no provider: the path is the crate's
+        // own, and the crate defines no macro of that name.
+        (
+            "mod tokio { pub fn f() {} }\ntokio::task_local! { static X: u8; }\n",
+            "task_local",
+            "item position",
+        ),
+        (
+            "mod std {}\nstd::thread_local! { static X: u8 = 0; }\n",
+            "thread_local",
+            "item position",
+        ),
         // The crate's own prefix, or one of its modules, names a macro the crate defines, and not
         // one that a `use` or a re-export brought in from elsewhere.
         (
             "use foreign::generate as new_items;\ncrate::new_items!();\n",
             "new_items",
+            "item position",
         ),
-        ("use foreign::generate;\ncrate::generate!();\n", "generate"),
+        (
+            "use foreign::generate;\ncrate::generate!();\n",
+            "generate",
+            "item position",
+        ),
         (
             "mod bridge { pub use foreign::*; }\nbridge::generate!();\n",
             "generate",
+            "item position",
         ),
         (
             "macro_rules! m { () => { crate::generate!(); }; }\nm!();\n",
             "generate",
+            "a transcriber",
         ),
         // A macro of the crate's own name behind another crate's path is that crate's macro.
         (
             "macro_rules! mine { () => {}; }\nforeign::mine! {}\n",
             "mine",
+            "item position",
         ),
         // The transcribers of a definition, at any depth.
         (
             "macro_rules! m { () => { other::generate!(); }; }\nm!();\n",
             "generate",
+            "a transcriber",
         ),
         (
             "macro_rules! m { () => { generate!(); }; }\nm!();\n",
             "generate",
+            "a transcriber",
         ),
         (
             "macro_rules! m { () => { vec![other::generate!()]; }; }\n",
             "generate",
+            "a transcriber",
         ),
         (
             "fn f() { macro_rules! local { () => { other::generate!(); }; } }\n",
             "generate",
+            "a transcriber",
         ),
+        // An item of an impl block or a trait is at item position too.
+        (
+            "struct S;\nimpl S { generate!(); }\n",
+            "generate",
+            "item position",
+        ),
+        ("trait T { generate!(); }\n", "generate", "item position"),
     ] {
         let (scan, lookup) = scanned(lib, &[]);
-        assert_eq!(scan, Err(text(name)), "{lib}");
-        assert_eq!(lookup, Lookup::Failed(text(name)), "{lib}");
+        assert_eq!(scan, Err(text(name, position)), "{lib}");
+        assert_eq!(lookup, Lookup::Failed(text(name, position)), "{lib}");
     }
-    // A name that one file imports from the accepted provider and another from a different one is
-    // refused: the call is read as each of them.
+    // A name that another file imports from the accepted provider is not imported here: the call is
+    // read as the file that holds it writes it.
     let (scan, _) = scanned(
         "mod a;\nmod b;\n",
         &[
-            (
-                "src/a.rs",
-                "use schemars::json_schema;\njson_schema!({});\n",
-            ),
-            ("src/b.rs", "use foreign::json_schema;\n"),
+            ("src/a.rs", "json_schema!({});\n"),
+            ("src/b.rs", "use schemars::json_schema;\n"),
         ],
     );
     assert_eq!(
         scan,
-        Err("crates/kr-sender/src/a.rs: json_schema! is called at item position, is not defined in kr_sender and is not one the scan accepts".to_owned())
+        Err("crates/kr-sender/src/a.rs: json_schema! is called at item position, is not defined in kr_sender and is not written as one of the macros the scan accepts".to_owned())
     );
 }
 
 #[test]
-fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_is_refused() {
+fn a_macro_called_through_a_metavariable_is_refused_where_a_call_with_a_sighting_expands_it() {
     let at = "kr_sender";
     // A macro that is expanded and calls a macro through a metavariable.
     let lib = "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\nfn uses() { meta!(Method::AgentTurnCancel); }\n";
@@ -930,32 +1005,115 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
     // The same macro that nothing calls with a sighting is not followed, so nothing is refused.
     let lib = "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\nfn uses() { meta!(x); }\n";
     assert_eq!(read_names(lib, &[]), Ok(vec!["macro:meta".to_owned()]));
-    // A call with a sighting to a macro another crate of the scan exports.
-    let folder = small_tree("fn f() { shared!(Method::AgentTurnCancel); }\n");
+    // A call in another crate marks the name, so the macro of that name here is expanded and refused.
+    let folder = small_tree("fn f() { meta!(Method::AgentTurnCancel); }\n");
     write(
         folder.path(),
         "crates/kr-worker/src/lib.rs",
-        "#[macro_export]\nmacro_rules! shared { ($m:expr) => { $m }; }\n",
+        "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\n",
     );
     let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(
         tree.sightings(&|_| true),
-        Err("kr_sender: shared! is called with a sighting and kr_worker exports it; the scan does not follow it across crates".to_owned())
+        Err("kr_worker: the macro meta calls a macro through a metavariable, which the scan cannot follow".to_owned())
     );
-    // The crate that exports it is not read, or the call holds no sighting: nothing is refused.
     assert_eq!(
-        tree.sightings(&|krate| krate == "kr_sender")
+        tree.refusals("kr_worker"),
+        Err("kr_worker: the macro meta calls a macro through a metavariable, which the scan cannot follow".to_owned())
+    );
+    // The crate that calls it is not read: nothing marks the name.
+    assert_eq!(
+        tree.sightings(&|krate| krate == "kr_worker")
             .map(|found| found.len()),
         Ok(1)
     );
-    write(
-        folder.path(),
-        "crates/kr-sender/src/lib.rs",
-        "fn f() { let _ = Method::AgentTurnSteer; shared!(1); }\n",
+}
+
+#[test]
+fn a_name_that_ends_a_call_with_a_sighting_expands_the_macros_of_that_name_in_every_crate_the_scan_reads()
+ {
+    use SightKind::{Expands, Names};
+    let sightings = |sender: &str, worker: &str, scope: &dyn Fn(&str) -> bool| {
+        let folder = small_tree(sender);
+        write(folder.path(), "crates/kr-worker/src/lib.rs", worker);
+        let tree = tree_at(folder.path()).expect("the tree");
+        tree.sightings(scope).map(|found| {
+            let mut by = BTreeMap::new();
+            for krate in ["kr_sender", "kr_worker"] {
+                by.insert(krate, super::walker_cases::names(&found, krate));
+            }
+            by
+        })
+    };
+    let worker = "#[macro_export]\nmacro_rules! shared { ($m:expr) => { $m }; }\n";
+    // A call with a sighting, bare or by a path to the other crate, marks the macro the other
+    // crate defines under that name: the scan knows a macro by its last name.
+    for call in [
+        "shared!(Method::AgentTurnCancel)",
+        "kr_worker::shared!(Method::AgentTurnCancel)",
+    ] {
+        let lib = format!("fn f() {{ {call}; }}\n");
+        assert_eq!(
+            sightings(&lib, worker, &|_| true),
+            Ok(BTreeMap::from([
+                ("kr_sender", BTreeMap::from([("f".to_owned(), vec![Names])])),
+                (
+                    "kr_worker",
+                    BTreeMap::from([("macro:shared".to_owned(), vec![Expands])])
+                ),
+            ])),
+            "{call}"
+        );
+    }
+    // A scope without the crate that holds the definition has nothing to mark, and a scope without the
+    // crate that makes the call marks nothing.
+    let lib = "fn f() { shared!(Method::AgentTurnCancel); }\n";
+    assert_eq!(
+        sightings(lib, worker, &|krate| krate == "kr_sender"),
+        Ok(BTreeMap::from([
+            ("kr_sender", BTreeMap::from([("f".to_owned(), vec![Names])])),
+            ("kr_worker", BTreeMap::new()),
+        ]))
     );
-    let tree = tree_at(folder.path()).expect("the tree");
-    assert_eq!(tree.sightings(&|_| true).map(|found| found.len()), Ok(1));
-    // The refusal over the crates, for a macro the other crate exports under `name`.
+    assert_eq!(
+        sightings(lib, worker, &|krate| krate == "kr_worker"),
+        Ok(BTreeMap::from([
+            ("kr_sender", BTreeMap::new()),
+            ("kr_worker", BTreeMap::new()),
+        ]))
+    );
+    // A call with no sighting in its arguments marks nothing.
+    assert_eq!(
+        sightings("fn f() { shared!(1); }\n", worker, &|_| true),
+        Ok(BTreeMap::from([
+            ("kr_sender", BTreeMap::new()),
+            ("kr_worker", BTreeMap::new()),
+        ]))
+    );
+    // The names that the transcribers of a marked definition call are marked in every crate too: the
+    // definition here calls one of the listed macros of another crate by its path.
+    let lib = "macro_rules! fwd { ($x:expr) => { kr_client::debug_fields!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
+    let worker = "macro_rules! debug_fields { ($x:expr) => { $x }; }\n";
+    assert_eq!(
+        sightings(lib, worker, &|_| true),
+        Ok(BTreeMap::from([
+            (
+                "kr_sender",
+                BTreeMap::from([
+                    ("f".to_owned(), vec![Names]),
+                    ("macro:fwd".to_owned(), vec![Expands]),
+                ])
+            ),
+            (
+                "kr_worker",
+                BTreeMap::from([("macro:debug_fields".to_owned(), vec![Expands])])
+            ),
+        ]))
+    );
+}
+
+#[test]
+fn a_rename_of_the_name_of_a_macro_that_a_crate_in_scope_defines_is_refused() {
     let across = |lib: &str, name: &str| {
         let folder = small_tree(lib);
         write(
@@ -966,60 +1124,53 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
         let tree = tree_at(folder.path()).expect("the tree");
         tree.sightings(&|_| true).map(|found| found.len())
     };
-    let refused = |name: &str| {
+    let renamed = |old: &str, new: &str| {
         Err(format!(
-            "kr_sender: {name}! is called with a sighting and kr_worker exports it; the scan does not follow it across crates"
+            "crates/kr-sender/src/lib.rs: the scan does not read a use of {old} under another name (as {new})"
         ))
     };
-    // A call reached only through the transcribers of a macro that is expanded: `fwd` is called
-    // with the sighting, and what it calls is the other crate's.
-    let lib = "use schemars::json_schema;\nmacro_rules! fwd { ($x:expr) => { json_schema!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
-    assert_eq!(across(lib, "json_schema"), refused("json_schema"));
-    // The same macro that nothing calls with a sighting is not followed.
-    let lib = "use schemars::json_schema;\nmacro_rules! fwd { ($x:expr) => { json_schema!($x) }; }\nfn f() { fwd!(1); let _ = Method::AgentTurnSteer; }\n";
-    assert_eq!(across(lib, "json_schema"), Ok(1));
-    // A path of the other crate names its macro whatever this crate defines under the same name;
-    // a bare call is this crate's own.
-    let lib = "macro_rules! shared { ($m:expr) => { $m }; }\nfn f() { kr_worker::shared!(Method::AgentTurnCancel); }\n";
-    assert_eq!(across(lib, "shared"), refused("shared"));
-    let lib = "macro_rules! shared { ($m:expr) => { $m }; }\nfn f() { shared!(Method::AgentTurnCancel); }\n";
-    assert_eq!(across(lib, "shared"), Ok(2));
-    let lib = "macro_rules! shared { ($m:expr) => { $m }; }\nfn f() { crate::shared!(Method::AgentTurnCancel); }\n";
-    assert_eq!(across(lib, "shared"), Ok(2));
-    // A transcriber that calls the other crate's macro by a path, where this crate defines one of the
-    // same name: what an expanded macro calls through a path is the other crate's.
-    let lib = "macro_rules! json_schema { ($m:expr) => { $m }; }\nmacro_rules! fwd { ($x:expr) => { schemars::json_schema!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
-    assert_eq!(across(lib, "json_schema"), refused("json_schema"));
-    // A call through the name a `use` gives the other crate's macro, in a call and in a transcriber.
-    let renamed = Err(
-        "crates/kr-sender/src/lib.rs: the scan does not read a use of shared under another name (as renamed)"
-            .to_owned(),
-    );
+    // A call through the name a `use` gives the other crate's macro.
     let lib = "use kr_worker::shared as renamed;\nfn f() { renamed!(Method::AgentTurnCancel); }\n";
-    assert_eq!(across(lib, "shared"), renamed);
-    // The same name in a transcriber is a call of another crate's macro that nothing accepts.
-    let lib = "use kr_worker::shared as renamed;\nmacro_rules! fwd { ($x:expr) => { renamed!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
-    assert_eq!(
-        across(lib, "shared"),
-        Err("crates/kr-sender/src/lib.rs: renamed! is called at item position, is not defined in kr_sender and is not one the scan accepts".to_owned())
-    );
+    assert_eq!(across(lib, "shared"), renamed("shared", "renamed"));
+    // The new name is the name of a macro the other crate defines.
+    let lib = "use kr_worker::other as shared;\nfn f() { shared!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "shared"), renamed("other", "shared"));
     // A name that is no rename of the other crate's macro is not that macro.
     let lib = "use kr_worker::other as renamed;\nfn f() { renamed!(Method::AgentTurnCancel); }\n";
     assert_eq!(across(lib, "shared"), Ok(1));
-    // A call at item position by a path, with a sighting in its arguments.
-    let lib = "schemars::json_schema!({ \"x\": \"agent.turn.cancel\" });\nmacro_rules! json_schema { ($m:expr) => { $m }; }\n";
-    assert_eq!(across(lib, "json_schema"), refused("json_schema"));
-    // The same call whose arguments begin with a name, which the scan takes for the item it defines:
-    // the call is then the one place that tells the scan the macro is the other crate's.
-    let lib = "schemars::json_schema!(Holder { \"x\": \"agent.turn.cancel\" });\nmacro_rules! json_schema { ($m:expr) => { $m }; }\n";
-    assert_eq!(across(lib, "json_schema"), refused("json_schema"));
+    // In a transcriber, the renamed name is a macro of another crate that nothing accepts.
+    let lib = "use kr_worker::shared as renamed;\nmacro_rules! fwd { ($x:expr) => { renamed!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
+    assert_eq!(
+        across(lib, "shared"),
+        Err("crates/kr-sender/src/lib.rs: renamed! is called at a transcriber, is not defined in kr_sender and is not written as one of the macros the scan accepts".to_owned())
+    );
 }
 
 #[test]
-fn a_macro_defined_in_a_function_body_is_a_macro_of_its_own() {
+fn a_macro_defined_in_a_function_body_is_part_of_the_function() {
     use SightKind::{Expands, Names};
     let folder = small_tree(
         "fn f() {\n    macro_rules! inner { ($m:expr) => { $m }; }\n    inner!(Method::AgentTurnCancel);\n}\nfn g() {\n    macro_rules! holds { () => { Method::AgentTurnSteer }; }\n    #[cfg(test)]\n    macro_rules! gone { () => {}; }\n}\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
+    let found = tree
+        .sightings(&|krate| krate == "kr_sender")
+        .map(|found| super::walker_cases::names(&found, "kr_sender"));
+    // The function holds the sightings its definitions write: none is an item of its own.
+    assert_eq!(
+        found,
+        Ok(BTreeMap::from([
+            ("f".to_owned(), vec![Names]),
+            ("g".to_owned(), vec![Names]),
+        ]))
+    );
+    for name in ["macro:inner", "macro:holds", "macro:gone"] {
+        assert_eq!(tree.item("kr_sender", name), Lookup::Absent, "{name}");
+    }
+    // What a definition in a body calls is called when the macro is marked: the name it calls is
+    // marked, and the macro of that name at item level is expanded.
+    let folder = small_tree(
+        "fn f() {\n    macro_rules! inner { ($x:expr) => { forward!($x) }; }\n    inner!(Method::AgentTurnCancel);\n}\nmacro_rules! forward { ($x:expr) => { $x }; }\n",
     );
     let tree = tree_at(folder.path()).expect("the tree");
     let found = tree
@@ -1029,67 +1180,8 @@ fn a_macro_defined_in_a_function_body_is_a_macro_of_its_own() {
         found,
         Ok(BTreeMap::from([
             ("f".to_owned(), vec![Names]),
-            ("g".to_owned(), vec![Names]),
-            ("macro:holds".to_owned(), vec![Names]),
-            ("macro:inner".to_owned(), vec![Expands]),
+            ("macro:forward".to_owned(), vec![Expands]),
         ]))
-    );
-    // Its rules are an item, whose source holds the definition; one that no build holds is not.
-    let held = tree
-        .source("kr_sender", "macro:inner")
-        .is_ok_and(|found| found.is_some_and(|source| source.text.contains("macro_rules")));
-    assert!(held, "the source of macro:inner holds its definition");
-    assert!(matches!(
-        tree.item("kr_sender", "macro:inner"),
-        Lookup::Found(_)
-    ));
-    assert_eq!(tree.item("kr_sender", "macro:gone"), Lookup::Absent);
-}
-
-#[test]
-fn a_cfg_attr_that_adds_macro_export_counts_where_the_predicate_is_not_false() {
-    // The other crate exports `shared` where the attribute is written, or a `cfg_attr` that is not
-    // false adds it, and a call with a sighting to a macro it exports is refused.
-    let call = |attribute: &str| {
-        let folder = small_tree("fn f() { shared!(Method::AgentTurnCancel); }\n");
-        write(
-            folder.path(),
-            "crates/kr-worker/src/lib.rs",
-            &format!("{attribute}\nmacro_rules! shared {{ ($m:expr) => {{ $m }}; }}\n"),
-        );
-        let tree = tree_at(folder.path()).expect("the tree");
-        tree.sightings(&|_| true).map(|found| found.len())
-    };
-    let refused = Err(
-        "kr_sender: shared! is called with a sighting and kr_worker exports it; the scan does not follow it across crates"
-            .to_owned(),
-    );
-    for attribute in [
-        "#[macro_export]",
-        "#[cfg_attr(unix, macro_export)]",
-        "#[cfg_attr(not(test), macro_export)]",
-        "#[cfg_attr(unix, cfg_attr(not(test), macro_export))]",
-        "#[cfg_attr(windows, cfg_attr(unix, macro_export))]",
-        "#[cfg_attr(some_atom, macro_export)]",
-    ] {
-        assert_eq!(call(attribute), refused, "{attribute}");
-    }
-    for attribute in [
-        "",
-        "#[cfg_attr(test, macro_export)]",
-        "#[cfg_attr(all(unix, test), macro_export)]",
-        "#[cfg_attr(unix, cfg_attr(test, macro_export))]",
-        "#[cfg_attr(unix, allow(unused))]",
-    ] {
-        assert_eq!(call(attribute), Ok(1), "{attribute}");
-    }
-    // A predicate the rule cannot read is its error.
-    assert_eq!(
-        call("#[cfg_attr(not(unix, windows), macro_export)]"),
-        Err(
-            "crates/kr-worker/src/lib.rs: the scan cannot read the condition not (unix , windows)"
-                .to_owned()
-        )
     );
 }
 
@@ -1334,4 +1426,37 @@ fn a_file_is_read_when_a_declaration_that_reaches_it_is_not_false() {
         sender_names(&tree_at(folder.path()).expect("the tree")),
         Ok(vec!["sends".to_owned()])
     );
+}
+
+#[test]
+fn a_macro_use_on_an_extern_crate_is_refused_where_a_configuration_without_test_builds_it() {
+    let at = "crates/kr-sender/src/lib.rs";
+    for lib in [
+        "#[macro_use]\nextern crate kr_protocol;",
+        "#[cfg_attr(unix, macro_use)]\nextern crate kr_protocol;",
+        "#[cfg_attr(unix, cfg_attr(not(test), macro_use))]\nextern crate kr_protocol;",
+        "#[macro_use]\nextern crate kr_protocol as proto;",
+        "mod inner { #[macro_use] extern crate kr_protocol; }",
+    ] {
+        assert_eq!(
+            read_names(&format!("{lib}\n"), &[]),
+            Err(format!(
+                "{at}: the scan does not read #[macro_use] on extern crate"
+            )),
+            "{lib}"
+        );
+    }
+    for lib in [
+        "extern crate kr_protocol;",
+        "#[cfg(test)]\n#[macro_use]\nextern crate kr_protocol;",
+        "#[cfg_attr(test, macro_use)]\nextern crate kr_protocol;",
+        "#[cfg_attr(unix, cfg_attr(test, macro_use))]\nextern crate kr_protocol;",
+        "#[allow(unused)]\nextern crate kr_protocol;",
+    ] {
+        assert_eq!(
+            read_names(&format!("{lib}\n"), &[]),
+            Ok(Vec::<String>::new()),
+            "{lib}"
+        );
+    }
 }
