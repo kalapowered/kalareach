@@ -6224,12 +6224,9 @@ answer: the same action sent again under an admission that stands is decided as 
 Finishing an effect that is already begun, such as completing a publication or a cancellation whose
 claim is committed, and the recovery at startup are not new effects, and the service does not ask
 again for them. A request whose envelope names a different session from the object its parameters
-name is refused, because the receipt would otherwise name a session the effect never touched. A call
-of one of the five agent mutations or of `plugin.action.invoke` is refused with `INVALID_ARGUMENT`,
-before anything is recorded, when its envelope names no application instance or names another
-instance or binding revision than its parameters. A retry after a lost reply is answered from the
-retained record before the freshness window is considered, because the retry carries the window it
-was first admitted under.
+name is refused, because the receipt would otherwise name a session the effect never touched. A
+retry after a lost reply is answered from the retained record before the freshness window is
+considered, because the retry carries the window it was first admitted under.
 
 A 1 MiB attachment chunk does not fit a control frame, so chunk traffic has its own endpoint,
 `t.sock`, framed at the attachment bound. Everything else about that connection is the control
