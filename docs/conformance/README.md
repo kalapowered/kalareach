@@ -134,13 +134,13 @@ matrix, and a part that fails does not stop the other.
 
 Cargo runs each test binary of a step through the report's program, once to list the binary's tests and once to run it, and the steps that build the workspace link that program again. Before its first step the report copies its program into a new directory under the temporary directory, compares the bytes of the copy with the original, and gives Cargo the copy. A step that writes a damaged file at the original's path cannot break a later listing or run.
 
-The directory is named `kr-conformance-runner-<time>-<process number>-<count>`, where the time is when the report makes the directory, after it reads the map. The report removes nothing, and a source check holds that, so each run leaves one folder in the temporary directory that holds a copy of the program, about 10 MB in a debug build, with the runner's records beside the copy, and the system or the person clears it.
+The directory is named `kr-conformance-runner-<time>-<process number>-<count>`, where the time is when the report makes the directory, after it reads the map. The report removes only the run's own scratch directory (see "How a step runs"), and a source check holds that, so each run leaves one folder in the temporary directory that holds a copy of the program, about 10 MB in a debug build, with the runner's records beside the copy, and the system or the person clears it.
 
 The report refuses before it runs a step, with the reason on its standard error and exit status 2, when it cannot read its program, cannot write the copy, finds the copy unequal to the original, or finds the temporary directory inside the repository or inside the target directory the steps build in. It refuses the same way when the copy's path holds a space, because Cargo takes its runner as one word: set `TMPDIR` (`TMP` on Windows) to a directory whose path holds none. It never falls back to the original.
 
 ### A program a step could not run
 
-Each step runs once, and a failed step stays failed. The case `a_step_that_could_not_run_a_program_fails_once_and_keeps_the_file_as_it_was_seen` (in `tests/observation.rs`) counts the runs of the failed step it sets up, so it shows the rule for that step and does not prove it for every step. The report's program removes and replaces no file, signals no process, and starts no program of its own that does either, reads the system's logs or reads its signatures. A source check refuses these names in the report's own sources, apart from the items under `#[cfg(test)]`. A `#[cfg(test)]` skips an item and nothing else: one inside a macro's input, or on anything that is not an item (a match arm, an argument, a field, a `let` or expression statement), skips nothing (a block statement that begins with `unsafe`, `async` or `const` counts as an item, and is skipped); a field, an argument or an assignment that a raw identifier such as `r#type` names is not an item either. The check reads every source file under `src` as Rust tokens and fails on a string that names `kill`, `pkill`, `killall`, `taskkill`, `ps`, `codesign`, `log`, `sudo`, `rm`, `unlink` or `rmdir` as a command or as the last part of a path, or that starts a shell command with one of them, and on any token named `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `unlink`, `rmdir`, `kill`, `killpg`, `process_group`, `SIGKILL`, `SIGTERM` or `TerminateProcess`, whatever follows it (a call, a function value, a type argument, an import), and on nothing else. The one exception is `rename` followed by `=` inside an attribute, as in `#[serde(rename = "x")]`, which is the attribute's key; `rename` anywhere else is refused, and so is `rename(` inside an attribute. It cannot see a name that a macro builds, a file that is taken in from outside `src`, or a program that is started under a name that is not on the list. It does not read the programs the steps run, which are the plan's. The report's program removes no file. Other parts of a job do: the Linux job's first step removes software that the runner image preinstalls and prunes its container images, the macOS job's step that frees the disk removes simulator runtimes the job does not use, and `scripts/run-conformance.sh` removes its own fetch files (partial downloads, work directories and the target directory it replaces) and its own list of collected files.
+Each step runs once, and a failed step stays failed. The case `a_step_that_could_not_run_a_program_fails_once_and_keeps_the_file_as_it_was_seen` (in `tests/observation.rs`) counts the runs of the failed step it sets up, so it shows the rule for that step and does not prove it for every step. The report's program replaces no file, signals no process, removes only the scratch directory its own run made, and starts no program of its own that does either, reads the system's logs or reads its signatures. A source check refuses these names in the report's own sources, apart from the items under `#[cfg(test)]`. A `#[cfg(test)]` skips an item and nothing else: one inside a macro's input, or on anything that is not an item (a match arm, an argument, a field, a `let` or expression statement), skips nothing (a block statement that begins with `unsafe`, `async` or `const` counts as an item, and is skipped); a field, an argument or an assignment that a raw identifier such as `r#type` names is not an item either. The check reads every source file under `src` as Rust tokens and fails on a string that names `kill`, `pkill`, `killall`, `taskkill`, `ps`, `codesign`, `log`, `sudo`, `rm`, `unlink` or `rmdir` as a command or as the last part of a path, or that starts a shell command with one of them, and on any token named `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `unlink`, `rmdir`, `kill`, `killpg`, `process_group`, `SIGKILL`, `SIGTERM` or `TerminateProcess`, whatever follows it (a call, a function value, a type argument, an import), and on nothing else. There are two exceptions. `rename` followed by `=` inside an attribute, as in `#[serde(rename = "x")]`, is the attribute's key; `rename` anywhere else is refused, and so is `rename(` inside an attribute. The other is the one call `std::fs::remove_dir_all(&self.path)` in `impl Drop for Scratch` in `src/scratch.rs`, which removes the directory that `Scratch::make` made new for the run; the same call in another file, a second call, another operand, an import and a function value are all refused. It cannot see a name that a macro builds, a file that is taken in from outside `src`, or a program that is started under a name that is not on the list. It does not read the programs the steps run, which are the plan's. The report's program removes no file of the repository and none of the evidence. Other parts of a job do: the Linux job's first step removes software that the runner image preinstalls and prunes its container images, the macOS job's step that frees the disk removes simulator runtimes the job does not use, and `scripts/run-conformance.sh` removes its own fetch files (partial downloads, work directories and the target directory it replaces) and its own list of collected files.
 
 A step failed because a program could not be run when its log holds Cargo's `could not execute process`, the runner's `could not start` for a path, or the shell's `cannot execute binary file` for a path together with exit status 126. Lines inside a test's captured output do not count. A test that ran and failed is a test failure, whatever it printed.
 
@@ -225,9 +225,13 @@ no `..` and no placeholder, it is not a link, no link on its way leads out of th
 is a directory of the repository when the plan loads.
 
 A step runs with the plan's `[env]` and its own `env`, and its value of a name replaces the plan's.
-Every name in `env`, in `[env]` and in `needs` has to be a variable name.
+Every name in `env`, in `[env]` and in `needs` has to be a variable name. On Windows, where names
+that differ only by case are one variable, a step's `PATH` replaces the plan's `Path`. The loader
+refuses each name the report sets for a step, in any case, in `env` and in `[env]`:
+`KR_TEST_ARTIFACTS_DIR`, `CARGO_TERM_COLOR`, `KR_CONFORMANCE_STEP`, `KR_CONFORMANCE_RECORDS`,
+`KR_CONFORMANCE_OWN_HARNESS` and `CARGO_TARGET_<triple>_RUNNER`.
 
-The placeholders are `{evidence}` (the evidence directory), `{root}` (the repository), `{scratch}`
+The placeholders are `{evidence}` (the evidence directory), `{root}` (the repository, as an absolute path), `{scratch}`
 and `{output}` (the step's own output). `{scratch}` is a directory the run makes under the directory
 it keeps its own files in, outside the evidence directory, and removes when the run ends; one that
 cannot be removed stays where it is. A placeholder is filled in a step's `command`, in the values of
@@ -243,7 +247,10 @@ in its command or in one of its variables. A step that names an `output` has to 
 a step that holds `{output}` has to name an `output`. A Vitest step and a lane step each name one,
 and the report reads that file and no word of the command. The run makes the directory that holds
 the output before the step runs, and the tool makes the output. Two outputs may not be equal or
-nested, and an output may not be in `logs` or be `result.json`, which are the report's own.
+nested, and an output may not be in `logs` or be `result.json`, which are the report's own. The
+loader compares output names without case and refuses a part that ends with a dot or a space,
+because the file systems of macOS and Windows take those names for one file. The run does not run
+a step whose output is there before the step runs: another step or command wrote it.
 
 A set-up step (`setup = true`) reads `exit`: the report records its exit status and nothing else. A
 step names the set-up steps it needs in `after`. Each is an earlier step of the plan that runs on
@@ -253,7 +260,9 @@ holds a step holds its set-up steps too, whatever their groups, in the plan's or
 step does not exit 0, or cannot be run, each step that names it is not run. It has no log and no
 exit status, its error says `not run because its set-up step <number> (<what>) ...`, the tests it
 would have run are not run, with those words in their reasons, and the run fails because the set-up
-step failed. A
+step failed. A set-up step that was itself not run, because a set-up step it names failed, reads
+`was not run, because its set-up step <number> did not succeed` in the error of the step that
+names it. A
 set-up step writes nothing back to the environment: the plan fixes every `env` before any step
 runs, and a set-up step leaves what the next steps need in `{scratch}`.
 
@@ -261,7 +270,11 @@ In a plan run in parts, a set-up step that a step names is not cut by count. It 
 part that holds a step naming it, directly or through another set-up step, so it runs once in each
 of those parts. A set-up step that no step names is cut by count like any other step.
 
-The result's record of a step does not name its `directory` or its `env`.
+The result's record of a step does not name its `directory` or its `env`. Two limits follow. A
+test's `command` in the result does not hold them, so for a step that has either, that command does
+not reproduce the test from the root. The result's toolchain is read in the root with the report's
+own variables, so a step whose `directory` has its own `rust-toolchain.toml`, or whose `env` holds
+`RUSTUP_TOOLCHAIN` or `PATH`, can run a toolchain that the result does not name.
 
 ## How a test names what it proves
 
