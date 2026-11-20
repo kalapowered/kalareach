@@ -303,6 +303,11 @@ Each later step of that budget is not run. It has no log and no exit status, and
 either, and its error ends `was not run, because its budget was spent by step <number>`. A step that is not
 run takes no time from its budget.
 
+A budget is spent in one run, and `--part` runs one part of a plan, so the steps of a budget must fall in one
+part. A plan cut into parts that puts them in more than one part, or gives a budget to a build that opens the
+plan (every part runs it), is refused before any step runs, with
+``the steps of budget `<id>` fall in more than one part: a budget's steps run in one part``.
+
 On macOS and Linux a step with a limit runs each command as the leader of a process group of its own;
 a step without a limit runs as before. A process that starts a group of its own is outside the kill.
 Playwright 1.63.0 does that for each browser, so a step that runs Playwright can leave browsers

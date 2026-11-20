@@ -291,7 +291,7 @@ fn run(root: PathBuf, plan: Plan, evidence_directory: &std::path::Path, asked: A
             }
             return ExitCode::from(2);
         }
-        Err(Stopped::Evidence(problem)) => {
+        Err(Stopped::Evidence(problem) | Stopped::Plan(problem)) => {
             eprintln!("kr-conformance: refused: {problem}");
             return ExitCode::from(2);
         }

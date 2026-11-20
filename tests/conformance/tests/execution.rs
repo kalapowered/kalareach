@@ -138,6 +138,11 @@ fn options(root: &Path, plan: Plan, evidence: &Path, base: &Path) -> Options {
 /// Loads `text` as the plan of the tree at `root`, after making its files tracked, and runs the
 /// report over it.
 fn run(root: &Path, text: &str) -> Result<Ran, Stopped> {
+    run_part(root, text, None)
+}
+
+/// [`run`] for the part `part` of the plan, as `--part` gives it, or the whole plan.
+fn run_part(root: &Path, text: &str, part: Option<(usize, usize)>) -> Result<Ran, Stopped> {
     git(root, &["add", "-A"]);
     let plan =
         Plan::parse(text, root).unwrap_or_else(|refusal| panic!("the plan loads: {refusal}"));
@@ -146,7 +151,8 @@ fn run(root: &Path, text: &str) -> Result<Ran, Stopped> {
         .tempdir()
         .expect("an evidence directory");
     let base = tempfile::tempdir().expect("a directory for the run's own files");
-    let options = options(root, plan, evidence.path(), base.path());
+    let mut options = options(root, plan, evidence.path(), base.path());
+    options.part = part;
     report::run(&options, &mut |_| {}).map(|document| Ran {
         document,
         #[cfg(unix)]
@@ -1365,4 +1371,51 @@ fn the_earlier_of_a_steps_timeout_and_its_budget_is_the_end_of_its_time() {
         steps[1].error.as_deref(),
         Some("not run because its budget was spent by step 1")
     );
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a budget is spent over the steps that name it
+/// in one run, so the steps of one budget run in one part. A plan cut into parts that puts them in
+/// more than one is refused before a step runs, whether they are cut by count or one is a build that
+/// opens the plan, which every part runs; the whole plan, and a plan whose budget's steps fall in
+/// one part, run.
+#[cfg(unix)]
+#[test]
+fn a_budget_whose_steps_fall_in_more_than_one_part_is_refused() {
+    let (_directory, root) = copy("time-limits");
+    let in_budget = |id: &str, reading: &str| {
+        timed_step(
+            id,
+            reading,
+            "'bash', 'scripts/sleep.sh', '0'",
+            "budget = 'shared'",
+        )
+    };
+    let plain = |id: &str| timed_step(id, "exit", "'bash', 'scripts/sleep.sh', '0'", "");
+    let budget = "[[budget]]\nid = 'shared'\nseconds = 60\n";
+    let words =
+        "the steps of budget `shared` fall in more than one part: a budget's steps run in one part";
+    let refused = |steps: &[String], part: (usize, usize)| match run_part(
+        &root,
+        &timed_plan(budget, steps),
+        Some(part),
+    ) {
+        Err(Stopped::Plan(problem)) => problem,
+        Err(other) => panic!("{other:?}"),
+        Ok(ran) => panic!("the run was not refused: {:?}", ran.document.steps),
+    };
+    let cut_by_count = [in_budget("first", "exit"), in_budget("second", "exit")];
+    assert_eq!(refused(&cut_by_count, (1, 2)), words);
+    assert_eq!(refused(&cut_by_count, (2, 2)), words);
+    let opening = [in_budget("build", "build"), plain("after")];
+    assert_eq!(refused(&opening, (1, 2)), words);
+    let in_one_part = [
+        plain("alone"),
+        in_budget("first", "exit"),
+        in_budget("second", "exit"),
+    ];
+    for (steps, part) in [(&cut_by_count[..], (1, 1)), (&in_one_part[..], (2, 2))] {
+        let ran = run_part(&root, &timed_plan(budget, steps), Some(part))
+            .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+        assert!(ran.document.passed(), "{:?}", ran.document.steps);
+    }
 }
