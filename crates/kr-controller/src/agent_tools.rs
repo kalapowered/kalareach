@@ -1095,15 +1095,14 @@ impl Installer {
         for operation in removal_order(&record.manifest.operations) {
             match operation {
                 ChangeOperation::WriteFile { path, digest, .. } => {
-                    let present = self.fs.read_digest(Path::new(path))?;
-                    match present {
-                        None => retained.push(format!("{path} is already gone")),
+                    match self.plan_file(Path::new(path), *digest)? {
+                        FilePlan::Gone => retained.push(format!("{path} is already gone")),
                         // Somebody edited it after this host wrote it. That edit is theirs, and a
                         // removal that deleted it would be deleting their work.
-                        Some(found) if found != *digest => {
+                        FilePlan::Changed => {
                             retained.push(format!("{path} has changed since it was installed"));
                         }
-                        Some(_) => match self.fs.remove_file(Path::new(path), *digest)? {
+                        FilePlan::Delete => match self.fs.remove_file(Path::new(path), *digest)? {
                             anchor::Taken::Removed => removed.push(operation.clone()),
                             anchor::Taken::Gone => retained.push(format!("{path} is already gone")),
                             anchor::Taken::Changed => {
@@ -1344,13 +1343,14 @@ impl Installer {
         if recorded.is_none() {
             self.layout(params)?;
         }
-        self.removable_from(recorded)
+        self.removable_from(params, recorded)
     }
 
     /// Refuses what a removal that works from `recorded` cannot do, and gives back what it would
     /// work from. Everything here reads, and the record is read before it, by the caller.
     fn removable_from(
         &self,
+        params: &AgentToolsParams,
         recorded: Option<InstallationRecord>,
     ) -> Result<Option<InstallationRecord>> {
         let Some(record) = recorded else {
@@ -1367,22 +1367,49 @@ impl Installer {
                 guard_access_controls(Path::new(path), CONFIGURATION_BY_HAND)?;
             }
         }
-        // The folder that holds each recorded name, where it is there, is one that only this user
-        // can change, and so is each file a removal deletes, a skill file or a document this host
-        // created, or nothing is removed. A document that another installation still holds is
-        // kept, and it is not checked here.
+        // What the removal will do to each recorded name is decided here, by the same reads it
+        // makes itself. The folder and the file of a name it deletes are judged as a removal;
+        // those of a document it rewrites, as a write, in the write's words; a name it keeps,
+        // because it is gone, is not what was written or is held by another installation, is not
+        // judged, since the removal does not touch it. A refusal here comes before the marker and
+        // leaves every file as it was.
         if let Fs::Walk(walk) = &self.fs {
             for operation in &record.manifest.operations {
-                walk.refuse_shared_folder(Path::new(operation.path()), anchor::Act::Remove)?;
-                if matches!(
-                    operation,
-                    ChangeOperation::WriteFile { .. }
-                        | ChangeOperation::AddConfigurationEntry {
-                            created_document: true,
-                            ..
+                let path = Path::new(operation.path());
+                match operation {
+                    ChangeOperation::WriteFile { digest, .. } => {
+                        if matches!(self.plan_file(path, *digest)?, FilePlan::Delete) {
+                            walk.refuse_shared_folder(path, anchor::Act::Remove)?;
+                            walk.refuse_shared_file(path, anchor::Act::Remove)?;
                         }
-                ) {
-                    walk.refuse_shared_file(Path::new(operation.path()), anchor::Act::Remove)?;
+                    }
+                    ChangeOperation::AddConfigurationEntry {
+                        entry,
+                        digest,
+                        created_document,
+                        ..
+                    } => {
+                        match self.plan_entry(
+                            path,
+                            entry_key(entry),
+                            *digest,
+                            *created_document,
+                            params,
+                        )? {
+                            EntryPlan::Keep(_) => {}
+                            EntryPlan::Delete { .. } => {
+                                walk.refuse_shared_folder(path, anchor::Act::Remove)?;
+                                walk.refuse_shared_file(path, anchor::Act::Remove)?;
+                            }
+                            EntryPlan::Edit { .. } => {
+                                walk.refuse_shared_folder(path, anchor::Act::Write)?;
+                                walk.refuse_shared_file(path, anchor::Act::Write)?;
+                            }
+                        }
+                    }
+                    ChangeOperation::CreateDirectory { .. } => {
+                        walk.refuse_shared_folder(path, anchor::Act::Remove)?;
+                    }
                 }
             }
         }
@@ -1736,6 +1763,16 @@ impl Installer {
         Ok(Some(digest_of(entry.to_string().as_bytes())))
     }
 
+    /// What a removal does to a file it recorded: the one decision `remove_on` acts on and
+    /// `removable_from` judges the file by.
+    fn plan_file(&self, path: &Path, digest: Digest256) -> Result<FilePlan> {
+        Ok(match self.fs.read_digest(path)? {
+            None => FilePlan::Gone,
+            Some(found) if found != digest => FilePlan::Changed,
+            Some(_) => FilePlan::Delete,
+        })
+    }
+
     /// Removes the server entry, when it is still the one that was written.
     fn remove_entry(
         &self,
@@ -1745,11 +1782,42 @@ impl Installer {
         created_document: bool,
         params: &AgentToolsParams,
     ) -> Result<Removal> {
+        Ok(
+            match self.plan_entry(path, key, digest, created_document, params)? {
+                EntryPlan::Keep(reason) => Removal::Kept(reason),
+                EntryPlan::Delete { checked } => match self.fs.remove_file(path, checked)? {
+                    anchor::Taken::Removed => Removal::Removed,
+                    anchor::Taken::Gone => Removal::Kept("it is already gone".to_owned()),
+                    anchor::Taken::Changed => {
+                        Removal::Kept("it has changed since it was installed".to_owned())
+                    }
+                    anchor::Taken::Kept { name, at } => {
+                        Removal::Told(anchor::kept_while_removing(path, &name, &at))
+                    }
+                },
+                EntryPlan::Edit { text, replaces } => {
+                    self.fs.write(path, text.as_bytes(), PRIVATE, replaces)?;
+                    Removal::Removed
+                }
+            },
+        )
+    }
+
+    /// What a removal does to the server entry it recorded, and with what: the one decision
+    /// `remove_entry` acts on and `removable_from` judges the document by.
+    fn plan_entry(
+        &self,
+        path: &Path,
+        key: &str,
+        digest: Digest256,
+        created_document: bool,
+        params: &AgentToolsParams,
+    ) -> Result<EntryPlan> {
         let Some(present) = self.entry_digest_under(path, key)? else {
-            return Ok(Removal::Kept("it is already gone".to_owned()));
+            return Ok(EntryPlan::Keep("it is already gone".to_owned()));
         };
         if present != digest {
-            return Ok(Removal::Kept(
+            return Ok(EntryPlan::Keep(
                 "it has changed since it was installed".to_owned(),
             ));
         }
@@ -1759,7 +1827,7 @@ impl Installer {
         // count cannot tell this record from somebody else's when its own file has already gone.
         let others = self.holders(path, key, &digest, Some(&self.record_path(params)))?;
         if !others.is_empty() {
-            return Ok(Removal::Kept(format!(
+            return Ok(EntryPlan::Keep(format!(
                 "{} other installation(s) on this host still use it; {} at {} scope was removed \
                  around it",
                 others.len(),
@@ -1767,7 +1835,7 @@ impl Installer {
                 params.scope
             )));
         }
-        if key == Format::CodexToml.key() {
+        Ok(if key == Format::CodexToml.key() {
             let read = self.fs.read_text(path)?;
             let replaces = text_digest(read.as_deref());
             let text = read.unwrap_or_default();
@@ -1785,8 +1853,10 @@ impl Installer {
             // nobody's business but the author's, and an empty-looking table is not evidence the
             // file holds nothing of theirs. The JSON branch below can delete one because it reads
             // the document exactly and can see that it holds nothing at all.
-            self.fs
-                .write(path, document.to_string().as_bytes(), PRIVATE, replaces)?;
+            EntryPlan::Edit {
+                text: document.to_string(),
+                replaces,
+            }
         } else {
             let read = self.fs.read_text(path)?;
             let replaces = text_digest(read.as_deref());
@@ -1809,22 +1879,15 @@ impl Installer {
                 // This host created the document and nothing else was ever added to it. It goes
                 // only while it is the file that was read.
                 let Some(checked) = replaces else {
-                    return Ok(Removal::Kept("it is already gone".to_owned()));
+                    return Ok(EntryPlan::Keep("it is already gone".to_owned()));
                 };
-                return Ok(match self.fs.remove_file(path, checked)? {
-                    anchor::Taken::Removed => Removal::Removed,
-                    anchor::Taken::Gone => Removal::Kept("it is already gone".to_owned()),
-                    anchor::Taken::Changed => {
-                        Removal::Kept("it has changed since it was installed".to_owned())
-                    }
-                    anchor::Taken::Kept { name, at } => {
-                        Removal::Told(anchor::kept_while_removing(path, &name, &at))
-                    }
-                });
+                return Ok(EntryPlan::Delete { checked });
             }
-            self.fs.write(path, edited.as_bytes(), PRIVATE, replaces)?;
-        }
-        Ok(Removal::Removed)
+            EntryPlan::Edit {
+                text: edited,
+                replaces,
+            }
+        })
     }
 
     fn entry_value(&self, format: Format, deadline: Option<&Deadline>) -> Value {
@@ -2436,7 +2499,7 @@ impl Installer {
                 this.layout(params).map_err(Declined::ByTheRequest)?;
             }
             return this
-                .removable_from(recorded)
+                .removable_from(params, recorded)
                 .map(|_| ())
                 .map_err(Declined::ByTheRequest);
         }
@@ -2739,6 +2802,32 @@ fn merge(operations: &mut Vec<ChangeOperation>, operation: ChangeOperation) {
         return;
     }
     operations.push(operation);
+}
+
+/// What a removal does to a file it recorded.
+enum FilePlan {
+    /// No file stands at the name.
+    Gone,
+    /// The file is not the one that was written: it is somebody's own now, and it stays.
+    Changed,
+    /// The file is the one that was written, and the removal takes it out of its place.
+    Delete,
+}
+
+/// What a removal does to a configuration entry it recorded, decided from the document as it
+/// stands.
+enum EntryPlan {
+    /// The entry and its document stay, for the stated reason.
+    Keep(String),
+    /// The document held nothing but the entry; the removal takes it out while it is the file with
+    /// the digest `checked`.
+    Delete { checked: Digest256 },
+    /// The removal rewrites the document as `text`, in place of the file with the digest
+    /// `replaces`, or of none.
+    Edit {
+        text: String,
+        replaces: Option<Digest256>,
+    },
 }
 
 /// What a removal did with one configuration entry.
@@ -4474,6 +4563,21 @@ mod tests {
             user["configuration"] = configuration;
         }
         serde_json::from_value(json!({ "word": "amp", "user": user })).expect("a target")
+    }
+
+    /// A skill target for the word `word` that keeps its skill in the folder `skills` and its
+    /// server entry in `configuration`.
+    #[cfg(unix)]
+    fn declared_as(
+        word: &str,
+        configuration: Value,
+        skills: &[&str],
+    ) -> kr_plugin_sdk::skill_target::SkillTarget {
+        serde_json::from_value(json!({
+            "word": word,
+            "user": { "skills": skills, "configuration": configuration }
+        }))
+        .expect("a target")
     }
 
     #[cfg(unix)]
@@ -6638,6 +6742,11 @@ mod tests {
     const FILE_WRITE_BIT_REMOVING: &str = "cannot be removed safely, because it lets its group or \
         every user change it, so nothing is removed there";
 
+    /// The words of a file refused for its write bit when a document was to be rewritten.
+    #[cfg(unix)]
+    const FILE_WRITE_BIT_WRITING: &str = "cannot be replaced safely, because it lets its group or \
+        every user change it, so nothing is written there";
+
     /// The words of a file refused for an allow entry when a removal was to take place.
     #[cfg(target_os = "macos")]
     const FILE_ENTRY_REMOVING: &str = "cannot be removed safely, because it has an allow entry for \
@@ -6792,6 +6901,137 @@ mod tests {
             recorded_files_gone(&tree),
             RECORDED_FILES.to_vec(),
             "and it takes the files away"
+        );
+    }
+
+    /// KR-REQ-11.01: a document that was there before the installation, and that a removal would
+    /// rewrite, is judged before the removal takes anything, as a write judges it and in the
+    /// words of a write: the skill files are not taken first and the entry left behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_that_was_there_before_and_became_changeable_is_refused_before_any_removal_in_the_words_of_a_write()
+     {
+        let tree = Tree::create();
+        let document = tree.home().join(".amp/mcp.json");
+        std::fs::create_dir_all(document.parent().expect("a folder")).expect("makes the folder");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        set_mode(&document, 0o666);
+        let refused = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a document every user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(".amp/mcp.json") && detail.contains(FILE_WRITE_BIT_WRITING)),
+            "{refused}"
+        );
+        assert_eq!(
+            recorded_files_gone(&tree),
+            Vec::<&str>::new(),
+            "nothing was removed before the refusal"
+        );
+        set_mode(&document, 0o644);
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the same removal goes ahead where the document is not shared: {removed:?}"
+        );
+        let text = std::fs::read_to_string(&document).expect("the document stays");
+        assert!(
+            text.contains("\"theme\""),
+            "the person's member stays: {text}"
+        );
+        assert!(!text.contains("kalareach"), "the entry is gone: {text}");
+        assert!(
+            !tree.home().join(SKILL_FILE).exists(),
+            "and the skill files are taken"
+        );
+    }
+
+    /// KR-REQ-11.01: a document whose entry another installation still holds is kept by a
+    /// removal, so it is not judged: the removal of the word that made it goes ahead, whatever the
+    /// document's permissions have become.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_another_installation_holds_is_kept_and_the_removal_goes_ahead_though_it_became_changeable()
+     {
+        let tree = Tree::create();
+        let first = amp_installed(&tree);
+        let second = tree.installer().with_declaration(
+            Some(declared_as(
+                "bmp",
+                json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+                &[".bmp", "skills"],
+            )),
+            Vec::new(),
+        );
+        let bmp = AgentTarget::parse("bmp").expect("a word");
+        second
+            .install(&params(bmp, InstallScope::User))
+            .expect("the second word installs into the same document");
+        let document = tree.home().join(".amp/mcp.json");
+        set_mode(&document, 0o666);
+        let removed = first.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around a document it keeps: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("still use it")),
+            "the removal says why it kept the entry: {:?}",
+            removed.retained
+        );
+        assert!(
+            std::fs::read_to_string(&document)
+                .expect("the document stays")
+                .contains("kalareach"),
+            "the other installation keeps its entry"
+        );
+        assert!(
+            !tree.home().join(SKILL_FILE).exists(),
+            "and its own skill files are taken"
+        );
+    }
+
+    /// KR-REQ-11.01: a skill file that was changed after the installation is kept by a removal,
+    /// so it is not judged: the removal goes ahead, whatever the file's permissions have become.
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_skill_file_that_became_changeable_is_kept_and_the_removal_goes_ahead() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        std::fs::write(&skill, "the person's own edit\n").expect("edits the file");
+        set_mode(&skill, 0o666);
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around a file it keeps: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed.retained.iter().any(|note| {
+                note.contains(SKILL_FILE) && note.contains("has changed since it was installed")
+            }),
+            "the removal says why it kept the file: {:?}",
+            removed.retained
+        );
+        assert_eq!(
+            std::fs::read(&skill).expect("the file stays"),
+            b"the person's own edit\n",
+            "the person's file is untouched"
+        );
+        assert!(
+            !tree
+                .home()
+                .join(".amp/skills/kalareach-contact/TOOLS.md")
+                .exists(),
+            "and the other files are taken"
         );
     }
 
