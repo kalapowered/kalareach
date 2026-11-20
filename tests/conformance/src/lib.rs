@@ -26,6 +26,7 @@ pub mod run;
 pub mod runner_copy;
 pub mod rust_items;
 pub mod rust_lex;
+pub mod scratch;
 pub mod typescript;
 pub mod vitest;
 pub mod workspace;

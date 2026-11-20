@@ -1936,7 +1936,7 @@ const LIST: &[Listed] = &[
         "tests/conformance/src/run.rs",
         &[
             (
-                "//! evidence directory, `KR_TEST_ARTIFACTS_DIR` naming that directory, so what a test records beside",
+                "//! output in a log of its own under the evidence directory, `KR_TEST_ARTIFACTS_DIR` naming that directory, so what a test records beside",
                 1,
             ),
             (r#".env("KR_TEST_ARTIFACTS_DIR", self.evidence)"#, 1),

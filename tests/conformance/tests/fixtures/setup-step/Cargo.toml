@@ -1,0 +1,10 @@
+# A tree the conformance report's own tests copy and run: tests that read the variables a step gives
+# them, and the scripts that set them up. It is a workspace of its own, so the repository's workspace
+# never builds it.
+[package]
+name = "setupstep"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
