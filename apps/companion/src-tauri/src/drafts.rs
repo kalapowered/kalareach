@@ -413,6 +413,11 @@ impl DraftDesk {
         self.flush_owed.store(true, Ordering::SeqCst);
     }
 
+    /// Notes that the flush a set-aside owed was made.
+    pub(crate) fn clear_owed_flush(&self) {
+        self.flush_owed.store(false, Ordering::SeqCst);
+    }
+
     /// Makes the flush a set-aside owes, if one is owed: the first step of every read of the drafts
     /// and every change of the ledger, so that nothing relies on a ledger whose name is not yet on
     /// disk.
