@@ -2135,6 +2135,158 @@ async fn a_snapshot_a_worker_answered_is_withheld_when_privacy_mode_starts_befor
     world.serving.abort();
 }
 
+/// A daemon whose session has two changes since a device's last visit, and a summary of them that
+/// a model wrote.
+async fn world_holding_a_summary_of_changes()
+-> crate::service::a_close_a_worker_never_answers::Silent {
+    use kr_attention::{EventCursor, EventKind, SourceEvent};
+    use kr_protocol::attention::AttentionSource;
+    use kr_protocol::scalars::TimestampMs;
+
+    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    let controller = &world.controller;
+    let events: Vec<SourceEvent> = [1_000_u64, 1_010]
+        .iter()
+        .zip(1_u64..)
+        .map(|(at_ms, sequence)| {
+            SourceEvent::new(
+                EventCursor::new(AttentionSource::Semantic, sequence),
+                TimestampMs::new(*at_ms),
+                EventKind::CommandCompleted {
+                    session_id: world.session_id,
+                    command: "cargo test".to_owned(),
+                    exit_code: 0,
+                },
+            )
+        })
+        .collect();
+    controller
+        .attention()
+        .observe(&events)
+        .expect("the changes are recorded");
+    let host = controller.descriptions().host().expect("a host").clone();
+    let profile = host.profile().expect("the host selected a profile");
+    controller
+        .descriptions()
+        .store()
+        .publish_summary(&kr_describe::summary::SummaryRecord {
+            session_id: world.session_id,
+            cursor: kr_describe::context::CursorInterval::new(0, 2),
+            from_ms: 1_000,
+            to_ms: 1_010,
+            text: kr_describe::metadata::SummaryText::new("Two commands ran").expect("a summary"),
+            profile_id: profile.profile_id().to_owned(),
+            profile_revision: profile.revision(),
+            generation: controller.privacy.state().now().generation,
+            produced_at_ms: 1,
+        })
+        .expect("the summary is kept");
+    world
+}
+
+/// A device whose grant's history reaches back to the first moment, so that it is served what a
+/// model wrote of the changes, and a connection of its own that keeps what it is written.
+fn summarising_connection(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    byte: u8,
+) -> (super::RemoteConnection, std::sync::Arc<Kept>) {
+    let viewer = paired(controller, byte, |grant| {
+        grant.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+    });
+    let kept = Kept::watching(controller.privacy.state().clone());
+    let connection = super::RemoteConnection::for_test_writing_to(
+        controller,
+        viewer,
+        Box::new(std::sync::Arc::clone(&kept)),
+    );
+    (connection, kept)
+}
+
+fn changed_request_of(session_id: SessionId, request_id: u64) -> kr_protocol::envelope::Request {
+    device_request(
+        request_id,
+        Method::VisitChanged,
+        &kr_protocol::attention::VisitChangedParams {
+            session_id,
+            max_changes: kr_protocol::scalars::U64::new(50),
+            summarise: true,
+        },
+    )
+}
+
+/// KR-REQ-24.28: the summary of what changed in a session, which a model wrote, goes to a device
+/// whole when no change of privacy mode falls between the read and the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_summary_of_changes_is_written_whole_under_the_privacy_state_it_was_read_in() {
+    use kr_protocol::attention::VisitChangedResult;
+    use kr_protocol::envelope::ControlFrame;
+
+    let world = world_holding_a_summary_of_changes().await;
+    let controller = &world.controller;
+    let (connection, kept) = summarising_connection(controller, 67);
+
+    let answer = connection
+        .answer_now(ControlFrame::Request(changed_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let stands = connection.write_answer(connection.output(), answer).await;
+    assert!(stands, "the connection stands");
+    let written: VisitChangedResult = answered(kept.frames()[0].clone());
+    assert_eq!(
+        written.summary.0.map(|summary| summary.text),
+        Some("Two commands ran".to_owned()),
+        "the answer carries the summary"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: a summary of changes that was read while privacy mode was off is not published
+/// after privacy mode has started, and the device is told the same answer without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_summary_of_changes_is_withheld_when_privacy_mode_starts_before_it_is_sent() {
+    use kr_protocol::attention::VisitChangedResult;
+    use kr_protocol::envelope::ControlFrame;
+
+    let world = world_holding_a_summary_of_changes().await;
+    let controller = &world.controller;
+    let (connection, kept) = summarising_connection(controller, 68);
+
+    // Read while privacy mode is off, then held at the writer while the mode starts.
+    let answer = connection
+        .answer_now(ControlFrame::Request(changed_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let turn = connection.output.hold_the_turn().await;
+    let (stands, ()) = tokio::join!(
+        connection.write_answer(connection.output(), answer),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while connection.output.writes_queued() < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the answer is waiting for the writer");
+            privacy_mode_is_turned_on(controller).await;
+            drop(turn);
+        }
+    );
+    assert!(stands, "the connection stands");
+    let withheld: VisitChangedResult = answered(kept.frames()[0].clone());
+    assert!(
+        withheld.summary.0.is_none(),
+        "what a model wrote is not published once privacy mode has started: {withheld:?}"
+    );
+    assert_eq!(withheld.changes.len(), 2, "the changes themselves are told");
+    world.serving.abort();
+}
+
 /// A page a worker answers after the daemon published privacy mode and before the worker was told,
 /// which still holds the output that privacy mode removes, is withheld.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
