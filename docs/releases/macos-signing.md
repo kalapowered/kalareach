@@ -3,8 +3,9 @@
 A host release for macOS and Linux is made in four steps. Two of them use a key: the machine that signs
 reads the Developer ID and the notary key from files, and one job reads the update channel's two
 release keys as secrets of one deployment environment. [The key table](keys.md) names every place
-that holds each key. The notary key's file is read by `scripts/store-ios.sh` too, for the iOS export
-([the store bundles](mobile-stores.md)). This page
+that holds each key. `scripts/store-ios.sh` reads the notary key's file too, for the iOS export
+([the store bundles](mobile-stores.md)), from the directory that
+[the files that sign](#the-files-that-sign) names for that script. This page
 says what each step does, what it checks before it goes on, what to do when it stops, and how a key
 is replaced.
 
@@ -90,8 +91,9 @@ blocked, and the store held no flagged file.
 
 ## The files that sign
 
-They are under `~/.config/kalareach-secrets/apple` (`KR_APPLE_DIR` names another directory), mode
-0600, and the script refuses to run when one is missing or has another mode:
+They are under `~/.config/kalareach-secrets/apple` (`KR_APPLE_DIR` names another directory for
+`scripts/sign-macos-release.sh`; `scripts/store-ios.sh` reads `asc-api-key.json` under
+`KR_SECRETS_DIR` whatever it names), mode 0600, and the script refuses to run when one is missing or has another mode:
 
 | File | What it is |
 | --- | --- |
@@ -122,7 +124,7 @@ made itself when one of its later steps fails, and the publish job removes it af
 The script works in a new folder for each run, `<work>`: `$KR_RELEASE_WORK/<stamp>` when `KR_RELEASE_WORK`
 is set, and `~/Library/Caches/kalareach-release/<stamp>` when it is not, where `<stamp>` is the time the run
 started as `YYYYMMDD-HHMMSS`. It keeps the folder. A run that stages prints no path to it, so the newest
-folder is the last run's; `--no-stage` prints the path, and so does a submission the service did not accept.
+folder is the last run's; `--no-stage` prints the path, and so does a submission whose status is not `Accepted`.
 For each tree, `<top>` is `kalareach-<target>-<release>`: the notary log is `<work>/<top>.notary-log.json`,
 and the tree taken from the run's artefact is `<work>/<target>/<top>`, so the log is not beside the tree.
 
@@ -221,8 +223,11 @@ a job and no safety. The sealed archives are kept for one day after the sealing,
 A second refusal is investigated, not re-run, and so is any other refusal of a notarised tree. Work through
 these in order and stop at the first that applies:
 
-1. Compare the digests in `source`'s summary with what the signing script printed. If they differ, the
-   sealed trees are not the ones that were signed. Do not re-run: sign again and dispatch again.
+1. Compare the staged sums in `source`'s summary, and the digest of that file, with what the signing
+   script printed. Leave out the digests of the trees to be sealed that are listed above them: they
+   are of tars that `source` wrote, which the signing script never saw. If the sums or their digest
+   differ, the sealed trees are not the ones that were signed. Do not re-run: sign again and dispatch
+   again.
 2. Read the submission's status and log with `xcrun notarytool info <submission id>` and
    `xcrun notarytool log <submission id>` (the notary key options as for `wait`). The submission
    identifiers are in `source`'s summary, under the notary submissions. A status other than `Accepted`
@@ -253,7 +258,8 @@ same. A lost key is a new certificate and no revocation, since permissions name 
 is a new build signed with a new certificate, taken by hosts through the update channel first, and
 then a revocation, because Apple stops new installs and stops installed copies from launching once a
 certificate is revoked. The notary key is replaced in App Store Connect, and the new key serves
-`scripts/store-ios.sh` and the upload of an iOS build too ([the store bundles](mobile-stores.md)).
+`scripts/store-ios.sh` and the upload of an iOS build too ([the store bundles](mobile-stores.md)),
+once its files are under `KR_SECRETS_DIR/apple`, where that script reads them.
 
 The update channel's root is `release/tester-channel/root.json`. It names two release keys, both of
 which have to sign (two of two), and it expires in 2099. A key is replaced only with a successor root
