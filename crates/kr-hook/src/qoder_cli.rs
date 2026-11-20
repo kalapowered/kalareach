@@ -14,14 +14,16 @@
 //! and changes nothing else.
 //!
 //! [`HOOKS`] also reports `Stop`, which Qoder CLI runs when the main agent has finished responding
-//! with no tool call pending. Its reference does not say whether `Stop` runs when the person
-//! interrupts. No released package registers `Stop` yet. On `Stop` exit code 2 makes the agent go
-//! on, and the forwarder never exits 2: a valid run answers `{}` and exits 0, after an operational
-//! error or a timeout too, a command line it refuses exits 64 and a forwarder that cannot hold its
-//! release exits 1. Another hook of the person's may still block the end, so a thread can end a
-//! turn more than once, each end being a later version of the same review. An older forwarder
-//! reports nothing for `Stop`, and an older worker refuses the frame, and the hook answers `{}`
-//! either way.
+//! with no tool call pending; the hooks reference at docs.qoder.com/cli/hooks says so under `Stop`,
+//! read 2026-11-20, and its `Stop` input (the common fields, `stop_hook_active` and
+//! `last_assistant_message`) is the payload the forwarder reads, `session_id` and `hook_event_name`
+//! among them. That reference does not say whether `Stop` runs when the person interrupts. No
+//! released package registers `Stop` yet. On `Stop` exit code 2 makes the agent go on, and the
+//! forwarder never exits 2: a valid run answers `{}` and exits 0, after an operational error or a
+//! timeout too, and a command line it refuses exits 64, or 1 when it also cannot hold its release.
+//! Another hook of the person's may still block the end, so a thread can end a turn more than once,
+//! each end being a later version of the same review. An older forwarder reports nothing for
+//! `Stop`, and an older worker refuses the frame, and the hook answers `{}` either way.
 
 use crate::hook::{Application, Report};
 

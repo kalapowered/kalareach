@@ -492,8 +492,8 @@ pub fn read_input(input: impl std::io::Read) -> Result<HookInput, String> {
 ///
 /// A session starting or ending selects or ends the thread, and a start the application marks as
 /// a continuation goes on in it; a tool finishing or failing, a notification and the end of a
-/// turn are recorded as observed history. A finished call of the contact skill's `ask_user` also names the request it
-/// asked, so the worker learns which thread the question was asked in.
+/// turn are recorded as observed history. A finished call of the contact skill's `ask_user` also
+/// names the request it asked, so the worker learns which thread the question was asked in.
 #[must_use]
 pub fn observation(application: &Application, input: &HookInput) -> Option<serde_json::Value> {
     let report = application.report(&input.hook_event_name)?;
