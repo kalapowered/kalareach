@@ -505,10 +505,33 @@ impl RemoteConnection {
                     self.started_at_ms(&decided.acting),
                 );
                 let reach = self.controller.attention_reach();
-                self.controller
-                    .attention()
-                    .read_frame(reach.as_ref(), &caller, &actor_id, request)
+                // The summary of what changed is text a model wrote, so that read is released
+                // only under the privacy state it was read under, which is taken before it is
+                // read.
+                let read_under = if entry.method == Method::VisitChanged {
+                    match super::output::ReadUnder::now(&self.controller).await {
+                        Ok(read_under) => Some(read_under),
+                        Err(error) => return failure(request.request_id, error),
+                    }
+                } else {
+                    None
+                };
+                let attention = self.controller.attention();
+                match attention
+                    .read_texts(reach.as_ref(), &caller, &actor_id, request)
                     .await
+                {
+                    Ok(read) => {
+                        if let Some(read_under) = read_under {
+                            hold_text(asked, read_under, read.withheld().cloned());
+                        }
+                        ControlFrame::Response(Response {
+                            request_id: request.request_id,
+                            outcome: Outcome::Ok(attention.settled(read).await),
+                        })
+                    }
+                    Err(error) => failure(request.request_id, error),
+                }
             }
             DeviceRead::Pairing => {
                 let caller = super::super::owner::Caller::device(self.device.clone())
@@ -582,11 +605,7 @@ impl RemoteConnection {
                     // under holds: decided now, and again where the frame is written, where the
                     // answer without it goes in its place.
                     Ok(read) => {
-                        let withheld = read.withheld().cloned();
-                        if let (Some(asked), Some(withheld)) = (asked.as_mut(), withheld) {
-                            asked.read_under = Some(read_under);
-                            asked.withheld = Some(withheld);
-                        }
+                        hold_text(asked, read_under, read.withheld().cloned());
                         ControlFrame::Response(Response {
                             request_id: request.request_id,
                             outcome: Outcome::Ok(self.controller.attention().settled(read).await),
@@ -2063,6 +2082,21 @@ fn settled_by_a_service<Ended>(
 }
 
 /// The frame a service's answer goes out as.
+/// Holds an answer to the privacy state it was read under, when it carries text a model wrote:
+/// `withheld` is the same answer without that text, which is written in its place once the state
+/// has moved ([`RemoteConnection::write_answer`]). An answer that carries no such text is held to
+/// nothing.
+fn hold_text(
+    asked: &mut Option<Asked>,
+    read_under: super::output::ReadUnder,
+    withheld: Option<ParamsValue>,
+) {
+    if let (Some(asked), Some(withheld)) = (asked.as_mut(), withheld) {
+        asked.read_under = Some(read_under);
+        asked.withheld = Some(withheld);
+    }
+}
+
 fn framed(request_id: RequestId, answer: Result<ParamsValue>) -> ControlFrame {
     framed_protocol(
         request_id,

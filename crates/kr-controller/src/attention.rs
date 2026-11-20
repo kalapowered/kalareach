@@ -1458,7 +1458,7 @@ impl AttentionModule {
 
     /// Serves one read of this group, with the session text it carries and what releasing it
     /// takes.
-    async fn read_texts(
+    pub(crate) async fn read_texts(
         &self,
         reach: &dyn Reach,
         caller: &Caller,
