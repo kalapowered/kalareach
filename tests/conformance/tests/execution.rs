@@ -1084,6 +1084,17 @@ fn a_listing_that_does_not_end_is_ended_at_the_steps_limit_with_the_process_it_s
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 1);
     assert_ended_at_its_limit(&ran, 8, &started);
+    // What the listing wrote before its time was spent is in the log, before the line that says so.
+    let log = std::fs::read_to_string(ran.evidence.path().join(&ran.document.steps[0].log))
+        .expect("the log");
+    let kept = log.find("== the listing failed: ").expect(&log);
+    let said = log.find("== ran out of its time limit: 8 s").expect(&log);
+    assert!(kept < said, "{log}");
+    assert!(
+        log[kept..said].contains("(ended at the time limit)"),
+        "{log}"
+    );
+    assert!(log[kept..said].contains("Compiling timelimits"), "{log}");
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: a step with a limit that ends in time is

@@ -721,7 +721,7 @@ fn host(place: &Place<'_>) -> Result<String, Stop> {
     .map_err(|error| format!("rustc could not be asked for the host: {error}"))?
     {
         Waited::Done(output) => output,
-        Waited::TimedOut => return Err(Stop::TimedOut),
+        Waited::TimedOut(_) => return Err(Stop::TimedOut),
     };
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -778,7 +778,17 @@ fn list(
     .map_err(|error| format!("the step's tests could not be listed: {error}"))?
     {
         Waited::Done(output) => output,
-        Waited::TimedOut => return Err(Stop::TimedOut),
+        Waited::TimedOut(captured) => {
+            // What the listing wrote before its time was spent is kept in the log, where the next
+            // failure of the same kind is read.
+            let _ = keep_failed_listing(
+                log_path,
+                &format!("`{}` (ended at the time limit)", command.join(" ")),
+                &String::from_utf8_lossy(&captured.stdout),
+                &String::from_utf8_lossy(&captured.stderr),
+            );
+            return Err(Stop::TimedOut);
+        }
     };
     let standard_error = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -1226,7 +1236,7 @@ fn build_first(
     .map_err(|error| format!("{} could not be started: {error}", command[0]))?
     {
         Waited::Done(output) => output,
-        Waited::TimedOut => return Err(Stop::TimedOut),
+        Waited::TimedOut(_) => return Err(Stop::TimedOut),
     };
     if !output.status.success() {
         return Err(Stop::Failed(format!(
@@ -1666,7 +1676,7 @@ fn run_logged(
         .map_err(|error| format!("{} could not be started: {error}", command[0]))?
     {
         Waited::Done(status) => Ok(status.code()),
-        Waited::TimedOut => Err(Stop::TimedOut),
+        Waited::TimedOut(_) => Err(Stop::TimedOut),
     }
 }
 

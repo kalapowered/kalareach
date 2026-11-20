@@ -316,9 +316,10 @@ fn scratch_removal(tokens: &[Token]) -> Option<usize> {
 
 /// The runs of words, each written once in the block of `impl Group` in `tree.rs`, that start a
 /// step's command as the leader of a process group of its own and signal that group and no other
-/// process: the group's leader is the pid of the child the report started, and the signal is
-/// `TERM`, then `KILL`. The `0` of the first run is the number `0` as it is written: the lexer keeps
-/// a number's spelling.
+/// process: the group is the one the child the report started leads, a `Child` that only a start
+/// of a command gives, and the signal is `TERM`, then `KILL`. The calls are written as rustfmt
+/// writes them, with the comma that ends a wrapped call. The `0` of the first run is the number `0`
+/// as it is written: the lexer keeps a number's spelling.
 const GROUP_CALLS: [&[&str]; 3] = [
     &[
         "std",
@@ -352,9 +353,19 @@ const GROUP_CALLS: [&[&str]; 3] = [
         ":",
         "kill_process_group",
         "(",
-        "self",
-        ".",
-        "leader",
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Pid",
+        ":",
+        ":",
+        "from_child",
+        "(",
+        "child",
+        ")",
         ",",
         "rustix",
         ":",
@@ -366,6 +377,7 @@ const GROUP_CALLS: [&[&str]; 3] = [
         ":",
         ":",
         "TERM",
+        ",",
         ")",
     ],
     &[
@@ -377,9 +389,19 @@ const GROUP_CALLS: [&[&str]; 3] = [
         ":",
         "kill_process_group",
         "(",
-        "self",
-        ".",
-        "leader",
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Pid",
+        ":",
+        ":",
+        "from_child",
+        "(",
+        "child",
+        ")",
         ",",
         "rustix",
         ":",
@@ -391,6 +413,7 @@ const GROUP_CALLS: [&[&str]; 3] = [
         ":",
         ":",
         "KILL",
+        ",",
         ")",
     ],
 ];
@@ -565,8 +588,12 @@ fn the_check_lets_through_the_groups_own_calls_and_no_other() {
         )
     };
     let start = "std::os::unix::process::CommandExt::process_group(command, 0);";
-    let term =
-        "let _ = rustix::process::kill_process_group(self.leader, rustix::process::Signal::TERM);";
+    let of_child = "rustix::process::Pid::from_child(child)";
+    // The call as rustfmt writes it: it does not fit a line, and a wrapped call ends in a comma.
+    let term = format!(
+        "let _ = rustix::process::kill_process_group(\n    {of_child},\n    rustix::process::Signal::TERM,\n);"
+    );
+    let term = term.as_str();
     let kill = term.replace("TERM", "KILL");
     let allowed = |path: &str, source: &str| {
         refused(Path::new(path), source)
@@ -615,12 +642,32 @@ fn the_check_lets_through_the_groups_own_calls_and_no_other() {
         (
             "another operand, a pid",
             "tree.rs",
-            group_with(&term.replace("self.leader", "pid")),
+            group_with(&term.replace(of_child, "pid")),
         ),
         (
             "another operand, a field",
             "tree.rs",
-            group_with(&term.replace("self.leader", "self.other")),
+            group_with(&term.replace(of_child, "self.other")),
+        ),
+        (
+            "another child",
+            "tree.rs",
+            group_with(&term.replace(of_child, "rustix::process::Pid::from_child(other)")),
+        ),
+        (
+            "the system's first process",
+            "tree.rs",
+            group_with(&term.replace(of_child, "rustix::process::Pid::INIT")),
+        ),
+        (
+            "the report's own process",
+            "tree.rs",
+            group_with(&term.replace(of_child, "rustix::process::getpid()")),
+        ),
+        (
+            "a pid made from a number",
+            "tree.rs",
+            group_with(&term.replace(of_child, "rustix::process::Pid::from_raw(1)")),
         ),
         (
             "another signal",
@@ -642,7 +689,7 @@ fn the_check_lets_through_the_groups_own_calls_and_no_other() {
         (
             "libc's call",
             "tree.rs",
-            group_with("let _ = libc::killpg(self.leader, 15);"),
+            group_with("let _ = libc::killpg(child, 15);"),
         ),
         (
             "an import of the signal type",
