@@ -44,6 +44,8 @@ mod condition;
 mod history;
 #[path = "retained_surface/history_cases.rs"]
 mod history_cases;
+#[path = "retained_surface/inventory.rs"]
+mod inventory;
 #[path = "retained_surface/inventory_cases.rs"]
 mod inventory_cases;
 #[path = "retained_surface/narrower.rs"]

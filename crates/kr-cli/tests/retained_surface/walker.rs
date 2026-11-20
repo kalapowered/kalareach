@@ -31,21 +31,76 @@ use std::rc::Rc;
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens as _;
-use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
 use super::condition::Condition;
+use super::inventory::{self, Inventory};
 
 /// A source tree: the repository, or a checkout of a release.
 pub struct Tree {
     root: PathBuf,
     /// The crates of the workspace, by the name their code uses (`kr_protocol`).
     crates: BTreeMap<String, PathBuf>,
+    /// What each crate's manifest says about its targets, by crate name.
+    manifests: BTreeMap<String, Manifest>,
     /// The manifests that exist and cannot be read as a package: a crate that no manifest names
     /// is then unknown and not absent.
     unreadable: Vec<String>,
     indexes: RefCell<BTreeMap<String, Rc<CrateIndex>>>,
     scans: RefCell<BTreeMap<String, Rc<CrateScan>>>,
+    inventories: RefCell<BTreeMap<String, Rc<Inventory>>>,
+}
+
+/// What a crate's manifest says that the inventory needs.
+struct Manifest {
+    /// The folder of the crate.
+    directory: PathBuf,
+    /// The manifest, as a path under the tree.
+    shown: String,
+    /// The paths of the library and the binaries, where the manifest names them.
+    targets: Vec<String>,
+    /// Whether the library is a procedural-macro crate.
+    proc_macro: bool,
+}
+
+/// The package name of a manifest, with `-` as `_`, and what it says of the crate's targets;
+/// `None` where it cannot be read as a package.
+fn read_manifest(path: &Path) -> Option<(String, Vec<String>, bool)> {
+    let table = std::fs::read_to_string(path)
+        .ok()?
+        .parse::<toml::Table>()
+        .ok()?;
+    let name = table
+        .get("package")?
+        .get("name")?
+        .as_str()?
+        .replace('-', "_");
+    let library = table.get("lib");
+    let mut targets: Vec<String> = library
+        .and_then(|library| library.get("path"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
+    for binary in table
+        .get("bin")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(path) = binary.get("path").and_then(toml::Value::as_str) {
+            targets.push(path.to_owned());
+        }
+    }
+    let proc_macro = library
+        .and_then(|library| {
+            library
+                .get("proc-macro")
+                .or_else(|| library.get("proc_macro"))
+        })
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    Some((name, targets, proc_macro))
 }
 
 /// Why a root cannot be followed.
@@ -168,6 +223,7 @@ impl Tree {
         let root =
             &std::fs::canonicalize(root).map_err(|error| format!("{}: {error}", root.display()))?;
         let mut crates = BTreeMap::new();
+        let mut described = BTreeMap::new();
         let mut unreadable = Vec::new();
         let directory = root.join("crates");
         let mut manifests: Vec<PathBuf> = Vec::new();
@@ -208,14 +264,22 @@ impl Tree {
                     continue;
                 }
             }
-            let package = std::fs::read_to_string(&manifest).ok().and_then(|text| {
-                text.lines()
-                    .skip_while(|line| line.trim() != "[package]")
-                    .find_map(|line| line.trim().strip_prefix("name = "))
-                    .map(|name| name.trim_matches('"').replace('-', "_"))
-            });
-            match package {
-                Some(name) => {
+            match read_manifest(&manifest) {
+                Some((name, targets, proc_macro)) => {
+                    let shown = manifest
+                        .strip_prefix(root)
+                        .unwrap_or(&manifest)
+                        .display()
+                        .to_string();
+                    described.insert(
+                        name.clone(),
+                        Manifest {
+                            directory: directory.clone(),
+                            shown,
+                            targets,
+                            proc_macro,
+                        },
+                    );
                     crates.insert(name, directory.join("src"));
                 }
                 None => unreadable.push(manifest.display().to_string()),
@@ -224,10 +288,41 @@ impl Tree {
         Ok(Self {
             root: root.to_owned(),
             crates,
+            manifests: described,
             unreadable,
             indexes: RefCell::new(BTreeMap::new()),
             scans: RefCell::new(BTreeMap::new()),
+            inventories: RefCell::new(BTreeMap::new()),
         })
+    }
+
+    /// The files product code of `krate` is made of: read once, for the index and the scan.
+    fn inventory(&self, krate: &str) -> Result<Rc<Inventory>, String> {
+        if let Some(found) = self.inventories.borrow().get(krate) {
+            return Ok(Rc::clone(found));
+        }
+        let source = self
+            .crates
+            .get(krate)
+            .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
+        let manifest = &self.manifests[krate];
+        let found = inventory::read(
+            krate,
+            &manifest.directory,
+            source,
+            &self.root,
+            &manifest.targets,
+        )?;
+        if let Some((at, name)) = found.unaccepted.first() {
+            return Err(format!(
+                "{at}: {name}! is called at item position, is not defined in {krate} and is not one the scan accepts"
+            ));
+        }
+        let found = Rc::new(found);
+        self.inventories
+            .borrow_mut()
+            .insert(krate.to_owned(), Rc::clone(&found));
+        Ok(found)
     }
 
     fn index(&self, krate: &str) -> Result<Rc<CrateIndex>, String> {
@@ -238,7 +333,14 @@ impl Tree {
             .crates
             .get(krate)
             .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-        let index = Rc::new(CrateIndex::read(krate, source, &self.root, &self.crates)?);
+        let inventory = self.inventory(krate)?;
+        let index = Rc::new(CrateIndex::read(
+            krate,
+            &inventory,
+            source,
+            &self.root,
+            &self.crates,
+        )?);
         self.indexes
             .borrow_mut()
             .insert(krate.to_owned(), Rc::clone(&index));
@@ -545,6 +647,7 @@ impl CrateIndex {
 
     fn read(
         name: &str,
+        inventory: &Inventory,
         source: &Path,
         root: &Path,
         crates: &BTreeMap<String, PathBuf>,
@@ -561,11 +664,8 @@ impl CrateIndex {
             files_of_module: BTreeMap::new(),
             imports: BTreeMap::new(),
         };
-        let mut files = Vec::new();
-        collect_files(source, &mut files)?;
-        files.sort();
         let workspace: BTreeSet<String> = crates.keys().cloned().collect();
-        for path in files {
+        for path in &inventory.files {
             let text = std::fs::read_to_string(&path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             let file =
@@ -814,20 +914,6 @@ fn module_of(source: &Path, file: &Path) -> String {
     }
 }
 
-fn collect_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    for entry in
-        std::fs::read_dir(directory).map_err(|error| format!("{}: {error}", directory.display()))?
-    {
-        let path = entry.map_err(|error| error.to_string())?.path();
-        if path.is_dir() {
-            collect_files(&path, files)?;
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            files.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// The attributes of an item, whatever its kind.
 fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     match item {
@@ -848,19 +934,6 @@ fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
         syn::Item::Use(item) => &item.attrs,
         _ => &[],
     }
-}
-
-/// Whether the attributes are exactly `#[cfg(test)]`; `cfg(any(test, ...))` is no test-only item.
-fn attrs_are_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attribute| {
-        attribute.path().is_ident("cfg")
-            && attribute
-                .meta
-                .to_token_stream()
-                .to_string()
-                .replace(' ', "")
-                == "cfg(test)"
-    })
 }
 
 fn type_name(ty: &syn::Type) -> String {
@@ -1407,6 +1480,12 @@ impl Tree {
         }
         let mut all = Vec::new();
         for krate in self.crates.keys().filter(|krate| include(krate)) {
+            if self.manifests[krate].proc_macro {
+                return Err(format!(
+                    "{}: a procedural-macro crate; the scan does not read what it generates",
+                    self.manifests[krate].shown
+                ));
+            }
             all.extend(self.scan(krate)?.sightings.iter().cloned());
         }
         Ok(all)
@@ -1420,7 +1499,12 @@ impl Tree {
             .crates
             .get(krate)
             .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-        let scan = Rc::new(scan_crate(krate, source, &self.root)?);
+        let scan = Rc::new(scan_crate(
+            krate,
+            source,
+            &self.root,
+            &*self.inventory(krate)?,
+        )?);
         self.scans
             .borrow_mut()
             .insert(krate.to_owned(), Rc::clone(&scan));
@@ -1434,107 +1518,6 @@ fn mentions_a_sighting(text: &str) -> bool {
         .iter()
         .any(|word| text.contains(word))
         || WIRE_NAMES.iter().any(|name| text.contains(name))
-}
-
-/// Whether the text may declare a module file: a file that does holds the letters `mod`, however
-/// the module is named and whatever stands between the keyword and the name.
-fn may_declare_modules(text: &str) -> bool {
-    text.contains("mod")
-}
-
-/// The files of a crate that only a `#[cfg(test)]` module declaration reaches, as rustc finds
-/// module files: from the crate's roots through the declarations of each file, a declaration under
-/// `#[cfg(test)]` giving the status to what it reaches. A file that a declaration outside
-/// `#[cfg(test)]` also reaches is product code.
-fn test_only_files(files: &[PathBuf], source: &Path) -> Result<BTreeSet<PathBuf>, String> {
-    let present: BTreeSet<&PathBuf> = files.iter().collect();
-    let binaries = source.join("bin");
-    let roots = || -> Vec<(PathBuf, bool)> {
-        files
-            .iter()
-            .filter(|path| {
-                let directory = path.parent();
-                let name = path.file_name().and_then(|name| name.to_str());
-                (directory == Some(source) && matches!(name, Some("lib.rs" | "main.rs")))
-                    || directory == Some(binaries.as_path())
-                    || (name == Some("main.rs")
-                        && directory.and_then(Path::parent) == Some(binaries.as_path()))
-            })
-            .map(|path| (path.clone(), true))
-            .collect()
-    };
-    let mut declarations = BTreeMap::new();
-    let every = reached(&present, roots(), true, &mut declarations)?;
-    let product = reached(&present, roots(), false, &mut declarations)?;
-    Ok(every.difference(&product).cloned().collect())
-}
-
-/// One module declaration of a file: the files its module may be at, whether it is declared
-/// test-only (by its own attribute or by a module around it), and whether a `#[path]` names it.
-struct Declared {
-    candidates: Vec<PathBuf>,
-    test: bool,
-    explicit: bool,
-}
-
-/// The files reachable from `roots` (each with whether it is a `mod.rs`-like file, whose modules
-/// sit beside it), through the module declarations of every file; those under `#[cfg(test)]` only
-/// when `with_tests`. A file is visited once for each place its modules are looked up in; each such
-/// visit reads and parses the file once for both walks, and `declarations` keeps the result.
-fn reached(
-    present: &BTreeSet<&PathBuf>,
-    roots: Vec<(PathBuf, bool)>,
-    with_tests: bool,
-    declarations: &mut BTreeMap<(PathBuf, bool), Vec<Declared>>,
-) -> Result<BTreeSet<PathBuf>, String> {
-    let mut seen: BTreeSet<(PathBuf, bool)> = BTreeSet::new();
-    let mut todo = roots;
-    while let Some(visit) = todo.pop() {
-        if !seen.insert(visit.clone()) {
-            continue;
-        }
-        if !declarations.contains_key(&visit) {
-            let found = declarations_of(&visit.0, visit.1)?;
-            declarations.insert(visit.clone(), found);
-        }
-        for declared in &declarations[&visit] {
-            if declared.test && !with_tests {
-                continue;
-            }
-            for candidate in &declared.candidates {
-                if present.contains(candidate) {
-                    // A file that a `#[path]` loads holds its modules beside it, as `mod.rs` does.
-                    let beside = declared.explicit
-                        || candidate.file_name().is_some_and(|name| name == "mod.rs");
-                    todo.push((candidate.clone(), beside));
-                }
-            }
-        }
-    }
-    Ok(seen.into_iter().map(|(path, _)| path).collect())
-}
-
-/// The module declarations of the file at `path`; `mod_rs` is whether its modules sit beside it.
-fn declarations_of(path: &Path, mod_rs: bool) -> Result<Vec<Declared>, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    if !may_declare_modules(&text) {
-        return Ok(Vec::new());
-    }
-    let file = syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-    let directory = path.parent().unwrap_or(Path::new(""));
-    let stem = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_default();
-    let modules = if mod_rs {
-        directory.to_owned()
-    } else {
-        directory.join(stem)
-    };
-    let mut declared = Vec::new();
-    declared_modules(&file.items, directory, &modules, false, &mut declared);
-    Ok(declared)
 }
 
 /// `path` with its `.` components left out and each `..` taken with the normal component before
@@ -1557,63 +1540,6 @@ pub(super) fn normalised(path: &Path) -> PathBuf {
         }
     }
     parts.iter().collect()
-}
-
-/// The module declarations `items` hold. `path_base` is what a `#[path]` is relative to, `modules`
-/// what a module's file is looked up under; an inline module with a `#[path]` moves both to that
-/// path, taken from `path_base`, as rustc does.
-fn declared_modules(
-    items: &[syn::Item],
-    path_base: &Path,
-    modules: &Path,
-    under_test: bool,
-    out: &mut Vec<Declared>,
-) {
-    for item in items {
-        let syn::Item::Mod(module) = item else {
-            continue;
-        };
-        let test = under_test || attrs_are_cfg_test(&module.attrs);
-        let name = module.ident.unraw().to_string();
-        let explicit = module.attrs.iter().find_map(|attribute| {
-            if !attribute.path().is_ident("path") {
-                return None;
-            }
-            match &attribute.meta {
-                syn::Meta::NameValue(pair) => match &pair.value {
-                    syn::Expr::Lit(literal) => match &literal.lit {
-                        syn::Lit::Str(text) => Some(text.value()),
-                        _ => None,
-                    },
-                    _ => None,
-                },
-                _ => None,
-            }
-        });
-        if let Some((_, inner)) = &module.content {
-            let inside = match &explicit {
-                Some(directory) => normalised(&path_base.join(directory)),
-                None => modules.join(&name),
-            };
-            declared_modules(inner, &inside, &inside, test, out);
-            continue;
-        }
-        match explicit {
-            Some(explicit) => out.push(Declared {
-                candidates: vec![normalised(&path_base.join(explicit))],
-                test,
-                explicit: true,
-            }),
-            None => out.push(Declared {
-                candidates: vec![
-                    modules.join(format!("{name}.rs")),
-                    modules.join(&name).join("mod.rs"),
-                ],
-                test,
-                explicit: false,
-            }),
-        }
-    }
 }
 
 struct Scanner {
@@ -1796,21 +1722,24 @@ impl Scanner {
     }
 }
 
-fn scan_crate(krate: &str, source: &Path, root: &Path) -> Result<CrateScan, String> {
-    let mut files = Vec::new();
-    collect_files(source, &mut files)?;
-    files.sort();
-    let test_only = test_only_files(&files, source)?;
+fn scan_crate(
+    krate: &str,
+    source: &Path,
+    root: &Path,
+    inventory: &Inventory,
+) -> Result<CrateScan, String> {
+    if let Some(file) = inventory.method_uses.first() {
+        return Err(format!(
+            "{file}: a use of Method::* or of Method under another name; the scan reads Method::<Variant> only"
+        ));
+    }
     let mut scanner = Scanner {
         sightings: BTreeMap::new(),
         scan_only: BTreeMap::new(),
         macro_rules: BTreeSet::new(),
         expanded: BTreeSet::new(),
     };
-    for path in &files {
-        if test_only.contains(path) {
-            continue;
-        }
+    for path in &inventory.files {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         if !mentions_a_sighting(&text) {

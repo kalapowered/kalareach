@@ -159,10 +159,15 @@ fn repo(unreadable_at: Option<usize>, broken_at: Option<usize>) -> Repo {
                     "crates/kr-other/Cargo.toml",
                     &MANIFEST.replace("NAME", "kr-other"),
                 );
+                let declared = if broken_at == Some(at) {
+                    "mod broken;\n"
+                } else {
+                    ""
+                };
                 write(
                     root,
                     "crates/kr-other/src/lib.rs",
-                    &format!("{OTHER_ONE}\n"),
+                    &format!("{OTHER_ONE}\n{declared}"),
                 );
             }
             None => {
@@ -682,8 +687,8 @@ fn a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_t
 
 #[test]
 fn a_source_that_cannot_be_read_at_a_tag_is_a_text_of_its_own() {
-    // The crate that holds only an account has a file that does not parse at one release: the
-    // scan, which reads the files that name a sighting, goes on, and the account's text cannot be read.
+    // The crate that holds only an account declares a file that does not parse at one release: the
+    // scan and the account's text both stop on it, each with a text of its own.
     let broken = repo(None, Some(2));
     let read = read(&repo(None, None));
     let (expected, snapshots) = read_history(broken.work.path(), &read.entry).expect("history");
@@ -697,13 +702,20 @@ fn a_source_that_cannot_be_read_at_a_tag_is_a_text_of_its_own() {
     );
     let error = &at.source_errors[&key];
     assert!(error.contains("broken.rs"), "{error}");
-    assert!(at.sightings.is_ok());
+    let scan_error = at
+        .sightings
+        .as_ref()
+        .expect_err("the scan stops on the file");
+    assert!(scan_error.contains("broken.rs"), "{scan_error}");
     assert_eq!(
         report.problems,
-        vec![said(&format!(
-            "{}: the source of kr_other::other_one cannot be read: {error}",
-            at.at.tag
-        ))]
+        vec![
+            said(&format!("{}: the scan failed: {scan_error}", at.at.tag)),
+            said(&format!(
+                "{}: the source of kr_other::other_one cannot be read: {error}",
+                at.at.tag
+            )),
+        ]
     );
 }
 
