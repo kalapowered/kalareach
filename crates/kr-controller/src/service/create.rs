@@ -763,6 +763,17 @@ impl Controller {
             }
         };
 
+        // The address the worker binds for its own clients is longer than the rendezvous address,
+        // by its display number and a letter, so a runtime directory can hold the one and not the
+        // other. A worker that cannot make its address ends before it reports, and the create
+        // would only learn that when its window ran out. It is known from the reservation, so it
+        // is checked here with nothing started.
+        if let Err(error) = self.paths.worker_endpoint(reservation.display_number) {
+            hold.end_wait().await;
+            self.resolve_failed(&reservation).await;
+            return Err(error.into());
+        }
+
         // Everything the launch needs is prepared before the checks that admit it, so nothing
         // between the last check and the launch can wait: a directory tree is several filesystem
         // operations, and a slow disk would otherwise spend the rest of an accepted deadline here.
