@@ -786,8 +786,9 @@ impl ClockTrust {
     }
 
     /// Whether something decided is not written down yet.
+    #[cfg(test)]
     #[must_use]
-    pub fn owes_a_write(&self) -> bool {
+    pub(crate) fn owes_a_write(&self) -> bool {
         self.held().owed.any()
     }
 

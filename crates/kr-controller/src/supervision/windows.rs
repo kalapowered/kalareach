@@ -261,6 +261,7 @@ impl RegisteredTask {
     ///
     /// `sid_of` resolves an account's name to its identifier, for an export that names the
     /// account rather than giving its identifier.
+    #[cfg(test)]
     #[must_use]
     pub fn belongs_to(
         &self,
@@ -1900,7 +1901,6 @@ mod launching {
     pub struct TaskSupervisor {
         environment: EnvironmentPaths,
         expected: TaskDefinition,
-        reach_bound: Duration,
         /// How long a test makes the daemon take to answer a starter whose hello it has received.
         #[cfg(feature = "testing")]
         slow_answer: Duration,
@@ -1929,7 +1929,6 @@ mod launching {
             Self {
                 environment,
                 expected,
-                reach_bound: REACH_BOUND,
                 #[cfg(feature = "testing")]
                 slow_answer: Duration::ZERO,
             }
@@ -1945,14 +1944,6 @@ mod launching {
         #[must_use]
         pub const fn answering_late(mut self, extra: Duration) -> Self {
             self.slow_answer = extra;
-            self
-        }
-
-        /// Gives a starter `bound`, rather than the usual half minute, to reach a launch once the
-        /// task has been run.
-        #[must_use]
-        pub const fn with_reach_bound(mut self, bound: Duration) -> Self {
-            self.reach_bound = bound;
             self
         }
 
@@ -2014,13 +2005,13 @@ mod launching {
                 };
                 return not_started(detail);
             }
-            let mut stream = match listener.accept(Instant::now() + self.reach_bound) {
+            let mut stream = match listener.accept(Instant::now() + REACH_BOUND) {
                 Ok(Some(stream)) => stream,
                 Ok(None) => {
                     return not_started(format!(
                         "the environment's task {} was run and no starter reached the launch within \
                          {:?}",
-                        self.expected.name, self.reach_bound
+                        self.expected.name, REACH_BOUND
                     ));
                 }
                 Err(error) => {
