@@ -26,6 +26,10 @@ on:
         description: "Run the Windows job."
         type: boolean
         default: true
+      apt_proof:
+        description: "The hosted proof of the apt install script to run, by name: r4, r5, r6, r6b or r7. Empty runs none. This input exists on a proof branch only."
+        type: string
+        default: ""
   schedule:
     - cron: "37 2 * * *"
 
@@ -725,3 +729,174 @@ jobs:
           name: conformance-windows-part-${{ matrix.part }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
+
+  # The hosted evidence for the apt install script, run by hand on this branch only: `apt_proof` names
+  # the run, and with the three platform inputs turned off nothing else of this workflow runs.
+  apt-proof:
+    name: apt proof
+    if: github.event_name == 'workflow_dispatch' && inputs.apt_proof != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PACKAGES: libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libncurses-dev
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Copies of the script that limit the download-only call, and that call alone, to 50 kB/s; the
+      # second also logs the HTTP exchange. The committed script is not edited, and the index is not
+      # limited.
+      - name: Make the limited copies of the script
+        run: |
+          limit='-o Acquire::http::Dl-Limit=50 -o Acquire::https::Dl-Limit=50'
+          debug='-o Debug::Acquire::http=true -o Debug::Acquire::https=true'
+          sed "s/download.log\" install --download-only/download.log\" install $limit --download-only/" scripts/apt-install.sh > "$RUNNER_TEMP/apt-install-slow.sh"
+          sed "s/download.log\" install --download-only/download.log\" install $limit $debug --download-only/" scripts/apt-install.sh > "$RUNNER_TEMP/apt-install-slow-debug.sh"
+          test "$(grep -c 'Dl-Limit=50' "$RUNNER_TEMP/apt-install-slow.sh")" = 1
+          test "$(grep -c 'Debug::Acquire::http=true' "$RUNNER_TEMP/apt-install-slow-debug.sh")" = 1
+          diff scripts/apt-install.sh "$RUNNER_TEMP/apt-install-slow.sh" || true
+
+      # R4. The index alone, timed, with the archives the plan needs listed from it: their names,
+      # sizes and hashes, and the total this run measures.
+      - name: R4, the index and the plan, unlimited
+        if: inputs.apt_proof == 'r4'
+        run: |
+          time sudo apt-get update
+          sudo mkdir -p "$RUNNER_TEMP/empty"
+          sudo apt-get install --print-uris -qq --no-install-recommends -o Acquire::ForceHash=SHA256 -o "Dir::Cache::Archives=$RUNNER_TEMP/empty" $PACKAGES | tee "$RUNNER_TEMP/uris.txt"
+          awk '{ total += $3 } END { print "listed total this run, bytes: " total }' "$RUNNER_TEMP/uris.txt"
+
+      - name: R4, first call, cut by its deadline of 120 s
+        id: r4-first
+        if: inputs.apt_proof == 'r4'
+        continue-on-error: true
+        run: bash "$RUNNER_TEMP/apt-install-slow.sh" --deadline 120 $PACKAGES
+
+      - name: R4, what the cut left
+        if: inputs.apt_proof == 'r4'
+        run: |
+          echo "the first call: ${{ steps.r4-first.outcome }} (expected: failure)"
+          echo "-- apt-get still running (expected: none):"
+          pgrep -a apt-get || echo none
+          echo "-- partial archives, name and bytes:"
+          sudo find /var/cache/apt/archives/partial -maxdepth 1 -name '*.deb' -printf '%f %s\n' | tee "$RUNNER_TEMP/partial.txt"
+          test -s "$RUNNER_TEMP/partial.txt"
+          echo "-- a package installed (expected: not installed):"
+          dpkg -s libwebkit2gtk-4.1-dev 2>&1 | head -2 || true
+
+      - name: R4, second call, resumes under its own deadline
+        if: inputs.apt_proof == 'r4'
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
+          bash "$RUNNER_TEMP/apt-install-slow-debug.sh" --deadline 3000 $PACKAGES 2>&1 | tee "$RUNNER_TEMP/second.log"
+
+      - name: R4, what the second call showed
+        if: inputs.apt_proof == 'r4' && !cancelled()
+        run: |
+          while read -r name size; do
+            echo "-- $name was $size bytes before this call"
+            grep -n "Range: bytes=$size-" "$RUNNER_TEMP/second.log" || echo "NO RANGE REQUEST FOR $name"
+          done < "$RUNNER_TEMP/partial.txt"
+          echo "-- 206 answers: $(grep -c 'HTTP/1.1 206' "$RUNNER_TEMP/second.log")"
+          grep -n 'Need to get' "$RUNNER_TEMP/second.log" || true
+          awk '{ total += $3 } END { print "listed total this run, bytes: " total }' "$RUNNER_TEMP/uris.txt"
+          echo "-- the completed archives against their hashes:"
+          while read -r _ file _ hash; do
+            if [ "$(sha256sum "/var/cache/apt/archives/$file" | cut -d' ' -f1)" = "${hash#SHA256:}" ]; then echo "ok $file"; else echo "MISMATCH $file"; fi
+          done < "$RUNNER_TEMP/uris.txt"
+
+      # R5, R6 and R6b. The archives are cached under keys of this proof's own, saved from this
+      # branch.
+      - name: Restore the proof archives
+        id: proof-archives
+        if: inputs.apt_proof == 'r5' || inputs.apt_proof == 'r6' || inputs.apt_proof == 'r6b'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/proof
+          key: apt-proof-v1-${{ runner.arch }}-${{ github.run_id }}
+          restore-keys: apt-proof-v1-${{ runner.arch }}-
+
+      - name: The cache that was restored
+        if: inputs.apt_proof == 'r5' || inputs.apt_proof == 'r6' || inputs.apt_proof == 'r6b'
+        run: |
+          echo "matched key: '${{ steps.proof-archives.outputs.cache-matched-key }}'"
+          ls -l ~/.cache/kalareach/apt/proof || true
+          cp ~/.cache/kalareach/apt/proof/MANIFEST "$RUNNER_TEMP/restored-MANIFEST" || true
+
+      - name: R6b, one byte of one restored archive changed, its size kept
+        if: inputs.apt_proof == 'r6b'
+        run: |
+          file=$(ls ~/.cache/kalareach/apt/proof/*.deb | head -1)
+          before=$(wc -c < "$file")
+          printf 'X' | dd of="$file" bs=1 count=1 conv=notrunc
+          echo "changed $file: $before bytes before, $(wc -c < "$file") after"
+
+      - name: The index alone, timed
+        if: inputs.apt_proof == 'r5' || inputs.apt_proof == 'r6' || inputs.apt_proof == 'r6b'
+        run: time sudo apt-get update
+
+      - name: The install through the script, with the archive directory
+        id: proof-install
+        if: inputs.apt_proof == 'r5' || inputs.apt_proof == 'r6' || inputs.apt_proof == 'r6b'
+        timeout-minutes: 35
+        run: |
+          set -o pipefail
+          bash scripts/apt-install.sh --deadline 1800 --archive ~/.cache/kalareach/apt/proof $PACKAGES 2>&1 | tee "$RUNNER_TEMP/install.log"
+
+      - name: What the install showed
+        if: (inputs.apt_proof == 'r5' || inputs.apt_proof == 'r6' || inputs.apt_proof == 'r6b') && !cancelled()
+        run: |
+          log="$RUNNER_TEMP/install.log"
+          grep -n '^apt-install: \(archive directory\|dropped\|not saved\|digest\|save\|entry\|packages\)' "$log" || true
+          echo "-- Get: lines of the download call (expected for R6: none; for R6b: the dropped archive only):"
+          awk '/install .*--download-only/ { after = 1 } after && /^Get:/' "$log"
+          echo "-- seeded: $(grep -c '^apt-install: seeded' "$log")"
+          if [ -s "$RUNNER_TEMP/restored-MANIFEST" ]; then
+            echo "-- restored entries that are unchanged in the new manifest, and whether each was seeded:"
+            comm -12 <(sort "$RUNNER_TEMP/restored-MANIFEST") <(sort ~/.cache/kalareach/apt/proof/MANIFEST) | while read -r name _; do
+              if grep -q "^apt-install: seeded $name\$" "$log"; then echo "seeded $name"; else echo "NOT SEEDED $name"; fi
+            done
+          fi
+
+      - name: Save the proof archives
+        if: (inputs.apt_proof == 'r5' || inputs.apt_proof == 'r6' || inputs.apt_proof == 'r6b') && steps.proof-install.outputs.save == 'true'
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kalareach/apt/proof
+          key: apt-proof-v1-${{ runner.arch }}-${{ steps.proof-install.outputs.entry }}
+
+      # R7. A source whose host refuses the connection: real apt prints `W: Failed to fetch` and
+      # exits 0 for it, which is what a 503 on an index does.
+      - name: R7, a source that refuses connections
+        if: inputs.apt_proof == 'r7'
+        run: echo 'deb [trusted=yes] http://127.0.0.1:9/ ./' | sudo tee /etc/apt/sources.list.d/zz-refused.list
+
+      - name: R7, the install through the script
+        if: inputs.apt_proof == 'r7'
+        run: |
+          set -o pipefail
+          bash scripts/apt-install.sh --deadline 600 tmux 2>&1 | tee "$RUNNER_TEMP/r7.log"
+          echo "-- updates run: $(grep -c 'apt-get update$' "$RUNNER_TEMP/r7.log") (expected: 3)"
+          echo "-- warnings printed: $(grep -c '^W: Failed to fetch' "$RUNNER_TEMP/r7.log") (expected: 3)"
+          dpkg -s tmux | head -3
+
+  # The control for R4: the install as the job made it before, at the same download limit, under
+  # the old step bound of 6 minutes, on a runner of its own.
+  apt-proof-control:
+    name: apt proof control
+    if: github.event_name == 'workflow_dispatch' && inputs.apt_proof == 'r4'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install the build dependencies as they were
+        timeout-minutes: 6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -o Acquire::http::Dl-Limit=50 -o Acquire::https::Dl-Limit=50 --no-install-recommends --yes \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libncurses-dev
