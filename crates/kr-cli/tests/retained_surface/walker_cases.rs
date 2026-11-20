@@ -252,7 +252,11 @@ impl Sends for [u8] {
     fn m(&self) { let _ = Method::AgentTurnCancel; }
     via_slice!(Method::AgentPromptQueue);
 }
-fn local() { macro_rules! check_local { (idle!(Method::AgentTurnCancel)) => {}; } }
+fn local() {
+    macro_rules! check_local { (idle!(Method::AgentTurnCancel)) => {}; }
+    macro_rules! check_paren ( (idle_p!(Method::AgentTurnCancel)) => {} );
+    macro_rules! check_brack [ (idle_b!(Method::AgentTurnCancel)) => {} ];
+}
 macro_rules! outer_fwd { ($m:expr) => { inner_fwd!($m) }; }
 fn uses_fwd() { outer_fwd!(Method::AgentTurnCancel); }
 macro_rules! d_paren ( () => { via_paren!(Method::AgentTurnSteer) } );
@@ -324,7 +328,7 @@ fn sender_tree() -> tempfile::TempDir {
         ),
         (
             "mac.rs",
-            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! via_body { ($m:expr) => { $m }; }\nmacro_rules! wrapper { ($($t:tt)*) => {}; }\nmacro_rules! inner_call { ($m:expr) => { $m }; }\nmacro_rules! via_slice { ($m:expr) => { const Y: u8 = 0; }; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\nmacro_rules! inner_fwd { ($m:expr) => { $m }; }\nmacro_rules! via_paren { () => {}; }\nmacro_rules! via_brack { () => {}; }\n",
+            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! via_body { ($m:expr) => { $m }; }\nmacro_rules! wrapper { ($($t:tt)*) => {}; }\nmacro_rules! inner_call { ($m:expr) => { $m }; }\nmacro_rules! via_slice { ($m:expr) => { const Y: u8 = 0; }; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\nmacro_rules! inner_fwd { ($m:expr) => { $m }; }\nmacro_rules! via_paren { () => {}; }\nmacro_rules! via_brack { () => {}; }\nmacro_rules! idle_p { () => {}; }\nmacro_rules! idle_b { () => {}; }\n",
         ),
     ] {
         write(folder.path(), &format!("{src}/{path}"), text);
