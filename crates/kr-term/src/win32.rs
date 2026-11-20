@@ -208,8 +208,9 @@ pub struct TooLong;
 /// take the buffer past `limit` bytes.
 ///
 /// The order is the record path's own promise: a key-down and the key-up that follows it arrive in
-/// that order, and a repeat count is one record rather than several. The bound is checked before each record is appended, so the buffer never holds more than the
-/// bound and a run is never built to be refused.
+/// that order, and a repeat count is one record rather than several. The bound is checked before
+/// each record is appended, so the buffer never holds more than the bound and a run is never built
+/// to be refused.
 ///
 /// # Errors
 ///
@@ -402,6 +403,7 @@ impl Fidelity {
     pub const fn carries_console_scan_codes(&self) -> bool {
         matches!(self, Self::Records)
     }
+
     /// The sentence a receipt or a diagnostic prints.
     #[must_use]
     pub const fn describe(&self) -> &'static str {
