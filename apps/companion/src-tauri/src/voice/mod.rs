@@ -1092,6 +1092,13 @@ impl Shared {
                 .filter(|ended| ended.owner == owner)
                 .map(|ended| ended.host.clone())
         };
+        // What the call is left to, in words, by the answer the owner wrote when it wrote one; nothing
+        // when that answer says the host closed it.
+        let left_words = cause::unsettled_words(
+            word,
+            written.as_ref().unwrap_or(&host_end),
+            may_have_reached,
+        );
         // The service is asked over its own route unless the host told it.
         let broker = match (&kept.service_call, written.as_ref().unwrap_or(&host_end)) {
             (
@@ -1110,13 +1117,11 @@ impl Shared {
             }
             // A call the host controls is closed by the host. This device asks no voice service and
             // holds no token for one: what the host did not confirm is left to it.
-            (None, end)
-                if kept.provider == CallProvider::OwnKey && kept.grant_until_ms.is_some() =>
-            {
-                if cause::host_closed_the_call(word, end) {
-                    "closed_by_host"
-                } else {
+            (None, _) if kept.provider == CallProvider::OwnKey && kept.grant_until_ms.is_some() => {
+                if left_words.is_some() {
                     "left_to_host"
+                } else {
+                    "closed_by_host"
                 }
             }
             // A start the host may have answered made a call this device cannot name.
@@ -1136,20 +1141,12 @@ impl Shared {
         ) {
             owed.push(OwedView::revocation(words, id, until_ms, host));
         }
-        // What the call is left to, in words, by the answer the owner wrote when it wrote one.
-        let left_words = cause::unsettled_words(
-            word,
-            written.as_ref().unwrap_or(&host_end),
-            may_have_reached,
-        )
-        .unwrap_or(cause::LEFT_TO_HOST);
-        if let (true, Some(until_ms), Some(id), Some(host)) = (
-            broker == "left_to_host",
-            kept.grant_until_ms,
-            kept.voice_session_id,
-            &kept.host,
-        ) {
-            owed.push(OwedView::left_to_host(id, until_ms, left_words, host));
+        // The words of what the call is left to, where it is left to the host.
+        let left = left_words.filter(|_| broker == "left_to_host");
+        if let (Some(words), Some(until_ms), Some(id), Some(host)) =
+            (left, kept.grant_until_ms, kept.voice_session_id, &kept.host)
+        {
+            owed.push(OwedView::left_to_host(id, until_ms, words, host));
         }
         if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
             owed.push(OwedView::start_unknown(
@@ -1179,16 +1176,16 @@ impl Shared {
                             cause: "owner_failed".to_owned(),
                             // A call that may have acted cannot say that nothing was done: what
                             // the owner had written to the host went with the owner.
-                            words: match (broker == "left_to_host", accepts) {
-                                (true, true) => {
-                                    format!("{left_words} {}", owner::REQUESTS_UNSETTLED)
+                            words: match (left, accepts) {
+                                (Some(words), true) => {
+                                    format!("{words} {}", owner::REQUESTS_UNSETTLED)
                                 }
-                                (true, false) => left_words.to_owned(),
-                                (false, true) => format!(
+                                (Some(words), false) => words.to_owned(),
+                                (None, true) => format!(
                                     "This device's call stopped working, so the call was ended. {}",
                                     owner::REQUESTS_UNSETTLED
                                 ),
-                                (false, false) => {
+                                (None, false) => {
                                     "This device's call stopped working, so the call was ended."
                                         .to_owned()
                                 }
