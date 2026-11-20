@@ -1619,6 +1619,47 @@ async fn a_kit_saved_over_a_file_that_grants_another_account_is_narrowed_and_rep
     );
 }
 
+/// KR-REQ-20.18: a kit saved over a file that another program has open is refused in words that say
+/// so, and the file is as it was: the save neither waits for that program nor writes where it may
+/// be reading.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kit_saved_over_a_file_another_program_has_open_is_refused_and_the_file_is_unchanged() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let path = out.path().join("recovery-kit.txt");
+    std::fs::write(&path, b"what was there before").expect("a file to save over");
+    let before = kr_ipc::paths::FileAccess::of(&path).expect("reads who can reach the file");
+    let reader = std::fs::File::open(&path).expect("another program reads the file");
+    page.dialog_returns(&path);
+
+    let refused = page
+        .call(
+            "recovery_save_kit",
+            json!({ "path": path.to_string_lossy() }),
+        )
+        .expect_err("the file is open in another program, so the kit is refused");
+
+    assert_eq!(
+        refused["message"],
+        "the kit could not be written: another program has the file open, so the file was not \
+         changed; close that program or choose another file"
+    );
+    drop(reader);
+    assert_eq!(
+        std::fs::read(&path).expect("the file"),
+        b"what was there before",
+        "the file is as it was"
+    );
+    assert_eq!(
+        kr_ipc::paths::FileAccess::of(&path).expect("reads who can reach the file"),
+        before,
+        "the file keeps its list"
+    );
+}
+
 /// KR-REQ-20.18: the bundle exports alone as a file of ciphertext, in the owner-only mode, that is
 /// the bundle as the service holds it; the archives the bundle names are listed; and a request for
 /// an archive the bundle does not name, or while recovery is off, writes nothing.

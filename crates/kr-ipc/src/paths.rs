@@ -3135,8 +3135,8 @@ mod windows {
                 "the file carries the owner-only list: {after:?}"
             );
             assert_eq!(
-                std::fs::read(&path).expect("reads"),
-                b"what was there",
+                file.metadata().expect("metadata").len(),
+                14,
                 "narrowing the list leaves the bytes"
             );
             file.set_len(0).expect("empties through the handle");
@@ -3258,6 +3258,64 @@ mod windows {
                 "the file keeps its list"
             );
             assert_eq!(folder.names(), vec!["kit".to_owned()]);
+        }
+
+        /// A file that another handle holds open for reading is refused with a sharing violation,
+        /// and keeps its bytes and its list: the file is opened for writing and shares deleting
+        /// only, so no read open made before the narrowing is left to read the kit that follows.
+        #[test]
+        fn an_existing_file_that_another_handle_reads_is_refused_and_keeps_its_bytes() {
+            use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+            let folder = Folder::new("held-open");
+            let path = wide_file(&folder);
+            let before = FileAccess::of(&path).expect("reads who can reach the file");
+            let reader = std::fs::File::open(&path).expect("another handle reads the file");
+
+            let error = crate::paths::open_owner_only_in_place(&path)
+                .expect_err("the file another handle reads is not opened");
+
+            assert_eq!(
+                error.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION.cast_signed()),
+                "{error}"
+            );
+            drop(reader);
+            assert_eq!(std::fs::read(&path).expect("reads"), b"what was there");
+            assert_eq!(
+                FileAccess::of(&path).expect("reads who can reach the file"),
+                before,
+                "the file keeps its list"
+            );
+            assert_eq!(folder.names(), vec!["kit".to_owned()]);
+        }
+
+        /// While a file is open in place no other handle opens it for reading, so nothing reads
+        /// the kit before it is complete, and a read open succeeds again once it is closed.
+        #[test]
+        fn no_other_handle_opens_a_file_for_reading_while_it_is_open_in_place() {
+            use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+
+            let folder = Folder::new("held-by-the-writer");
+            let path = wide_file(&folder);
+            let opened = crate::paths::open_owner_only_in_place(&path);
+            assert!(opened.is_ok(), "opens and narrows the file: {opened:?}");
+            let file = opened.expect("opens and narrows the file");
+
+            let error = std::fs::File::open(&path)
+                .expect_err("a read open is refused while the file is held");
+
+            assert_eq!(
+                error.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION.cast_signed()),
+                "{error}"
+            );
+            drop(file);
+            let reopened = std::fs::File::open(&path);
+            assert!(
+                reopened.is_ok(),
+                "a read open succeeds once the file is closed: {reopened:?}"
+            );
         }
 
         /// A free name opened in place is created with the owner-only list, checked, and empty.

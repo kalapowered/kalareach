@@ -1306,4 +1306,23 @@ mod tests {
             "the kit could not be written: the disk is full"
         );
     }
+
+    /// A file that another program has open is refused in words that say so and that the file was
+    /// not changed, for the kit, the QR code and the offline copy, and the system's own words for
+    /// the error are not the person's to read.
+    #[test]
+    fn a_file_another_program_has_open_is_refused_in_words_that_say_so() {
+        // ERROR_SHARING_VIOLATION, the error Windows gives for a file another program has open.
+        let held = std::io::Error::from_raw_os_error(32);
+        for what in ["the kit", "the QR code", "the export"] {
+            assert_eq!(
+                write_failure(what, &held).message,
+                format!(
+                    "{what} could not be written: another program has the file open, so the \
+                     file was not changed; close that program or choose another file"
+                ),
+                "{what}"
+            );
+        }
+    }
 }
