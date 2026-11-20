@@ -64,7 +64,7 @@ pub struct AppState {
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
     /// Where a suite has paused the state's own steps.
     #[cfg(feature = "testing")]
-    pauses: testing::Pauses,
+    pauses: Arc<testing::Pauses>,
 }
 
 /// A choice of host that has been made ready: the host it is for, and what starts the task that
@@ -104,7 +104,7 @@ impl AppState {
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
-            pauses: testing::Pauses::default(),
+            pauses: Arc::default(),
         }
     }
 
@@ -250,12 +250,16 @@ impl AppState {
     #[must_use]
     pub fn replacer(&self) -> crate::connection::Replacer {
         let owner = Arc::clone(&self.contact);
+        #[cfg(feature = "testing")]
+        let pauses = Arc::clone(&self.pauses);
         Arc::new(move |withdrawn, fresh| {
             // The receiver is taken before the connection is installed, so that nothing the host
             // sends on it before the keeper takes it up is lost. The withdrawn session is closed
             // when the owner's answer is dropped, after the swap and outside the owner.
             let events = fresh.session().events();
             drop(owner.replaced(withdrawn, fresh, events));
+            #[cfg(feature = "testing")]
+            pauses.after_replacement.wait();
         })
     }
 
@@ -790,6 +794,7 @@ pub mod testing {
         pub(super) device_read: Place,
         pub(super) before_start: Place,
         pub(super) before_cleanup: Place,
+        pub(super) after_replacement: Place,
     }
 
     /// Where in the making of a choice of host a step is paused.
@@ -808,6 +813,14 @@ pub mod testing {
         #[must_use]
         pub fn hold_the_device_read(&self) -> Hold {
             self.pauses.device_read.set()
+        }
+
+        /// Pauses the next replacement of a withdrawn connection once the replacer has put the new
+        /// connection in its place and dropped what the owner removed, which is where the withdrawn
+        /// session has been closed. The pause is reached whether or not it was.
+        #[must_use]
+        pub fn hold_after_replacement(&self) -> Hold {
+            self.pauses.after_replacement.set()
         }
 
         /// Pauses the next choice of a host at `point`, with the choice gate held.

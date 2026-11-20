@@ -4411,10 +4411,26 @@ async fn an_already_ended_replacement_is_adopted_and_its_end_is_typed_by_the_clo
 async fn the_replacer_closes_the_withdrawn_session_after_the_swap() {
     let rig = Rig::start().await;
     let dials = Arc::new(Dials::default());
+    // The replacer is held once it has dropped what the owner removed. The pause is reached
+    // whether or not the session was closed, so the case reads the session there and waits for
+    // nothing.
+    let mut after = rig.app.app.state::<AppState>().hold_after_replacement();
     let (_keeper, first, _second) = a_replaced_connection(&rig, &dials).await;
-    tokio::time::timeout(Duration::from_secs(30), first.closed())
-        .await
-        .expect("the withdrawn session is closed by the swap");
+    after.reached().await;
+    assert!(
+        ready_at_once(first.closed()),
+        "the withdrawn session is closed once the replacer has dropped the owner's answer"
+    );
+    after.release();
+}
+
+/// Whether `future` is ready the first time it is polled.
+fn ready_at_once(future: impl std::future::Future) -> bool {
+    let mut future = std::pin::pin!(future);
+    future
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        .is_ready()
 }
 
 /// The milliseconds since the epoch, as this computer's clock says.
