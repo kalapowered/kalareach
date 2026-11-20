@@ -41,7 +41,7 @@ import {
   CHANNEL_ANSWER_LINE,
   CHANNEL_ANSWER_WORDS,
   channelAnswersRest,
-  endsAsChannelAnswer,
+  endsAsChannelEnd,
   outcomeMessage,
   outcomeTone
 } from '../model/receipts'
@@ -278,7 +278,7 @@ export function ApprovalRequests({
         // An answer a channel took and the host's own word left unknown says so, and the
         // connection stops counting it; a lost answer, and any other unknown outcome, say what the
         // host could not confirm.
-        if (endsAsChannelAnswer(settled, request.channel)) {
+        if (endsAsChannelEnd(settled, request.channel)) {
           say(CHANNEL_ANSWER_WORDS, 'neutral')
           if (settled.action_id !== null) release(sessionId, settled.action_id)
           return

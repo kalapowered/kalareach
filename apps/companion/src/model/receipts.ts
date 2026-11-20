@@ -28,6 +28,15 @@ export type InputState =
   | 'not_taken'
   | 'unknown'
 
+/**
+ * How a message to a channel session that confirms nothing was handed over, kept in memory only.
+ *
+ * `keeping`: the answer is recorded and the device's store of channel messages is keeping the text.
+ * `ended`: the store took it, so the row no longer holds the next message and is no longer counted
+ * as waiting for the host. `released`: the host was asked, once, to let go of the action.
+ */
+export type ChannelMark = 'keeping' | 'ended' | 'released'
+
 /** One submission the interface is tracking. */
 export interface Submission {
   /** This device's own identity for the submission, which exists before an action does. */
@@ -71,6 +80,30 @@ export interface Submission {
   readonly createdAtMs: number
   /** The failure, when it has one. */
   readonly error: { readonly code: string; readonly message: string } | null
+  /** Set once the text is handed over to the channel store: no text of the row returns to a composer. Memory only. */
+  readonly channel?: ChannelMark
+}
+
+/** Whether the row's text is, or is being, handed over: no text of it ever returns to a composer, and no later receipt acts on one. */
+export function isHandOver(submission: Submission): boolean {
+  return submission.channel !== undefined
+}
+
+/**
+ * Whether the row has left the counts: its text is kept apart and it no longer holds the next
+ * message, waits on the host, or is written for a restart. A row still being kept counts as an
+ * unknown row until the store answers.
+ */
+export function isOutOfCounts(submission: Submission): boolean {
+  return submission.channel === 'ended' || submission.channel === 'released'
+}
+
+/** Whether the host still owes this submission an outcome, and the interface still counts it. */
+export function awaitsHost(submission: Submission): boolean {
+  return (
+    (submission.state === 'queued' || submission.state === 'sent' || submission.state === 'unknown') &&
+    !isOutOfCounts(submission)
+  )
 }
 
 /**
@@ -189,7 +222,9 @@ export function sendOutcomeOf(state: InputState): 'taken' | 'refused' | 'unknown
  * its own that leaves this one listed as it is.
  */
 export function unconfirmedReason(submissions: readonly Submission[]): string | null {
-  const count = submissions.filter((submission) => submission.state === 'unknown').length
+  const count = submissions.filter(
+    (submission) => submission.state === 'unknown' && !isOutOfCounts(submission)
+  ).length
   return count === 0 ? null : unconfirmedWords(count)
 }
 
@@ -278,10 +313,7 @@ function sentence(reason: string): string {
 
 /** The submissions that are not finished, which is what the reconnect banner lists. */
 export function unresolved(submissions: readonly Submission[]): readonly Submission[] {
-  return submissions.filter(
-    (submission) =>
-      submission.state === 'queued' || submission.state === 'sent' || submission.state === 'unknown'
-  )
+  return submissions.filter(awaitsHost)
 }
 
 /**
@@ -390,11 +422,17 @@ export function channelAnswersRest(count: number): string {
 
 /**
  * Whether an answer ended as a channel end: the host's own word, not a lost answer, says the
- * outcome is unknown, and the request's package takes answers over a channel that confirms nothing
- * (`viaChannel`). A lost answer, and every unknown outcome of another package, are not.
+ * outcome is unknown, the request's package takes messages and answers over a channel that
+ * confirms nothing (`viaChannel`), and the action has an identity to keep the text under. A lost
+ * answer, an answer with no action, and every unknown outcome of another package, are not.
  */
-export function endsAsChannelAnswer(answer: Answer, viaChannel: boolean): boolean {
-  return answeredState(answer) === 'unknown' && answer.answer_lost === false && viaChannel
+export function endsAsChannelEnd(answer: Answer, viaChannel: boolean): boolean {
+  return (
+    answeredState(answer) === 'unknown' &&
+    answer.answer_lost === false &&
+    viaChannel &&
+    answer.action_id !== null
+  )
 }
 
 /**
