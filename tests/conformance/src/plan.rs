@@ -240,9 +240,18 @@ impl Cut {
     /// The part, from 1, that holds the remaining step at `position` among the remaining steps: the
     /// first part whose share ends after it.
     fn part_at(&self, position: usize) -> usize {
-        let share = ((position + 1) * self.shares).div_ceil(self.rest);
+        let share = scaled((position + 1, self.shares, self.rest), true);
         share + usize::from(self.alone.is_some())
     }
+}
+
+/// `a * b / c`, rounded up when `up` and down when not, with the product taken in 128 bits so that
+/// it cannot overflow for any `usize` factors. `c` is above 0. A quotient above a `usize` is
+/// `usize::MAX`.
+fn scaled((a, b, c): (usize, usize, usize), up: bool) -> usize {
+    let (a, b, c) = (a as u128, b as u128, c as u128);
+    let quotient = if up { (a * b).div_ceil(c) } else { a * b / c };
+    usize::try_from(quotient).unwrap_or(usize::MAX)
 }
 
 /// The parts that hold a step: every part, or the parts named.
@@ -327,8 +336,8 @@ pub fn part_of(steps: Vec<Step>, part: (usize, usize)) -> Vec<Step> {
     } else {
         number
     };
-    let from = cut.rest * share.saturating_sub(1) / cut.shares;
-    let to = cut.rest * share / cut.shares;
+    let from = scaled((cut.rest, share.saturating_sub(1), cut.shares), false);
+    let to = scaled((cut.rest, share, cut.shares), false);
     let mut kept = vec![false; steps.len()];
     let mut position = 0;
     for (slot, index) in cut.steps.iter().enumerate() {
@@ -638,6 +647,31 @@ mod tests {
             .expect("the check did not return in 20 s");
         assert_eq!(spread.as_deref(), Some("a"));
         assert_eq!(without, None);
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a plan cut into `usize::MAX` parts places
+    /// each step in the part its place gives, whatever the size of the products that place them, and
+    /// the check for a budget across parts finds the budget whose steps are in different parts. Three
+    /// steps cut by count go to the parts that the third, two thirds and all of `usize::MAX` mark.
+    #[test]
+    fn a_plan_cut_into_the_largest_number_of_parts_places_its_steps_and_finds_a_budget_across_them()
+    {
+        let t = |id: &str| named(id, Reading::Cargo, false, &[]);
+        let plan = vec![budgeted(t("t0"), "a"), budgeted(t("t1"), "a"), t("t2")];
+        let parts = usize::MAX;
+        let wide = parts as u128;
+        let at = |third: u128| usize::try_from((wide * third).div_ceil(3)).expect("a usize");
+        let ids = |number: usize| -> Vec<String> {
+            part_of(plan.clone(), (number, parts))
+                .into_iter()
+                .map(|step| step.id)
+                .collect()
+        };
+        assert_eq!(budget_across_parts(&plan, parts), Some("a".to_owned()));
+        assert_eq!(ids(1), Vec::<String>::new());
+        assert_eq!(ids(at(1)), ["t0"]);
+        assert_eq!(ids(at(2)), ["t1"]);
+        assert_eq!(ids(parts), ["t2"]);
     }
 
     fn step_of(what: &str, command: &[&str], reading: Reading) -> Step {
