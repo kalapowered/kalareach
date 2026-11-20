@@ -267,6 +267,8 @@ mod platform {
             name: &str,
         ) -> std::io::Result<Self> {
             rustix::fs::mkdirat(self.handle.as_fd(), name, Mode::RWXU)?;
+            #[cfg(test)]
+            crate::catalogue::native_bridge::anchor::private_pause::run(&self.join(name));
             let opened = rustix::fs::openat(
                 self.handle.as_fd(),
                 name,

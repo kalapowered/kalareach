@@ -5995,18 +5995,24 @@ mod tests {
         }
     }
 
-    /// What another process does to the entry a write made beside its destination: it moves that
-    /// entry aside and puts a file of its own under the name. Returns that file's path.
+    /// The temporary entries a write made in `folder`.
     #[cfg(unix)]
-    fn put_a_file_under_the_temporary_name(folder: &Path) -> PathBuf {
-        let entries: Vec<PathBuf> = std::fs::read_dir(folder)
+    fn temporary_entries(folder: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(folder)
             .expect("the folder")
             .map(|entry| entry.expect("an entry").path())
             .filter(|path| {
                 path.file_name()
                     .is_some_and(|name| name.to_string_lossy().contains(".kalareach"))
             })
-            .collect();
+            .collect()
+    }
+
+    /// What another process does to the entry a write made beside its destination: it moves that
+    /// entry aside and puts a file of its own under the name. Returns that file's path.
+    #[cfg(unix)]
+    fn put_a_file_under_the_temporary_name(folder: &Path) -> PathBuf {
+        let entries = temporary_entries(folder);
         assert_eq!(entries.len(), 1, "one temporary entry stands: {entries:?}");
         let temporary = entries[0].clone();
         std::fs::rename(&temporary, folder.join("moved-aside")).expect("moves it aside");
@@ -6160,6 +6166,178 @@ mod tests {
         assert!(
             detail.ends_with(&holding[0].display().to_string()),
             "the refusal names it: {detail}"
+        );
+    }
+
+    /// What another process does between a write's making of its private folder and its opening of
+    /// it: it moves the new folder aside and puts a folder of its own at the name, with `mode` and,
+    /// where `holding` is set, a file in it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn replace_the_private_folder_before_it_is_opened(mode: u32, holding: bool) {
+        anchor::private_pause::once(move |folder| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::rename(folder, folder.with_file_name("moved-aside")).expect("moves it aside");
+            std::fs::create_dir(folder).expect("another process makes a folder of its own");
+            std::fs::set_permissions(folder, std::fs::Permissions::from_mode(mode))
+                .expect("sets its mode");
+            if holding {
+                std::fs::write(folder.join("note"), b"theirs").expect("puts a file in it");
+            }
+        });
+    }
+
+    /// KR-REQ-11.01: a folder that other users can enter, put at the private folder's name before
+    /// the write opens it, is not written into. The write is refused and nothing is published; the
+    /// folder is not this write's, so it stays.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_open_to_others_put_at_the_private_folders_name_is_refused_and_kept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        replace_the_private_folder_before_it_is_opened(0o755, false);
+        let refused = walk
+            .write(&place, b"one", 0o600, None)
+            .expect_err("a folder other users can enter is not used");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains("because the temporary folder beside it is open to other users")),
+            "{refused}"
+        );
+        assert!(!place.exists(), "nothing is published");
+        let theirs = temporary_entries(&tree.home());
+        assert_eq!(theirs.len(), 1, "their folder stays: {theirs:?}");
+        assert_eq!(
+            theirs[0]
+                .metadata()
+                .expect("it is there")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "as they made it"
+        );
+        assert_eq!(
+            std::fs::read_dir(&theirs[0]).expect("a folder").count(),
+            0,
+            "nothing was staged in it"
+        );
+    }
+
+    /// KR-REQ-11.01: a folder that already holds a file, put at the private folder's name before
+    /// the write opens it, is not written into either, even where its owner and mode would pass.
+    /// The write is refused with its own words and nothing is published; the folder and its file
+    /// stay.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_holding_a_file_put_at_the_private_folders_name_is_refused_and_kept() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        replace_the_private_folder_before_it_is_opened(0o700, true);
+        let refused = walk
+            .write(&place, b"one", 0o600, None)
+            .expect_err("a folder that holds a file is not used");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains("because another program put something in the temporary folder beside it")),
+            "{refused}"
+        );
+        assert!(!place.exists(), "nothing is published");
+        let theirs = temporary_entries(&tree.home());
+        assert_eq!(theirs.len(), 1, "their folder stays: {theirs:?}");
+        let held: Vec<PathBuf> = std::fs::read_dir(&theirs[0])
+            .expect("a folder")
+            .map(|entry| entry.expect("an entry").path())
+            .collect();
+        assert_eq!(held, [theirs[0].join("note")], "holding only their file");
+        assert_eq!(
+            std::fs::read(&held[0]).ok().as_deref(),
+            Some(&b"theirs"[..]),
+            "which is kept"
+        );
+    }
+
+    /// KR-REQ-11.01: on macOS the folder a write makes takes the access-list entries its parent
+    /// passes on to folders, and mode 0700 does not limit them. A write whose private folder
+    /// carries such an entry is refused, nothing is published, and the folder it made is removed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_private_folder_that_takes_an_access_entry_from_its_parent_is_refused_and_removed() {
+        let tree = Tree::create();
+        let shared = tree.home().join("shared");
+        std::fs::create_dir(&shared).expect("a shared folder");
+        // Declared after the tree, so it is dropped first however the test ends.
+        let _entry = Restriction(shared.clone());
+        exacl::setfacl(
+            &[&shared],
+            &[exacl::AclEntry::allow_group(
+                "everyone",
+                exacl::Perm::READ
+                    | exacl::Perm::WRITE
+                    | exacl::Perm::EXECUTE
+                    | exacl::Perm::APPEND
+                    | exacl::Perm::DELETE_CHILD,
+                Some(exacl::Flag::DIRECTORY_INHERIT | exacl::Flag::ONLY_INHERIT),
+            )],
+            None,
+        )
+        .expect("gives every user a right in the folders made in it");
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = shared.join("doc.json");
+        let refused = walk
+            .write(&place, b"one", 0o600, None)
+            .expect_err("a folder that others can enter is not used");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains("because the temporary folder beside it is open to other users")),
+            "{refused}"
+        );
+        assert!(!place.exists(), "nothing is published");
+        let left = temporary_entries(&shared);
+        assert!(
+            left.is_empty(),
+            "the folder this write made is removed: {left:?}"
+        );
+    }
+
+    /// KR-REQ-11.01: the folder a write stages in is closed to every user but its owner while the
+    /// write runs: the one temporary entry beside the place, when the staged file is about to be
+    /// published, is a folder of mode 0700.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_stages_in_a_folder_only_its_owner_can_enter() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None::<Vec<(bool, u32)>>));
+        let (look, home) = (std::rc::Rc::clone(&seen), tree.home());
+        anchor::publish_pause::once(move |_| {
+            let entries = temporary_entries(&home)
+                .iter()
+                .map(|entry| {
+                    let metadata = entry.symlink_metadata().expect("an entry");
+                    (metadata.is_dir(), metadata.permissions().mode() & 0o777)
+                })
+                .collect();
+            *look.borrow_mut() = Some(entries);
+        });
+        walk.write(&place, b"one", 0o600, None)
+            .expect("a private folder is used");
+        assert_eq!(
+            seen.borrow().as_deref(),
+            Some(&[(true, 0o700)][..]),
+            "one folder, closed to every user but its owner"
         );
     }
 

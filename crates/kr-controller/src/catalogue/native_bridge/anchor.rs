@@ -643,6 +643,32 @@ pub(crate) mod cleanup_pause {
     }
 }
 
+/// What the unit tests run in a write after its private folder is made and before it is opened, to
+/// make the change another process could make between the two. The hook is given the folder's
+/// path.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) mod private_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE_OPEN: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a private folder on this thread is about to be opened.
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE_OPEN.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(path: &Path) {
+        if let Some(then) = BEFORE_OPEN.with(|before| before.borrow_mut().take()) {
+            then(path);
+        }
+    }
+}
+
 /// Lets a test make the folder another process would make between a look and the making.
 #[cfg(test)]
 pub(crate) mod make_pause {
