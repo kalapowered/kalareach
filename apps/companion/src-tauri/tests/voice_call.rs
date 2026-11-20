@@ -5173,7 +5173,9 @@ async fn a_start_whose_record_cannot_be_written_is_refused_before_the_host_is_as
         let _ = std::fs::remove_file(&probe);
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
             .expect("the folder is made writable again");
-        eprintln!("the folder's mode does not bind this user, so the write cannot be made to fail");
+        eprintln!(
+            "skipped: the folder's mode does not bind this user, so the write cannot be made to fail"
+        );
         scene.stop_host().await;
         return;
     }

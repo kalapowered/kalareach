@@ -2419,7 +2419,9 @@ mod tests {
                 let _ = std::fs::remove_file(&probe);
                 std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
                     .expect("the folder is made writable again");
-                eprintln!("the folder's mode does not bind this user: the write cannot fail");
+                eprintln!(
+                    "skipped: the folder's mode does not bind this user: the write cannot fail"
+                );
                 return;
             }
             calls.forget_starts_of(host(1).0);
@@ -2590,7 +2592,7 @@ mod tests {
         if std::fs::File::create(&probe).is_ok() {
             let _ = std::fs::remove_file(&probe);
             make_writable();
-            eprintln!("the folder's mode does not bind this user: the write cannot fail");
+            eprintln!("skipped: the folder's mode does not bind this user: the write cannot fail");
             return;
         }
         {
