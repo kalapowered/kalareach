@@ -5102,7 +5102,7 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
         "2 written under revision 7",
         "the rollback ended no draft"
     );
-    let side = kr_transfer::revisions::Revisions::beside(&journal);
+    let side = journal.with_file_name("draft-revisions.sqlite3");
     assert_eq!(
         rusqlite::Connection::open(&side)
             .expect("opens the store of binding revisions")
