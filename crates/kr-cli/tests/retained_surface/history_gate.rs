@@ -425,6 +425,47 @@ pub fn expected_audit_problems(
     problems
 }
 
+/// The report the gate in `retained_history_gate` reads, tab separated: for each snapshot a
+/// `release` line, a `scan` line (`ok` with the number of sightings, or `failed` with the text), a
+/// `sighting` line for each sighting and an `extent` line for each range of lines that an item of a
+/// sighting covers.
+fn render_report(snapshots: &[Snapshot]) -> String {
+    let one_line = |text: &str| text.replace(['\t', '\n'], " ");
+    let mut out = String::new();
+    for snapshot in snapshots {
+        let tag = &snapshot.at.tag;
+        out.push_str(&format!("release\t{tag}\t{}\n", snapshot.at.commit));
+        match &snapshot.sightings {
+            Ok(sightings) => {
+                out.push_str(&format!("scan\t{tag}\tok\t{}\n", sightings.len()));
+                for sighting in sightings {
+                    let kinds: Vec<String> = sighting
+                        .kinds
+                        .iter()
+                        .map(|kind| format!("{kind:?}"))
+                        .collect();
+                    out.push_str(&format!(
+                        "sighting\t{tag}\t{}\t{}\t{}\n",
+                        sighting.krate,
+                        one_line(&sighting.name),
+                        kinds.join(",")
+                    ));
+                }
+                for ((krate, name), extents) in &snapshot.extents {
+                    for (file, first, last) in extents {
+                        out.push_str(&format!(
+                            "extent\t{tag}\t{krate}\t{}\t{file}\t{first}\t{last}\n",
+                            one_line(name)
+                        ));
+                    }
+                }
+            }
+            Err(error) => out.push_str(&format!("scan\t{tag}\tfailed\t{}\n", one_line(error))),
+        }
+    }
+    out
+}
+
 #[test]
 #[ignore = "reads every release tag; run by hand with --show-output"]
 fn the_reader_reads_every_release_tag_with_a_scratch_entry() {
@@ -443,6 +484,15 @@ fn the_reader_reads_every_release_tag_with_a_scratch_entry() {
         println!("problem {problem}");
     }
     let took = started.elapsed();
+    // The report for the gate in its own target: where `KR_HISTORY_REPORT` names a file it is written.
+    if let Some(path) = std::env::var_os("KR_HISTORY_REPORT") {
+        let report = render_report(&snapshots);
+        assert!(
+            !report.contains("\t0\t0\n"),
+            "an extent at line 0: the tokens carry no line numbers"
+        );
+        std::fs::write(&path, report).expect("the report is written");
+    }
     println!(
         "read {} releases of {} tags with the scratch entry in {took:?}",
         snapshots.len(),

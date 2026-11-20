@@ -1483,6 +1483,10 @@ pub enum SightKind {
     Expands,
 }
 
+/// The lines of a product file that the item of a sighting covers: the file, the first and the last
+/// line (the first line of a file is 1).
+pub type Extent = (String, usize, usize);
+
 /// An item that builds, names or sets what a mutation for a worker carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sighting {
@@ -1522,6 +1526,8 @@ struct CrateScan {
     callees: BTreeMap<String, Callees>,
     /// The names of the `macro_rules!` items the crate defines.
     rules: BTreeSet<String>,
+    /// The lines each sighted name's items cover.
+    extents: BTreeMap<String, BTreeSet<Extent>>,
 }
 
 impl Tree {
@@ -1636,6 +1642,21 @@ impl Tree {
                 name,
                 kinds,
             }));
+        }
+        Ok(all)
+    }
+
+    /// The lines that the items of each sighting of the crates `include` accepts cover, by crate and
+    /// name: a sighting that only a mark gives (`Expands`) covers none.
+    pub fn sighting_extents(
+        &self,
+        include: &dyn Fn(&str) -> bool,
+    ) -> Result<BTreeMap<(String, String), BTreeSet<Extent>>, String> {
+        let mut all = BTreeMap::new();
+        for krate in self.crates.keys().filter(|krate| include(krate)) {
+            for (name, extents) in &self.refused(krate, include)?.extents {
+                all.insert((krate.clone(), name.clone()), extents.clone());
+            }
         }
         Ok(all)
     }
@@ -1765,6 +1786,10 @@ pub(super) fn normalised(path: &Path) -> PathBuf {
 }
 
 struct Scanner {
+    /// The file being scanned, relative to the root.
+    file: String,
+    /// The lines of the items that gave each sighted name its sightings.
+    extents: BTreeMap<String, BTreeSet<Extent>>,
     /// The kind of the type of the `impl` block the scan is in, when it is `MutationRequest` or
     /// `ActionTarget`.
     self_kind: Option<SightKind>,
@@ -1819,7 +1844,8 @@ impl Scanner {
     /// bodies then give the parameters' target.
     fn body(&mut self, name: String, tokens: TokenStream) {
         calls_in(&tokens, &mut self.calls);
-        self.sight(name, kinds_in(&tokens, self.self_kind));
+        let kinds = kinds_in(&tokens, self.self_kind);
+        self.sight(name, kinds, &tokens);
     }
 
     /// The tokens of an item that only the scan names: when `tokens` (the item without the nested
@@ -1842,7 +1868,7 @@ impl Scanner {
             .or_insert_with(|| (file.to_owned(), Vec::new()))
             .1
             .push(written.to_string());
-        self.sight(name, kinds);
+        self.sight(name, kinds, written);
     }
 
     /// A constant or a macro call of an `impl` block: named by the block's type, and by the file
@@ -1862,8 +1888,16 @@ impl Scanner {
         }
     }
 
-    fn sight(&mut self, name: String, kinds: BTreeSet<SightKind>) {
+    /// A sighting of `name` by an item whose tokens are `tokens`: the lines they cover are kept.
+    fn sight(&mut self, name: String, kinds: BTreeSet<SightKind>, tokens: &TokenStream) {
         if !kinds.is_empty() && !name.is_empty() {
+            if let Some((first, last)) = lines_of(tokens) {
+                self.extents.entry(name.clone()).or_default().insert((
+                    self.file.clone(),
+                    first,
+                    last,
+                ));
+            }
             self.sightings.entry(name).or_default().extend(kinds);
         }
     }
@@ -1944,7 +1978,7 @@ impl Scanner {
                             calls_in(&expansion, &mut inner);
                         }
                         self.calls.absorb(name.to_string(), inner);
-                        self.sight(format!("macro:{name}"), kinds);
+                        self.sight(format!("macro:{name}"), kinds, &plain());
                         continue;
                     }
                     if kinds.is_empty() {
@@ -1955,7 +1989,7 @@ impl Scanner {
                     }
                     calls_in(&call.mac.tokens, &mut self.calls);
                     match defined_name(&call.mac.tokens) {
-                        Some(name) => self.sight(name, kinds),
+                        Some(name) => self.sight(name, kinds, &plain()),
                         None => {
                             let macro_name = call
                                 .mac
@@ -2007,6 +2041,8 @@ fn scan_crate(
     inventory: &Inventory,
 ) -> Result<CrateScan, String> {
     let mut scanner = Scanner {
+        file: String::new(),
+        extents: BTreeMap::new(),
         self_kind: None,
         sightings: BTreeMap::new(),
         scan_only: BTreeMap::new(),
@@ -2028,6 +2064,7 @@ fn scan_crate(
             .unwrap_or(path)
             .display()
             .to_string();
+        scanner.file.clone_from(&relative);
         scanner.items(&parsed.items, &relative, &under_src)?;
     }
     let scan_names = scanner
@@ -2063,7 +2100,17 @@ fn scan_crate(
         sighted: scanner.calls.sighted,
         callees: scanner.calls.defined,
         rules: scanner.macro_rules,
+        extents: scanner.extents,
     })
+}
+
+/// The first and the last line of the tokens, from the line of their first token to the line where
+/// their last one ends (the span's lines need proc-macro2's `span-locations`).
+fn lines_of(tokens: &TokenStream) -> Option<(usize, usize)> {
+    let all: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    let first = all.first()?.span().start().line;
+    let last = all.last()?.span().end().line;
+    Some((first, last))
 }
 
 /// The expansions of the arms of a `macro_rules!` body: what follows each `=>` outside the

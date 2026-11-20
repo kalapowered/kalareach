@@ -441,6 +441,7 @@ fn clone_snapshot(snapshot: &Snapshot) -> Snapshot {
         krates: snapshot.krates.clone(),
         items: snapshot.items.clone(),
         sightings: snapshot.sightings.clone(),
+        extents: snapshot.extents.clone(),
         records: snapshot.records.clone(),
         source_errors: snapshot.source_errors.clone(),
     }

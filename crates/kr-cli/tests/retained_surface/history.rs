@@ -16,7 +16,7 @@ use kr_protocol::update::CompatibilityLevel;
 
 use super::narrower::{ABSENT, DAEMON_CRATES, Evidence, Item, Narrower, RECEIVER_CRATES};
 use super::releases;
-use super::walker::{Lookup, SightKind, Sighting, Source, Tree, WIRE_NAMES};
+use super::walker::{Extent, Lookup, SightKind, Sighting, Source, Tree, WIRE_NAMES};
 
 /// A release as its tag names it, with the date of its commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +47,8 @@ pub struct Snapshot {
     pub items: BTreeMap<(String, String), Lookup>,
     /// The sightings of the client crates.
     pub sightings: Result<Vec<Sighting>, String>,
+    /// The lines that the items of each sighting cover (none for a failed scan).
+    pub extents: BTreeMap<(String, String), BTreeSet<Extent>>,
     /// Every client row item, every client-crate account and every sighted item.
     pub records: BTreeMap<(String, String), Source>,
     /// The sources that could not be read, by item: a crate whose files do not all parse reads
@@ -531,6 +533,7 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
                     })
                     .collect(),
                 sightings: Err(error),
+                extents: BTreeMap::new(),
                 records: BTreeMap::new(),
                 source_errors: BTreeMap::new(),
             });
@@ -553,6 +556,9 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
     let scan_started = std::time::Instant::now();
     let sightings = tree.sightings(&|krate| is_client(krate));
     let scan_took = scan_started.elapsed();
+    let extents = tree
+        .sighting_extents(&|krate| is_client(krate))
+        .unwrap_or_default();
     let mut records: BTreeMap<(String, String), Source> = BTreeMap::new();
     let mut source_errors: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut wanted: BTreeSet<(String, String)> = client_items(entry)
@@ -612,6 +618,7 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
         krates,
         items,
         sightings,
+        extents,
         records,
         source_errors,
     })
