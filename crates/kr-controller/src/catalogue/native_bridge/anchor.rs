@@ -67,6 +67,17 @@ pub(crate) enum Taken {
     },
 }
 
+/// What a removal did with the folder at a name it had recorded.
+#[derive(Debug)]
+pub(crate) enum FolderRemoval {
+    /// The folder was empty, and it is gone.
+    Removed,
+    /// No folder stood at the name.
+    Gone,
+    /// The folder holds something, so it stays.
+    NotEmpty,
+}
+
 /// A refusal the person is told of: the place is not one an installation may use.
 fn refused(detail: String) -> ControllerError {
     ControllerError::PermissionDenied { detail }
@@ -536,41 +547,57 @@ impl Anchor {
                 parent.flush().map_err(storage)?;
                 Ok(Taken::Removed)
             }
-            _ => Ok(give_back(&parent, place.name, &temporary)),
+            _ => give_back(&parent, place.name, &temporary),
         }
     }
 
-    /// Removes the empty folder at `path`; false where it stayed, which the caller reports as a
-    /// folder that is not empty and leaves. A folder another user can change is refused.
-    pub(crate) fn remove_directory(&self, path: &Path) -> Result<bool> {
-        let Ok(place) = self.place(path) else {
-            return Ok(false);
-        };
-        let Ok(Some(parent)) = self.parent(&place, false) else {
-            return Ok(false);
+    /// Removes the empty folder at `path`, and says what came of it: removed, not there, or not
+    /// empty, which the caller leaves. A folder another user can change is refused, and any other
+    /// failure, a path outside the root, a link or a file on the way, or a flush that fails, is an
+    /// error.
+    pub(crate) fn remove_directory(&self, path: &Path) -> Result<FolderRemoval> {
+        let place = self.place(path)?;
+        let Some(parent) = self.parent(&place, false)? else {
+            return Ok(FolderRemoval::Gone);
         };
         #[cfg(test)]
         walked_pause::run(path);
         check_folder(&parent, path, Act::Remove)?;
-        Ok(parent
-            .remove_directory(place.name)
-            .and_then(|()| parent.flush())
-            .is_ok())
+        match parent.remove_directory(place.name) {
+            Ok(()) => {
+                parent.flush().map_err(storage)?;
+                Ok(FolderRemoval::Removed)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(FolderRemoval::Gone),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists
+                ) =>
+            {
+                Ok(FolderRemoval::NotEmpty)
+            }
+            Err(error) => Err(storage(error)),
+        }
     }
 }
 
 /// Puts a file a removal took out of `name` back, though it is not the file the removal checked,
 /// by a rename that replaces nothing: where another process has made the name again the file stays
-/// under `temporary`, which the outcome names.
-fn give_back(parent: &Dir, name: &str, temporary: &str) -> Taken {
-    match parent.rename_new(temporary, parent, name) {
+/// under `temporary`, which the outcome names, and where another process took the file from under
+/// `temporary` nothing stands at the name. The folder is made durable before this returns, so a
+/// caller that goes on has the name, or the kept file, on storage.
+fn give_back(parent: &Dir, name: &str, temporary: &str) -> Result<Taken> {
+    let outcome = match parent.rename_new(temporary, parent, name) {
         Ok(()) => Taken::Changed,
-        Err(error) if error.kind() == ErrorKind::NotFound => Taken::Changed,
+        Err(error) if error.kind() == ErrorKind::NotFound => Taken::Gone,
         Err(_) => Taken::Kept {
             name: temporary.to_owned(),
             at: parent.join(temporary),
         },
-    }
+    };
+    parent.flush().map_err(storage)?;
+    Ok(outcome)
 }
 
 /// The refusal of a write over a file that is not the one the caller checked.
@@ -1005,6 +1032,11 @@ pub(crate) mod removal_pause {
         }
     }
 }
+
+/// Lets a test make the next flush of a folder fail, as a storage that cannot make a change durable
+/// does.
+#[cfg(all(test, unix))]
+pub(crate) use super::tree::flush_failure;
 
 /// What the unit tests run in a removal after it has read the file at a place and before it reads the
 /// protection of that file, to make the change another process could make in between. The hook is

@@ -593,6 +593,12 @@ mod platform {
 
         /// Makes this directory's own entries durable.
         pub(in crate::catalogue::native_bridge) fn flush(&self) -> std::io::Result<()> {
+            #[cfg(test)]
+            if super::flush_failure::take(self.path()) {
+                return Err(std::io::Error::other(
+                    "the folder could not be made durable",
+                ));
+            }
             rustix::fs::fsync(self.handle.as_fd()).map_err(Into::into)
         }
 
@@ -716,7 +722,7 @@ mod platform {
         if primary != group
             || accounts
                 .iter()
-                .any(|(other, _, theirs)| *theirs == group && *other != name)
+                .any(|(_, id, theirs)| *theirs == group && *id != user)
         {
             return false;
         }
@@ -956,6 +962,13 @@ mod platform {
             assert!(
                 !is_private_group(alone, groups, 4242, 4242),
                 "a user the file does not know"
+            );
+            let namesake = "root:x:0:0:root:/root:/bin/bash\n\
+                ana:x:1000:1000:Ana:/home/ana:/bin/bash\n\
+                ana:x:2000:1000:Ana again:/home/ana-again:/bin/bash\n";
+            assert!(
+                !is_private_group(namesake, "ana:x:1000:\n", 1000, 1000),
+                "an account of the same name and another number has it as its primary group"
             );
         }
 
@@ -1199,6 +1212,33 @@ mod platform {
         ) -> std::io::Result<()> {
             Err(unsupported())
         }
+    }
+}
+
+/// Lets a test make the next flush of one folder on its thread fail.
+#[cfg(all(test, unix))]
+pub(crate) mod flush_failure {
+    use std::cell::Cell;
+    use std::path::Path;
+
+    thread_local! {
+        static NEXT: Cell<Option<&'static str>> = const { Cell::new(None) };
+    }
+
+    /// The next flush on this thread of a folder whose path ends with `folder` fails.
+    pub(crate) fn once_at(folder: &'static str) {
+        NEXT.with(|next| next.set(Some(folder)));
+    }
+
+    /// True once after `once_at`, for the folder it named.
+    pub(super) fn take(path: &Path) -> bool {
+        NEXT.with(|next| match next.get() {
+            Some(folder) if path.ends_with(folder) => {
+                next.set(None);
+                true
+            }
+            _ => false,
+        })
     }
 }
 

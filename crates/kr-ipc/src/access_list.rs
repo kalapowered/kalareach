@@ -15,7 +15,7 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io;
-use std::os::fd::{AsRawFd as _, BorrowedFd};
+use std::os::fd::{AsRawFd as _, BorrowedFd, RawFd};
 
 /// The type of list this platform keeps for a file or a directory, `ACL_TYPE_EXTENDED` in the SDK.
 const ACL_TYPE_EXTENDED: c_int = 0x100;
@@ -68,9 +68,16 @@ impl AccessList {
 /// Returns the system's error when the descriptor is not open or the list cannot be read, and
 /// `InvalidData` when the system's text for the list is not in the form this reads.
 pub fn read(descriptor: BorrowedFd<'_>) -> io::Result<AccessList> {
-    // SAFETY: the call takes the number of a descriptor the borrow keeps open, reads no memory of
-    // this process, and returns a list that is released below, or null.
-    let list = unsafe { acl_get_fd_np(descriptor.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    read_raw(descriptor.as_raw_fd())
+}
+
+/// Reads the list of the object the descriptor numbered `descriptor` holds; a number with nothing
+/// open at it is the error `EBADF`.
+fn read_raw(descriptor: RawFd) -> io::Result<AccessList> {
+    // SAFETY: the call takes a descriptor number and reads no memory of this process; a number
+    // that nothing holds open fails with `EBADF`, and the list it returns is released below, or
+    // null.
+    let list = unsafe { acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) };
     if list.is_null() {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
@@ -140,7 +147,7 @@ mod tests {
     use std::os::fd::AsFd as _;
     use std::path::PathBuf;
 
-    use super::{AccessList, has_no_list, parse, read};
+    use super::{AccessList, has_no_list, parse, read, read_raw};
 
     /// A folder of this test's own, under the temporary folder, gone when this is dropped.
     struct Folder(PathBuf);
@@ -284,11 +291,8 @@ mod tests {
     /// A descriptor that is not open is an error, and not a list that is empty.
     #[test]
     fn a_descriptor_that_is_not_open_is_an_error() {
-        use std::os::fd::BorrowedFd;
-        // SAFETY: the number is far above any descriptor this process holds, so no object is
-        // reached through it; the borrow is only given to a call that reads nothing through it.
-        let closed = unsafe { BorrowedFd::borrow_raw(i32::MAX) };
-        let error = read(closed).expect_err("nothing is held");
+        // The number is far above any descriptor this process holds, so nothing is open at it.
+        let error = read_raw(i32::MAX).expect_err("nothing is held");
         assert_eq!(error.raw_os_error(), Some(libc::EBADF), "{error}");
     }
 }

@@ -244,20 +244,23 @@ impl Fs {
         }
     }
 
-    /// Removes the folder at `path` when it is empty; false for one that could not be removed.
-    fn remove_directory(&self, path: &Path) -> Result<bool> {
+    /// Removes the folder at `path` when it is empty, and says what came of it.
+    fn remove_directory(&self, path: &Path) -> Result<anchor::FolderRemoval> {
         match self {
             Self::Paths => match std::fs::remove_dir(path) {
                 Ok(()) => {
                     if let Some(parent) = path.parent() {
                         sync_directory(parent, NameKind::Directory)?;
                     }
-                    Ok(true)
+                    Ok(anchor::FolderRemoval::Removed)
                 }
-                Err(_) => Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(anchor::FolderRemoval::Gone)
+                }
+                Err(_) => Ok(anchor::FolderRemoval::NotEmpty),
             },
             Self::Walk(walk) => walk.remove_directory(path),
-            Self::Absent(_) => Ok(false),
+            Self::Absent(_) => Ok(anchor::FolderRemoval::Gone),
         }
     }
 
@@ -1134,10 +1137,14 @@ impl Installer {
                 ChangeOperation::CreateDirectory { path } => {
                     // Only when it is empty. A directory that holds anything else holds somebody
                     // else's file.
-                    if self.fs.remove_directory(Path::new(path))? {
-                        removed.push(operation.clone());
-                    } else {
-                        retained.push(format!("{path} is not empty"));
+                    match self.fs.remove_directory(Path::new(path))? {
+                        anchor::FolderRemoval::Removed => removed.push(operation.clone()),
+                        anchor::FolderRemoval::Gone => {
+                            retained.push(format!("{path} is already gone"));
+                        }
+                        anchor::FolderRemoval::NotEmpty => {
+                            retained.push(format!("{path} is not empty"));
+                        }
                     }
                 }
             }
@@ -7081,6 +7088,152 @@ mod tests {
         assert!(!skills.join("new").exists(), "the folder is not made");
     }
 
+    /// KR-REQ-11.01: a removal that puts back a file that was not the one it checked makes the
+    /// folder durable before it goes on, and a flush that fails stops the removal before the
+    /// installation's record is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_flush_that_fails_after_a_file_was_put_back_stops_the_removal_before_its_record_goes() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let skill = tree.home().join(SKILL_FILE);
+        let installed = std::fs::read(&skill).expect("the installed file");
+        let parked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        note_parks(parked.clone());
+        let at = skill.clone();
+        when_read(SKILL_FILE, move || {
+            put_another_file(&at, &installed);
+            anchor::flush_failure::once_at(".amp/skills/kalareach-contact");
+        });
+        let stopped = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a folder that cannot be made durable stops the removal");
+        assert!(
+            matches!(stopped, ControllerError::Storage { .. }),
+            "{stopped}"
+        );
+        assert!(
+            installer
+                .status(&params(amp(), InstallScope::User))
+                .expect("a status")
+                .installed,
+            "the record is still there"
+        );
+        assert!(
+            parked
+                .borrow()
+                .last()
+                .is_some_and(|place| place.ends_with(SKILL_FILE)),
+            "the removal stopped at the file it put back, and took nothing out after it: {:?}",
+            parked.borrow()
+        );
+    }
+
+    /// KR-REQ-11.01: a flush that fails after a recorded folder was removed stops the removal as
+    /// well, and is not taken for a folder that is not empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_flush_that_fails_after_a_folder_was_removed_stops_the_removal_before_its_record_goes() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        std::fs::remove_file(tree.home().join(SKILL_FILE)).expect("the skill goes");
+        std::fs::remove_file(tree.home().join(".amp/mcp.json")).expect("the document goes");
+        when_walked_to(".amp/skills/kalareach-contact", || {
+            anchor::flush_failure::once_at(".amp/skills");
+        });
+        let stopped = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a folder that cannot be made durable stops the removal");
+        assert!(
+            matches!(stopped, ControllerError::Storage { .. }),
+            "{stopped}"
+        );
+        assert!(
+            installer
+                .status(&params(amp(), InstallScope::User))
+                .expect("a status")
+                .installed,
+            "the record is still there"
+        );
+    }
+
+    /// KR-REQ-11.01: a file that another process takes out from under the temporary name the removal
+    /// parked it under leaves nothing at the name, and the removal says it is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_parked_file_another_process_took_is_told_as_gone() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let folder = tree.home().join(".amp/skills/kalareach-contact");
+        let there = folder.clone();
+        when_taken_out(SKILL_FILE, move || {
+            for name in temporary_names(&there) {
+                std::fs::remove_file(there.join(name)).expect("another process takes the file");
+            }
+        });
+        let result = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal tells a file that is gone");
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with("SKILL.md is already gone")),
+            "{:?}",
+            result.retained
+        );
+        assert!(
+            result
+                .removed
+                .iter()
+                .all(|operation| !operation.path().ends_with("SKILL.md")),
+            "it is not counted as removed"
+        );
+    }
+
+    /// KR-REQ-11.01: a recorded folder that is not there is told as gone, and one that holds another
+    /// file is told as not empty and left.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_folder_is_told_as_gone_or_as_not_empty() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let folder = tree.home().join(".amp/skills/kalareach-contact");
+        std::fs::remove_dir_all(&folder).expect("the folder goes");
+        let gone = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal tells a folder that is gone");
+        assert!(
+            gone.retained
+                .iter()
+                .any(|line| line.ends_with("kalareach-contact is already gone")),
+            "{:?}",
+            gone.retained
+        );
+        assert!(
+            gone.retained
+                .iter()
+                .all(|line| !line.ends_with("is not empty")),
+            "{:?}",
+            gone.retained
+        );
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let folder = tree.home().join(".amp/skills/kalareach-contact");
+        std::fs::write(folder.join("theirs.txt"), b"x").expect("another file");
+        let kept = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal leaves a folder that holds another file");
+        assert!(
+            kept.retained
+                .iter()
+                .any(|line| line.ends_with("kalareach-contact is not empty")),
+            "{:?}",
+            kept.retained
+        );
+        assert!(folder.join("theirs.txt").exists(), "their file stays");
+    }
+
     /// KR-REQ-11.01: a write judges the folder it walked to, read through the handle it holds. A
     /// folder another process swaps for a different one at the same name after the walk changes
     /// nothing: an open folder is refused whatever stands at its name afterwards, and a closed one
@@ -7395,16 +7548,18 @@ mod tests {
             list.extend(permissions.to_le_bytes());
             list.extend(id.to_le_bytes());
         }
-        if rustix::fs::setxattr(
+        match rustix::fs::setxattr(
             &place,
             "system.posix_acl_access",
             &list,
             rustix::fs::XattrFlags::empty(),
-        )
-        .is_err()
-        {
-            println!("this file system keeps no POSIX lists, so there is nothing to compare");
-            return;
+        ) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::NOTSUP) => {
+                println!("this file system keeps no POSIX lists, so there is nothing to compare");
+                return;
+            }
+            Err(error) => panic!("a POSIX list is set on the file: {error}"),
         }
         let refused = replace_one_with_two(&tree, &place).expect_err("the replacement is refused");
         assert!(
