@@ -62,7 +62,8 @@
 //!   reference to an equal definition and for `oneOf` branches in a new order too.
 //!
 //! What it does not see: the `kr-plugin-host/3` frames, which have no schema; the types a
-//! daemon-served method names only in its description; rules that live in code; the hand-written
+//! daemon-served method names only in its description; rules that live in code, except the roots
+//! and helpers an entry of the narrower table lists (the held check, below); the hand-written
 //! TypeScript exports; the rest of `package-contract.json` (its limits and tables) and the
 //! component interface. A difference it fails on that is harmless takes a cut or a reviewed
 //! change of the comparison in `public_contract.rs`.
@@ -70,7 +71,11 @@
 //! It fails closed. It cannot list origin's tags, this checkout's tags are not origin's, a release's
 //! tree cannot be read, or a source is in a form it does not read: each is a failure with its own
 //! message, never a release left out. When no release is at the commit's level, the commit moves the
-//! level, and the cut's own check, `scripts/check-retained-release.sh`, runs in the same run.
+//! level, and the cut's own check, `scripts/check-retained-release.sh`, runs in the same run. When a
+//! release is, `scripts/check-narrower-entries.sh` runs instead, whether or not the cut is asked
+//! for: it holds the root and the helpers of each entry of the narrower table to every release at
+//! the level, from the list that `--level-releases` prints, and builds nothing while the table is
+//! empty.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -215,13 +220,7 @@ impl Head {
     /// When the package at `commit` is not this build's, or its table of public majors cannot be
     /// read.
     pub fn of_this_build(repository: &Path, commit: &str) -> Result<Self, String> {
-        let stated = package_version_at(repository, commit)?;
-        if stated != PACKAGE_VERSION {
-            return Err(format!(
-                "the package at {commit} is {stated} and this build is {PACKAGE_VERSION}; run this \
-                 in a clean checkout of the commit to release"
-            ));
-        }
+        this_build_is_at(repository, commit)?;
         let sdk_schema = file_at(repository, commit, SDK_SCHEMA_PATH)
             .map_err(|error| format!("{SDK_SCHEMA_PATH} at {commit} cannot be read: {error}"))?
             .ok_or_else(|| format!("{commit} has no {SDK_SCHEMA_PATH}"))
@@ -251,6 +250,18 @@ impl Head {
                 .collect(),
         })
     }
+}
+
+/// Fails unless the package at `commit` is the version this build has.
+fn this_build_is_at(repository: &Path, commit: &str) -> Result<(), String> {
+    let stated = package_version_at(repository, commit)?;
+    if stated != PACKAGE_VERSION {
+        return Err(format!(
+            "the package at {commit} is {stated} and this build is {PACKAGE_VERSION}; run this \
+             in a clean checkout of the commit to release"
+        ));
+    }
+    Ok(())
 }
 
 /// The level of the configuration document that a release's stored-format lock records: the
@@ -666,27 +677,76 @@ fn table_differences(old: &WorkerSurface, new: &WorkerSurface) -> Vec<String> {
 ///
 /// Whatever the check fails on.
 pub fn run(repository: &Path, cut: bool) -> Result<(), String> {
-    let commit = git_in(repository, &["rev-parse", "--verify", "HEAD^{commit}"])?
-        .trim()
-        .to_owned();
+    let commit = head_commit(repository)?;
     let release_tags = inventory(repository)?;
     agree_with_origin(repository, &release_tags, &commit)?;
     let head = Head::of_this_build(repository, &commit)?;
-    conclude(repository, &head, &release_tags, cut, &run_cut_check)
+    conclude(
+        repository,
+        &head,
+        &release_tags,
+        cut,
+        &run_cut_check,
+        &run_narrower_check,
+    )
 }
 
-/// Compares `head` and prints what it found; a commit that moves the level has its cut checked by
-/// `cut_check` when `cut` says so.
+fn head_commit(repository: &Path) -> Result<String, String> {
+    Ok(
+        git_in(repository, &["rev-parse", "--verify", "HEAD^{commit}"])?
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// Prints `<tag> <commit>` for every release at this build's level other than the commit at
+/// `HEAD`, from the tags of the checkout once they are origin's.
 ///
 /// # Errors
 ///
-/// Whatever the comparison or the cut's check fails on.
+/// What [`level_releases`] fails on, and a package at `HEAD` that is not this build's.
+pub fn print_level_releases(repository: &Path) -> Result<(), String> {
+    let commit = head_commit(repository)?;
+    this_build_is_at(repository, &commit)?;
+    for line in level_releases(repository, CompatibilityLevel::of(PACKAGE_VERSION), &commit)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// `<tag> <commit>` for each release at `level` other than the one at `commit`, which a tag of
+/// this checkout that no history of `commit` reaches belongs to as much as any other.
+///
+/// # Errors
+///
+/// When the tags cannot be read, or are not origin's.
+pub fn level_releases(
+    repository: &Path,
+    level: CompatibilityLevel,
+    commit: &str,
+) -> Result<Vec<String>, String> {
+    let release_tags = inventory(repository)?;
+    agree_with_origin(repository, &release_tags, commit)?;
+    Ok(kept(&release_tags, level, commit)
+        .iter()
+        .map(|release| format!("{} {}", release.tag, release.commit))
+        .collect())
+}
+
+/// Compares `head` and prints what it found; a commit that moves the level has its cut checked by
+/// `cut_check` when `cut` says so, and a commit at a level that has a release has the rules of the
+/// narrower table held to the releases by `held_check`, whatever `cut` says.
+///
+/// # Errors
+///
+/// Whatever the comparison, the cut's check or the held check fails on.
 pub fn conclude(
     repository: &Path,
     head: &Head,
     release_tags: &[Release],
     cut: bool,
     cut_check: &dyn Fn(&Path) -> Result<(), String>,
+    held_check: &dyn Fn(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     let commit = &head.commit;
     match check(repository, head, release_tags)? {
@@ -720,20 +780,28 @@ pub fn conclude(
                     releases.join(", ")
                 );
             }
-            Ok(())
+            held_check(repository)
         }
     }
 }
 
 fn run_cut_check(repository: &Path) -> Result<(), String> {
+    run_script(repository, "scripts/check-retained-release.sh")
+}
+
+fn run_narrower_check(repository: &Path) -> Result<(), String> {
+    run_script(repository, "scripts/check-narrower-entries.sh")
+}
+
+fn run_script(repository: &Path, script: &str) -> Result<(), String> {
     let status = std::process::Command::new("bash")
-        .arg("scripts/check-retained-release.sh")
+        .arg(script)
         .current_dir(repository)
         .status()
-        .map_err(|error| format!("scripts/check-retained-release.sh did not start: {error}"))?;
+        .map_err(|error| format!("{script} did not start: {error}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("scripts/check-retained-release.sh said {status}"))
+        Err(format!("{script} said {status}"))
     }
 }
