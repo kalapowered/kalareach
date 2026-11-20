@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use kr_conformance::plan::{Platform, Step};
-use kr_conformance::plan_file::Plan;
+use kr_conformance::plan_file::{Plan, Values};
 
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
@@ -328,9 +328,9 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "a placeholder outside the plan's",
             step_with(
                 "command = ['cargo', 'test']",
-                "command = ['cargo', 'test', '--target-dir={scratch}/t']",
+                "command = ['cargo', 'test', '--target-dir={nothing}/t']",
             ),
-            "step `one` holds `{scratch}`, which is not a placeholder of the plan (evidence)",
+            "step `one` holds `{nothing}`, which is not a placeholder of the plan (evidence, scratch, root, output)",
         ),
         (
             "a brace that nothing closes",
@@ -338,7 +338,7 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
                 "command = ['cargo', 'test']",
                 "command = ['cargo', 'test', '{evidence']",
             ),
-            "step `one` holds a `{` that no `}` closes, which is not a placeholder of the plan (evidence)",
+            "step `one` holds a `{` that no `}` closes, which is not a placeholder of the plan (evidence, scratch, root, output)",
         ),
         (
             "skips on a step that does not run cargo",
@@ -618,6 +618,211 @@ fn a_key_that_names_a_path_is_refused_with_its_reason_for_each_way_a_path_goes_w
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// The values a run gives the placeholders are put in as they are written: a value that holds the
+/// text of a placeholder is not expanded again, whatever the order the placeholders come in.
+#[test]
+fn a_value_that_holds_the_text_of_a_placeholder_is_put_in_as_it_is_written() {
+    let text = with(&STEP.replace(
+        "command = ['cargo', 'test']",
+        "env = { HERE = '{root}|{scratch}|{evidence}' }\ncommand = ['cargo', 'test', '{evidence}']",
+    ));
+    let plan = Plan::parse(&text, &repository()).expect("the plan loads");
+    let values = Values {
+        evidence: "/e/{root}",
+        root: "/r/{scratch}",
+        scratch: "/s/{evidence}",
+    };
+    let steps = plan.steps(Platform::Linux, &selection(&["rust"]), &values, None);
+    assert_eq!(steps[0].command[2], "/e/{root}");
+    assert_eq!(
+        steps[0].env,
+        [(
+            "HERE".to_owned(),
+            "/r/{scratch}|/s/{evidence}|/e/{root}".to_owned()
+        )]
+    );
+}
+
+/// A step that differs from [`STEP`] in the lines `before`, added ahead of its command, and in the
+/// command `command`, which replaces its own.
+fn step_adding(before: &str, command: &str) -> String {
+    with(&STEP.replace(
+        "command = ['cargo', 'test']",
+        &format!("{before}command = {command}"),
+    ))
+}
+
+/// The planted files of the execution model: a name, the text, and the words the refusal holds.
+fn execution_faults() -> Vec<(&'static str, String, &'static str)> {
+    let cargo = "['cargo', 'test']";
+    let output = |path: &str| {
+        step_adding(
+            &format!("output = '{path}'\n"),
+            "['cargo', 'test', '{output}']",
+        )
+    };
+    vec![
+        (
+            "a directory that is absolute",
+            step_adding("directory = '/tmp'\n", cargo),
+            "step `one` names the `directory` `/tmp`, which is not a relative path",
+        ),
+        (
+            "a directory that holds `..`",
+            step_adding("directory = 'crates/..'\n", cargo),
+            "which holds `..`",
+        ),
+        (
+            "a directory that is not one",
+            step_adding("directory = 'no-such-directory'\n", cargo),
+            "which is not a directory of the repository",
+        ),
+        (
+            "a directory that holds a placeholder",
+            step_adding("directory = '{root}'\n", cargo),
+            "which holds a placeholder",
+        ),
+        (
+            "a cargo step in a directory that is no workspace's root",
+            step_adding("directory = 'crates'\n", cargo),
+            "which no `[rust] manifests` entry is the workspace root of",
+        ),
+        (
+            "a needed name that is not a variable name",
+            step_adding("needs = ['two words']\n", cargo),
+            "step `one` needs `two words`, which is not a variable name",
+        ),
+        (
+            "a variable of a step that is not a variable name",
+            step_adding("env = { 'two words' = 'x' }\n", cargo),
+            "step `one` gives `two words`, which is not a variable name",
+        ),
+        (
+            "a variable of the plan that is not a variable name",
+            with("[env]\n'two words' = 'x'\n"),
+            "`[env]` gives `two words`, which is not a variable name",
+        ),
+        (
+            "a value of a step that holds a placeholder outside the plan's",
+            step_adding("env = { A = '{nothing}' }\n", cargo),
+            "step `one` gives `A` a value that holds `{nothing}`",
+        ),
+        (
+            "a value of the plan that holds a placeholder outside the plan's",
+            with("[env]\nA = '{nothing}'\n"),
+            "`[env]` gives `A` a value that holds `{nothing}`",
+        ),
+        (
+            "a value of the plan that holds the output of a step",
+            with("[env]\nA = '{output}'\n"),
+            "`[env]` gives `A` a value that holds `{output}`",
+        ),
+        (
+            "a word of a command that holds a placeholder outside the plan's",
+            step_adding("", "['cargo', 'test', '{nothing}']"),
+            "step `one` holds `{nothing}`, which is not a placeholder of the plan",
+        ),
+        (
+            "an output outside the report's directory",
+            output("{evidence}/elsewhere/x"),
+            "which is not below `{evidence}/conformance/`",
+        ),
+        (
+            "an output that is an absolute path",
+            output("/tmp/x"),
+            "which is not below `{evidence}/conformance/`",
+        ),
+        (
+            "an output that climbs out of the report's directory",
+            output("{evidence}/conformance/../x"),
+            "which holds `..`, `.` or an empty part",
+        ),
+        (
+            "an output that holds a placeholder",
+            output("{evidence}/conformance/{scratch}"),
+            "which holds a placeholder or a backslash",
+        ),
+        (
+            "an output in the directory of the logs",
+            output("{evidence}/conformance/logs/one.json"),
+            "which is the report's own",
+        ),
+        (
+            "an output that is the result",
+            output("{evidence}/conformance/result.json"),
+            "which is the report's own",
+        ),
+        (
+            "two steps with one output",
+            format!(
+                "{}{}",
+                output("{evidence}/conformance/same.json"),
+                STEP.replace("'one'", "'two'").replace(
+                    "command = ['cargo', 'test']",
+                    "output = '{evidence}/conformance/same.json'\ncommand = ['cargo', 'test', '{output}']"
+                )
+            ),
+            "the steps `one` and `two` name outputs that are equal or nested",
+        ),
+        (
+            "an output inside another step's output",
+            format!(
+                "{}{}",
+                output("{evidence}/conformance/outer"),
+                STEP.replace("'one'", "'two'").replace(
+                    "command = ['cargo', 'test']",
+                    "output = '{evidence}/conformance/outer/inner.json'\ncommand = ['cargo', 'test', '{output}']"
+                )
+            ),
+            "the steps `one` and `two` name outputs that are equal or nested",
+        ),
+        (
+            "a Vitest reading that names no output",
+            step_with("reading = 'cargo'", "reading = 'vitest'\npackage = 'p'"),
+            "step `one` reads a file and names no `output`",
+        ),
+        (
+            "a lane reading that names no output",
+            step_with("reading = 'cargo'", "reading = 'lane'\nlane = 'junit'"),
+            "step `one` reads a file and names no `output`",
+        ),
+        (
+            "an output that no command word and no variable holds",
+            step_adding("output = '{evidence}/conformance/x.json'\n", cargo),
+            "neither its command nor an `env` value holds `{output}`",
+        ),
+        (
+            "a command that holds the output of a step that names none",
+            step_adding("", "['cargo', 'test', '{output}']"),
+            "step `one` holds `{output}` and names no `output`",
+        ),
+    ]
+}
+
+/// Each planted file of the execution model is refused with its own reason. A step whose `{output}`
+/// is held by a variable and not by a command word is accepted.
+#[test]
+fn a_step_of_the_execution_model_is_refused_for_each_fault_by_its_reason() {
+    let root = repository();
+    let accepted = step_adding(
+        "output = '{evidence}/conformance/x.json'\nenv = { WHERE = '{output}', HERE = '{root}', LATER = '{scratch}/y' }\n",
+        "['cargo', 'test']",
+    );
+    let control = Plan::parse(&accepted, &root);
+    assert!(control.is_ok(), "the control file loads: {control:?}");
+    let mut wrong = Vec::new();
+    for (name, text, reason) in execution_faults() {
+        match Plan::parse(&text, &root) {
+            Ok(_) => wrong.push(format!("{name}: the loader refused nothing")),
+            Err(refusal) if refusal.to_string().contains(reason) => {}
+            Err(refusal) => wrong.push(format!(
+                "{name}: refused as `{refusal}`, which lacks `{reason}`"
+            )),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A script that is a link is refused, and so is one that is tracked and is not a link (accepted).
 #[test]
 fn a_script_that_is_a_link_is_refused_and_a_tracked_one_is_accepted() {
@@ -773,14 +978,21 @@ fn the_steps_are_the_plans_in_its_own_order_for_a_platform_and_a_selection() {
     );
     let plan = Plan::parse(&two, &repository()).expect("a plan of two steps");
     let rust = vec!["rust".to_owned()];
-    let linux = plan.steps(Platform::Linux, &rust, "/tmp/e", None);
+    let linux = plan.steps(Platform::Linux, &rust, &Values::evidence("/tmp/e"), None);
     assert_eq!(linux.len(), 2);
-    assert_eq!(plan.steps(Platform::MacOs, &rust, "/tmp/e", None).len(), 1);
+    assert_eq!(
+        plan.steps(Platform::MacOs, &rust, &Values::evidence("/tmp/e"), None)
+            .len(),
+        1
+    );
     assert!(
-        plan.steps(Platform::Windows, &rust, "/tmp/e", None)
+        plan.steps(Platform::Windows, &rust, &Values::evidence("/tmp/e"), None)
             .is_empty()
     );
-    assert!(plan.steps(Platform::Linux, &[], "/tmp/e", None).is_empty());
+    assert!(
+        plan.steps(Platform::Linux, &[], &Values::evidence("/tmp/e"), None)
+            .is_empty()
+    );
 }
 
 /// Runs the program with `arguments` and returns its exit code and what it wrote to stderr.
@@ -1147,7 +1359,8 @@ what = 'the unit tests'
 platforms = ['linux']
 reading = 'vitest'
 package = '.'
-command = ['pnpm', 'run', 'test']
+output = '{evidence}/conformance/unit.json'
+command = ['pnpm', 'run', 'test', '--outputFile.json={output}']
 [[step]]
 id = 'build'
 group = 'node'
@@ -1237,7 +1450,12 @@ fn the_one_expansion_rule_gives_the_words_the_steps_are_run_with() {
         ),
     ] {
         let lines: Vec<String> = plan
-            .steps(platform, &selection(&[group]), "/tmp/e", None)
+            .steps(
+                platform,
+                &selection(&[group]),
+                &Values::evidence("/tmp/e"),
+                None,
+            )
             .iter()
             .map(Step::line)
             .collect();
@@ -1266,7 +1484,12 @@ command = ['cargo', 'test']
     );
     let plan = Plan::parse(&planted, &repository()).expect("the planted plan loads");
     let lines: Vec<String> = plan
-        .steps(Platform::Linux, &selection(&["rust"]), "/tmp/e", None)
+        .steps(
+            Platform::Linux,
+            &selection(&["rust"]),
+            &Values::evidence("/tmp/e"),
+            None,
+        )
         .iter()
         .map(Step::line)
         .collect();

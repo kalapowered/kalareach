@@ -12,7 +12,7 @@ use kr_conformance::lane::{self, Case};
 use kr_conformance::libtest::Outcome as LibtestOutcome;
 use kr_conformance::map::{self, Declarations, Map, Place};
 use kr_conformance::plan::{self, Platform, Reading, Step, Tests};
-use kr_conformance::plan_file::{IgnoredPolicy, Plan};
+use kr_conformance::plan_file::{IgnoredPolicy, Plan, Values};
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Verdict};
 use kr_conformance::run::Executed;
 
@@ -77,7 +77,7 @@ fn options(platform: Platform) -> Options {
 
 fn step(platform: Platform) -> Step {
     core_plan()
-        .steps(platform, &phones(), "/tmp/e", None)
+        .steps(platform, &phones(), &Values::evidence("/tmp/e"), None)
         .pop()
         .expect("a phones step")
 }
@@ -677,7 +677,7 @@ fn a_windows_run_that_selects_the_phones_group_gives_no_rust_test_the_phones_rea
 #[test]
 fn the_phones_group_is_planned_for_linux_and_macos_and_not_for_windows() {
     let plan = core_plan();
-    let runs = |platform| plan.steps(platform, &phones(), "/tmp/e", None);
+    let runs = |platform| plan.steps(platform, &phones(), &Values::evidence("/tmp/e"), None);
     assert_eq!(
         runs(Platform::Linux)[0].reading,
         Reading::Lane(Tests::Junit)
@@ -886,6 +886,7 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
             .into_owned(),
         format!("--results={}", results.display()),
     ];
+    step.output = Some(results.to_string_lossy().replace('\\', "/"));
     let mut run = options(Platform::Linux);
     run.evidence = checked;
     run.plan.steps = Plan::of_steps("phones", vec![step]).steps;
@@ -900,6 +901,50 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
     );
     assert_eq!(document.run.toolchain.phones["gradle"], "8.14.3");
     assert_eq!(document.run.toolchain.phones["java"], "unknown");
+}
+
+/// KR-REQ-29.01, the part about results mapped to acceptance IDs with reproducible commands: the
+/// report reads a lane step's results from the place its plan names as the step's output, whatever
+/// words the command holds: the command here names another place after `--results=`.
+#[cfg(unix)]
+#[test]
+fn the_report_reads_a_lane_step_from_its_output_and_not_from_a_word_of_its_command() {
+    let evidence = tempfile::Builder::new()
+        .prefix("kr-conformance-evidence.")
+        .tempdir()
+        .expect("an evidence directory");
+    let checked = kr_conformance::evidence::check_directory(evidence.path())
+        .expect("inside the temporary directory");
+    let results = checked.join("conformance").join("android");
+    let mut step = step(Platform::Linux);
+    step.command = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "cp -R \"$0\" \"$1\"".to_owned(),
+        fixtures()
+            .join("lane-results")
+            .join("junit")
+            .to_string_lossy()
+            .into_owned(),
+        results.to_string_lossy().into_owned(),
+        format!(
+            "--results={}",
+            checked.join("conformance").join("elsewhere").display()
+        ),
+    ];
+    step.output = Some(results.to_string_lossy().replace('\\', "/"));
+    let mut run = options(Platform::Linux);
+    run.evidence = checked;
+    run.plan.steps = Plan::of_steps("phones", vec![step]).steps;
+    run.lister = PathBuf::from(env!("CARGO_BIN_EXE_kr-conformance"));
+    let base = tempfile::tempdir().expect("a directory for the copy");
+    run.runner_base = base.path().to_path_buf();
+    let document = report::run(&run, &mut |_| {}).expect("the run");
+    assert!(document.passed(), "{:?}", document.problems);
+    assert_eq!(
+        counts(&document, "KR-REQ-15.34"),
+        (Verdict::Passed, 10, 0, 13)
+    );
 }
 
 #[test]

@@ -27,9 +27,10 @@ use crate::libtest::Outcome as LibtestOutcome;
 use crate::map::{self, Binding, Declarations, Map, Place, Reference, TypeScriptRead};
 use crate::observe::{self, Observed};
 use crate::plan::{self, ApplicationsPlan, Platform};
-use crate::plan_file::Plan;
+use crate::plan_file::{Plan, Values};
 use crate::run::{self, Executed};
 use crate::runner_copy;
+use crate::scratch::{self, Scratch};
 use crate::workspace::{TargetId, TargetKind};
 
 /// The result's schema identifier.
@@ -398,20 +399,33 @@ pub enum Stopped {
     /// The report's own program could not be copied where no step builds, or the copy is not
     /// equal to it. No step has run.
     PrivateCopy(String),
+    /// The run's scratch directory could not be made, or would lie in the evidence directory. No
+    /// step has run.
+    Scratch(String),
 }
 
-/// The directories a step of `options` builds in that are known from the options and the
-/// environment: the repository, which holds the build directories the plan's scripts name, and the
-/// target directory a step is given by a variable. A target directory set in Cargo's configuration
-/// file is not named.
-fn build_directories(options: &Options) -> Vec<PathBuf> {
+/// The directories a step of `options` builds in that are known from the options, the steps and the
+/// environment: the repository, which holds the build directories the plan's scripts name, the
+/// target directory the options or the report's environment give, and the one each step is given by
+/// its own variables or the plan's (`steps` carry both). A relative one lies below the directory its
+/// step runs in. A target directory set in Cargo's configuration file is not named.
+fn build_directories(options: &Options, steps: &[plan::Step]) -> Vec<PathBuf> {
     let given = options
         .environment
         .iter()
         .find(|(name, _)| name == "CARGO_TARGET_DIR")
         .map(|(_, value)| std::ffi::OsString::from(value))
         .or_else(|| std::env::var_os("CARGO_TARGET_DIR"));
-    directories_built_in(&options.root, given.as_deref())
+    let mut directories = directories_built_in(&options.root, given.as_deref());
+    for step in steps {
+        if let Some((_, target)) = step.env.iter().find(|(name, _)| name == "CARGO_TARGET_DIR") {
+            let built = options.root.join(&step.directory).join(target);
+            if !directories.contains(&built) {
+                directories.push(built);
+            }
+        }
+    }
+    directories
 }
 
 /// The repository and the target directory `given`, which a step reads from the repository: a
@@ -496,14 +510,10 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             },
         ));
     }
-    for part in ["logs", "vitest"] {
-        std::fs::create_dir(own.join(part)).map_err(|error| {
-            Stopped::Evidence(format!(
-                "{} could not be made: {error}",
-                own.join(part).display()
-            ))
-        })?;
-    }
+    let logs = own.join("logs");
+    std::fs::create_dir(&logs).map_err(|error| {
+        Stopped::Evidence(format!("{} could not be made: {error}", logs.display()))
+    })?;
     let mut problems = Vec::new();
     let before = evidence::before(&options.evidence).unwrap_or_else(|problem| {
         problems.push(problem);
@@ -528,10 +538,17 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                 })
                 .collect(),
         });
+    let root_text = options.root.to_string_lossy().replace('\\', "/");
+    let scratch_path = scratch::path_in(&options.runner_base);
+    let scratch_text = scratch_path.to_string_lossy().replace('\\', "/");
     let steps = options.plan.steps(
         options.platform,
         &groups,
-        &evidence_text,
+        &Values {
+            evidence: &evidence_text,
+            root: &root_text,
+            scratch: &scratch_text,
+        },
         applications_plan.as_ref(),
     );
     let steps = match options.part {
@@ -541,9 +558,11 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
     let runner = runner_copy::private_copy(
         &options.lister,
         &options.runner_base,
-        &build_directories(options),
+        &build_directories(options, &steps),
     )
     .map_err(Stopped::PrivateCopy)?;
+    // Held until the result is made: the directory is removed when the run ends.
+    let _scratch = Scratch::make(scratch_path, &options.evidence).map_err(Stopped::Scratch)?;
     let runner_records = runner
         .parent()
         .map_or_else(PathBuf::new, |directory| directory.join(run::REFUSALS));
@@ -556,13 +575,25 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             step.what,
             step.line()
         ));
+        let directory = if step.directory.is_empty() {
+            options.root.clone()
+        } else {
+            options.root.join(&step.directory)
+        };
+        let environment: Vec<(String, String)> = options
+            .environment
+            .iter()
+            .chain(&step.env)
+            .cloned()
+            .collect();
         let mut done = run::execute(
             step,
             index + 1,
             &run::Place {
                 root: &options.root,
+                directory: &directory,
                 evidence: &options.evidence,
-                environment: &options.environment,
+                environment: &environment,
                 lister: &runner,
             },
             &map.packages,
@@ -1107,13 +1138,14 @@ impl<'a> Resolver<'a> {
                         reason: Some(format!("it returned early and said why: {line}")),
                     },
                 };
-                // The step's own command, less the place it leaves its results, narrowed to the one
-                // case: each script passes what follows `--` on to its tool.
+                // The step's own command, less the words that name the place it leaves its results,
+                // narrowed to the one case: each script passes what follows `--` on to its tool.
+                let output = step.step.output.as_deref();
                 let mut words: Vec<String> = step
                     .step
                     .command
                     .iter()
-                    .filter(|word| !word.starts_with("--results="))
+                    .filter(|word| output.is_none_or(|output| !word.contains(output)))
                     .cloned()
                     .collect();
                 words.push("--".to_owned());

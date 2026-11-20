@@ -13,9 +13,13 @@
 //! A key whose absence means "none" is optional (`scripts`, `lane_directories`, the `[typescript]`
 //! lists and `[terminal_profile]`). The Rust manifests and the ignored-run policy are required: a
 //! plan states them, and no default stands in for a repository's own values.
+//!
+//! A step runs in its `directory` with the plan's `[env]` and its own `env`. A step that reads a
+//! file names it as its `output` and passes it to its tool as `{output}`; the report reads that
+//! file and no word of the command.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
@@ -28,8 +32,10 @@ pub const PLAN_PATH: &str = "conformance/plan.toml";
 /// The programs a step runs: what the repositories' workflows run today.
 pub const PROGRAMS: [&str; 5] = ["cargo", "pnpm", "node", "bash", "python3"];
 
-/// The placeholders a command may hold, each as it is written between braces.
-pub const PLACEHOLDERS: [&str; 1] = ["evidence"];
+/// The placeholders a command, a variable's value or an output may hold, each as it is written
+/// between braces: the evidence directory, the run's scratch directory, the repository, and the
+/// step's own output.
+pub const PLACEHOLDERS: [&str; 4] = ["evidence", "scratch", "root", "output"];
 
 /// Why a plan was not accepted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +104,20 @@ pub struct StepDef {
     /// Variables it reads from the environment the report was started in, which must be set.
     #[serde(default)]
     pub needs: Vec<String>,
+    /// The directory it runs in, relative to the repository; the repository's root when absent. The
+    /// build, the listing of the tests and the run all use it. A `cargo` step's directory is a
+    /// workspace root that `[rust] manifests` names. It is a literal path: it holds no placeholder.
+    #[serde(default)]
+    pub directory: Option<String>,
+    /// Variables it is run with besides the plan's `[env]`; its value of a name replaces the plan's.
+    /// A value may hold the placeholders.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// The one file it writes for the report to read, below `{evidence}/conformance/`: a directory
+    /// for a JUnit lane. Its command or one of its variables holds `{output}`, and a Vitest or lane
+    /// reading names one.
+    #[serde(default)]
+    pub output: Option<String>,
     /// A name filter the command passes to the test binaries, and why tests outside it are not run.
     #[serde(default)]
     pub filter: Option<Reasoned>,
@@ -354,6 +374,10 @@ pub struct Plan {
     /// repository. Absent means none: no lane file is read.
     #[serde(default)]
     pub lane_directories: Vec<String>,
+    /// Variables every step is run with; a step's own `env` replaces a value of the same name. A
+    /// value may hold `{evidence}`, `{scratch}` and `{root}`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     /// The steps, in the order every platform runs them.
     #[serde(default, rename = "step")]
     pub steps: Vec<StepDef>,
@@ -403,6 +427,94 @@ impl Default for Unrun {
     }
 }
 
+/// What the placeholders stand for in one run, each as a path with forward slashes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Values<'a> {
+    /// The evidence directory.
+    pub evidence: &'a str,
+    /// The repository.
+    pub root: &'a str,
+    /// The run's scratch directory.
+    pub scratch: &'a str,
+}
+
+impl<'a> Values<'a> {
+    /// The values of a run whose plan names only its evidence directory.
+    #[must_use]
+    pub fn evidence(evidence: &'a str) -> Self {
+        Self {
+            evidence,
+            root: "",
+            scratch: "",
+        }
+    }
+}
+
+/// `text` with each placeholder given its value. The text is read once, so a value that holds a
+/// brace is left as it is. `output` is the step's own, already expanded.
+fn fill(text: &str, values: &Values<'_>, output: &str) -> String {
+    let mut filled = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        filled.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let value = after.find('}').and_then(|close| {
+            let value = match &after[..close] {
+                "evidence" => values.evidence,
+                "scratch" => values.scratch,
+                "root" => values.root,
+                "output" => output,
+                _ => return None,
+            };
+            Some((value, close))
+        });
+        if let Some((value, close)) = value {
+            filled.push_str(value);
+            rest = &after[close + 1..];
+        } else {
+            filled.push('{');
+            rest = after;
+        }
+    }
+    filled.push_str(rest);
+    filled
+}
+
+/// The step's output with its placeholders given their values.
+fn output_of(definition: &StepDef, values: &Values<'_>) -> Option<String> {
+    definition
+        .output
+        .as_ref()
+        .map(|output| fill(output, values, ""))
+}
+
+/// The variables a step is run with: the plan's, then its own, which replace them, each value with
+/// its placeholders given their values.
+fn environment_of(
+    plan: &Plan,
+    definition: &StepDef,
+    values: &Values<'_>,
+    output: &str,
+) -> Vec<(String, String)> {
+    let mut merged: BTreeMap<&String, &String> = plan.env.iter().collect();
+    merged.extend(definition.env.iter());
+    merged
+        .into_iter()
+        .map(|(name, value)| (name.clone(), fill(value, values, output)))
+        .collect()
+}
+
+/// The components of a relative path, joined with forward slashes: empty for the root.
+fn normal(path: &Path) -> String {
+    path.components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The words the loader adds to a step's command, and the words of its expansion: the command with
 /// the placeholders given their values.
 ///
@@ -414,13 +526,14 @@ impl Default for Unrun {
 #[must_use]
 pub fn expand(
     definition: &StepDef,
-    evidence: &str,
+    values: &Values<'_>,
     applications_skips: &[Reasoned],
 ) -> Vec<String> {
+    let output = output_of(definition, values).unwrap_or_default();
     let mut words: Vec<String> = definition
         .command
         .iter()
-        .map(|word| word.replace("{evidence}", evidence))
+        .map(|word| fill(word, values, &output))
         .collect();
     if words.first().map(String::as_str) == Some("cargo")
         && words.get(1).map(String::as_str) == Some("test")
@@ -470,6 +583,36 @@ fn placeholder_refused(word: &str) -> Option<String> {
         rest = &after[close + 1..];
     }
     None
+}
+
+/// Whether `name` is the name of an environment variable: letters, digits and underscores, not
+/// beginning with a digit.
+fn variable_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The parts of `output` below `{evidence}/conformance/`, or why it is not a place a step may write
+/// its output: it is below that directory, in no part empty, `.` or `..`, and not in the report's
+/// own directory of logs or its result.
+fn output_parts(output: &str) -> Result<Vec<&str>, String> {
+    let Some(rest) = output.strip_prefix("{evidence}/conformance/") else {
+        return Err("is not below `{evidence}/conformance/`".to_owned());
+    };
+    if rest.contains(['{', '}', '\\']) {
+        return Err("holds a placeholder or a backslash".to_owned());
+    }
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.iter().any(|part| matches!(*part, "" | "." | "..")) {
+        return Err("holds `..`, `.` or an empty part".to_owned());
+    }
+    if matches!(parts[0], "logs" | "result.json") {
+        return Err("is the report's own: its logs and its result are there".to_owned());
+    }
+    Ok(parts)
 }
 
 /// The words of `command` that name a script the program runs.
@@ -643,7 +786,28 @@ impl Plan {
 
     fn check(&self, root: &Path) -> Result<(), Refusal> {
         let refuse = |why: String| Err(Refusal(why));
+        for (name, value) in &self.env {
+            if !variable_name(name) {
+                return refuse(format!(
+                    "`[env]` gives `{name}`, which is not a variable name"
+                ));
+            }
+            if let Some(placeholder) = placeholder_refused(value) {
+                return refuse(format!(
+                    "`[env]` gives `{name}` a value that holds {placeholder}, which is not a \
+                     placeholder of the plan ({})",
+                    PLACEHOLDERS.join(", ")
+                ));
+            }
+            if value.contains("{output}") {
+                return refuse(format!(
+                    "`[env]` gives `{name}` a value that holds `{{output}}`, which belongs to one \
+                     step: a step gives it in its own `env`"
+                ));
+            }
+        }
         let mut ids = BTreeSet::new();
+        let mut outputs: Vec<(&str, Vec<&str>)> = Vec::new();
         for step in &self.steps {
             let id = &step.id;
             if !ids.insert(id.as_str()) {
@@ -681,12 +845,98 @@ impl Plan {
                     "step `{id}` holds `--show-output`, which the loader adds and a plan file does not write"
                 ));
             }
+            for name in &step.needs {
+                if !variable_name(name) {
+                    return refuse(format!(
+                        "step `{id}` needs `{name}`, which is not a variable name"
+                    ));
+                }
+            }
+            for (name, value) in &step.env {
+                if !variable_name(name) {
+                    return refuse(format!(
+                        "step `{id}` gives `{name}`, which is not a variable name"
+                    ));
+                }
+                if let Some(placeholder) = placeholder_refused(value) {
+                    return refuse(format!(
+                        "step `{id}` gives `{name}` a value that holds {placeholder}, which is not \
+                         a placeholder of the plan ({})",
+                        PLACEHOLDERS.join(", ")
+                    ));
+                }
+            }
+            let directory = step.directory.as_deref().unwrap_or_default();
+            if let Some(named) = &step.directory {
+                if named.contains(['{', '}']) {
+                    return refuse(format!(
+                        "step `{id}` names the `directory` `{named}`, which holds a placeholder: a \
+                         directory is a literal path of the repository"
+                    ));
+                }
+                if let Some(why) = directory_refused(root, named) {
+                    return refuse(format!(
+                        "step `{id}` names the `directory` `{named}`, which {why}"
+                    ));
+                }
+                let here = normal(Path::new(named));
+                if program == "cargo"
+                    && !self.rust.manifests.iter().any(|manifest| {
+                        Path::new(manifest).parent().map(normal) == Some(here.clone())
+                    })
+                {
+                    return refuse(format!(
+                        "step `{id}` runs `cargo` in `{named}`, which no `[rust] manifests` entry \
+                         is the workspace root of"
+                    ));
+                }
+            }
             for operand in script_operands(&step.command) {
-                if let Some(why) = operand_refused(root, operand) {
+                // The script is read from the step's directory, which is where it runs.
+                let place = match normal(Path::new(directory)).as_str() {
+                    "" => operand.to_owned(),
+                    here => format!("{here}/{operand}"),
+                };
+                if let Some(why) = operand_refused(root, &place) {
                     return refuse(format!(
                         "step `{id}` runs the script `{operand}`, which {why}"
                     ));
                 }
+            }
+            let holds_output = step.command.iter().any(|word| word.contains("{output}"))
+                || step.env.values().any(|value| value.contains("{output}"));
+            match &step.output {
+                Some(output) => {
+                    let parts = match output_parts(output) {
+                        Ok(parts) => parts,
+                        Err(why) => {
+                            return refuse(format!(
+                                "step `{id}` names the `output` `{output}`, which {why}"
+                            ));
+                        }
+                    };
+                    if !holds_output {
+                        return refuse(format!(
+                            "step `{id}` names an `output` and neither its command nor an `env` \
+                             value holds `{{output}}`"
+                        ));
+                    }
+                    if let Some((other, _)) = outputs.iter().find(|(_, theirs)| {
+                        let shared = parts.len().min(theirs.len());
+                        parts[..shared] == theirs[..shared]
+                    }) {
+                        return refuse(format!(
+                            "the steps `{other}` and `{id}` name outputs that are equal or nested"
+                        ));
+                    }
+                    outputs.push((id.as_str(), parts));
+                }
+                None if holds_output => {
+                    return refuse(format!(
+                        "step `{id}` holds `{{output}}` and names no `output`"
+                    ));
+                }
+                None => {}
             }
             match (step.reading, &step.package, &step.lane) {
                 (ReadingKind::Vitest, Some(_), None)
@@ -708,6 +958,14 @@ impl Plan {
                     ));
                 }
             }
+            if step.output.is_none()
+                && matches!(step.reading, ReadingKind::Vitest | ReadingKind::Lane)
+            {
+                return refuse(format!(
+                    "step `{id}` reads a file and names no `output`: the report reads the file the \
+                     output names"
+                ));
+            }
             let carries =
                 step.filter.is_some() || !step.skips.is_empty() || step.skips_from.is_some();
             if carries && program != "cargo" {
@@ -716,7 +974,7 @@ impl Plan {
                 ));
             }
             if let Some(filter) = &step.filter {
-                let words = expand(step, "", &[]);
+                let words = expand(step, &Values::default(), &[]);
                 if !words.contains(&filter.name) {
                     return refuse(format!(
                         "step `{id}` filters by `{}`, which is not a word of its command",
@@ -926,6 +1184,9 @@ impl Plan {
                         _ => None,
                     },
                     needs: step.needs,
+                    directory: (!step.directory.is_empty()).then_some(step.directory),
+                    env: step.env.into_iter().collect(),
+                    output: step.output,
                     filter: step.filter.map(|(name, reason)| Reasoned { name, reason }),
                     skips: Vec::new(),
                     skips_from: None,
@@ -942,15 +1203,15 @@ impl Plan {
     }
 
     /// The steps of the selected `groups` on `platform`, in the plan's order, as the report runs
-    /// them. `evidence` is the directory the placeholders `{evidence}` stand for, and
-    /// `applications` names the programs whose cases are left out, each with its reason; a step that
-    /// skips from the applications is left out of a plan that has none.
+    /// them. `values` are what the placeholders stand for, and `applications` names the programs
+    /// whose cases are left out, each with its reason; a step that skips from the applications is
+    /// left out of a plan that has none.
     #[must_use]
     pub fn steps(
         &self,
         platform: Platform,
         groups: &[String],
-        evidence: &str,
+        values: &Values<'_>,
         applications: Option<&ApplicationsPlan>,
     ) -> Vec<Step> {
         self.selected(Some(platform), groups)
@@ -967,11 +1228,24 @@ impl Plan {
                         })
                         .collect(),
                 };
+                let output = output_of(definition, values);
                 Some(Step {
                     group: definition.group.clone(),
                     what: definition.what.clone(),
-                    command: expand(definition, evidence, &from_applications),
+                    command: expand(definition, values, &from_applications),
                     needs: definition.needs.clone(),
+                    directory: definition
+                        .directory
+                        .as_deref()
+                        .map(|directory| normal(Path::new(directory)))
+                        .unwrap_or_default(),
+                    env: environment_of(
+                        self,
+                        definition,
+                        values,
+                        output.as_deref().unwrap_or_default(),
+                    ),
+                    output,
                     reading: match definition.reading {
                         ReadingKind::Cargo => Reading::Cargo,
                         ReadingKind::Build => Reading::Build,
@@ -1169,7 +1443,7 @@ impl Plan {
         self.steps(
             Platform::Linux,
             &self.groups,
-            "evidence",
+            &Values::evidence("evidence"),
             Some(&ApplicationsPlan {
                 left_out: Vec::new(),
             }),

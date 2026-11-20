@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use kr_conformance::plan::{ApplicationsPlan, Platform};
-use kr_conformance::plan_file::Plan;
+use kr_conformance::plan_file::{Plan, Values};
 use kr_conformance::report::{self, Options};
 
 fn repository() -> PathBuf {
@@ -97,7 +97,7 @@ fn the_command_lines_of_every_selection_are_written_whole_to_the_file_named_by_t
                 writeln!(
                     text,
                     "{:#?}",
-                    plan.steps(platform, groups, "evidence", given)
+                    plan.steps(platform, groups, &Values::evidence("evidence"), given)
                 )
                 .expect("a string");
             }
