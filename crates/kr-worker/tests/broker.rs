@@ -310,6 +310,7 @@ fn open_channel(broker: &Broker, connector: &InstalledConnector) -> GatewayConne
             },
             connector,
             Some(fixture::QUALIFIED_VERSION),
+            None,
         )
         .expect("the application's own channel is opened")
 }

@@ -283,6 +283,17 @@ async fn kr_req_12_26_the_channel_tells_the_model_who_each_message_is_from() {
     );
 }
 
+/// KR-REQ-12.26: the worker writes a message in the notification this forwarder carries. The
+/// worker holds the wire name as a literal of its own, because it cannot name this crate, and this
+/// case is what keeps the two the same.
+#[test]
+fn kr_req_12_26_the_workers_channel_event_name_is_the_one_the_forwarder_carries() {
+    assert_eq!(
+        kr_worker::broker::channel_prompt::CHANNEL_EVENT_WIRE_NAME,
+        kr_hook::claude_code::channel::CHANNEL_EVENT
+    );
+}
+
 /// KR-REQ-12.18: the Channels frames cross as the worker of the release before this one wrote and
 /// read them, recorded in `channel-frames-0.77.json` (a file, not frames this build wrote): the
 /// approval this forwarder relays is the one that worker reads, and the verdict that worker wrote,
