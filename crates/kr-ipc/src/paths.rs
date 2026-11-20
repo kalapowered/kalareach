@@ -1011,17 +1011,18 @@ mod windows {
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetKernelObjectSecurity, GetLengthSid,
         GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
         GetSecurityDescriptorSacl, GetTokenInformation, INHERITED_ACE, IsValidSid,
-        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
         SCOPE_SECURITY_INFORMATION, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
         SE_SACL_AUTO_INHERITED, SE_SACL_PROTECTED, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
-        TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenGroups,
-        TokenOwner, TokenUser,
+        SetKernelObjectSecurity, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY,
+        TOKEN_USER, TokenGroups, TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ENCRYPTED,
         FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GetVolumeInformationByHandleW, READ_CONTROL,
+        GetVolumeInformationByHandleW, OPEN_ALWAYS, READ_CONTROL, WRITE_DAC,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::SystemServices::{
@@ -2184,41 +2185,63 @@ mod windows {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Creates a new file with one explicit security descriptor, written as SDDL, and returns the
-    /// handle that created it.
+    /// How [`create_owner_only_file`] treats a name that is already taken.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Disposition {
+        /// The name has to be free: a name that is taken is an `AlreadyExists` error.
+        New,
+        /// A file that stands at the name is opened as it is and then narrowed, and a free name
+        /// is created.
+        NewOrExisting,
+    }
+
+    /// Opens a file at `path` with one explicit security descriptor, and returns the handle and
+    /// whether a file already stood at the name.
     ///
-    /// The descriptor is part of the creation, so the file never exists under another list. The
-    /// handle holds write, read-control and read-attributes access, shares reading, writing and
-    /// deleting as the standard library's own opens do, and is not inherited by a child. The name
-    /// goes through [`kr_flush::native_name`], which refuses a NUL and lifts the old length limit.
+    /// The descriptor is part of the creation, so a new file never exists under another list; a
+    /// file that already stood at the name keeps the list it had, which only the caller can narrow.
+    /// The handle holds write, read-control and read-attributes access, and for an existing file
+    /// also the right to change its list, shares reading, writing and deleting as the standard
+    /// library's own opens do, and is not inherited by a child. The name goes through
+    /// [`kr_flush::native_name`], which refuses a NUL and lifts the old length limit.
     ///
     /// # Errors
     ///
-    /// Returns the operating system's error when the descriptor cannot be built or the file cannot
-    /// be created with it, and an error of kind `InvalidInput` for a name that holds a NUL.
-    fn create_new_file_with_descriptor(
+    /// Returns the operating system's error when the file cannot be opened or created with it, and
+    /// an error of kind `InvalidInput` for a name that holds a NUL.
+    fn open_with_descriptor(
         path: &Path,
-        descriptor: &str,
-    ) -> std::io::Result<std::fs::File> {
+        built: &BuiltDescriptor,
+        disposition: Disposition,
+    ) -> std::io::Result<(std::fs::File, bool)> {
         use std::os::windows::io::FromRawHandle as _;
 
         let name = kr_flush::native_name(path)?;
-        let built = BuiltDescriptor::parse(descriptor)?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
             lpSecurityDescriptor: built.0,
             bInheritHandle: 0,
         };
+        let (access, creation) = match disposition {
+            Disposition::New => (
+                GENERIC_WRITE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+                CREATE_NEW,
+            ),
+            Disposition::NewOrExisting => (
+                GENERIC_WRITE | READ_CONTROL | FILE_READ_ATTRIBUTES | WRITE_DAC,
+                OPEN_ALWAYS,
+            ),
+        };
         // SAFETY: `name` is a NUL-terminated wide buffer with no NUL before its end, which this
-        // function owns for the call, and `attributes` points at a descriptor that lives until
-        // `built` is dropped, after the call.
+        // function owns for the call, and `attributes` points at a descriptor that lives as long
+        // as `built`, which the caller holds past the call.
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
-                GENERIC_WRITE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+                access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 &raw const attributes,
-                CREATE_NEW,
+                creation,
                 FILE_ATTRIBUTE_NORMAL,
                 std::ptr::null_mut(),
             )
@@ -2226,35 +2249,65 @@ mod windows {
         if handle == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: the handle came from the creation above, is open, and is owned by nothing else.
-        Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
+        // The last error is read before anything else can set it: an open of a name that is taken
+        // succeeds with `ERROR_ALREADY_EXISTS`, and the creation of a free name leaves it zero.
+        let existed = disposition == Disposition::NewOrExisting
+            && std::io::Error::last_os_error().raw_os_error()
+                == Some(ERROR_ALREADY_EXISTS.cast_signed());
+        // SAFETY: the handle came from the call above, is open, and is owned by nothing else.
+        Ok((
+            unsafe { std::fs::File::from_raw_handle(handle.cast()) },
+            existed,
+        ))
     }
 
-    /// Creates a new file that only its owner and this user can reach, and returns the handle that
-    /// created it, with the list checked before any content can be written through it.
+    /// Turns what a refused list read says into an error of the standard library.
+    fn refusal_error(refusal: AccessListRefusal) -> std::io::Error {
+        std::io::Error::other(match refusal {
+            AccessListRefusal::Unreadable(detail) | AccessListRefusal::Policy(detail) => detail,
+        })
+    }
+
+    /// Opens a file that only its owner and this user can reach, and returns the handle, with the
+    /// list checked before any content can be written through it.
     ///
-    /// The file is created with a list of its own, protected from what its directory passes down,
-    /// that allows OWNER RIGHTS, which names whoever owns the file, and this process's user every
-    /// right. Then the volume is asked whether it keeps access lists, and the list is read back
-    /// through the handle and has to be the one set. When either fails the file, which is still
-    /// empty, is removed, and nothing else at the path is touched.
+    /// A new file is created with a list of its own, protected from what its directory passes
+    /// down, that allows OWNER RIGHTS, which names whoever owns the file, and this process's user
+    /// every right. Then the volume is asked whether it keeps access lists, and the list is read
+    /// back through the handle and has to be the one set. When either fails the file, which is
+    /// still empty, is removed, and nothing else at the path is touched.
+    ///
+    /// With [`Disposition::NewOrExisting`] a file that already stands at the name is opened as it
+    /// is and given that list through the handle, before the caller writes or empties anything:
+    /// its owner has to be the account that owns the files this process creates, the volume has
+    /// to keep access lists, and the list has to read back as set. When any of that fails the file
+    /// keeps its contents and its list as they were, or a list no wider than they were, and the
+    /// error says why.
     ///
     /// # Errors
     ///
-    /// Returns an error of kind `Unsupported` when the volume keeps no access lists, another error
-    /// when the list reads back other than as set or cannot be read, and the operating system's
-    /// error when the file cannot be created, among them `AlreadyExists` for a name that is taken.
-    pub(super) fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
-        let refused = |refusal: AccessListRefusal| {
-            std::io::Error::other(match refusal {
-                AccessListRefusal::Unreadable(detail) | AccessListRefusal::Policy(detail) => detail,
-            })
-        };
-        let accounts = TokenAccounts::read().map_err(refused)?;
-        let user = account_in(accounts.user(), &accounts.user, usize::MAX).map_err(refused)?;
-        let descriptor = format!("D:P(A;;GA;;;OW)(A;;GA;;;{})", describe(accounts.user()));
-        let file = create_new_file_with_descriptor(path, &descriptor)?;
-        if let Err(error) = keeps_the_list(&file, &user) {
+    /// Returns an error of kind `Unsupported` when the volume keeps no access lists, an error of
+    /// kind `PermissionDenied` when an existing file belongs to another account or this user may
+    /// not change its list, another error when the list reads back other than as set or cannot be
+    /// read or set, and the operating system's error when the file cannot be opened, among them
+    /// `AlreadyExists` for a taken name under [`Disposition::New`].
+    pub(super) fn create_owner_only_file(
+        path: &Path,
+        disposition: Disposition,
+    ) -> std::io::Result<std::fs::File> {
+        let accounts = TokenAccounts::read().map_err(refusal_error)?;
+        let user =
+            account_in(accounts.user(), &accounts.user, usize::MAX).map_err(refusal_error)?;
+        let built = BuiltDescriptor::parse(&format!(
+            "D:P(A;;GA;;;OW)(A;;GA;;;{})",
+            describe(accounts.user())
+        ))?;
+        let (file, existed) = open_with_descriptor(path, &built, disposition)?;
+        if existed {
+            narrow_existing_file(&file, &built, &user)?;
+            return Ok(file);
+        }
+        if let Err(error) = keeps_the_list(&file, &user, "new file") {
             drop(file);
             let _ = std::fs::remove_file(path);
             return Err(error);
@@ -2262,14 +2315,52 @@ mod windows {
         Ok(file)
     }
 
-    /// Checks that the volume of a new file keeps access lists and that the file's list reads back
-    /// as the one [`create_owner_only_file`] set, `user` being this process's user.
-    fn keeps_the_list(file: &std::fs::File, user: &Account) -> std::io::Result<()> {
+    /// Gives a file that already stood at the name the list [`create_owner_only_file`] sets,
+    /// through the handle that opened it, before anything is written through the handle.
+    ///
+    /// The owner is checked by the rule that decides who owns a file this process creates, the
+    /// volume is asked whether it keeps access lists before the list is set, and the list is read
+    /// back as it is for a new file.
+    fn narrow_existing_file(
+        file: &std::fs::File,
+        built: &BuiltDescriptor,
+        user: &Account,
+    ) -> std::io::Result<()> {
         use std::os::windows::io::AsHandle as _;
 
-        #[cfg(test)]
-        let seen = tests::BEFORE_THE_CHECK
-            .with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook(file)));
+        let held = query_descriptor(file.as_handle(), OWNER_SECURITY_INFORMATION)
+            .and_then(|descriptor| read_descriptor(&descriptor))
+            .map_err(refusal_error)?;
+        if !held.is_owned_as_new_files_are().map_err(refusal_error)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the file belongs to another account, so it cannot be made readable by its owner \
+                 alone",
+            ));
+        }
+        if !volume_keeps_lists(file)? {
+            return Err(no_lists_refusal());
+        }
+        // SAFETY: the handle is open for the call and holds the right to change the list, and the
+        // descriptor lives as long as `built`, which the caller holds past the call.
+        let set = unsafe {
+            SetKernelObjectSecurity(
+                file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                built.0,
+            )
+        };
+        if set == 0 {
+            return Err(std::io::Error::other(format!(
+                "the access list of the file could not be set: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        keeps_the_list(file, user, "file")
+    }
+
+    /// Asks the volume of an open file whether it keeps access lists.
+    fn volume_keeps_lists(file: &std::fs::File) -> std::io::Result<bool> {
         let mut flags: u32 = 0;
         // SAFETY: the handle is open for the call, `flags` is a live out parameter, and the other
         // out parameters are null with a length of zero, which the call documents as "not asked
@@ -2292,18 +2383,32 @@ mod windows {
                 std::io::Error::last_os_error()
             )));
         }
+        Ok(flags & FILE_PERSISTENT_ACLS != 0)
+    }
+
+    /// What a volume that keeps no access lists, such as FAT or exFAT, is told.
+    fn no_lists_refusal() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the volume does not keep access lists, so this file cannot be made readable by its \
+             owner alone",
+        )
+    }
+
+    /// Checks that the volume of a file keeps access lists and that the file's list reads back as
+    /// the one [`create_owner_only_file`] set, `user` being this process's user. `what` names the
+    /// file in the words of a refusal: "new file" or "file".
+    fn keeps_the_list(file: &std::fs::File, user: &Account, what: &str) -> std::io::Result<()> {
+        use std::os::windows::io::AsHandle as _;
+
         #[cfg(test)]
-        {
-            if matches!(seen, Some(tests::Seen::NoLists)) {
-                flags &= !FILE_PERSISTENT_ACLS;
-            }
-        }
-        if flags & FILE_PERSISTENT_ACLS == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "the volume does not keep access lists, so this file cannot be made readable by its \
-                 owner alone",
-            ));
+        let seen = tests::BEFORE_THE_CHECK
+            .with(|hook| hook.borrow_mut().as_mut().and_then(|hook| hook(file)));
+        let keeps = volume_keeps_lists(file)?;
+        #[cfg(test)]
+        let keeps = keeps && !matches!(seen, Some(tests::Seen::NoLists));
+        if !keeps {
+            return Err(no_lists_refusal());
         }
         let read = query_descriptor(
             file.as_handle(),
@@ -2314,7 +2419,7 @@ mod windows {
             Ok(read) => read.discretionary.is_the_owner_only_list(user),
             Err(AccessListRefusal::Unreadable(detail)) => {
                 return Err(std::io::Error::other(format!(
-                    "the access list of the new file could not be read back: {detail}"
+                    "the access list of the {what} could not be read back: {detail}"
                 )));
             }
             Err(AccessListRefusal::Policy(_)) => false,
@@ -2322,10 +2427,10 @@ mod windows {
         #[cfg(test)]
         let as_set = as_set && !matches!(seen, Some(tests::Seen::OtherList));
         if !as_set {
-            return Err(std::io::Error::other(
-                "the access list of the new file reads back other than as set, so it cannot be made \
-                 readable by its owner alone",
-            ));
+            return Err(std::io::Error::other(format!(
+                "the access list of the {what} reads back other than as set, so it cannot be made \
+                 readable by its owner alone"
+            )));
         }
         Ok(())
     }
@@ -2344,7 +2449,8 @@ mod windows {
         path: &Path,
         descriptor: &str,
     ) -> std::io::Result<()> {
-        create_new_file_with_descriptor(path, descriptor).map(drop)
+        let built = BuiltDescriptor::parse(descriptor)?;
+        open_with_descriptor(path, &built, Disposition::New).map(drop)
     }
 
     /// Sets a directory's discretionary list, written as SDDL, without carrying it to anything the
@@ -2469,7 +2575,7 @@ mod windows {
         fn the_new_file_of_the_writers_stays_openable_and_removable_while_it_is_held() {
             let folder = Folder::new("held");
             let path = folder.0.join("new");
-            let file = create_owner_only_file(&path).expect("creates the file");
+            let file = create_owner_only_file(&path, Disposition::New).expect("creates the file");
             let other = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -2564,6 +2670,101 @@ mod windows {
                 "the access list of the new file reads back other than as set, so it cannot be made \
                  readable by its owner alone",
             );
+        }
+
+        /// This process's user, as SDDL writes an account.
+        fn user_text() -> String {
+            let accounts = TokenAccounts::read().expect("this process's token");
+            describe(accounts.user())
+        }
+
+        /// A file that already stands at the name is given the owner-only list through the handle
+        /// that opens it, and keeps its bytes until the caller empties it.
+        #[test]
+        fn an_existing_file_is_narrowed_to_the_owner_only_list_through_its_handle() {
+            use std::io::Write as _;
+
+            let folder = Folder::new("narrowed");
+            let path = folder.0.join("kit");
+            create_file_with_descriptor(
+                &path,
+                &format!("D:P(A;;GA;;;OW)(A;;GA;;;{})(A;;GR;;;AU)", user_text()),
+            )
+            .expect("a file that grants Authenticated Users");
+            std::fs::write(&path, b"what was there").expect("content");
+            let before = FileAccess::of(&path).expect("reads who can reach the file");
+            assert!(
+                !before.is_the_owner_only_list().expect("the token"),
+                "the file starts wider than the owner-only list: {before:?}"
+            );
+
+            let mut file =
+                crate::paths::open_owner_only_in_place(&path).expect("opens and narrows the file");
+
+            let after = FileAccess::of(&path).expect("reads who can reach the file");
+            assert!(
+                after.is_the_owner_only_list().expect("the token"),
+                "the file carries the owner-only list: {after:?}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("reads"),
+                b"what was there",
+                "narrowing the list leaves the bytes"
+            );
+            file.set_len(0).expect("empties through the handle");
+            file.write_all(b"the kit")
+                .expect("writes through the handle");
+            drop(file);
+            assert_eq!(std::fs::read(&path).expect("reads"), b"the kit");
+            assert_eq!(folder.names(), vec!["kit".to_owned()]);
+        }
+
+        /// A file whose list this user may not change is refused with its bytes and its list as they
+        /// were: its owner has no right to change the list because its list gives OWNER RIGHTS none.
+        #[test]
+        fn a_file_whose_list_cannot_be_set_is_refused_and_keeps_its_bytes() {
+            let folder = Folder::new("not-narrowed");
+            let path = folder.0.join("kit");
+            create_file_with_descriptor(
+                &path,
+                &format!("D:P(A;;GRGW;;;OW)(A;;GRGW;;;{})", user_text()),
+            )
+            .expect("a file that leaves no right to change its list");
+            std::fs::write(&path, b"what was there").expect("content");
+            let before = FileAccess::of(&path).expect("reads who can reach the file");
+
+            let error = crate::paths::open_owner_only_in_place(&path)
+                .expect_err("the list cannot be set, so the file is not opened");
+
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).expect("reads"), b"what was there");
+            assert_eq!(
+                FileAccess::of(&path).expect("reads who can reach the file"),
+                before,
+                "the file keeps its list"
+            );
+            assert_eq!(folder.names(), vec!["kit".to_owned()]);
+        }
+
+        /// A free name opened in place is created with the owner-only list, checked, and empty.
+        #[test]
+        fn a_free_name_opened_in_place_makes_a_new_file_with_the_checked_list() {
+            let folder = Folder::new("in-place");
+            let path = folder.0.join("kit");
+
+            let file = crate::paths::open_owner_only_in_place(&path).expect("creates the file");
+
+            assert_eq!(file.metadata().expect("metadata").len(), 0);
+            let access = FileAccess::of(&path).expect("reads who can reach the file");
+            assert!(
+                access.is_the_owner_only_list().expect("the token"),
+                "the new file carries the owner-only list: {access:?}"
+            );
+            assert_eq!(folder.names(), vec!["kit".to_owned()]);
         }
 
         /// This process's token again, as a primary token of its own this test may read and give
@@ -3483,7 +3684,7 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
 fn create_temporary(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
     {
-        windows::create_owner_only_file(path)
+        windows::create_owner_only_file(path, windows::Disposition::New)
     }
     #[cfg(not(windows))]
     {
@@ -3496,6 +3697,32 @@ fn create_temporary(path: &Path) -> std::io::Result<std::fs::File> {
         }
         options.open(path)
     }
+}
+
+/// Opens the file at `path` to be written in place, readable by its owner and this user alone, on
+/// Windows, where a file that is not new has no mode to set.
+///
+/// A free name is created as the two writers create their files: with a list of its own that is
+/// protected from what the directory passes down and names OWNER RIGHTS and this user, checked
+/// through the new handle before any content can be written. A file that already stands there is
+/// opened as it is and given that list through the handle before the caller empties or writes it,
+/// provided the account that owns the files this process creates owns it, its volume keeps access
+/// lists and the list reads back as set. When any of that fails, the file keeps its contents. The
+/// handle can write, and shares reading, writing and deleting.
+///
+/// Unlike [`write_owner_only_file`] this does not go through a temporary file, for the caller whose
+/// destination is the one file the person chose and not the folder it is in. A volume that keeps
+/// no access lists, such as FAT or exFAT, is refused, new files and old alike.
+///
+/// # Errors
+///
+/// Returns an error of kind `Unsupported` for a volume that keeps no access lists, one of kind
+/// `PermissionDenied` for an existing file that belongs to another account or whose list this user
+/// may not change, and another error when the file cannot be opened or its list cannot be set or
+/// read back.
+#[cfg(windows)]
+pub fn open_owner_only_in_place(path: &Path) -> std::io::Result<std::fs::File> {
+    windows::create_owner_only_file(path, windows::Disposition::NewOrExisting)
 }
 
 /// Writes a file owner-only, replacing any previous contents atomically.
