@@ -1462,6 +1462,24 @@ jobs:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
         run: cargo test --locked -p kr-client --lib -- --nocapture --ignored --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
 
+      # The recovery seed has an item of its own in the Credential Manager, and the class it is kept
+      # with decides whether a roaming profile carries it to another computer: the seed has to be
+      # kept with the Local class, which stays on this computer. The test is ignored in an ordinary
+      # run and fails before it writes unless the run sets the switch, which only this step and the
+      # one above set. It writes one item under a service named for the run, checks the item's
+      # class and takes it away, and the step fails unless exactly that one case passed.
+      - name: The recovery seed is kept in this runner's credential store with the Local class
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        shell: bash
+        env:
+          KR_TEST_PLATFORM_SECRET_STORE: "1"
+        run: |
+          log=$(mktemp)
+          cargo test --locked -p kr-crypto --lib -- --nocapture --ignored --exact --color never \
+            store::tests::the_recovery_seed_is_kept_in_the_credential_manager_with_the_local_class \
+            2>&1 | tee "$log"
+          grep -q -E '^test result: ok\. 1 passed; 0 failed' "$log"
+
       # Section 24 at the worker: the durability contract, the outbox, retention, the journal-fault
       # seam, local state and forward-only migration. The root shell each session runs is PowerShell
       # 7 here rather than the `/bin/sh` this platform has not got, and the owner-only check reads
