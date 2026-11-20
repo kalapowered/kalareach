@@ -2246,13 +2246,15 @@ mod windows {
     /// The file is created with a list of its own, protected from what its directory passes down,
     /// that allows OWNER RIGHTS, which names whoever owns the file, and this process's user every
     /// right. Then the volume is asked whether it keeps access lists, and the list is read back
-    /// through the handle and has to be the one set. When either fails the file, which is still
-    /// empty, is removed, and nothing else at the path is touched.
+    /// through the handle and has to be the one set, with an owner this process could have created
+    /// the file as. When any of these fails the file, which is still empty, is deleted through the
+    /// handle and nothing else at the path is touched, whatever is at the path by then; if the
+    /// deletion fails, the error says so and the empty file stays.
     ///
     /// # Errors
     ///
     /// Returns an error of kind `Unsupported` when the volume keeps no access lists, another error
-    /// when the list reads back other than as set or cannot be read, and the operating system's
+    /// when the list or the owner reads back other than as set or cannot be read, and the operating system's
     /// error when the file cannot be created, among them `AlreadyExists` for a name that is taken.
     pub(super) fn create_owner_only_file(path: &Path) -> std::io::Result<std::fs::File> {
         let refused = |refusal: AccessListRefusal| {
@@ -3752,8 +3754,10 @@ fn create_temporary(path: &Path) -> std::io::Result<std::fs::File> {
 /// that is mode 0600. On Windows it is a list of the file's own, protected from what the directory
 /// passes down, that allows every right to OWNER RIGHTS, which names the file's owner, and to this
 /// user, and no one else. Before any content is written the volume is asked whether it keeps access
-/// lists and the list is read back through the new file's own handle; a volume that keeps none, or
-/// a list that reads back other than as set, refuses the write, and the new file is removed.
+/// lists and the list is read back through the new file's own handle; a volume that keeps none, a
+/// list that reads back other than as set, or an owner this process could not have created the file
+/// as, refuses the write. A refusal removes the empty file it made, through its own handle; if the
+/// removal fails, the refusal says so and the empty file stays.
 /// On Windows the rename is tried again while another program holds the file it replaces or the new
 /// one, as [`kr_flush::retry_while_held`] says; nothing about the destination is checked before
 /// it, so there is nothing to check again.
@@ -3763,11 +3767,13 @@ fn create_temporary(path: &Path) -> std::io::Result<std::fs::File> {
 ///
 /// - the file carries none of the entries its directory passes down, the system's and the
 ///   Administrators group's among them;
-/// - under an elevated token the file's owner is the Administrators group, and a program of the
-///   same user that is not elevated can open it, where the open used to be refused; the reader of
-///   [`read_owner_only_file`] then refuses it for its owner and not for the open;
-/// - a volume that keeps no access lists, such as FAT or exFAT, or a share whose server cannot keep
-///   one, refuses the write where it used to succeed.
+/// - a program that is not elevated can now open a file that an elevated command wrote also in a
+///   directory that gives this user no entry (a private directory is one example; there, that open
+///   was refused before). The file takes the token's default owner, and where that owner is the
+///   Administrators group the reader of [`read_owner_only_file`] refuses such a file for its owner,
+///   as it did before in other directories;
+/// - a volume that keeps no access lists, such as FAT or exFAT, a share whose server cannot keep
+///   one, or a share that records another owner, refuses the write where it used to succeed.
 ///
 /// # Errors
 ///

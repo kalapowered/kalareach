@@ -1196,16 +1196,17 @@ file is created new. Something already at the name, a link included, is refused 
 read and again where the file is made, and is left as it was. The bytes go into a file beside the
 final name, which is given its name without replacing anything, so a failed export leaves no partial
 file. The mode is 0600 on Unix. On Windows the file is given an access list that names your account
-and the file's owner (your account, or the Administrators group when the command runs as
-administrator), and no one else. The command reads that list back from the new file before it writes
-any byte, and it refuses a volume that keeps no access lists, such as FAT or exFAT. On Windows this
-differs from a file that took its folder's list: the file carries none of the entries its folder
-passes down, the system's and the Administrators group's among them; a program of your account that
-is not elevated can open a file that an elevated command wrote, and the reader of this host then
-refuses it because the Administrators group owns it; and a volume that keeps no access lists is
-refused. On Unix the file is given its name by a hard link, so an export to a FAT or exFAT volume, or
-to some network shares, is refused. Windows gives it its name by a rename that replaces nothing,
-which needs no hard link. Nothing is uploaded, and no destination
+and the file's owner (your account, or, when the command runs as administrator, usually the
+Administrators group), and no one else. The command reads that list back from the new file before it
+writes any byte, and it refuses a volume that keeps no access lists, such as FAT or exFAT. The empty
+file it made for the check is removed; if that fails, the refusal says so and the empty file stays.
+On Windows this differs from a file that took its folder's list: the file carries none of the
+entries its folder passes down, the system's and the Administrators group's among them; a program of
+your account that is not elevated can open a file that an elevated command wrote, also in a folder
+that gives your account no entry of its own; and a volume that keeps no access lists, or a share
+that records another owner, is refused. On Unix the file is given its name by a hard link, so an
+export to a FAT or exFAT volume, or to some network shares, is refused. Windows gives it its name by
+a rename that replaces nothing, which needs no hard link. Nothing is uploaded, and no destination
 is chosen for you.
 
 With `--json` the command prints one document: `ok`, `session_id`, `display_number`, `path`,
