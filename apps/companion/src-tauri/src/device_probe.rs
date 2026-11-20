@@ -100,7 +100,7 @@ pub fn leaves_the_keychain_alone() -> bool {
 
 /// Runs the checks a script asked for, if it asked: the request is read once and taken away.
 pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    let Ok(data) = app.path().app_data_dir() else {
+    let Ok(data) = companion_platform::companion_data_dir(app) else {
         return;
     };
     let directory = data.join("kr-probe");

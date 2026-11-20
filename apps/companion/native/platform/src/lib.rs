@@ -1,11 +1,13 @@
 //! The companion's native platform services, shared by every feature that needs them.
 //!
-//! Ten services, each a mechanism with no feature's policy in it:
+//! Eleven services, each a mechanism with no feature's policy in it:
 //!
 //! * [`secrets`]: the one secure store the companion keeps secrets in. The Keychain on macOS and
 //!   iOS, the Credential Manager on Windows, the Secret Service on Linux, and on Android files
 //!   sealed under a non-exportable Keystore key. An account's tokens and a device's keys both live
 //!   here, and nothing writes a second store.
+//! * [`data_dir`]: the one folder the companion keeps its records in, which on Windows is the
+//!   folder that stays on this computer, with the keys, and not the one a roaming profile carries.
 //! * [`backup`]: marking a directory as not to be backed up, on the systems whose backup would carry
 //!   a record without the key it was made beside.
 //! * [`protection`]: whether the device's protected data can be read yet, and the system's word
@@ -39,6 +41,7 @@ use tauri::{Manager as _, Runtime};
 pub mod backup;
 pub mod browser;
 pub mod call;
+pub mod data_dir;
 pub mod notify;
 pub mod presence;
 pub mod protection;
@@ -47,6 +50,8 @@ pub mod scan;
 pub mod secrets;
 #[cfg(target_os = "android")]
 mod tls;
+
+pub use data_dir::companion_data_dir;
 
 /// The plugin's name.
 pub const NAME: &str = "companion-platform";

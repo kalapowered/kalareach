@@ -1077,9 +1077,7 @@ pub async fn call_check<R: Runtime>(
     report: &mut (dyn FnMut(&Check) + Send),
 ) -> Vec<Check> {
     let driver = match harness.mode {
-        Mode::Delegating => app
-            .path()
-            .app_data_dir()
+        Mode::Delegating => companion_platform::companion_data_dir(app)
             .map_err(|error| error.to_string())
             .and_then(|data| PeerDriver::from_files(&data, harness)),
         Mode::NativeFailure | Mode::Outage | Mode::LockScreen => {

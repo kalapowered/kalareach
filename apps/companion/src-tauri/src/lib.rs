@@ -119,7 +119,7 @@ pub fn run() {
             // The place for what this application keeps on this device: the answers a host did not
             // confirm and the drafts a person has not sent. It is given before the window opens, so
             // no command the page calls at once finds the application without it.
-            match app.path().app_data_dir() {
+            match companion_platform::companion_data_dir(app) {
                 Ok(data) => app.state::<AppState>().keep_under(&data),
                 Err(error) => {
                     tracing::warn!(
@@ -282,7 +282,7 @@ fn voice_calls(app: &tauri::AppHandle) -> voice::Calls {
             service,
             voice::Timings::default(),
             // What a call left owed, and the note, are kept in the application's own directory.
-            match app.path().app_data_dir() {
+            match companion_platform::companion_data_dir(app) {
                 Ok(directory) => voice::Kept::at(directory),
                 Err(error) => {
                     tracing::warn!(%error, "this device has no place to keep what a voice call left owed");
@@ -314,7 +314,7 @@ fn manage_harness(
     use companion_platform::call::{NativeCalls, PluginCommands};
     use tauri::Manager as _;
 
-    let kept = match app.path().app_data_dir() {
+    let kept = match companion_platform::companion_data_dir(app) {
         Ok(directory) => voice::Kept::at(directory),
         Err(_) => voice::Kept::nowhere(),
     };
@@ -378,11 +378,8 @@ fn build_account(
     let mut signed_in = SignedInAccount::new(Arc::clone(&service), store, client);
     #[cfg(desktop)]
     {
-        use tauri::Manager as _;
-        let directory = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| error.to_string())?;
+        let directory =
+            companion_platform::companion_data_dir(app).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
         signed_in = signed_in.with_shared_lock(directory.join("account.lock"));
     }
@@ -406,11 +403,8 @@ fn build_account(
     );
     #[cfg(desktop)]
     {
-        use tauri::Manager as _;
-        let directory = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| error.to_string())?;
+        let directory =
+            companion_platform::companion_data_dir(app).map_err(|error| error.to_string())?;
         deletion = deletion.with_shared_lock(directory.join("deletion.lock"));
     }
     let deletion = Arc::new(deletion);
@@ -660,7 +654,7 @@ fn open_the_records(app: &tauri::AppHandle) -> Result<()> {
 
     use tauri::Manager as _;
 
-    let data = app.path().app_data_dir().map_err(|error| {
+    let data = companion_platform::companion_data_dir(app).map_err(|error| {
         error::CommandError::stated(
             ErrorCode::ResourceUnavailable,
             format!("there is no application data directory: {error}"),
@@ -775,9 +769,7 @@ const fn keep_records_out_of_backup(
 /// Opens the sync service setting, which needs no keys, and starts telling the page about the
 /// settings, so a step that begins at once is heard.
 fn open_sync_service(app: &tauri::AppHandle) {
-    use tauri::Manager as _;
-
-    let Ok(data) = app.path().app_data_dir() else {
+    let Ok(data) = companion_platform::companion_data_dir(app) else {
         tracing::warn!("no application data directory, so this computer keeps no sync setting");
         return;
     };
@@ -790,7 +782,7 @@ fn open_sync_service(app: &tauri::AppHandle) {
 fn open_recovery(app: &tauri::AppHandle) {
     use tauri::Manager as _;
 
-    let Ok(data) = app.path().app_data_dir() else {
+    let Ok(data) = companion_platform::companion_data_dir(app) else {
         return;
     };
     let Ok(device) = app.state::<AppState>().device() else {
@@ -812,9 +804,7 @@ fn open_recovery(app: &tauri::AppHandle) {
 /// Opens this computer's reader of its own mailbox, once the pairing records and the sync service
 /// setting are open.
 fn open_mailbox(app: &tauri::AppHandle) {
-    use tauri::Manager as _;
-
-    let Ok(data) = app.path().app_data_dir() else {
+    let Ok(data) = companion_platform::companion_data_dir(app) else {
         return;
     };
     if let Err(error) = start_mailbox(app, &data) {
@@ -951,7 +941,7 @@ pub fn start_recovery<R: tauri::Runtime>(
 fn open_push(app: &tauri::AppHandle) {
     use tauri::Manager as _;
 
-    let Ok(data) = app.path().app_data_dir() else {
+    let Ok(data) = companion_platform::companion_data_dir(app) else {
         return;
     };
     if let Err(error) = start_push(app, &data) {
