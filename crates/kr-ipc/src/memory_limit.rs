@@ -115,7 +115,6 @@ pub struct MemoryLimit {
     _job: OwnedHandle,
     /// Where the job posts that a process in it passed the limit.
     port: OwnedHandle,
-    limit_bytes: u64,
 }
 
 impl MemoryLimit {
@@ -225,17 +224,7 @@ impl MemoryLimit {
         if asked != 0 && inside == 0 {
             return Err("this host did not report the process in the job");
         }
-        Ok(Self {
-            _job: job,
-            port,
-            limit_bytes,
-        })
-    }
-
-    /// The limit asked for, in bytes. The system holds it to a whole number of pages.
-    #[must_use]
-    pub const fn limit_bytes(&self) -> u64 {
-        self.limit_bytes
+        Ok(Self { _job: job, port })
     }
 
     /// Whether the job has recorded that the system refused the process a commit because it would
@@ -481,7 +470,6 @@ mod tests {
         let mut child = held_child_asking(ask);
         let limit = MemoryLimit::around(child.as_handle(), limit_bytes)
             .expect("the limit is applied to the child");
-        assert_eq!(limit.limit_bytes(), limit_bytes);
         resume(child.as_handle()).expect("the child is let run");
         let ended = child.wait().expect("the child ends");
         (ended.code(), limit.take_refusal(), limit.take_refusal())
