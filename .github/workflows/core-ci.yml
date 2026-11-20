@@ -97,9 +97,10 @@ jobs:
       # mirror: the script retries the update and the download, each under a bound, until a deadline
       # and installs from what it fetched. The deadlines are 30, 5, 5, 5 and 10 minutes, 55 in all,
       # and the ssh, tmux and fuse3 steps usually run no apt at all. A run whose Test step takes its
-      # 225 minutes and whose mirror is slow in every step can pass the job's 360 minutes by what
-      # the steps after it have left. This step's deadline is 30 minutes. The companion job installs
-      # the same list, and the two lists stay equal so that the two jobs share one set of archives.
+      # 225 minutes and whose mirror is slow in every step can reach the job's 360-minute bound
+      # before the steps after the Test step end. This step's deadline is 30 minutes. The companion
+      # job installs the same list, and the two lists stay equal so that the two jobs share one set
+      # of archives.
       # The archives are kept in the Actions cache: a run on a runner whose mirror is slow then
       # fetches what has changed and not the whole set. apt accepts a cached archive by its size
       # alone, so the script copies one only when its SHA-256 matches the package index and fetches
