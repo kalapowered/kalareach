@@ -779,6 +779,18 @@ fn every_decision_a_group_takes_is_what_core_s_file_says() {
             applications,
             "{names:?}"
         );
+        for package in [
+            "packages/protocol",
+            "packages/plugin-sdk",
+            "apps/companion",
+            "packages/no-such-package",
+        ] {
+            assert_eq!(
+                plan.selects_package(&groups, package),
+                typescript && package != "packages/no-such-package",
+                "{package} {names:?}"
+            );
+        }
         for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
             let unix = platform != Platform::Windows;
             assert_eq!(
