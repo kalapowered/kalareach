@@ -61,6 +61,13 @@
 # it. A leg that breaks by itself on every attempt fails, and a leg that passed only on a replay ends
 # with exit 4, partial, naming each attempt's failure: a rerun is not a pass.
 #
+# On the emulator the wait for the result also watches the application's process. When the system
+# ends it (the emulator's Play Store updating the WebView does, for every application that shows
+# one) the wait stops at the second look that finds it gone, says so with the system's record of why,
+# and the attempt is played again like a break of the recorder when that record names the install of a
+# package and no check of the application had failed. A process that ended for another reason fails
+# the leg. The simulator's wait does not look at its process: it waits out its limit.
+#
 # The fourth mode, `lock-screen` (Android only), runs a call against the peer and, while it is up, first
 # reads the call's own screen and presses its microphone control (the screen says the microphone is
 # on and offers to mute it; muted, it says so and offers to unmute it; unmuted, it says it is on
@@ -622,14 +629,16 @@ note_verdict() { # <leg> <status> [<attempts>]
 # `leg_is_replayable`): a break the leg did not make, which a phone's recorder can make when the device
 # is busy with its own start (the emulator on a loaded machine does). The attempt counts for nothing,
 # is kept under its own name with the failed checks it lists, and the leg's verdict is its last
-# attempt's. An attempt in which anything else failed (the revocation of the grant, the end of the
-# call, a wrong or doubled reply to a delegation, a host that gave no verdict, a result that never says
-# done) fails the leg at once, so that a later clean attempt never hides it. A leg whose recorder
+# attempt's. An attempt whose application the system ended for the install of a package is played
+# again the same way (`system_ended_the_application`). An attempt in which anything else failed (the
+# revocation of the grant, the end of the call, a wrong or doubled reply to a delegation, a host that
+# gave no verdict, a result that never says done for any other reason) fails the leg at once, so that
+# a later clean attempt never hides it. A leg whose recorder
 # breaks by itself on every attempt fails, and says so. A rerun is not a pass: a leg that passed only
 # on a later attempt ends with exit 4, "partial", naming the leg and what failed in each attempt, so
 # that exit 0 of the script says every leg passed on its first attempt.
 play_leg() { # <leg> <runner> <runner arguments...>
-    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}" kept history=""
+    local each=$1 runner=$2 rc attempt=1 attempts="${KR_LEG_ATTEMPTS:-3}" kept history="" reason
     shift 2
     while :; do
         begin_run "$each"
@@ -638,10 +647,15 @@ play_leg() { # <leg> <runner> <runner arguments...>
         end_run
         [ "$rc" != 0 ] || break
         leg_is_replayable "$artefacts/$result_name" "$log" "$artefacts/host-judge.rc" || break
-        history="$history attempt $attempt: $(grep -h ' ok=0 detail=' "$artefacts/$result_name" | cut -c1-200 | tr '\n' ' ')"
-        say "== leg ${each:-the call} attempt $attempt of $attempts: the recorder broke by itself"
+        if grep -q '^done=1$' "$artefacts/$result_name" 2>/dev/null; then
+            reason="the recorder broke by itself"
+        else
+            reason="the system ended the application's process"
+        fi
+        history="$history attempt $attempt: $(grep -h ' ok=0 detail=' "$artefacts/$result_name" | cut -c1-200 | tr '\n' ' ')$(grep -h "the application's process ended" "$log" | cut -c1-200)"
+        say "== leg ${each:-the call} attempt $attempt of $attempts: $reason"
         if [ "$attempt" -ge "$attempts" ]; then
-            say "== leg ${each:-the call}: the recorder broke by itself on all $attempts attempts, so the leg fails"
+            say "== leg ${each:-the call}: $reason on all $attempts attempts, so the leg fails"
             break
         fi
         kept="$artefacts-attempt-$attempt"
@@ -741,10 +755,26 @@ run_ios() {
     return "$worst"
 }
 
+# The wait for the application's result on the emulator looks at it three ways: the lines it has
+# written, whether its process runs, and the system's record of why that process ended (the
+# `am_kill` line of the events log, which names the reason). They read the device and process of the
+# run that `android_run` has set.
+android_written() { "$app_adb" -s "$app_serial" shell run-as "$app_id" cat "kr-probe/$result_name" 2>/dev/null | tr -d '\r'; }
+android_runs() { [ -n "$("$app_adb" -s "$app_serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')" ]; }
+android_end_record() {
+    "$app_adb" -s "$app_serial" logcat -b events -d 2>/dev/null | tr -d '\r' \
+        | grep -F "am_kill" | grep -F ",$app_pid,$app_id," | tail -1 | cut -c1-300
+}
+android_cues() { # <the result text so far>
+    take_the_service_away_when_cued "$1"
+    lock_the_screen_when_cued "$1"
+}
+
 # One call on the emulator: a fresh install, the host and the stand-in, the request, the
 # application, and the verdicts.
 android_run() { # <adb> <serial> <package>
     local adb="$1" serial="$2" apk="$3"
+    app_adb="$adb" app_serial="$serial" app_pid=""
     "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
     "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the package did not install"; return 2; }
     "$adb" -s "$serial" shell pm grant "$app_id" android.permission.RECORD_AUDIO
@@ -785,30 +815,25 @@ android_run() { # <adb> <serial> <package>
     "$adb" -s "$serial" shell am start -n "$app_id/.MainActivity" >/dev/null
     # The process is named while it runs: a log read by pid after the application has ended has
     # no pid to read.
-    local pid="" tries=0
-    while [ -z "$pid" ] && [ "$tries" -lt 20 ]; do
-        pid="$("$adb" -s "$serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')"
-        [ -n "$pid" ] || { sleep 1; tries=$((tries + 1)); }
+    local tries=0
+    while [ -z "$app_pid" ] && [ "$tries" -lt 20 ]; do
+        app_pid="$("$adb" -s "$serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')"
+        [ -n "$app_pid" ] || { sleep 1; tries=$((tries + 1)); }
     done
 
-    local text="" until=$((SECONDS + 420))
-    while :; do
-        text="$("$adb" -s "$serial" shell run-as "$app_id" cat "kr-probe/$result_name" 2>/dev/null | tr -d '\r')"
-        case "$text" in *done=1*) break ;; esac
-        take_the_service_away_when_cued "$text"
-        lock_the_screen_when_cued "$text"
-        sleep 2
-        [ "$SECONDS" -lt "$until" ] || break
-    done
-    printf '%s\n' "$text" >"$artefacts/$result_name"
+    # The result stays readable after the application's process has ended, so the wait asks the
+    # process too: the system ends it, for the install of a package among other reasons, and it then
+    # writes nothing more.
+    wait_for_result 420 2 android_written android_runs android_cues android_end_record
+    printf '%s\n' "$waited_text" >"$artefacts/$result_name"
     # What the lock-screen leg found, in the lines the application's own checks have.
     if [ "$mode" = lock-screen ] && [ -s "$harness/script-checks.txt" ]; then
         lock_judge_trail "$artefacts/$result_name"
         cat "$harness/script-checks.txt" >>"$artefacts/$result_name"
     fi
     # What the application said while it ran, kept for a run that wrote no result.
-    if [ -n "$pid" ]; then
-        "$adb" -s "$serial" logcat -d --pid="$pid" 2>/dev/null \
+    if [ -n "$app_pid" ]; then
+        "$adb" -s "$serial" logcat -d --pid="$app_pid" 2>/dev/null \
             | grep -v -E 'avc: |AssetManager|HWUI|vulkan|glBind|Tauri/Plugin' | tail -1500 >"$artefacts/logcat.log"
     else
         "$adb" -s "$serial" logcat -d 2>/dev/null | tail -300 >"$artefacts/logcat.log"
