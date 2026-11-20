@@ -272,6 +272,15 @@ async fn a_stop_marks_the_row_closed_before_it_is_deleted_and_hangs_up_only_when
     let own = started(&world).await;
     assert!(world.provider.close(&own.call_id).await.is_err());
     assert_eq!(states(&world), [CallState::Unresolved]);
+    // A 404 whose body names another code is no closure either.
+    let world = fresh();
+    world.stand_in.answer_close(false);
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, Some(other_code_body())));
+    let own = started(&world).await;
+    assert!(world.provider.close(&own.call_id).await.is_err());
+    assert_eq!(states(&world), [CallState::Unresolved]);
     // An empty 404 is not a closure; a 404 with the recorded code is.
     let world = fresh();
     world.stand_in.answer_close(false);
@@ -426,10 +435,15 @@ async fn a_start_that_a_removal_fenced_hangs_a_late_creation_up_with_the_origina
         settled
     };
     let (outcome, settled) = tokio::join!(dispatch, removal);
-    assert!(matches!(
-        outcome.expect("an answer"),
-        VoiceStart::Refused(_)
-    ));
+    let VoiceStart::Refused(refusal) = outcome.expect("an answer") else {
+        panic!("a creation after the fence is refused");
+    };
+    assert_eq!(
+        refusal.reason,
+        VoiceRefusalReason::ProviderRefused,
+        "the creation is refused where the fence is found, not let into readiness"
+    );
+    assert_eq!(refusal.message, words::SETTLING);
     assert_eq!(settled, Settled::LateSessionClosed);
     let hangups = world.stand_in.recorded().hangups;
     assert_eq!(hangups.len(), 1);
@@ -788,6 +802,14 @@ async fn a_reconcile_closes_stored_calls_that_no_live_call_owns_and_deletes_clos
     world
         .stand_in
         .script_hangup(HangupScript::Answer(404, Some(Vec::new())));
+    world.provider.reconcile().await;
+    assert_eq!(states(&world), [CallState::Unresolved]);
+    // A 404 whose body names another code is no closure either.
+    let world = fresh();
+    stored(&world, 4, CallState::Open, Some("live_c"));
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, Some(other_code_body())));
     world.provider.reconcile().await;
     assert_eq!(states(&world), [CallState::Unresolved]);
     // A mark that cannot be written keeps the row's earlier state.
@@ -1726,6 +1748,14 @@ async fn a_closure_on_the_retained_channel_is_read_before_the_next_attachment_re
         "a closure the provider told is not hung up"
     );
     assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+/// A 404 body that is JSON and names a code other than the recorded one.
+fn other_code_body() -> Vec<u8> {
+    json!({ "error": { "type": "invalid_request_error", "code": "invalid_request",
+        "message": "The request could not be completed" } })
+    .to_string()
+    .into_bytes()
 }
 
 /// Lets the other tasks run, without moving the clock, until the stand-in has seen `count`
