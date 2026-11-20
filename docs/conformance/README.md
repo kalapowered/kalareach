@@ -273,12 +273,12 @@ In a plan run in parts, a set-up step that a step names is not cut by count. It 
 part that holds a step naming it, directly or through another set-up step, so it runs once in each
 of those parts. A set-up step that no step names is cut by count like any other step.
 
-The result's record of a step does not name its `directory` or its `env`, which has two
-consequences. A test's `command` in the result holds neither, so for a step that has a `directory`
-or an `env` it does not reproduce the test from the root. And the result's toolchain is read in the
-root with the report's own variables. A step whose `directory` has its own `rust-toolchain.toml`,
-or whose `env` holds `RUSTUP_TOOLCHAIN` or `PATH`, can run a toolchain that the result does not
-name.
+The result's record of a step does not name its `directory` or its `env`. A test's `command` does:
+it begins `cd <directory> && ` for a test of a workspace that is not the root, and it repeats the
+step's variables whose value holds no placeholder (see "Which tests a step covers"). The result's
+toolchain is read in the root with the report's own variables, so a step whose `directory` has its
+own `rust-toolchain.toml`, or whose `env` holds `RUSTUP_TOOLCHAIN` or `PATH`, can run a toolchain
+that the result does not name.
 
 ### Time limits
 
@@ -309,6 +309,68 @@ On macOS and Linux a step with a limit runs each command as the leader of a proc
 a step without a limit runs as before. A process that starts a group of its own is outside the kill.
 Playwright 1.63.0 does that for each browser, so a step that runs Playwright can leave browsers
 running when its time is spent.
+
+### Which tests a step covers
+
+A `cargo` step that reads the output of `cargo test` covers the targets its command selects in its
+workspace, the one whose root its directory is. The report reads the command's flags the way Cargo
+does. A target is covered when its package is in the step's set and its kind and name pass the
+step's target flags. A run selects the targets its steps cover; a target that ran or was built
+without any step covering it stays unselected, and the result reports it as a problem.
+
+A command that gives neither `-p` nor `--workspace` takes the workspace's default members: the root
+package, the manifest's `default-members`, or, in a virtual workspace without them, every member.
+`-p` or `--package` takes the members whose names match. It may be repeated, written with `=`, and
+given a pattern of `*`, `?` and `[...]`. `--workspace` or `--all` takes every member, and `--exclude`
+removes the members that match. Cargo ignores `-p` beside `--workspace`, and so does the report.
+
+With no target flag, a step covers each selected package's targets that the manifest says `cargo
+test` builds: the library, the binaries and the integration tests, and an example that sets
+`test = true`. `--tests` selects the same set. `--bins`, `--examples`, `--all-targets`, `--bin`,
+`--test`, `--bench` and `--example` select a target whatever its manifest says. `--benches` selects
+the library, every binary and the benchmarks, `--lib` selects the library, and `--doc` selects no
+target. A test of the report builds 29 commands in three workspaces with `cargo test --no-run
+--message-format=json` and requires the covered set to equal the targets Cargo builds. Cargo refuses
+`--doc` with `--no-run`, so unit cases cover that flag.
+
+The report does not read feature flags, `--target`, a `bench = false` entry in a manifest or a
+target's `required-features`. A target that Cargo leaves out for one of these counts as covered, and
+its tests read as not run, because no listing returned them.
+
+The loader refuses a step that reads the output of `cargo test` and gives a command the report
+cannot read. These are a command that is not `cargo test`, which includes `cargo +nightly test` and
+any other program, `--manifest-path` (the directory is the workspace), `-Z`, `--exclude` without
+`--workspace`, a flag that `cargo test --help` does not list, a flag without its value, a package
+given with a version, a URL or a path, a pattern with a `[` that no `]` closes, and `--doc` beside
+another flag that selects targets. The refusal names the step and the word.
+
+A Rust test that no step ran is not run, and its reason is the first of these that applies:
+
+- the plan's text for its package, when the platform leaves the package out;
+- `<step> built this target, and no run of it can be read from that step (<why>)`, when a step
+  stopped after it built the target;
+- `no step that ran listed this target; <step> did not build (<why>)`, or `... was <why>`, when a
+  step that covers the target failed before it listed anything;
+- `no step that ran listed this target, though <step> selects it`, when a step covers the target and
+  no listing returned it;
+- `no step of this selection covers this target`, when the target's workspace holds a selected step,
+  and `no step of this selection covers this workspace`, when it holds none. A benchmark reads the
+  plan's text for benchmarks, then `, and` and that sentence, and the reason of a group that runs
+  nothing on the platform follows the sentence after a `;`.
+
+The last two sentences replace the platform's general `[unrun.rust]` line, which the loader still
+requires and the report no longer reads. A step in a directory is named `cd <directory> && <command>`
+in these reasons.
+
+A target that a step built or ran and that no step of the selection covers is a problem of the
+result: `step <number> built or ran <target>, but no step of this selection covers it: the selection
+rule and Cargo disagree`. The run does not pass.
+
+A test's `command` is the step's that ran it, or the first step that covers its target where none
+did. It begins `cd <directory> && ` when the test's workspace is not the root. It repeats the step's
+variables whose value holds no placeholder, written `NAME=value`, and the step's features and
+profile. A variable whose value holds a placeholder is named in the test's `needs`, because the
+step's own set-up gave it that value.
 
 ## How a test names what it proves
 
@@ -595,7 +657,7 @@ Each keyed test has one outcome on this platform:
 | `passed` | A step ran it and it passed |
 | `failed` | A step ran it and it failed, or the run of its binary could not be read, and the reason says why |
 | `ignored` | Every step that listed it left it out, with the reason its `#[ignore]` gives |
-| `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another platform's report runs its lane, the step that built it failed before a run of it could be read, or it returned early and said why. The reason says which |
+| `not_run` | No step of this run ran it here: a step's own flags left it out, no step of the selection covers its target, no selected group runs its target on this platform, another platform's report runs its lane, the step that built it failed before a run of it could be read, or it returned early and said why. The reason says which |
 | `not_built` | A step ran its target and this platform's build of it has no such test, or a Playwright test, which only the landing workflow's companion job builds |
 | `known_difference` | It ran and held what the profile defines, and it recorded that the application it is about reads the same thing differently |
 
