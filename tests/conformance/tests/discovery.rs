@@ -752,6 +752,94 @@ fn a_relative_root_finds_the_compiler_the_plan_names() {
     }
 }
 
+/// The script of the tracked step that stands in for a Vitest run of `web/forms.test.ts`: it writes
+/// the report a run of that file would, to the file it is given.
+const REPORT_SCRIPT: &str = "const fs = require('fs');
+const path = require('path');
+const output = process.argv[2];
+fs.mkdirSync(path.dirname(output), { recursive: true });
+fs.writeFileSync(output, JSON.stringify({ testResults: [{
+  name: path.join(process.cwd(), 'web', 'forms.test.ts'),
+  assertionResults: [{
+    ancestorTitles: ['the web package'], title: 'keeps its title', status: 'passed',
+    location: { line: 5, column: 3 },
+  }],
+}] }));
+";
+
+/// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: a run reads
+/// the TypeScript of a tree with the compiler that `--typescript-compiler` names, which replaces the
+/// plan's directories, and the directory may be given as an absolute path or as a path relative to
+/// where the program runs. A run with no compiler is refused.
+#[test]
+#[ignore = "reads TypeScript with the packages' own compiler, which `pnpm install --frozen-lockfile` installs; the report's typescript group runs it"]
+fn a_run_reads_typescript_with_the_compiler_the_command_line_names_given_absolute_or_relative() {
+    let (_directory, root) = copy("typescript-only");
+    std::fs::write(root.join("scripts").join("report.js"), REPORT_SCRIPT).expect("a script");
+    let words = "command = ['pnpm', '-C', 'web', 'test', '--outputFile.json={output}']";
+    let text = plan_text(&root);
+    assert!(text.contains(words), "the fixture's step");
+    std::fs::write(
+        root.join("conformance").join("plan.toml"),
+        text.replace(words, "command = ['node', 'scripts/report.js', '{output}']"),
+    )
+    .expect("the plan is written");
+    git(&root, &["add", "-A"]);
+    // Two compilers outside the tested root, each with a version of its own, so that the result says
+    // which one read the tree.
+    let tools = tempfile::tempdir().expect("a directory");
+    let tools = tools
+        .path()
+        .canonicalize()
+        .expect("the directory's own path");
+    plant_compiler(&tools, "absolute", Some("absolute-1"));
+    plant_compiler(&tools, "relative", Some("relative-1"));
+    let run = |from: &Path, compiler: Option<&str>| {
+        let evidence = tempfile::Builder::new()
+            .prefix("kr-conformance-evidence.")
+            .tempdir()
+            .expect("an evidence directory");
+        let (root, directory) = (root.to_string_lossy(), evidence.path().to_string_lossy());
+        let mut arguments = vec!["run", "--root", &root, "--evidence", &directory];
+        arguments.extend(
+            compiler
+                .into_iter()
+                .flat_map(|c| ["--typescript-compiler", c]),
+        );
+        let (code, stdout, stderr) = program_in(from, &arguments);
+        let result = std::fs::read_to_string(report::result_path(evidence.path()))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        (code, format!("{stdout}{stderr}"), result)
+    };
+    let (code, said, result) = run(&root, None);
+    assert_eq!(code, Some(2), "{said}");
+    assert!(said.contains("pnpm install"), "{said}");
+    assert!(result.is_none(), "a refused run writes no result");
+    let absolute = tools.join("absolute");
+    for (from, compiler, version) in [
+        (
+            root.clone(),
+            absolute.to_string_lossy().into_owned(),
+            "absolute-1",
+        ),
+        (tools.clone(), "relative".to_owned(), "relative-1"),
+        (tools.join("relative"), ".".to_owned(), "relative-1"),
+    ] {
+        let (code, said, result) = run(&from, Some(&compiler));
+        assert_eq!(code, Some(0), "{compiler}: {said}");
+        let result = result.expect("a result");
+        assert_eq!(
+            result["run"]["toolchain"]["typescript"], version,
+            "{compiler}: the compiler that read the tree"
+        );
+        assert_eq!(
+            result["identifiers"]["KR-REQ-05.01"]["verdict"], "passed",
+            "{compiler}: {said}"
+        );
+    }
+}
+
 /// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: a call is a
 /// test only when its first argument is a string or a template, or a function follows it. A
 /// condition that `test.skip` takes, a step, the fixtures' `use` and `extend` and the four hooks,
