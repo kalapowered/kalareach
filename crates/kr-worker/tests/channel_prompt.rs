@@ -265,6 +265,12 @@ fn a_route_toward_the_host_is_refused_by_the_packages_own_validation() {
         !reversed.is_valid(),
         "a package whose channel event runs towards the host is refused"
     );
+    assert!(
+        reversed.findings.iter().any(|finding| finding.detail
+            == "the action prompt.send sends channel.event, which the connector table routes \
+                from the application to the host"),
+        "the refusal is the one for the reversed route: {reversed:?}"
+    );
 }
 
 /// KR-REQ-12.26: the frame a message goes out in names the text and the host's own sender
