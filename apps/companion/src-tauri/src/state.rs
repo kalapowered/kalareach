@@ -988,43 +988,64 @@ mod tests {
     }
 
     /// A task that takes the choice gate while a choice holds it leaves its worker to the runtime's
-    /// other tasks. The runtime has one worker: a task that blocked it would stop every other task
-    /// of the runtime, and its timers and I/O with them.
+    /// other tasks, whichever way it takes it: to run its work under the gate, to forget a host
+    /// under it, or to make a choice under it. The runtime has one worker: a task that blocked it
+    /// would stop every other task of the runtime, and its timers and I/O with them.
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_task_that_waits_for_the_choice_gate_leaves_its_worker_to_the_runtime() {
         use std::time::Duration;
 
         let state = Arc::new(AppState::new());
-        let mut hold = state.hold_the_choice_at(testing::ChoicePoint::BeforeStart);
-        // A choice that holds the gate, on a thread of its own, as the application runs one.
-        let choosing = std::thread::spawn({
-            let state = Arc::clone(&state);
-            move || {
-                state.choose_host("reaching", || {
-                    Err(CommandError::local_failure("the choice is not made"))
-                })
-            }
-        });
-        hold.reached().await;
-        let waiting = tokio::spawn({
-            let state = Arc::clone(&state);
-            async move { state.under_the_choice_gate(|| ()) }
-        });
-        // This thread is not a worker: it lets the task reach the gate and wait there, and then
-        // looks for a task that only a free worker can run.
-        std::thread::sleep(Duration::from_millis(300));
-        let other = tokio::spawn(async {});
-        let ran = (0..200).any(|_| {
-            std::thread::sleep(Duration::from_millis(25));
-            other.is_finished()
-        });
-        assert!(
-            ran,
-            "a task that waits for the choice gate keeps the runtime's only worker from its other tasks"
-        );
-        hold.release();
-        assert!(choosing.join().expect("the choice ended").is_err());
-        waiting.await.expect("the task took the gate");
+        for leg in 0..3 {
+            let mut hold = state.hold_the_choice_at(testing::ChoicePoint::BeforeStart);
+            // A choice that holds the gate, on a thread of its own, as the application runs one.
+            let choosing = std::thread::spawn({
+                let state = Arc::clone(&state);
+                move || {
+                    state.choose_host("reaching", || {
+                        Err(CommandError::local_failure("the choice is not made"))
+                    })
+                }
+            });
+            hold.reached().await;
+            let waiting = tokio::spawn({
+                let state = Arc::clone(&state);
+                async move {
+                    match leg {
+                        0 => state.under_the_choice_gate(|| ()),
+                        1 => drop(state.forget_host(
+                            kr_protocol::ids::DeviceId::new(
+                                kr_protocol::scalars::Uuid::from_bytes([7; 16]),
+                            ),
+                            "forgetting",
+                            || Ok(()),
+                        )),
+                        _ => drop(state.choose_host("reaching", || {
+                            Err(CommandError::local_failure("the choice is not made"))
+                        })),
+                    }
+                }
+            });
+            // This thread is not a worker: it lets the task reach the gate and wait there, and
+            // then looks for a task that only a free worker can run.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !waiting.is_finished(),
+                "leg {leg}: the task waits for the gate while the choice holds it"
+            );
+            let other = tokio::spawn(async {});
+            let ran = (0..200).any(|_| {
+                std::thread::sleep(Duration::from_millis(25));
+                other.is_finished()
+            });
+            assert!(
+                ran,
+                "leg {leg}: a task that waits for the choice gate keeps the runtime's only worker from its other tasks"
+            );
+            hold.release();
+            assert!(choosing.join().expect("the choice ended").is_err());
+            waiting.await.expect("the task took the gate");
+        }
     }
 }
