@@ -215,11 +215,11 @@ impl Notice {
     /// The summary is the announcement's own line when that line is the host's own words. It goes
     /// inside a push destination's seal, and into an external message only for the rule that
     /// carries it. A line that is a session's text is left out: the attention store keeps
-    /// none of a session's text, only where to read it, so this journal never holds it either. A
-    /// consumer that sends a session's text reads it when it sends, under the control daemon's
-    /// privacy fence (`delivery_texts` and `release_delivery` on the daemon's attention module).
-    /// The collapse group is the session and the rule, so repeated attention about one thing
-    /// replaces itself on the device rather than stacking.
+    /// none of a session's text, only where to read it, so this journal never holds it either. No
+    /// consumer sends a session's text yet; one would have to read it when it sends, through the
+    /// control daemon's privacy fence (`delivery_texts` and `release_delivery` on the daemon's
+    /// attention module). The collapse group is the session and the rule, so repeated attention
+    /// about one thing replaces itself on the device rather than stacking.
     #[must_use]
     pub fn from_announcement(announcement: &Announcement, audience: Audience, now_ms: u64) -> Self {
         let session = announcement.session_id;

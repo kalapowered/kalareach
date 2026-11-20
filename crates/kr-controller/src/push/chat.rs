@@ -15,9 +15,10 @@
 //! | Discord | `POST` to the webhook's address with `?wait=true`, so a message that is not saved is an error rather than silence | `content`, with no mention allowed and link embeds suppressed |
 //! | Telegram | `POST https://api.telegram.org/bot<token>/sendMessage` | `chat_id`, `text`, with link previews off and no parse mode |
 //!
-//! Session text reaches these services as text, never as markup: Slack's control characters are
-//! escaped, Discord is told to ping nobody, and Telegram parses no entities. So a line of session
-//! output cannot mention a channel, ping everyone or become a link a service fetches. A message
+//! What these services receive is the host's own sentence and its identifiers, never session text,
+//! and they receive it as text, never as markup: Slack's control characters are escaped, Discord is
+//! told to ping nobody, and Telegram parses no entities. So no line of a message can mention a
+//! channel, ping everyone or become a link a service fetches; the escape stays as a guard. A message
 //! longer than its service takes is shortened before it is sent, and still ends with the sentence
 //! that says who can read it.
 //!
@@ -512,8 +513,8 @@ pub fn fit(body: &str, limit: usize, service: &str) -> String {
     format!("{kept}{marker}{RECIPIENTS_CAN_READ}")
 }
 
-/// Escapes the three characters Slack reads as markup, so session text reaches a channel as text:
-/// no mention, no channel link, no link of its own.
+/// Escapes the three characters Slack reads as markup, so the host's own sentence and identifiers
+/// reach a channel as text: no mention, no channel link, no link of its own. It stays as a guard.
 #[must_use]
 pub fn slack_escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());

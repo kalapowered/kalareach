@@ -1415,7 +1415,9 @@ impl AttentionModule {
 
     /// Resolves the text of records for a delivery send, with the ticket its release is bound by.
     ///
-    /// The consumer sends the text only through [`Self::release_delivery`].
+    /// No delivery path sends session text today: this is the interface a per-chunk writer would
+    /// use, and it sends the text only through [`Self::release_delivery`]. No production sender
+    /// writes in one non-waiting call, which that contract needs.
     pub async fn delivery_texts(
         &self,
         reach: &dyn Reach,
