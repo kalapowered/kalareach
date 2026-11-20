@@ -12,7 +12,7 @@ use std::process::Command;
 
 use kr_conformance::plan::Platform;
 use kr_conformance::plan_file::Plan;
-use kr_conformance::report::{self, Document, Options, Stopped, Verdict};
+use kr_conformance::report::{self, Document, Options, Outcome, Stopped, Verdict};
 
 const FIXED: &str = "[ignored_runs]
 held = false
@@ -384,4 +384,94 @@ fn the_vitest_and_lane_steps_of_cores_plan_each_name_their_output() {
         );
     }
     assert_eq!(reading_a_file, 5);
+}
+
+/// The fixture's own plan, with the exit status the set-up step's script is given replaced.
+fn fixture_plan(root: &Path, status: &str) -> String {
+    let text = std::fs::read_to_string(root.join("conformance").join("plan.toml"))
+        .expect("the fixture's plan");
+    let from = "'{scratch}/made.txt', '0']";
+    assert!(text.contains(from), "the fixture's set-up step");
+    text.replace(from, &format!("'{{scratch}}/made.txt', '{status}']"))
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a set-up step that exits 0 gives a later
+/// step what it made, and the test of that step asserts the value it got through its `env`.
+#[cfg(unix)]
+#[test]
+fn a_set_up_step_that_exits_0_gives_a_test_the_value_it_asserts() {
+    let (_directory, root) = copy("setup-step");
+    let ran = run(&root, &fixture_plan(&root, "0")).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let steps = &ran.document.steps;
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    for step in steps {
+        assert_eq!(
+            (step.exit, step.error.as_deref()),
+            (Some(0), None),
+            "{step:?}"
+        );
+    }
+    assert_eq!(
+        ran.document.identifiers["KR-REQ-05.02"].verdict,
+        Verdict::Passed
+    );
+    assert!(ran.document.passed(), "{:?}", ran.document.problems);
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a set-up step that exits 1 fails the run,
+/// and the step that names it is not run: it reads not run with the set-up step's number and what
+/// became of it, and so does the test that step covers. A step that does not name it still runs.
+#[cfg(unix)]
+#[test]
+fn a_set_up_step_that_fails_leaves_its_dependent_not_run_and_fails_the_run() {
+    let (_directory, root) = copy("setup-step");
+    let ran = run(&root, &fixture_plan(&root, "1")).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let steps = &ran.document.steps;
+    assert_eq!(steps[0].exit, Some(1));
+    assert_eq!(
+        (steps[1].exit, steps[1].error.as_deref()),
+        (Some(0), None),
+        "a step that does not name the set-up step runs"
+    );
+    assert_eq!(steps[2].exit, None);
+    assert_eq!(
+        steps[2].error.as_deref(),
+        Some("not run because its set-up step 1 (the file the tests read) exited with status 1")
+    );
+    assert!(!ran.document.passed());
+    assert_eq!(ran.document.summary.failed_steps, [1, 3]);
+    let record = &ran.document.identifiers["KR-REQ-05.02"];
+    assert_eq!(record.verdict, Verdict::NotRun);
+    let test = &record.tests[0];
+    assert_eq!(test.outcome, Outcome::NotRun);
+    let reason = test.reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains(
+            "was not run because its set-up step 1 (the file the tests read) exited with status 1"
+        ),
+        "{reason}"
+    );
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a set-up step is not run twice in a run that
+/// is one part, and a plan cut into parts gives each part the set-up steps its steps name.
+#[test]
+fn a_plan_run_in_parts_gives_each_part_the_set_up_step_its_steps_name() {
+    let (_directory, root) = copy("setup-step");
+    let plan = Plan::parse(&fixture_plan(&root, "0"), &root).expect("the fixture's plan loads");
+    let steps = plan.steps(
+        Platform::current(),
+        &plan.all_groups(),
+        &kr_conformance::plan_file::Values::evidence("/tmp/e"),
+        None,
+    );
+    let ids = |part: (usize, usize)| -> Vec<String> {
+        kr_conformance::plan::part_of(steps.clone(), part)
+            .into_iter()
+            .map(|step| step.id)
+            .collect()
+    };
+    assert_eq!(ids((1, 2)), ["variables"]);
+    assert_eq!(ids((2, 2)), ["make-the-file", "made"]);
+    assert_eq!(ids((1, 1)), ["make-the-file", "variables", "made"]);
 }

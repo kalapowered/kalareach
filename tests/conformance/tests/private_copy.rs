@@ -21,6 +21,7 @@ fn tree(name: &str) -> PathBuf {
 /// writes reads.
 fn zeroing(path: &Path) -> Step {
     Step {
+        id: String::new(),
         group: "rust".to_owned(),
         what: "a build that damages the report's program".to_owned(),
         command: vec![
@@ -37,6 +38,8 @@ fn zeroing(path: &Path) -> Step {
         directory: String::new(),
         env: Vec::new(),
         output: None,
+        setup: false,
+        after: Vec::new(),
     }
 }
 

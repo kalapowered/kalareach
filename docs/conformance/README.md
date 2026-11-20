@@ -240,6 +240,19 @@ report reads that file and no word of the command. The run makes the directory t
 before the step runs; the tool makes the output. Two outputs may not be equal or nested, and an
 output may not be in `logs` or be `result.json`, which are the report's own.
 
+A set-up step (`setup = true`) reads `exit`: the report records its exit status and nothing else. A
+step names the set-up steps it needs in `after`; each is an earlier step of the plan that runs on
+every platform the step runs on. A selection that holds a step holds its set-up steps too, whatever
+their groups, and in the plan's order. When a set-up step does not exit 0, or cannot be run, each
+step that names it is not run: it has no log and no exit status, its error says `not run because its
+set-up step <number> (<what>) ...`, the tests it would have run are not run with the same words, and
+the run fails because the set-up step failed. A set-up step writes nothing back to the environment:
+the plan fixes every `env` before any step runs, and a set-up step leaves what the next steps need
+in `{scratch}`.
+
+In a plan run in parts, a set-up step is not cut by count. It goes into every part that holds a step
+that names it, so a set-up step runs once in each of those parts.
+
 ## How a test names what it proves
 
 ### The identifiers

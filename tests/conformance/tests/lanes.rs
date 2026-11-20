@@ -99,6 +99,7 @@ fn executed(step: Step, exit: i32, cases: Result<Vec<Case>, String>) -> Executed
         lane,
         tools: vec![("gradle".to_owned(), "8.14.3".to_owned())],
         error,
+        blocked_by: None,
         observation: None,
     }
 }
@@ -901,6 +902,40 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
     );
     assert_eq!(document.run.toolchain.phones["gradle"], "8.14.3");
     assert_eq!(document.run.toolchain.phones["java"], "unknown");
+}
+
+/// KR-REQ-29.01, the part about results mapped to acceptance IDs with reproducible commands: a lane
+/// step that was not run because a set-up step failed leaves every row of its lane not run, with
+/// the set-up step's number, and not failed.
+#[test]
+fn a_lane_step_that_was_not_run_leaves_its_rows_not_run_with_the_set_up_steps_number() {
+    let map = map_of(&fixtures().join("lanes"));
+    let blocked = kr_conformance::run::not_run(
+        &step(Platform::Linux),
+        4,
+        "the emulator",
+        "exited with status 1",
+    );
+    let document = assemble(Platform::Linux, &map, &[blocked]);
+    let record = &document.identifiers["KR-REQ-15.34"];
+    assert_eq!(record.verdict, Verdict::NotRun);
+    assert_eq!(record.counts.failed, 0);
+    for test in &record.tests {
+        let reason = test.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains(
+                "was not run because its set-up step 4 (the emulator) exited with status 1"
+            ) || test.outcome == Outcome::NotRun && reason.contains("macOS report"),
+            "{test:?}"
+        );
+    }
+    assert!(record.tests.iter().any(|test| {
+        test.outcome == Outcome::NotRun
+            && test
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("set-up step 4"))
+    }));
 }
 
 /// KR-REQ-29.01, the part about results mapped to acceptance IDs with reproducible commands: the

@@ -1,0 +1,51 @@
+# What the conformance report runs in this tree: a set-up step that makes a file in the run's scratch
+# directory, and the tests that read the variables the plan and the steps give.
+repository = 'setup-step'
+groups = ['rust']
+
+[rust]
+manifests = ['Cargo.toml']
+
+[ignored_runs]
+held = false
+
+[env]
+KR_FROM_PLAN = 'plan'
+KR_IN_BOTH = "the plan's"
+
+[unrun]
+bench = 'a benchmark'
+typescript = 'no step runs TypeScript'
+
+[unrun.rust]
+linux = 'no step runs this target'
+macos = 'no step runs this target'
+windows = 'no step runs this target'
+
+[[step]]
+id = 'make-the-file'
+group = 'rust'
+what = 'the file the tests read'
+platforms = ['linux', 'macos', 'windows']
+reading = 'exit'
+setup = true
+command = ['bash', 'scripts/set-up.sh', '{scratch}/made.txt', '0']
+
+[[step]]
+id = 'variables'
+group = 'rust'
+what = 'the variables of the plan and the step'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+env = { KR_FROM_STEP = 'step', KR_IN_BOTH = "the step's" }
+command = ['cargo', 'test', '--locked', '--test', 'plan_env']
+
+[[step]]
+id = 'made'
+group = 'rust'
+what = 'the test that reads the file'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+after = ['make-the-file']
+env = { KR_MADE_BY_SET_UP = '{scratch}/made.txt' }
+command = ['cargo', 'test', '--locked', '--test', 'set_up']

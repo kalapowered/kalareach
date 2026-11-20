@@ -30,6 +30,7 @@ fn shell(what: &str, script: &str, arguments: &[&Path]) -> Step {
             .map(|argument| argument.to_string_lossy().into_owned()),
     );
     Step {
+        id: String::new(),
         group: "rust".to_owned(),
         what: what.to_owned(),
         command,
@@ -40,6 +41,8 @@ fn shell(what: &str, script: &str, arguments: &[&Path]) -> Step {
         directory: String::new(),
         env: Vec::new(),
         output: None,
+        setup: false,
+        after: Vec::new(),
     }
 }
 
