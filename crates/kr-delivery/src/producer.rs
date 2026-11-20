@@ -3954,7 +3954,7 @@ mod tests {
                 .expect("the store records the window");
             // Its repeat falls due inside the hours and is held, over the approval not yet taken. The
             // repeat is decided under the state in force then: privacy mode on, or not.
-            let repeat = 1_000 + kr_attention::rule::REMINDER_INTERVAL_MS;
+            let repeat = 1_000 + kr_protocol::attention_rule::REMINDER_INTERVAL_MS;
             let during = if private_period {
                 PrivacyStamp {
                     generation: 1,

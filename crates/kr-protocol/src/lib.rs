@@ -68,6 +68,7 @@
 //! | [`skill`] | Contact-skill installation: agents, scopes and the exact change manifest |
 //! | [`attachment`] | Attachments, geometry ownership and the attachment method group |
 //! | [`attention`] | The attention inbox, review acknowledgements and the changed-since-last-visit view |
+//! | [`attention_rule`] | The attention rule set, each rule's escalation ladder and its de-duplication window |
 //! | [`input`] | The single input lease and the input method group |
 //! | [`root`] | The trusted root integration: the editor fence, its events and the launch transaction |
 //! | [`recovery`] | Subscriptions, snapshots, history pages and resynchronisation |
@@ -121,6 +122,7 @@ pub mod agent;
 pub mod archive;
 pub mod attachment;
 pub mod attention;
+pub mod attention_rule;
 pub mod authority;
 pub mod automation;
 pub mod backup_bundle;

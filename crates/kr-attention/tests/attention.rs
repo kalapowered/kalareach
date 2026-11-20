@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 use kr_attention::engine::Outcome;
 use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, Fingerprint, SourceEvent};
 use kr_attention::key::DERIVED_MARKER;
-use kr_attention::rule::{ADAPTER_ESCALATION_MS, REMINDER_INTERVAL_MS, RULES, rule};
 use kr_attention::{
     Attention, Claimant, Content, DeviceScope, HostReading, Liveness, Origin, Subject, Viewer,
 };
@@ -19,6 +18,7 @@ use kr_protocol::attention::{
     RetainedLogView, ReviewAcknowledgeResult, ReviewState, ReviewSubject, SemanticChange,
     VisitAcknowledgeResult,
 };
+use kr_protocol::attention_rule::{ADAPTER_ESCALATION_MS, REMINDER_INTERVAL_MS, RULES, rule};
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
     ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, GrantId, PluginId, QuestionId, SessionId,
