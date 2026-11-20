@@ -191,7 +191,7 @@ pub struct GroupAbsent {
 }
 
 /// Why a test no step runs is not run.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Unrun {
     /// A benchmark target that no step of the selection covers, before the sentence that says so.
@@ -422,15 +422,6 @@ pub struct Plan {
     /// without it leaves the profile out.
     #[serde(default)]
     pub terminal_profile: Option<TerminalProfileFile>,
-}
-
-impl Default for Unrun {
-    fn default() -> Self {
-        Self {
-            bench: String::new(),
-            typescript: String::new(),
-        }
-    }
 }
 
 /// What the placeholders stand for in one run, each as a path with forward slashes.
