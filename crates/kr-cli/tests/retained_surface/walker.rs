@@ -31,6 +31,7 @@ use std::rc::Rc;
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens as _;
+use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
 /// A source tree: the repository, or a checkout of a release.
@@ -1415,18 +1416,10 @@ fn mentions_a_sighting(text: &str) -> bool {
         || WIRE_NAMES.iter().any(|name| text.contains(name))
 }
 
-/// Whether the text may declare a module file: a module with no body. A `#[path]` is read on such
-/// a module, so a file that none holds is not read for declarations.
+/// Whether the text may declare a module file: a file that does holds the letters `mod`, however
+/// the module is named and whatever stands between the keyword and the name.
 fn may_declare_modules(text: &str) -> bool {
-    let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-    compact.match_indices("mod").any(|(at, _)| {
-        let rest = &compact[at + 3..];
-        let name: String = rest
-            .chars()
-            .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
-            .collect();
-        !name.is_empty() && rest[name.len()..].starts_with(';')
-    })
+    text.contains("mod")
 }
 
 /// The files of a crate that only a `#[cfg(test)]` module declaration reaches, as rustc finds
@@ -1466,8 +1459,8 @@ struct Declared {
 
 /// The files reachable from `roots` (each with whether it is a `mod.rs`-like file, whose modules
 /// sit beside it), through the module declarations of every file; those under `#[cfg(test)]` only
-/// when `with_tests`. A file is visited once for each place its modules are looked up in, and each
-/// is read and parsed once for both walks, whose results `declarations` keeps.
+/// when `with_tests`. A file is visited once for each place its modules are looked up in; each such
+/// visit reads and parses the file once for both walks, and `declarations` keeps the result.
 fn reached(
     present: &BTreeSet<&PathBuf>,
     roots: Vec<(PathBuf, bool)>,
@@ -1544,7 +1537,7 @@ fn lexical(path: &Path) -> PathBuf {
 
 /// The module declarations `items` hold. `path_base` is what a `#[path]` is relative to, `modules`
 /// what a module's file is looked up under; an inline module with a `#[path]` moves both to that
-/// path, as rustc does.
+/// path, taken from `path_base`, as rustc does.
 fn declared_modules(
     items: &[syn::Item],
     path_base: &Path,
@@ -1557,7 +1550,7 @@ fn declared_modules(
             continue;
         };
         let test = under_test || attrs_are_cfg_test(&module.attrs);
-        let name = module.ident.to_string();
+        let name = module.ident.unraw().to_string();
         let explicit = module.attrs.iter().find_map(|attribute| {
             if !attribute.path().is_ident("path") {
                 return None;
@@ -1575,7 +1568,7 @@ fn declared_modules(
         });
         if let Some((_, inner)) = &module.content {
             let inside = match &explicit {
-                Some(directory) => lexical(&modules.join(directory)),
+                Some(directory) => lexical(&path_base.join(directory)),
                 None => modules.join(&name),
             };
             declared_modules(inner, &inside, &inside, test, out);
