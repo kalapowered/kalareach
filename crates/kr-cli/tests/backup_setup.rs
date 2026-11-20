@@ -2706,6 +2706,29 @@ impl Window {
             .expect("types into the window");
     }
 
+    /// As [`Self::wait_for`], with every white space taken out of what the window showed and of the
+    /// marker: a console that does not return at a line end draws each line from where the one
+    /// before it ended, so a marker can wrap across rows and no longer stand in one piece.
+    fn wait_for_unwrapped(&self, marker: &str) -> String {
+        fn squashed(text: &str) -> String {
+            text.chars().filter(|c| !c.is_whitespace()).collect()
+        }
+        let wanted = squashed(marker);
+        let started = Instant::now();
+        loop {
+            let shown = self.shown();
+            if squashed(&shown).contains(&wanted) {
+                return shown;
+            }
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the window never showed {marker:?}, even with its white space taken out: {}",
+                shown.escape_debug()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Sends Ctrl-Break to the program on the console, the way that reaches it here, or fails with
     /// the words that say this machine has none.
     fn send_break(&mut self, rig: &Rig) {
@@ -2810,7 +2833,11 @@ async fn a_console_left_raw_is_given_back_raw_when_the_command_ends() {
 }
 
 /// A console that does not return to the start of a line at a line feed shows the kit as it
-/// is, line under line: the dialogue sets the output mode it needs and puts it back.
+/// is, line under line: the dialogue sets the output mode it needs and puts it back. The case
+/// reads the kit's lines as the screen drew them and does not parse the kit. A command that did
+/// not set the mode would draw each line from where the one before it ended, and a question could
+/// wrap across rows, so the waits read the screen with its white space taken out and the case
+/// reaches its own assertion in that run too.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_kit_is_shown_without_a_staircase_on_a_console_that_does_not_return_at_a_line_end() {
@@ -2820,16 +2847,23 @@ async fn the_kit_is_shown_without_a_staircase_on_a_console_that_does_not_return_
         &["backup", "setup"],
         &[(setup_console::NO_AUTO_RETURN, "1")],
     );
-    window.bring_up_the_kit();
+    window.wait_for_unwrapped("Type yes to go on");
+    window.type_line("yes");
+    window.wait_for_unwrapped("type the last 8 symbols of its seed line");
     let lines = setup_console::Screen::of(&window.transcript()).lines();
-    for start in ["kalareach-recovery-kit/1", "seed: ", "locator: "] {
+    for start in [
+        "kalareach-recovery-kit/1",
+        "seed: ",
+        "locator: ",
+        "origin: ",
+    ] {
         assert!(
             lines.iter().any(|line| line.starts_with(start)),
             "a line of the kit begins at the left edge with {start:?}: {lines:#?}"
         );
     }
     window.type_bytes_exactly(&[0x03]);
-    let shown = window.wait_for("kr ended");
+    let shown = window.wait_for_unwrapped("kr ended");
     // The case's condition, asserted: the output mode that the observer set was in force when `kr`
     // started, so a kit shown at the left edge is the command's doing and not the console's.
     let (before, _) = modes_of(&shown);
