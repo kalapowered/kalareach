@@ -1997,7 +1997,14 @@ fn a_snapshot_of_retained_entries() -> kr_protocol::agent::AgentSnapshotResult {
             binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
             turn_id: Nullable::null(),
         }],
-        continuation: Nullable::null(),
+        // Where a reader continues, so that the withheld answer is seen to take it away.
+        continuation: Nullable::some(kr_protocol::semantic::SemanticContinuation {
+            limit: kr_protocol::semantic::SemanticLimit::Nodes,
+            limit_value: U64::new(1),
+            from_node: U64::new(3),
+            nodes: U64::new(1),
+            bytes: U64::new(14),
+        }),
         history_gap: false,
         withheld_entries: U64::new(1),
     }
@@ -2114,9 +2121,17 @@ async fn a_snapshot_a_worker_answered_is_withheld_when_privacy_mode_starts_befor
         "no entry goes once privacy mode has started: {withheld:?}"
     );
     assert!(withheld.history_gap, "the range is said to be gone");
-    assert_eq!(withheld.continuation, Nullable::null());
+    assert_eq!(
+        withheld.continuation,
+        Nullable::null(),
+        "the cursor into the removed entries goes"
+    );
     assert_eq!(withheld.binding, snapshot.binding);
-    assert_eq!(withheld.withheld_entries, snapshot.withheld_entries);
+    assert_eq!(
+        withheld.withheld_entries,
+        kr_protocol::scalars::U64::ZERO,
+        "a count of the removed generation is no fact"
+    );
     world.serving.abort();
 }
 
