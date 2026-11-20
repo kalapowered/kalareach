@@ -129,6 +129,7 @@ import { scriptedHostDrafts, type BindParams, type FakeHostDrafts } from './fake
 import { fakeRetryOf } from './fake-retry'
 import { receivedFailure } from './tauri'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } from './fake-decode'
+import { FakeChannelMessageStore } from './fake-channel-messages'
 import { FakeDraftStore } from './fake-drafts'
 import { ScriptedLaunching, type InstalledLaunch, type LaunchScenario } from './fake-launch'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
@@ -547,6 +548,8 @@ export interface FakeHostControls {
   readonly standings: FakeStandings
   /** The drafts this device keeps, which another window can write to. */
   readonly drafts: FakeDraftStore
+  /** The messages this device kept apart from the drafts, and the records of sends under way. */
+  readonly channelMessages: FakeChannelMessageStore
   /**
    * Moves the prompt on to a new generation, as the reader draws a new prompt: a button drawn at the
    * old one is disabled, and a launch that quotes it is refused.
@@ -1094,7 +1097,11 @@ export type IntakeSource = 'pasteboard' | 'camera' | 'photo'
 
 /** The fake host, and the controls a test drives it with. */
 export function fakeHost(
-  options: { readonly drafts?: FakeDraftStore; readonly stockShell?: LaunchShell } = {}
+  options: {
+    readonly drafts?: FakeDraftStore
+    readonly channelMessages?: FakeChannelMessageStore
+    readonly stockShell?: LaunchShell
+  } = {}
 ): {
   port: HostPort
   controls: FakeHostControls
@@ -1113,6 +1120,7 @@ export function fakeHost(
   // The device's drafts outlive a host: a test that starts the application again hands the next
   // host the store the last one wrote to, as a device's disk would be.
   const drafts = options.drafts ?? new FakeDraftStore()
+  const channelMessages = options.channelMessages ?? new FakeChannelMessageStore()
   let connected = true
   /** Native code's words for the loss of the connection, while it is lost. */
   let lostBecause = UNREACHABLE
@@ -2212,11 +2220,18 @@ export function fakeHost(
       })
     },
 
-    deviceDrafts: () => Promise.resolve(drafts.list()),
+    deviceDrafts: () => Promise.resolve(channelMessages.drafts(drafts)),
     deviceDraftSave: (request) => Promise.resolve(drafts.save(request)),
     deviceDraftRetarget: (request) => Promise.resolve(drafts.retarget(request)),
     deviceDraftDiscard: (request) => Promise.resolve(drafts.discard(request)),
     deviceDraftMarkRemoval: (request) => Promise.resolve(drafts.markRemoval(request)),
+    deviceChannelMessages: (request) => Promise.resolve(channelMessages.list(request.withText)),
+    deviceChannelMessageKeep: (request) => Promise.resolve(channelMessages.keep(request, drafts)),
+    deviceChannelMessageRemove: (request) => Promise.resolve(channelMessages.remove(request)),
+    deviceChannelHoldCreate: (request) => Promise.resolve(channelMessages.createHold(request)),
+    deviceChannelHoldUpdate: (request) => Promise.resolve(channelMessages.updateHold(request)),
+    deviceChannelHoldClear: (request) => Promise.resolve(channelMessages.clearHold(request)),
+    deviceDraftsLedgerSetAside: () => Promise.resolve({ moved: false, confirmed: false }),
 
     draftCreate: (params, subject) => {
       requireConnection()
@@ -3584,6 +3599,7 @@ export function fakeHost(
       }
     },
     drafts,
+    channelMessages,
     changePromptGeneration() {
       launching.changePromptGeneration()
     },

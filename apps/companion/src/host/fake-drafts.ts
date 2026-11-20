@@ -163,7 +163,13 @@ export class FakeDraftStore {
     if (!this.#opens) {
       refuse('STORAGE_UNAVAILABLE', 'the drafts kept on this device could not be opened')
     }
-    return { drafts: this.all(), unreadable: this.#unreadable, pendingRemovals: this.pendingRemovals() }
+    return {
+      drafts: this.all(),
+      unreadable: this.#unreadable,
+      pendingRemovals: this.pendingRemovals(),
+      sources: 'known',
+      ledger: 'ok'
+    }
   }
 
   /** The removals still to be made, as a test reads them. */
