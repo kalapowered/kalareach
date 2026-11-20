@@ -613,6 +613,33 @@ fn variable_name(name: &str) -> bool {
         && characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Why a plan may not give the variable `name`, when the report sets it for each step: the step
+/// would run without what the report gives it. A name is the same in any case, since Windows takes
+/// it so.
+fn set_by_the_report(name: &str) -> Option<&'static str> {
+    let upper = name.to_ascii_uppercase();
+    if upper == "KR_TEST_ARTIFACTS_DIR" {
+        Some(
+            "the tests write their records and figures there and the report reads them from the \
+             evidence directory",
+        )
+    } else if upper == "CARGO_TERM_COLOR" {
+        Some("the report reads Cargo's output and sets it to `never`")
+    } else if [
+        crate::run::STEP_VARIABLE,
+        crate::run::RECORDS_VARIABLE,
+        crate::run::OWN_HARNESS_VARIABLE,
+    ]
+    .contains(&upper.as_str())
+    {
+        Some("the report's own program reads it while it lists and records the tests")
+    } else if upper.starts_with("CARGO_TARGET_") && upper.ends_with("_RUNNER") {
+        Some("the report sets it to its own program, which runs each test binary")
+    } else {
+        None
+    }
+}
+
 /// The parts of `output` below `{evidence}/conformance/`, in lower case, or why it is not a place a
 /// step may write its output: it is below that directory, in no part empty, `.` or `..` or ending
 /// with a dot or a space, and not in the report's own directory of logs or its result. The parts
@@ -818,6 +845,11 @@ impl Plan {
                     "`[env]` gives `{name}`, which is not a variable name"
                 ));
             }
+            if let Some(why) = set_by_the_report(name) {
+                return refuse(format!(
+                    "`[env]` sets `{name}`, which the report sets for each step: {why}"
+                ));
+            }
             if let Some(placeholder) = placeholder_refused(value) {
                 return refuse(format!(
                     "`[env]` gives `{name}` a value that holds {placeholder}, which is not a \
@@ -882,6 +914,11 @@ impl Plan {
                 if !variable_name(name) {
                     return refuse(format!(
                         "step `{id}` gives `{name}`, which is not a variable name"
+                    ));
+                }
+                if let Some(why) = set_by_the_report(name) {
+                    return refuse(format!(
+                        "step `{id}` sets `{name}`, which the report sets for each step: {why}"
                     ));
                 }
                 if let Some(placeholder) = placeholder_refused(value) {

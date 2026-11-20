@@ -895,6 +895,82 @@ fn execution_faults() -> Vec<(&'static str, String, &'static str)> {
     ]
 }
 
+/// The variables the report sets for each step, with the reason the loader gives for refusing each
+/// one in a plan's `[env]` or a step's `env`.
+const SET_BY_THE_REPORT: [(&str, &str); 6] = [
+    (
+        "KR_TEST_ARTIFACTS_DIR",
+        "the tests write their records and figures there and the report reads them from the evidence directory",
+    ),
+    (
+        "CARGO_TERM_COLOR",
+        "the report reads Cargo's output and sets it to `never`",
+    ),
+    (
+        "KR_CONFORMANCE_STEP",
+        "the report's own program reads it while it lists and records the tests",
+    ),
+    (
+        "KR_CONFORMANCE_RECORDS",
+        "the report's own program reads it while it lists and records the tests",
+    ),
+    (
+        "KR_CONFORMANCE_OWN_HARNESS",
+        "the report's own program reads it while it lists and records the tests",
+    ),
+    (
+        "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER",
+        "the report sets it to its own program, which runs each test binary",
+    ),
+];
+
+/// A plan's `[env]` and a step's `env` may not give a variable the report sets for each step: the
+/// step would run without what the report gives it, and a known difference a test recorded could
+/// be written where the report does not read it. Each name is refused in both places, with its own
+/// reason, in the spelling of the report and in lower case, and a name the report does not set
+/// loads.
+#[test]
+fn a_variable_the_report_sets_for_each_step_is_refused_in_the_plan_and_in_a_step() {
+    let in_plan = |name: &str| with(&format!("[env]\n{name} = 'x'\n{STEP}"));
+    let in_step = |name: &str| {
+        with(&STEP.replace(
+            "command = ['cargo', 'test']",
+            &format!("env = {{ {name} = 'x' }}\ncommand = ['cargo', 'test']"),
+        ))
+    };
+    for name in [
+        "KR_FROM_THE_PLAN",
+        "CARGO_TARGET_DIR",
+        "CARGO_TARGET_X_LINKER",
+    ] {
+        for text in [in_plan(name), in_step(name)] {
+            let loaded = Plan::parse(&text, &repository());
+            assert!(loaded.is_ok(), "{name}: {loaded:?}");
+        }
+    }
+    let mut wrong = Vec::new();
+    for (name, reason) in SET_BY_THE_REPORT {
+        for spelt in [name.to_owned(), name.to_ascii_lowercase()] {
+            for (place, text) in [
+                ("`[env]`", in_plan(&spelt)),
+                ("step `one`", in_step(&spelt)),
+            ] {
+                let words = format!(
+                    "{place} sets `{spelt}`, which the report sets for each step: {reason}"
+                );
+                match Plan::parse(&text, &repository()) {
+                    Ok(_) => wrong.push(format!("{spelt} in {place}: the loader refused nothing")),
+                    Err(refusal) if refusal.to_string().contains(&words) => {}
+                    Err(refusal) => wrong.push(format!(
+                        "{spelt} in {place}: refused as `{refusal}`, which lacks `{words}`"
+                    )),
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A set-up step, `prep`, on `platforms`, and a step, `one`, that holds `after` and its own
 /// `platforms`, in a plan of one group.
 fn set_up_and_one(
