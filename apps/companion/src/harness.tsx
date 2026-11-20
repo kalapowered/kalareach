@@ -13,6 +13,7 @@ import { createRoot } from 'react-dom/client'
 
 import { AppProvider } from './app/state'
 import { fakeHost, type FakeHostControls } from './host/fake'
+import { FakeChannelMessageStore } from './host/fake-channel-messages'
 import { FakeDraftStore } from './host/fake-drafts'
 // The same shell choice the shipped entry makes, with `?surface=` so a browser test can ask for
 // the phone's one without pretending to be a phone.
@@ -39,7 +40,10 @@ applyPendingReset(window.localStorage, window.sessionStorage)
 
 // The device's drafts are kept in the page's storage, which is what lets a reload stand for the
 // application being started again.
-const { port, controls } = fakeHost({ drafts: new FakeDraftStore(window.localStorage) })
+const { port, controls } = fakeHost({
+  drafts: new FakeDraftStore(window.localStorage),
+  channelMessages: new FakeChannelMessageStore(window.localStorage)
+})
 window.krTestHost = controls
 
 // `?sessions=` lengthens the host's list past a screen, for a test of what a scrolled list asks.

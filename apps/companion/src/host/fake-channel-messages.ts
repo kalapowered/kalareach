@@ -16,6 +16,7 @@ import type {
   ChannelMessageList,
   ChannelMessageRemoval,
   DraftDiscardRequest,
+  LedgerSetAside,
   StoredChannelMessage,
   StoredDrafts,
   StoredHold
@@ -58,6 +59,11 @@ export class FakeChannelMessageStore {
   #unavailable = false
   #withoutRepair = false
   #refuseHoldWrites: { code: string; message: string } | null = null
+  #ledger: 'ok' | 'unreadable' | 'damaged' = 'ok'
+  #refuseListings: { code: string; message: string } | null = null
+  #refuseSetAside: { code: string; message: string } | null = null
+  #setAsideUnconfirmed = false
+  #flushOwed = false
   readonly #disk: DraftDisk | null
   /** Every call this store was asked for, for a test to read. */
   readonly calls: { readonly kind: string; readonly text?: string; readonly withText?: boolean }[] = []
@@ -122,6 +128,39 @@ export class FakeChannelMessageStore {
     this.#refuseHoldWrites = refusal
   }
 
+  /** Makes the list of removals unreadable now, damaged (the state a person can set aside), or readable again. */
+  damageLedger(state: 'ok' | 'unreadable' | 'damaged'): void {
+    this.#ledger = state
+  }
+
+  /** Makes every listing of the messages refuse with `refusal` until it is cleared; the drafts' own read still answers. */
+  refuseListings(refusal: { code: string; message: string } | null): void {
+    this.#refuseListings = refusal
+  }
+
+  /** Makes setting the list aside refuse with `refusal` until it is cleared: nothing moves. */
+  refuseSetAside(refusal: { code: string; message: string } | null): void {
+    this.#refuseSetAside = refusal
+  }
+
+  /** Makes the next set-aside move the list and fail to confirm that on disk. */
+  leaveSetAsideUnconfirmed(): void {
+    this.#setAsideUnconfirmed = true
+  }
+
+  /** Sets a damaged list aside: nothing else is set aside, and a list that is readable is refused. */
+  setAside(): LedgerSetAside {
+    this.calls.push({ kind: 'set-aside' })
+    if (this.#refuseSetAside) refuse(this.#refuseSetAside.code, this.#refuseSetAside.message)
+    if (this.#ledger !== 'damaged') refuse('INVALID_ARGUMENT', 'the list of removals is not damaged, so it is not set aside')
+    this.#ledger = 'ok'
+    const confirmed = !this.#setAsideUnconfirmed
+    this.#setAsideUnconfirmed = false
+    // A move that is not on disk yet is made so by the next read of the drafts, which refuses until then.
+    this.#flushOwed = !confirmed
+    return { moved: true, confirmed }
+  }
+
   /** The messages kept, with their text, oldest first, as a test reads them. */
   all(): readonly StoredChannelMessage[] {
     return [...this.#entries.values()].sort(
@@ -136,6 +175,7 @@ export class FakeChannelMessageStore {
 
   list(withText: boolean): ChannelMessageList {
     this.calls.push({ kind: 'list', withText })
+    if (this.#refuseListings) refuse(this.#refuseListings.code, this.#refuseListings.message)
     if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'the messages kept on this device could not be read')
     const entries = [...this.#entries.values()]
     return {
@@ -234,6 +274,7 @@ export class FakeChannelMessageStore {
     this.calls.push({ kind: 'hold-clear' })
     if (this.#refuseHoldWrites) refuse(this.#refuseHoldWrites.code, this.#refuseHoldWrites.message)
     this.#holds.delete(request.holdId)
+    this.#damagedHolds = this.#damagedHolds.filter((name) => name !== request.holdId)
     this.#write()
   }
 
@@ -244,6 +285,10 @@ export class FakeChannelMessageStore {
    */
   drafts(draftStore: FakeDraftStore): StoredDrafts {
     if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'the messages kept on this device could not be read')
+    if (this.#flushOwed) {
+      this.#flushOwed = false
+      refuse('STORAGE_UNAVAILABLE', 'the data directory could not be made durable yet')
+    }
     const read = draftStore.list()
     if (!this.#withoutRepair) {
       for (const entry of this.#entries.values()) {
@@ -263,7 +308,8 @@ export class FakeChannelMessageStore {
     return {
       ...read,
       pendingRemovals: draftStore.pendingRemovals(),
-      sources: this.#unreadableMessages.now > 0 ? 'unknown' : 'known'
+      sources: this.#unreadableMessages.now > 0 || this.#ledger !== 'ok' ? 'unknown' : 'known',
+      ledger: this.#ledger
     }
   }
 
