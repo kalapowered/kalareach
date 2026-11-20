@@ -122,9 +122,6 @@ const FAULT_RESERVE: usize = 8;
 /// binding disables itself instead, which is what the notice would have asked for.
 const FAULT_DELIVERY_WAIT: core::time::Duration = core::time::Duration::from_secs(2);
 
-/// How long preparing a binding may take before the caller is told it has not finished.
-pub const DEFAULT_PREPARE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
-
 /// What a broker asks for when it prepares a binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BindingRequest {
@@ -405,17 +402,6 @@ impl Runtime {
             bindings
                 .values()
                 .filter(|entry| matches!(entry.state, RegistrationState::Live(_)))
-                .count()
-        })
-    }
-
-    /// Returns how many bindings one owner holds.
-    #[must_use]
-    pub fn bindings_of(&self, owner: BindingOwner) -> usize {
-        self.bindings.lock().map_or(0, |bindings| {
-            bindings
-                .values()
-                .filter(|entry| entry.owner == owner)
                 .count()
         })
     }
@@ -1981,7 +1967,6 @@ mod tests {
         assert!(!Unbound::Absent.existed());
         assert!(Unbound::Stopped.existed());
         assert!(Unbound::Preparing.existed());
-        assert_eq!(runtime.bindings_of(owner), 0);
         assert_eq!(runtime.release_owner(owner), 0);
     }
 

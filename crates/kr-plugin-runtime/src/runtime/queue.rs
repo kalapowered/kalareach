@@ -107,12 +107,6 @@ impl ObservationQueue {
         }
     }
 
-    /// Returns the capacity in bytes.
-    #[must_use]
-    pub const fn capacity_bytes(&self) -> u64 {
-        self.capacity_bytes
-    }
-
     /// Returns how many bytes the queue holds.
     #[must_use]
     pub const fn held_bytes(&self) -> u64 {
@@ -317,11 +311,6 @@ mod tests {
             Some(id.to_owned()),
             vec![0_u8; bytes],
         )
-    }
-
-    #[test]
-    fn the_capacity_is_the_specified_four_mebibytes() {
-        assert_eq!(ObservationQueue::new().capacity_bytes(), 4_194_304);
     }
 
     #[test]

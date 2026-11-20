@@ -30,7 +30,6 @@ use kr_plugin_sdk::capability::{
     PluginCapability, SubjectIdentity,
 };
 use kr_plugin_sdk::catalogue::{IndexEntry, QualificationResult};
-use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::text::DisabledReason;
 use kr_protocol::ids::CapabilityRevision;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
@@ -289,16 +288,6 @@ pub fn check_grants_nothing(
     Ok(())
 }
 
-/// Returns true when a record still describes the binding it is about.
-///
-/// An installed upgrade does not invalidate an old running process's correctly pinned identity, so
-/// the comparison is against the hash the binding holds rather than against whatever is installed
-/// now.
-#[must_use]
-pub fn applies_to_binding(record: &CapabilityEvidence, package_digest: PayloadDigest) -> bool {
-    record.identity.package_digest.0 == Some(package_digest)
-}
-
 fn disabled_reason(
     capability: PluginCapability,
     qualification: &QualificationResult,
@@ -327,6 +316,7 @@ fn disabled_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_plugin_sdk::digest::PayloadDigest;
     use kr_plugin_sdk::example::example_manifest;
     use kr_plugin_sdk::text::{Label, Summary};
     use kr_plugin_sdk::version::PackageVersion;
@@ -573,8 +563,6 @@ mod tests {
         assert_eq!(record.state, CapabilityState::NotTested);
         assert!(!record.state.is_positive());
         assert!(record.disabled_reason.0.is_some());
-        assert!(applies_to_binding(&record, installation.package_digest));
-        assert!(!applies_to_binding(&record, PayloadDigest::of(b"other")));
     }
 
     #[test]
