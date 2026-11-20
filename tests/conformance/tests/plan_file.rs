@@ -54,8 +54,147 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
     vec![
         (
             "an unknown key at the top",
-            with("bogus = 1\n"),
+            format!("bogus = 1\n{}", with("")),
             "unknown field `bogus`",
+        ),
+        (
+            "an unknown key among the unrun reasons",
+            with("").replacen("[unrun.rust]", "bogus = 'x'\n[unrun.rust]", 1),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key among the unrun reasons of Rust",
+            with("bogus = 'x'\n"),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key in an excluded package",
+            with(
+                "[[excluded_package]]\nplatform = 'linux'\npackage = 'p'\nreason = 'r'\nbogus = 1\n",
+            ),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key in an absent group",
+            with(
+                "[[group_absent]]\ngroup = 'rust'\nplatform = 'windows'\nreason = 'r'\nbogus = 1\n",
+            ),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key in a case table",
+            with(
+                "[[case_table]]\nfiles = 'f'\npackage = 'p'\ntarget = 't'\ntests = ['a']\nbogus = 1\n",
+            ),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key in an ignored run",
+            with(
+                "[[ignored_run]]\npackage = 'p'\ntarget = '--lib'\nbogus = 1\n[ignored_run.runs]\nkind = 'by_hand'\nwhy = 'w'\n",
+            ),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key in a lane",
+            with("[[lane]]\nfiles = 'a/**'\nreason = 'r'\nbogus = 1\n"),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key among the terminals",
+            with("[terminals]\nnames = ['a']\nreason = 'r'\nbogus = 1\n"),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key among the TypeScript packages",
+            with("[typescript]\npackages = []\nbogus = 1\n"),
+            "unknown field `bogus`",
+        ),
+        (
+            "an unknown key among the applications",
+            with("[applications]\nlock = 'l'\nbogus = 1\n"),
+            "unknown field `bogus`",
+        ),
+        (
+            "a step that names no platform",
+            step_with("platforms = ['linux']", "platforms = []"),
+            "step `one` names no platform",
+        ),
+        (
+            "a step with an empty command",
+            step_with("command = ['cargo', 'test']", "command = []"),
+            "step `one` has an empty command",
+        ),
+        (
+            "a lane reading that takes no lane",
+            step_with("reading = 'cargo'", "reading = 'lane'"),
+            "step `one` reads a lane and takes a `lane` and no `package`",
+        ),
+        (
+            "skips from the applications in a plan that has none",
+            step_with(
+                "reading = 'cargo'",
+                "reading = 'cargo'\nskips_from = 'applications'",
+            ),
+            "step `one` skips from the applications and the plan has no `[applications]`",
+        ),
+        (
+            "an unrun reason of Rust that says nothing",
+            with("").replace("linux = 'l'", "linux = ''"),
+            "`[unrun]` has no `rust.linux` reason",
+        ),
+        (
+            "an unrun reason of the benchmarks that is blank",
+            with("").replace("bench = 'b'", "bench = '  '"),
+            "`[unrun]` has no `bench` reason",
+        ),
+        (
+            "an unrun reason of TypeScript that says nothing",
+            with("").replace("typescript = 't'", "typescript = ''"),
+            "`[unrun]` has no `typescript` reason",
+        ),
+        (
+            "a filter with no reason",
+            format!(
+                "{}{STEP}[step.filter]\nname = 'test'\nreason = ''\n",
+                with("")
+            ),
+            "step `one` filters with no reason",
+        ),
+        (
+            "a skip with no reason",
+            format!(
+                "{}{STEP}[[step.skips]]\nname = 'a'\nreason = ' '\n",
+                with("")
+            ),
+            "step `one` skips `a` with no reason",
+        ),
+        (
+            "an excluded package with no reason",
+            with("[[excluded_package]]\nplatform = 'linux'\npackage = 'p'\nreason = ''\n"),
+            "an `[[excluded_package]]` for `p` has no reason",
+        ),
+        (
+            "an absent group with no reason",
+            with("[[group_absent]]\ngroup = 'rust'\nplatform = 'windows'\nreason = ''\n"),
+            "a `[[group_absent]]` for the group `rust` has no reason",
+        ),
+        (
+            "a lane with no reason",
+            with("[[lane]]\nfiles = 'a/**'\nreason = ' '\n"),
+            "the lane `a/**` has no reason",
+        ),
+        (
+            "terminals with no reason",
+            with("[terminals]\nnames = ['a']\nreason = ''\n"),
+            "`[terminals]` has no reason",
+        ),
+        (
+            "an ignored run by hand that says not why",
+            with(
+                "[[ignored_run]]\npackage = 'p'\ntarget = '--lib'\n[ignored_run.runs]\nkind = 'by_hand'\nwhy = ''\n",
+            ),
+            "the `[[ignored_run]]` of `p` `--lib` has no `why`",
         ),
         (
             "an unknown key in a step",
