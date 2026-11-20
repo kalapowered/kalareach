@@ -187,28 +187,30 @@ them.
 
 ### What the plan names to read
 
-`[rust] manifests` lists the manifest of each Rust workspace, relative to the repository; an empty
-list means no Rust. The report runs one `cargo metadata` for each manifest and reads each workspace's
-lock from that workspace's root. A lock that is absent is a problem of the map. A package name that
-two workspaces hold is refused, naming both manifests, because a target is named by its package, its
-kind and its name. A manifest that is absent, absolute, holds `..` or is a link is refused when the
-plan loads. The files of the map are named relative to the tested root.
+The plan says where the report looks. The report takes no default from this repository: `[rust] manifests` and `[ignored_runs] held` are required, and any other key that is absent names nothing.
 
-`[typescript]` names the packages, `compiler_from`, `skip_directories` (names of directories that no
-file is read below), `scripts` (directories whose files are read for the rows they name) and
-`lane_directories` (directories whose Kotlin, Swift and Java files are read for the lanes). A key
-that is absent names nothing, and a `compiler_from` entry has to be a directory of the tested root.
-The suffixes of the files read stay constants of the program, because they are the suffixes its
-parsers read.
+`[rust] manifests` lists the manifest of each Rust workspace, relative to the repository. An empty list turns Rust discovery off. Each entry is a workspace's own manifest: the manifest of one of its members is a problem of the map that names the workspace's, and a manifest named twice is refused when the plan loads. The report runs one `cargo metadata` for each manifest and reads the lock from the workspace root that Cargo reports. An absent lock is a problem of the map. So is a package name that two workspaces hold, which names both manifests, because a target is named by its package, its kind and its name. `[ignored_runs] held` is `true` for a tree held to its `[[ignored_run]]` entries and `false` for one that is not.
 
-`[ignored_runs] held` is `true` for a tree that is held to its `[[ignored_run]]` entries and `false`
-for one that is not. `[terminal_profile] path` names the file that holds the terminal profile the
-result records; a plan without it leaves the profile out of the result.
+Five keys are optional, and each names nothing when it is absent:
 
-A plan that names no manifest and no package maps nothing, which is not an error. A group that no
-step uses is refused. The table of identifiers is compiled into the program and holds three bounds
-only (30 sections, 35 acceptance rows, 10 performance rows), so a tool release does not prove which
-revision of the specification a repository cites.
+- `scripts` lists the directories whose files are read for the rows they name.
+- `lane_directories` lists the directories whose Kotlin, Swift and Java files are read for the lanes.
+- `[typescript] compiler_from` lists the directories whose own `node_modules` holds the compiler.
+- `[typescript] skip_directories` lists the names of directories that no TypeScript file is read below, at any depth. An entry is one name, with no `/` or `\`.
+- `[terminal_profile] path` names the file that holds the terminal profile the result records. A plan without it leaves the profile out of the result, and a field that the file lacks, or a file that is not JSON, gives `unknown`.
+
+`scripts` and `lane_directories` sit at the top of the plan, so a repository with lanes and no TypeScript can name them. `[typescript] packages` is required when that table is present, and an empty list turns TypeScript discovery off. The scripts, the lanes and the case tables still supply their entries when `manifests` and `packages` are empty.
+
+The loader refuses a path in any of these keys, and a script that a step runs, when it:
+
+- is absolute, or holds `..` or `\`;
+- holds a pattern character (`*`, `?`, `[` or `]`), which is refused on every platform before any file is looked for;
+- is absent, or is the other kind of place: a manifest, a script and the profile are regular files, and every other key names a directory;
+- is a link, or reaches a place outside the repository through a link.
+
+The files that the map names are relative to the tested root, with one exception: Cargo names a Rust source by its absolute path, and the map shows it relative only when `--root` is an absolute path with no `.` or `..` part. The suffixes of the files read stay constants of the program, because they are the suffixes its parsers read. Two sets of directory names are constants too, because build tools write their output there: no walk enters `node_modules` or `target`, and the walk of the lanes also leaves out `build`, `.gradle`, `Pods`, `DerivedData` and `gen`, whatever the plan says.
+
+A group that no step uses is refused. The identifier grammar is compiled into the program and holds three bounds only (30 sections, 35 acceptance rows, 10 performance rows), so a tool release does not prove which revision of the specification a repository cites.
 
 ## How a test names what it proves
 
@@ -401,15 +403,20 @@ A test annotated with `#[ignore]` will not run under `cargo test` unless either 
 
 The report reads TypeScript with a compiler that the tested tree has installed, or that the command
 line names (`tests/conformance/typescript-facts.mjs`, which the program embeds), so a comment marker
-inside a string, a template or JSX text is never taken for a comment. The compiler comes from the
-first directory of the plan's `[typescript] compiler_from` whose own `node_modules` holds it, or from
-the directory that `--typescript-compiler <directory>` gives, which replaces them. A tree with
-neither has no compiler: the map says so and names the install command. The result records the
-compiler's version in `run.toolchain.typescript`.
+inside a string, a template or JSX text is never taken for a comment. The compiler is the package
+`node_modules/typescript` of the first directory in the plan's `[typescript] compiler_from` that
+holds one, loaded by its own path: no parent directory and no `NODE_PATH` is searched.
+`--typescript-compiler <directory>`, which `map` and `run` take, names a directory instead and
+replaces `compiler_from`. A tree with neither has no compiler: the map says so and names the install
+command. The result records the compiler's version in `run.toolchain.typescript` and leaves the field
+out when the run read no TypeScript.
 
-A call is a test when its first argument is a string or a template, or when a function follows its
-first argument. A `test.skip(condition, reason)`, a `test.step`, a `test.use`, a `test.extend` and the
-four hooks are not tests.
+A call is a test when its callee is `it`, `test`, `describe` or `suite` (with modifiers such as
+`.skip`, `.only` and `.each(table)`) and its first argument is a string or a template, or an arrow
+function or a function expression follows its first argument. A function passed by its name does
+not count. A `test.skip(condition, reason)`, a `test.step`, a `test.use`, a `test.extend` and the
+four hooks (`beforeAll`, `beforeEach`, `afterAll` and `afterEach`), with a title or without one, are
+not tests.
 
 - A comment inside a test's body keys that test.
 - A comment directly above a test call, with no blank line between, keys that test; one above a
@@ -545,7 +552,7 @@ identifier's `references` and `figures`.
     "platform": "linux",
     "system": { "os": "linux", "release": "Ubuntu 24.04.3 LTS, Linux 6.11.0", "arch": "x86_64", "target": "x86_64-unknown-linux-gnu" },
     "commit": { "id": "<40 hex digits>", "modified": false },
-    "toolchain": { "rustc": "rustc 1.97.1 (...)", "cargo": "cargo 1.97.1 (...)", "node": "v22.23.1", "pnpm": "11.14.0", "phones": { "gradle": "8.14.3", "java": "17.0.20 (Eclipse Adoptium 17.0.20+101)" } },
+    "toolchain": { "rustc": "rustc 1.97.1 (...)", "cargo": "cargo 1.97.1 (...)", "node": "v22.23.1", "pnpm": "11.14.0", "typescript": "5.9.3", "phones": { "gradle": "8.14.3", "java": "17.0.20 (Eclipse Adoptium 17.0.20+101)" } },
     "terminal_profile": { "profile": "kr-vt/1", "term": "xterm-256color" },
     "packages": [ { "name": "kr-term", "version": "0.1.0" }, { "name": "@kalareach/protocol", "version": "0.34.0" } ],
     "applications": [ { "id": "neovim", "version": "0.12.5", "status": "installed", "url": "https://...", "sha256": "...", "build": "release", "reason": null } ],
@@ -593,7 +600,7 @@ identifier's `references` and `figures`.
 
 | Field | Meaning |
 | --- | --- |
-| `run` | What was tested, with what, where: the commit (and whether tracked files differed from it), the toolchain, the machine, the terminal profile from its committed fixture, every package's version, the applications and how each was installed, the groups selected, and whether the whole terminal matrix was asked for (`all_terminals`) |
+| `run` | What was tested, with what, where: the commit (and whether tracked files differed from it), the toolchain, the machine, the terminal profile from the file the plan names (left out when it names none), the TypeScript compiler's version when the run read TypeScript, every package's version, the applications and how each was installed, the groups selected, and whether the whole terminal matrix was asked for (`all_terminals`) |
 | `steps` | Every command the run ran, as run, with its exit status, how long it took and its log, relative to the evidence directory. `needs` names the variables a step reads from the environment |
 | `steps[].observation` | Present on a failed step whose log names a program the system would not start: each program's path, the log's lines about it and what its file looked like when the step ended, and whether a test also failed in the log; `log` is present, with no programs, when the step's log was not read, and says what its path held or why it could not be read |
 | `summary.failed_with_damage_seen`, `summary.failed_otherwise` | The numbers of the failed steps that carry an observation with damage seen and no failed test, and of the other failed steps |
