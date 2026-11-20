@@ -52,6 +52,7 @@ import {
   QR_FILE_NAME,
   QR_HELP,
   RECOVERY_HELP,
+  SEED_KEPT_ON_WINDOWS,
   SETTLE_HELP,
   SYNC_SERVICE_HELP,
   describeArchive,
@@ -678,6 +679,11 @@ export function SyncPanel({
                 ) : null}
                 {recovery?.state === 'off' ? (
                   <p className="account-note">{RECOVERY_HELP}</p>
+                ) : null}
+                {recovery?.platform === 'windows' ? (
+                  <p className="account-note" data-testid="recovery-seed-kept">
+                    {SEED_KEPT_ON_WINDOWS}
+                  </p>
                 ) : null}
                 {recovery?.state === 'on' && hostCover === null ? (
                   <p className="account-note" data-testid="recovery-host-help">

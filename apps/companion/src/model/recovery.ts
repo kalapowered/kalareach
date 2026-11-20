@@ -20,6 +20,12 @@ export const RECOVERY_HELP =
   'Recovery keeps an encrypted bundle with your account and gives you a kit to keep. Without the kit, ' +
   'KalaReach cannot bring your data back for you.'
 
+/** Where the seed is kept on Windows, and who can read it there. */
+export const SEED_KEPT_ON_WINDOWS =
+  'On Windows the recovery seed is kept in the Credential Manager, where programs that run as your ' +
+  'Windows account can read it, the agents of KalaReach sessions that run as your account on this ' +
+  'computer among them.'
+
 /** What the sync service setting is. */
 export const SYNC_SERVICE_HELP = 'An https address, like https://reach.kala.to.'
 

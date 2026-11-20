@@ -377,7 +377,8 @@ module:
   the Secret Service, under "KalaReach Companion". The name it offers a host is its host name.
 - A code's tries are counted in `pairing-budget` in the application's data directory, under a key
   kept in the same store, so a restart, a reboot or a second copy of the application spends from
-  the same five.
+  the same five. On Windows the application's data directory is in Local AppData, so what the
+  application keeps there stays on this computer and does not roam with a roaming profile.
 - The hosts it is paired with, and an attempt still waiting for its owner, are records in
   `pairing`, each written whole and renamed into place. They hold no secret.
 - The service it pairs through is `https://reach.kala.to` until the person picks another, and the
@@ -1035,7 +1036,9 @@ answer never came back.
 - Turning recovery on writes `recovery/recovery.json` first (the service, a locator drawn for the
   bundle, and whether the first write is known to have landed), flushed to disk before the first
   request. It then makes the seed and keeps it in the device's secure store, and puts the first
-  bundle at the service. A kit exists only once that write has landed. A start that did not finish
+  bundle at the service. On Windows the recovery seed is kept in the Credential Manager, where
+  programs that run as your Windows account can read it, the agents of KalaReach sessions that run
+  as your account on this computer among them. A kit exists only once that write has landed. A start that did not finish
   goes on with the locator it began with, and a bundle that landed unrecorded is read with the
   seed and kept; a bundle the seed does not open is left alone and no kit is offered for it.
 - Each step holds `recovery/recovery.lock` for as long as it runs. A second companion on the same
@@ -1047,9 +1050,12 @@ answer never came back.
 - Saving the kit writes the seed, the locator and the service to a file at a destination the save
   dialog returned. The file is flushed to disk and, on Unix, has the owner-only mode (0600); on
   macOS its access list is removed first, and the save fails and leaves the file's contents as they
-  were when the list cannot be removed. On Windows a new file has the permissions of the folder the
-  person chose, and a file that already existed keeps its own. The page is sent none of its
-  contents.
+  were when the list cannot be removed. On Windows the file is given an access list that names your
+  account and the file's owner (your account, or, when the program runs as administrator, usually
+  the Administrators group), and no one else. A file that already exists has its list set the same
+  way before it is emptied, and the save fails, leaving the file as it was, when another account
+  owns it or its list cannot be set. A volume that keeps no access lists, such as FAT or exFAT, is
+  refused. The page is sent none of its contents.
 - Saving the kit as a QR code draws the kit's own text, the document a person could have typed, at error correction level Q as an SVG with a four-module quiet zone, and writes it where the save dialog put it with the same owner-only rules as the text kit. The file has a print size, about six centimetres across for a typical kit. The code holds the whole kit, the seed included, and the card says so. The SVG text that holds it is built in one buffer, sized beforehand and cleared when it is dropped; the encoder's own copies of the kit (the bit buffer and codewords it builds from the kit text, and the `qrcodegen::QrCode` it returns) are ones this program cannot clear, and they are freed without being cleared.
 - An offline copy is a file of ciphertext. The card lists the archives the recovery bundle names, each with the newest generation the service holds of it, and writes the bundle alone or the bundle with one archive's newest generation to the file the save dialog returned. This computer reads the service with the account to make it, authenticates the bundle with the kit and opens the archive's manifest in memory to find the objects it names; nothing decrypted is written or sent, and the file holds no kit text. Reading the service is not a host's privacy-mode matter, so privacy mode does not stop it. The file opens with the kit alone, with `kr backup restore --from-export`. An archive of more than 256 MiB of ciphertext is refused by name: it has no offline copy and restores from the service only, so with the service gone it cannot be restored.
 - Covering the host on this computer (`recovery_cover_host`, `Recovery::cover_host`) is how the
