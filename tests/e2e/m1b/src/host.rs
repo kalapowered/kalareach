@@ -392,6 +392,7 @@ impl<'r> Host<'r> {
     ///
     /// Panics when it does not answer within [`LIVENESS`].
     fn start_daemon_once(&self) -> Result<(), String> {
+        kr_ipc::testing::account_launchd::require("the host start");
         self.start_daemon_once_ready_by(&|bound| self.kr_lists(bound))
     }
 

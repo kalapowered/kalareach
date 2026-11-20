@@ -901,7 +901,7 @@ enum Way {
 
 /// The funnels of the programs that are built without the hold: file, function (`Type::name` inside
 /// an `impl`), the way its guard stands, and why it is a funnel.
-const FUNNELS: [(&str, &str, Way, &str); 8] = [
+const FUNNELS: [(&str, &str, Way, &str); 9] = [
     (
         "tests/e2e/m1b/src/host.rs",
         "Host::start_prepared",
@@ -913,6 +913,12 @@ const FUNNELS: [(&str, &str, Way, &str); 8] = [
         "Host::start_daemon_once",
         Way::First,
         "spawns the daemon, and is the restart's start too",
+    ),
+    (
+        "tests/e2e/m1b/src/host.rs",
+        "Host::start_daemon_once_ready_by",
+        Way::First,
+        "spawns the daemon for `Host::start_daemon_once`, with the readiness the caller names",
     ),
     (
         "tests/e2e/agents/src/stage.rs",
