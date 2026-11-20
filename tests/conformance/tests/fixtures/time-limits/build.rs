@@ -1,10 +1,12 @@
-//! Waits when a case asks it to: while the step builds (`KR_BLOCK=build`) or while it lists its
-//! tests (`KR_BLOCK=listing`). It records its pid in the file `KR_BLOCK_PIDS` names, and waits
-//! with `sleep`.
+//! Waits when a case asks it to: while the step builds (`KR_BLOCK=build`), while it lists its
+//! tests (`KR_BLOCK=listing`), or in each of them and in the step's run (`KR_BLOCK=both`). It records
+//! its pid in the file `KR_BLOCK_PIDS` names, and waits with `sleep` for `KR_BLOCK_SECONDS` seconds,
+//! or for 300 when that is not set.
 
 fn main() {
     println!("cargo:rerun-if-env-changed=KR_BLOCK");
     println!("cargo:rerun-if-env-changed=KR_BLOCK_PIDS");
+    println!("cargo:rerun-if-env-changed=KR_BLOCK_SECONDS");
     // The listing and the run set this variable, and the build before them does not, so the script
     // runs again when the listing begins.
     println!("cargo:rerun-if-env-changed=KR_CONFORMANCE_STEP");
@@ -12,10 +14,15 @@ fn main() {
     match std::env::var("KR_BLOCK").as_deref() {
         Ok("build") if !listing => {}
         Ok("listing") if listing => {}
+        Ok("both") => {}
         _ => return,
     }
     if let Ok(file) = std::env::var("KR_BLOCK_PIDS") {
         std::fs::write(file, format!("{}\n", std::process::id())).expect("the pid file");
     }
-    std::thread::sleep(std::time::Duration::from_secs(300));
+    let seconds = std::env::var("KR_BLOCK_SECONDS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(300);
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
 }
