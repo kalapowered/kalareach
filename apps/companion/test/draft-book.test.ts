@@ -15,6 +15,7 @@ import type {
   DraftSaveRequest,
   HostPort
 } from '../src/host/port'
+import { EMPTY_SHELF } from '../src/model/channel-messages'
 import { DraftBook, keptEntry } from '../src/model/draft-book'
 import { edit, startDraft } from '../src/model/drafts'
 
@@ -1183,7 +1184,7 @@ describe('a prompt kept apart from the composer', () => {
     expect(notices.join(' ')).toMatch(/too long/i)
     // The text is held for the person to copy, with the kept drafts, after the tab is gone as well.
     expect(book.snapshot().unstored.map((each) => each.text)).toEqual(['send this'])
-    expect(keptEntry(book.snapshot())?.title).toBe('One prompt held in this window only')
+    expect(keptEntry(book.snapshot(), EMPTY_SHELF)?.title).toBe('One prompt held in this window only')
     store.refuseSaves(null)
     book.writeAll()
     await book.settled()
@@ -1740,7 +1741,7 @@ describe('a listed draft whose act ended while the store would not be read', () 
 })
 
 describe('what the entry to the kept drafts says', () => {
-  const none = { kept: [], unreadable: 0, unstored: [] } as const
+  const none = { kept: [], unreadable: 0, unstored: [], ledger: 'ok' } as const
   const one = { id: 'a', sessionId: MAIN, text: 'x', files: 0, inComposer: false }
   const kept = {
     id: 'k',
@@ -1754,20 +1755,20 @@ describe('what the entry to the kept drafts says', () => {
   } as const
 
   it('says text is held in this window only, and does not call it a kept draft', () => {
-    expect(keptEntry(none)).toBeNull()
-    expect(keptEntry({ ...none, unstored: [one] })).toMatchObject({
+    expect(keptEntry(none, EMPTY_SHELF)).toBeNull()
+    expect(keptEntry({ ...none, unstored: [one] }, EMPTY_SHELF)).toMatchObject({
       title: 'One prompt held in this window only'
     })
-    expect(keptEntry({ ...none, unstored: [one, { ...one, id: 'b' }] })?.title).toBe(
+    expect(keptEntry({ ...none, unstored: [one, { ...one, id: 'b' }] }, EMPTY_SHELF)?.title).toBe(
       '2 prompts held in this window only'
     )
   })
 
   it('says it in the line a phone shows, when there are kept drafts as well', () => {
-    expect(keptEntry({ ...none, kept: [kept], unstored: [one] })?.title).toBe(
+    expect(keptEntry({ ...none, kept: [kept], unstored: [one] }, EMPTY_SHELF)?.title).toBe(
       'One kept draft, and text held in this window only'
     )
-    expect(keptEntry({ ...none, kept: [kept] })?.title).toBe('One kept draft')
+    expect(keptEntry({ ...none, kept: [kept] }, EMPTY_SHELF)?.title).toBe('One kept draft')
   })
 })
 

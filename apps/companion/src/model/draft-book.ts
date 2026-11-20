@@ -39,9 +39,12 @@ import {
   failureMessage,
   type DraftSaved,
   type HostPort,
+  type LedgerSetAside,
   type StoredDraft,
+  type StoredDrafts,
   type StoredMark
 } from '../host/port'
+import type { ShelfSnapshot } from './channel-messages'
 import {
   connectionLost,
   retarget as retargeted,
@@ -75,6 +78,8 @@ export type KeptWhy =
   | 'other'
   /** The text of a prompt the host did not take, or could not say it took. */
   | 'sent'
+  /** A place that can say a draft was sent could not be read, so no composer takes it by itself. */
+  | 'unread'
 
 /** One draft in the list of kept drafts. */
 export interface KeptDraft {
@@ -115,38 +120,80 @@ export interface BookSnapshot {
   readonly unreadable: number
   /** The text of prompts the store will not keep, held in this window so that a person can copy it. */
   readonly unstored: readonly UnstoredPrompt[]
+  /** What the list of removals is: readable, unreadable now, or damaged (the one state a person can set aside). */
+  readonly ledger: StoredDrafts['ledger']
+  /** `unknown` while a place that can say a draft was sent could not be read: no stored draft goes into a composer by itself. */
+  readonly sources: StoredDrafts['sources']
   /** Why the newest write failed, or why the store would not open. Null when all is well. */
   readonly problem: string | null
+}
+
+/** What the entry to the kept drafts says: `title` alone on a phone, `label` and `rest` as two halves of a desktop's line. */
+export interface KeptEntry {
+  readonly title: string
+  readonly label: string
+  readonly rest: string
 }
 
 /**
  * What the entry to the kept drafts says, or null when there is nothing to enter for.
  *
  * `title` stands alone (a phone's row); `label` and `rest` are the two halves of a sentence whose
- * first half is the control (a desktop's line). Drafts that could not be read are reported too: a
- * person whose drafts are unreadable is told, rather than shown an empty list.
+ * first half is the control (a desktop's line). What could not be read is reported too: a person
+ * whose drafts, messages or removals are unreadable is told, rather than shown an empty list. The
+ * order of the forms is the order of what matters most: the list of removals, a failed read of the
+ * messages, drafts with another kind that could not be read, messages, records of sends, and then
+ * what can be read.
  */
 export function keptEntry(
-  book: Pick<BookSnapshot, 'kept' | 'unreadable' | 'unstored'>
-): { readonly title: string; readonly label: string; readonly rest: string } | null {
+  book: Pick<BookSnapshot, 'kept' | 'unreadable' | 'unstored' | 'ledger'>,
+  shelf: Pick<
+    ShelfSnapshot,
+    'status' | 'messages' | 'holds' | 'damagedHolds' | 'unreadableMessages' | 'unreadableHolds'
+  >
+): KeptEntry | null {
+  const alone = (label: string, rest: string): KeptEntry => ({ title: `${label} ${rest}`.replace(/\.$/, ''), label, rest })
+  const messagesUnreadable = shelf.unreadableMessages.layout + shelf.unreadableMessages.now
+  const holdsUnreadable = shelf.unreadableHolds.layout + shelf.unreadableHolds.now + shelf.damagedHolds.length
+  if (book.ledger !== 'ok') return alone('The list of removals for drafts', 'could not be read.')
+  if (shelf.status === 'failed') return alone('Channel messages', 'could not be read now.')
+  if (book.unreadable > 0 && messagesUnreadable + holdsUnreadable > 0) {
+    return alone('Some drafts and channel messages', 'could not be read.')
+  }
+  if (messagesUnreadable > 0) return alone('Some channel messages', 'could not be read.')
+  if (holdsUnreadable > 0) return alone('Some records of messages being sent', 'could not be read.')
   const stored = book.kept.length
   const held = book.unstored.length
-  if (stored === 0 && held === 0) {
+  const messages = shelf.messages.length
+  const holds = shelf.holds.length
+  if (stored === 0 && held === 0 && messages === 0) {
+    if (holds > 0) {
+      const label = holds === 1 ? 'One record of a message being sent' : `${String(holds)} records of messages being sent`
+      return alone(label, 'can be removed on this page.')
+    }
     return book.unreadable === 0
       ? null
       : { title: 'Some drafts could not be read', label: 'Some drafts', rest: 'could not be read.' }
   }
-  if (stored === 0) {
+  const messagesLabel = messages === 0 ? '' : messages === 1 ? 'One channel message' : `${String(messages)} channel messages`
+  if (stored === 0 && messages === 0) {
     // Text that is held in this window only, and is lost when the application stops.
     const label = held === 1 ? 'One prompt' : `${String(held)} prompts`
     return { title: `${label} held in this window only`, label, rest: 'held in this window only.' }
   }
-  const label = stored === 1 ? 'One kept draft' : `${String(stored)} kept drafts`
-  const alone = held === 0 ? '' : ' Some text is held in this window only.'
+  const draftsLabel = stored === 0 ? '' : stored === 1 ? 'One kept draft' : `${String(stored)} kept drafts`
+  const label =
+    draftsLabel === '' ? messagesLabel : messagesLabel === '' ? draftsLabel : `${draftsLabel} and ${messagesLabel.toLowerCase()}`
+  const heldNote = held === 0 ? '' : ' Some text is held in this window only.'
+  const plural = stored + messages > 1
+  const rest =
+    stored === 0
+      ? `${plural ? 'are' : 'is'} kept apart from the composers.${heldNote}`
+      : `${plural ? 'are' : 'is'} not in a composer.${heldNote}`
   return {
     title: held === 0 ? label : `${label}, and text held in this window only`,
     label,
-    rest: `${stored === 1 ? 'is' : 'are'} not in a composer.${alone}`
+    rest
   }
 }
 
@@ -431,6 +478,9 @@ export class DraftBook {
   #drafts: readonly Draft[] = []
   #others: readonly StoredDraft[] = []
   #unreadable = 0
+  #ledger: StoredDrafts['ledger'] = 'ok'
+  #sources: StoredDrafts['sources'] = 'known'
+  readonly #reloaded = new Set<() => void>()
   #problem: string | null = null
   readonly #failed = new Map<string, { readonly code: string; readonly message: string }>()
   readonly #tracks = new Map<string, Track>()
@@ -494,6 +544,26 @@ export class DraftBook {
     }
   }
 
+  /** Subscribes to the end of each read that follows the first, so that what depends on the store is read again. */
+  onReloaded(listener: () => void): () => void {
+    this.#reloaded.add(listener)
+    return () => {
+      this.#reloaded.delete(listener)
+    }
+  }
+
+  /**
+   * Sets a damaged list of removals aside, then reads the store again: the rebuilt list shows what
+   * it owes, and a draft the old list held back can show again. Resolves with what the host's
+   * command answered.
+   */
+  async setLedgerAside(): Promise<LedgerSetAside> {
+    const done = await this.#port.deviceDraftsLedgerSetAside()
+    // The read is the book's own, and a failure of it leaves the book as it was.
+    await this.reload()
+    return done
+  }
+
   /** Subscribes to the passing messages the book has for the person. */
   onNotice(listener: (words: string) => void): () => void {
     this.#notices.add(listener)
@@ -509,6 +579,8 @@ export class DraftBook {
       drafts: this.#drafts,
       kept: this.#keptList(),
       unreadable: this.#unreadable,
+      ledger: this.#ledger,
+      sources: this.#sources,
       unstored: this.#unstored.map((flight) => ({
         id: flight.id,
         sessionId: flight.sent.target.sessionId,
@@ -540,6 +612,8 @@ export class DraftBook {
     try {
       const stored = await this.#port.deviceDrafts()
       this.#unreadable = stored.unreadable
+      this.#ledger = stored.ledger
+      this.#sources = stored.sources
       // Before the drafts are read into composers: a record owed for removal is no draft's.
       this.#oweFrom(stored.pendingRemovals)
       this.#merge(stored.drafts)
@@ -575,9 +649,12 @@ export class DraftBook {
         // never merged, so after the last attempt the book is left as it was.
         if (this.#moves !== seen) continue
         this.#unreadable = stored.unreadable
+        this.#ledger = stored.ledger
+        this.#sources = stored.sources
         this.#oweFrom(stored.pendingRemovals)
         this.#merge(stored.drafts)
         this.#changed()
+        for (const listener of this.#reloaded) listener()
       } catch (failure) {
         this.#problem = failureMessage(failure)
         this.#changed()
@@ -2147,7 +2224,9 @@ export class DraftBook {
     const held = new Set([...composed, ...this.#reserved(), ...this.#acting])
     const next = [...this.#drafts]
     const chosen = new Set<string>()
-    const sessions = new Set(list.map((stored) => stored.sessionId))
+    // While a place that can say a draft was sent could not be read, no draft goes into a composer
+    // by itself: each is listed, and a person decides.
+    const sessions = this.#sources === 'unknown' ? new Set<string>() : new Set(list.map((stored) => stored.sessionId))
     for (const sessionId of sessions) {
       // While a recovery is storing the text of a prompt, the record it makes is not known yet, so
       // no composer takes a draft from a read: the next read, once it has decided, does.
@@ -2201,7 +2280,9 @@ export class DraftBook {
             ? 'conflicted'
             : this.#sentRecords.has(stored.id)
               ? 'sent'
-              : 'other'
+              : this.#sources === 'unknown'
+                ? 'unread'
+                : 'other'
     const apart = this.#others.filter((stored) => !this.#acting.has(stored.id)).map<KeptDraft>((stored) => ({
       id: stored.id,
       revision: stored.revision,

@@ -14,6 +14,7 @@ import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@
 
 import { Badge, Banner, Button, Card } from '../components/ui'
 import { useApp } from '../app/state'
+import { useChannelMessages } from '../app/channel-messages'
 import { useBook } from '../app/drafts'
 import { keptEntry } from '../model/draft-book'
 import { useConnectionRights } from '../app/rights'
@@ -69,7 +70,7 @@ export function sessionDescription(session: Session): string {
 export function Sessions(): ReactNode {
   const { port, go } = useApp()
   const rights = useConnectionRights()
-  const keptEntryLine = keptEntry(useBook())
+  const keptEntryLine = keptEntry(useBook(), useChannelMessages())
   const [list, setList] = useState<SessionListResult | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [query, setQuery] = useState('')
