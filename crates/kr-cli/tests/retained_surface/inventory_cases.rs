@@ -1185,7 +1185,7 @@ fn a_module_candidate_that_cannot_be_looked_at_is_an_error_and_not_an_absence() 
     let folder = small_tree("mod sub;\npub fn quiet() {}\n");
     let shut = folder.path().join("crates/kr-sender/src/sub");
     std::fs::create_dir_all(&shut).expect("a folder");
-    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0)).expect("permissions");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o0)).expect("permissions");
     let tree = tree_at(folder.path());
     let outcome = tree
         .as_ref()
