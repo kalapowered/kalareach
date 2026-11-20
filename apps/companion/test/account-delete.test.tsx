@@ -20,7 +20,8 @@ import { PLAIN_DELETION_PREVIEW, fakeHost } from '../src/host/fake'
 import { MobileApp } from '../src/mobile/MobileApp'
 import { minimumTarget } from '../src/mobile/platform'
 import { DeleteAccount, type DeletionFlow, type DeletionStep } from '../src/components/DeleteAccount'
-import { PURCHASE_WORDS, type AccountView } from '../src/model/account'
+import type { AccountView } from '../src/model/account'
+import { PURCHASE_WORDS } from './purchase-words'
 import {
   describeKept,
   describeProblem,

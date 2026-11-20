@@ -15,7 +15,7 @@ import userEvent from '@testing-library/user-event'
 import { AppProvider } from '../../src/app/state'
 import { fakeHost } from '../../src/host/fake'
 import { MobileApp } from '../../src/mobile/MobileApp'
-import { PURCHASE_WORDS } from '../../src/model/account'
+import { PURCHASE_WORDS } from '../purchase-words'
 
 function start() {
   const { port, controls } = fakeHost()

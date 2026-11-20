@@ -25,7 +25,7 @@ import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
 import { AttachmentPicker } from '../../src/mobile/components/picker'
 import { Inbox } from '../../src/mobile/views/Inbox'
-import { PURCHASE_WORDS } from '../../src/model/account'
+import { PURCHASE_WORDS } from '../purchase-words'
 import { TOUCH_TARGET, type MobilePlatform } from '../../src/mobile/platform'
 
 const MAIN_SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'

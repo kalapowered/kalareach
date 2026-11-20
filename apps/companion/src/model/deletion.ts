@@ -9,8 +9,8 @@
  * here.
  *
  * The words follow the same rule as the rest of the account panel: nothing to buy. A paid feature
- * set up on the website is called that, never by the words in `PURCHASE_WORDS`, and the policy is
- * named as text and never linked.
+ * set up on the website is called that, never by a word of purchase such as buy, subscribe or
+ * price, and the policy is named as text and never linked.
  */
 
 import { ACCOUNT_HOST } from './account'

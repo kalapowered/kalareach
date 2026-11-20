@@ -16,7 +16,7 @@ import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
 import { MobileApp } from '../src/mobile/MobileApp'
-import { PURCHASE_WORDS } from '../src/model/account'
+import { PURCHASE_WORDS } from './purchase-words'
 import { readAloud, shown } from './live-regions'
 
 const SIGNED_IN = {
