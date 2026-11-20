@@ -34,7 +34,9 @@ const FIRST_ATTEMPT_WITHIN: Duration = Duration::from_secs(60);
 /// # Errors
 ///
 /// Returns a local failure when this computer's pairing records could not be opened or the choice
-/// could not be kept.
+/// could not be kept. The step that makes the choice can also stop part of the way, through a
+/// panic, which is logged: the failure then says so and sends the person to the connection's state,
+/// because the choice may or may not have been made.
 pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Result<Publication> {
     let state = app.state::<AppState>();
     let device = state.device()?;
@@ -68,11 +70,19 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
             })
     })
     .await
-    .map_err(|error| {
-        CommandError::local_failure(format!("the host choice did not finish: {error}"))
-    })??;
+    .map_err(|error| unfinished(&error))??;
     let _ = tokio::time::timeout(FIRST_ATTEMPT_WITHIN, reached).await;
     Ok(state.connection_state())
+}
+
+/// The failure when the step that makes a choice stopped part of the way. The choice may or may not
+/// have been made, so the words send the person to the connection's state, which shows the host in
+/// use. What stopped the step, a task number and the text of a panic, is for the log.
+fn unfinished(error: &tauri::Error) -> CommandError {
+    tracing::error!(%error, "the step that makes a choice of host stopped part of the way");
+    CommandError::local_failure(
+        "the choice of host stopped part of the way; the connection's state shows which host is in use",
+    )
 }
 
 /// The host a choice names, as the owner holds it: the identity the host has, the one it gave this
@@ -213,4 +223,28 @@ async fn keep<R: Runtime>(
 /// What the page is refused with when it names a host this computer is not paired with.
 pub fn unknown_host() -> CommandError {
     CommandError::invalid("this computer is not paired with that host")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A choice whose step panics is told in words that say it stopped part of the way and where the
+    /// host in use shows, with nothing of the panic in them.
+    #[tokio::test]
+    async fn a_choice_that_stops_part_of_the_way_is_told_without_the_panic() {
+        let error = tauri::async_runtime::spawn_blocking(|| -> u8 { panic!("the keeper broke") })
+            .await
+            .expect_err("the step panicked");
+        let failure = unfinished(&error);
+        assert_eq!(
+            failure.message,
+            "the choice of host stopped part of the way; the connection's state shows which host is in use"
+        );
+        assert!(
+            !failure.message.contains("keeper broke"),
+            "{}",
+            failure.message
+        );
+    }
 }
