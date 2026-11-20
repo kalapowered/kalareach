@@ -332,6 +332,23 @@ macro_rules! outer_fwd { ($m:expr) => { inner_fwd!($m) }; }
 fn uses_fwd() { outer_fwd!(Method::AgentTurnCancel); }
 macro_rules! d_paren ( () => { via_paren!(Method::AgentTurnSteer) } );
 macro_rules! d_brack [ () => { via_brack!(Method::AgentTurnSteer) } ];
+struct Nest;
+impl Nest {
+    fn with_nested(&self) { #[cfg(test)] fn gone() { let _ = Method::AgentTurnCancel; } }
+}
+fn holds_impl() {
+    struct L;
+    impl L { #[cfg(test)] fn t(&self) { let _ = Method::AgentTurnCancel; } }
+}
+fn holds_mod() { mod m { #[cfg(test)] fn t() { let _ = Method::AgentTurnCancel; } } }
+trait Quiet2 {
+    #[cfg(test)]
+    const C: Method = Method::AgentTurnCancel;
+    #[cfg(test)]
+    type A: Into<[u8; Method::AgentTurnCancel as usize]>;
+    #[cfg(all(test, unix))]
+    via_impl!(Method::AgentTurnSteer);
+}
 idle!();
 unnamed!("agent.turn.cancel");
 unnamed!("agent.turn.steer");
@@ -443,6 +460,8 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("Holder::in_method", vec![Names]),
         ("Holder", vec![Names]),
         ("outer_live", vec![Names]),
+        // A stack that no configuration builds is read: the rule does not tell the names apart.
+        ("never", vec![Names]),
         ("Sends", vec![Names]),
         ("in_inline", vec![Request]),
         ("builds_request", vec![Request]),
@@ -521,11 +540,12 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
             .digest,
         root_before
     );
-    // The index holds what some configuration without `test` builds, at every position: a method
-    // only test code defines, and an item under an inline module whose condition contradicts its own.
-    for name in ["never", "only_tests", "also_tests", "Quiet::only_tests"] {
+    // The index holds what is not false without `test`, at every position: a method only test code
+    // defines is out, and an item under a stack that no configuration builds is in.
+    for name in ["only_tests", "also_tests", "Quiet::only_tests"] {
         assert_eq!(tree.item("kr_sender", name), Lookup::Absent, "{name}");
     }
+    assert!(matches!(tree.item("kr_sender", "never"), Lookup::Found(_)));
     assert!(matches!(
         tree.item("kr_sender", "product_method"),
         Lookup::Found(_)

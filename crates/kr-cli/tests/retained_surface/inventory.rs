@@ -1,12 +1,12 @@
 //! The module inventory of a crate: the files that product code is made of.
 //!
 //! The inventory starts at the crate's roots, the library and binary targets Cargo reports for it,
-//! and follows the module declarations that some configuration without `test` builds (see
-//! `condition`), as rustc finds the files: `mod name;` is `name.rs` or `name/mod.rs` beside the file
-//! or in a folder of its name, and `#[path = "..."]` is relative to the file's folder, or to the
-//! inline module's folder inside one. A file is read under the condition of the declaration that
-//! reaches it, and under each when several do. A file no declaration reaches is not read. The item
-//! index and the scan both take their files, with those conditions, from here.
+//! and follows the module declarations that are not false without `test` (see `condition`), as
+//! rustc finds the files: `mod name;` is `name.rs` or `name/mod.rs` beside the file or in a folder of
+//! its name, and `#[path = "..."]` is relative to the file's folder, or to the inline module's folder
+//! inside one. A file is read when a declaration that is not false reaches it and its own inner
+//! attributes are not false. A file no declaration reaches is not read. The item index and the scan
+//! both take their files from here.
 //!
 //! What the inventory does not read it refuses, with an error that names the file: a path through a
 //! link or outside the checkout, a module declared in a block or by a macro, `include!`, a `#[path]`
@@ -22,7 +22,7 @@ use proc_macro2::{TokenStream, TokenTree};
 use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
-use super::condition::Condition;
+use super::condition;
 use super::walker::{VARIANTS, is_own_prefix, normalised, path_before, transcribers};
 
 /// The macros of other crates that product code may call at item position and in a transcriber, each
@@ -176,26 +176,10 @@ impl Scope {
     }
 }
 
-/// A target Cargo builds from one source file, which is where the inventory of its crate starts.
-pub struct Root {
-    pub path: PathBuf,
-    /// The features the target requires: it is read under each of them.
-    pub features: Vec<String>,
-}
-
-/// A product file, with the condition it is reached under.
-pub struct File {
-    /// The canonical path.
-    pub path: PathBuf,
-    /// The condition around the declaration that reaches the file, or any one of them when several
-    /// do. The file's own inner attributes and its items add to it.
-    pub condition: Condition,
-}
-
 /// What the product code of a crate is made of.
 pub struct Inventory {
-    /// The product files in path order.
-    pub files: Vec<File>,
+    /// The product files in path order, by canonical path.
+    pub files: Vec<PathBuf>,
     /// The `macro_rules!` names product code defines, at any depth.
     pub defined: BTreeSet<String>,
     /// The names of those that carry `#[macro_export]`.
@@ -216,8 +200,6 @@ struct Declared {
     /// Whether `#[macro_use]` is on the declaration, so that the macros of its file stay in scope
     /// after it.
     macro_use: bool,
-    /// What holds around the declaration: the file is read under it.
-    condition: Condition,
 }
 
 /// Whether `path` is a file: a path that is not there, or has a file where a folder should be, is
@@ -237,9 +219,9 @@ fn is_file(path: &Path) -> Result<bool, String> {
     }
 }
 
-/// Reads the inventory of the crate `krate`, which Cargo builds from `roots`, inside the tree at
-/// `root`.
-pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, String> {
+/// Reads the inventory of the crate `krate`, which Cargo builds from the source files `roots`, inside
+/// the tree at `root`.
+pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, String> {
     if roots.is_empty() {
         return Err(format!("{krate}: no library or binary target"));
     }
@@ -249,19 +231,12 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
             .display()
             .to_string()
     };
-    let mut todo: Vec<(PathBuf, bool, bool, Condition)> = roots
+    let mut todo: Vec<(PathBuf, bool, bool)> = roots
         .iter()
-        .map(|target| {
-            (
-                target.path.clone(),
-                true,
-                false,
-                Condition::requiring(&target.features),
-            )
-        })
+        .map(|target| (target.clone(), true, false))
         .collect();
-    let mut seen: BTreeSet<(PathBuf, bool, bool, Condition)> = BTreeSet::new();
-    let mut reached: BTreeMap<PathBuf, BTreeSet<Condition>> = BTreeMap::new();
+    let mut seen: BTreeSet<(PathBuf, bool, bool)> = BTreeSet::new();
+    let mut reached: BTreeSet<PathBuf> = BTreeSet::new();
     // For each macro name: where it is defined, and whether the definition's scope reaches
     // beyond its module (`#[macro_export]`, or a module under `#[macro_use]`).
     let mut defined: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
@@ -278,7 +253,7 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
         if !seen.insert(visit.clone()) {
             continue;
         }
-        let (path, beside, macro_use, carried) = visit;
+        let (path, beside, macro_use) = visit;
         let at = shown(&path);
         let real = std::fs::canonicalize(&path).map_err(|error| format!("{at}: {error}"))?;
         if real != path || !path.starts_with(root) {
@@ -291,13 +266,10 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let parsed =
             syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-        let Some(condition) = carried.within(&parsed.attrs, &at)? else {
+        if !condition::enabled(&parsed.attrs, &at)? {
             continue;
-        };
-        reached
-            .entry(path.clone())
-            .or_default()
-            .insert(carried.clone());
+        }
+        reached.insert(path.clone());
         let directory = path.parent().unwrap_or(Path::new(""));
         let stem = path
             .file_stem()
@@ -312,8 +284,6 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
         };
         let mut reader = Reader {
             at: &at,
-            condition,
-            saved: Vec::new(),
             path_base: directory.to_owned(),
             modules,
             macro_use: usize::from(macro_use),
@@ -372,12 +342,7 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
                     // A file that a `#[path]` loads keeps its modules beside it, as `mod.rs` does.
                     let beside =
                         declared.explicit || one.file_name().is_some_and(|name| name == "mod.rs");
-                    todo.push((
-                        (*one).clone(),
-                        beside,
-                        declared.macro_use,
-                        declared.condition.clone(),
-                    ));
+                    todo.push(((*one).clone(), beside, declared.macro_use));
                 }
                 [] => {
                     let tried: Vec<&PathBuf> = declared.candidates.iter().collect();
@@ -450,13 +415,7 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
         }
     }
     Ok(Inventory {
-        files: reached
-            .into_iter()
-            .map(|(path, conditions)| File {
-                path,
-                condition: Condition::any_of(&conditions.into_iter().collect::<Vec<_>>()),
-            })
-            .collect(),
+        files: reached.into_iter().collect(),
         defined: defined.into_keys().collect(),
         exported,
         // The crate that defines `Method` names its own variants (`Self::Variant`, a glob of them,
@@ -477,8 +436,6 @@ pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, Strin
 /// refuses.
 struct Reader<'a> {
     at: &'a str,
-    condition: Condition,
-    saved: Vec<Condition>,
     path_base: PathBuf,
     modules: PathBuf,
     /// How many blocks the visit is inside.
@@ -506,28 +463,17 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
-    /// Enters a place with these attributes: whether product code is there.
+    /// Whether product code is in a place with these attributes.
     fn enter(&mut self, attrs: &[syn::Attribute]) -> bool {
         if self.error.is_some() {
             return false;
         }
-        match self.condition.within(attrs, self.at) {
-            Ok(Some(inner)) => {
-                self.saved
-                    .push(std::mem::replace(&mut self.condition, inner));
-                true
-            }
-            Ok(None) => false,
+        match condition::enabled(attrs, self.at) {
+            Ok(enabled) => enabled,
             Err(error) => {
                 self.error = Some(error);
                 false
             }
-        }
-    }
-
-    fn leave(&mut self) {
-        if let Some(outer) = self.saved.pop() {
-            self.condition = outer;
         }
     }
 
@@ -585,7 +531,7 @@ impl Reader<'_> {
     /// Whether the attributes carry `#[name]`, written or added by a `cfg_attr` that some
     /// configuration enables.
     fn carries(&mut self, attrs: &[syn::Attribute], name: &str) -> bool {
-        match self.condition.carries(attrs, name, self.at) {
+        match condition::carries(attrs, name, self.at) {
             Ok(found) => found,
             Err(error) => {
                 self.error.get_or_insert(error);
@@ -601,7 +547,6 @@ macro_rules! gated {
         fn $visit(&mut self, node: &'ast $node) {
             if self.enter(&node.attrs) {
                 syn::visit::$walk(self, node);
-                self.leave();
             }
         }
     )*};
@@ -630,7 +575,6 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         if self.enter(&node.attrs) {
             self.defines_method |= node.ident == "Method";
             syn::visit::visit_item_enum(self, node);
-            self.leave();
         }
     }
 
@@ -639,7 +583,6 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         if self.enter(&node.attrs) {
             self.method_use |= ends_in_method(&node.ty);
             syn::visit::visit_item_type(self, node);
-            self.leave();
         }
     }
 
@@ -648,7 +591,6 @@ impl<'ast> Visit<'ast> for Reader<'_> {
             let outer = std::mem::replace(&mut self.in_method_impl, ends_in_method(&node.self_ty));
             syn::visit::visit_item_impl(self, node);
             self.in_method_impl = outer;
-            self.leave();
         }
     }
 
@@ -723,12 +665,10 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                         candidates,
                         explicit,
                         macro_use,
-                        condition: self.condition.clone(),
                     });
                 }
             },
         }
-        self.leave();
     }
 
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
@@ -747,14 +687,12 @@ impl<'ast> Visit<'ast> for Reader<'_> {
             _ => self.call(&node.mac.path),
         }
         syn::visit::visit_item_macro(self, node);
-        self.leave();
     }
 
     fn visit_impl_item_macro(&mut self, node: &'ast syn::ImplItemMacro) {
         if self.enter(&node.attrs) {
             self.call(&node.mac.path);
             syn::visit::visit_impl_item_macro(self, node);
-            self.leave();
         }
     }
 
@@ -762,7 +700,6 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         if self.enter(&node.attrs) {
             self.call(&node.mac.path);
             syn::visit::visit_trait_item_macro(self, node);
-            self.leave();
         }
     }
 
@@ -798,7 +735,6 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         if self.enter(&node.attrs) {
             self.method_use |= renames_method(&node.tree, false);
             use_paths(&node.tree, &mut Vec::new(), &mut self.imports);
-            self.leave();
         }
     }
 }

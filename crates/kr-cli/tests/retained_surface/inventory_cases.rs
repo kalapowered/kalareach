@@ -2,21 +2,19 @@
 
 use std::collections::BTreeMap;
 
-use super::condition::Condition;
+use super::condition;
 use super::repository;
 use super::walker::{Depth, Lookup, SightKind, Tree};
 use super::walker_cases::{small_tree, tree_at, write};
 
-/// Whether some configuration without `test` enables a function written with `attributes`.
+/// Whether product code can be in a function written with `attributes`.
 fn enabled(attributes: &str) -> Result<bool, String> {
     let item: syn::ItemFn = syn::parse_str(&format!("{attributes} fn f() {{}}")).expect("an item");
-    Condition::default()
-        .within(&item.attrs, "lib.rs")
-        .map(|found| found.is_some())
+    condition::enabled(&item.attrs, "lib.rs")
 }
 
 #[test]
-fn a_place_is_read_when_some_configuration_without_test_enables_every_condition_around_it() {
+fn a_place_is_skipped_when_a_condition_around_it_is_false_with_test_false_and_the_rest_unknown() {
     for (attributes, expected) in [
         ("", true),
         ("#[cfg(true)]", true),
@@ -24,67 +22,42 @@ fn a_place_is_read_when_some_configuration_without_test_enables_every_condition_
         ("#[cfg(any(false, unix))]", true),
         ("#[cfg(not(false))]", true),
         ("#[cfg(not(true))]", false),
+        ("#[cfg(all())]", true),
+        ("#[cfg(any())]", false),
+        // `test` is false.
         ("#[cfg(test)]", false),
         ("#[cfg(all(test, unix))]", false),
+        ("#[cfg(all(unix, test))]", false),
         ("#[cfg(not(not(test)))]", false),
         ("#[cfg(any(all(test, unix), all(test, windows)))]", false),
         ("#[cfg(not(all(test, unix)))]", true),
-        ("#[cfg(any(test, feature = \"testing\"))]", true),
+        ("#[cfg(not(any(test, windows)))]", true),
         ("#[cfg(not(test))]", true),
-        ("#[cfg(all(unix, windows))]", false),
-        ("#[cfg(any(unix, windows))]", true),
-        ("#[cfg(all(target_os = \"macos\", unix))]", true),
-        ("#[cfg(all(target_os = \"macos\", windows))]", false),
-        (
-            "#[cfg(all(target_os = \"windows\", target_family = \"unix\"))]",
-            false,
-        ),
-        (
-            "#[cfg(all(target_vendor = \"apple\", target_os = \"linux\"))]",
-            false,
-        ),
+        // Every other name is unknown, and a place that is not false is read.
+        ("#[cfg(any(test, feature = \"testing\"))]", true),
+        ("#[cfg(any(all(unix, not(target_os = \"macos\")), test))]", true),
         ("#[cfg(any(target_os = \"ios\", test))]", true),
-        ("#[cfg(all(mobile, target_os = \"macos\"))]", false),
-        ("#[cfg(all(desktop, target_os = \"android\"))]", false),
-        (
-            "#[cfg(any(all(unix, not(target_os = \"macos\")), test))]",
-            true,
-        ),
-        // Each platform is one the rule tries, and each has its own atoms.
-        ("#[cfg(target_os = \"macos\")]", true),
-        ("#[cfg(target_os = \"linux\")]", true),
-        ("#[cfg(target_os = \"windows\")]", true),
-        ("#[cfg(target_os = \"ios\")]", true),
-        ("#[cfg(target_os = \"android\")]", true),
-        (
-            "#[cfg(all(windows, target_family = \"windows\", target_vendor = \"pc\"))]",
-            true,
-        ),
-        (
-            "#[cfg(all(unix, target_vendor = \"unknown\", not(target_os = \"linux\")))]",
-            true,
-        ),
-        ("#[cfg(all(unix, mobile, target_vendor = \"apple\"))]", true),
-        (
-            "#[cfg(all(unix, desktop, target_vendor = \"apple\"))]",
-            true,
-        ),
-        ("#[cfg(target_os = \"freebsd\")]", false),
-        // One atom has one value in a configuration.
-        ("#[cfg(all(feature = \"a\", not(feature = \"a\")))]", false),
-        ("#[cfg(all(feature = \"a\", feature = \"b\"))]", true),
-        (
-            "#[cfg(all(target_feature = \"sse4.2\", not(target_feature = \"sse4.2\")))]",
-            false,
-        ),
-        ("#[cfg(target_feature = \"sse4.2\")]", true),
-        // Several attributes are one conjunction.
-        ("#[cfg(unix)] #[cfg(windows)]", false),
-        ("#[cfg(unix)] #[cfg(not(target_os = \"linux\"))]", true),
-        (
-            "#[cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]",
-            true,
-        ),
+        ("#[cfg(unix)]", true),
+        ("#[cfg(windows)]", true),
+        ("#[cfg(target_os = \"freebsd\")]", true),
+        ("#[cfg(some_atom)]", true),
+        ("#[cfg(some_atom = \"x\")]", true),
+        ("#[cfg(target_arch)]", true),
+        ("#[cfg(debug_assertions = \"x\")]", true),
+        // A stack that no configuration builds is read: the rule does not tell the names apart.
+        ("#[cfg(all(unix, windows))]", true),
+        ("#[cfg(unix)] #[cfg(windows)]", true),
+        ("#[cfg(all(feature = \"a\", not(feature = \"a\")))]", true),
+        // Several attributes: one false decides.
+        ("#[cfg(unix)] #[cfg(test)]", false),
+        ("#[cfg(test)] #[cfg(unix)]", false),
+        // A predicate may be followed by one comma, and a list ends in one.
+        ("#[cfg(unix,)]", true),
+        ("#[cfg(test,)]", false),
+        ("#[cfg(any(false, unix,),)]", true),
+        ("#[cfg(all(test, unix,),)]", false),
+        ("#[cfg(true,)]", true),
+        ("#[cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]", true),
         ("#[cfg_attr(test, derive(Debug))]", true),
         (
             "#[cfg_attr(not(debug_assertions), cfg_attr(windows, windows_subsystem = \"windows\"))]",
@@ -93,41 +66,21 @@ fn a_place_is_read_when_some_configuration_without_test_enables_every_condition_
     ] {
         assert_eq!(enabled(attributes), Ok(expected), "{attributes}");
     }
-    // A condition around a condition holds as one.
-    let outer: syn::ItemFn = syn::parse_str("#[cfg(unix)] fn f() {}").expect("an item");
-    let inner: syn::ItemFn = syn::parse_str("#[cfg(windows)] fn f() {}").expect("an item");
-    let around = Condition::default()
-        .within(&outer.attrs, "lib.rs")
-        .expect("readable")
-        .expect("enabled");
-    assert!(
-        around
-            .within(&inner.attrs, "lib.rs")
-            .expect("readable")
-            .is_none()
-    );
 }
 
 #[test]
 fn a_condition_the_rule_cannot_read_is_an_error_and_never_a_skip() {
     let unreadable = |text: &str| format!("lib.rs: the scan cannot read the condition {text}");
     for (attributes, text) in [
-        ("#[cfg(some_atom)]", "some_atom"),
-        ("#[cfg(some_atom = \"x\")]", "some_atom = \"x\""),
         ("#[cfg(not(unix, windows))]", "not (unix , windows)"),
+        ("#[cfg(not())]", "not ()"),
         ("#[cfg(target_os = 7)]", "target_os = 7"),
         ("#[cfg(a::b)]", "a :: b"),
+        ("#[cfg(unix, windows)]", "# [cfg (unix , windows)]"),
+        ("#[cfg(version(\"1.2\"))]", "version (\"1.2\")"),
     ] {
         assert_eq!(enabled(attributes), Err(unreadable(text)), "{attributes}");
     }
-    let many = (0..13)
-        .map(|at| format!("feature = \"f{at}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    assert_eq!(
-        enabled(&format!("#[cfg(all({many}))]")),
-        Err(unreadable("(more atoms than the scan tries together)"))
-    );
     let sets = |text: &str| {
         format!(
             "lib.rs: the scan does not read a cfg_attr that sets a path or a condition ({text})"
@@ -460,17 +413,17 @@ fn an_inner_condition_of_a_file_decides_whether_the_file_is_read() {
             "src/tested.rs",
             "#![cfg(test)]\nfn from_tested() { let _ = Method::AgentTurnSteer; }\ninclude!(\"x.rs\");\n",
         ),
-        // The condition of the file holds for each item in it: no configuration is both.
+        // The condition of the file does not stop an item in it from being skipped by its own.
         (
             "src/mixed.rs",
-            "#![cfg(unix)]\n#[cfg(windows)]\nfn from_both() { let _ = Method::AgentPromptQueue; }\nfn from_unix() { let _ = Method::AgentTurnCancel; }\n",
+            "#![cfg(unix)]\n#[cfg(test)]\nfn from_both() { let _ = Method::AgentPromptQueue; }\nfn from_unix() { let _ = Method::AgentTurnCancel; }\n",
         ),
     ];
     assert_eq!(
         read_names("mod windows_only;\nmod tested;\nmod mixed;\n", &files),
         Ok(vec!["from_unix".to_owned(), "from_windows".to_owned()])
     );
-    // The index holds the same: the file's condition holds for each item in it there too.
+    // The index holds the same.
     let folder = small_tree("mod windows_only;\nmod tested;\nmod mixed;\n");
     for (path, text) in files {
         write(folder.path(), &format!("crates/kr-sender/{path}"), text);
@@ -484,18 +437,22 @@ fn an_inner_condition_of_a_file_decides_whether_the_file_is_read() {
             "{name}"
         );
     }
-    // The condition of the declaration that reaches a file holds for each item in it as well.
-    let folder = small_tree("#[cfg(unix)]\nmod unix_only;\n");
+    // A file that only a declaration that is false reaches is not read, and one that a declaration
+    // that is not false reaches is.
+    let folder = small_tree("#[cfg(all(test, unix))]\nmod only_by_test;\n#[cfg(unix)]\nmod by_unix;\n");
     write(
         folder.path(),
-        "crates/kr-sender/src/unix_only.rs",
-        "#[cfg(windows)]\nfn from_windows_in_unix() {}\nfn from_unix_file() {}\n",
+        "crates/kr-sender/src/only_by_test.rs",
+        "fn from_a_test_file() { include!(\"x.rs\"); }\n",
+    );
+    write(
+        folder.path(),
+        "crates/kr-sender/src/by_unix.rs",
+        "#[cfg(test)]\nfn from_test_in_unix() {}\nfn from_unix_file() {}\n",
     );
     let tree = tree_at(folder.path()).expect("the tree");
-    assert_eq!(
-        tree.item("kr_sender", "from_windows_in_unix"),
-        Lookup::Absent
-    );
+    assert_eq!(tree.item("kr_sender", "from_a_test_file"), Lookup::Absent);
+    assert_eq!(tree.item("kr_sender", "from_test_in_unix"), Lookup::Absent);
     assert!(matches!(
         tree.item("kr_sender", "from_unix_file"),
         Lookup::Found(_)
@@ -1051,6 +1008,8 @@ fn a_cfg_attr_that_adds_macro_export_or_macro_use_counts_where_some_configuratio
         "#[cfg_attr(unix, macro_export)]",
         "#[cfg_attr(not(test), macro_export)]",
         "#[cfg_attr(unix, cfg_attr(not(test), macro_export))]",
+        "#[cfg_attr(windows, cfg_attr(unix, macro_export))]",
+        "#[cfg_attr(some_atom, macro_export)]",
     ] {
         let found = siblings("mod a;\nmod b;\n", &format!("{attribute}\n"));
         assert!(hides(found), "{attribute}");
@@ -1059,7 +1018,6 @@ fn a_cfg_attr_that_adds_macro_export_or_macro_use_counts_where_some_configuratio
         "#[cfg_attr(test, macro_export)]",
         "#[cfg_attr(all(unix, test), macro_export)]",
         "#[cfg_attr(unix, cfg_attr(test, macro_export))]",
-        "#[cfg_attr(windows, cfg_attr(unix, macro_export))]",
         "#[cfg_attr(unix, allow(unused))]",
     ] {
         assert_eq!(
@@ -1101,8 +1059,11 @@ fn a_cfg_attr_that_adds_macro_export_or_macro_use_counts_where_some_configuratio
     assert_eq!(inline("#[cfg_attr(test, macro_use)]"), none);
     // A predicate the rule cannot read is its error.
     assert_eq!(
-        siblings("mod a;\nmod b;\n", "#[cfg_attr(some_atom, macro_export)]\n"),
-        Err("crates/kr-sender/src/a.rs: the scan cannot read the condition some_atom".to_owned())
+        siblings("mod a;\nmod b;\n", "#[cfg_attr(not(unix, windows), macro_export)]\n"),
+        Err(
+            "crates/kr-sender/src/a.rs: the scan cannot read the condition not (unix , windows)"
+                .to_owned()
+        )
     );
 }
 
@@ -1199,7 +1160,8 @@ fn a_crate_is_read_from_the_targets_cargo_reports_for_it() {
         assert_eq!(real.krate(krate), Lookup::Found(String::new()), "{krate}");
     }
     assert_eq!(real.krate("kr_conformance"), Lookup::Absent);
-    // A binary that Cargo builds only with a feature is read under that feature.
+    // A binary that Cargo builds only with a feature is read, and a feature is an unknown name: the
+    // item for the feature's absence is read too.
     let folder = small_tree("pub fn quiet() {}\n");
     write(
         folder.path(),
@@ -1217,7 +1179,7 @@ fn a_crate_is_read_from_the_targets_cargo_reports_for_it() {
     );
     assert_eq!(
         sender_names(&tree_at(folder.path()).expect("the tree")),
-        Ok(vec!["on".to_owned()])
+        Ok(vec!["off".to_owned(), "on".to_owned()])
     );
     // A workspace Cargo cannot read is no tree, and the first line of its complaint is the text.
     let folder = small_tree("pub fn quiet() {}\n");
@@ -1254,50 +1216,39 @@ fn a_module_candidate_that_cannot_be_looked_at_is_an_error_and_not_an_absence() 
 }
 
 #[test]
-fn a_file_is_read_under_the_condition_of_each_declaration_that_reaches_it() {
-    // A file declared under one platform has that platform's condition around its items, and an
-    // `include!` that no configuration of it builds is no refusal.
-    let folder = small_tree("#[cfg(unix)]\nmod child;\n");
+fn a_file_is_read_when_a_declaration_that_reaches_it_is_not_false() {
+    // A declaration that is false reaches nothing, and an `include!` in the file it names is no
+    // refusal; a declaration that is not false reaches the file whatever its name is.
+    let folder = small_tree("#[cfg(test)]\nmod child;\n#[cfg(windows)]\nmod other;\n");
     write(
         folder.path(),
         "crates/kr-sender/src/child.rs",
-        "pub fn plain() { let _ = Method::AgentTurnSteer; }\n\
-         #[cfg(windows)]\npub fn only_windows() { let _ = Method::AgentTurnCancel; }\n\
-         #[cfg(unix)]\npub fn only_unix() { let _ = Method::AgentTurnCancel; }\n\
-         #[cfg(windows)]\ninclude!(\"other.rs\");\n",
+        "include!(\"x.rs\");\npub fn from_child() { let _ = Method::AgentTurnCancel; }\n",
+    );
+    write(
+        folder.path(),
+        "crates/kr-sender/src/other.rs",
+        "pub fn from_other() { let _ = Method::AgentTurnSteer; }\n#[cfg(test)]\npub fn tested() {}\n",
     );
     let tree = tree_at(folder.path()).expect("the tree");
-    assert_eq!(
-        sender_names(&tree),
-        Ok(vec!["only_unix".to_owned(), "plain".to_owned()])
-    );
-    assert_eq!(tree.item("kr_sender", "only_windows"), Lookup::Absent);
-    assert!(matches!(
-        tree.item("kr_sender", "only_unix"),
-        Lookup::Found(_)
-    ));
-    // Two declarations that reach one file, each under its own condition: the file is read under
-    // both, so an item either of them builds is product code, and one neither builds is not.
-    let lib = "#[cfg(unix)]\n#[path = \"shared.rs\"]\nmod as_unix;\n\
-               #[cfg(windows)]\n#[path = \"shared.rs\"]\nmod as_windows;\n";
+    assert_eq!(sender_names(&tree), Ok(vec!["from_other".to_owned()]));
+    assert_eq!(tree.item("kr_sender", "from_child"), Lookup::Absent);
+    assert_eq!(tree.item("kr_sender", "tested"), Lookup::Absent);
+    // Two declarations reach one file and one of them is false: the file is read.
+    let lib = "#[cfg(test)]\n#[path = \"shared.rs\"]\nmod as_test;\n\
+               #[cfg(unix)]\n#[path = \"shared.rs\"]\nmod as_unix;\n";
     let folder = small_tree(lib);
     write(
         folder.path(),
         "crates/kr-sender/src/shared.rs",
-        "#[cfg(windows)]\npub fn w() { let _ = Method::AgentTurnCancel; }\n\
-         #[cfg(unix)]\npub fn u() { let _ = Method::AgentTurnCancel; }\n\
-         #[cfg(target_os = \"freebsd\")]\npub fn f() { let _ = Method::AgentTurnCancel; }\n",
+        "pub fn shared() { let _ = Method::AgentTurnCancel; }\n\
+         #[cfg(test)]\npub fn tested() { let _ = Method::AgentTurnSteer; }\n",
     );
     let tree = tree_at(folder.path()).expect("the tree");
-    assert_eq!(
-        sender_names(&tree),
-        Ok(vec!["u".to_owned(), "w".to_owned()])
-    );
-    assert!(matches!(tree.item("kr_sender", "w"), Lookup::Found(_)));
-    assert!(matches!(tree.item("kr_sender", "u"), Lookup::Found(_)));
-    assert_eq!(tree.item("kr_sender", "f"), Lookup::Absent);
-    // A declaration that reaches the file it is in under a condition ends the reading: the
-    // condition it carries again is the one it had.
+    assert_eq!(sender_names(&tree), Ok(vec!["shared".to_owned()]));
+    assert!(matches!(tree.item("kr_sender", "shared"), Lookup::Found(_)));
+    assert_eq!(tree.item("kr_sender", "tested"), Lookup::Absent);
+    // A declaration that reaches the file it is in ends the reading.
     let folder = small_tree(&format!(
         "#[cfg(unix)]\n#[path = \"lib.rs\"]\nmod again;\n{SENDS}"
     ));

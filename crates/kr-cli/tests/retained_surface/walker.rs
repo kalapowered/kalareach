@@ -34,7 +34,7 @@ use quote::ToTokens as _;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
-use super::condition::Condition;
+use super::condition;
 use super::inventory::{self, Inventory};
 
 /// A source tree: the repository, or a checkout of a release.
@@ -56,8 +56,8 @@ pub struct Tree {
 struct Manifest {
     /// The manifest, as a path under the tree.
     shown: String,
-    /// The library and binary targets, with the features each requires.
-    roots: Vec<inventory::Root>,
+    /// The source file of each library and binary target.
+    roots: Vec<PathBuf>,
     /// Whether the library is a procedural-macro crate.
     proc_macro: bool,
 }
@@ -168,16 +168,7 @@ fn workspace(root: &Path) -> Result<BTreeMap<String, (PathBuf, Manifest)>, Strin
             let source = target["src_path"]
                 .as_str()
                 .ok_or_else(|| cannot("a target with no source path"))?;
-            roots.push(inventory::Root {
-                path: normalised(Path::new(source)),
-                features: target["required-features"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .collect(),
-            });
+            roots.push(normalised(Path::new(source)));
         }
         found.insert(
             name,
@@ -705,8 +696,7 @@ impl CrateIndex {
             imports: BTreeMap::new(),
         };
         let workspace: BTreeSet<String> = crates.keys().cloned().collect();
-        for reached in &inventory.files {
-            let path = &reached.path;
+        for path in &inventory.files {
             let text = std::fs::read_to_string(path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             let file =
@@ -721,18 +711,8 @@ impl CrateIndex {
                 .entry(module_of(source, path))
                 .or_default()
                 .insert(relative.clone());
-            let Some(condition) = reached.condition.within(&file.attrs, &relative)? else {
-                continue;
-            };
             let mut imports = Imports::default();
-            index.add_items(
-                &file.items,
-                &relative,
-                name,
-                &workspace,
-                &mut imports,
-                &condition,
-            )?;
+            index.add_items(&file.items, &relative, name, &workspace, &mut imports)?;
             index.imports.insert(relative, imports);
         }
         Ok(index)
@@ -745,12 +725,11 @@ impl CrateIndex {
         krate: &str,
         workspace: &BTreeSet<String>,
         imports: &mut Imports,
-        condition: &Condition,
     ) -> Result<(), String> {
         for item in items {
-            let Some(within) = condition.within(item_attrs(item), file)? else {
+            if !condition::enabled(item_attrs(item), file)? {
                 continue;
-            };
+            }
             match item {
                 syn::Item::Use(used) => {
                     use_leaves(&used.tree, &mut Vec::new(), workspace, krate, imports);
@@ -772,7 +751,7 @@ impl CrateIndex {
                             .entry(module.ident.to_string())
                             .or_default()
                             .insert(file.to_owned());
-                        self.add_items(inner, file, krate, workspace, imports, &within)?;
+                        self.add_items(inner, file, krate, workspace, imports)?;
                     }
                     continue;
                 }
@@ -811,7 +790,7 @@ impl CrateIndex {
             self.push(item, file, krate, workspace, kind, names);
             // A `macro_rules!` written inside the item (in a function's body) is a macro of its own.
             if !matches!(item, syn::Item::Macro(_)) {
-                for rules in nested_rules(item, &within, file)? {
+                for rules in nested_rules(item, file)? {
                     if let syn::Item::Macro(definition) = &rules
                         && let Some(name) = &definition.ident
                     {
@@ -824,7 +803,7 @@ impl CrateIndex {
                 for inner in &block.items {
                     if let syn::ImplItem::Fn(method) = inner {
                         // A method that no configuration without `test` builds is not defined.
-                        if within.within(&method.attrs, file)?.is_none() {
+                        if !condition::enabled(&method.attrs, file)? {
                             continue;
                         }
                         self.push_method(
@@ -974,31 +953,24 @@ fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
 
 /// Takes the items that no configuration without `test` builds out of a copy of a node: the items
 /// nested in its blocks and modules, and the members of the impl blocks and traits among them. The
-/// condition rule decides each, with the condition around the node.
+/// condition rule decides each.
 struct Strip<'a> {
-    condition: Condition,
     at: &'a str,
     error: Option<String>,
 }
 
 impl Strip<'_> {
-    fn keeps(&mut self, attrs: &[syn::Attribute]) -> Option<Condition> {
+    fn keeps(&mut self, attrs: &[syn::Attribute]) -> bool {
         if self.error.is_some() {
-            return None;
+            return false;
         }
-        match self.condition.within(attrs, self.at) {
-            Ok(inner) => inner,
+        match condition::enabled(attrs, self.at) {
+            Ok(enabled) => enabled,
             Err(error) => {
                 self.error = Some(error);
-                None
+                false
             }
         }
-    }
-
-    fn under<T>(&mut self, inner: Condition, node: &mut T, visit: impl FnOnce(&mut Self, &mut T)) {
-        let outer = std::mem::replace(&mut self.condition, inner);
-        visit(self, node);
-        self.condition = outer;
     }
 }
 
@@ -1007,10 +979,10 @@ impl VisitMut for Strip<'_> {
         let mut kept = Vec::new();
         for mut statement in std::mem::take(&mut block.stmts) {
             if let syn::Stmt::Item(item) = &mut statement {
-                let Some(inner) = self.keeps(item_attrs(item)) else {
+                if !self.keeps(item_attrs(item)) {
                     continue;
-                };
-                self.under(inner, item, |strip, item| strip.visit_item_mut(item));
+                }
+                self.visit_item_mut(item);
             } else {
                 self.visit_stmt_mut(&mut statement);
             }
@@ -1023,10 +995,10 @@ impl VisitMut for Strip<'_> {
         if let Some((_, items)) = &mut module.content {
             let mut kept = Vec::new();
             for mut item in std::mem::take(items) {
-                let Some(inner) = self.keeps(item_attrs(&item)) else {
+                if !self.keeps(item_attrs(&item)) {
                     continue;
-                };
-                self.under(inner, &mut item, |strip, item| strip.visit_item_mut(item));
+                }
+                self.visit_item_mut(&mut item);
                 kept.push(item);
             }
             *items = kept;
@@ -1036,12 +1008,10 @@ impl VisitMut for Strip<'_> {
     fn visit_item_impl_mut(&mut self, block: &mut syn::ItemImpl) {
         let mut kept = Vec::new();
         for mut member in std::mem::take(&mut block.items) {
-            let Some(inner) = self.keeps(impl_item_attrs(&member)) else {
+            if !self.keeps(impl_item_attrs(&member)) {
                 continue;
-            };
-            self.under(inner, &mut member, |strip, member| {
-                strip.visit_impl_item_mut(member);
-            });
+            }
+            self.visit_impl_item_mut(&mut member);
             kept.push(member);
         }
         block.items = kept;
@@ -1050,12 +1020,10 @@ impl VisitMut for Strip<'_> {
     fn visit_item_trait_mut(&mut self, block: &mut syn::ItemTrait) {
         let mut kept = Vec::new();
         for mut member in std::mem::take(&mut block.items) {
-            let Some(inner) = self.keeps(trait_item_attrs(&member)) else {
+            if !self.keeps(trait_item_attrs(&member)) {
                 continue;
-            };
-            self.under(inner, &mut member, |strip, member| {
-                strip.visit_trait_item_mut(member);
-            });
+            }
+            self.visit_trait_item_mut(&mut member);
             kept.push(member);
         }
         block.items = kept;
@@ -1064,11 +1032,7 @@ impl VisitMut for Strip<'_> {
 
 /// The `macro_rules!` definitions written inside `item` (in a function's body, say) that some
 /// configuration without `test` builds, as items.
-fn nested_rules(
-    item: &syn::Item,
-    within: &Condition,
-    file: &str,
-) -> Result<Vec<syn::Item>, String> {
+fn nested_rules(item: &syn::Item, file: &str) -> Result<Vec<syn::Item>, String> {
     #[derive(Default)]
     struct Find(Vec<syn::ItemMacro>);
     impl<'ast> Visit<'ast> for Find {
@@ -1083,22 +1047,19 @@ fn nested_rules(
     if any.0.is_empty() {
         return Ok(Vec::new());
     }
-    let kept = stripped(item, within, file, |strip, node| strip.visit_item_mut(node))?;
+    let kept = stripped(item, file, |strip, node| strip.visit_item_mut(node))?;
     let mut found = Find::default();
     found.visit_item(&kept);
     Ok(found.0.into_iter().map(syn::Item::Macro).collect())
 }
 
-/// A copy of `node` without its nested items that no configuration without `test` builds, read
-/// under `within`, the condition around the node.
+/// A copy of `node` without its nested items that no configuration without `test` builds.
 fn stripped<T: Clone>(
     node: &T,
-    within: &Condition,
     file: &str,
     visit: impl FnOnce(&mut Strip<'_>, &mut T),
 ) -> Result<T, String> {
     let mut strip = Strip {
-        condition: within.clone(),
         at: file,
         error: None,
     };
@@ -1888,24 +1849,21 @@ impl Scanner {
         items: &[syn::Item],
         file: &str,
         under_src: &str,
-        condition: &Condition,
     ) -> Result<(), String> {
         for item in items {
-            let Some(within) = condition.within(item_attrs(item), file)? else {
+            if !condition::enabled(item_attrs(item), file)? {
                 continue;
-            };
+            }
             // The item's tokens, without the nested items that no configuration builds.
             let text = || -> Result<TokenStream, String> {
-                let kept = stripped(item, &within, file, |strip, node| {
-                    strip.visit_item_mut(node)
-                })?;
+                let kept = stripped(item, file, |strip, node| strip.visit_item_mut(node))?;
                 Ok(without_docs(kept.to_token_stream()))
             };
             let plain = || without_docs(item.to_token_stream());
             match item {
                 syn::Item::Mod(module) => {
                     if let Some((_, inner)) = &module.content {
-                        self.items(inner, file, under_src, &within)?;
+                        self.items(inner, file, under_src)?;
                     }
                 }
                 syn::Item::Use(_) => {
@@ -1914,12 +1872,12 @@ impl Scanner {
                 syn::Item::Impl(block) => {
                     let owner = type_name(&block.self_ty);
                     for inner in &block.items {
-                        let Some(member) = within.within(impl_item_attrs(inner), file)? else {
+                        if !condition::enabled(impl_item_attrs(inner), file)? {
                             continue;
-                        };
+                        }
                         match inner {
                             syn::ImplItem::Fn(method) => {
-                                let kept = stripped(method, &member, file, |strip, node| {
+                                let kept = stripped(method, file, |strip, node| {
                                     strip.visit_impl_item_fn_mut(node);
                                 })?;
                                 self.body(
@@ -1928,7 +1886,7 @@ impl Scanner {
                                 );
                             }
                             syn::ImplItem::Const(constant) => {
-                                let kept = stripped(constant, &member, file, |strip, node| {
+                                let kept = stripped(constant, file, |strip, node| {
                                     strip.visit_impl_item_const_mut(node);
                                 })?;
                                 let tokens = without_docs(kept.to_token_stream());
@@ -2034,8 +1992,7 @@ fn scan_crate(
         macro_rules: BTreeSet::new(),
         calls: Calls::default(),
     };
-    for reached in &inventory.files {
-        let path = &reached.path;
+    for path in &inventory.files {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         if !mentions_a_sighting(&text) {
@@ -2053,10 +2010,7 @@ fn scan_crate(
             .unwrap_or(path)
             .display()
             .to_string();
-        let Some(condition) = reached.condition.within(&parsed.attrs, &relative)? else {
-            continue;
-        };
-        scanner.items(&parsed.items, &relative, &under_src, &condition)?;
+        scanner.items(&parsed.items, &relative, &under_src)?;
     }
     // A macro is expanded when something calls it with a sighting, and so is each macro that the
     // transcribers of one that is expanded call: that adds marks and never takes one away.
