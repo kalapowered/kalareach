@@ -817,7 +817,9 @@ fn authority_and_dispatch_data_is_never_evicted_under_a_history_cap() {
         let store = stores::store(name).expect("a declaration");
         assert!(!store.evictable_under_history_cap);
     }
-    let evictable: Vec<&str> = stores::evictable_under_history_cap()
+    let evictable: Vec<&str> = stores::STORES
+        .iter()
+        .filter(|store| store.evictable_under_history_cap)
         .map(|store| store.name)
         .collect();
     assert_eq!(

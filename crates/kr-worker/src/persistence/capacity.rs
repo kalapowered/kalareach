@@ -13,49 +13,11 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 
 use crate::persistence::fault::{DurabilityPosture, FaultKind, WorkClass};
 
-/// An exception a full or faulted durable store does not refuse.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Exception {
-    /// Section 7: `session.close` proceeds on the worker's current in-memory authority and
-    /// reports `durability=volatile`. Storage failure must not prevent an authorised stop.
-    AuthorisedStop,
-    /// Section 11: raw terminal input and interruption remain available under the live input
-    /// lease. Neither exception authorises a hidden rich retry.
-    NativeTerminal,
-}
-
-impl Exception {
-    /// Returns which section names this exception.
-    #[must_use]
-    pub const fn stated_in(self) -> &'static str {
-        match self {
-            Self::AuthorisedStop => {
-                "section 7, storage failure must not prevent an authorised stop"
-            }
-            Self::NativeTerminal => {
-                "section 11, raw terminal input and interruption under the live input lease"
-            }
-        }
-    }
-}
-
 /// What a store's capacity admits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoreCapacity;
 
 impl StoreCapacity {
-    /// Returns the exception this class of work falls under, if any.
-    #[must_use]
-    pub const fn exception_for(work: WorkClass) -> Option<Exception> {
-        match work {
-            WorkClass::AuthorisedStop => Some(Exception::AuthorisedStop),
-            WorkClass::NativeTerminal => Some(Exception::NativeTerminal),
-            // A read writes nothing, so a full store does not refuse it. It is not an exception
-            // to the rule; it is outside it.
-            WorkClass::RichMutation | WorkClass::Read => None,
-        }
-    }
-
     /// Returns whether this class of work proceeds under this posture.
     #[must_use]
     pub fn admits(posture: &DurabilityPosture, work: WorkClass) -> bool {
@@ -108,29 +70,6 @@ mod tests {
         assert!(StoreCapacity::admits(&posture, WorkClass::AuthorisedStop));
         assert!(StoreCapacity::admits(&posture, WorkClass::NativeTerminal));
         assert!(StoreCapacity::admits(&posture, WorkClass::Read));
-    }
-
-    #[test]
-    fn every_admitted_write_names_the_section_that_admits_it() {
-        assert_eq!(
-            StoreCapacity::exception_for(WorkClass::AuthorisedStop),
-            Some(Exception::AuthorisedStop)
-        );
-        assert_eq!(
-            StoreCapacity::exception_for(WorkClass::NativeTerminal),
-            Some(Exception::NativeTerminal)
-        );
-        assert_eq!(StoreCapacity::exception_for(WorkClass::RichMutation), None);
-        assert!(
-            Exception::AuthorisedStop
-                .stated_in()
-                .starts_with("section 7")
-        );
-        assert!(
-            Exception::NativeTerminal
-                .stated_in()
-                .starts_with("section 11")
-        );
     }
 
     #[test]
