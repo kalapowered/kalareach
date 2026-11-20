@@ -1271,11 +1271,10 @@ impl Plan {
             }
         }
         // A step that reads the output of `cargo test` selects its packages and targets by the flags
-        // of its command, and the report reads those flags as Cargo does: a `cargo` command it cannot
-        // read is refused here rather than read as selecting what it does not.
+        // of its command, and the report reads those flags as Cargo does: a command it cannot read,
+        // or that is not `cargo test`, is refused here rather than read as selecting what it does not.
         for step in &self.steps {
             if step.reading == ReadingKind::Cargo
-                && step.command.first().map(String::as_str) == Some("cargo")
                 && let Err(why) = crate::coverage::parse(&step.command)
             {
                 return refuse(format!("step `{}` {why}", step.id));
