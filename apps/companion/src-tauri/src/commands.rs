@@ -88,6 +88,15 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("device_draft_retarget", None),
     ("device_draft_discard", None),
     ("device_draft_mark_removal", None),
+    // The messages sent over a channel that confirms nothing, and the records of sends under way,
+    // in a store of their own beside the drafts.
+    ("device_channel_messages", None),
+    ("device_channel_message_keep", None),
+    ("device_channel_message_remove", None),
+    ("device_channel_hold_create", None),
+    ("device_channel_hold_update", None),
+    ("device_channel_hold_clear", None),
+    ("device_drafts_ledger_set_aside", None),
     // Drafts and attachments.
     ("draft_create", Some(Method::DraftCreate)),
     (
@@ -640,6 +649,13 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         device_draft_retarget,
         device_draft_discard,
         device_draft_mark_removal,
+        device_channel_messages,
+        device_channel_message_keep,
+        device_channel_message_remove,
+        device_channel_hold_create,
+        device_channel_hold_update,
+        device_channel_hold_clear,
+        device_drafts_ledger_set_aside,
         draft_create,
         draft_add_attachment,
         attachment_upload,
@@ -1437,6 +1453,80 @@ pub async fn device_draft_mark_removal(state: State<'_, AppState>, params: Value
     let drafts = state.drafts();
     blocking(move || drafts.mark_removal(typed)).await?;
     encode(&())
+}
+
+/// Reads the messages this device kept that were sent over a channel that confirms nothing, and the
+/// records of sends under way.
+#[tauri::command]
+pub async fn device_channel_messages(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: crate::channel_messages::ListParams = decode(params)?;
+    let channels = state.channels();
+    encode(&blocking(move || channels.list(typed.with_text)).await?)
+}
+
+/// Keeps a message whose outcome the host cannot tell, whole, before the draft that held it goes.
+#[tauri::command]
+pub async fn device_channel_message_keep(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    let typed: crate::channel_messages::KeepParams = decode(params)?;
+    let channels = state.channels();
+    let drafts = state.drafts();
+    encode(&blocking(move || channels.keep(&drafts, typed)).await?)
+}
+
+/// Removes a message the person chose, or every message of a session they chose.
+#[tauri::command]
+pub async fn device_channel_message_remove(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    let typed: crate::channel_messages::RemoveParams = decode(params)?;
+    let channels = state.channels();
+    encode(&blocking(move || channels.remove(&typed)).await?)
+}
+
+/// Records, before it is sent, a message to a channel session, so that a restart still holds the
+/// next message to that session.
+#[tauri::command]
+pub async fn device_channel_hold_create(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    let typed: crate::channel_messages::HoldCreateParams = decode(params)?;
+    let channels = state.channels();
+    blocking(move || channels.hold_create(typed)).await?;
+    encode(&())
+}
+
+/// Gives a record of a send the action the host named.
+#[tauri::command]
+pub async fn device_channel_hold_update(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    let typed: crate::channel_messages::HoldUpdateParams = decode(params)?;
+    let channels = state.channels();
+    blocking(move || channels.hold_update(&typed)).await?;
+    encode(&())
+}
+
+/// Removes a record of a send under way.
+#[tauri::command]
+pub async fn device_channel_hold_clear(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: crate::channel_messages::HoldClearParams = decode(params)?;
+    let channels = state.channels();
+    blocking(move || channels.hold_clear(&typed)).await?;
+    encode(&())
+}
+
+/// Sets a damaged list of removals aside, as a file of its own, and starts a rebuilt one.
+#[tauri::command]
+pub async fn device_drafts_ledger_set_aside(state: State<'_, AppState>) -> Result<Value> {
+    let channels = state.channels();
+    let drafts = state.drafts();
+    encode(&blocking(move || channels.set_aside(&drafts)).await?)
 }
 
 /// Reads a session's questions.
@@ -3970,6 +4060,13 @@ mod tests {
         "device_draft_retarget",
         "device_draft_discard",
         "device_draft_mark_removal",
+        "device_channel_messages",
+        "device_channel_message_keep",
+        "device_channel_message_remove",
+        "device_channel_hold_create",
+        "device_channel_hold_update",
+        "device_channel_hold_clear",
+        "device_drafts_ledger_set_aside",
         "attachment_upload_status",
         "question_kept",
         "question_dismiss_kept",
@@ -4312,6 +4409,13 @@ mod tests {
                 "device_draft_retarget",
                 "device_draft_discard",
                 "device_draft_mark_removal",
+                "device_channel_messages",
+                "device_channel_message_keep",
+                "device_channel_message_remove",
+                "device_channel_hold_create",
+                "device_channel_hold_update",
+                "device_channel_hold_clear",
+                "device_drafts_ledger_set_aside",
             ])
         );
     }
