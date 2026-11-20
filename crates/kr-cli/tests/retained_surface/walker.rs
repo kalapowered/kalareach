@@ -1680,16 +1680,24 @@ impl Tree {
             ));
         }
         let scan = self.scan(krate)?;
+        let imported = self.inventory(krate)?;
         for name in &scan.unresolved {
+            // A call names a macro as written, or as a `use ... as` renamed it.
+            let mut called = vec![(name.clone(), String::new())];
+            for original in imported.imported_as.get(name).into_iter().flatten() {
+                called.push((original.clone(), format!(" (imported as {name})")));
+            }
             for other in self
                 .crates
                 .keys()
                 .filter(|other| *other != krate && include(other))
             {
-                if self.inventory(other)?.exported.contains(name) {
-                    return Err(format!(
-                        "{krate}: {name}! is called with a sighting and {other} exports it; the scan does not follow it across crates"
-                    ));
+                for (exported, how) in &called {
+                    if self.inventory(other)?.exported.contains(exported) {
+                        return Err(format!(
+                            "{krate}: {exported}! is called with a sighting{how} and {other} exports it; the scan does not follow it across crates"
+                        ));
+                    }
                 }
             }
         }
@@ -1719,7 +1727,9 @@ impl Tree {
 
 /// Whether the text holds a word a sighting is made of, so that the file is parsed.
 fn mentions_a_sighting(text: &str) -> bool {
-    ["Method", "MutationRequest", "ActionTarget", "macro_rules"]
+    // An escape or a line continuation can spell a wire name that the text does not hold: a file
+    // with one is parsed, and the literal's value decides.
+    ["Method", "MutationRequest", "ActionTarget", "macro_rules", "\\x", "\\u{", "\\\n", "\\\r\n"]
         .iter()
         .any(|word| text.contains(word))
         || WIRE_NAMES.iter().any(|name| text.contains(name))

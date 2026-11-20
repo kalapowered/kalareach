@@ -226,6 +226,7 @@ mod sender;
 mod through_path;
 mod sub;
 mod grouped;
+mod escaped;
 mod wire;
 mod req;
 mod tgt;
@@ -402,6 +403,12 @@ fn sender_tree() -> tempfile::TempDir {
             "grouped.rs",
             "use kr_protocol::Method::{AgentTurnCancel, AgentTurnSteer};\n",
         ),
+        // A wire name written with an escape or a line continuation is its value: the file is
+        // parsed although its text holds no wire name.
+        (
+            "escaped.rs",
+            "fn escaped() -> &'static str { \"agent\\x2eturn.cancel\" }\nfn continued() -> &'static str { \"agent.turn.\\\ncancel\" }\n",
+        ),
         (
             "wire.rs",
             "fn names_by_wire() -> &'static str { \"agent.turn.steer\" }\n",
@@ -477,6 +484,8 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("U", vec![Names]),
         ("Alias", vec![Names]),
         ("from_y", vec![Names]),
+        ("escaped", vec![Names]),
+        ("continued", vec![Names]),
         ("from_grand", vec![Names]),
         ("from_shared_send", vec![Names]),
         ("first", vec![Names]),

@@ -258,6 +258,22 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
             "{at}: the scan does not read a module declared in a macro (mod $(...); in the tokens of other!)"
         ),
     );
+    // A `macro_rules!` written in the tokens of another macro, in a definition's transcriber or in
+    // the arguments of a call, is no definition the scan reads.
+    refuse(
+        "macro_rules! outer { () => { macro_rules! inner { () => {}; } }; }\n",
+        &[],
+        format!(
+            "{at}: the scan does not read a macro_rules! written in the tokens of another macro (macro_rules! inner in the tokens of macro_rules!)"
+        ),
+    );
+    refuse(
+        "other! { macro_rules! inner { () => {}; } }\n",
+        &[],
+        format!(
+            "{at}: the scan does not read a macro_rules! written in the tokens of another macro (macro_rules! inner in the tokens of other!)"
+        ),
+    );
     refuse(
         "#[path = concat!(\"a\", \".rs\")]\nmod m;\n",
         &[],
@@ -304,6 +320,9 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         "type M = kr_protocol::Method;",
         "impl Local for Method { fn f() { let _ = Self::AgentTurnCancel; } }",
         "impl Local for kr_protocol::Method { fn f() { match 1 { _ => Self::PluginActionInvoke }; } }",
+        // A variant named through the type in angle brackets.
+        "fn f() { let _ = <Method>::AgentTurnCancel; }",
+        "fn f() { match 1 { _ => <kr_protocol::Method>::PluginActionInvoke }; }",
     ] {
         let (scan, _) = scanned(&format!("{import}\n"), &[]);
         assert_eq!(
@@ -320,6 +339,8 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         "impl Local for Method { fn f() { let _ = Self::Unrelated; } }",
         "impl Local for Other { fn f() { let _ = Self::AgentTurnCancel; } }",
         "type M = Other;",
+        "fn f() { let _ = <Other>::AgentTurnCancel; }",
+        "fn f() { let _ = <Method as std::str::FromStr>::from_str; }",
     ] {
         assert_eq!(
             read_names(&format!("{lib}\n"), &[]),
@@ -327,9 +348,23 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
             "{lib}"
         );
     }
-    // The crate that defines `Method` names its own variants and is not read as a sender.
+    // An enum named `Method` in a crate that is not the protocol's is no exemption, and the protocol
+    // crate, which defines `Method` and names its own variants, is not read as a sender.
     let definition = "pub enum Method { AgentTurnCancel }\nuse Method::*;\ntype M = Method;\nimpl Method { fn f() -> Self { Self::AgentTurnCancel } }\n";
-    assert_eq!(read_names(definition, &[]), Ok(Vec::<String>::new()));
+    assert_eq!(
+        read_names(&format!("mod local {{ {definition} }}\n"), &[]),
+        Err(format!(
+            "{at}: a use of Method::* or of Method under another name; the scan reads Method::<Variant> only"
+        ))
+    );
+    let folder = small_tree("pub fn quiet() {}\n");
+    write(folder.path(), "crates/kr-protocol/src/lib.rs", definition);
+    let tree = tree_at(folder.path()).expect("the tree");
+    assert_eq!(
+        tree.sightings(&|krate| krate == "kr_protocol")
+            .map(|found| found.len()),
+        Ok(0)
+    );
     // Targets and roots: Cargo's own report gives them, so a binary at any path is a root.
     let manifest = |extra: &str| {
         format!(
@@ -739,8 +774,6 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
         "use kr_client::{debug_fields as shown};\nshown!(E { a });",
         "use schemars::json_schema;\nmacro_rules! schema { () => { json_schema!({}) }; }",
         "macro_rules! schema { () => { schemars::json_schema!({}) }; }",
-        // A macro that a transcriber defines and calls is that crate's own.
-        "macro_rules! outer { () => { macro_rules! inner { () => {}; } inner!(); }; }",
     ] {
         assert_eq!(
             read_names(&format!("{call}\n"), &[]),
@@ -782,6 +815,18 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
             "json_schema",
         ),
         ("kr_worker::debug_fields!(E { a });", "debug_fields"),
+        // The crate's own prefix, or one of its modules, names a macro the crate defines, and not
+        // one that a `use` or a re-export brought in from elsewhere.
+        (
+            "use foreign::generate as new_items;\ncrate::new_items!();\n",
+            "new_items",
+        ),
+        (
+            "use foreign::generate;\ncrate::generate!();\n",
+            "generate",
+        ),
+        ("mod bridge { pub use foreign::*; }\nbridge::generate!();\n", "generate"),
+        ("macro_rules! m { () => { crate::generate!(); }; }\nm!();\n", "generate"),
         // A macro of the crate's own name behind another crate's path is that crate's macro.
         (
             "macro_rules! mine { () => {}; }\nforeign::mine! {}\n",
@@ -794,10 +839,6 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
         ),
         (
             "macro_rules! m { () => { generate!(); }; }\nm!();\n",
-            "generate",
-        ),
-        (
-            "macro_rules! m { () => { macro_rules! n { () => { deep::generate!(); }; } }; }\n",
             "generate",
         ),
         (
@@ -906,6 +947,22 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
     // same name: what an expanded macro calls through a path is the other crate's.
     let lib = "macro_rules! json_schema { ($m:expr) => { $m }; }\nmacro_rules! fwd { ($x:expr) => { schemars::json_schema!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
     assert_eq!(across(lib, "json_schema"), refused("json_schema"));
+    // A call through the name a `use` gives the other crate's macro, in a call and in a transcriber.
+    let renamed = Err(
+        "kr_sender: shared! is called with a sighting (imported as renamed) and kr_worker exports it; the scan does not follow it across crates"
+            .to_owned(),
+    );
+    let lib = "use kr_worker::shared as renamed;\nfn f() { renamed!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "shared"), renamed);
+    // The same name in a transcriber is a call of another crate's macro that nothing accepts.
+    let lib = "use kr_worker::shared as renamed;\nmacro_rules! fwd { ($x:expr) => { renamed!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
+    assert_eq!(
+        across(lib, "shared"),
+        Err("crates/kr-sender/src/lib.rs: renamed! is called at item position, is not defined in kr_sender and is not one the scan accepts".to_owned())
+    );
+    // A name that is no rename of the other crate's macro is not that macro.
+    let lib = "use kr_worker::other as renamed;\nfn f() { renamed!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "shared"), Ok(1));
     // A call at item position by a path, with a sighting in its arguments.
     let lib = "schemars::json_schema!({ \"x\": \"agent.turn.cancel\" });\nmacro_rules! json_schema { ($m:expr) => { $m }; }\n";
     assert_eq!(across(lib, "json_schema"), refused("json_schema"));
