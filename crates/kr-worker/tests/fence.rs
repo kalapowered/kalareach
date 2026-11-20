@@ -10474,12 +10474,14 @@ async fn wired_with_a_floor() -> Wired {
 /// that fails ends with the writer free.
 ///
 /// The batch carries a UTC end an hour away, so every look answers that the deadline has not
-/// passed. The writer makes one look before it offers the batch to the terminal and one for each
-/// piece it offers: the first is let by, and the stop is where the piece's look is made.
+/// passed, and `boot_ms` as the end of its authority on the continuous clock. The writer makes one
+/// look before it offers the batch to the terminal and one for each piece it offers: the first is
+/// let by, and the stop is where the piece's look is made.
 async fn stand_the_writer_in_a_look(
     wired: &Wired,
     holder: AttachmentId,
     bytes: &[u8],
+    boot_ms: Option<u64>,
 ) -> std::sync::mpsc::Sender<()> {
     let time = Arc::clone(wired.runtime.session().time());
     let (arrived, release) = time.arm_floor_look_stall(1);
@@ -10493,7 +10495,7 @@ async fn stand_the_writer_in_a_look(
                 0,
                 bytes,
                 kr_worker::session::InputAuthority {
-                    boot_ms: None,
+                    boot_ms,
                     utc_ms: Some(kr_ipc::now_ms().get() + 3_600_000),
                 },
                 std::time::Instant::now(),
@@ -10598,7 +10600,7 @@ async fn a_takeover_returns_its_epoch_while_the_writer_stands_in_a_look_at_the_f
     let challenger = attached_over(&mut second, &wired).await;
     let epoch = wired.runtime.session().lease().epoch.get();
     let queued = wired.runtime.input().lock().queued_input_bytes();
-    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
+    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND, None).await;
 
     let answered = acquiring(second, &wired, challenger);
     let in_the_look = answered_within_soon(&answered);
@@ -10669,7 +10671,7 @@ async fn a_release_of_the_keys_completes_while_the_writer_stands_in_a_look_at_th
         .expect("connects");
     let holder = holder_over(&mut client, &wired).await;
     let epoch = wired.runtime.session().lease().epoch;
-    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
+    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND, None).await;
 
     let answered = releasing(client, &wired, holder, epoch);
     let released = answered_within_soon(&answered);
@@ -10716,7 +10718,7 @@ async fn the_hold_timer_fires_while_the_writer_stands_in_a_look_at_the_floors_na
     // it, which `Wired::pass` does not.
     let waker = wired.runtime.session().fence().expect("a driver").waker();
     let epoch = wired.runtime.session().lease().epoch.get();
-    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
+    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND, None).await;
 
     wired
         .bridge
@@ -10775,5 +10777,57 @@ async fn the_hold_timer_fires_while_the_writer_stands_in_a_look_at_the_floors_na
     assert_eq!(busy.reason, EditorBusyReason::FenceExchangeTimedOut);
     assert_eq!(busy.input_epoch.get(), epoch + 1);
     drop(release);
+    wired.close().await;
+}
+
+/// KR-REQ-07.77, KR-REQ-07.79, KR-REQ-07.83: a piece whose authority ends on the continuous clock
+/// while the writer stands in a look at the floor's name is not written.
+///
+/// A look that stands on storage answers from readings taken before it stood, here that the UTC end
+/// is an hour away. No lease changes, so no fence ends the batch: the writer has to read the
+/// continuous clock again once the look has answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_piece_whose_boot_end_passes_while_the_writer_stands_in_a_look_is_not_written() {
+    use kr_ipc::clock::SharedClock as _;
+    let wired = wired_with_a_floor().await;
+    let holder = wired.holder();
+    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let clock = kr_ipc::clock::SystemSharedClock;
+    let end = clock.boot_elapsed_ms() + 3_000;
+    let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND, Some(end)).await;
+
+    // The end passes with the writer in the look.
+    let by = std::time::Instant::now() + 30 * SOON;
+    while clock.boot_elapsed_ms() <= end && std::time::Instant::now() < by {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        clock.boot_elapsed_ms() > end,
+        "the continuous clock did not pass the end of the batch's authority"
+    );
+    drop(release);
+    let settled = std::time::Instant::now() + SOON;
+    while queued.load(std::sync::atomic::Ordering::Acquire) != 0
+        && std::time::Instant::now() < settled
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        queued.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the writer settled the holder's batch"
+    );
+    let handed: Vec<u8> = wired
+        .runtime
+        .input()
+        .terminal_writes()
+        .into_iter()
+        .filter(|write| write.of_a_lease)
+        .flat_map(|write| write.bytes)
+        .collect();
+    assert!(
+        !contains(&handed, LEFT_BEHIND),
+        "a piece was written after the end of its authority: {handed:?}"
+    );
     wired.close().await;
 }
