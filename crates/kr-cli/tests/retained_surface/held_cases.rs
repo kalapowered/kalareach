@@ -4,8 +4,9 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use super::held::{Extract, Listed, parse_list, read_releases};
-use super::narrower_cases::{ROOT, control, the_root};
+use super::held::{Extract, Git, Listed, hold_releases, parse_list, read_releases};
+use super::narrower::Reader;
+use super::narrower_cases::{ROOT, control, leak, said, the_root};
 use super::walker::{Depth, Lookup};
 
 /// A stand-in for git that counts what it is asked, and answers from a table: for each commit the
@@ -66,7 +67,10 @@ impl Extract for Counting {
         std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
         std::fs::write(
             folder.join("lib.rs"),
-            "pub fn check_envelope() {}\npub fn helper_fn() {}\n",
+            format!(
+                "pub fn check_envelope() {{ let _ = \"{}\"; }}\npub fn helper_fn() {{}}\n",
+                self.crates[commit].1
+            ),
         )
         .map_err(|error| error.to_string())
     }
@@ -201,6 +205,17 @@ fn the_list(releases: usize) -> String {
 /// Runs the script: `uname` says `system`, `table` is the table file, the generator prints `list`,
 /// and the test prints `output` and ends with `status`.
 fn run_script(system: &str, table: &str, list: &str, output: &str, status: i32) -> Script {
+    run_script_with(system, Some(table), list, output, status)
+}
+
+/// As [`run_script`], with no table file when `table` is none.
+fn run_script_with(
+    system: &str,
+    table: Option<&str>,
+    list: &str,
+    output: &str,
+    status: i32,
+) -> Script {
     use std::os::unix::fs::PermissionsExt;
 
     let folder = tempfile::tempdir().expect("a folder");
@@ -218,11 +233,13 @@ fn run_script(system: &str, table: &str, list: &str, output: &str, status: i32) 
         std::fs::read_to_string(super::repository().join("scripts/check-narrower-entries.sh"))
             .expect("the script");
     write("scripts/check-narrower-entries.sh", &script, false);
-    write(
-        "crates/kr-cli/tests/retained_surface/narrower_table.rs",
-        table,
-        false,
-    );
+    if let Some(table) = table {
+        write(
+            "crates/kr-cli/tests/retained_surface/narrower_table.rs",
+            table,
+            false,
+        );
+    }
     write("bin/uname", &format!("#!/bin/sh\necho '{system}'\n"), true);
     write("canned/list", list, false);
     write("canned/output", output, false);
@@ -406,4 +423,157 @@ fn the_table_file_counts_its_entries() {
     let two = folder.path().join("two.rs");
     std::fs::write(&two, a_table(2)).expect("a file");
     assert_eq!(count(&two), 2);
+}
+
+#[test]
+fn a_missing_table_is_refused_before_anything_is_built() {
+    let run = run_script_with("Linux", None, &the_list(2), &a_good_output(1, 2), 0);
+    assert_eq!(run.code, Some(1), "{}{}", run.stdout, run.stderr);
+    assert!(
+        run.stderr.contains(
+            "REFUSED: crates/kr-cli/tests/retained_surface/narrower_table.rs is not here"
+        ),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(run.cargo, "");
+}
+
+/// The digests of the root and of the helper that the release `commit` has, read through the
+/// stand-in with the subtree id `id`.
+fn digests_of(commit: &'static str, id: &'static str) -> (String, String) {
+    let entries = [control().entry];
+    let root = the_root(ROOT, "kr_worker", Depth::Alone);
+    let work = tempfile::tempdir().expect("a folder");
+    let trees = read_releases(
+        &entries,
+        std::slice::from_ref(&root),
+        &listed(&[commit]),
+        &Counting::new(&[(commit, "kr-worker", id)]),
+        work.path(),
+    )
+    .expect("a release");
+    let (Lookup::Found(root), Lookup::Found(helper)) = (
+        trees[0].1.root(&root),
+        trees[0].1.item("kr_worker", "helper_fn"),
+    ) else {
+        panic!("the rule is not in the release")
+    };
+    (root, helper)
+}
+
+#[test]
+fn the_release_whose_rule_differs_is_named_with_its_digest() {
+    let (root_one, helper_one) = digests_of("c1", "id1");
+    let (root_two, helper_two) = digests_of("c2", "id2");
+    assert_ne!(root_one, root_two);
+    assert_eq!(helper_one, helper_two);
+    let leaked = |text: &String| -> &'static str { Box::leak(text.clone().into_boxed_str()) };
+    let mut entry = control().entry;
+    entry.digest = leaked(&root_one);
+    let mut helper = entry.helpers[0].clone();
+    helper.now = leaked(&helper_one);
+    entry.helpers = leak(vec![helper]);
+    let roots = [the_root(ROOT, "kr_worker", Depth::Alone)];
+    let work = tempfile::tempdir().expect("a folder");
+    let held = hold_releases(
+        &[entry],
+        &roots,
+        &listed(&["c1", "c2"]),
+        &Counting::new(&[("c1", "kr-worker", "id1"), ("c2", "kr-worker", "id2")]),
+        work.path(),
+    )
+    .expect("the releases are read");
+    assert_eq!((held.entries, held.releases), (1, 2));
+    assert_eq!(
+        held.problems,
+        vec![said(&format!(
+            "packages/v0.78.0+c2 has the digest {root_two} for the root, the entry names {root_one}"
+        ))]
+    );
+}
+
+/// `git` in `folder`, with nothing of the person's configuration.
+fn git(folder: &Path, arguments: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", folder)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "user.name=a", "-c", "user.email=a@example.invalid"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(arguments)
+        .current_dir(folder)
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("text")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn two_releases_read_through_git_have_each_the_crate_they_had() {
+    let folder = tempfile::tempdir().expect("a folder");
+    let repository = folder.path().join("repository");
+    let crate_at = repository.join("crates/kr-worker");
+    std::fs::create_dir_all(crate_at.join("src")).expect("a folder");
+    git(&repository, &["init", "-q", "-b", "main"]);
+    std::fs::write(
+        crate_at.join("Cargo.toml"),
+        "[package]\nname = \"kr-worker\"\n",
+    )
+    .expect("a manifest");
+    let mut commits = Vec::new();
+    for body in ["let _ = 1;", "let _ = 2;"] {
+        std::fs::write(
+            crate_at.join("src/lib.rs"),
+            format!("pub fn check_envelope() {{}}\npub fn helper_fn() {{ {body} }}\n"),
+        )
+        .expect("a source");
+        git(&repository, &["add", "-A"]);
+        git(&repository, &["commit", "-q", "-m", body]);
+        commits.push(git(&repository, &["rev-parse", "HEAD"]));
+    }
+    let reader = Git::new(repository);
+    let first = reader
+        .subtree(&commits[0], "crates/kr-worker")
+        .expect("an id");
+    let second = reader
+        .subtree(&commits[1], "crates/kr-worker")
+        .expect("an id");
+    assert_ne!(first, second);
+
+    let root = the_root(ROOT, "kr_worker", Depth::Alone);
+    let work = folder.path().join("work");
+    let trees = read_releases(
+        &[control().entry],
+        std::slice::from_ref(&root),
+        &commits
+            .iter()
+            .map(|commit| Listed {
+                tag: format!("packages/v0.78.0+{}", &commit[..12]),
+                commit: commit.clone(),
+            })
+            .collect::<Vec<_>>(),
+        &reader,
+        &work,
+    )
+    .expect("the releases are read");
+    let helper = |at: usize| trees[at].1.item("kr_worker", "helper_fn");
+    assert!(matches!(helper(0), Lookup::Found(_)), "{:?}", helper(0));
+    assert!(matches!(helper(1), Lookup::Found(_)), "{:?}", helper(1));
+    assert_ne!(helper(0), helper(1));
 }

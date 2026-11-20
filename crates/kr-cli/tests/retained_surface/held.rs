@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::Root;
-use super::narrower::Narrower;
+use super::narrower::{Narrower, Reader, check_held};
 use super::walker::Tree;
 
 /// A release of the list: its tag and its full commit.
@@ -152,6 +152,37 @@ pub fn read_releases(
         ));
     }
     Ok(trees)
+}
+
+/// What the held check found over the releases of a list.
+pub struct Held {
+    pub entries: usize,
+    pub releases: usize,
+    pub problems: Vec<String>,
+}
+
+/// Reads each release of `listed` and holds the rules of the entries to it.
+///
+/// # Errors
+///
+/// When a release cannot be extracted.
+pub fn hold_releases(
+    entries: &[Narrower],
+    roots: &[Root],
+    listed: &[Listed],
+    extract: &dyn Extract,
+    work: &Path,
+) -> Result<Held, String> {
+    let trees = read_releases(entries, roots, listed, extract, work)?;
+    let releases: Vec<(&str, &dyn Reader)> = trees
+        .iter()
+        .map(|(tag, tree)| (tag.as_str(), tree as &dyn Reader))
+        .collect();
+    Ok(Held {
+        entries: entries.len(),
+        releases: listed.len(),
+        problems: check_held(entries, roots, &releases),
+    })
 }
 
 /// Reads the files of a release out of the repository's own object store.

@@ -66,10 +66,7 @@ mod walker;
 #[path = "retained_surface/walker_cases.rs"]
 mod walker_cases;
 
-use narrower::{
-    DAEMON_CRATES, Input, LevelRecord, Narrower, RECEIVER_CRATES, Reader, check_held,
-    check_narrower,
-};
+use narrower::{DAEMON_CRATES, Input, LevelRecord, Narrower, RECEIVER_CRATES, check_narrower};
 use walker::{Depth, Followed, Tree};
 
 /// A rule of the surface: where it is rooted, and the names it is followed from.
@@ -451,7 +448,7 @@ fn narrower_rules_are_in_every_release_of_their_level() {
     let current = Tree::at(&repository()).expect("this checkout");
     let roots = roots(&current);
     let work = tempfile::tempdir().expect("a folder for the releases");
-    let trees = held::read_releases(
+    let found = held::hold_releases(
         entries,
         &roots,
         &listed,
@@ -459,16 +456,11 @@ fn narrower_rules_are_in_every_release_of_their_level() {
         work.path(),
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    let releases: Vec<(&str, &dyn Reader)> = trees
-        .iter()
-        .map(|(tag, tree)| (tag.as_str(), tree as &dyn Reader))
-        .collect();
     println!(
         "narrower: {} entries, {} releases read",
-        entries.len(),
-        listed.len()
+        found.entries, found.releases
     );
-    let problems = check_held(entries, &roots, &releases);
+    let problems = found.problems;
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
