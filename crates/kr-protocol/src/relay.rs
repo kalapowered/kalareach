@@ -1034,10 +1034,28 @@ mod tests {
     }
 
     #[test]
+    fn a_lease_admits_only_the_pair_it_names() {
+        let lease = lease();
+        let stranger = EndpointKey::from_bytes([0x23; 32]);
+        let (ingress, egress) = (instance(FRANKFURT), instance(ASHBURN));
+
+        assert!(lease.admits_payload(source(), destination(), ingress, egress));
+        assert!(lease.admits_payload(destination(), source(), egress, ingress));
+        assert!(!lease.admits_payload(source(), stranger, ingress, egress));
+        assert!(!lease.admits_payload(stranger, destination(), ingress, egress));
+    }
+
+    #[test]
     fn a_one_way_lease_does_not_carry_the_reverse_direction() {
         let mut lease = lease();
         lease.direction = RelayDirection::SourceToDestination;
 
+        assert!(lease.admits_payload(
+            source(),
+            destination(),
+            instance(FRANKFURT),
+            instance(ASHBURN)
+        ));
         assert!(!lease.admits_payload(
             destination(),
             source(),
