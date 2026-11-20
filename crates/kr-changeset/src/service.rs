@@ -1159,19 +1159,6 @@ impl ChangeSetService {
             .settle_action(actor_id, action_id, method, payload_digest, outcome)
     }
 
-    /// Gives one action's claim back, for an effect that wrote nothing.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn release_action(
-        &self,
-        actor_id: &kr_protocol::ids::ActorId,
-        action_id: kr_protocol::scalars::Uuid,
-    ) -> Result<()> {
-        self.locked()?.release_action(actor_id, action_id)
-    }
-
     /// Records one action's outcome, leaving an existing row alone.
     ///
     /// # Errors

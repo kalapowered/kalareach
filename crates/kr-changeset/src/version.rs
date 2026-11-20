@@ -21,8 +21,6 @@ use kr_protocol::project::{
 use kr_protocol::scalars::{Digest256, U64};
 use sha2::{Digest as _, Sha256};
 
-use crate::error::{ChangeSetError, Result};
-
 /// The domain this digest is taken in.
 ///
 /// A digest with no domain is a digest that could be mistaken for one of something else. This one
@@ -151,24 +149,6 @@ impl Manifest {
             .iter()
             .filter(|entry| entry.class.is_change())
             .collect()
-    }
-
-    /// Refuses a manifest whose total exceeds what this host copies.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChangeSetError::QuotaExceeded`] with the figure.
-    pub fn check_size(&self, limit: u64) -> Result<()> {
-        let total = self.summary().total_bytes.get();
-        if total > limit {
-            return Err(ChangeSetError::QuotaExceeded {
-                detail: format!(
-                    "this capture would hold {total} bytes and one capture holds at most {limit}"
-                )
-                .into(),
-            });
-        }
-        Ok(())
     }
 }
 
@@ -548,20 +528,5 @@ mod tests {
         let changes = manifest.changes();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "src/main.rs");
-    }
-
-    #[test]
-    fn a_capture_larger_than_the_bound_is_refused_with_the_figure() {
-        let (_, _, _, manifest) = fixture();
-        let failure = manifest
-            .check_size(4)
-            .expect_err("a tree above the bound is refused");
-        assert!(
-            failure.to_string().contains("at most 4"),
-            "the refusal names the bound: {failure}"
-        );
-        manifest
-            .check_size(u64::MAX)
-            .expect("a tree under the bound is accepted");
     }
 }
