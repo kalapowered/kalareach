@@ -1596,8 +1596,9 @@ async fn a_choice_made_with_a_stale_pairing_changes_nothing() {
 
 /// KR-REQ-13.08: a choice that is resolved and then waits before the choice gate while the host it
 /// names is forgotten and paired again is refused when it gets the gate: the pairing it names is not
-/// the one this computer holds. No choice, no revision, and no host in use, in the device's own
-/// record or in the connection.
+/// the one this computer holds. The phone takes another host in the meantime, by the normal pairing,
+/// selection and connection, and that connection stands: the same publication, the same use record,
+/// the same session, and the session still live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refused_when_it_gets_it()
 {
@@ -1605,6 +1606,7 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
 
     let owner = DeviceKeys::generate().expect("keys");
     let host = Host::start(&owner).await;
+    let other = Host::start(&owner).await;
     let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
     let companion = &phone.companion;
     connection(companion, true).await;
@@ -1623,12 +1625,17 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
         async move { companion_tauri::hosts::use_host(&handle, current).await }
     });
     hold.reached().await;
-    // The phone forgets the host, and is paired with it again. A host does not pair an endpoint it
-    // already holds a second time, so the pairing's own record is written: the same host, and
-    // another identity this device has with it.
+    // The phone forgets the host, and takes another by the normal pairing: that host is selected
+    // and connected, as the first host a phone pairs with is.
     companion_tauri::hosts::forget_host(companion.app.handle(), &current)
         .await
         .expect("the host is forgotten");
+    pair(&phone, &other, &owner, &[ActionRight::SessionView]).await;
+    connection(companion, true).await;
+    companion.told_everything().await;
+    // The pairing with the first host that a second pairing commits: the same host, and another
+    // identity this device has with it. A host does not pair an endpoint it holds a second time, so
+    // only this record is written.
     let paired_again = kr_client::pairing::paired::PairedHost {
         device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
             [42; 16],
@@ -1643,6 +1650,13 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
         .expect("the pairing is recorded again");
     let before = state.connection_state();
     let in_use = companion.device().host_in_use().map(|host| host.device_id);
+    assert!(
+        in_use.is_some(),
+        "a host is selected and its use is recorded"
+    );
+    let session = state
+        .session()
+        .expect("the host paired after the forget is connected");
     hold.release();
 
     let refused = choosing.await.expect("the choice ran");
@@ -1650,7 +1664,7 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
     assert_eq!(
         state.connection_state(),
         before,
-        "no revision and no host in use"
+        "the same publication: no revision and the same host in use"
     );
     assert_eq!(
         companion.device().host_in_use().map(|host| host.device_id),
@@ -1658,10 +1672,17 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
         "the device's own record of the host in use"
     );
     assert!(
-        state.session().is_err(),
-        "no connection is installed by the choice"
+        state.session().is_ok_and(|now| Arc::ptr_eq(&now, &session)),
+        "the connection installed is the same one"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), session.closed())
+            .await
+            .is_err(),
+        "the session is still live"
     );
     host.stop().await;
+    other.stop().await;
 }
 
 /// KR-REQ-18.01: a choice whose step stops part of the way, after the owner accepted it, is told in
