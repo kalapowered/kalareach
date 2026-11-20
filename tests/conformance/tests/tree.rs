@@ -37,6 +37,7 @@ fn timed_out(waited: Waited<Output>) -> Captured {
     match waited {
         Waited::TimedOut(captured) => captured,
         Waited::Done(output) => panic!("the command ended in its time: {:?}", output.status),
+        Waited::NotStarted => panic!("the command was not started"),
     }
 }
 
@@ -135,8 +136,8 @@ fn a_command_whose_time_is_spent_before_it_starts_is_not_started() {
     };
     let by_output = tree::output(&mut bash(script, &[&marker]), Some(spent)).expect("a call");
     let by_status = tree::status(&mut bash(script, &[&marker]), Some(spent)).expect("a call");
-    assert!(matches!(by_output, Waited::TimedOut(_)), "{by_output:?}");
-    assert!(matches!(by_status, Waited::TimedOut(_)), "{by_status:?}");
+    assert!(matches!(by_output, Waited::NotStarted), "{by_output:?}");
+    assert!(matches!(by_status, Waited::NotStarted), "{by_status:?}");
     // An order: a command that was started is asked to end and given the grace.
     assert!(
         began.elapsed() < GRACE,
