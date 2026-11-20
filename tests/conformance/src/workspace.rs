@@ -635,8 +635,10 @@ harness = false
             "workspace_root": outer.to_string_lossy(),
         });
         let problem = describe(&root, "Cargo.toml", &value).expect_err("refused");
+        // The product shows a path that lies outside the root as `shown` writes it, with forward
+        // slashes; the expectation calls the same helper.
         assert!(
-            problem.contains(&format!("is at `{}`", outer.to_string_lossy()))
+            problem.contains(&format!("is at `{}`", shown(&root, &outer)))
                 && problem.ends_with("which is not inside the tested root"),
             "{problem}"
         );
