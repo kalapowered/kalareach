@@ -10601,27 +10601,35 @@ async fn a_takeover_returns_its_epoch_while_the_writer_stands_in_a_look_at_the_f
     let release = stand_the_writer_in_a_look(&wired, holder, LEFT_BEHIND).await;
 
     let answered = acquiring(second, &wired, challenger);
-    let taken = answered_within_soon(&answered);
+    let in_the_look = answered_within_soon(&answered);
+    let answered_in_the_look = in_the_look.is_some();
+    // The look returns whatever the takeover did, so a takeover that waited for the writer is
+    // answered too, and what it counted says whether the writer wrote first.
+    drop(release);
+    let taken = match in_the_look {
+        Some(taken) => taken,
+        None => answered
+            .recv_timeout(SOON)
+            .expect("the takeover is answered once the look returns"),
+    };
+    assert_eq!(
+        taken.discarded_bytes.get(),
+        LEFT_BEHIND.len() as u64,
+        "the takeover counts what the first holder's lease left unwritten"
+    );
     assert!(
-        taken.is_some(),
+        answered_in_the_look,
         "the takeover was not answered while the writer stood in the look at the floor's name"
     );
-    let taken = taken.expect("answered");
     assert_eq!(
         taken.lease.epoch.get(),
         epoch + 1,
         "the takeover returns the epoch that follows the one it ended"
     );
     assert_eq!(taken.lease.holder.0, Some(challenger));
-    assert_eq!(
-        taken.discarded_bytes.get(),
-        LEFT_BEHIND.len() as u64,
-        "the takeover counts what the first holder's lease left unwritten"
-    );
 
-    // The look returns. The writer is serial, so the first holder's batch is settled once nothing
-    // is owed for it, and what it settled to is what the application was handed.
-    drop(release);
+    // The writer is serial, so the first holder's batch is settled once nothing is owed for it, and
+    // what it settled to is what the application was handed.
     let settled = std::time::Instant::now() + SOON;
     while queued.load(std::sync::atomic::Ordering::Acquire) != 0
         && std::time::Instant::now() < settled
