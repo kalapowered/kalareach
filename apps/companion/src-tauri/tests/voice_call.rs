@@ -10547,10 +10547,9 @@ async fn a_stop_after_the_connection_dropped_and_the_look_for_the_close_use_the_
     scene.stop_host().await;
 }
 
-/// An owner that fails after the host revoked the grant asks the host for the final status of the
-/// call, and the end is told by the host's word. `closes` says whether the host closes the call
-/// within the look's bound.
-async fn an_owner_fails_after_the_host_revoked_the_grant(closes: bool) {
+/// An owner that fails after the host revoked the grant: the end it records. `closes` says whether
+/// the host closes the call within the look's bound.
+async fn an_owner_fails_after_the_host_revoked_the_grant(closes: bool) -> serde_json::Value {
     let timings = Timings {
         final_status_beat: Duration::from_millis(100),
         final_status_within: Duration::from_secs(1),
@@ -10605,21 +10604,9 @@ async fn an_owner_fails_after_the_host_revoked_the_grant(closes: bool) {
             state["ended"]["cause"] == "owner_failed" && state["setting_up"] == false
         })
         .await;
-    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
-    if closes {
-        assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
-        assert_eq!(left_to_host_notice(&ended), None, "{ended}");
-    } else {
-        assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
-        assert_eq!(ended["ended"]["words"], HOST_UNCONFIRMED_WORDS, "{ended}");
-        assert_eq!(
-            left_to_host_notice(&ended),
-            Some(json!(HOST_UNCONFIRMED_WORDS)),
-            "{ended}"
-        );
-    }
     letting_go.await.expect("the hang-up was let go");
     scene.stop_host().await;
+    ended
 }
 
 /// An owner that fails after the host revoked the grant asks the host for the final status of the
@@ -10627,7 +10614,10 @@ async fn an_owner_fails_after_the_host_revoked_the_grant(closes: bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owner_that_fails_after_the_host_revoked_the_grant_finds_the_close_the_host_then_confirms()
  {
-    an_owner_fails_after_the_host_revoked_the_grant(true).await;
+    let ended = an_owner_fails_after_the_host_revoked_the_grant(true).await;
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    assert_eq!(left_to_host_notice(&ended), None, "{ended}");
 }
 
 /// A call the host has not closed within the look's bound is left to the host by the failed owner,
@@ -10635,7 +10625,15 @@ async fn an_owner_that_fails_after_the_host_revoked_the_grant_finds_the_close_th
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owner_that_fails_after_the_host_revoked_the_grant_leaves_the_call_to_the_host_that_does_not_close_it_in_time()
  {
-    an_owner_fails_after_the_host_revoked_the_grant(false).await;
+    let ended = an_owner_fails_after_the_host_revoked_the_grant(false).await;
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+    assert_eq!(ended["ended"]["words"], HOST_UNCONFIRMED_WORDS, "{ended}");
+    assert_eq!(
+        left_to_host_notice(&ended),
+        Some(json!(HOST_UNCONFIRMED_WORDS)),
+        "{ended}"
+    );
 }
 
 /// A host that does not know the call for one heartbeat but still holds it ends the phone's control
