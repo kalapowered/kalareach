@@ -53,14 +53,14 @@ pub enum Reading {
     Cargo,
     /// A build whose success is all there is to record.
     Build,
-    /// A package's `test` script, reporting to the JSON file named, for the package in the
-    /// directory named.
+    /// A package's `test` script, reporting to the step's output, a JSON file, for the package in
+    /// the directory named.
     Vitest {
         /// The package's directory, relative to the repository.
         directory: String,
     },
     /// A phone application's unit tests, which the step's script runs and leaves the results of at
-    /// the path its `--results=` argument names.
+    /// the step's output.
     Lane(Tests),
 }
 
@@ -92,6 +92,15 @@ pub struct Step {
     pub filter: Option<(String, String)>,
     /// Tests the command leaves out by name, each with its reason.
     pub skips: Vec<(String, String)>,
+    /// The directory it runs in, relative to the repository and with forward slashes; empty for
+    /// the repository's root. Its build, the listing of its tests and its run all use it.
+    pub directory: String,
+    /// The variables it is run with beyond the report's own, by name, the plan's and its own with
+    /// each placeholder given its value.
+    pub env: Vec<(String, String)>,
+    /// The file it writes for the report to read (a directory, for a JUnit lane), as an absolute
+    /// path with forward slashes, when it names one.
+    pub output: Option<String>,
 }
 
 impl Step {
@@ -110,6 +119,9 @@ impl Step {
             reading: Reading::Cargo,
             filter: None,
             skips: Vec::new(),
+            directory: String::new(),
+            env: Vec::new(),
+            output: None,
         }
     }
 
@@ -259,7 +271,12 @@ mod tests {
             .iter()
             .map(|group| group.as_ref().to_owned())
             .collect();
-        core_plan().steps(platform, &names, evidence, applications)
+        core_plan().steps(
+            platform,
+            &names,
+            &crate::plan_file::Values::evidence(evidence),
+            applications,
+        )
     }
 
     #[test]
@@ -272,6 +289,9 @@ mod tests {
             reading,
             filter: None,
             skips: Vec::new(),
+            directory: String::new(),
+            env: Vec::new(),
+            output: None,
         };
         let mut steps = vec![step("a", Reading::Build), step("b", Reading::Build)];
         steps.extend((0..7).map(|n| step(&format!("t{n}"), Reading::Cargo)));
@@ -295,6 +315,9 @@ mod tests {
             reading,
             filter: None,
             skips: Vec::new(),
+            directory: String::new(),
+            env: Vec::new(),
+            output: None,
         }
     }
 

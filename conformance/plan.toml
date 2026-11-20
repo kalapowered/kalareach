@@ -1895,6 +1895,7 @@ what = '''packages/protocol's tests'''
 platforms = ['linux', 'macos']
 reading = 'vitest'
 package = 'packages/protocol'
+output = '{evidence}/conformance/vitest/packages-protocol.json'
 command = [
     'pnpm',
     '--dir',
@@ -1903,7 +1904,7 @@ command = [
     'test',
     '--reporter=default',
     '--reporter=json',
-    '--outputFile.json={evidence}/conformance/vitest/packages-protocol.json',
+    '--outputFile.json={output}',
     '--includeTaskLocation',
 ]
 
@@ -1914,6 +1915,7 @@ what = '''packages/plugin-sdk's tests'''
 platforms = ['linux', 'macos']
 reading = 'vitest'
 package = 'packages/plugin-sdk'
+output = '{evidence}/conformance/vitest/packages-plugin-sdk.json'
 command = [
     'pnpm',
     '--dir',
@@ -1922,7 +1924,7 @@ command = [
     'test',
     '--reporter=default',
     '--reporter=json',
-    '--outputFile.json={evidence}/conformance/vitest/packages-plugin-sdk.json',
+    '--outputFile.json={output}',
     '--includeTaskLocation',
 ]
 
@@ -1933,6 +1935,7 @@ what = '''apps/companion's tests'''
 platforms = ['linux', 'macos']
 reading = 'vitest'
 package = 'apps/companion'
+output = '{evidence}/conformance/vitest/apps-companion.json'
 command = [
     'pnpm',
     '--dir',
@@ -1941,7 +1944,7 @@ command = [
     'test',
     '--reporter=default',
     '--reporter=json',
-    '--outputFile.json={evidence}/conformance/vitest/apps-companion.json',
+    '--outputFile.json={output}',
     '--includeTaskLocation',
 ]
 
@@ -1973,7 +1976,8 @@ what = '''the Android application's unit tests'''
 platforms = ['linux']
 reading = 'lane'
 lane = 'junit'
-command = ['bash', 'scripts/android-unit-tests.sh', '--results={evidence}/conformance/android']
+output = '{evidence}/conformance/android'
+command = ['bash', 'scripts/android-unit-tests.sh', '--results={output}']
 
 [[step]]
 id = 'phones-the-ios-application-s-unit-tests'
@@ -1982,7 +1986,8 @@ what = '''the iOS application's unit tests'''
 platforms = ['macos']
 reading = 'lane'
 lane = 'xcode'
-command = ['bash', 'scripts/ios-unit-tests.sh', '--results={evidence}/conformance/ios.json']
+output = '{evidence}/conformance/ios.json'
+command = ['bash', 'scripts/ios-unit-tests.sh', '--results={output}']
 
 [[ignored_run]]
 package = 'kr-shell-integration'

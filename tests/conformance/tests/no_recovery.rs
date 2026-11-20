@@ -277,6 +277,15 @@ fn the_report_s_sources_remove_nothing_and_signal_and_read_no_one() {
     for path in files {
         let source = std::fs::read_to_string(&path).expect("a source");
         match found(&source) {
+            // The scratch directory is the one place the report removes anything: the directory it
+            // made for the run, which no step shares with the evidence or the tested tree.
+            Ok(hits) if path.ends_with("scratch.rs") => {
+                let others: Vec<&String> = hits
+                    .iter()
+                    .filter(|hit| !hit.ends_with("`remove_dir_all`"))
+                    .collect();
+                assert!(others.is_empty(), "{}: {others:#?}", path.display());
+            }
             Ok(hits) => assert!(hits.is_empty(), "{}: {hits:#?}", path.display()),
             Err(problem) => panic!("{}: {problem}", path.display()),
         }

@@ -21,7 +21,7 @@ use kr_conformance::libtest::{Binary, Outcome as LibtestOutcome};
 use kr_conformance::map::Key;
 use kr_conformance::map::{self, Binding, Declarations, Map, Place, TypeScriptRead};
 use kr_conformance::plan::{self, Platform, Reading, Step};
-use kr_conformance::plan_file::{IgnoredRun, Plan, Runs, TerminalProfileFile};
+use kr_conformance::plan_file::{IgnoredRun, Plan, Runs, TerminalProfileFile, Values};
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Stopped, Verdict};
 use kr_conformance::run::Executed;
 use kr_conformance::workspace::{TargetId, TargetKind};
@@ -676,7 +676,12 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
             source: "crates/kr-client/src/sync/keys.rs:698".to_owned(),
         },
     );
-    let steps = core_plan().steps(Platform::Windows, &rust_group(), "/tmp/e", None);
+    let steps = core_plan().steps(
+        Platform::Windows,
+        &rust_group(),
+        &Values::evidence("/tmp/e"),
+        None,
+    );
     let whole = steps
         .iter()
         .find(|step| step.what == "the client's stores and their directory flush")
@@ -2229,7 +2234,12 @@ fn end_to_end_drift(plan: &Plan) -> Result<(), String> {
     ];
     let mut steps: Vec<(Step, (String, String))> = Vec::new();
     let mut builds = 0;
-    for step in plan.steps(Platform::Linux, &["end-to-end".to_owned()], "/tmp/e", None) {
+    for step in plan.steps(
+        Platform::Linux,
+        &["end-to-end".to_owned()],
+        &Values::evidence("/tmp/e"),
+        None,
+    ) {
         if step.reading == Reading::Build {
             if step.command != worker_build {
                 return Err(format!(
@@ -2396,7 +2406,12 @@ fn platform_drift(plan: &Plan) -> Result<(), String> {
         .map(|command| without_display(command))
         .collect();
     let (builds, tests): (Vec<Step>, Vec<Step>) = plan
-        .steps(Platform::Windows, &plan.all_groups(), "/tmp/e", None)
+        .steps(
+            Platform::Windows,
+            &plan.all_groups(),
+            &Values::evidence("/tmp/e"),
+            None,
+        )
         .into_iter()
         .partition(|step| step.command.get(1).is_some_and(|word| word == "build"));
     let mut planned: Vec<String> = tests
@@ -2433,11 +2448,16 @@ fn platform_drift(plan: &Plan) -> Result<(), String> {
         .filter(|pair| pair[0] == "--skip")
         .map(|pair| pair[1].to_owned())
         .collect();
-    let mut skipped: Vec<String> = plan.steps(Platform::MacOs, &rust_group(), "/tmp/e", None)[0]
-        .skips
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect();
+    let mut skipped: Vec<String> = plan.steps(
+        Platform::MacOs,
+        &rust_group(),
+        &Values::evidence("/tmp/e"),
+        None,
+    )[0]
+    .skips
+    .iter()
+    .map(|(name, _)| name.clone())
+    .collect();
     left_out.sort();
     skipped.sort();
     if skipped != left_out {
@@ -2473,7 +2493,12 @@ fn performance_drift(plan: &Plan) -> Result<(), String> {
     // target: none passes unread.
     let mut measurements: Vec<(Step, (String, String))> = Vec::new();
     for step in plan
-        .steps(Platform::Linux, &["performance".to_owned()], "/tmp/e", None)
+        .steps(
+            Platform::Linux,
+            &["performance".to_owned()],
+            &Values::evidence("/tmp/e"),
+            None,
+        )
         .into_iter()
         .filter(|step| step.command.iter().any(|word| word == "--exact"))
     {
