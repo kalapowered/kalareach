@@ -1824,6 +1824,9 @@ fn another_state_proves_a_set_aside_durable_before_it_reads_with_no_message_fold
 /// A change to the members of a stored file, as a case under test makes it.
 type Edit = dyn Fn(&mut serde_json::Map<String, Value>);
 
+/// A step of the store that a window takes on a thread of its own, and whether it succeeded.
+type Step = Box<dyn FnOnce(Window) -> bool + Send>;
+
 /// KR-REQ-12.26: a file is of this layout only with every member, nullable ones included, a numeric
 /// time and no member more.
 #[test]
@@ -2127,7 +2130,7 @@ fn the_lock_file_of_the_folder_holds_a_keep_a_repair_a_removal_and_a_listing_bac
         kr_flush::lock::exclusive(&file).expect("held by another process's handle");
         file
     };
-    let steps: [(&str, Box<dyn FnOnce(Window) -> bool + Send>); 4] = [
+    let steps: [(&str, Step); 4] = [
         (
             "a keep",
             Box::new(|window| window.keep(message(1, "text", &[])).is_ok()),
