@@ -621,6 +621,68 @@ directory = 'first'
     }
 }
 
+/// KR-REQ-29.01, the part about reproducible commands: a directory a step builds in is also the one
+/// that the report's own environment names. The program is started with `CARGO_TARGET_DIR` in its
+/// own environment and a temporary directory inside that directory, which is where it copies its
+/// own program to run each test binary, so the run is stopped before a step runs and nothing is
+/// copied there.
+#[cfg(unix)]
+#[test]
+fn a_runner_base_inside_the_target_directory_of_the_programs_own_environment_is_refused() {
+    let (case, root) = copy_beside("no-root-manifest");
+    let built = case.path().canonicalize().expect("the case").join("built");
+    let temporary = built.join("work");
+    std::fs::create_dir_all(&temporary).expect("a temporary directory inside the target directory");
+    let text = plan_of(
+        &["first/Cargo.toml", "second/Cargo.toml"],
+        "[[step]]
+id = 'first'
+group = 'rust'
+what = 'the first workspace'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+directory = 'first'
+command = ['cargo', 'test', '--locked']
+",
+    );
+    std::fs::create_dir_all(root.join("conformance")).expect("a directory");
+    let plan = root.join("conformance").join("plan.toml");
+    std::fs::write(&plan, text).expect("the plan");
+    git(&root, &["add", "-A"]);
+    let evidence = tempfile::Builder::new()
+        .prefix("kr-conformance-evidence.")
+        .tempdir_in(&temporary)
+        .expect("an evidence directory inside the temporary directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_kr-conformance"))
+        .current_dir(case.path())
+        .env("CARGO_TARGET_DIR", &built)
+        .env("TMPDIR", &temporary)
+        .args(["run", "--root"])
+        .arg(&root)
+        .arg("--plan")
+        .arg(&plan)
+        .arg("--evidence")
+        .arg(evidence.path())
+        .output()
+        .expect("the program runs");
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{said}");
+    assert!(
+        said.contains("where a step builds")
+            && said.contains(&built.to_string_lossy().into_owned()),
+        "{said}"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&temporary)
+        .expect("the base")
+        .map(|entry| entry.expect("an entry").path())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![evidence.path().to_path_buf()],
+        "the report's program was copied into the base"
+    );
+}
+
 #[test]
 fn the_vitest_and_lane_steps_of_cores_plan_each_name_their_output() {
     let text = std::fs::read_to_string(
