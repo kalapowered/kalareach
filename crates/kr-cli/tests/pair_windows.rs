@@ -350,7 +350,7 @@ async fn the_first_owner_is_not_confirmed_without_a_terminal() {
         host.log()
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("needs a terminal"),
+        String::from_utf8_lossy(&output.stderr).contains("needs a Windows console"),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );

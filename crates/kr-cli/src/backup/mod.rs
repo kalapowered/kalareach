@@ -3,7 +3,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
-//! | `setup` (Unix) | The owner's setup: the plan, the kit shown once, the daemon's call and its outcomes |
+//! | `setup` | The owner's setup: the plan, the kit shown once, the daemon's call and its outcomes |
 //! | [`restore`] | The restore itself: the plan, its digest, the confirmation, the files, the record |
 //! | [`kit`] | Reading the recovery kit from a file, a pipe or the terminal, and clearing it |
 //! | [`protect`] | The access lists that keep other programs of the account from setup on Windows |
@@ -19,7 +19,6 @@ pub mod interrupt;
 pub mod kit;
 pub mod protect;
 pub mod restore;
-#[cfg(unix)]
 pub mod setup;
 pub mod source;
 
@@ -30,9 +29,7 @@ use kr_client::shown::Shown;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::ids::ArchiveId;
 
-use crate::cli::{
-    BackupCommand, BackupRestoreArguments, BackupSetupArguments, EnvironmentSelector,
-};
+use crate::cli::{BackupCommand, BackupRestoreArguments, EnvironmentSelector};
 use crate::daemon::Daemon;
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Request};
@@ -56,31 +53,8 @@ use self::source::{DaemonBundleWriter, DaemonSource, real_pause};
 pub async fn run(paths: &HostPaths, command: BackupCommand, json: bool) -> Result<Completion> {
     match command {
         BackupCommand::Restore(arguments) => restore(paths, arguments, json).await,
-        BackupCommand::Setup(arguments) => setup(paths, arguments, json).await,
+        BackupCommand::Setup(arguments) => setup::run(paths, arguments, json).await,
     }
-}
-
-#[cfg(unix)]
-async fn setup(
-    paths: &HostPaths,
-    arguments: BackupSetupArguments,
-    json: bool,
-) -> Result<Completion> {
-    setup::run(paths, arguments, json).await
-}
-
-/// Setup shows the recovery kit at a terminal and protects the process from a core dump, and both
-/// are Unix calls.
-#[cfg(windows)]
-async fn setup(
-    _paths: &HostPaths,
-    _arguments: BackupSetupArguments,
-    _json: bool,
-) -> Result<Completion> {
-    Err(CliError::Usage(Shown::said(
-        "setting backups up needs a Unix terminal (macOS, Linux, or a Linux host under WSL) and \
-         makes nothing on Windows",
-    )))
 }
 
 /// What a command that has no way to ask says.

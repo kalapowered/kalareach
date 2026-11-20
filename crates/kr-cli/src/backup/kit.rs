@@ -222,7 +222,7 @@ pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
 }
 
 /// How long a stopped reader is given to leave a read of the console.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const READER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How often the reader's read is asked again to end.
@@ -301,13 +301,13 @@ fn read_console_line(stopped: &AtomicBool) -> Result<Option<String>> {
 
 /// The thread that reads an answer, held so that it is ended before anything changes the console
 /// under it.
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 struct ReaderGuard {
     thread: Option<std::thread::JoinHandle<()>>,
     stopped: Arc<AtomicBool>,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 impl ReaderGuard {
     /// Joins a thread that has sent its answer, which it does as it ends.
     fn finish(&mut self) {

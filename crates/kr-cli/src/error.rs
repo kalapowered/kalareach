@@ -124,7 +124,13 @@ impl Said for CliError {
             Self::NotInSession => {
                 Shown::said("this command needs a session; run it inside one or name the session")
             }
+            #[cfg(unix)]
             Self::NotATerminal => Shown::said("this command needs a terminal"),
+            #[cfg(windows)]
+            Self::NotATerminal => Shown::said(
+                "this command needs a Windows console: run it in a console window or in Windows \
+                 Terminal",
+            ),
             Self::Refused(error) => refusal_said(error, kr_client::retry::user_action(error.code)),
             Self::ServiceRefused { error, action } => refusal_said(error, *action),
             Self::ReadRefused { error, then } => {

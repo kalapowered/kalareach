@@ -619,13 +619,15 @@ impl Window {
         // The Enter key of a console sends a carriage return, where a Unix terminal sends a line
         // feed, so a line end typed as `\n` here is typed as the key of the platform.
         #[cfg(windows)]
-        let bytes: Vec<u8> = bytes
+        let converted: Vec<u8> = bytes
             .iter()
             .map(|byte| if *byte == b'\n' { b'\r' } else { *byte })
             .collect();
+        #[cfg(windows)]
+        let bytes = converted.as_slice();
         let mut typing = self.typing.lock().unwrap_or_else(PoisonError::into_inner);
         typing
-            .write_all(&bytes)
+            .write_all(bytes)
             .and_then(|()| typing.flush())
             .expect("types into the window");
     }

@@ -11,12 +11,19 @@
 //! * The command runs at a terminal outside every session, whose worker keeps its output.
 //! * Before the seed exists the process is kept out of a core dump: the core size limit is zero,
 //!   and on Linux the process is made non-dumpable, because a core pattern that pipes to a handler
-//!   ignores the limit. Setup is refused if either call fails.
+//!   ignores the limit. Setup is refused if either call fails. On Windows the process ends itself
+//!   at once on an unhandled exception that reaches its filter, so that no report is made of it,
+//!   and the access lists of its process, threads and token withhold the opens that read its
+//!   memory or take it over from later programs of the account ([`super::protect`]); setup is
+//!   refused if a list cannot be set, if it reads back other than set, or if a debugger is
+//!   attached.
 //! * The kit is written straight to the terminal from the buffer that holds it, and the buffer
 //!   clears when it is dropped. It does not pass through standard output's buffer or the line
 //!   writer.
 //! * However the dialogue ends, the terminal's modes are put back with the input still waiting
-//!   discarded, so text pasted past a line never reaches the shell or its history.
+//!   discarded, so text pasted past a line never reaches the shell or its history. On Windows
+//!   this holds for the endings that run the guard's drop and for input already in the console's
+//!   queue ([`super::console`]).
 //!
 //! # How a setup ends
 //!
@@ -38,6 +45,7 @@
 
 use std::fs::File;
 use std::io::{IsTerminal as _, Write as _};
+#[cfg(unix)]
 use std::os::fd::AsFd as _;
 use std::time::Duration;
 
@@ -54,6 +62,7 @@ use kr_protocol::backup_setup::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ArchiveId;
 use kr_protocol::method::Method;
+#[cfg(unix)]
 use rustix::termios::{OptionalActions, Termios};
 use zeroize::Zeroizing;
 
@@ -109,9 +118,13 @@ pub async fn run(
          agent in it can read",
     )
     .await?;
-    keep_out_of_a_core_dump()?;
+    // Held to the end of the command: on Windows it holds the token whose list was set.
+    let _protection = protect_the_process()?;
 
-    let interrupt = Interrupt::install()?;
+    // Armed before the first question: on Windows, Ctrl-C and Ctrl-Break end the process by the
+    // default handler until this, which skips every destructor.
+    let mut interrupt = Interrupt::install()?;
+    interrupt.arm()?;
     // Held from here to the end, so that every exit puts the terminal back and drops what is
     // waiting in it.
     let _terminal = Terminal::hold()?;
@@ -261,9 +274,12 @@ impl Dialogue {
     /// Puts `question` to the person and returns the line they typed, or none at the end of the
     /// input. A line is cleared when dropped.
     async fn ask(&mut self, question: &Shown) -> Result<Option<Zeroizing<String>>> {
+        // The interrupt first: a read that a Ctrl-C ended and the Ctrl-C itself can both be ready,
+        // and the person's interrupt is the one that counts.
         let answer = tokio::select! {
-            answer = ask_line(question) => answer.map_err(|error| self.failed(error))?,
+            biased;
             () = self.interrupt.arrived() => return Err(self.stopped()),
+            answer = ask_line(question) => answer.map_err(|error| self.failed(error))?,
         };
         Ok(answer.map(Zeroizing::new))
     }
@@ -798,6 +814,27 @@ fn show_the_plan(ready: &Ready) {
     report::say(&Shown::said(""));
 }
 
+/// Where the kit is written: the controlling terminal, opened as itself.
+#[cfg(unix)]
+const CONTROLLING_TERMINAL: &str = "/dev/tty";
+
+/// Where the kit is written: the console's output buffer, opened as itself.
+#[cfg(windows)]
+const CONTROLLING_TERMINAL: &str = "CONOUT$";
+
+/// What is said before the kit is shown.
+#[cfg(unix)]
+const SHOWN_ONCE: &str = "Your recovery kit follows. It is shown once. The terminal's scrollback \
+     keeps it until you clear the scrollback.";
+
+/// What is said before the kit is shown. The console host and Windows Terminal keep their own copy
+/// of what a window shows, which no list on this process covers.
+#[cfg(windows)]
+const SHOWN_ONCE: &str = "Your recovery kit follows. It is shown once. This window can keep it in \
+     its buffer, where programs of your Windows account can read it until the window is closed or \
+     the buffer is cleared. Windows Terminal can also save a window's text when it closes. Clear \
+     the buffer when the kit is stored.";
+
 /// Writes the kit to the terminal, once.
 fn show_the_kit(kit: &Zeroizing<String>, fingerprint: &Shown) -> Result<()> {
     let failed = |error: &std::io::Error| {
@@ -810,12 +847,9 @@ fn show_the_kit(kit: &Zeroizing<String>, fingerprint: &Shown) -> Result<()> {
     // the command runs only where standard output is that terminal.
     let mut terminal = File::options()
         .write(true)
-        .open("/dev/tty")
+        .open(CONTROLLING_TERMINAL)
         .map_err(|error| failed(&error))?;
-    report::say(&Shown::said(
-        "Your recovery kit follows. It is shown once. The terminal's scrollback keeps it until \
-         you clear the scrollback.",
-    ));
+    report::say(&Shown::said(SHOWN_ONCE));
     terminal.write_all(b"\n").map_err(|error| failed(&error))?;
     terminal
         .write_all(kit.as_bytes())
@@ -859,11 +893,24 @@ fn is_yes(answer: Option<&Zeroizing<String>>) -> bool {
     answer.is_some_and(|typed| typed.trim().eq_ignore_ascii_case("yes"))
 }
 
+/// What holds the protection of the process for as long as the command runs.
+#[cfg(unix)]
+struct Protection;
+
+/// What holds the protection of the process for as long as the command runs: the token whose list
+/// was set stays open.
+#[cfg(windows)]
+type Protection = super::protect::Protected<crate::platform::ProtectionCalls>;
+
 /// Keeps this process out of a core dump, before the seed exists.
 ///
 /// The core size limit is zero. On Linux the process is also made non-dumpable, because a core
 /// pattern that pipes to a handler ignores the limit. A failure of either refuses the setup.
-fn keep_out_of_a_core_dump() -> Result<()> {
+///
+/// After this setup starts no process and makes no named object that another program opens; a
+/// change that needs one gives it an access list of its own ([`super::protect`]).
+#[cfg(unix)]
+fn protect_the_process() -> Result<Protection> {
     let refused = |error: rustix::io::Errno| {
         CliError::Other(shown!(
             "the recovery kit is not made because this process could not be kept out of a core \
@@ -882,17 +929,36 @@ fn keep_out_of_a_core_dump() -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
         .map_err(refused)?;
-    Ok(())
+    Ok(Protection)
+}
+
+/// Keeps other programs of the account from this process and its token, and makes a crash leave no
+/// report, before the seed exists. A list that cannot be set, or that reads back other than it was
+/// set, or a debugger, refuses the setup.
+///
+/// After this setup starts no process and makes no named object that another program opens: the
+/// token's default list, which every object this process makes from now on is given, would not
+/// serve it. A change that needs one gives it an access list of its own ([`super::protect`]).
+#[cfg(windows)]
+fn protect_the_process() -> Result<Protection> {
+    crate::platform::protect_this_process().map_err(super::protect::Refusal::into_error)
 }
 
 /// The terminal's modes as they were found. They are put back when this is dropped, and the input
 /// still waiting is discarded with them: what was pasted past a line the dialogue read is not for
 /// the shell.
+#[cfg(unix)]
 struct Terminal {
     input: File,
     saved: Termios,
 }
 
+/// On Windows the console's two mode words are put back, and the input still waiting is
+/// discarded, as a separate step, by [`super::console::Console`].
+#[cfg(windows)]
+type Terminal = super::console::Console;
+
+#[cfg(unix)]
 impl Terminal {
     fn hold() -> Result<Self> {
         let input = std::io::stdin()
@@ -915,6 +981,7 @@ impl Terminal {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Terminal {
     fn drop(&mut self) {
         // The call waits for output to drain, so a signal can end it early; it is asked again.

@@ -9,7 +9,9 @@
 //!
 //! Windows polls sockets only, so a command there reads its secret without a handler and installs
 //! one afterwards ([`Interrupt::arm`]): before that, Ctrl-C ends the process, which has written and
-//! changed nothing.
+//! changed nothing. A command that asks questions arms it before the first one, and the handler
+//! takes Ctrl-Break as it takes Ctrl-C. Closing the window, signing out and shutting down end the
+//! process after a few seconds whatever a handler says.
 
 use kr_client::shown;
 use kr_client::shown::Shown;
@@ -28,6 +30,8 @@ pub struct Interrupt {
     quit: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: Option<tokio::signal::windows::CtrlC>,
+    #[cfg(windows)]
+    ctrl_break: Option<tokio::signal::windows::CtrlBreak>,
 }
 
 kr_client::debug_as_name!(Interrupt);
@@ -58,7 +62,10 @@ impl Interrupt {
         }
         #[cfg(windows)]
         {
-            Ok(Self { ctrl_c: None })
+            Ok(Self {
+                ctrl_c: None,
+                ctrl_break: None,
+            })
         }
     }
 
@@ -70,13 +77,19 @@ impl Interrupt {
     /// Returns a failure when the handler cannot be installed.
     pub fn arm(&mut self) -> Result<()> {
         #[cfg(windows)]
-        if self.ctrl_c.is_none() {
-            self.ctrl_c = Some(tokio::signal::windows::ctrl_c().map_err(|error| {
+        {
+            let failed = |error: std::io::Error| {
                 CliError::Other(shown!(
                     "the interrupt could not be handled: {}",
                     Shown::io(&error)
                 ))
-            })?);
+            };
+            if self.ctrl_c.is_none() {
+                self.ctrl_c = Some(tokio::signal::windows::ctrl_c().map_err(failed)?);
+            }
+            if self.ctrl_break.is_none() {
+                self.ctrl_break = Some(tokio::signal::windows::ctrl_break().map_err(failed)?);
+            }
         }
         Ok(())
     }
@@ -94,11 +107,14 @@ impl Interrupt {
         }
         #[cfg(windows)]
         {
-            match self.ctrl_c.as_mut() {
-                Some(ctrl_c) => {
-                    ctrl_c.recv().await;
+            match (self.ctrl_c.as_mut(), self.ctrl_break.as_mut()) {
+                (Some(ctrl_c), Some(ctrl_break)) => {
+                    tokio::select! {
+                        _ = ctrl_c.recv() => {}
+                        _ = ctrl_break.recv() => {}
+                    }
                 }
-                None => std::future::pending::<()>().await,
+                _ => std::future::pending::<()>().await,
             }
         }
     }
