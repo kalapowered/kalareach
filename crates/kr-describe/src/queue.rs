@@ -599,12 +599,6 @@ impl Scheduler {
         self.queued.contains_key(session_id) || self.summaries.contains_key(session_id)
     }
 
-    /// Returns whether a session has a summary waiting.
-    #[must_use]
-    pub fn has_summary(&self, session_id: &SessionId) -> bool {
-        self.summaries.contains_key(session_id)
-    }
-
     /// Drops a session's queued jobs, of both kinds, and returns whether there was one.
     pub fn cancel(&mut self, session_id: &SessionId) -> bool {
         let description = self.queued.remove(session_id).is_some();

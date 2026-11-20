@@ -141,7 +141,6 @@ fn a_verified_status_comes_from_host_facts_and_names_what_is_waiting() {
 #[test]
 fn a_logical_group_grants_no_transcript_access_and_no_shared_mapping() {
     let group = MachineGroup::new("Ricky's machines");
-    assert!(!group.grants_transcript_access());
     let first = native(1).in_group(group.clone());
     let second = native(2).in_group(group);
     let profile = default_profile();

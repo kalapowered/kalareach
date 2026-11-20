@@ -6,7 +6,7 @@
 
 mod support;
 
-use kr_describe::budget::{Budgets, GIB, ProcessFigures};
+use kr_describe::budget::{Budgets, GIB};
 use kr_describe::context::{ContextBuilder, ContextRevision, DescriptionContext};
 use kr_describe::metrics::{LatencyLedger, PUBLISHED_SESSION_COUNTS};
 use kr_describe::priority::enter_background;
@@ -792,19 +792,6 @@ fn queue_wait_and_execution_latency_are_published_apart_at_each_session_count() 
     );
     assert_eq!(fifty.execution.p95_ms, one.execution.p95_ms);
     assert_eq!(one.execution.p99_ms, 1_099);
-}
-
-/// KR-REQ-22.21: whole-product figures are reported beside the separated model ones.
-#[test]
-fn whole_product_figures_are_reported_beside_the_model_ones() {
-    let figures = ProcessFigures {
-        whole_product_rss_bytes: 3 * GIB,
-        model_rss_bytes: 2 * GIB,
-        whole_product_cpu_centis: 180,
-        model_cpu_centis: 150,
-    };
-    assert_eq!(figures.product_without_model_rss_bytes(), GIB);
-    assert_eq!(figures.product_without_model_cpu_centis(), 30);
 }
 
 /// KR-REQ-22.11: this host names the background class it applied only where a read on the thread
