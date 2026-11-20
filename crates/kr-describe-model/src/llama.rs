@@ -38,7 +38,7 @@
 //! than instant, and a job that is stopped produces nothing.
 
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -258,7 +258,6 @@ impl Model for Llama {
 pub struct LlamaRuntime {
     model: LlamaModel,
     context_tokens: u32,
-    weights_path: PathBuf,
 }
 
 impl LlamaRuntime {
@@ -330,14 +329,7 @@ impl LlamaRuntime {
         Ok(Self {
             model,
             context_tokens: profile.execution().context_tokens,
-            weights_path: weights.to_path_buf(),
         })
-    }
-
-    /// Returns the file this model was loaded from.
-    #[must_use]
-    pub fn weights_path(&self) -> &Path {
-        &self.weights_path
     }
 
     /// Returns the tokens a job decodes for `prompt`, which is what it spends of its context window
