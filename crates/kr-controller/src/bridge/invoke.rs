@@ -33,7 +33,7 @@ use kr_protocol::actor::{ActorEnvelope, ActorIngress};
 use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Request, Response};
 use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
-use kr_protocol::hello::{ActionWindow, PACKAGE_VERSION, ProtocolVersion};
+use kr_protocol::hello::{ActionWindow, PACKAGE_VERSION};
 use kr_protocol::identity::EnvironmentEnrolment;
 use kr_protocol::identity::{BridgeFrame, BridgeHello, BridgeHelloAck, BridgeTarget};
 use kr_protocol::ids::{BuildId, EnvironmentId, RequestId};
@@ -1540,12 +1540,6 @@ fn opening(
     })
 }
 
-/// The protocol version this host opens bridges with.
-#[must_use]
-pub const fn invoker_version() -> ProtocolVersion {
-    kr_protocol::hello::PROTOCOL_VERSION
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1969,7 +1963,7 @@ mod tests {
             Refusal::NotAnAcknowledgement,
             Refusal::ProtocolMajor {
                 destination: 9,
-                invoker: invoker_version().major,
+                invoker: kr_protocol::hello::PROTOCOL_VERSION.major,
             },
             Refusal::WrongRole {
                 expected: LocalRole::Controller,
