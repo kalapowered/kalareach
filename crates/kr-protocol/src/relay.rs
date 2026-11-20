@@ -333,15 +333,6 @@ impl RelayLease {
         self.bytes_remaining(bytes_consumed)
     }
 
-    /// Returns true when the lease permits a payload from `source` to `destination`.
-    ///
-    /// This is the pair rule alone. A forwarding boundary also checks the route, which
-    /// [`Self::admits_payload`] does.
-    #[must_use]
-    pub fn admits_pair(&self, source: EndpointKey, destination: EndpointKey) -> bool {
-        self.orientation(source, destination).is_some()
-    }
-
     /// Returns true when the lease permits this payload on this route.
     ///
     /// `ingress` is the relay the payload entered the tier at and `egress` is the relay it leaves
@@ -690,12 +681,6 @@ impl RelayConsumptionReceipt {
         )))
     }
 
-    /// Returns true when this receipt could be the first one of its reservation.
-    #[must_use]
-    pub fn is_first(&self) -> bool {
-        self.sequence.get() == FIRST_RECEIPT_SEQUENCE
-    }
-
     /// Returns true when this receipt is the one that follows `previous`.
     ///
     /// The next receipt of a reservation comes from the same instance, sits one position later,
@@ -779,19 +764,6 @@ impl RelayConsumptionReport {
             previous = Some(receipt);
         }
         true
-    }
-
-    /// Returns true when the receipts form one unbroken run.
-    ///
-    /// A report may be a batch, but a batch with a hole inside it is a batch the service cannot
-    /// record: it would have to accept a later position while the one before it is still missing.
-    #[must_use]
-    pub fn is_contiguous(&self) -> bool {
-        self.is_well_formed()
-            && self
-                .receipts
-                .windows(2)
-                .all(|pair| pair[1].receipt.follows(&pair[0].receipt))
     }
 }
 
@@ -952,24 +924,6 @@ impl RelayInstanceRegistration {
         }
     }
 
-    /// The only key this registration accepts at `now_ms`, or null when it accepts two.
-    ///
-    /// A registration that accepts one key has handed that key sole authority over the instance.
-    /// Which is why [`Self::replaces`] refuses a replacement that would do that to a key other than
-    /// the one submitting it.
-    #[must_use]
-    pub fn sole_accepted_key(&self, now_ms: u64) -> Nullable<RelayInstanceKey> {
-        let mut accepted = [self.instance_key, self.instance_key]
-            .into_iter()
-            .take(1)
-            .chain(self.successor.0.map(|successor| successor.instance_key))
-            .filter(|key| self.accepts_key(*key, now_ms));
-        match (accepted.next(), accepted.next()) {
-            (Some(only), None) => Nullable::some(only),
-            _ => Nullable::null(),
-        }
-    }
-
     /// Returns true when this registration is in force at `now_ms`.
     ///
     /// A registration takes effect when it is recorded, so one that starts in the future would
@@ -1074,23 +1028,10 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_admits_only_the_pair_it_names() {
-        let lease = lease();
-        let stranger = EndpointKey::from_bytes([0x23; 32]);
-
-        assert!(lease.admits_pair(source(), destination()));
-        assert!(lease.admits_pair(destination(), source()));
-        assert!(!lease.admits_pair(source(), stranger));
-        assert!(!lease.admits_pair(stranger, destination()));
-    }
-
-    #[test]
     fn a_one_way_lease_does_not_carry_the_reverse_direction() {
         let mut lease = lease();
         lease.direction = RelayDirection::SourceToDestination;
 
-        assert!(lease.admits_pair(source(), destination()));
-        assert!(!lease.admits_pair(destination(), source()));
         assert!(!lease.admits_payload(
             destination(),
             source(),
@@ -1473,7 +1414,6 @@ mod tests {
         let shrunk = receipt(2, 512);
         let skipped = receipt(3, 4096);
 
-        assert!(first.is_first());
         assert!(second.follows(&first));
         assert!(flat.follows(&first));
         assert!(!shrunk.follows(&first));
@@ -1487,7 +1427,6 @@ mod tests {
         let wrapped = receipt(0, 8192);
 
         assert!(!wrapped.follows(&last));
-        assert!(!last.is_first());
     }
 
     #[test]
@@ -1510,7 +1449,6 @@ mod tests {
             receipts: vec![signed(receipt(1, 1024)), signed(receipt(2, 2048))],
         };
         assert!(report.is_well_formed());
-        assert!(report.is_contiguous());
 
         report.receipts.reverse();
         assert!(!report.is_well_formed());
@@ -1523,20 +1461,6 @@ mod tests {
 
         report.receipts = Vec::new();
         assert!(!report.is_well_formed());
-    }
-
-    #[test]
-    fn a_batch_with_a_hole_inside_it_is_not_contiguous() {
-        let signature = Signature64::from_bytes([0x51; 64]);
-        let signed = |receipt| SignedRelayConsumptionReceipt { receipt, signature };
-        let report = RelayConsumptionReport {
-            relay_instance_id: instance(FRANKFURT),
-            reservation_id: RelayReservationId::new(Uuid::from_bytes([0x11; 16])),
-            receipts: vec![signed(receipt(1, 1024)), signed(receipt(3, 4096))],
-        };
-
-        assert!(report.is_well_formed());
-        assert!(!report.is_contiguous());
     }
 
     #[test]
@@ -1717,10 +1641,6 @@ mod tests {
 
         // It is well formed, and it would hand sole authority to a key that has proved nothing.
         assert!(sneaked.is_well_formed());
-        assert_eq!(
-            sneaked.sole_accepted_key(5_000),
-            Nullable::some(RelayInstanceKey::from_bytes([0x63; 32]))
-        );
         assert!(!sneaked.replaces(&previous, 5_000));
 
         // Announced for the future, the key that submits it keeps answering in the meantime.
@@ -1731,11 +1651,6 @@ mod tests {
             predecessor_retires_at_ms: TimestampMs::new(7_000),
         });
         assert!(proper.replaces(&previous, 5_000));
-        assert_eq!(proper.sole_accepted_key(5_000), Nullable::some(old_key()));
-    }
-
-    fn old_key() -> RelayInstanceKey {
-        RelayInstanceKey::from_bytes([0x61; 32])
     }
 
     #[test]

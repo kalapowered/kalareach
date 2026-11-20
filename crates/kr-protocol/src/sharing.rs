@@ -146,12 +146,6 @@ impl SessionRole {
             ],
         }
     }
-
-    /// Returns true when this role carries `question.respond` without an explicit option.
-    #[must_use]
-    pub const fn responds_to_questions_by_default(self) -> bool {
-        matches!(self, Self::Controller | Self::Owner)
-    }
 }
 
 impl fmt::Display for SessionRole {
@@ -1352,19 +1346,7 @@ pub struct OfflineValidityPolicy {
     pub last_synchronised_at_ms: Nullable<TimestampMs>,
 }
 
-impl OfflineValidityPolicy {
-    /// Returns true when personal remote access is still inside the bound at `now_ms`.
-    ///
-    /// A policy that has never synchronised is outside its bound from the moment it is chosen:
-    /// there is no successful synchronisation to measure from, and treating that as unlimited
-    /// would make the policy mean nothing.
-    #[must_use]
-    pub fn is_inside_bound(&self, now_ms: u64) -> bool {
-        self.last_synchronised_at_ms
-            .as_ref()
-            .is_some_and(|last| now_ms <= last.get().saturating_add(self.maximum_offline_ms.get()))
-    }
-}
+impl OfflineValidityPolicy {}
 
 /// What this host shows about the remote authority feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1387,24 +1369,6 @@ pub struct AuthorityFeedStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_controller_and_owner_answer_questions_by_default() {
-        for role in SessionRole::ALL {
-            let carries = role
-                .default_actions()
-                .contains(&ActionRight::QuestionRespond);
-            assert_eq!(
-                carries,
-                role.responds_to_questions_by_default(),
-                "{role} disagrees with its own default action list"
-            );
-        }
-        assert!(!SessionRole::Viewer.responds_to_questions_by_default());
-        assert!(!SessionRole::Reviewer.responds_to_questions_by_default());
-        assert!(SessionRole::Controller.responds_to_questions_by_default());
-        assert!(SessionRole::Owner.responds_to_questions_by_default());
-    }
 
     #[test]
     fn each_role_carries_everything_the_role_below_it_carries() {
@@ -1454,22 +1418,6 @@ mod tests {
                 .sentence()
                 .contains("runs as your account")
         );
-    }
-
-    #[test]
-    fn an_offline_policy_that_never_synchronised_is_outside_its_bound() {
-        let policy = OfflineValidityPolicy {
-            maximum_offline_ms: DurationMs::new(1_000),
-            last_synchronised_at_ms: Nullable::null(),
-        };
-        assert!(!policy.is_inside_bound(0));
-
-        let synchronised = OfflineValidityPolicy {
-            maximum_offline_ms: DurationMs::new(1_000),
-            last_synchronised_at_ms: Nullable::some(TimestampMs::new(10_000)),
-        };
-        assert!(synchronised.is_inside_bound(11_000));
-        assert!(!synchronised.is_inside_bound(11_001));
     }
 
     #[test]

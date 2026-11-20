@@ -364,12 +364,6 @@ pub struct PushRegistrationChallenge {
 }
 
 impl PushRegistrationChallenge {
-    /// Returns true when the challenge can still be answered at `now_ms`.
-    #[must_use]
-    pub const fn is_answerable_at(&self, now_ms: u64) -> bool {
-        now_ms < self.expires_at_ms.get()
-    }
-
     /// Returns true when the challenge lasts no longer than section 16 permits.
     #[must_use]
     pub const fn lifetime_within_maximum(&self, issued_at_ms: u64) -> bool {
@@ -460,12 +454,6 @@ impl PushRegistrationAnswer {
     pub fn answers(&self, challenge: &PushRegistrationChallenge) -> bool {
         self.payload == challenge.expected_answer()
     }
-
-    /// Returns true when the key that answered is the installation the payload names.
-    #[must_use]
-    pub fn key_names_its_installation(&self) -> bool {
-        crate::service::installation_id(&self.installation_key) == self.payload.installation_id
-    }
 }
 
 /// Whether a bound token is still usable.
@@ -514,23 +502,7 @@ pub struct PushInstallationBinding {
     pub token_digest: Digest256,
 }
 
-impl PushInstallationBinding {
-    /// Returns true when a request signed by `key` is an ordinary update of this binding.
-    ///
-    /// An update re-registers the same key: a token refresh, or the same token re-registered after
-    /// a reinstall. Anything else is a replacement, and a replacement takes over only after passing
-    /// a fresh challenge.
-    #[must_use]
-    pub fn is_ordinary_update(&self, key: &AuthorisationKey) -> bool {
-        self.installation_key == *key
-    }
-
-    /// Returns true when the gateway may send to this binding at all.
-    #[must_use]
-    pub const fn is_deliverable(&self) -> bool {
-        matches!(self.state, PushTokenState::Active)
-    }
-}
+impl PushInstallationBinding {}
 
 // ----- Sender authorisation -----------------------------------------------------------------
 
@@ -618,31 +590,6 @@ pub struct PushSenderRecord {
 }
 
 impl PushSenderRecord {
-    /// When the host may start renewing: seven days before the credential expires.
-    #[must_use]
-    pub const fn renewal_opens_at_ms(&self) -> u64 {
-        self.credential_expires_at_ms
-            .get()
-            .saturating_sub(SENDER_RENEWAL_WINDOW_MS)
-    }
-
-    /// Returns true when the current credential is usable at `now_ms`.
-    #[must_use]
-    pub const fn credential_valid_at(&self, now_ms: u64) -> bool {
-        matches!(self.state, PushSenderState::Active)
-            && now_ms < self.credential_expires_at_ms.get()
-    }
-
-    /// Returns true when the host may renew at `now_ms`.
-    ///
-    /// Renewal opens seven days before expiry and does not close at expiry. A host that was offline
-    /// for a month renews on reconnect: its credential lapsed, the authorisation behind it did not,
-    /// and section 16 says that is enough. A revoked record renews never.
-    #[must_use]
-    pub const fn may_renew_at(&self, now_ms: u64) -> bool {
-        matches!(self.state, PushSenderState::Active) && now_ms >= self.renewal_opens_at_ms()
-    }
-
     /// Returns true when `proposed` leaves the destination, host key and rate policy untouched.
     ///
     /// # Errors
@@ -1156,15 +1103,6 @@ impl PushUrgency {
         }
     }
 
-    /// The FCM Android message priority this asks for.
-    #[must_use]
-    pub const fn fcm_priority(self) -> &'static str {
-        match self {
-            Self::Attention => "high",
-            Self::Deferred => "normal",
-        }
-    }
-
     /// The `apns-priority` header value this asks for.
     #[must_use]
     pub const fn apns_priority(self) -> &'static str {
@@ -1255,12 +1193,6 @@ impl PushDeliveryRequest {
     /// Returns a CBOR error when the request cannot be represented in KR-CBOR-1.
     pub fn digest(&self) -> Result<Digest256, CborError> {
         Ok(Digest256::from_bytes(sha256(&self.signing_input()?)))
-    }
-
-    /// Returns true when the notification is still worth delivering at `now_ms`.
-    #[must_use]
-    pub const fn is_live_at(&self, now_ms: u64) -> bool {
-        now_ms < self.expires_at_ms.get()
     }
 
     /// Returns true when the sealed preview is shaped the way a notification preview is shaped.
@@ -1466,30 +1398,6 @@ mod tests {
     }
 
     #[test]
-    fn renewal_opens_seven_days_before_expiry_and_does_not_close() {
-        let expires = 40 * 24 * 60 * 60 * 1000;
-        let record = record(expires);
-        assert_eq!(
-            record.renewal_opens_at_ms(),
-            expires - SENDER_RENEWAL_WINDOW_MS
-        );
-        assert!(!record.may_renew_at(record.renewal_opens_at_ms() - 1));
-        assert!(record.may_renew_at(record.renewal_opens_at_ms()));
-        // The credential has lapsed and the authorisation has not: section 16 still allows this.
-        assert!(!record.credential_valid_at(expires + 1));
-        assert!(record.may_renew_at(expires + 1));
-    }
-
-    #[test]
-    fn a_revoked_record_never_renews() {
-        let mut record = record(40 * 24 * 60 * 60 * 1000);
-        record.state = PushSenderState::Revoked;
-        assert!(!record.may_renew_at(record.renewal_opens_at_ms()));
-        assert!(!record.may_renew_at(u64::MAX));
-        assert!(!record.credential_valid_at(2_000));
-    }
-
-    #[test]
     fn a_renewal_that_changes_what_was_authorised_is_not_a_renewal() {
         let record = record(40 * 24 * 60 * 60 * 1000);
         assert!(
@@ -1559,28 +1467,6 @@ mod tests {
     }
 
     #[test]
-    fn an_answering_key_names_its_own_installation() {
-        let key = AuthorisationKey::from_bytes([11; 32]);
-        let mut answer = PushRegistrationAnswer {
-            payload: PushRegistrationAnswerPayload {
-                challenge: Nonce256::from_bytes([5; 32]),
-                expires_at_ms: TimestampMs::new(300_000),
-                gateway_origin: origin(),
-                installation_id: crate::service::installation_id(&key),
-                platform: PushPlatform::Android,
-                registration_id: PushRegistrationId::new(Uuid::from_bytes([6; 16])),
-                token_digest: token_digest(&token("a-token")),
-            },
-            installation_key: key,
-            signature: Signature64::from_bytes([0; 64]),
-        };
-        assert!(answer.key_names_its_installation());
-
-        answer.payload.installation_id = InstallationId::new(Uuid::from_bytes([0; 16]));
-        assert!(!answer.key_names_its_installation());
-    }
-
-    #[test]
     fn a_challenge_lasts_at_most_five_minutes() {
         let challenge = PushRegistrationChallenge {
             challenge: Nonce256::from_bytes([5; 32]),
@@ -1593,8 +1479,6 @@ mod tests {
         };
         assert!(challenge.lifetime_within_maximum(1_000));
         assert!(!challenge.lifetime_within_maximum(999));
-        assert!(challenge.is_answerable_at(challenge.expires_at_ms.get() - 1));
-        assert!(!challenge.is_answerable_at(challenge.expires_at_ms.get()));
     }
 
     #[test]
@@ -1633,9 +1517,7 @@ mod tests {
 
     #[test]
     fn urgency_maps_to_both_providers() {
-        assert_eq!(PushUrgency::Attention.fcm_priority(), "high");
         assert_eq!(PushUrgency::Attention.apns_priority(), "10");
-        assert_eq!(PushUrgency::Deferred.fcm_priority(), "normal");
         assert_eq!(PushUrgency::Deferred.apns_priority(), "5");
     }
 
@@ -1692,8 +1574,6 @@ mod tests {
             bucket + SEAL_OVERHEAD_BYTES,
         )));
         assert!(request.preview_is_well_formed());
-        assert!(request.is_live_at(1_999));
-        assert!(!request.is_live_at(2_000));
 
         // Previews disabled on the device: still a notification, still a generic alert.
         assert!(delivery(Nullable::null()).preview_is_well_formed());
@@ -1790,25 +1670,5 @@ mod tests {
                 "two bodies share a digest"
             );
         }
-    }
-
-    #[test]
-    fn a_disabled_token_is_not_delivered_to() {
-        let mut binding = PushInstallationBinding {
-            bound_at_ms: TimestampMs::new(1_000),
-            gateway_origin: origin(),
-            installation_id: InstallationId::new(Uuid::from_bytes([3; 16])),
-            installation_key: AuthorisationKey::from_bytes([2; 32]),
-            platform: PushPlatform::Android,
-            registration_id: PushRegistrationId::new(Uuid::from_bytes([6; 16])),
-            state: PushTokenState::Active,
-            token_digest: token_digest(&token("a-token")),
-        };
-        assert!(binding.is_deliverable());
-        assert!(binding.is_ordinary_update(&AuthorisationKey::from_bytes([2; 32])));
-        assert!(!binding.is_ordinary_update(&AuthorisationKey::from_bytes([9; 32])));
-
-        binding.state = PushTokenState::Disabled;
-        assert!(!binding.is_deliverable());
     }
 }

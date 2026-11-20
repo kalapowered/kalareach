@@ -531,7 +531,6 @@ fn an_envelope_carries_the_signing_input_of_what_is_inside_it() {
 
     let report = consumption_report();
     assert!(report.is_well_formed());
-    assert!(report.is_contiguous());
     for (position, signed) in report.receipts.iter().enumerate() {
         assert_eq!(
             signed.receipt.signing_input().expect("a signing input"),
