@@ -799,7 +799,7 @@ mod platform {
     #[cfg(target_os = "linux")]
     fn posix_list(file: &std::fs::File) -> std::io::Result<Option<Vec<u8>>> {
         const NAME: &str = "system.posix_acl_access";
-        let size = match rustix::fs::fgetxattr(file, NAME, &mut []) {
+        let size = match rustix::fs::fgetxattr_query(file, NAME) {
             Ok(size) => size,
             Err(Errno::NODATA | Errno::NOTSUP) => return Ok(None),
             Err(error) => return Err(error.into()),
