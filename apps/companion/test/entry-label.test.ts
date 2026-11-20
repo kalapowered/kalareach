@@ -48,6 +48,7 @@ const ENTRY_LABELS = {
   'thread.started': 'Conversation started',
   'thread.continued': 'Conversation continued',
   'thread.ended': 'Conversation ended',
+  'turn.ended': 'Turn ended',
   'tool.finished': 'Tool finished',
   'tool.failed': 'Tool failed',
   notification: 'Notice'
@@ -93,7 +94,7 @@ describe('the labels of the history entries (KR-REQ-13.19)', () => {
 
   it('has a label in words for every kind the worker records', () => {
     const kinds = recordedKinds()
-    // Six observed events and the message an agent writes.
+    // Seven observed events and the message an agent writes.
     expect(kinds).toEqual(
       expect.arrayContaining([
         'thread.started',

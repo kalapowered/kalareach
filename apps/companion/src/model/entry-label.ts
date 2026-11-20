@@ -14,6 +14,7 @@ const ENTRY_LABELS: ReadonlyMap<string, string> = new Map([
   ['thread.started', 'Conversation started'],
   ['thread.continued', 'Conversation continued'],
   ['thread.ended', 'Conversation ended'],
+  ['turn.ended', 'Turn ended'],
   ['tool.finished', 'Tool finished'],
   ['tool.failed', 'Tool failed'],
   ['notification', 'Notice']
