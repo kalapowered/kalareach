@@ -517,7 +517,7 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
         .into_iter()
         .map(|krate| (krate.to_owned(), tree.krate(krate)))
         .collect();
-    let items = client_items(entry)
+    let items: BTreeMap<(String, String), Lookup> = client_items(entry)
         .iter()
         .map(|item| {
             (
@@ -526,7 +526,9 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
             )
         })
         .collect();
+    let scan_started = std::time::Instant::now();
     let sightings = tree.sightings(&|krate| is_client(krate));
+    let scan_took = scan_started.elapsed();
     let mut records: BTreeMap<(String, String), Source> = BTreeMap::new();
     let mut wanted: BTreeSet<(String, String)> = client_items(entry)
         .iter()
@@ -551,6 +553,26 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
             records.insert(key, source);
         }
     }
+    let failed_items: Vec<String> = items
+        .iter()
+        .filter_map(|((krate, name), lookup)| match lookup {
+            Lookup::Failed(error) => Some(format!("{krate}::{name}: {error}")),
+            _ => None,
+        })
+        .collect();
+    println!(
+        "snapshot {}: sightings {} in {:?}; {} items failed{}",
+        at.tag,
+        sightings.as_ref().map_or_else(
+            |error| format!("failed ({error})"),
+            |list| list.len().to_string()
+        ),
+        scan_took,
+        failed_items.len(),
+        failed_items
+            .first()
+            .map_or_else(String::new, |first| format!(" ({first})")),
+    );
     Ok(Snapshot {
         at,
         names_a_method,

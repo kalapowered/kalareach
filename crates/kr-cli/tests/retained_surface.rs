@@ -425,6 +425,7 @@ fn the_entries_of_the_narrower_table_hold() {
 #[ignore = "reads every release tag below the level of each entry"]
 fn the_senders_of_each_entry_at_each_release() {
     for entry in narrower_table::NARROWER {
+        print_this_checkouts_sightings();
         let started = std::time::Instant::now();
         let (expected, snapshots) = history::read_history(&repository(), entry)
             .unwrap_or_else(|error| panic!("{}: {error}", entry.root));
@@ -437,6 +438,31 @@ fn the_senders_of_each_entry_at_each_release() {
         let report = history::audit_tags(entry, &expected, &snapshots);
         history::print_report(&report);
         assert!(report.problems.is_empty(), "{}", report.problems.join("\n"));
+    }
+}
+
+/// What the scan finds in this checkout, by class of crate, and how long it takes.
+fn print_this_checkouts_sightings() {
+    let tree = Tree::at(&repository()).expect("this checkout");
+    let started = std::time::Instant::now();
+    let sightings = tree.sightings(&|_| true).expect("the scan");
+    println!(
+        "this checkout: {} sightings in {:?}",
+        sightings.len(),
+        started.elapsed()
+    );
+    for sighting in &sightings {
+        let class = if RECEIVER_CRATES.contains(&sighting.krate.as_str()) {
+            "receiver"
+        } else if DAEMON_CRATES.contains(&sighting.krate.as_str()) {
+            "daemon"
+        } else {
+            "client"
+        };
+        println!(
+            "  {class} {}::{} {:?}",
+            sighting.krate, sighting.name, sighting.kinds
+        );
     }
 }
 
