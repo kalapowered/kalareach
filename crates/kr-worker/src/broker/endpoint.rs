@@ -81,11 +81,40 @@ pub enum Stream {
     Pipe(kr_ipc::endpoint::Connection),
 }
 
+/// The device and inode of a socket file.
+#[cfg(unix)]
+pub(crate) type SocketIdentity = (u64, u64);
+
+/// The identity of the socket that stands at `path` now, or none where nothing does or something
+/// else does.
+#[cfg(unix)]
+pub(crate) fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    metadata
+        .file_type()
+        .is_socket()
+        .then(|| (metadata.dev(), metadata.ino()))
+}
+
+/// Removes what stands at `path` only when it is the socket whose identity `made` is: a path that
+/// names another socket, a file or nothing is left as it is, because it is not what a bind made.
+#[cfg(unix)]
+pub(crate) fn remove_socket_made(path: &std::path::Path, made: SocketIdentity) {
+    if socket_identity(path) == Some(made) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// The endpoint a launched agent's bridge connects to.
 #[derive(Debug)]
 pub struct BoundEndpoint {
     address: ListenerAddress,
     listener: Bound,
+    /// The identity of the socket file this endpoint made, read as soon as its bind succeeded: what
+    /// its end removes, and nothing else.
+    #[cfg(unix)]
+    made: SocketIdentity,
 }
 
 #[derive(Debug)]
@@ -153,22 +182,37 @@ impl BoundEndpoint {
                 crate::broker::process::check_private_directory(parent)?;
                 let listener = tokio::net::UnixListener::bind(path)
                     .map_err(|error| bind_refusal(path, &error))?;
+                // What the bind made is read before anything else is done to it, so a step that
+                // fails after it removes that socket and nothing else.
+                let Some(made) = socket_identity(path) else {
+                    return Err(BrokerError::Listen {
+                        endpoint: path.to_string_lossy().into_owned(),
+                        refusal: kr_ipc::listen::ListenRefusal::Other {
+                            operation: kr_ipc::listen::ListenStep::Inspect,
+                            os: None,
+                        },
+                    });
+                };
                 // And the socket itself is owner-only, so the filesystem answers "who may
                 // connect" before any byte is read.
                 {
                     use std::os::unix::fs::PermissionsExt as _;
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                        .map_err(|error| BrokerError::Listen {
-                            endpoint: path.to_string_lossy().into_owned(),
-                            refusal: kr_ipc::listen::ListenRefusal::Other {
-                                operation: kr_ipc::listen::ListenStep::Permissions,
-                                os: error.raw_os_error(),
-                            },
+                        .map_err(|error| {
+                            remove_socket_made(path, made);
+                            BrokerError::Listen {
+                                endpoint: path.to_string_lossy().into_owned(),
+                                refusal: kr_ipc::listen::ListenRefusal::Other {
+                                    operation: kr_ipc::listen::ListenStep::Permissions,
+                                    os: error.raw_os_error(),
+                                },
+                            }
                         })?;
                 }
                 Ok(Self {
                     address,
                     listener: Bound::Socket(listener),
+                    made,
                 })
             }
             #[cfg(not(unix))]
@@ -287,14 +331,31 @@ impl BoundEndpoint {
     }
 }
 
+impl BoundEndpoint {
+    /// The identity of the socket file this endpoint made.
+    #[cfg(unix)]
+    pub(crate) const fn made(&self) -> SocketIdentity {
+        self.made
+    }
+
+    /// Removes the socket file this endpoint made, if it still stands at its address and is that
+    /// socket.
+    #[cfg(unix)]
+    pub(crate) fn remove_its_socket(&self) {
+        if let ListenerAddress::PrivateSocket(path) = &self.address {
+            remove_socket_made(path, self.made);
+        }
+    }
+}
+
 impl Drop for BoundEndpoint {
     fn drop(&mut self) {
         // A socket file outlives the process that bound it, and a stale one would make the next
         // launch refuse to bind. Removing it is the endpoint's own business, because it is the
-        // only thing that knows it created it.
-        if let ListenerAddress::PrivateSocket(path) = &self.address {
-            let _ = std::fs::remove_file(path);
-        }
+        // only thing that knows it created it, and it removes that socket and nothing else: a
+        // path that names another socket by now is another program's.
+        #[cfg(unix)]
+        self.remove_its_socket();
     }
 }
 
@@ -312,6 +373,54 @@ mod tests {
             .take(8)
             .collect();
         std::env::temp_dir().join(format!("kr-e-{name}"))
+    }
+
+    /// KR-REQ-12.07: an endpoint removes the socket file it made and no other: a path that names
+    /// another socket, or a file, by the time the endpoint ends is not its own and stays, and the
+    /// socket it made is removed where nothing has replaced it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_path_replaced_after_a_successful_bind_is_not_removed_when_the_endpoint_ends() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = short_directory();
+        std::fs::create_dir_all(&directory).expect("the directory is created");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is made private");
+        let path_of = |endpoint: &BoundEndpoint| {
+            let ListenerAddress::PrivateSocket(path) = endpoint.address().clone() else {
+                panic!("this platform prefers a private socket");
+            };
+            path
+        };
+
+        let untouched = BoundEndpoint::bind(&directory).expect("the endpoint binds");
+        let path = path_of(&untouched);
+        assert_eq!(socket_identity(&path), Some(untouched.made()));
+        drop(untouched);
+        assert!(!path.exists(), "the socket the endpoint made is removed");
+
+        let replaced = BoundEndpoint::bind(&directory).expect("the endpoint binds");
+        let path = path_of(&replaced);
+        std::fs::remove_file(&path).expect("another program takes the path");
+        let other = std::os::unix::net::UnixListener::bind(&path).expect("another socket");
+        drop(replaced);
+        assert!(
+            std::os::unix::net::UnixStream::connect(&path).is_ok(),
+            "the other program's socket was not removed"
+        );
+        drop(other);
+        std::fs::remove_file(&path).expect("the other program's socket is cleared");
+
+        let overwritten = BoundEndpoint::bind(&directory).expect("the endpoint binds");
+        let path = path_of(&overwritten);
+        std::fs::remove_file(&path).expect("something takes the path");
+        std::fs::write(&path, b"a file").expect("a file stands there");
+        drop(overwritten);
+        assert_eq!(
+            std::fs::read(&path).expect("the file was not removed"),
+            b"a file"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     // Unix only: a socket file's mode and a kernel-named peer exist only on a private socket.

@@ -344,6 +344,7 @@ pub(super) async fn start(
             }
         }
         let endpoint = BoundEndpoint::bind_named(&backend.directory, GATEWAY_SOCKET)?;
+        *run.made.lock().unwrap_or_else(PoisonError::into_inner) = Some(endpoint.made());
         *run.listener.lock().unwrap_or_else(PoisonError::into_inner) = Some(endpoint);
         Ok(())
     };
