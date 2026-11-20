@@ -5069,11 +5069,11 @@ mod session_work {
         host.stop().await;
     }
 
-    /// KR-REQ-14.35: a worker started again over the journal gives the daemon the end of the turn
-    /// at the version it had, so the review a person acknowledged stays acknowledged: replaying the
-    /// journal's record of a turn the hook reported is not a later end.
+    /// KR-REQ-14.35: a worker started again over the journal is reached by the daemon again, which
+    /// asks for the records past the cursor it had read, so the review a person acknowledged stays
+    /// acknowledged and the next record the journal gets is read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_journal_of_a_turn_a_hook_reported_replays_as_the_version_it_was() {
+    async fn a_worker_started_again_over_the_journal_is_read_on_from_the_cursor_it_had() {
         let first = lasting_worker().await;
         let (host, mut control, reach) = daemon_over(&first).await;
         let route = HookRoute::over(&first);
@@ -5129,6 +5129,117 @@ mod session_work {
             !replayed.outstanding,
             "the replay of the same record is no later end: {replayed:?}"
         );
+        host.stop().await;
+    }
+
+    /// KR-REQ-14.35: the page of the worker's journal that holds the end of a turn a hook reported,
+    /// delivered to the store again after the review was acknowledged and with the sequence it
+    /// had, is a record the store has read: the review keeps its version and its acknowledgement,
+    /// no review is outstanding, and the one item is as it was. The same record under the next
+    /// sequence is a later end, so the delivery does reach the review.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_page_of_a_turn_a_hook_reported_delivered_again_changes_nothing() {
+        let first = lasting_worker().await;
+        let (host, mut control, _reach) = daemon_over(&first).await;
+        let route = HookRoute::over(&first);
+        route.hook(10, SESSION_STARTED);
+        route.hook(20, TURN_ENDED);
+        let subject = the_hook_turn(&first);
+        let before = review_when(&mut control, &subject, |_| true).await;
+
+        // The page the worker's journal gives for the turn, read the way the worker reads it.
+        let journal = kr_worker::journal::Journal::open_read_only(first.journal_path.clone())
+            .expect("the journal opens for reading");
+        let page = kr_worker::attention_source::page(
+            &journal,
+            &kr_protocol::attention::AttentionSourcesRequest {
+                request_id: RequestId::new(1),
+                questions_after: U64::new(0),
+                approvals_after: U64::new(0),
+                host_events_after: U64::new(0),
+                max_records: U64::new(50),
+                wait_ms: U64::new(0),
+                fingerprint_key: kr_protocol::scalars::SecretBytes32::from_bytes([5; 32]),
+                recorded_generation: Nullable::null(),
+            },
+            0,
+            1 << 20,
+        )
+        .expect("the journal gives a page");
+        let events = kr_controller::attention::events_of(first.session_id, &page);
+        let version_of = |events: &[kr_attention::event::SourceEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    kr_attention::event::EventKind::TurnCompleted { version, .. } => Some(*version),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            version_of(&events),
+            vec![before.current_version.get()],
+            "the page holds the one end the store reviewed, under its sequence"
+        );
+
+        let _: ReviewAcknowledgeResult = owner_mutation(
+            &mut control,
+            &host,
+            Method::ReviewAcknowledge,
+            &ReviewAcknowledgeParams {
+                session_id: first.session_id,
+                subject: subject.clone(),
+                version: before.current_version,
+            },
+        )
+        .await;
+        review_when(&mut control, &subject, |state| !state.outstanding).await;
+        let item_of = |items: Vec<AttentionItem>| {
+            let mut items = of_rule(&items, AttentionRule::ReviewReady);
+            assert_eq!(items.len(), 1, "one item for the subject: {items:?}");
+            items.remove(0)
+        };
+        let item = item_of(owner_inbox(&mut control).await);
+        assert!(
+            item.acknowledged,
+            "the item is acknowledged with its review"
+        );
+
+        let attention = host.controller().attention();
+        attention.observe(&events).expect("the page is delivered");
+        let replayed = review_when(&mut control, &subject, |_| true).await;
+        assert_eq!(replayed.current_version, before.current_version);
+        assert_eq!(
+            replayed.acknowledged_version,
+            Nullable::some(before.current_version),
+            "the acknowledgement is kept"
+        );
+        assert!(
+            !replayed.outstanding,
+            "the page again is no later end: {replayed:?}"
+        );
+        let again = item_of(owner_inbox(&mut control).await);
+        assert!(again.acknowledged, "the item stays acknowledged");
+        assert_eq!(again.occurrences, item.occurrences);
+        assert_eq!(again.last_seen_ms, item.last_seen_ms);
+
+        // The same record under the next sequence is a later end of the turn, so the delivery
+        // reaches the review and the first delivery changed nothing there.
+        let mut later = events;
+        for event in &mut later {
+            event.cursor.sequence += 1;
+            if let kr_attention::event::EventKind::TurnCompleted { version, .. } = &mut event.kind {
+                *version += 1;
+            }
+        }
+        attention
+            .observe(&later)
+            .expect("the next end is delivered");
+        let reopened = review_when(&mut control, &subject, |state| {
+            state.current_version > before.current_version
+        })
+        .await;
+        assert!(reopened.outstanding, "a later end is new review work");
         host.stop().await;
     }
 
