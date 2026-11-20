@@ -1005,6 +1005,11 @@ impl HostCall {
         delegation_id: Option<String>,
         content: Option<String>,
     ) -> Result<(), VoiceHostRefusal> {
+        // A write starts only while the call's end is not recorded, however long the caller waited
+        // for the revision it holds, and the second write of a note is such a start.
+        if self.state().ended.is_some() {
+            return Err(VoiceHostRefusal::Closing);
+        }
         let id = self.next_write_id(Some(action_id));
         let frame = VoiceContextFrame::new(id, command, delegation_id, content)
             .map_err(|_| VoiceHostRefusal::TooLarge)?;
@@ -1427,8 +1432,16 @@ impl HostCall {
                 // The append counts as written from the step that may write it, in the lock that
                 // makes it wait for its answer: the provider's closure can be read and the call
                 // ended before this task has the write's result back, and the final status then
-                // still counts it.
+                // still counts it. A call whose end is recorded has taken the running send and told
+                // it stopped, whatever the look before this step waited for: no append starts
+                // after the end.
                 let mut state = self.state();
+                if !state
+                    .sending
+                    .is_some_and(|send| send.action_id == action_id)
+                {
+                    return;
+                }
                 state.acks.insert(id.clone(), Ack::Waiting);
                 if let Some(send) = state
                     .sending
@@ -1913,6 +1926,8 @@ mod tests {
         selection: VoiceContextSelection,
         verdict: Mutex<Result<(), VoiceContextStop>>,
         rechecks: AtomicU64,
+        /// A gate the look before an append waits at, until the test lets it through.
+        hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl Support {
@@ -1921,6 +1936,7 @@ mod tests {
                 selection: selection_of(messages),
                 verdict: Mutex::new(Ok(())),
                 rechecks: AtomicU64::new(0),
+                hold: Mutex::new(None),
             })
         }
 
@@ -1954,7 +1970,13 @@ mod tests {
         ) -> HostFuture<'a, Result<(), VoiceContextStop>> {
             self.rechecks.fetch_add(1, Ordering::SeqCst);
             let verdict = *self.verdict.lock().expect("the verdict");
-            Box::pin(async move { verdict })
+            let hold = self.hold.lock().expect("the hold").clone();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    hold.notified().await;
+                }
+                verdict
+            })
         }
     }
 
@@ -3846,6 +3868,72 @@ mod tests {
                 dropped: false,
             }
         );
+    }
+
+    /// The look before an append is pending when the call ends, and the end comes before it
+    /// answers: the append is not written after the end, and the send is told stopped by it.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_whose_look_before_an_append_is_pending_when_the_call_ends_writes_nothing_after_the_end()
+     {
+        let (calls, call, sideband) = held();
+        let support = Support::of(3);
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *support.hold.lock().expect("the hold") = Some(Arc::clone(&hold));
+        let _ = call
+            .send_context(action(5), send_params(), support.clone(), OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(
+            support.rechecks.load(Ordering::SeqCst),
+            1,
+            "the sender waits at its look before the first append"
+        );
+        assert!(sideband.written().is_empty());
+        calls.end(voice_session(1), VoiceEndReason::Stop, OPENED + 1_500);
+        hold.notify_one();
+        settle().await;
+        assert!(
+            sideband.written().is_empty(),
+            "nothing is written after the recorded end"
+        );
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 0,
+                of: 4,
+                unconfirmed: 0,
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::Stop
+                }
+            }]
+        );
+    }
+
+    /// A note that goes both ways writes its first frame before the end and its second after it
+    /// has waited: the second is not started.
+    #[tokio::test]
+    async fn the_second_write_of_a_note_that_goes_both_ways_is_not_started_after_the_end() {
+        let (calls, call, sideband) = held();
+        let support = Reads(Ok(String::new()));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *sideband.gate.lock().expect("the gate") = Some(Arc::clone(&gate));
+        let note = call.note(action(1), VoiceNote::SpeechTainted, None, &support, 5_000);
+        let end_between_the_two_writes = async {
+            settle().await;
+            calls.end(voice_session(1), VoiceEndReason::Stop, 5_500);
+            for _ in 0..5 {
+                gate.notify_waiters();
+                settle().await;
+            }
+        };
+        let (answer, ()) = tokio::join!(note, end_between_the_two_writes);
+        assert_eq!(
+            sideband.written().len(),
+            1,
+            "the first write began before the end, the second is not started after it"
+        );
+        assert_eq!(answer, closing());
     }
 
     /// A back note that was claimed before the end is recorded is not written after it.
