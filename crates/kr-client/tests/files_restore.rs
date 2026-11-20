@@ -104,7 +104,7 @@ impl World {
     /// The recipients of an archive that the owner can recover: the recovery recipient.
     fn recipients(&self) -> ArchiveRecipients {
         let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
-        assert!(recipients.add_recovery(&self.seed.recipient().expect("a recipient")));
+        assert!(recipients.add(*self.seed.recipient().expect("a recipient").public()));
         recipients
     }
 

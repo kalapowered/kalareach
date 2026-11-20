@@ -20,23 +20,6 @@ use crate::sodium;
 /// The version of the public archive descriptor this producer writes.
 const DESCRIPTOR_VERSION: u64 = kr_protocol::archive::ARCHIVE_DESCRIPTOR_VERSION;
 
-/// About how many recipients' manifest-key wraps fit one descriptor.
-///
-/// Section 20 gives a descriptor two defaults, 64 KiB and 128 recipients, and the first applicable
-/// one binds. In this encoding that is the byte limit, at roughly a hundred recipients rather than
-/// at a hundred and twenty-eight, because [`SealedKeyWrap`] carries its whole authenticated
-/// context beside the box: the format, the purpose, the archive, the generation, the object, the
-/// encrypted-object hash and both key identifiers, which is 648 bytes at a small generation
-/// number.
-///
-/// **It is a figure, not a guarantee.** A wrap grows with the integer width of the backup
-/// generation, so an archive at generation 65 536 fits fewer recipients than one at generation 3.
-/// [`seal_archive`] enforces the *encoded size*, which is the quantity section 20 bounds, and
-/// refuses whatever does not fit; this constant is what a caller sizing a recipient set should
-/// expect, and `a_descriptor_refuses_the_recipient_that_takes_it_over_the_byte_limit` and
-/// `a_larger_generation_number_fits_fewer_recipients` are what keep it honest.
-pub const RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT: usize = 100;
-
 /// One member object, as the producer is handed it.
 ///
 /// `Debug` names the object and its filename and says how many bytes there are. It does not print

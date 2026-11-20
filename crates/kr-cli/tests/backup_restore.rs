@@ -203,7 +203,7 @@ fn object(byte: u8) -> BackupObjectId {
 /// Seals `members` as one generation of the archive, for the recovery recipient.
 fn seal(world: &World, generation: u64, members: &[(&str, Vec<u8>)]) -> Sealed {
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
-    assert!(recipients.add_recovery(&world.seed.recipient().expect("a recipient")));
+    assert!(recipients.add(*world.seed.recipient().expect("a recipient").public()));
     let staged: Vec<_> = members
         .iter()
         .enumerate()

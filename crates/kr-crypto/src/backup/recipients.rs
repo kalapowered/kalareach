@@ -6,7 +6,6 @@ use kr_protocol::ids::{BackupGeneration, BackupObjectId};
 use kr_protocol::scalars::{KeyId, StoredEnvelopeKey};
 
 use crate::error::{CryptoError, Result};
-use crate::kdf::RecoveryRecipient;
 use crate::secret::SymmetricKey;
 
 /// What kind of collection an archive belongs to.
@@ -118,14 +117,6 @@ impl ArchiveRecipients {
         true
     }
 
-    /// Adds the recipient the owner's recovery seed derives.
-    ///
-    /// A producer registers the public key and nothing else, which is what keeps future archives
-    /// recoverable without copying a device private key.
-    pub fn add_recovery(&mut self, recovery: &RecoveryRecipient) -> bool {
-        self.add(*recovery.public())
-    }
-
     /// Returns true when the set names this recipient.
     #[must_use]
     pub fn contains(&self, key_id: &KeyId) -> bool {
@@ -206,16 +197,6 @@ pub struct Revocation {
 }
 
 impl Revocation {
-    /// Always false, and said rather than left to be assumed.
-    ///
-    /// Section 20: *a removed device may retain earlier keys; do not claim retroactive secrecy.*
-    /// Revocation is prospective. A device that already held a wrap holds it still, and a copy of
-    /// the ciphertext it already had stays readable to it for ever.
-    #[must_use]
-    pub const fn claims_retroactive_secrecy(&self) -> bool {
-        false
-    }
-
     /// The sentence a person is shown, which says what revocation does and what it does not.
     #[must_use]
     pub fn describe(&self) -> String {

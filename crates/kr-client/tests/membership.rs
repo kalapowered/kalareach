@@ -4026,7 +4026,7 @@ fn through_an_archive(
     let recovery = seed.recipient().expect("a recovery recipient");
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
     assert!(recipients.add(*producer.keys.stored_envelope.public()));
-    assert!(recipients.add_recovery(&recovery));
+    assert!(recipients.add(*recovery.public()));
     let staged = stage_object(
         &ObjectSource {
             object_id: BackupObjectId::new(Uuid::from_bytes([0x21; 16])),
