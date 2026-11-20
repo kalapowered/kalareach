@@ -2056,6 +2056,34 @@ pub fn bind_chunk_endpoint(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Li
     Ok(Listener::bind(&endpoint)?)
 }
 
+/// The schema version at which an environment's transfers journal holds each draft's binding
+/// revision in a column: the version a rollback brings the journal back from
+/// ([`bring_the_journal_back`]).
+pub const JOURNAL_VERSION_WITH_THE_COLUMN: i64 = kr_transfer::store::COLUMN_VERSION;
+
+/// The schema version a journal is brought back to: the one the release before reads.
+pub const JOURNAL_VERSION_BROUGHT_BACK_TO: i64 = kr_transfer::store::SCHEMA_VERSION;
+
+/// Brings an environment's transfers journal at `journal` back from the version that holds each
+/// draft's binding revision in a column, for a rollback to a release that reads the journal
+/// without it, and says whether it did.
+///
+/// Every daemon of the environment has stopped and its lock is held. The revisions the column
+/// holds are first kept in the store beside the journal, then the version moves; a failure leaves
+/// the journal at the version it was and is returned as the reason. A journal that is not there,
+/// or is at any other version, is not opened.
+///
+/// # Errors
+///
+/// Returns the refusal when the journal cannot be read or the step fails.
+pub fn bring_the_journal_back(
+    journal: &std::path::Path,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> std::result::Result<bool, ProtocolError> {
+    kr_transfer::Store::bring_back_from_the_column_version(journal, environment_id)
+        .map_err(|error| error.to_protocol_error())
+}
+
 /// Accepts attachment-chunk connections until the daemon goes.
 ///
 /// An accept that fails ends the loop, as it does on the control endpoint: a listener that cannot

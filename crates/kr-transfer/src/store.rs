@@ -34,27 +34,32 @@ use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
 use crate::authority::ObjectIdentity;
 use crate::error::{Result, TransferError};
 use crate::filesystem::{FilesystemId, RecordedIdentity, Settled};
+use crate::revisions::{Kept, Revisions};
 
 /// The schema version this build reads, and the one a journal holds nothing of the sessions of
-/// earlier builds at ([`Noting`]). A journal at it has the table of ended sessions, the columns
-/// that say which offer a binding was claimed for, and the column that holds the binding revision a
-/// draft that names an application was written under.
-pub const SCHEMA_VERSION: i64 = 6;
+/// earlier builds at ([`Noting`]). A journal at it has the table of ended sessions and the columns
+/// that say which offer a binding was claimed for. The binding revision a draft that names an
+/// application was written under is not in the journal: it is kept in a store of its own
+/// ([`crate::revisions`]).
+pub const SCHEMA_VERSION: i64 = 5;
 
-/// The version before the column that holds a draft's binding revision: a journal at it has the
-/// columns that record who claimed a binding and no revision for any draft. The step to
-/// [`SCHEMA_VERSION`] adds the column and moves the version; a build that does not read the column
-/// then refuses the journal, because it would send a draft under a revision it was not written
-/// under.
+/// The version a build wrote that kept a draft's binding revision in a column of the table of
+/// drafts, `agent_binding_revision`, which this build neither reads nor writes. A journal at it is
+/// brought to [`SCHEMA_VERSION`] when it is opened: the revisions the column holds are kept in the
+/// store of binding revisions, and then the version moves. The step is the one place this build
+/// reads the column. It fails closed: a revision that cannot be kept leaves the journal at this
+/// version and the open fails, so the version never moves with a revision lost.
 ///
-/// Remove this, with the step from it, once no supported upgrade can start from a journal at this
-/// version.
-const UNBOUND_VERSION: i64 = 5;
+/// The release that lists the transfers store reads it through this version
+/// (`reads_through` in the stored formats table), so a host whose journal is at it can be updated
+/// by `kr host update`, and a rollback brings a journal at it back before the target is checked.
+/// The step and `reads_through` go together: remove this, with the step from it and `reads_through`
+/// of the transfers store, once no supported upgrade can start from a journal at this version.
+pub const COLUMN_VERSION: i64 = 6;
 
 /// The version before the columns that record who claimed a binding: a journal at it has the table
-/// of ended sessions and holds no claim. The step to [`SCHEMA_VERSION`] adds the columns, and the
-/// column that holds a draft's binding revision, and moves the version; a build that cannot read a
-/// claim then refuses the journal.
+/// of ended sessions and holds no claim. The step to [`SCHEMA_VERSION`] adds the columns and moves
+/// the version; a build that cannot read a claim then refuses the journal.
 ///
 /// Remove this, with the step from it, once no supported upgrade can start from a journal at this
 /// version.
@@ -303,9 +308,11 @@ pub struct DraftRow {
     pub session_id: Option<SessionId>,
     /// The application it targets.
     pub application_instance_id: Option<ApplicationInstanceId>,
-    /// The binding revision of that application the draft was written under. A draft that names
-    /// an application is sent only under this revision. It is absent for a draft that names no
-    /// application, and for one that a journal at an earlier version held.
+    /// The binding revision of that application the draft was written under, kept in the store of
+    /// binding revisions and read from it with the draft ([`Store::draft`]). A draft that names an
+    /// application is sent only under this revision. It is absent for a draft that names no
+    /// application, and for one whose revision the store does not hold or cannot be read: such a
+    /// draft is never sent.
     pub agent_binding_revision: Option<AgentBindingRevision>,
     /// Its revision.
     pub revision: DraftRevision,
@@ -489,6 +496,7 @@ pub struct EventRow {
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
+    revisions: Revisions,
     environment_id: EnvironmentId,
 }
 
@@ -501,7 +509,54 @@ impl Store {
     pub fn open(path: impl AsRef<std::path::Path>, environment_id: EnvironmentId) -> Result<Self> {
         let connection = kr_flush::release::open_connection(path.as_ref(), None)
             .map_err(|error| TransferError::store(kr_flush::release::describe(&error)))?;
-        Self::prepare(connection, environment_id)
+        let revisions = Revisions::open(&Revisions::beside(path.as_ref()));
+        Self::prepare(connection, revisions, environment_id)
+    }
+
+    /// Brings the journal at `path` back from [`COLUMN_VERSION`] to [`SCHEMA_VERSION`], for a
+    /// rollback to a build that does not read the column, and says whether it did. The version is
+    /// read first and the journal is opened for the step only when it is exactly at
+    /// [`COLUMN_VERSION`]: a journal that is not there, or is at any other version, is left as it
+    /// is, whatever the version. The step is the one [`Store::open`] makes, so it fails closed
+    /// and repeats safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the version cannot be read or the step
+    /// fails; the journal is then at the version it was.
+    pub fn bring_back_from_the_column_version(
+        path: impl AsRef<std::path::Path>,
+        environment_id: EnvironmentId,
+    ) -> Result<bool> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(false);
+        }
+        let recorded: Option<i64> = {
+            let connection = kr_flush::release::open_connection(path, None)
+                .map_err(|error| TransferError::store(kr_flush::release::describe(&error)))?;
+            let recorded_anywhere: bool = connection
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                     WHERE type = 'table' AND name = 'schema_version')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(TransferError::store)?;
+            if recorded_anywhere {
+                connection
+                    .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+                    .optional()
+                    .map_err(TransferError::store)?
+            } else {
+                None
+            }
+        };
+        if recorded != Some(COLUMN_VERSION) {
+            return Ok(false);
+        }
+        drop(Self::open(path, environment_id)?);
+        Ok(true)
     }
 
     /// Opens a store that exists only for the life of this process.
@@ -512,11 +567,16 @@ impl Store {
     pub fn in_memory(environment_id: EnvironmentId) -> Result<Self> {
         Self::prepare(
             Connection::open_in_memory().map_err(TransferError::store)?,
+            Revisions::in_memory(),
             environment_id,
         )
     }
 
-    fn prepare(connection: Connection, environment_id: EnvironmentId) -> Result<Self> {
+    fn prepare(
+        connection: Connection,
+        revisions: Revisions,
+        environment_id: EnvironmentId,
+    ) -> Result<Self> {
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(TransferError::store)?;
@@ -528,9 +588,12 @@ impl Store {
             .map_err(TransferError::store)?;
         let store = Self {
             connection,
+            revisions,
             environment_id,
         };
         store.migrate()?;
+        // Before anything writes: no create falls between the two writes it makes.
+        store.revisions.sweep(&store.connection);
         Ok(store)
     }
 
@@ -638,8 +701,7 @@ impl Store {
                      state                   TEXT NOT NULL,
                      text                    TEXT NOT NULL,
                      created_at_ms           INTEGER NOT NULL,
-                     updated_at_ms           INTEGER NOT NULL,
-                     agent_binding_revision  INTEGER
+                     updated_at_ms           INTEGER NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS draft_attachments (
                      draft_id          BLOB NOT NULL
@@ -738,11 +800,6 @@ impl Store {
         // supported upgrade can start from a store written before a binding could be claimed.
         self.add_column_if_absent("draft_attachments", "claimed_by", "TEXT")?;
         self.add_column_if_absent("draft_attachments", "claim_grant", "BLOB")?;
-        // The binding revision a draft that names an application was written under. Added empty at
-        // every version below the current one, for the same reason as the columns above. A draft
-        // that names an application and holds no revision is never sent. Remove this once no
-        // supported upgrade can start from a store written before the revision was kept.
-        self.add_column_if_absent("drafts", "agent_binding_revision", "INTEGER")?;
         match version {
             // A journal this build makes has no earlier build's session to note, and comes to the
             // current version with its table in one step.
@@ -753,7 +810,20 @@ impl Store {
             Some(SETTLED_VERSION) => self.add_ended_sessions(Some(SETTLED_VERSION))?,
             // The table is there and the columns have just been added: the version is all that
             // is left to move.
-            Some(UNCLAIMED_VERSION | UNBOUND_VERSION) => {
+            Some(UNCLAIMED_VERSION) => {
+                self.connection
+                    .execute(
+                        "UPDATE schema_version SET version = ?1",
+                        params![SCHEMA_VERSION],
+                    )
+                    .map_err(TransferError::store)?;
+            }
+            // One-off: a journal that a build wrote at [`COLUMN_VERSION`]. The revisions its column
+            // holds are written to the store of binding revisions, in one transaction, and then
+            // the version moves, so a stop between the two repeats the step with the same rows. A
+            // failure leaves the version where it was. Remove this arm with the constant.
+            Some(COLUMN_VERSION) => {
+                self.keep_the_revisions_the_column_holds()?;
                 self.connection
                     .execute(
                         "UPDATE schema_version SET version = ?1",
@@ -772,6 +842,44 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Writes the binding revision of every draft that holds one in the column of a journal at
+    /// [`COLUMN_VERSION`] to the store of binding revisions, bound to the draft by its identifier,
+    /// the application it names and the time it was made. Nothing is changed in the journal.
+    fn keep_the_revisions_the_column_holds(&self) -> Result<()> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT draft_id, application_instance_id, created_at_ms, agent_binding_revision
+                   FROM drafts
+                  WHERE agent_binding_revision IS NOT NULL
+                    AND application_instance_id IS NOT NULL",
+            )
+            .map_err(TransferError::store)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(Kept {
+                    draft_id: DraftId::new(uuid_column(row, 0)?),
+                    application_instance_id: ApplicationInstanceId::new(uuid_column(row, 1)?),
+                    created_at_ms: timestamp(row.get(2)?),
+                    agent_binding_revision: AgentBindingRevision::new(identity_from_sql(
+                        row.get(3)?,
+                    )),
+                })
+            })
+            .map_err(TransferError::store)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(TransferError::store)?;
+        self.revisions.keep(&rows).map_err(|reason| {
+            TransferError::store(format!(
+                "the transfers journal is at schema version {COLUMN_VERSION} and the binding \
+                 revisions of its drafts could not be kept in {}: {reason}; kr host rollback \
+                 goes back to the release that wrote version {COLUMN_VERSION}, which reads the \
+                 journal as it is",
+                crate::revisions::FILE_NAME
+            ))
+        })
     }
 
     /// Adds a column to a table that an earlier build created without it.
@@ -1710,10 +1818,9 @@ impl Store {
         // One comparison, equality and not "at most": the revision advances when the selected
         // owner or thread changes, so a draft written under an earlier one is stale, and a prompt
         // prepared behind the draft is refused as well. A draft that names an application and holds
-        // no revision fails it too, so no row of an earlier shape is waved through. The words differ
-        // for such a row only; remove them with `UNBOUND_VERSION` once no supported upgrade can start
-        // from a journal at that version. The revision, like the application, is fixed when the
-        // draft is made.
+        // no revision fails it too, whether an earlier build wrote it or its revision cannot be
+        // read, so nothing is waved through. The words differ for such a draft only. The revision,
+        // like the application, is fixed when the draft is made.
         if draft.application_instance_id.is_some()
             && draft.agent_binding_revision != Some(binding_revision)
         {
@@ -1723,10 +1830,11 @@ impl Store {
                         "this draft was written under binding revision {written_under} of this \
                          application and the prompt names {binding_revision}, so it is not sent"
                     ),
-                    None => "this draft was written before this host kept the binding revision it \
-                             was written under, so it is not sent; write it again for the \
-                             conversation that is open now"
-                        .to_owned(),
+                    None => {
+                        "this host holds no binding revision for this draft, so it is not sent; \
+                             write it again for the conversation that is open now"
+                            .to_owned()
+                    }
                 },
             });
         }
@@ -2481,7 +2589,12 @@ impl Store {
         action: Option<&RetainedAction>,
         open_limit: Option<u64>,
     ) -> Result<ActionOutcome> {
-        let transaction = self.begin()?;
+        // The transaction borrows the journal's connection and not the store, so the store of
+        // binding revisions can be written while it is open.
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(TransferError::store)?;
         if claim_action(&transaction, action)? == ActionOutcome::AlreadyPerformed {
             return Ok(ActionOutcome::AlreadyPerformed);
         }
@@ -2493,13 +2606,41 @@ impl Store {
                 return Err(open_bound_refusal(open, limit));
             }
         }
+        // The revision is written before the draft, after the replay and the bound have been
+        // decided, so a draft never exists without its revision having been written. A revision
+        // that cannot be written refuses the create and writes nothing: a draft with no row would
+        // read as one of an earlier build, which is never sent. A row left by a create that fails
+        // below is deleted here and swept at the next open if that fails too.
+        if let (Some(application_instance_id), Some(agent_binding_revision)) =
+            (row.application_instance_id, row.agent_binding_revision)
+        {
+            self.revisions
+                .keep(&[Kept {
+                    draft_id: row.draft_id,
+                    application_instance_id,
+                    created_at_ms: row.created_at_ms,
+                    agent_binding_revision,
+                }])
+                .map_err(TransferError::store)?;
+        }
+        let written = Self::write_draft(transaction, row);
+        if written.is_err() {
+            self.revisions.forget(row.draft_id);
+        }
+        written?;
+        Ok(ActionOutcome::Committed)
+    }
+
+    /// Writes a draft's row and the event that announces it in the caller's transaction, and
+    /// commits.
+    fn write_draft(transaction: Transaction<'_>, row: &DraftRow) -> Result<()> {
         transaction
             .execute(
                 "INSERT INTO drafts
                      (draft_id, environment_id, actor_id, device_id, session_id,
                       application_instance_id, revision, state, text, created_at_ms,
-                      updated_at_ms, agent_binding_revision)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                      updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     uuid_sql(row.draft_id.get()),
                     uuid_sql(row.environment_id.get()),
@@ -2513,8 +2654,6 @@ impl Store {
                     row.text,
                     as_i64(row.created_at_ms.get()),
                     as_i64(row.updated_at_ms.get()),
-                    row.agent_binding_revision
-                        .map(|value| identity_sql(value.get())),
                 ],
             )
             .map_err(TransferError::store)?;
@@ -2527,8 +2666,7 @@ impl Store {
             &row.draft_id.to_string(),
             row.created_at_ms,
         )?;
-        transaction.commit().map_err(TransferError::store)?;
-        Ok(ActionOutcome::Committed)
+        transaction.commit().map_err(TransferError::store)
     }
 
     /// Returns one draft.
@@ -2537,11 +2675,12 @@ impl Store {
     ///
     /// Returns [`TransferError::StoreUnavailable`] when the read fails.
     pub fn draft(&self, draft_id: DraftId) -> Result<Option<DraftRow>> {
-        self.connection
+        let row = self
+            .connection
             .query_row(
                 "SELECT draft_id, environment_id, actor_id, device_id, session_id,
                         application_instance_id, revision, state, text, created_at_ms,
-                        updated_at_ms, agent_binding_revision
+                        updated_at_ms
                  FROM drafts WHERE draft_id = ?1",
                 params![uuid_sql(draft_id.get())],
                 |row| {
@@ -2558,14 +2697,22 @@ impl Store {
                         text: row.get(8)?,
                         created_at_ms: timestamp(row.get(9)?),
                         updated_at_ms: timestamp(row.get(10)?),
-                        agent_binding_revision: row
-                            .get::<_, Option<i64>>(11)?
-                            .map(|value| AgentBindingRevision::new(identity_from_sql(value))),
+                        agent_binding_revision: None,
                     })
                 },
             )
             .optional()
-            .map_err(TransferError::store)
+            .map_err(TransferError::store)?;
+        // The revision comes from the store of binding revisions, and only from a row bound to this
+        // draft by all three fixed fields. A revision that cannot be read is none, and a draft that
+        // names an application and holds none is not sent.
+        Ok(row.map(|mut row| {
+            row.agent_binding_revision = row.application_instance_id.and_then(|application| {
+                self.revisions
+                    .read(row.draft_id, application, row.created_at_ms)
+            });
+            row
+        }))
     }
 
     /// Replaces a draft's text at its exact revision, advancing it, and announces the update.
@@ -2706,6 +2853,9 @@ impl Store {
             });
         }
         transaction.commit().map_err(TransferError::store)?;
+        // The draft's revision goes with it. A row this does not delete is swept when the journal
+        // is next opened.
+        self.revisions.forget(draft_id);
         Ok(ActionOutcome::Committed)
     }
 
@@ -3823,7 +3973,7 @@ fn shielding_sessions(
     Ok(shielding)
 }
 
-fn uuid_sql(value: Uuid) -> Vec<u8> {
+pub(crate) fn uuid_sql(value: Uuid) -> Vec<u8> {
     value.as_bytes().to_vec()
 }
 
@@ -3914,7 +4064,7 @@ fn optional_digest(
 /// Every count this store holds is a byte length or a millisecond bounded well below the signed
 /// maximum. Saturating keeps a nonsensical value from wrapping into a negative one that would then
 /// read back as an enormous quota.
-const fn as_i64(value: u64) -> i64 {
+pub(crate) const fn as_i64(value: u64) -> i64 {
     if value > i64::MAX as u64 {
         i64::MAX
     } else {
@@ -3933,11 +4083,11 @@ const fn from_i64(value: i64) -> u64 {
 /// saturating conversion counts use for byte lengths would turn a valid value into `i64::MAX` and
 /// make it compare unequal after a restart, or equal to another value. The reinterpretation
 /// round-trips exactly.
-const fn identity_sql(value: u64) -> i64 {
+pub(crate) const fn identity_sql(value: u64) -> i64 {
     value as i64
 }
 
-const fn identity_from_sql(value: i64) -> u64 {
+pub(crate) const fn identity_from_sql(value: i64) -> u64 {
     value as u64
 }
 
@@ -4010,7 +4160,8 @@ mod tests {
                  );",
             )
             .expect("writes a version-one journal");
-        let store = Store::prepare(connection, environment()).expect("migrates and opens");
+        let store = Store::prepare(connection, Revisions::in_memory(), environment())
+            .expect("migrates and opens");
 
         // The version moved, the column is there, and the reader that needs it works. The journal
         // is one an earlier build wrote, so the sessions of earlier builds are still owed their
@@ -4068,6 +4219,16 @@ mod tests {
             .expect("reads the version")
     }
 
+    /// The schema version the store of binding revisions beside the journal at `path` records.
+    fn side_version(path: &std::path::Path) -> Option<i64> {
+        rusqlite::Connection::open(crate::revisions::Revisions::beside(path))
+            .expect("opens")
+            .query_row("SELECT version FROM draft_revisions_schema", [], |row| {
+                row.get(0)
+            })
+            .ok()
+    }
+
     fn has_the_table_of_ended_sessions(path: &std::path::Path) -> bool {
         rusqlite::Connection::open(path)
             .expect("opens")
@@ -4097,9 +4258,18 @@ mod tests {
         let path = directory.path().join("transfers.sqlite");
 
         let mut store = Store::open(&path, environment()).expect("creates and opens");
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 5);
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
         assert!(has_the_table_of_ended_sessions(&path));
+        assert!(
+            !drafts_have_the_column(&path),
+            "a journal this build makes holds no binding revision: the store beside it does"
+        );
+        assert_eq!(
+            side_version(&path),
+            Some(crate::revisions::SCHEMA_VERSION),
+            "the store of binding revisions is made with the journal, at its own version"
+        );
         assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
         end_a_session(&mut store);
     }
@@ -4199,14 +4369,15 @@ mod tests {
     }
 
     #[test]
-    fn a_version_five_journal_gains_the_column_that_holds_a_binding_revision_and_keeps_its_draft() {
+    fn a_version_five_journal_is_read_as_it_is_and_a_draft_the_release_before_wrote_holds_no_revision()
+     {
         // The tables as the release before wrote them: the table of ended sessions, the table of
         // drafts without the column, and a draft that names an application.
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("transfers.sqlite");
         write_a_journal_at(
             &path,
-            UNBOUND_VERSION,
+            SCHEMA_VERSION,
             &format!(
                 "CREATE TABLE ended_sessions (session_id BLOB PRIMARY KEY, ended_at_ms INTEGER NOT NULL);
                  {DRAFTS_BEFORE_REVISIONS}
@@ -4216,15 +4387,12 @@ mod tests {
         );
         assert!(!drafts_have_the_column(&path));
 
-        let opened = Store::open(&path, environment());
-        assert!(
-            opened.is_ok(),
-            "the step from version 5 opens: {:?}",
-            opened.err()
-        );
-        let store = opened.expect("opens");
+        let store = Store::open(&path, environment()).expect("opens");
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
-        assert!(drafts_have_the_column(&path));
+        assert!(
+            !drafts_have_the_column(&path),
+            "the journal is not changed: it is the one the release before reads"
+        );
         assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
         let kept = store
             .draft(DraftId::new(Uuid::from_bytes([0x0B; 16])))
@@ -4249,7 +4417,7 @@ mod tests {
         let path = directory.path().join("transfers.sqlite");
         write_a_journal_at(
             &path,
-            UNBOUND_VERSION,
+            SCHEMA_VERSION,
             &format!(
                 "CREATE TABLE ended_sessions (session_id BLOB PRIMARY KEY, ended_at_ms INTEGER NOT NULL);
                  {DRAFTS_BEFORE_REVISIONS}
@@ -4281,7 +4449,7 @@ mod tests {
                 .expect_err("a draft with no revision is refused under every one");
             assert!(
                 matches!(&refused, TransferError::DraftConflict { detail }
-                    if detail.contains("before this host kept the binding revision")),
+                    if detail.contains("this host holds no binding revision for this draft")),
                 "{refused:?}"
             );
         }
@@ -4296,29 +4464,6 @@ mod tests {
             sent.is_ok(),
             "a draft that names no application is held to no revision: {sent:?}"
         );
-    }
-
-    #[test]
-    fn a_version_two_journal_gains_the_column_that_holds_a_binding_revision_and_keeps_its_version()
-    {
-        // A journal of an earlier build's sessions stays at its version until they are settled, and
-        // it has the column all the same, so that settling still finds a journal this build reads.
-        let directory = tempfile::tempdir().expect("a temporary directory");
-        let path = directory.path().join("transfers.sqlite");
-        write_a_journal_at(&path, UNSETTLED_VERSION, DRAFTS_BEFORE_REVISIONS);
-        assert!(!drafts_have_the_column(&path));
-
-        let mut store = Store::open(&path, environment()).expect("migrates and opens");
-        assert_eq!(recorded_version(&path), UNSETTLED_VERSION);
-        assert!(drafts_have_the_column(&path));
-        assert_eq!(store.noting().expect("reads the noting"), Noting::Owed);
-
-        store
-            .settle_unseen_prompt_sessions(TimestampMs::new(2000))
-            .expect("settles");
-        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
-        assert!(drafts_have_the_column(&path));
-        assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
     }
 
     #[test]
@@ -4481,6 +4626,436 @@ mod tests {
                 "the revision {written} records the draft: {sent:?}"
             );
         }
+    }
+
+    /// A draft made at time 1000, for the application made of sixteen bytes of `application` when
+    /// it names one.
+    fn a_draft(draft: u8, application: Option<u8>, revision: Option<u64>) -> DraftRow {
+        DraftRow {
+            draft_id: DraftId::new(Uuid::from_bytes([draft; 16])),
+            environment_id: environment(),
+            actor_id: actor(),
+            device_id: None,
+            session_id: None,
+            application_instance_id: application
+                .map(|byte| ApplicationInstanceId::new(Uuid::from_bytes([byte; 16]))),
+            agent_binding_revision: revision.map(AgentBindingRevision::new),
+            revision: DraftRevision::new(1),
+            state: DraftState::Open,
+            text: format!("draft {draft}"),
+            created_at_ms: TimestampMs::new(1000),
+            updated_at_ms: TimestampMs::new(1000),
+        }
+    }
+
+    fn draft_id(draft: u8) -> DraftId {
+        DraftId::new(Uuid::from_bytes([draft; 16]))
+    }
+
+    /// The revision `store` reads for a draft.
+    fn revision_of(store: &Store, draft: u8) -> Option<u64> {
+        store
+            .draft(draft_id(draft))
+            .expect("reads the draft")
+            .expect("the draft is there")
+            .agent_binding_revision
+            .map(AgentBindingRevision::get)
+    }
+
+    /// How many rows the store of binding revisions beside the journal at `path` holds.
+    fn side_rows(path: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(crate::revisions::Revisions::beside(path))
+            .expect("opens")
+            .query_row("SELECT COUNT(*) FROM draft_revisions", [], |row| row.get(0))
+            .expect("counts the rows")
+    }
+
+    fn remove_the_side_store(path: &std::path::Path) {
+        let side = crate::revisions::Revisions::beside(path);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = side.clone().into_os_string();
+            name.push(suffix);
+            let _ = std::fs::remove_file(name);
+        }
+    }
+
+    /// A journal as a build that kept the revision in a column wrote it: at [`COLUMN_VERSION`],
+    /// with the column, with `drafts` as (draft, application, revision) rows made at time 1000,
+    /// and with no store of binding revisions beside it.
+    fn write_a_journal_at_the_column_version(
+        path: &std::path::Path,
+        drafts: &[(u8, Option<u8>, Option<i64>)],
+    ) {
+        drop(Store::open(path, environment()).expect("makes a journal"));
+        remove_the_side_store(path);
+        let connection = rusqlite::Connection::open(path).expect("opens");
+        connection
+            .execute_batch(&format!(
+                "ALTER TABLE drafts ADD COLUMN agent_binding_revision INTEGER;
+                 UPDATE schema_version SET version = {COLUMN_VERSION};"
+            ))
+            .expect("makes the journal one of the column version");
+        for (draft, application, revision) in drafts {
+            connection
+                .execute(
+                    "INSERT INTO drafts (draft_id, environment_id, actor_id, application_instance_id,
+                                         revision, state, text, created_at_ms, updated_at_ms,
+                                         agent_binding_revision)
+                     VALUES (?1, ?2, ?3, ?4, 1, 'open', 'a draft', 1000, 1000, ?5)",
+                    params![
+                        uuid_sql(Uuid::from_bytes([*draft; 16])),
+                        uuid_sql(environment().get()),
+                        actor().as_str(),
+                        application.map(|byte| uuid_sql(Uuid::from_bytes([byte; 16]))),
+                        revision,
+                    ],
+                )
+                .expect("writes a draft");
+        }
+    }
+
+    #[test]
+    fn a_draft_that_names_an_application_keeps_its_revision_in_the_store_beside_the_journal() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        {
+            let mut store = Store::open(&path, environment()).expect("opens");
+            store
+                .insert_draft(&a_draft(1, Some(0x0A), Some(7)), None, None)
+                .expect("writes a draft that names an application");
+            store
+                .insert_draft(&a_draft(2, None, None), None, None)
+                .expect("writes a draft that names none");
+            store
+                .insert_draft(&a_draft(3, Some(0x0A), Some(9)), None, None)
+                .expect("writes another draft for the same application, under another revision");
+            assert_eq!(revision_of(&store, 1), Some(7));
+            assert_eq!(revision_of(&store, 2), None);
+            assert_eq!(
+                revision_of(&store, 3),
+                Some(9),
+                "each draft reads its own revision"
+            );
+        }
+        assert!(
+            !drafts_have_the_column(&path),
+            "the journal holds no column for it"
+        );
+        assert_eq!(
+            side_rows(&path),
+            2,
+            "a draft that names no application has no row"
+        );
+
+        let store = Store::open(&path, environment()).expect("reopens");
+        assert_eq!(
+            revision_of(&store, 1),
+            Some(7),
+            "the revision comes back after a reopen"
+        );
+    }
+
+    #[test]
+    fn a_rollback_does_not_open_a_journal_that_is_not_at_the_column_version() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+
+        // A journal that is not there is not made.
+        assert!(!Store::bring_back_from_the_column_version(&path, environment()).expect("reads"));
+        assert!(!path.exists(), "no journal was made");
+
+        // A journal at version 3 is not stepped: opening it would add the table of ended sessions
+        // and move it to version 5.
+        write_a_journal_at(&path, SETTLED_VERSION, "");
+        assert!(!Store::bring_back_from_the_column_version(&path, environment()).expect("reads"));
+        assert_eq!(recorded_version(&path), SETTLED_VERSION);
+        assert!(!has_the_table_of_ended_sessions(&path));
+        assert!(!crate::revisions::Revisions::beside(&path).exists());
+
+        // A journal at the current version is left as it is.
+        drop(Store::open(&path, environment()).expect("opens"));
+        assert!(!Store::bring_back_from_the_column_version(&path, environment()).expect("reads"));
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+
+        // A journal at version 6 is brought back.
+        let other = directory.path().join("other").join("transfers.sqlite");
+        std::fs::create_dir_all(other.parent().expect("a directory")).expect("a directory");
+        write_a_journal_at_the_column_version(&other, &[(1, Some(0x0A), Some(7))]);
+        assert!(
+            Store::bring_back_from_the_column_version(&other, environment()).expect("brings back")
+        );
+        assert_eq!(recorded_version(&other), SCHEMA_VERSION);
+        assert_eq!(side_rows(&other), 1);
+    }
+
+    #[test]
+    fn a_row_bound_to_another_application_or_another_time_gives_no_revision() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        let mut store = Store::open(&path, environment()).expect("opens");
+        store
+            .insert_draft(&a_draft(1, Some(0x0A), Some(7)), None, None)
+            .expect("writes a draft");
+        let side = rusqlite::Connection::open(crate::revisions::Revisions::beside(&path))
+            .expect("opens the store of binding revisions");
+
+        side.execute(
+            "UPDATE draft_revisions SET application_instance_id = ?1",
+            params![uuid_sql(Uuid::from_bytes([0x0F; 16]))],
+        )
+        .expect("binds the row to another application");
+        assert_eq!(revision_of(&store, 1), None, "another application");
+        side.execute(
+            "UPDATE draft_revisions SET application_instance_id = ?1, created_at_ms = 1001",
+            params![uuid_sql(Uuid::from_bytes([0x0A; 16]))],
+        )
+        .expect("binds the row to another time");
+        assert_eq!(revision_of(&store, 1), None, "another time");
+        side.execute("UPDATE draft_revisions SET created_at_ms = 1000", [])
+            .expect("binds the row to the draft again");
+        assert_eq!(revision_of(&store, 1), Some(7));
+    }
+
+    #[test]
+    fn a_damaged_or_deleted_store_of_revisions_gives_no_revision_and_refuses_a_create_that_needs_one()
+     {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        {
+            let mut store = Store::open(&path, environment()).expect("opens");
+            store
+                .insert_draft(&a_draft(1, Some(0x0A), Some(7)), None, None)
+                .expect("writes a draft");
+        }
+        // Damaged: the journal opens, and every draft that names an application reads as one that
+        // holds no revision, which is never sent.
+        remove_the_side_store(&path);
+        std::fs::write(
+            crate::revisions::Revisions::beside(&path),
+            b"these bytes are not a database, and are long enough to be read as a damaged one",
+        )
+        .expect("damages the store");
+        let mut store = Store::open(&path, environment()).expect("the journal opens");
+        assert_eq!(revision_of(&store, 1), None);
+        let refused = store
+            .insert_draft(&a_draft(2, Some(0x0A), Some(7)), None, None)
+            .expect_err("a revision that cannot be kept refuses the create");
+        assert!(
+            matches!(refused, TransferError::StoreUnavailable { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            store.draft(draft_id(2)).expect("reads").is_none(),
+            "and writes nothing"
+        );
+        store
+            .insert_draft(&a_draft(3, None, None), None, None)
+            .expect("a draft that names no application needs no revision");
+        drop(store);
+
+        // Deleted after use: the store is made again, empty.
+        remove_the_side_store(&path);
+        let store = Store::open(&path, environment()).expect("opens");
+        assert_eq!(revision_of(&store, 1), None);
+        assert_eq!(side_rows(&path), 0);
+    }
+
+    #[test]
+    fn a_row_with_no_draft_is_swept_when_the_journal_is_opened() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        {
+            let mut store = Store::open(&path, environment()).expect("opens");
+            store
+                .insert_draft(&a_draft(1, Some(0x0A), Some(7)), None, None)
+                .expect("writes a draft");
+        }
+        rusqlite::Connection::open(crate::revisions::Revisions::beside(&path))
+            .expect("opens the store of binding revisions")
+            .execute(
+                "INSERT INTO draft_revisions
+                     (draft_id, application_instance_id, created_at_ms, agent_binding_revision)
+                 VALUES (?1, ?2, 1000, 9)",
+                params![
+                    uuid_sql(Uuid::from_bytes([0x44; 16])),
+                    uuid_sql(Uuid::from_bytes([0x0A; 16])),
+                ],
+            )
+            .expect("writes a row no draft is bound to");
+        assert_eq!(side_rows(&path), 2);
+
+        let store = Store::open(&path, environment()).expect("reopens");
+        assert_eq!(side_rows(&path), 1, "the row with no draft is gone");
+        assert_eq!(revision_of(&store, 1), Some(7), "the row of a draft is not");
+    }
+
+    #[test]
+    fn a_create_that_fails_after_its_row_was_written_leaves_no_row() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        let mut store = Store::open(&path, environment()).expect("opens");
+        store
+            .insert_draft(&a_draft(1, Some(0x0A), Some(7)), None, Some(1))
+            .expect("the first draft is within the bound");
+
+        // Refused at the bound of open drafts, before the row is written.
+        let refused = store
+            .insert_draft(&a_draft(2, Some(0x0A), Some(7)), None, Some(1))
+            .expect_err("a second open draft is over the bound");
+        assert!(
+            matches!(refused, TransferError::QuotaExceeded { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(side_rows(&path), 1);
+
+        // Refused for an ended session, after the row was written.
+        end_a_session(&mut store);
+        let mut towards_an_ended_session = a_draft(3, Some(0x0A), Some(7));
+        towards_an_ended_session.session_id = Some(SessionId::new(Uuid::from_bytes([7; 16])));
+        let refused = store
+            .insert_draft(&towards_an_ended_session, None, None)
+            .expect_err("a draft for an ended session is not made");
+        assert!(
+            matches!(refused, TransferError::SessionEnded),
+            "{refused:?}"
+        );
+        assert_eq!(
+            side_rows(&path),
+            1,
+            "the row the refused create wrote is gone"
+        );
+        assert!(store.draft(draft_id(3)).expect("reads").is_none());
+    }
+
+    #[test]
+    fn a_discarded_draft_takes_its_row_with_it() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        let mut store = Store::open(&path, environment()).expect("opens");
+        store
+            .insert_draft(&a_draft(1, Some(0x0A), Some(7)), None, None)
+            .expect("writes a draft");
+        assert_eq!(side_rows(&path), 1);
+        store
+            .discard_draft(draft_id(1), None)
+            .expect("ends the draft");
+        assert_eq!(side_rows(&path), 0);
+    }
+
+    #[test]
+    fn a_journal_at_the_column_version_keeps_the_revisions_its_column_holds_and_moves_to_version_five()
+     {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at_the_column_version(
+            &path,
+            &[
+                (1, Some(0x0A), Some(7)),
+                (2, None, None),
+                (3, Some(0x0A), Some(-1)),
+                (4, Some(0x0A), None),
+            ],
+        );
+        assert_eq!(recorded_version(&path), COLUMN_VERSION);
+
+        let store = Store::open(&path, environment()).expect("brings the journal back and opens");
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+        assert_eq!(revision_of(&store, 1), Some(7));
+        assert_eq!(revision_of(&store, 2), None);
+        assert_eq!(
+            revision_of(&store, 3),
+            Some(u64::MAX),
+            "a revision above the signed range comes through whole"
+        );
+        assert_eq!(
+            revision_of(&store, 4),
+            None,
+            "a draft with no revision is given none"
+        );
+        assert_eq!(side_rows(&path), 2);
+        assert!(
+            drafts_have_the_column(&path),
+            "the column stays in the journal, unused: the release before ignores it"
+        );
+        drop(store);
+
+        let again = Store::open(&path, environment()).expect("opens again");
+        assert_eq!(
+            revision_of(&again, 1),
+            Some(7),
+            "nothing is converted twice"
+        );
+    }
+
+    #[test]
+    fn the_step_from_the_column_version_fails_closed_when_the_store_of_revisions_is_closed() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at_the_column_version(&path, &[(1, Some(0x0A), Some(7))]);
+        std::fs::write(
+            crate::revisions::Revisions::beside(&path),
+            b"these bytes are not a database, and are long enough to be read as a damaged one",
+        )
+        .expect("damages the store");
+
+        let refused = Store::open(&path, environment()).expect_err("the open fails");
+        let said = format!("{refused:?}");
+        assert!(
+            said.contains("draft-revisions.sqlite3"),
+            "it names the store: {said}"
+        );
+        assert_eq!(
+            recorded_version(&path),
+            COLUMN_VERSION,
+            "the version never moves with a revision lost"
+        );
+    }
+
+    #[test]
+    fn the_step_from_the_column_version_leaves_the_version_when_a_row_cannot_be_written() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at_the_column_version(&path, &[(1, Some(0x0A), Some(7))]);
+        drop(Revisions::open(&Revisions::beside(&path)));
+        rusqlite::Connection::open(Revisions::beside(&path))
+            .expect("opens the store of binding revisions")
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_row BEFORE INSERT ON draft_revisions
+                 BEGIN SELECT RAISE(ABORT, 'the row cannot be written'); END;",
+            )
+            .expect("makes the store refuse a row");
+
+        let refused = Store::open(&path, environment()).expect_err("the open fails");
+        assert!(
+            format!("{refused:?}").contains("the row cannot be written"),
+            "the open failed at the row: {refused:?}"
+        );
+        assert_eq!(recorded_version(&path), COLUMN_VERSION);
+        assert_eq!(side_rows(&path), 0);
+    }
+
+    #[test]
+    fn a_stop_between_the_rows_and_the_version_repeats_the_step_with_the_same_rows() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at_the_column_version(&path, &[(1, Some(0x0A), Some(7))]);
+        // The rows are written and the version has not moved: the state a stop between the two
+        // leaves.
+        let side = Revisions::open(&Revisions::beside(&path));
+        side.keep(&[Kept {
+            draft_id: draft_id(1),
+            application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([0x0A; 16])),
+            created_at_ms: TimestampMs::new(1000),
+            agent_binding_revision: AgentBindingRevision::new(7),
+        }])
+        .expect("writes the row");
+        drop(side);
+        assert_eq!(recorded_version(&path), COLUMN_VERSION);
+
+        let store = Store::open(&path, environment()).expect("repeats the step");
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+        assert_eq!(revision_of(&store, 1), Some(7));
+        assert_eq!(side_rows(&path), 1);
     }
 
     #[test]

@@ -90,7 +90,8 @@ nothing is recorded. The revision advances when the application's upstream owner
 changes, so a draft written for an earlier conversation is not sent into the one that is open now,
 and the person writes a new draft for it. A draft keeps its revision for as long as it exists:
 `draft.update` and `agent.draft.add_attachment` do not move it. A draft that names an application
-and was written before the host kept the revision is refused the same way. The worker still checks
+and has no revision on record, because an earlier build wrote it or because the store that holds
+the revisions cannot be read, is refused the same way. The worker still checks
 the prompt's own binding revision against the binding in force. A prompt the worker takes and then
 refuses was still sent to its session, so the
 attachments stay with it. A prompt made under an identifier already used for another prompt is
@@ -295,15 +296,42 @@ of a draft by `draft.discard`, which the action's own record traces.
 | `actions` | retained mutation outcomes, keyed by actor and action identifier |
 | `events`, `cursors` | the outbox and its consumers' positions |
 
-The journal is at schema version 6. The step from version 5 adds the column that holds the binding
-revision a draft that names an application was written under; a draft that an earlier build wrote
-has none. The step from version 4 adds the two columns that record who claimed a binding and the
-read grant of that claim, and that column. An older build that doesn't know about the `inserting`
-and `unknown` states, or doesn't read the revision, will refuse to accept a version-6 journal. A
-journal that still holds sessions of an earlier build keeps its older version until they are
-settled. It has the columns all the same, and no claim is made in it. No draft that names an
-application is made in it either, because a build that ignored the revision could send that draft
-under another one: the create is refused until those sessions have ended.
+The journal is at schema version 5. The step from version 4 adds the two columns that record who
+claimed a binding and the read grant of that claim. An older build that doesn't know about the
+`inserting` and `unknown` states will refuse to accept a version-5 journal. A journal that still
+holds sessions of an earlier build keeps its older version until they are settled. It has the
+columns all the same, and no claim is made in it. No draft that names an application is made in it
+either: a build before this one keeps no binding revision for a draft and records a prompt that
+names it under whichever revision the prompt is made under, and such a build can read the journal
+until those sessions have ended, so the create is refused until they have.
+
+The binding revision a draft that names an application was written under is not in the journal. It
+is kept in `draft-revisions.sqlite3`, beside the journal, a store of its own at schema version 1
+whose one table has a row for each such draft. A row is bound to its draft by the draft's
+identifier, the application it names and the time it was made: a row that does not match all
+three gives no revision, and neither does a store that cannot be read, and a draft with no
+revision is not sent. A create writes the revision first and then the draft, and a create whose
+revision cannot be written is refused and writes nothing. A row whose draft was ended, or whose
+create failed, is deleted when the journal is next opened.
+
+A journal at schema version 6 is one that a build before this one wrote while it kept the revision
+in a column of the table of drafts, which the journal no longer has and which a build at version 5
+ignores. A daemon of this build brings such a journal to version 5 when it opens it: it writes the
+revisions the column holds to the store beside the journal, in one transaction, and then moves the
+version, so a stop between the two repeats the step with the same rows. If a revision cannot be
+written, the journal stays at version 6 and the daemon does not start. `kr host rollback` takes the
+same step, before it checks the stores, for a journal that no daemon of this build has opened, when
+the release it goes to reads the journal below version 6. The step goes, with the version that the
+release lists as read through, once no supported upgrade can start from a journal at version 6.
+
+A rollback goes to a release that keeps no binding revision for a draft. That release records a
+prompt that names a draft written for an application under the binding revision in force at the
+prompt, not the one the draft was written under. No release carries the text of a draft to an
+agent on such a prompt, so what it makes is a record, not a delivery. The rollback ends no draft
+and says so. When the host is updated again, this build reads that record as a draft sent to that
+session: the draft is kept as the record of what the session was sent, a prompt that names it under
+any revision but its own is refused, and its attachments follow the session's retention. The
+record is not repaired.
 
 The order the rows are written in is what makes a resume possible.
 

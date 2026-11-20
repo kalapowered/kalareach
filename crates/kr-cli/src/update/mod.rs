@@ -588,6 +588,12 @@ pub struct Updated {
     pub not_removed: Vec<NotRemoved>,
     /// The environments no daemon served, whose registries the update brought forward.
     pub carried: Vec<CarriedRegistry>,
+    /// The environments whose transfers journals a rollback brought back, before it checked the
+    /// stores, to the schema the release it goes to reads.
+    pub brought_back: Vec<LoweredJournal>,
+    /// Whether this rollback goes to a release that keeps no binding revision for a draft, and so
+    /// records a prompt that names a draft under the revision in force at the prompt.
+    pub draft_limit: bool,
     /// The environments the store records that the update could not reach.
     pub unreached: Vec<Unreached>,
     /// Whether this was a check only, which changed nothing.
@@ -696,6 +702,51 @@ impl CarriedRegistry {
     }
 }
 
+/// An environment's transfers journal a rollback brought back from the schema that keeps each
+/// draft's binding revision in the journal to the schema the release it goes to reads, with the
+/// revisions kept beside the journal.
+pub struct LoweredJournal {
+    /// Its environment.
+    pub environment: EnvironmentId,
+    /// The schema version the journal recorded.
+    pub from: i64,
+    /// The schema version it was brought back to.
+    pub to: i64,
+}
+
+impl LoweredJournal {
+    /// What `--json` says of it.
+    fn document(&self) -> Document {
+        Document::new()
+            .with("environment", crate::output::said(&self.environment))
+            .with("from", self.from)
+            .with("to", self.to)
+    }
+
+    /// What is said to a person.
+    fn said(&self, target: &ReleaseName) -> Shown {
+        shown!(
+            "environment {}'s transfers journal was at schema version {} and was brought back to \
+             {}, the version {} reads; the binding revisions of its drafts are kept beside it, and \
+             a newer release's control daemon reads them again",
+            self.environment,
+            self.from,
+            self.to,
+            crate::shown::release(target)
+        )
+    }
+
+    /// What a rollback that did not finish says it had already done to this journal.
+    fn brought(&self) -> Shown {
+        shown!(
+            "the transfers journal of environment {} from schema version {} to {}",
+            self.environment,
+            self.from,
+            self.to
+        )
+    }
+}
+
 /// A pair of roots the store records a control daemon served, whose environment the update could
 /// not look at, because what holds its identity is gone: a stopped distribution, a removed
 /// container, a mount that is not there.
@@ -769,6 +820,14 @@ impl Updated {
                     .collect::<Vec<_>>(),
             )
             .with(
+                "brought_back",
+                self.brought_back
+                    .iter()
+                    .map(LoweredJournal::document)
+                    .collect::<Vec<_>>(),
+            )
+            .with("draft_limit", self.draft_limit)
+            .with(
                 "not_reached",
                 self.unreached
                     .iter()
@@ -815,6 +874,19 @@ impl Updated {
             ));
         }
         lines.extend(self.carried.iter().map(CarriedRegistry::said));
+        lines.extend(
+            self.brought_back
+                .iter()
+                .map(|journal| journal.said(&self.target)),
+        );
+        if self.draft_limit {
+            lines.push(shown!(
+                "release {} records a prompt that names a draft written for an application under \
+                 the binding revision in force at the prompt, not the one the draft was written \
+                 under; this rollback ended no draft",
+                crate::shown::release(&self.target)
+            ));
+        }
         lines.extend(self.unreached.iter().map(|unreached| unreached.said(false)));
         lines.push(Shown::said(
             "every live session goes on running the release it started from until it closes",
@@ -1200,6 +1272,8 @@ pub async fn update(archive: Option<&std::path::Path>, check: bool) -> Result<Up
             removed: Vec::new(),
             not_removed: staging_left.into_iter().collect(),
             carried: Vec::new(),
+            brought_back: Vec::new(),
+            draft_limit: false,
             unreached: Vec::new(),
             checked_only: check,
             rolled_back: false,
@@ -1371,6 +1445,7 @@ async fn carry_out(
     // What the rest of the run learns that a person is told, whether it finishes or not.
     let mut report = Report {
         carried: Vec::new(),
+        brought_back: Vec::new(),
         unreached,
         check,
         rolled_back,
@@ -1400,6 +1475,15 @@ async fn carry_out(
         removed,
         not_removed,
         carried: report.carried,
+        brought_back: report.brought_back,
+        // The release a rollback goes to keeps the binding revision of a draft in a store of its
+        // own only if its manifest lists that store; one that does not records a prompt for a draft
+        // without it. The manifest says so, so no journal is read to decide it.
+        draft_limit: rolled_back
+            && !target
+                .stores
+                .iter()
+                .any(|listed| listed.store == formats::DRAFT_REVISIONS_STORE),
         unreached: report.unreached,
         checked_only: check,
         rolled_back,
@@ -1414,6 +1498,7 @@ async fn carry_out(
 /// already done.
 struct Report {
     carried: Vec<CarriedRegistry>,
+    brought_back: Vec<LoweredJournal>,
     unreached: Vec<Unreached>,
     check: bool,
     /// Whether the switch goes back to an older release, which the messages that say what to run
@@ -1433,6 +1518,17 @@ impl Report {
             notes.push(shown!(
                 "The update had already brought forward {}; a control daemon of a newer release \
                  brings one on when it starts there",
+                list
+            ));
+        }
+        if let Some((first, rest)) = self.brought_back.split_first() {
+            let mut list = first.brought();
+            for next in rest {
+                list = shown!("{}, {}", list, next.brought());
+            }
+            notes.push(shown!(
+                "The rollback had already brought back {}; this release reads those journals as \
+                 they are now",
                 list
             ));
         }
@@ -1892,6 +1988,17 @@ async fn hand_over(
         install,
         writers,
     };
+    // A rollback to a release that reads the transfers journal below the version that keeps each
+    // draft's binding revision in it brings a journal at that version back first, so that the check
+    // below reads the journal as the release will. The revisions are kept beside the journal and
+    // nothing is lost; each journal brought back is told at once, so a refusal after it says so.
+    if report.rolled_back
+        && let Err(error) =
+            formats::bring_the_journals_back(target, &every, &mut report.brought_back)
+    {
+        drop(holds);
+        return Err(undo(store, record, error).await);
+    }
     // Every store the target lists, read where the target's manifest says it is, before anything is
     // brought forward: a switch the target cannot read the stores for is refused with nothing
     // changed, and every daemon it stopped is started again.
@@ -3429,6 +3536,8 @@ mod tests {
                 from: 4,
                 to: 6,
             }],
+            brought_back: Vec::new(),
+            draft_limit: false,
             unreached: vec![Unreached {
                 runtime_root: PathBuf::from("/runtime/gone"),
                 state_root: PathBuf::from("/state/gone"),
@@ -3462,6 +3571,81 @@ mod tests {
         );
     }
 
+    /// A rollback says which transfers journals it brought back and what the release it goes to does
+    /// with a prompt that names a draft; one that did not finish says what it had already done.
+    #[test]
+    fn a_rollback_says_what_it_brought_back_and_the_limit_of_the_release_it_goes_to() {
+        let release = |name: &str| ReleaseName::new(name).expect("a release name");
+        let environment = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        let lowered = || LoweredJournal {
+            environment,
+            from: 6,
+            to: 5,
+        };
+        let updated = |draft_limit: bool| Updated {
+            source: release("0.2.0+bbbbbbbbbbbb"),
+            target: release("0.1.0+aaaaaaaaaaaa"),
+            restarted: Vec::new(),
+            removed: Vec::new(),
+            not_removed: Vec::new(),
+            carried: Vec::new(),
+            brought_back: vec![lowered()],
+            draft_limit,
+            unreached: Vec::new(),
+            checked_only: false,
+            rolled_back: true,
+        };
+        let said = |lines: Vec<Shown>| {
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let text = said(updated(true).lines());
+        assert!(
+            text.contains("transfers journal was at schema version 6 and was brought back to 5"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "records a prompt that names a draft written for an application under the binding \
+                 revision in force at the prompt, not the one the draft was written under; this \
+                 rollback ended no draft"
+            ),
+            "{text}"
+        );
+        let json = updated(true).document().json();
+        assert_eq!(json["draft_limit"], true, "{json}");
+        assert_eq!(json["brought_back"][0]["from"], 6, "{json}");
+        assert_eq!(json["brought_back"][0]["to"], 5, "{json}");
+        let without = said(updated(false).lines());
+        assert!(
+            !without.contains("records a prompt that names a draft"),
+            "{without}"
+        );
+        assert_eq!(updated(false).document().json()["draft_limit"], false);
+
+        let refused = Report {
+            carried: Vec::new(),
+            brought_back: vec![lowered()],
+            unreached: Vec::new(),
+            check: false,
+            rolled_back: true,
+        }
+        .annotate(CliError::Other(Shown::said("a store was refused")));
+        let note = refused.to_string();
+        assert!(
+            note.contains(
+                "The rollback had already brought back the transfers journal of environment"
+            ) && note.contains(
+                "from schema version 6 to 5; this release reads those journals as they are now"
+            ),
+            "{note}"
+        );
+    }
+
     /// Whatever ends an update after its survey says what it had carried and could not reach, in the
     /// kind of error it was and with its exit code: a wait stays a wait, a failure a failure, and a
     /// local IPC failure, which exits with 3 as a host that is not available does, says it too.
@@ -3487,6 +3671,7 @@ mod tests {
                     to: 6,
                 },
             ],
+            brought_back: Vec::new(),
             unreached: vec![unreached("one"), unreached("two")],
             check,
             rolled_back: false,
@@ -3545,6 +3730,7 @@ mod tests {
         // A check names what an update would not reach, and carries nothing.
         let checked = Report {
             carried: Vec::new(),
+            brought_back: Vec::new(),
             unreached: vec![unreached("one")],
             check: true,
             rolled_back: false,
@@ -3559,6 +3745,7 @@ mod tests {
         // Nothing carried and nothing unreached: the error is as it was.
         let plain = Report {
             carried: Vec::new(),
+            brought_back: Vec::new(),
             unreached: Vec::new(),
             check: false,
             rolled_back: false,

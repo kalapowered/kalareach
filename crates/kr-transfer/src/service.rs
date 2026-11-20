@@ -2094,11 +2094,11 @@ impl TransferService {
         }
         ask_admission(action)?;
         // A draft that names an application keeps the binding revision it was written under, and
-        // a build before this one ignores the revision and would send the draft under another. A
-        // journal that still holds sessions of an earlier build may be read by such a build until
-        // they have ended, so no draft of this kind is made in it until then, as no attachment is
-        // offered from it ([`Self::insertion_begin`]). A repeat of a create already performed was answered
-        // above.
+        // a build before this one keeps none: it records a prompt that names the draft under
+        // whichever revision the prompt is made under. A journal that still holds sessions of an
+        // earlier build may be read by such a build until they have ended, so no draft of this
+        // kind is made in it until then, as no attachment is offered from it
+        // ([`Self::insertion_begin`]). A repeat of a create already performed was answered above.
         if row.application_instance_id.is_some() && store.noting()? != Noting::Done {
             return Err(TransferError::store(
                 "the journal still holds sessions of an earlier build, so no draft that names an \
