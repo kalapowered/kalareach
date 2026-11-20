@@ -3646,15 +3646,19 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     mod held {
         use std::io::{BufRead as _, BufReader, Write as _};
-        use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-        use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+        use std::process::{Child, ChildStdin, Command, Stdio};
+        use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+        use std::sync::{Arc, Condvar, Mutex, PoisonError};
         use std::thread::JoinHandle;
+        use std::time::Duration;
 
         /// Set in the process that serves.
         pub(super) const SERVES: &str = "KR_IDENTITY_TEST_SERVES";
         /// What marks each line that the process that serves says. The harness's own text can
         /// come before it on the same line.
         const SAYS: &str = "held: ";
+        /// What a case waits for a thing the process says, before it fails.
+        const REPLY: Duration = Duration::from_secs(60);
 
         /// Threads wait for it, and [`Signal::give`] lets them all go.
         #[derive(Clone, Default)]
@@ -3684,6 +3688,8 @@ mod tests {
             /// Threads older than the owner, each of which makes a thread when the gate opens and
             /// ends.
             holders: Vec<JoinHandle<JoinHandle<()>>>,
+            /// The threads the holders made, once the gate has opened and they have ended.
+            replacements: Vec<JoinHandle<()>>,
             /// The thread that has the child, which ends when it is told to leave, with the child
             /// running.
             owner: JoinHandle<Child>,
@@ -3737,6 +3743,7 @@ mod tests {
                 gate,
                 over,
                 holders,
+                replacements: Vec::new(),
                 owner,
                 leave,
                 younger: None,
@@ -3760,6 +3767,9 @@ mod tests {
                     .join()
                     .expect("its replacement ends");
             }
+            for replacement in round.replacements {
+                replacement.join().expect("a replacement ends");
+            }
             if let Some((parked, thread)) = round.younger {
                 parked.give();
                 thread.join().expect("the younger thread ends");
@@ -3771,7 +3781,8 @@ mod tests {
         /// - `begin <n>`: `n` holders, then the owner with a child; says `held <child> <owner's
         ///   thread>`.
         /// - `younger`: a thread younger than the owner; says `younger` once it has begun.
-        /// - `open`: the gate the holders wait at opens, and each makes a thread and ends.
+        /// - `open`: the gate the holders wait at opens, and each makes a thread and ends; says
+        ///   `churned` when all of them have.
         /// - `leave`: the owner ends, with its child running.
         /// - `finish`: the round ends; says `done`.
         pub(super) fn serve() {
@@ -3796,7 +3807,15 @@ mod tests {
                         round.younger = Some((parked, thread));
                         println!("{SAYS}younger");
                     }
-                    (Some("open"), Some(round)) => round.gate.give(),
+                    (Some("open"), Some(round)) => {
+                        round.gate.give();
+                        for holder in round.holders.drain(..) {
+                            round
+                                .replacements
+                                .push(holder.join().expect("a holder ends"));
+                        }
+                        println!("{SAYS}churned");
+                    }
                     (Some("leave"), Some(round)) => {
                         let _ = round.leave.send(());
                     }
@@ -3832,7 +3851,7 @@ mod tests {
         pub(super) struct Held {
             process: Child,
             commands: Commands,
-            said: BufReader<ChildStdout>,
+            said: Receiver<String>,
         }
 
         impl Held {
@@ -3851,10 +3870,24 @@ mod tests {
                     .expect("the process starts");
                 let input = process.stdin.take().expect("its input");
                 let output = process.stdout.take().expect("its output");
+                let (tell, said) = mpsc::channel();
+                // What the process says is read as it comes, so that a case can look for it
+                // without waiting. The channel ends with the process.
+                std::thread::spawn(move || {
+                    for line in BufReader::new(output).lines().map_while(Result::ok) {
+                        if let Some(at) = line.find(SAYS)
+                            && tell
+                                .send(line[at + SAYS.len()..].trim_end().to_owned())
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
                 Self {
                     process,
                     commands: Commands(Arc::new(Mutex::new(Some(input)))),
-                    said: BufReader::new(output),
+                    said,
                 }
             }
 
@@ -3868,12 +3901,13 @@ mod tests {
 
             /// The next thing the process says, which is a line of it among the harness's own.
             fn hear(&mut self) -> String {
-                loop {
-                    let mut line = String::new();
-                    let read = self.said.read_line(&mut line).expect("the process speaks");
-                    assert!(read > 0, "the process ended without saying what was asked");
-                    if let Some(at) = line.find(SAYS) {
-                        return line[at + SAYS.len()..].trim_end().to_owned();
+                match self.said.recv_timeout(REPLY) {
+                    Ok(said) => said,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        panic!("the process ended without saying what was asked")
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        panic!("the process said nothing in a minute")
                     }
                 }
             }
@@ -3899,9 +3933,25 @@ mod tests {
                 assert_eq!(self.hear(), "younger");
             }
 
-            /// Lets the holders go on: each makes a thread and ends. Nothing is waited for.
+            /// Lets the holders go on: each makes a thread and ends. Nothing is waited for: the
+            /// process says when all of them have, and [`Held::churned`] tells whether it has.
             pub(super) fn open(&self) {
                 self.commands.send("open");
+            }
+
+            /// Whether the process has said that the threads that `open` let go have ended. It
+            /// does not wait for it to say so.
+            pub(super) fn churned(&self) -> bool {
+                match self.said.try_recv() {
+                    Ok(said) => {
+                        assert_eq!(said, "churned", "the process says the churn is over");
+                        true
+                    }
+                    Err(TryRecvError::Empty) => false,
+                    Err(TryRecvError::Disconnected) => {
+                        panic!("the process ended without saying the churn was over")
+                    }
+                }
             }
 
             pub(super) fn finish(&mut self) {
@@ -4005,15 +4055,19 @@ mod tests {
     /// it, and a listing taken up again after it finds its place by counting threads, which lands
     /// after a thread that stayed when the ones ahead of it have gone and takes in the threads made
     /// since. A child that is alive is listed whatever the process's other threads do. The threads
-    /// are those of a process that only this case changes: in this test's own process the other
+    /// are those of a process that only this case changes, and they go on its word alone, so each
+    /// round's churn is a finite one that a reading settles: in this test's own process the other
     /// cases' threads come and go as well, and a reading that never meets two passes alike is
     /// refused.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_live_child_is_listed_while_the_process_s_other_threads_come_and_go() {
+        use std::time::{Duration, Instant};
+
         const ROUNDS: usize = 300;
         let mut held = held::Held::start();
         let pid = held.pid();
+        let mut readings = 0_usize;
         let mut unlisted = Vec::new();
         for round in 0..ROUNDS {
             // Threads made before the one that holds the child, which each make a thread and leave
@@ -4021,17 +4075,31 @@ mod tests {
             // with the child, and new threads follow it.
             let (child, _) = held.begin(16);
             held.open();
-            let children =
-                super::children_of(pid).expect("the kernel lists the process's children");
-            if !children.contains(&child) {
-                unlisted.push(round);
+            // The process is read as often as the churn takes, and the child is alive throughout:
+            // it is ended only when the round is over.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                let children =
+                    super::children_of(pid).expect("the kernel lists the process's children");
+                readings += 1;
+                if !children.contains(&child) {
+                    unlisted.push(round);
+                }
+                if held.churned() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the churn was over within a minute"
+                );
             }
             held.finish();
         }
         held.end();
         assert!(
             unlisted.is_empty(),
-            "a child that was alive went unlisted in {} of {ROUNDS} readings, the first in round {:?}",
+            "a child that was alive went unlisted in {} of {readings} readings in {ROUNDS} rounds, \
+             the first in round {:?}",
             unlisted.len(),
             unlisted.first()
         );
