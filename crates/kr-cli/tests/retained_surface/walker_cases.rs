@@ -13,7 +13,7 @@ fn manifest(name: &str) -> String {
     format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n")
 }
 
-fn write(root: &Path, path: &str, text: &str) {
+pub(super) fn write(root: &Path, path: &str, text: &str) {
     let full = root.join(path);
     std::fs::create_dir_all(full.parent().expect("a parent")).expect("a directory");
     std::fs::write(full, text).expect("a file");
@@ -21,7 +21,7 @@ fn write(root: &Path, path: &str, text: &str) {
 
 /// A tree with a `kr-worker` crate, a `kr-sender` crate whose library is `lib`, and a
 /// `kr-protocol` crate.
-fn small_tree(lib: &str) -> tempfile::TempDir {
+pub(super) fn small_tree(lib: &str) -> tempfile::TempDir {
     let folder = tempfile::tempdir().expect("a temporary directory");
     for (name, source) in [
         ("kr-worker", "pub fn worker() {}\n"),
@@ -203,11 +203,15 @@ impl Holder {
     fn in_method(&self) { let _ = Method::PluginActionInvoke; }
     #[cfg(test)]
     fn test_method(&self) { let _ = Method::AgentTurnCancel; }
+    #[cfg(all(test, unix))]
+    fn test_member(&self) { let _ = Method::AgentTurnCancel; }
 }
 trait Sends {
     fn default_method(&self) { let _ = Method::AgentTurnSteer; }
     #[cfg(test)]
     fn test_only(&self) { let _ = MutationRequest { x: 1 }; }
+    #[cfg(not(not(test)))]
+    fn test_only_too(&self) { let _ = MutationRequest { x: 1 }; }
 }
 mod inline {
     fn in_inline() { let _ = MutationRequest { x: 1 }; }
@@ -216,6 +220,15 @@ mod inline {
 }
 #[cfg(any(test, feature = "testing"))]
 fn kept_by_feature() { let _ = Method::AgentPromptQueue; }
+#[cfg(not(all(test, unix)))]
+fn kept_by_not() { let _ = Method::AgentPromptQueue; }
+#[cfg(all(test, windows))]
+fn under_all_test() { let _ = Method::AgentTurnCancel; }
+mod inline_all {
+    fn in_all() { let _ = MutationRequest { x: 1 }; }
+    #[cfg(all(test, unix))]
+    mod tests { fn deep_all() { let _ = Method::AgentTurnCancel; } }
+}
 const SUBMIT: Method = Method::AgentPromptSubmit;
 static QUEUE: &str = "agent.prompt.queue";
 #[serde(rename = "agent.turn.cancel")]
@@ -314,7 +327,10 @@ fn sender_tree() -> tempfile::TempDir {
     folder
 }
 
-fn names(sightings: &[super::walker::Sighting], krate: &str) -> BTreeMap<String, Vec<SightKind>> {
+pub(super) fn names(
+    sightings: &[super::walker::Sighting],
+    krate: &str,
+) -> BTreeMap<String, Vec<SightKind>> {
     sightings
         .iter()
         .filter(|sighting| sighting.krate == krate)
@@ -352,6 +368,8 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("target", vec![Target]),
         ("returns_only", vec![Target]),
         ("kept_by_feature", vec![Names]),
+        ("kept_by_not", vec![Names]),
+        ("in_all", vec![Request]),
         ("SUBMIT", vec![Names]),
         ("QUEUE", vec![Names]),
         ("Renamed", vec![Names]),
