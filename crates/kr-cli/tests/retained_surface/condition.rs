@@ -12,8 +12,9 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use quote::ToTokens as _;
+use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
-use syn::{Attribute, Expr, Lit, Meta, Token};
+use syn::{Attribute, Expr, Ident, Lit, LitBool, Meta, Token};
 
 /// A supported platform with the atoms that depend on it.
 struct Platform {
@@ -141,12 +142,12 @@ impl Condition {
         for attribute in attrs {
             if attribute.path().is_ident("cfg") {
                 let meta = attribute
-                    .parse_args::<Meta>()
+                    .parse_args_with(parse_meta)
                     .map_err(|_| unreadable(at, &attribute.to_token_stream().to_string()))?;
                 added.push(predicate(&meta, at)?);
             } else if attribute.path().is_ident("cfg_attr") {
                 let listed = attribute
-                    .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                    .parse_args_with(parse_metas)
                     .map_err(|_| unreadable(at, &attribute.to_token_stream().to_string()))?;
                 let adds = sets_path_or_condition(&listed);
                 if adds && sets.is_none() {
@@ -190,7 +191,7 @@ impl Condition {
             }
             if attribute.path().is_ident("cfg_attr") {
                 let listed = attribute
-                    .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                    .parse_args_with(parse_metas)
                     .map_err(|_| unreadable(at, &attribute.to_token_stream().to_string()))?;
                 if self.added_by(&listed, name, &mut Vec::new(), at)? {
                     return Ok(true);
@@ -224,7 +225,7 @@ impl Condition {
                 && list.path.is_ident("cfg_attr")
             {
                 let inner = list
-                    .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                    .parse_args_with(parse_metas)
                     .map_err(|_| unreadable(at, &meta.to_token_stream().to_string()))?;
                 found = self.added_by(&inner, name, guards, at)?;
             }
@@ -242,7 +243,7 @@ impl Condition {
 fn sets_path_or_condition(listed: &Punctuated<Meta, Token![,]>) -> bool {
     listed.iter().skip(1).any(|meta| match meta {
         Meta::List(list) if list.path.is_ident("cfg_attr") => list
-            .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            .parse_args_with(parse_metas)
             .map_or(true, |inner| sets_path_or_condition(&inner)),
         _ => ["cfg", "path"]
             .iter()
@@ -252,6 +253,22 @@ fn sets_path_or_condition(listed: &Punctuated<Meta, Token![,]>) -> bool {
 
 fn unreadable(at: &str, text: &str) -> String {
     format!("{at}: the scan cannot read the condition {text}")
+}
+
+/// One meta item as a `cfg` writes it. `syn` takes no `true` or `false` as the outermost path of a
+/// meta item, and a predicate may be either.
+fn parse_meta(input: ParseStream) -> syn::Result<Meta> {
+    if input.peek(LitBool) {
+        let flag: LitBool = input.parse()?;
+        let name = if flag.value { "true" } else { "false" };
+        return Ok(Meta::Path(Ident::new(name, flag.span()).into()));
+    }
+    input.parse()
+}
+
+/// The meta items of a list, each read by `parse_meta`.
+fn parse_metas(input: ParseStream) -> syn::Result<Punctuated<Meta, Token![,]>> {
+    Punctuated::parse_terminated_with(input, parse_meta)
 }
 
 fn predicate(meta: &Meta, at: &str) -> Result<Predicate, String> {
@@ -291,7 +308,7 @@ fn predicate(meta: &Meta, at: &str) -> Result<Predicate, String> {
         Meta::List(list) => {
             let name = list.path.get_ident().ok_or_else(bad)?.to_string();
             let inner = list
-                .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                .parse_args_with(parse_metas)
                 .map_err(|_| bad())?
                 .iter()
                 .map(|meta| predicate(meta, at))
