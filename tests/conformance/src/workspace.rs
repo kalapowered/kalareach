@@ -399,10 +399,13 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
                     .as_str()
                     .ok_or("a target without a path")?,
             );
-            // Cargo omits `test` in older formats; a benchmark and an example are only tested when
-            // asked for by name, whatever the manifest says.
-            let tested = target["test"].as_bool().unwrap_or(true)
-                && matches!(kind, TargetKind::Lib | TargetKind::Bin | TargetKind::Test);
+            // What Cargo says is tested when no flag names targets: a library, a binary and an
+            // integration test unless their manifest says otherwise, and an example or a
+            // benchmark only when its manifest says `test = true`. Older formats omit `test`.
+            let tested = target["test"].as_bool().unwrap_or(matches!(
+                kind,
+                TargetKind::Lib | TargetKind::Bin | TargetKind::Test
+            ));
             targets.push(Target {
                 id: TargetId {
                     package: name.clone(),
@@ -550,6 +553,8 @@ mod tests {
                         { "kind": ["lib"], "name": "a", "src_path": "/w/a/src/lib.rs", "test": true },
                         { "kind": ["test"], "name": "flow", "src_path": "/w/a/tests/flow.rs", "test": true },
                         { "kind": ["bench"], "name": "speed", "src_path": "/w/a/benches/speed.rs", "test": false },
+                        { "kind": ["example"], "name": "plain", "src_path": "/w/a/examples/plain.rs", "test": false },
+                        { "kind": ["example"], "name": "checked", "src_path": "/w/a/examples/checked.rs", "test": true },
                         { "kind": ["custom-build"], "name": "build-script-build", "src_path": "/w/a/build.rs" }
                     ]
                 },
@@ -568,7 +573,9 @@ mod tests {
             [
                 (TargetKind::Lib, true),
                 (TargetKind::Test, true),
-                (TargetKind::Bench, false)
+                (TargetKind::Bench, false),
+                (TargetKind::Example, false),
+                (TargetKind::Example, true)
             ]
         );
         assert_eq!(packages[0].targets[1].id.to_string(), "a --test flow");

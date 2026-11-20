@@ -11,6 +11,7 @@
 //! source with.
 
 pub mod clike;
+pub mod coverage;
 pub mod evidence;
 pub mod id;
 pub mod identity;
