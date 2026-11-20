@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
@@ -31,6 +31,7 @@ use crate::plan_file::{Plan, Values};
 use crate::run::{self, Executed};
 use crate::runner_copy;
 use crate::scratch::{self, Scratch};
+use crate::tree::Deadline;
 use crate::workspace::{TargetId, TargetKind};
 
 /// The result's schema identifier.
@@ -596,6 +597,11 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                     evidence: &options.evidence,
                     environment: &environment,
                     lister: &runner,
+                    deadline: step.timeout.map(|seconds| Deadline {
+                        at: Instant::now() + Duration::from_secs(seconds),
+                        seconds,
+                        budget: false,
+                    }),
                 },
                 &map.packages,
             ),

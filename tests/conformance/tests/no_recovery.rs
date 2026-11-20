@@ -19,20 +19,23 @@ const PROGRAMS: [&str; 11] = [
     "rmdir",
 ];
 
-/// Names of functions that remove from the disk, replace a file or signal a process, wherever
-/// they are written: called, taken as a value, given type arguments, imported or renamed.
-const NAMES: [&str; 10] = [
+/// Names of functions that remove from the disk, replace a file or signal a process, and of the
+/// type that names a signal, wherever they are written: called, taken as a value, given type
+/// arguments, imported or renamed. So is every name that begins with `kill`, which covers `kill`,
+/// `killpg` and `kill_process_group`.
+const NAMES: [&str; 8] = [
     "remove_dir_all",
     "remove_dir",
     "remove_file",
     "rename",
     "unlink",
     "rmdir",
-    "kill",
-    "killpg",
     "process_group",
     "TerminateProcess",
 ];
+
+/// The name of the type that names a signal.
+const SIGNAL_TYPE: &str = "Signal";
 
 /// Names of signals, whenever they are written.
 const SIGNALS: [&str; 2] = ["SIGKILL", "SIGTERM"];
@@ -229,15 +232,15 @@ fn product_tokens(source: &str) -> Result<Vec<Token>, String> {
 
 /// What in `source` removes, replaces, signals or starts a program that does, each with its line.
 fn found(source: &str) -> Result<Vec<String>, String> {
-    Ok(found_in(&product_tokens(source)?, None))
+    Ok(found_in(&product_tokens(source)?, &[]))
 }
 
-/// What in `tokens` does, each with its line, except the token at `excused`.
-fn found_in(tokens: &[Token], excused: Option<usize>) -> Vec<String> {
+/// What in `tokens` does, each with its line, except the tokens at `excused`.
+fn found_in(tokens: &[Token], excused: &[usize]) -> Vec<String> {
     let in_attribute = inside_attributes(tokens);
     let mut found = Vec::new();
     for (at, token) in tokens.iter().enumerate() {
-        if excused == Some(at) {
+        if excused.contains(&at) {
             continue;
         }
         let what = match &token.tok {
@@ -246,6 +249,8 @@ fn found_in(tokens: &[Token], excused: Option<usize>) -> Vec<String> {
             }
             Tok::Ident(name)
                 if SIGNALS.contains(&name.as_str())
+                    || name == SIGNAL_TYPE
+                    || name.starts_with("kill")
                     || (NAMES.contains(&name.as_str())
                         // `rename = "x"` is the key of an attribute, as in `#[serde(rename = "x")]`,
                         // and is not one anywhere else.
@@ -309,17 +314,146 @@ fn scratch_removal(tokens: &[Token]) -> Option<usize> {
     })
 }
 
+/// The runs of words, each written once in the block of `impl Group` in `tree.rs`, that start a
+/// step's command as the leader of a process group of its own and signal that group and no other
+/// process: the group's leader is the pid of the child the report started, and the signal is
+/// `TERM`, then `KILL`. The lexer keeps no value for a number, so the `0` of the first run stands
+/// for any number.
+const GROUP_CALLS: [&[&str]; 3] = [
+    &[
+        "std",
+        ":",
+        ":",
+        "os",
+        ":",
+        ":",
+        "unix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "CommandExt",
+        ":",
+        ":",
+        "process_group",
+        "(",
+        "command",
+        ",",
+        "0",
+        ")",
+    ],
+    &[
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "kill_process_group",
+        "(",
+        "self",
+        ".",
+        "leader",
+        ",",
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Signal",
+        ":",
+        ":",
+        "TERM",
+        ")",
+    ],
+    &[
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "kill_process_group",
+        "(",
+        "self",
+        ".",
+        "leader",
+        ",",
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Signal",
+        ":",
+        ":",
+        "KILL",
+        ")",
+    ],
+];
+
+/// The positions of the names the check refuses inside the first written copy of each run of
+/// [`GROUP_CALLS`] that lies in the block of `impl Group`: no other call, operand, signal or place
+/// is one.
+fn group_calls(tokens: &[Token]) -> Vec<usize> {
+    let word = |at: usize| match tokens.get(at).map(|token| &token.tok) {
+        Some(Tok::Ident(name)) => Some(name.as_str()),
+        _ => None,
+    };
+    let Some(opens) = (0..tokens.len()).find(|&at| {
+        word(at) == Some("impl")
+            && word(at + 1) == Some("Group")
+            && tokens.get(at + 2).is_some_and(|token| token.is_punct('{'))
+    }) else {
+        return Vec::new();
+    };
+    let closes = end_of_item(tokens, opens + 2);
+    let mut excused = Vec::new();
+    for run in GROUP_CALLS {
+        let found = (opens..closes).find(|&at| {
+            at + run.len() <= closes
+                && run.iter().enumerate().all(|(offset, text)| {
+                    tokens
+                        .get(at + offset)
+                        .is_some_and(|token| match &token.tok {
+                            Tok::Ident(name) => name == text,
+                            Tok::Punct(c) => text.len() == 1 && text.starts_with(*c),
+                            Tok::Number => *text == "0",
+                            _ => false,
+                        })
+                })
+        });
+        if let Some(at) = found {
+            excused.extend(
+                run.iter()
+                    .enumerate()
+                    .filter(|(_, text)| {
+                        matches!(**text, "process_group" | "kill_process_group" | SIGNAL_TYPE)
+                    })
+                    .map(|(offset, _)| at + offset),
+            );
+        }
+    }
+    excused
+}
+
 /// What in the source of the file `path` (below the sources' directory) the check refuses. The
 /// report removes one thing, its run's scratch directory, and that call is allowed in `scratch.rs`
-/// at the sources' top and nowhere else.
+/// at the sources' top and nowhere else; it signals one kind of process group, a step's own, and
+/// those calls are allowed in `tree.rs` at the sources' top and nowhere else.
 fn refused(path: &Path, source: &str) -> Result<Vec<String>, String> {
     let tokens = product_tokens(source)?;
-    let excused = if path == Path::new("scratch.rs") {
-        scratch_removal(&tokens)
+    let excused: Vec<usize> = if path == Path::new("scratch.rs") {
+        scratch_removal(&tokens).into_iter().collect()
+    } else if path == Path::new("tree.rs") {
+        group_calls(&tokens)
     } else {
-        None
+        Vec::new()
     };
-    Ok(found_in(&tokens, excused))
+    Ok(found_in(&tokens, &excused))
 }
 
 /// The Rust sources in `directory` and in each directory below it.
@@ -420,6 +554,109 @@ fn the_check_lets_through_the_scratch_removal_and_no_other() {
     }
 }
 
+/// The calls that start a step's command as a group's leader and signal that group are the ones the
+/// check lets through: the three written in the block of `impl Group` in `tree.rs`, and no other
+/// call, operand, signal, form or place.
+#[test]
+fn the_check_lets_through_the_groups_own_calls_and_no_other() {
+    let group_with = |body: &str| {
+        format!(
+            "impl Group {{\n    fn f(&self, command: &mut Command) {{\n        {body}\n    }}\n}}\n"
+        )
+    };
+    let start = "std::os::unix::process::CommandExt::process_group(command, 0);";
+    let term =
+        "let _ = rustix::process::kill_process_group(self.leader, rustix::process::Signal::TERM);";
+    let kill = term.replace("TERM", "KILL");
+    let allowed = |path: &str, source: &str| {
+        refused(Path::new(path), source)
+            .expect("a source")
+            .is_empty()
+    };
+    let all = format!("{start} {term} {kill}");
+    assert!(allowed("tree.rs", &group_with(&all)));
+    assert!(allowed("tree.rs", &group_with(term)));
+    for (what, path, source) in [
+        (
+            "the same text in another file",
+            "other.rs",
+            group_with(&all),
+        ),
+        (
+            "the same text in a tree.rs below the top",
+            "nested/tree.rs",
+            group_with(&all),
+        ),
+        (
+            "a second signal call",
+            "tree.rs",
+            group_with(&format!("{term} {term}")),
+        ),
+        (
+            "a second start",
+            "tree.rs",
+            group_with(&format!("{start} {start}")),
+        ),
+        (
+            "another operand, a pid",
+            "tree.rs",
+            group_with(&term.replace("self.leader", "pid")),
+        ),
+        (
+            "another operand, a field",
+            "tree.rs",
+            group_with(&term.replace("self.leader", "self.other")),
+        ),
+        (
+            "another signal",
+            "tree.rs",
+            group_with(&term.replace("TERM", "HUP")),
+        ),
+        (
+            "one process and not a group",
+            "tree.rs",
+            group_with(&term.replace("kill_process_group", "kill_process")),
+        ),
+        (
+            "the report's own group",
+            "tree.rs",
+            group_with(
+                "let _ = rustix::process::kill_current_process_group(rustix::process::Signal::TERM);",
+            ),
+        ),
+        (
+            "libc's call",
+            "tree.rs",
+            group_with("let _ = libc::killpg(self.leader, 15);"),
+        ),
+        (
+            "an import of the signal type",
+            "tree.rs",
+            format!("use rustix::process::Signal;\n{}", group_with(&all)),
+        ),
+        (
+            "a start spelled as a method",
+            "tree.rs",
+            group_with("command.process_group(0);"),
+        ),
+        (
+            "the calls outside the block of the impl",
+            "tree.rs",
+            format!("fn stray(&self) {{ {term} }}\n{}", group_with("()")),
+        ),
+        (
+            "the calls in the block of another impl",
+            "tree.rs",
+            format!(
+                "impl Other {{ fn f(&self) {{ {term} }} }}\n{}",
+                group_with("()")
+            ),
+        ),
+    ] {
+        assert!(!allowed(path, &source), "{what}: let through");
+    }
+}
+
 #[test]
 fn the_check_finds_what_it_is_there_for() {
     for code in [
@@ -447,6 +684,12 @@ fn the_check_finds_what_it_is_there_for() {
         "child.kill ()",
         "Child::kill(&mut child)",
         "nix::sys::signal::kill(pid, signal)",
+        "rustix::process::kill_process_group(group, signal)",
+        "rustix::process::kill_process(pid, signal)",
+        "rustix::process::kill_current_process_group(signal)",
+        "libc::killpg(group, 15)",
+        "let signal: Signal = x;",
+        "command.process_group(0);",
         "command.process_group(0);",
         "let signal = SIGKILL;",
         "let remove = std::fs::remove_file;",

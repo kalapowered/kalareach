@@ -37,6 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::lane;
 use crate::libtest::{self, Binary, Recording};
 use crate::plan::{Reading, Step, Tests};
+use crate::tree::{self, Deadline, Waited};
 use crate::vitest;
 use crate::workspace::{Package, TargetId, TargetKind};
 
@@ -73,10 +74,27 @@ pub struct Executed {
     /// The programs its log says could not be run, and what their files looked like when the
     /// step ended, when it failed so.
     pub observation: Option<crate::observe::Observed>,
+    /// Whether its time was spent and its processes were ended; its `error` says so.
+    pub timed_out: bool,
+}
+
+/// Why a step's command did not run to its end.
+enum Stop {
+    /// It could not be run, or what it left could not be read, for this reason.
+    Failed(String),
+    /// Its time was spent and its processes were ended.
+    TimedOut,
+}
+
+impl From<String> for Stop {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
 }
 
 /// Where a step runs: the repository, the directory of it the step runs in, the evidence
-/// directory, and the variables it is run with beyond the report's own environment.
+/// directory, the variables it is run with beyond the report's own environment, and when its time
+/// is spent.
 #[derive(Clone, Copy, Debug)]
 pub struct Place<'a> {
     /// The repository.
@@ -90,6 +108,9 @@ pub struct Place<'a> {
     pub environment: &'a [(String, String)],
     /// This program, which Cargo runs each test binary through while the step's tests are listed.
     pub lister: &'a Path,
+    /// When the step's time is spent, when it has a limit: its build, the listing of its tests and
+    /// its run all end by then.
+    pub deadline: Option<Deadline>,
 }
 
 impl Place<'_> {
@@ -141,6 +162,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         error: None,
         blocked_by: None,
         observation: None,
+        timed_out: false,
     };
     if let Err(error) = std::fs::create_dir_all(&logs) {
         executed.error = Some(format!("the log directory could not be made: {error}"));
@@ -208,10 +230,9 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
             });
         match prepared {
             Ok(listed) => executed.listed = listed,
-            Err(error) => {
+            Err(stop) => {
                 executed.seconds = started.elapsed().as_secs();
-                executed.error = Some(error);
-                return executed;
+                return stopped(executed, stop, place, &log_path);
             }
         }
     }
@@ -219,10 +240,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
     executed.seconds = started.elapsed().as_secs();
     match status {
         Ok(code) => executed.exit = code,
-        Err(error) => {
-            executed.error = Some(error);
-            return executed;
-        }
+        Err(stop) => return stopped(executed, stop, place, &log_path),
     }
     let output = match std::fs::read(&log_path) {
         Ok(bytes) => {
@@ -299,6 +317,23 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
     executed
 }
 
+/// `executed` for a step that stopped for `stop`: its error is the reason, or that its time was
+/// spent, which the log says too.
+fn stopped(mut executed: Executed, stop: Stop, place: &Place<'_>, log_path: &Path) -> Executed {
+    match stop {
+        Stop::Failed(error) => executed.error = Some(error),
+        Stop::TimedOut => {
+            let said = place.deadline.map_or_else(String::new, |deadline| {
+                format!("ran out of its time limit: {} s", deadline.seconds)
+            });
+            let _ = append_to_log(log_path, &format!("== {said}\n"));
+            executed.timed_out = true;
+            executed.error = Some(said);
+        }
+    }
+    executed
+}
+
 /// What a step that was not run is: `step` did not run because the set-up step `number` (`what`)
 /// did not exit 0 or could not be run, which `why` tells.
 #[must_use]
@@ -319,6 +354,7 @@ pub fn not_run(step: &Step, number: usize, what: &str, why: &str) -> Executed {
         )),
         blocked_by: Some(number),
         observation: None,
+        timed_out: false,
     }
 }
 
@@ -525,7 +561,7 @@ pub fn run_one(arguments: &[String]) -> u8 {
 
 /// The variable that makes Cargo run each test binary through this program's `command`, and its
 /// value.
-fn runner(place: &Place<'_>, command: &str) -> Result<(String, String), String> {
+fn runner(place: &Place<'_>, command: &str) -> Result<(String, String), Stop> {
     let lister = place
         .lister
         .to_str()
@@ -572,7 +608,7 @@ fn recording(
     number: usize,
     harness: &BTreeSet<String>,
     records: &Path,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String)>, Stop> {
     let (variable, runner) = runner(place, "run-one")?;
     let list: String = harness.iter().map(|name| format!("{name}\n")).collect();
     std::fs::create_dir(records)
@@ -656,17 +692,24 @@ fn unrecorded(
 }
 
 /// The host's target triple, as the toolchain the step builds with names it.
-fn host(place: &Place<'_>) -> Result<String, String> {
-    let output = place
-        .command(&["rustc".to_owned(), "-vV".to_owned()])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("rustc could not be asked for the host: {error}"))?;
-    String::from_utf8_lossy(&output.stdout)
+fn host(place: &Place<'_>) -> Result<String, Stop> {
+    let output = match tree::output(
+        place
+            .command(&["rustc".to_owned(), "-vV".to_owned()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped()),
+        place.deadline,
+    )
+    .map_err(|error| format!("rustc could not be asked for the host: {error}"))?
+    {
+        Waited::Done(output) => output,
+        Waited::TimedOut => return Err(Stop::TimedOut),
+    };
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .map(|host| host.trim().to_owned())
-        .ok_or_else(|| "rustc named no host".to_owned())
+        .ok_or_else(|| "rustc named no host".to_owned())?)
 }
 
 /// Every test each binary of a step holds, whatever the step's own filters are, as each binary
@@ -690,7 +733,7 @@ fn list(
     log_path: &Path,
     executables: &BTreeMap<String, TargetId>,
     packages: &[Package],
-) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
+) -> Result<BTreeMap<TargetId, BTreeSet<String>>, Stop> {
     let (variable, runner) = runner(place, "list-one")?;
     let own: Vec<&str> = executables
         .iter()
@@ -704,15 +747,21 @@ fn list(
         .cloned()
         .collect();
     command.extend(["--".to_owned(), "--list".to_owned()]);
-    let output = place
-        .command(&command)
-        .env(&variable, runner)
-        .env(STEP_VARIABLE, number.to_string())
-        .env(OWN_HARNESS_VARIABLE, own.join(","))
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("the step's tests could not be listed: {error}"))?;
+    let output = match tree::output(
+        place
+            .command(&command)
+            .env(&variable, runner)
+            .env(STEP_VARIABLE, number.to_string())
+            .env(OWN_HARNESS_VARIABLE, own.join(","))
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped()),
+        place.deadline,
+    )
+    .map_err(|error| format!("the step's tests could not be listed: {error}"))?
+    {
+        Waited::Done(output) => output,
+        Waited::TimedOut => return Err(Stop::TimedOut),
+    };
     let standard_error = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         let command = command.join(" ");
@@ -727,10 +776,10 @@ fn list(
             &standard_error,
         )
         .map_or_else(|error| error, |()| "the log has all of it".to_owned());
-        return Err(format!(
+        return Err(Stop::Failed(format!(
             "`{command}` did not list the step's tests (exit {code}); {} ({kept})",
             ends_of(&libtest::plain(&standard_error), place.root)
-        ));
+        )));
     }
     // A listing is not a build: the step's tests were built before it. Say so in the log when it
     // compiled anything, which takes time and disk the step's own run does not account for.
@@ -745,7 +794,11 @@ fn list(
             &format!("== the listing compiled again:\n{}\n", compiled.join("\n")),
         );
     }
-    read_listing(&String::from_utf8_lossy(&output.stdout), executables, &own)
+    Ok(read_listing(
+        &String::from_utf8_lossy(&output.stdout),
+        executables,
+        &own,
+    )?)
 }
 
 /// How many of the last lines of a failed listing's standard error the step's error names.
@@ -1127,7 +1180,7 @@ fn build_first(
     place: &Place<'_>,
     log_path: &Path,
     packages: &[Package],
-) -> Result<Built, String> {
+) -> Result<Built, Stop> {
     let mut command: Vec<String> = step
         .command
         .iter()
@@ -1143,22 +1196,28 @@ fn build_first(
         .map_err(|error| format!("{} could not be opened: {error}", log_path.display()))?;
     let _ = writeln!(log, "== the build before the run: {}", command.join(" "));
     let began = SystemTime::now();
-    let output = place
-        .command(&command)
-        .stdin(Stdio::null())
-        .stderr(Stdio::from(
-            log.try_clone().map_err(|error| error.to_string())?,
-        ))
-        .output()
-        .map_err(|error| format!("{} could not be started: {error}", command[0]))?;
+    let output = match tree::output(
+        place
+            .command(&command)
+            .stdin(Stdio::null())
+            .stderr(Stdio::from(
+                log.try_clone().map_err(|error| error.to_string())?,
+            )),
+        place.deadline,
+    )
+    .map_err(|error| format!("{} could not be started: {error}", command[0]))?
+    {
+        Waited::Done(output) => output,
+        Waited::TimedOut => return Err(Stop::TimedOut),
+    };
     if !output.status.success() {
-        return Err(format!(
+        return Err(Stop::Failed(format!(
             "the step's tests did not build (exit {}); the log has the compiler's output",
             output
                 .status
                 .code()
                 .map_or_else(|| "by a signal".to_owned(), |code| code.to_string())
-        ));
+        )));
     }
     let mut built = Vec::new();
     let mut executables = BTreeMap::new();
@@ -1572,7 +1631,7 @@ fn run_logged(
     place: &Place<'_>,
     log_path: &Path,
     environment: &[(String, String)],
-) -> Result<Option<i32>, String> {
+) -> Result<Option<i32>, Stop> {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1580,15 +1639,17 @@ fn run_logged(
         .map_err(|error| format!("{} could not be opened: {error}", log_path.display()))?;
     let _ = writeln!(log, "== {}", command.join(" "));
     let errors = log.try_clone().map_err(|error| error.to_string())?;
-    let status = place
-        .command(command)
-        .envs(environment.iter().map(|(name, value)| (name, value)))
+    let mut run = place.command(command);
+    run.envs(environment.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(errors))
-        .status()
-        .map_err(|error| format!("{} could not be started: {error}", command[0]))?;
-    Ok(status.code())
+        .stderr(Stdio::from(errors));
+    match tree::status(&mut run, place.deadline)
+        .map_err(|error| format!("{} could not be started: {error}", command[0]))?
+    {
+        Waited::Done(status) => Ok(status.code()),
+        Waited::TimedOut => Err(Stop::TimedOut),
+    }
 }
 
 #[cfg(test)]

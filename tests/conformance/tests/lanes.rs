@@ -101,6 +101,7 @@ fn executed(step: Step, exit: i32, cases: Result<Vec<Case>, String>) -> Executed
         error,
         blocked_by: None,
         observation: None,
+        timed_out: false,
     }
 }
 
