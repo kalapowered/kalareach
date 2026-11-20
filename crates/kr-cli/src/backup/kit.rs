@@ -339,26 +339,36 @@ fn end_the_reader(
     !waited.still_running
 }
 
+/// Ends the reader as [`end_the_reader`] does, and ends the command at once when the reader does
+/// not end: the console's modes cannot be put back under a read that is still under way, and the
+/// input cannot be thrown away. The command says so, and ends before any guard of the console
+/// restores or discards anything.
+#[cfg(any(windows, test))]
+fn end_the_reader_or_the_command(
+    thread: std::thread::JoinHandle<()>,
+    stopped: &AtomicBool,
+    cancel: &dyn Fn(&std::thread::JoinHandle<()>) -> bool,
+    wait: std::time::Duration,
+) {
+    if !end_the_reader(thread, stopped, cancel, wait) {
+        crate::report::say(&Shown::said(
+            "the console did not release a read, so the command ends now without putting the \
+             console back",
+        ));
+        std::process::exit(i32::from(CliError::NotATerminal.exit_code()));
+    }
+}
+
 #[cfg(windows)]
 impl Drop for ReaderGuard {
     fn drop(&mut self) {
-        let Some(thread) = self.thread.take() else {
-            return;
-        };
-        let ended = end_the_reader(
-            thread,
-            &self.stopped,
-            &crate::platform::cancel_blocked_read,
-            READER_DEADLINE,
-        );
-        if !ended {
-            // The console's modes cannot be put back under a read that is still under way, and
-            // the input cannot be thrown away. The command ends here and says so.
-            crate::report::say(&Shown::said(
-                "the console did not release a read, so the command ends now without putting the \
-                 console back",
-            ));
-            std::process::exit(i32::from(CliError::NotATerminal.exit_code()));
+        if let Some(thread) = self.thread.take() {
+            end_the_reader_or_the_command(
+                thread,
+                &self.stopped,
+                &crate::platform::cancel_blocked_read,
+                READER_DEADLINE,
+            );
         }
     }
 }
@@ -950,7 +960,10 @@ mod answer_tests {
 
     use kr_client::shown::Said as _;
 
-    use super::{LONGEST_ANSWER, OPERATION_ABORTED, end_the_reader, read_line_through};
+    use super::{
+        LONGEST_ANSWER, OPERATION_ABORTED, end_the_reader, end_the_reader_or_the_command,
+        read_line_through,
+    };
 
     /// A step that gives `bytes` in reads of at most the size the caller offers, then the end of
     /// the input, and counts what it gave.
@@ -1181,5 +1194,76 @@ mod answer_tests {
         while !console.cancel() {
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// What a command does at that deadline, run as the command does it in a program of its own,
+    /// since it ends the process: the said reason is the last thing on its output, the exit code
+    /// is 6, and nothing that a guard would do when dropped is done. Only the helper below runs the
+    /// decision, and only when the case that starts it says so.
+    #[test]
+    fn a_read_that_never_gives_way_ends_the_command_with_its_reason_and_restores_nothing() {
+        let me = std::env::current_exe().expect("this test program has a path");
+        let output = std::process::Command::new(me)
+            .args([
+                "--exact",
+                "backup::kit::answer_tests::the_command_that_meets_a_read_that_never_gives_way",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(STUCK_READER, "1")
+            .output()
+            .expect("starts the helper");
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(6), "{said}");
+        assert!(
+            said.contains(
+                "the console did not release a read, so the command ends now without putting the \
+                 console back"
+            ),
+            "{said}"
+        );
+        assert!(
+            !said.contains("the guard of the console restored"),
+            "the command ended before the console's guard was dropped: {said}"
+        );
+        assert!(
+            !said.contains("the helper went on"),
+            "the command ended at the deadline: {said}"
+        );
+    }
+
+    /// The variable that makes the helper below run the decision.
+    const STUCK_READER: &str = "KR_TEST_STUCK_READER";
+
+    /// A guard that says when it is dropped, standing for the console's own, which restores the
+    /// modes and throws the input away.
+    struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            println!("the guard of the console restored");
+        }
+    }
+
+    /// The helper of the case above: a reader that no cancel reaches, ended with the command's own
+    /// decision and a short deadline. It does nothing in an ordinary run.
+    #[test]
+    fn the_command_that_meets_a_read_that_never_gives_way() {
+        if std::env::var_os(STUCK_READER).is_none() {
+            return;
+        }
+        let _guard = Guard;
+        let console = Console::new();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let thread = reader(&console, &stopped, Duration::ZERO);
+        while !console.state.lock().expect("the console").0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        end_the_reader_or_the_command(thread, &stopped, &|_| false, Duration::from_millis(300));
+        println!("the helper went on");
     }
 }
