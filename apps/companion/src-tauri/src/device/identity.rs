@@ -83,7 +83,7 @@ fn this_computer() -> DeviceName {
 }
 
 /// The platform this build runs on.
-const fn this_platform() -> DevicePlatform {
+pub(crate) const fn this_platform() -> DevicePlatform {
     if cfg!(target_os = "macos") {
         DevicePlatform::Macos
     } else if cfg!(target_os = "windows") {

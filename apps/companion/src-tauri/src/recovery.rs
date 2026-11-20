@@ -63,12 +63,14 @@ use kr_protocol::backup_read::BackupSignIn;
 use kr_protocol::backup_setup::{BackupEnableCause, BackupUnusable};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ArchiveId;
+use kr_protocol::pairing::DevicePlatform;
 use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::account::Account;
+use crate::device::identity::this_platform;
 use crate::error::{CommandError, Result};
 use crate::services::SyncServices;
 use crate::sync_service::{SyncService, SyncServiceView, host_of};
@@ -139,41 +141,7 @@ pub struct RecoveryView {
     /// What stops the next step now.
     pub blocker: Option<Blocker>,
     /// The system this computer runs, which the page reads to say where the seed is kept.
-    pub platform: Platform,
-}
-
-/// The system a build runs on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Platform {
-    /// macOS.
-    Macos,
-    /// Windows.
-    Windows,
-    /// Linux and the other Unix systems that are none of the rest.
-    Linux,
-    /// iOS.
-    Ios,
-    /// Android.
-    Android,
-}
-
-impl Platform {
-    /// The system this build runs on.
-    #[must_use]
-    pub const fn this() -> Self {
-        if cfg!(target_os = "windows") {
-            Self::Windows
-        } else if cfg!(target_os = "macos") {
-            Self::Macos
-        } else if cfg!(target_os = "ios") {
-            Self::Ios
-        } else if cfg!(target_os = "android") {
-            Self::Android
-        } else {
-            Self::Linux
-        }
-    }
+    pub platform: DevicePlatform,
 }
 
 /// What the page is told once a kit has been written.
@@ -530,7 +498,7 @@ impl Recovery {
             state,
             kept_at,
             blocker: blocker(account, &used),
-            platform: Platform::this(),
+            platform: this_platform(),
         })
     }
 
