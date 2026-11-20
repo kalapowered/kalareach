@@ -189,6 +189,45 @@ command = ['cargo', 'test', '--locked', '--test', 'plan_env']
     );
 }
 
+/// KR-REQ-29.01, the part about reproducible commands: a step's tests are the targets of the map
+/// when the root is spelled by a link (or, on Windows, in the `\\?\` form of a canonical path)
+/// that the working directory Cargo builds in does not carry. The build's source paths and the
+/// map's are two spellings of one file, and the run reads the tests from the build's.
+#[cfg(unix)]
+#[test]
+fn a_step_reads_its_tests_when_the_root_is_spelled_by_a_link() {
+    let (_directory, root) = copy("setup-step");
+    let links = tempfile::tempdir().expect("a directory");
+    let link = links.path().join("checkout");
+    std::os::unix::fs::symlink(&root, &link).expect("a link");
+    let text = plan_of(
+        &["Cargo.toml"],
+        "[env]
+KR_FROM_PLAN = 'plan'
+KR_IN_BOTH = \"the plan's\"
+[[step]]
+id = 'variables'
+group = 'rust'
+what = 'the variables'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+env = { KR_FROM_STEP = 'step', KR_IN_BOTH = \"the step's\" }
+command = ['cargo', 'test', '--locked', '--test', 'plan_env']
+",
+    );
+    let ran = run(&link, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let step = &ran.document.steps[0];
+    assert_eq!(
+        (step.exit, step.error.as_deref()),
+        (Some(0), None),
+        "{step:?}"
+    );
+    assert_eq!(
+        ran.document.identifiers["KR-REQ-05.01"].verdict,
+        Verdict::Passed
+    );
+}
+
 /// A plan of one `bash` script step that reads nothing, whose command is `words`.
 fn script_plan(words: &str, more: &str) -> String {
     plan_of(
