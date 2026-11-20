@@ -103,6 +103,12 @@ fn release_key(key: &Key) -> Option<[u8; 32]> {
 /// are compared after each has passed its own checks, so by then a key has one spelling, its 32
 /// bytes.
 ///
+/// The comparison is of those bytes and of nothing derived from them, so a key derived from another,
+/// such as an Ed25519 key's negation or its sum with a small-order point, is not found: whoever
+/// holds the private key of one can sign for the other. The root is signed by the holders of its
+/// root keys, who can name any key, so the check catches a key named twice by mistake and does not
+/// prove that two keys have two holders.
+///
 /// # Errors
 ///
 /// Returns [`VerifyError::ReusedKey`] naming the first role that names a key twice,

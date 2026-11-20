@@ -422,6 +422,73 @@ fn a_key_that_two_roles_share_is_refused_wherever_a_root_is_read() {
     }
 }
 
+/// KR-REQ-26.40: one key that a root describes a second way for another role is still one key, and
+/// every call that reads a root refuses it as shared. What the comparison does not find is a key
+/// derived from another: an Ed25519 key's negation differs from it in the sign bit of its encoding,
+/// so a root that gives a key to one role and its negation to another passes. That is the limit the
+/// crate's text states, and this case holds it where it is.
+#[test]
+fn one_key_spelt_two_ways_by_two_roles_is_refused_and_a_derived_key_is_not_found() {
+    let only = pair();
+    let plain = tuf_key(&only);
+    let written = members("kalareach-release");
+    let manifest = signed_by(&written, &[&only]);
+    let two_roles = |first: Key, second: Key| {
+        root_of(&[
+            (RoleType::Root, vec![first], 1),
+            (RoleType::Targets, vec![second], 1),
+            (RoleType::Snapshot, vec![tuf_key(&pair())], 1),
+            (RoleType::Timestamp, vec![tuf_key(&pair())], 1),
+        ])
+    };
+
+    for (how, again) in described_again(&plain) {
+        assert_ne!(
+            plain.key_id().expect("an identifier"),
+            again.key_id().expect("an identifier"),
+            "the two descriptions have two names: {how}"
+        );
+        let root = two_roles(plain.clone(), again);
+        let own = signed_root(root.clone(), &only);
+        for (call, verdict) in [
+            ("check_root_keys", check_root_keys(&root)),
+            (
+                "verify_manifest",
+                verify_manifest(&root, manifest.as_bytes()).map(|_| ()),
+            ),
+            ("verify_root_itself", verify_root_itself(&own)),
+        ] {
+            assert!(
+                matches!(
+                    verdict,
+                    Err(VerifyError::SharedKey {
+                        first: "root",
+                        second: "targets"
+                    })
+                ),
+                "{call}, {how}: {verdict:?}"
+            );
+        }
+    }
+
+    let mut negated = only.public_key().as_ref().to_vec();
+    assert_eq!(negated.len(), 32);
+    negated[31] ^= 0x80;
+    let negation = described("ed25519", "ed25519", &negated);
+    assert_ne!(
+        plain.key_id().expect("an identifier"),
+        negation.key_id().expect("an identifier"),
+        "the negation is another key to the comparison"
+    );
+    let root = two_roles(plain, negation);
+    assert!(
+        check_root_keys(&root).is_ok(),
+        "a key and its negation in two roles pass: {:?}",
+        check_root_keys(&root)
+    );
+    assert!(verify_root_itself(&signed_root(root, &only)).is_ok());
+}
+
 /// KR-REQ-26.40: the root `kr-release dev-keys` writes gives each role a key of its own, every key
 /// it names is a file in the keys directory, the keys the targets role names sign a release that
 /// the root verifies, and a host takes the root.
