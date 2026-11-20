@@ -245,6 +245,38 @@ describe('a message handed over to the channel store', () => {
     }
   })
 
+  it('still keeps a message whose words another prompt of the composer was applied for', async () => {
+    const of = world()
+    const book = await opened(of)
+    type(book, MAIN, 'the message')
+    await book.settled()
+    const first = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    await book.settled()
+    await first.claimed
+    // The same words again, sent by a person who checked, and still on their way.
+    type(book, MAIN, 'the message')
+    await book.settled()
+    const second = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    await book.settled()
+    await second.claimed
+    // The first prompt is said to have been applied after nobody knew: it marks the second consumed.
+    book.endSend(first, 'unknown', 'local-first')
+    await book.settled()
+    book.sendSettled('local-first', 'applied')
+    await book.settled()
+    const seen: HeldPrompt[] = []
+    book.endSend(second, 'handed_over', LOCAL, undefined, keeping(of, seen))
+    await book.settled()
+    // Consumed or not, the keep ran: the message is in the store and nothing of it is left to send again.
+    expect(seen).toHaveLength(1)
+    expect(book.handedOver(LOCAL)).toBe('kept')
+    expect(of.messages.all().map((message) => message.actionId)).toEqual([ACTION])
+    expect(of.drafts.all()).toEqual([])
+    expect(book.draft(MAIN).text).toBe('')
+  })
+
   it('exact() is true only when the press stored the sent text', async () => {
     const of = world()
     const { token } = await pressed(of)
