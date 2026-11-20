@@ -4279,4 +4279,163 @@ mod tests {
             "The connection to the voice provider failed."
         );
     }
+
+    /// An end is told in whole sentences by what the cause was, what the host said of the provider's
+    /// close, and what the stop came to: the cause's own sentence, then the sentence that says what
+    /// the call is left to, and nothing of the host's own rule unless the stop was not sent.
+    #[test]
+    fn an_end_is_told_in_whole_sentences_by_the_cause_the_word_and_the_stop() {
+        let told = |cause: &Cause, word, stop: &HostEnd, may| {
+            ended_words(cause, unsettled_words(word, stop, may), false, false)
+        };
+        let not_told = HostEnd::NotTold {
+            words: empty_words(),
+        };
+        let not_held = HostEnd::NotHeld {
+            words: empty_words(),
+        };
+        // The person's stop: the cause, then what the host did not say.
+        let requested = Cause::Requested;
+        assert_eq!(
+            told(&requested, CloseWord::Confirmed, &not_held, true),
+            "You ended the call."
+        );
+        for (word, stop, may, left) in [
+            (
+                CloseWord::Unconfirmed,
+                &stop_revoked(false),
+                true,
+                HOST_UNCONFIRMED,
+            ),
+            (
+                CloseWord::Unheard,
+                &stop_revoked(false),
+                true,
+                HOST_UNCONFIRMED,
+            ),
+            (CloseWord::Unheard, &not_held, true, HOST_UNHEARD),
+            (CloseWord::Unheard, &not_told, true, HOST_UNHEARD),
+            (CloseWord::Unheard, &not_told, false, LEFT_TO_HOST),
+        ] {
+            assert_eq!(
+                told(&requested, word, stop, may),
+                format!("You ended the call. {left}"),
+                "{word:?} {stop:?} {may}"
+            );
+        }
+        // A provider's close the host could not confirm: the host's connection ended, and the call is
+        // left to the host's own failure to confirm.
+        let unconfirmed_close = Cause::Host(HostEnding::Reason {
+            reason: VoiceEndReason::ProviderClosed,
+            provider_close: VoiceProviderClose::Unconfirmed,
+        });
+        assert_eq!(
+            told(
+                &unconfirmed_close,
+                CloseWord::Unconfirmed,
+                &stop_revoked(false),
+                true
+            ),
+            format!("The host's connection to the call at OpenAI ended. {HOST_UNCONFIRMED}")
+        );
+        // A host that was not heard from, or could not find the call: the closing sentence of its
+        // own, whatever the host says later.
+        let silent = Cause::Host(HostEnding::Silent);
+        let lost = Cause::Host(HostEnding::NotKnown(
+            kr_protocol::voice_host::VoiceHostRefusal::UnknownCall,
+        ));
+        for (word, stop, may, expected) in [
+            (
+                CloseWord::Confirmed,
+                &not_held,
+                true,
+                crate::voice::cause::HOST_SILENT_SETTLED,
+            ),
+            (
+                CloseWord::Unconfirmed,
+                &stop_revoked(false),
+                true,
+                HOST_UNCONFIRMED,
+            ),
+            (CloseWord::Unheard, &not_held, true, HOST_UNHEARD),
+            (CloseWord::Unheard, &not_told, false, LEFT_TO_HOST),
+        ] {
+            assert_eq!(
+                told(&silent, word, stop, may),
+                expected,
+                "silent: {word:?} {stop:?}"
+            );
+        }
+        assert_eq!(
+            told(&lost, CloseWord::Confirmed, &not_held, true),
+            crate::voice::cause::HOST_FOUND_CLOSED
+        );
+        assert_eq!(
+            told(&lost, CloseWord::Unheard, &not_held, true),
+            HOST_UNHEARD
+        );
+    }
+
+    /// The news the host's control told while the call closed is read to its end before the word of
+    /// the provider's close is: a word told by news that was still on its way is in the evidence
+    /// once the collection returns.
+    #[tokio::test(start_paused = true)]
+    async fn collecting_the_close_evidence_reads_the_news_a_stopped_control_still_held() {
+        let evidence = CloseEvidence::default();
+        let (news, mut feed) = mpsc::channel::<CallNews>(4);
+        let offered = evidence.clone();
+        let draining = tokio::spawn(async move {
+            let mut last = None;
+            while let Some(news) = feed.recv().await {
+                super::note_while_closing(news, &mut last, &offered);
+            }
+            last
+        });
+        news.send(CallNews::Host(HostNews::Ended(HostEnding::Reason {
+            reason: VoiceEndReason::Deadline,
+            provider_close: VoiceProviderClose::Confirmed,
+        })))
+        .await
+        .expect("the drain is reading");
+        // The control stops: its feed ends once what it told has been read.
+        drop(news);
+        super::collect_close_evidence(Some(draining), Duration::from_secs(20)).await;
+        assert_eq!(
+            evidence.get(),
+            Some(VoiceProviderClose::Confirmed),
+            "the word the control told is read before the end is recorded"
+        );
+        // No drain, no wait.
+        super::collect_close_evidence(None, Duration::from_secs(20)).await;
+    }
+
+    /// A drain that does not end within the bound is aborted and awaited, so nothing of it runs on
+    /// after the final read, and the collection ends at the bound and not when the drain would.
+    #[tokio::test(start_paused = true)]
+    async fn collecting_the_close_evidence_ends_at_its_bound_and_leaves_no_drain_running() {
+        let within = Duration::from_secs(20);
+        let (news, mut feed) = mpsc::channel::<CallNews>(4);
+        let draining = tokio::spawn(async move {
+            let mut last = None;
+            let evidence = CloseEvidence::default();
+            while let Some(news) = feed.recv().await {
+                super::note_while_closing(news, &mut last, &evidence);
+            }
+            last
+        });
+        let watch = draining.abort_handle();
+        // The feed would end after ten times the bound.
+        tokio::spawn(async move {
+            tokio::time::sleep(within * 10).await;
+            drop(news);
+        });
+        let began = Instant::now();
+        super::collect_close_evidence(Some(draining), within).await;
+        let spent = began.elapsed();
+        assert_eq!(spent, within, "the collection ends at its bound");
+        assert!(
+            watch.is_finished(),
+            "the drain that did not end in time was aborted and awaited"
+        );
+    }
 }
