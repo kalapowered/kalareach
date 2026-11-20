@@ -666,18 +666,18 @@ impl CrateIndex {
         };
         let workspace: BTreeSet<String> = crates.keys().cloned().collect();
         for path in &inventory.files {
-            let text = std::fs::read_to_string(&path)
+            let text = std::fs::read_to_string(path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             let file =
                 syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
             let relative = path
                 .strip_prefix(root)
-                .unwrap_or(&path)
+                .unwrap_or(path)
                 .display()
                 .to_string();
             index
                 .files_of_module
-                .entry(module_of(source, &path))
+                .entry(module_of(source, path))
                 .or_default()
                 .insert(relative.clone());
             let Some(condition) = Condition::default().within(&file.attrs, &relative)? else {
