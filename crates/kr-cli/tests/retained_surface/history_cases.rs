@@ -1,7 +1,6 @@
 //! The cases of the historical audit, on a repository a case makes with `git init`: its tags, an
 //! origin that is a bare repository, and the production reader of snapshots.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 

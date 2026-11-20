@@ -354,12 +354,15 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// Whether a level's surface defines a type of a name.
+type Defines = Box<dyn Fn(&str) -> bool>;
+
 /// What the retained levels recorded, read once.
 struct Records {
     levels: Vec<String>,
     roots: Vec<Value>,
     /// Whether each level's surface defines a type of that name.
-    defines: Vec<Box<dyn Fn(&str) -> bool>>,
+    defines: Vec<Defines>,
 }
 
 fn level_records() -> Records {
@@ -375,8 +378,7 @@ fn level_records() -> Records {
         defines: RETAINED
             .iter()
             .map(|level| {
-                Box::new(move |label: &str| level.surface().definition(label).is_some())
-                    as Box<dyn Fn(&str) -> bool>
+                Box::new(move |label: &str| level.surface().definition(label).is_some()) as Defines
             })
             .collect(),
     }
