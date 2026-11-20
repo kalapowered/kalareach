@@ -40,6 +40,8 @@ fn zeroing(path: &Path) -> Step {
         output: None,
         setup: false,
         after: Vec::new(),
+        timeout: None,
+        budget: None,
     }
 }
 

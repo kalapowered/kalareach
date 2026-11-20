@@ -2087,3 +2087,172 @@ command = ['cargo', 'test']
         ["cargo test -- --nocapture", "cargo test -- --show-output"]
     );
 }
+
+/// A second step of [`STEP`]'s kind, named `two`, with `extra` ahead of its command.
+fn second_step(extra: &str) -> String {
+    STEP.replace("id = 'one'", "id = 'two'").replace(
+        "command = ['cargo', 'test']",
+        &format!("{extra}command = ['cargo', 'test']"),
+    )
+}
+
+/// The planted files of the time limits: a name, the text, and the words the refusal holds.
+fn time_faults() -> Vec<(&'static str, String, &'static str)> {
+    let limited = |extra: &str| step_adding(extra, "['cargo', 'test']");
+    let budgeted = |tables: &str, extra: &str| {
+        with(&format!(
+            "{tables}{}",
+            STEP.replace(
+                "command = ['cargo', 'test']",
+                &format!("{extra}command = ['cargo', 'test']")
+            )
+        ))
+    };
+    let on_windows =
+        |text: String| text.replace("platforms = ['linux']", "platforms = ['linux', 'windows']");
+    vec![
+        (
+            "a timeout of zero",
+            limited("timeout = 0\n"),
+            "step `one` has a `timeout` of 0 seconds: a time is a whole number of seconds from 1 to 86400",
+        ),
+        (
+            "a negative timeout",
+            limited("timeout = -5\n"),
+            "step `one` has a `timeout` of -5 seconds",
+        ),
+        (
+            "a timeout over a day",
+            limited("timeout = 86401\n"),
+            "step `one` has a `timeout` of 86401 seconds",
+        ),
+        (
+            "a budget of zero seconds",
+            budgeted("[[budget]]\nid = 'b'\nseconds = 0\n", "budget = 'b'\n"),
+            "budget `b` has 0 seconds: a time is a whole number of seconds from 1 to 86400",
+        ),
+        (
+            "a budget over a day",
+            budgeted("[[budget]]\nid = 'b'\nseconds = 86401\n", "budget = 'b'\n"),
+            "budget `b` has 86401 seconds",
+        ),
+        (
+            "a budget id with a space",
+            budgeted("[[budget]]\nid = 'a b'\nseconds = 5\n", "budget = 'a b'\n"),
+            "a `[[budget]]` has the `id` `a b`, which is not a name",
+        ),
+        (
+            "an empty budget id",
+            budgeted("[[budget]]\nid = ''\nseconds = 5\n", "budget = ''\n"),
+            "a `[[budget]]` has the `id` ``, which is not a name",
+        ),
+        (
+            "a budget id used twice",
+            budgeted(
+                "[[budget]]\nid = 'b'\nseconds = 5\n[[budget]]\nid = 'b'\nseconds = 6\n",
+                "budget = 'b'\n",
+            ),
+            "the budget id `b` is used twice",
+        ),
+        (
+            "a budget a step names that the plan does not hold",
+            budgeted("", "budget = 'nowhere'\n"),
+            "step `one` names the budget `nowhere`, which no `[[budget]]` of the plan is",
+        ),
+        (
+            "a budget that no step names",
+            budgeted("[[budget]]\nid = 'idle'\nseconds = 5\n", ""),
+            "the budget `idle` is named by no step",
+        ),
+        (
+            "an unknown key of a budget",
+            budgeted(
+                "[[budget]]\nid = 'b'\nseconds = 5\nminutes = 1\n",
+                "budget = 'b'\n",
+            ),
+            "minutes",
+        ),
+        (
+            "a timeout on a step that runs on windows",
+            on_windows(limited("timeout = 5\n")),
+            "step `one` has a time limit and runs on windows, where the report cannot end the processes of a step",
+        ),
+        (
+            "a budget on a step that runs on windows",
+            on_windows(budgeted(
+                "[[budget]]\nid = 'b'\nseconds = 5\n",
+                "budget = 'b'\n",
+            )),
+            "step `one` has a time limit and runs on windows",
+        ),
+    ]
+}
+
+/// Each fault of a time limit is refused with its own reason, and the file that holds none of
+/// them loads: the one control carries a timeout, a budget two steps share, and both on one step.
+#[test]
+fn a_time_limit_is_refused_for_each_fault_by_its_reason() {
+    let root = repository();
+    let control = with(&format!(
+        "[[budget]]\nid = 'shared-1_a'\nseconds = 7\n{}{}",
+        STEP.replace(
+            "command = ['cargo', 'test']",
+            "timeout = 86400\nbudget = 'shared-1_a'\ncommand = ['cargo', 'test']"
+        ),
+        second_step("budget = 'shared-1_a'\n"),
+    ));
+    let loaded = Plan::parse(&control, &root);
+    assert!(loaded.is_ok(), "the control file loads: {loaded:?}");
+    let mut wrong = Vec::new();
+    for (name, text, reason) in time_faults() {
+        match Plan::parse(&text, &root) {
+            Ok(_) => wrong.push(format!("{name}: the loader refused nothing")),
+            Err(refusal) if refusal.to_string().contains(reason) => {}
+            Err(refusal) => wrong.push(format!(
+                "{name}: refused as `{refusal}`, which lacks `{reason}`"
+            )),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A step's time limit reaches the step the report runs: its `timeout`, and its budget's id with the
+/// budget's seconds; a step without either has none. A step that runs on Windows and holds none
+/// loads beside steps that hold them.
+#[test]
+fn a_steps_time_limit_and_its_budget_reach_the_step_the_report_runs() {
+    let text = with(&format!(
+        "[[budget]]\nid = 'b'\nseconds = 7\n{}{}{}",
+        STEP.replace(
+            "command = ['cargo', 'test']",
+            "timeout = 5\nbudget = 'b'\ncommand = ['cargo', 'test']"
+        ),
+        second_step("budget = 'b'\n"),
+        STEP.replace("id = 'one'", "id = 'three'")
+            .replace("platforms = ['linux']", "platforms = ['linux', 'windows']"),
+    ));
+    let plan = Plan::parse(&text, &repository()).expect("the plan loads");
+    let rust = selection(&["rust"]);
+    let linux = plan.steps(Platform::Linux, &rust, &Values::evidence("/e"), None);
+    let limits: Vec<_> = linux
+        .iter()
+        .map(|step| (step.timeout, step.budget.clone()))
+        .collect();
+    assert_eq!(
+        limits,
+        [
+            (Some(5), Some(("b".to_owned(), 7))),
+            (None, Some(("b".to_owned(), 7))),
+            (None, None),
+        ]
+    );
+    let windows = plan.steps(Platform::Windows, &rust, &Values::evidence("/e"), None);
+    assert_eq!(
+        windows
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<Vec<_>>(),
+        ["three"],
+        "the steps that hold a limit are not Windows steps"
+    );
+}

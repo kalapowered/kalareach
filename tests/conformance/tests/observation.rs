@@ -43,6 +43,8 @@ fn shell(what: &str, script: &str, arguments: &[&Path]) -> Step {
         output: None,
         setup: false,
         after: Vec::new(),
+        timeout: None,
+        budget: None,
     }
 }
 

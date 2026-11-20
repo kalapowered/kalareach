@@ -139,6 +139,28 @@ pub struct StepDef {
     /// Where more skips come from at run time.
     #[serde(default)]
     pub skips_from: Option<SkipsFrom>,
+    /// The most seconds the step may take, from its start to its end: its build and the listing of
+    /// its tests count. The report ends the step's processes when they are spent, so a step with a
+    /// limit does not run on Windows. A whole number of seconds from 1 to [`MOST_SECONDS`].
+    #[serde(default)]
+    pub timeout: Option<i64>,
+    /// The `id` of the `[[budget]]` the step spends from, with the other steps that name it.
+    #[serde(default)]
+    pub budget: Option<String>,
+}
+
+/// The most seconds a step's `timeout` or a budget's `seconds` may be: a day.
+pub const MOST_SECONDS: i64 = 86_400;
+
+/// A time that several steps share: the steps that name it spend it in the order of the plan, and the
+/// report ends the process of the step that is running when it is spent.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Budget {
+    /// Its name, unique in the plan: ASCII letters, digits, `-` and `_`.
+    pub id: String,
+    /// Its time, in whole seconds from 1 to [`MOST_SECONDS`].
+    pub seconds: i64,
 }
 
 /// A package no step runs on one platform, and why.
@@ -390,6 +412,9 @@ pub struct Plan {
     /// value may hold `{evidence}`, `{scratch}` and `{root}`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// The time budgets that steps share.
+    #[serde(default, rename = "budget")]
+    pub budgets: Vec<Budget>,
     /// The steps, in the order every platform runs them.
     #[serde(default, rename = "step")]
     pub steps: Vec<StepDef>,
@@ -889,6 +914,30 @@ impl Plan {
                 ));
             }
         }
+        let mut budget_ids = BTreeSet::new();
+        for budget in &self.budgets {
+            let id = &budget.id;
+            if id.is_empty()
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return refuse(format!(
+                    "a `[[budget]]` has the `id` `{id}`, which is not a name: ASCII letters, digits, \
+                     `-` and `_`"
+                ));
+            }
+            if !budget_ids.insert(id.as_str()) {
+                return refuse(format!("the budget id `{id}` is used twice"));
+            }
+            if !(1..=MOST_SECONDS).contains(&budget.seconds) {
+                return refuse(format!(
+                    "budget `{id}` has {} seconds: a time is a whole number of seconds from 1 to \
+                     {MOST_SECONDS}",
+                    budget.seconds
+                ));
+            }
+        }
         let mut ids = BTreeSet::new();
         let mut outputs: Vec<(&str, Vec<String>)> = Vec::new();
         for step in &self.steps {
@@ -1116,6 +1165,37 @@ impl Plan {
                     ));
                 }
             }
+            if let Some(seconds) = step.timeout
+                && !(1..=MOST_SECONDS).contains(&seconds)
+            {
+                return refuse(format!(
+                    "step `{id}` has a `timeout` of {seconds} seconds: a time is a whole number of \
+                     seconds from 1 to {MOST_SECONDS}"
+                ));
+            }
+            if let Some(name) = &step.budget
+                && !budget_ids.contains(name.as_str())
+            {
+                return refuse(format!(
+                    "step `{id}` names the budget `{name}`, which no `[[budget]]` of the plan is"
+                ));
+            }
+            if (step.timeout.is_some() || step.budget.is_some())
+                && step.platforms.contains(&Platform::Windows)
+            {
+                return refuse(format!(
+                    "step `{id}` has a time limit and runs on windows, where the report cannot end \
+                     the processes of a step"
+                ));
+            }
+        }
+        if let Some(unused) = self.budgets.iter().find(|budget| {
+            !self
+                .steps
+                .iter()
+                .any(|step| step.budget.as_deref() == Some(budget.id.as_str()))
+        }) {
+            return refuse(format!("the budget `{}` is named by no step", unused.id));
         }
         for absent in &self.group_absent {
             if !self.groups.contains(&absent.group) {
@@ -1285,6 +1365,15 @@ impl Plan {
             steps.iter().all(|step| step.skips.is_empty()),
             "a plan of steps holds no skips"
         );
+        let mut budgets: Vec<Budget> = Vec::new();
+        for (id, seconds) in steps.iter().filter_map(|step| step.budget.as_ref()) {
+            if !budgets.iter().any(|budget| budget.id == *id) {
+                budgets.push(Budget {
+                    id: id.clone(),
+                    seconds: i64::try_from(*seconds).unwrap_or(MOST_SECONDS),
+                });
+            }
+        }
         let reason = "no step of this run's selection runs this target on this platform";
         Self {
             repository: "test".to_owned(),
@@ -1338,8 +1427,11 @@ impl Plan {
                     filter: step.filter.map(|(name, reason)| Reasoned { name, reason }),
                     skips: Vec::new(),
                     skips_from: None,
+                    timeout: step.timeout.and_then(|seconds| i64::try_from(seconds).ok()),
+                    budget: step.budget.map(|(id, _)| id),
                 })
                 .collect(),
+            budgets,
             ..Self::default()
         }
     }
@@ -1417,6 +1509,16 @@ impl Plan {
                         .chain(&from_applications)
                         .map(|skip| (skip.name.clone(), skip.reason.clone()))
                         .collect(),
+                    timeout: definition
+                        .timeout
+                        .and_then(|seconds| u64::try_from(seconds).ok()),
+                    budget: definition.budget.as_ref().and_then(|id| {
+                        self.budgets
+                            .iter()
+                            .find(|budget| budget.id == *id)
+                            .and_then(|budget| u64::try_from(budget.seconds).ok())
+                            .map(|seconds| (id.clone(), seconds))
+                    }),
                 })
             })
             .collect()
