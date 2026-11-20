@@ -2916,7 +2916,7 @@ async fn kr_req_12_26_queued_prompts_never_take_the_room_a_verdict_needs() {
     }
     let _ = verdict_flight.settled(TimestampMs::new(21)).await;
 
-    broker
+    let after = broker
         .agent_prompt(
             &paired_device(),
             &queued(2, "after"),
@@ -2924,7 +2924,12 @@ async fn kr_req_12_26_queued_prompts_never_take_the_room_a_verdict_needs() {
             TimestampMs::new(30),
         )
         .await
-        .expect_err("the room was released after the writes: a message is accepted again");
+        .expect_err("a channel confirms nothing");
+    assert_eq!(
+        after.code(),
+        ErrorCode::OutcomeUnknown,
+        "the room was released after the writes, so a message is accepted again: {after}"
+    );
     assert_eq!(
         channel.next().await,
         Some(message_frame("after", "paired_device", "03204de92e11fc8c"))

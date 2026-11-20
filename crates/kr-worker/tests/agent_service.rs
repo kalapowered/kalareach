@@ -6222,6 +6222,12 @@ async fn kr_req_12_26_a_prompt_still_queued_at_the_workers_bound_is_a_channel_en
         panic!("a message nobody wrote in time ends as an outcome nobody can establish");
     };
     assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        error.message,
+        "The host cannot tell whether Claude Code took this message. Claude Code does not \
+         confirm messages on this channel.",
+        "the person is told the channel's end, not that an upstream never answered"
+    );
     let reached = tokio::time::timeout(LIVENESS_DEADLINE, arrived).await;
     assert!(
         matches!(reached, Ok(Ok(_))),
