@@ -10,6 +10,8 @@
 //! A test that none of the selected groups runs on this platform is reported as not run, with the
 //! reason the plan file gives, and never as passed.
 
+use std::collections::BTreeSet;
+
 /// The platforms the report knows how to run on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +55,8 @@ pub enum Reading {
     Cargo,
     /// A build whose success is all there is to record.
     Build,
+    /// A command whose exit status is all there is to record: the reading of a set-up step.
+    Exit,
     /// A package's `test` script, reporting to the step's output, a JSON file, for the package in
     /// the directory named.
     Vitest {
@@ -77,6 +81,8 @@ pub enum Tests {
 /// One command of a group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
+    /// Its name, unique in the plan it was loaded from.
+    pub id: String,
     /// Its group.
     pub group: String,
     /// What it runs, in a few words.
@@ -101,6 +107,11 @@ pub struct Step {
     /// The file it writes for the report to read (a directory, for a JUnit lane), as an absolute
     /// path with forward slashes, when it names one.
     pub output: Option<String>,
+    /// Whether it sets up what later steps need: the report records only its exit status, and a
+    /// step that names it in `after` is not run when it failed.
+    pub setup: bool,
+    /// The set-up steps that run before it, by name.
+    pub after: Vec<String>,
 }
 
 impl Step {
@@ -112,6 +123,7 @@ impl Step {
         let mut command = vec!["cargo".to_owned()];
         command.extend(arguments.iter().map(|argument| (*argument).to_owned()));
         Self {
+            id: String::new(),
             group: group.to_owned(),
             what: what.to_owned(),
             command,
@@ -122,6 +134,8 @@ impl Step {
             directory: String::new(),
             env: Vec::new(),
             output: None,
+            setup: false,
+            after: Vec::new(),
         }
     }
 
@@ -162,19 +176,30 @@ fn runs_the_workspace(step: &Step) -> bool {
 /// A plan that holds the workspace's tests puts that step, with the opening builds, in part 1 by
 /// itself, and cuts the other steps into the remaining parts by count. `part` is the number of the
 /// part from 1 and the number of parts.
+///
+/// A set-up step that a step of the plan names in `after` is not cut by count: it goes, in its own
+/// place, into every part that holds a step naming it, directly or through another set-up step, so
+/// a set-up step runs in each of those parts.
 #[must_use]
 pub fn part_of(steps: Vec<Step>, part: (usize, usize)) -> Vec<Step> {
     let (number, parts) = part;
     let parts = parts.max(1);
-    let opening = steps
+    let named: BTreeSet<&str> = steps
         .iter()
-        .take_while(|step| step.reading == Reading::Build)
+        .flat_map(|step| step.after.iter().map(String::as_str))
+        .collect();
+    // The steps cut by count: every step but the set-up steps that another step names.
+    let cut: Vec<usize> = (0..steps.len())
+        .filter(|index| !(steps[*index].setup && named.contains(steps[*index].id.as_str())))
+        .collect();
+    let opening = cut
+        .iter()
+        .take_while(|index| steps[**index].reading == Reading::Build)
         .count();
     let alone = if parts > 1 {
-        steps
-            .iter()
-            .position(runs_the_workspace)
-            .filter(|index| *index >= opening)
+        cut.iter()
+            .position(|index| runs_the_workspace(&steps[*index]))
+            .filter(|slot| *slot >= opening)
     } else {
         None
     };
@@ -183,24 +208,37 @@ pub fn part_of(steps: Vec<Step>, part: (usize, usize)) -> Vec<Step> {
     } else {
         (number, parts)
     };
-    let rest = steps.len() - opening - usize::from(alone.is_some());
+    let rest = cut.len() - opening - usize::from(alone.is_some());
     let from = rest * share.saturating_sub(1) / shares;
     let to = rest * share / shares;
+    let mut kept = vec![false; steps.len()];
     let mut position = 0;
-    steps
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, step)| {
-            if index < opening || (alone == Some(index) && number == 1) {
-                return Some(step);
-            }
-            if alone == Some(index) {
-                return None;
-            }
+    for (slot, index) in cut.iter().enumerate() {
+        kept[*index] = if slot < opening || (alone == Some(slot) && number == 1) {
+            true
+        } else if alone == Some(slot) {
+            false
+        } else {
             let at = position;
             position += 1;
-            (from..to).contains(&at).then_some(step)
-        })
+            (from..to).contains(&at)
+        };
+    }
+    // A set-up step comes before the steps that name it, so one pass from the end keeps each set-up
+    // step that a kept step names, and each that those name.
+    for index in (0..steps.len()).rev() {
+        if kept[index] {
+            for name in &steps[index].after {
+                if let Some(earlier) = steps.iter().position(|step| step.id == *name) {
+                    kept[earlier] = true;
+                }
+            }
+        }
+    }
+    steps
+        .into_iter()
+        .zip(kept)
+        .filter_map(|(step, keep)| keep.then_some(step))
         .collect()
 }
 
@@ -282,6 +320,7 @@ mod tests {
     #[test]
     fn the_parts_of_a_plan_each_hold_the_opening_builds_and_together_every_other_step_once() {
         let step = |what: &str, reading: Reading| Step {
+            id: String::new(),
             group: "rust".to_owned(),
             what: what.to_owned(),
             command: vec!["cargo".to_owned()],
@@ -292,6 +331,8 @@ mod tests {
             directory: String::new(),
             env: Vec::new(),
             output: None,
+            setup: false,
+            after: Vec::new(),
         };
         let mut steps = vec![step("a", Reading::Build), step("b", Reading::Build)];
         steps.extend((0..7).map(|n| step(&format!("t{n}"), Reading::Cargo)));
@@ -306,8 +347,59 @@ mod tests {
         assert_eq!(names((1, 1)).len(), steps.len());
     }
 
+    fn named(id: &str, reading: Reading, setup: bool, after: &[&str]) -> Step {
+        Step {
+            id: id.to_owned(),
+            setup,
+            after: after.iter().map(|name| (*name).to_owned()).collect(),
+            ..step_of(id, &["cargo"], reading)
+        }
+    }
+
+    #[test]
+    fn a_set_up_step_goes_into_every_part_that_holds_a_step_naming_it_and_no_other() {
+        let steps = vec![
+            named("build", Reading::Build, false, &[]),
+            named("set", Reading::Exit, true, &[]),
+            named("t0", Reading::Cargo, false, &["set"]),
+            named("t1", Reading::Cargo, false, &[]),
+            named("t2", Reading::Cargo, false, &["set"]),
+            named("t3", Reading::Cargo, false, &[]),
+        ];
+        let ids = |part| -> Vec<String> {
+            part_of(steps.clone(), part)
+                .into_iter()
+                .map(|step| step.id)
+                .collect()
+        };
+        assert_eq!(ids((1, 2)), ["build", "set", "t0", "t1"]);
+        assert_eq!(ids((2, 2)), ["build", "set", "t2", "t3"]);
+        assert_eq!(ids((2, 4)), ["build", "t1"]);
+        assert_eq!(ids((3, 4)), ["build", "set", "t2"]);
+        assert_eq!(ids((1, 1)).len(), steps.len());
+    }
+
+    #[test]
+    fn a_set_up_step_that_another_set_up_step_names_goes_with_it_into_a_part() {
+        let steps = vec![
+            named("s1", Reading::Exit, true, &[]),
+            named("s2", Reading::Exit, true, &["s1"]),
+            named("a", Reading::Cargo, false, &[]),
+            named("t", Reading::Cargo, false, &["s2"]),
+        ];
+        let ids = |part| -> Vec<String> {
+            part_of(steps.clone(), part)
+                .into_iter()
+                .map(|step| step.id)
+                .collect()
+        };
+        assert_eq!(ids((1, 2)), ["a"]);
+        assert_eq!(ids((2, 2)), ["s1", "s2", "t"]);
+    }
+
     fn step_of(what: &str, command: &[&str], reading: Reading) -> Step {
         Step {
+            id: String::new(),
             group: "rust".to_owned(),
             what: what.to_owned(),
             command: command.iter().map(|word| (*word).to_owned()).collect(),
@@ -318,6 +410,8 @@ mod tests {
             directory: String::new(),
             env: Vec::new(),
             output: None,
+            setup: false,
+            after: Vec::new(),
         }
     }
 
