@@ -560,8 +560,37 @@ fn a_ledger_that_fails_leaves_none_or_both_lines_and_undoes_only_an_unnamed_entr
         !names(&dir(data.path())).contains(&format!("{}.message", action(1))),
         "an entry that no line names is undone"
     );
-    window.keep(message(1, "ab", &refs)).expect("kept now");
-    assert_eq!(ledger_refs(data.path()), sorted(refs));
+    let kept = window.keep(message(1, "ab", &refs));
+    assert!(kept.is_ok(), "kept now: {kept:?}");
+    assert_eq!(ledger_refs(data.path()), sorted(refs.clone()));
+    // A hook that lets the first publication through and refuses a second: the two references of one
+    // keep are one publication, so both lines come and the keep succeeds; a writer that publishes a
+    // line for each reference is refused at its second and leaves one.
+    let c = window.draft("c");
+    let d = window.draft("d");
+    let more = vec![c, d];
+    let publications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&publications);
+    let _second = testing::at(data.path(), Point::LedgerBeforeRename, move || {
+        if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Ok(())
+        } else {
+            Err(io_fault("a second publication is refused"))
+        }
+    });
+    let kept = window.keep(message(2, "cd", &more));
+    assert!(kept.is_ok(), "one batch is one publication: {kept:?}");
+    assert_eq!(
+        publications.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the keep published once"
+    );
+    let all: Vec<(String, String)> = refs.iter().chain(more.iter()).cloned().collect();
+    assert_eq!(
+        ledger_refs(data.path()),
+        sorted(all),
+        "both lines of the keep stand with the earlier two"
+    );
 }
 
 /// KR-REQ-12.26: a ledger renamed whose flush then failed keeps the entry, and the removal is made
