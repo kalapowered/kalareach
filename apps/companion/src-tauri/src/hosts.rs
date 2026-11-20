@@ -233,9 +233,13 @@ mod tests {
     /// host in use shows, with nothing of the panic in them.
     #[tokio::test]
     async fn a_choice_that_stops_part_of_the_way_is_told_without_the_panic() {
-        let error = tauri::async_runtime::spawn_blocking(|| -> u8 { panic!("the keeper broke") })
-            .await
-            .expect_err("the step panicked");
+        // The step stops with a panic payload and no panic message, so the one panic this case
+        // prints is its own assertion's.
+        let error = tauri::async_runtime::spawn_blocking(|| -> u8 {
+            std::panic::resume_unwind(Box::new("the keeper broke"))
+        })
+        .await
+        .expect_err("the step panicked");
         let failure = unfinished(&error);
         assert_eq!(
             failure.message,
