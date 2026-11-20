@@ -429,6 +429,48 @@ fn a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names() {
     assert!(stdout.contains("pnpm install"), "{stdout}");
 }
 
+/// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: a call is a
+/// test only when its first argument is a string or a template, or a function follows it. A condition that `test.skip` takes, a step, the fixtures' `use` and `extend` and the four
+/// hooks are not tests.
+#[test]
+#[ignore = "reads TypeScript with the packages' own compiler, which `pnpm install --frozen-lockfile` installs; the report's typescript group runs it"]
+fn a_typescript_call_is_a_test_only_when_it_names_one() {
+    let (_directory, root) = copy("typescript-only");
+    let map = map_of(&root, load(&root), Some(&compiler()), true);
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    let file = map
+        .typescript
+        .iter()
+        .find(|file| file.file == "web/calls.test.ts")
+        .expect("the file of calls");
+    let named = |text: &str| file.calls.iter().any(|call| call.title_text == text);
+    for (form, text, is_a_call) in [
+        ("a string title", "a string title", true),
+        ("a template title", "a template title", true),
+        (
+            "a template with a substitution",
+            "`${named} and more`",
+            true,
+        ),
+        (
+            "an identifier title with a function after it",
+            "named",
+            true,
+        ),
+        ("a condition named by an identifier", "mobile", false),
+        (
+            "a condition that compares",
+            "process.platform === 'win32'",
+            false,
+        ),
+        ("a step", "a step inside a test", false),
+    ] {
+        assert_eq!(named(text), is_a_call, "{form}");
+    }
+    assert_eq!(file.calls.len(), 5, "{:?}", file.calls);
+    // Five calls and no more: the suite, four tests, and none of the other calls of the file.
+}
+
 /// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: each key of
 /// the `[typescript]` table that steers the reading changes the map when it is edited: the
 /// packages, the directories left out and the compiler's directories.

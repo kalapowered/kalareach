@@ -407,6 +407,10 @@ the directory that `--typescript-compiler <directory>` gives, which replaces the
 neither has no compiler: the map says so and names the install command. The result records the
 compiler's version in `run.toolchain.typescript`.
 
+A call is a test when its first argument is a string or a template, or when a function follows its
+first argument. A `test.skip(condition, reason)`, a `test.step`, a `test.use`, a `test.extend` and the
+four hooks are not tests.
+
 - A comment inside a test's body keys that test.
 - A comment directly above a test call, with no blank line between, keys that test; one above a
   `describe` keys every test inside it. A comment of several `//` lines is one comment.
