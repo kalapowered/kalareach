@@ -667,18 +667,6 @@ impl Attention {
         Ok(self.state.engine.awaiting_delivery())
     }
 
-    /// Answers whether this value still holds its store, without changing anything.
-    ///
-    /// A host asks before it dispatches an action, so a store it no longer holds is a refusal of
-    /// the action rather than an outcome nobody can establish.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::Error::StoreTaken`] when somebody else has taken the store.
-    pub fn check_store(&self) -> Result<()> {
-        self.live()
-    }
-
     /// Answers whether this store would admit one actor, without changing anything.
     ///
     /// The bound is on admission rather than on eviction: nothing anybody has acknowledged is
