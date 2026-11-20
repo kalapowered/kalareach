@@ -607,21 +607,29 @@ fn variable_name(name: &str) -> bool {
         && characters.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The parts of `output` below `{evidence}/conformance/`, or why it is not a place a step may write
-/// its output: it is below that directory, in no part empty, `.` or `..`, and not in the report's
-/// own directory of logs or its result.
-fn output_parts(output: &str) -> Result<Vec<&str>, String> {
+/// The parts of `output` below `{evidence}/conformance/`, in lower case, or why it is not a place a
+/// step may write its output: it is below that directory, in no part empty, `.` or `..` or ending
+/// with a dot or a space, and not in the report's own directory of logs or its result. The parts
+/// are in lower case because the file systems of macOS and Windows name one file by `Logs` and
+/// `logs`, and Windows by `x` and `x.` too.
+fn output_parts(output: &str) -> Result<Vec<String>, String> {
     let Some(rest) = output.strip_prefix("{evidence}/conformance/") else {
         return Err("is not below `{evidence}/conformance/`".to_owned());
     };
     if rest.contains(['{', '}', '\\']) {
         return Err("holds a placeholder or a backslash".to_owned());
     }
-    let parts: Vec<&str> = rest.split('/').collect();
-    if parts.iter().any(|part| matches!(*part, "" | "." | "..")) {
+    let parts: Vec<String> = rest.split('/').map(str::to_ascii_lowercase).collect();
+    if parts
+        .iter()
+        .any(|part| matches!(part.as_str(), "" | "." | ".."))
+    {
         return Err("holds `..`, `.` or an empty part".to_owned());
     }
-    if matches!(parts[0], "logs" | "result.json") {
+    if parts.iter().any(|part| part.ends_with(['.', ' '])) {
+        return Err("holds a part that ends with a dot or a space".to_owned());
+    }
+    if matches!(parts[0].as_str(), "logs" | "result.json") {
         return Err("is the report's own: its logs and its result are there".to_owned());
     }
     Ok(parts)
@@ -819,7 +827,7 @@ impl Plan {
             }
         }
         let mut ids = BTreeSet::new();
-        let mut outputs: Vec<(&str, Vec<&str>)> = Vec::new();
+        let mut outputs: Vec<(&str, Vec<String>)> = Vec::new();
         for step in &self.steps {
             let id = &step.id;
             if !ids.insert(id.as_str()) {

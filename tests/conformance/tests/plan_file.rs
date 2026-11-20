@@ -789,6 +789,60 @@ fn execution_faults() -> Vec<(&'static str, String, &'static str)> {
             "the steps `one` and `two` name outputs that are equal or nested",
         ),
         (
+            "an output in the directory of the logs spelt with capitals",
+            output("{evidence}/conformance/Logs/one.json"),
+            "which is the report's own",
+        ),
+        (
+            "an output that is the result spelt with capitals",
+            output("{evidence}/conformance/RESULT.json"),
+            "which is the report's own",
+        ),
+        (
+            "two steps with outputs that differ only by case",
+            format!(
+                "{}{}",
+                output("{evidence}/conformance/same.json"),
+                STEP.replace("'one'", "'two'").replace(
+                    "command = ['cargo', 'test']",
+                    "output = '{evidence}/conformance/SAME.json'\ncommand = ['cargo', 'test', '{output}']"
+                )
+            ),
+            "the steps `one` and `two` name outputs that are equal or nested",
+        ),
+        (
+            "an output inside another step's output that differs by case",
+            format!(
+                "{}{}",
+                output("{evidence}/conformance/outer"),
+                STEP.replace("'one'", "'two'").replace(
+                    "command = ['cargo', 'test']",
+                    "output = '{evidence}/conformance/OUTER/inner.json'\ncommand = ['cargo', 'test', '{output}']"
+                )
+            ),
+            "the steps `one` and `two` name outputs that are equal or nested",
+        ),
+        (
+            "an output with a part that ends with a dot",
+            output("{evidence}/conformance/x."),
+            "which holds a part that ends with a dot or a space",
+        ),
+        (
+            "an output with a part that ends with a space",
+            output("{evidence}/conformance/dir /x.json"),
+            "which holds a part that ends with a dot or a space",
+        ),
+        (
+            "an output that holds a backslash",
+            output("{evidence}/conformance/a\\b.json"),
+            "which holds a placeholder or a backslash",
+        ),
+        (
+            "an output that holds an empty part",
+            output("{evidence}/conformance/a//b.json"),
+            "which holds `..`, `.` or an empty part",
+        ),
+        (
             "a Vitest reading that names no output",
             step_with("reading = 'cargo'", "reading = 'vitest'\npackage = 'p'"),
             "step `one` reads a file and names no `output`",
