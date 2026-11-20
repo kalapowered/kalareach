@@ -67,6 +67,9 @@ pub struct Executed {
     pub tools: Vec<(String, String)>,
     /// Why it could not be run or read, when it could not.
     pub error: Option<String>,
+    /// The number of the set-up step whose failure kept it from running, when that is why it did
+    /// not run: it has no log, no exit status and no seconds.
+    pub blocked_by: Option<usize>,
     /// The programs its log says could not be run, and what their files looked like when the
     /// step ended, when it failed so.
     pub observation: Option<crate::observe::Observed>,
@@ -136,6 +139,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         lane: None,
         tools: Vec::new(),
         error: None,
+        blocked_by: None,
         observation: None,
     };
     if let Err(error) = std::fs::create_dir_all(&logs) {
@@ -253,7 +257,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
                     .or_else(|| unrecorded(&records, &executed.binaries));
             }
         }
-        Reading::Build => {}
+        Reading::Build | Reading::Exit => {}
         Reading::Vitest { .. } => match step.output.as_deref() {
             Some(path) => match vitest::read(Path::new(path), place.root) {
                 Ok(results) => executed.vitest = Some(results),
@@ -277,6 +281,29 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         }
     }
     executed
+}
+
+/// What a step that was not run is: `step` did not run because the set-up step `number` (`what`)
+/// did not exit 0 or could not be run, which `why` tells.
+#[must_use]
+pub fn not_run(step: &Step, number: usize, what: &str, why: &str) -> Executed {
+    Executed {
+        step: step.clone(),
+        exit: None,
+        seconds: 0,
+        log: String::new(),
+        binaries: Vec::new(),
+        built: Vec::new(),
+        listed: BTreeMap::new(),
+        vitest: None,
+        lane: None,
+        tools: Vec::new(),
+        error: Some(format!(
+            "not run because its set-up step {number} ({what}) {why}"
+        )),
+        blocked_by: Some(number),
+        observation: None,
+    }
 }
 
 /// The beginning of a line in which a lane's script says what it ran with.

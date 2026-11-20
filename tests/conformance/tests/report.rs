@@ -713,6 +713,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         lane: None,
         tools: Vec::new(),
         error: None,
+        blocked_by: None,
         observation: None,
     };
     let options = Options {

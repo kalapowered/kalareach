@@ -67,6 +67,8 @@ pub enum ReadingKind {
     Vitest,
     /// A phone application's unit tests.
     Lane,
+    /// A command whose exit status is all there is to record: a set-up step reads so.
+    Exit,
 }
 
 /// What a step's skip list is taken from, other than the file.
@@ -102,6 +104,15 @@ pub struct StepDef {
     /// Variables it reads from the environment the report was started in, which must be set.
     #[serde(default)]
     pub needs: Vec<String>,
+    /// Whether it sets up what later steps need: the report records only its exit status, and its
+    /// reading is `exit`. A step that names it in `after` is not run when it failed.
+    #[serde(default)]
+    pub setup: bool,
+    /// The set-up steps that run before it, by `id`: each is an earlier step of the plan, on every
+    /// platform this step is on. A selection that holds this step holds them too, whatever their
+    /// groups.
+    #[serde(default)]
+    pub after: Vec<String>,
     /// The directory it runs in, relative to the repository; the repository's root when absent. The
     /// build, the listing of the tests and the run all use it. A `cargo` step's directory is a
     /// workspace root that `[rust] manifests` names. It is a literal path: it holds no placeholder.
@@ -904,7 +915,7 @@ impl Plan {
             match (step.reading, &step.package, &step.lane) {
                 (ReadingKind::Vitest, Some(_), None)
                 | (ReadingKind::Lane, None, Some(_))
-                | (ReadingKind::Cargo | ReadingKind::Build, None, None) => {}
+                | (ReadingKind::Cargo | ReadingKind::Build | ReadingKind::Exit, None, None) => {}
                 (ReadingKind::Vitest, _, _) => {
                     return refuse(format!(
                         "step `{id}` reads vitest and takes a `package` and no `lane`"
@@ -959,6 +970,43 @@ impl Plan {
                 return refuse(format!(
                     "step `{id}` skips from the applications and the plan has no `[applications]`"
                 ));
+            }
+        }
+        for (index, step) in self.steps.iter().enumerate() {
+            let id = &step.id;
+            if step.setup && step.reading != ReadingKind::Exit {
+                return refuse(format!(
+                    "step `{id}` is a set-up step and reads `{}`: a set-up step reads `exit`",
+                    format!("{:?}", step.reading).to_lowercase()
+                ));
+            }
+            for name in &step.after {
+                let Some(at) = self.steps.iter().position(|other| other.id == *name) else {
+                    return refuse(format!(
+                        "step `{id}` is `after` `{name}`, which names no step of the plan"
+                    ));
+                };
+                if at >= index {
+                    return refuse(format!(
+                        "step `{id}` is `after` `{name}`, which does not come before it in the plan"
+                    ));
+                }
+                let setup = &self.steps[at];
+                if !setup.setup {
+                    return refuse(format!(
+                        "step `{id}` is `after` `{name}`, which is not a set-up step"
+                    ));
+                }
+                if let Some(platform) = step
+                    .platforms
+                    .iter()
+                    .find(|platform| !setup.platforms.contains(platform))
+                {
+                    return refuse(format!(
+                        "step `{id}` runs on {}, where its set-up step `{name}` does not run",
+                        platform.name()
+                    ));
+                }
             }
         }
         for absent in &self.group_absent {
@@ -1094,14 +1142,21 @@ impl Plan {
                 .into_iter()
                 .enumerate()
                 .map(|(index, step)| StepDef {
-                    id: format!("step-{}", index + 1),
+                    id: if step.id.is_empty() {
+                        format!("step-{}", index + 1)
+                    } else {
+                        step.id.clone()
+                    },
                     group: step.group,
                     what: step.what,
                     platforms: vec![Platform::Linux, Platform::MacOs, Platform::Windows],
                     command: step.command,
+                    setup: step.setup,
+                    after: step.after,
                     reading: match step.reading {
                         Reading::Cargo => ReadingKind::Cargo,
                         Reading::Build => ReadingKind::Build,
+                        Reading::Exit => ReadingKind::Exit,
                         Reading::Vitest { .. } => ReadingKind::Vitest,
                         Reading::Lane(_) => ReadingKind::Lane,
                     },
@@ -1160,6 +1215,9 @@ impl Plan {
                 };
                 let output = output_of(definition, values);
                 Some(Step {
+                    id: definition.id.clone(),
+                    setup: definition.setup,
+                    after: definition.after.clone(),
                     group: definition.group.clone(),
                     what: definition.what.clone(),
                     command: expand(definition, values, &from_applications),
@@ -1179,6 +1237,7 @@ impl Plan {
                     reading: match definition.reading {
                         ReadingKind::Cargo => Reading::Cargo,
                         ReadingKind::Build => Reading::Build,
+                        ReadingKind::Exit => Reading::Exit,
                         ReadingKind::Vitest => Reading::Vitest {
                             directory: definition.package.clone().unwrap_or_default(),
                         },
@@ -1200,16 +1259,36 @@ impl Plan {
     }
 
     /// The steps of the selected groups, on `platform` when one is given and on every platform
-    /// when none is.
+    /// when none is, and every set-up step that a step of them names in `after`, directly or through
+    /// another set-up step, whatever its group.
     fn selected<'a>(
         &'a self,
         platform: Option<Platform>,
         groups: &'a [String],
     ) -> impl Iterator<Item = &'a StepDef> {
-        self.steps.iter().filter(move |step| {
-            groups.contains(&step.group)
-                && platform.is_none_or(|platform| step.platforms.contains(&platform))
-        })
+        let mut taken: Vec<bool> = self
+            .steps
+            .iter()
+            .map(|step| {
+                groups.contains(&step.group)
+                    && platform.is_none_or(|platform| step.platforms.contains(&platform))
+            })
+            .collect();
+        // A set-up step comes before the steps that name it, so one pass from the end finds each
+        // set-up step that a taken step names, and each that those name.
+        for index in (0..self.steps.len()).rev() {
+            if taken[index] {
+                for name in &self.steps[index].after {
+                    if let Some(earlier) = self.steps.iter().position(|step| step.id == *name) {
+                        taken[earlier] = true;
+                    }
+                }
+            }
+        }
+        self.steps
+            .iter()
+            .zip(taken)
+            .filter_map(|(step, taken)| taken.then_some(step))
     }
 
     /// Whether the selection reads TypeScript: a selected step, on any platform, reads a package's
