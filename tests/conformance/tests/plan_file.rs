@@ -1751,7 +1751,8 @@ fn an_option_without_a_value_is_a_usage_error_for_map_and_run() {
 #[test]
 fn the_tables_are_not_in_the_code() {
     // The names of two variables, the schema's version, the two `const fn` of `Platform`, the
-    // loader's own constants, and the reach and the characters the ignored-test reader holds.
+    // loader's own constants (the most seconds a time limit may be among them), and the reach and
+    // the characters the ignored-test reader holds.
     let kept = [
         "SECRET_STORE_VARIABLE",
         "APPLICATIONS_VARIABLE",
@@ -1763,6 +1764,7 @@ fn the_tables_are_not_in_the_code() {
         "PLACEHOLDERS",
         "HELPER_REACH",
         "UNREAD",
+        "MOST_SECONDS",
     ];
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut found = Vec::new();
@@ -2175,7 +2177,7 @@ fn time_faults() -> Vec<(&'static str, String, &'static str)> {
         (
             "a timeout on a step that runs on windows",
             on_windows(limited("timeout = 5\n")),
-            "step `one` has a time limit and runs on windows, where the report cannot end the processes of a step",
+            "step `one` has a time limit and runs on `windows`, where the report cannot end the processes of a step",
         ),
         (
             "a budget on a step that runs on windows",
@@ -2183,7 +2185,7 @@ fn time_faults() -> Vec<(&'static str, String, &'static str)> {
                 "[[budget]]\nid = 'b'\nseconds = 5\n",
                 "budget = 'b'\n",
             )),
-            "step `one` has a time limit and runs on windows",
+            "step `one` has a time limit and runs on `windows`",
         ),
     ]
 }

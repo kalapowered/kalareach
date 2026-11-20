@@ -280,30 +280,33 @@ name.
 
 ### Time limits
 
-A step may name a `timeout`, and a plan may name `[[budget]]` tables that steps share. A `timeout` and
-a budget's `seconds` are whole seconds from 1 to 86400. A budget has an `id` of ASCII letters, digits,
-`-` and `_`, and a step names it as `budget = "<id>"`. The loader refuses a time outside that range,
-two budgets with one `id`, a `budget` that names no `[[budget]]`, a `[[budget]]` that no step names,
-and a step that runs on Windows and has either field, because the report cannot end a step's
-processes there. Core's plan uses neither field.
+A step may name a `timeout`, and a plan may name `[[budget]]` tables that steps share. Each is a whole
+number of seconds from 1 to 86400. A budget has an `id`, made of ASCII letters, digits, `-` and `_`,
+and a step joins it with `budget = "<id>"`. The loader refuses a time outside that range, two budgets
+with one `id`, a `budget` that names no `[[budget]]`, a `[[budget]]` that no step names, and a step
+that runs on `windows` with either field, because the report cannot end a step's processes there.
+Core's plan uses neither field.
 
-A step's time starts when the step does, before Cargo's preparation, and one deadline covers the
-build of a `cargo` step, the listing of its tests and its run. The steps that name a budget spend it
-in the plan's order, by the time they take, and a step that names both a `timeout` and a budget is out
-of time at the earlier deadline. When the time is spent, the report asks the step's process group to
-end, waits two seconds and then ends the group by force. The step fails with the error `ran out of its
-time limit: <n> s`, where `<n>` is the limit that was spent, the step's `timeout` or the budget's
-`seconds`, and the log ends with the same words. The step has no exit status, and the run fails. A
-later step that names the same budget is not run: it has no log and no exit status, and its error
-says `not run because its budget was spent by step <number>`. A step that names it in `after` is not
-run either, and its error ends `was not run, because its budget was spent by step <number>`. A step
-that is not run takes no time from its budget.
+A step's time starts with the step, before Cargo's preparation. One deadline covers the build of a
+`cargo` step, the listing of its tests and its run. Steps that name a budget spend it in plan order,
+by the time they take. A step with both a `timeout` and a budget is out of time at the earlier
+deadline, and at a tie the error names the `timeout`.
 
-On macOS and Linux a step with a limit runs each of its commands as the leader of a process group of
-its own, and the report ends that group; a step without a limit runs as it did. A process that leaves
-the group by starting one of its own is not reached. Playwright 1.63.0 starts each browser as the
-leader of a group of its own, so a step that runs Playwright can leave its browsers running when its
-time is spent.
+When the time is spent, the report asks the step's process group to end, waits two seconds, then
+kills whatever is left of the group, whether or not the step's own process has gone. The step fails
+with the error `ran out of its time limit: <n> s`, where `<n>` is the seconds of the limit that was
+spent, the `timeout` or the budget. The log ends with the same words. The step has no exit status,
+and the run fails.
+
+Each later step of that budget is not run. It has no log and no exit status, and its error is
+`not run because its budget was spent by step <number>`. A step that names it in `after` is not run
+either, and its error ends `was not run, because its budget was spent by step <number>`. A step that is not
+run takes no time from its budget.
+
+On macOS and Linux a step with a limit runs each command as the leader of a process group of its own;
+a step without a limit runs as before. A process that starts a group of its own is outside the kill.
+Playwright 1.63.0 does that for each browser, so a step that runs Playwright can leave browsers
+running when its time is spent.
 
 ## How a test names what it proves
 
