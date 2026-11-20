@@ -13,7 +13,6 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use kr_crypto::store::{KeyOwner, StoreSelection};
-use kr_ipc::endpoint::Listener;
 use kr_ipc::install::Running;
 use kr_ipc::paths::HostPaths;
 use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
@@ -167,7 +166,12 @@ pub fn main() -> ExitCode {
     match runtime.block_on(run(arguments, running)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("kr-controller: {error}");
+            // A refused bind of an endpoint is one line of a fixed grammar, which the command that
+            // started this daemon reads back; every other failure is the bare error.
+            match error.downcast_ref::<kr_controller::local_endpoints::BindFailure>() {
+                Some(failure) => eprintln!("{}", failure.line(std::process::id())),
+                None => eprintln!("kr-controller: {error}"),
+            }
             ExitCode::FAILURE
         }
     }
@@ -306,11 +310,11 @@ async fn run(
     // through the proxy this daemon started with, the one its network endpoint uses.
     controller.attach_managed_delivery()?;
 
-    let rendezvous = Listener::bind(&environment.rendezvous_endpoint()?)?;
-    let clients = Listener::bind(&environment.controller_endpoint()?)?;
-    // A 1 MiB attachment chunk does not fit a control frame, so transfer chunks have their own
-    // endpoint, framed at the attachment bound and served by the same admission path.
-    let chunks = kr_controller::transfer::bind_chunk_endpoint(&environment)?;
+    let kr_controller::local_endpoints::LocalEndpoints {
+        rendezvous,
+        control: clients,
+        chunks,
+    } = kr_controller::local_endpoints::bind_local_endpoints(&environment)?;
     // The endpoints are bound, so this daemon serves: a command's record of an attempt to stop
     // another daemon is of no use to anyone now, and only a record that names this daemon as the
     // one to stop is left.
