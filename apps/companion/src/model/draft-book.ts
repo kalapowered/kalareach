@@ -158,6 +158,18 @@ export type SendOutcome =
   | 'refused'
   /** Nobody knows. */
   | 'unknown'
+  /**
+   * The host cannot tell and never will on this channel, and this device has kept the text apart,
+   * whole, in its store of channel messages: the draft that held it goes and nothing returns to a
+   * composer.
+   */
+  | 'handed_over'
+
+/** What a hand-over asks this device to keep: the sent text and the stored records that held it. */
+export interface HeldPrompt {
+  readonly text: string
+  readonly drafts: readonly StoredRef[]
+}
 
 /** Whether a rejection of a send's claim is the loss of it: another window holds the draft. */
 export function claimWasLost(failure: unknown): boolean {
@@ -174,6 +186,13 @@ export interface SendToken {
    * of the stored draft the prompt was sent from, or null when the store holds none for it.
    */
   readonly claimed: Promise<string | null>
+  /**
+   * Whether the press stored exactly the sent text, which is so only once `claimed` has settled:
+   * false for a save that failed, was lost, or found the book not ready to store.
+   */
+  exact(): boolean
+  /** The stored records the press wrote for the sent text, once `claimed` has settled. */
+  pressed(): readonly StoredRef[]
 }
 
 /** What a phone keeps of a prompt an earlier run sent, so that a later run can find the draft that holds its text. */
@@ -217,6 +236,8 @@ interface Flight {
    * then said to have been applied.
    */
   older?: StoredRef
+  /** True once the press stored exactly what was sent. */
+  exact?: boolean
   /** True once the prompt was said to have been applied after nobody knew: nothing of it is to be stored. */
   consumed?: boolean
   /**
@@ -418,6 +439,12 @@ export class DraftBook {
   readonly #byLocal = new Map<string, string>()
   /** Prompts that ended as of unknown outcome, until the host says what became of them. */
   readonly #unknowns = new Map<string, Flight>()
+  /** Prompts being handed over to the channel store, by the submission's local identity, with the first final state said meanwhile. */
+  readonly #handovers = new Map<string, { readonly flight: Flight; late: InputState | null }>()
+  /** Submissions whose text this device kept apart, whole, in its store of channel messages. */
+  readonly #kept = new Set<string>()
+  /** Work that waits for the store to have been read. */
+  #readyWaiters: (() => void)[] = []
   /** Prompts that ended without their text stored anywhere, kept here until the store takes it. */
   #unsettled: Flight[] = []
   /** Prompts whose text the store will never take, for its size: held here for a person to copy. */
@@ -689,6 +716,7 @@ export class DraftBook {
         // The save names the version this window holds and always makes a new one, so of two
         // windows that hold the same stored draft only the first can claim it.
         const written = await this.#write(key, sent, true)
+        flight.exact = written === 'stored'
         if (written === 'failed') flight.earlier = this.#find(key)?.stored ?? null
         else flight.record = this.#find(key)?.stored ?? null
         if (written === 'lost') {
@@ -713,7 +741,12 @@ export class DraftBook {
       this.#mutate(key, (draft) => ({ ...draft, stored: null }))
       this.#track(key).savedKey = contentKey(now) === contentKey(sent) ? contentKey(now) : null
     })
-    return { key: token, claimed }
+    return {
+      key: token,
+      claimed,
+      exact: () => flight.exact === true,
+      pressed: () => [flight.record, flight.earlier].filter((ref): ref is StoredRef => ref !== null)
+    }
   }
 
   /**
@@ -745,8 +778,16 @@ export class DraftBook {
    */
   sendSettled(localId: string, state: InputState, earlier?: EarlierPrompt): void {
     const outcome = sendOutcomeOf(state)
-    const key = this.#byLocal.get(localId)
     if (outcome === null) return
+    // A message being handed over, or kept apart, never reaches a composer: a final state said
+    // while the keep is pending waits for the keep's answer, and one said after it changes nothing.
+    if (this.#kept.has(localId)) return
+    const handover = this.#handovers.get(localId)
+    if (handover !== undefined) {
+      if (outcome !== 'unknown' && handover.late === null) handover.late = state
+      return
+    }
+    const key = this.#byLocal.get(localId)
     if (key === undefined) {
       if (outcome === 'taken' && earlier !== undefined) this.#takenEarlier(localId, earlier)
       return
@@ -788,6 +829,9 @@ export class DraftBook {
   /** Makes the late end of every prompt of an earlier run that is waiting, once the store has been read. */
   #settleEarlier(): void {
     if (this.#status !== 'ready') return
+    const waiters = this.#readyWaiters
+    this.#readyWaiters = []
+    for (const resolve of waiters) resolve()
     const waiting = this.#earlier
     this.#earlier = []
     for (const each of waiting) {
@@ -1043,10 +1087,18 @@ export class DraftBook {
    * another prompt: a send names its prompt by its token, a submission by its local identity.
    */
   textConsumed(prompt: { readonly key: string } | { readonly localId: string }): boolean {
+    // A message kept apart is never put back: its words are done whatever the host says of it.
+    if ('localId' in prompt && this.handedOver(prompt.localId) !== null) return true
     const key = 'key' in prompt ? prompt.key : this.#byLocal.get(prompt.localId)
     if (key === undefined) return false
     const flight = this.#flights.get(key) ?? this.#unknowns.get(key)
     return flight?.consumed === true
+  }
+
+  /** Whether a submission's text is being handed over to the channel store, or was kept there. */
+  handedOver(localId: string): 'pending' | 'kept' | null {
+    if (this.#kept.has(localId)) return 'kept'
+    return this.#handovers.has(localId) ? 'pending' : null
   }
 
   /** Whether a prompt was said to have been applied: read again after each wait, as it can change in one. */
@@ -1090,42 +1142,148 @@ export class DraftBook {
     token: Pick<SendToken, 'key'>,
     outcome: SendOutcome,
     localId?: string,
-    ended?: (storedDraftId: string | null) => void
+    ended?: (storedDraftId: string | null) => void,
+    keep?: (held: HeldPrompt) => Promise<boolean>
   ): void {
     const flight = this.#flights.get(token.key)
     if (flight === undefined || flight.endedAs !== undefined) return
     flight.endedAs = outcome
     if (ended !== undefined) flight.onEnded = ended
+    if (outcome === 'handed_over') {
+      // The submission is known by its hand-over until the keep answers, so that what the host
+      // says meanwhile is held back and never queued for a composer.
+      if (localId !== undefined) this.#handovers.set(localId, { flight, late: null })
+      this.#enqueue(flight.composer, () => this.#handOver(flight, localId, keep))
+      return
+    }
     if (localId !== undefined && outcome === 'unknown') this.#byLocal.set(localId, flight.id)
     else if (localId !== undefined) this.#byLocal.delete(localId)
-    this.#enqueue(flight.composer, async () => {
-      try {
-        // Words that another prompt was applied for are done, whatever became of this one. Its
-        // outcome may still be unknown, and the book goes on answering for it until the host says.
-        if (outcome === 'taken' || flight.consumed === true) {
-          await this.#dropSent(flight)
-          await this.#dropEarlier(flight)
-          if (outcome === 'unknown' && localId !== undefined) this.#unknowns.set(flight.id, flight)
-          return
-        }
-        const stored = await this.#giveBack(flight)
-        if (stored) {
-          // The text is stored under a record that stands for it, so the older version it grew from
-          // says less and goes. Until then it stays: it is all the store holds of this draft.
-          await this.#dropEarlier(flight)
-        } else {
-          this.#unsettled.push(flight)
-        }
-        // Nobody knows what became of it, and the host may still say: the prompt is remembered
-        // for as long as the window is.
+    this.#enqueue(flight.composer, () => this.#end(flight, outcome, localId))
+  }
+
+  /** Makes the end of a prompt that was taken, refused or of unknown outcome, in its composer's turn. */
+  async #end(flight: Flight, outcome: 'taken' | 'refused' | 'unknown', localId: string | undefined): Promise<void> {
+    try {
+      // Words that another prompt was applied for are done, whatever became of this one. Its
+      // outcome may still be unknown, and the book goes on answering for it until the host says.
+      if (outcome === 'taken' || flight.consumed === true) {
+        await this.#dropSent(flight)
+        await this.#dropEarlier(flight)
         if (outcome === 'unknown' && localId !== undefined) this.#unknowns.set(flight.id, flight)
+        return
+      }
+      const stored = await this.#giveBack(flight)
+      if (stored) {
+        // The text is stored under a record that stands for it, so the older version it grew from
+        // says less and goes. Until then it stays: it is all the store holds of this draft.
+        await this.#dropEarlier(flight)
+      } else {
+        this.#unsettled.push(flight)
+      }
+      // Nobody knows what became of it, and the host may still say: the prompt is remembered
+      // for as long as the window is.
+      if (outcome === 'unknown' && localId !== undefined) this.#unknowns.set(flight.id, flight)
+    } finally {
+      this.#flights.delete(flight.id)
+      flight.onEnded?.(this.#holding(flight))
+      // A prompt of an earlier run that this one held the draft of is settled now.
+      if (this.#earlier.length > 0) this.#settleEarlier()
+    }
+  }
+
+  /**
+   * Hands a prompt over to the channel store, in its composer's turn and after the press's own
+   * write: the keep is awaited whatever `consumed` says, because words that another prompt was
+   * applied for do not make this message's keep unnecessary.
+   *
+   * A keep that answered true leaves nothing in any composer. One that failed ends the prompt as of
+   * unknown outcome, in this same turn, and a final state said meanwhile is applied as an ordinary
+   * late one: the text is then in the composer once.
+   */
+  async #handOver(
+    flight: Flight,
+    localId: string | undefined,
+    keep: ((held: HeldPrompt) => Promise<boolean>) | undefined
+  ): Promise<void> {
+    const kept = await (async (): Promise<boolean> => {
+      try {
+        return (
+          keep !== undefined &&
+          (await keep({
+            text: flight.sent.text,
+            drafts: [flight.record, flight.earlier].filter((ref): ref is StoredRef => ref !== null)
+          }))
+        )
+      } catch {
+        return false
+      }
+    })()
+    if (kept) {
+      try {
+        await this.#dropSent(flight)
+        await this.#dropEarlier(flight)
+        if (localId !== undefined) {
+          this.#handovers.delete(localId)
+          this.#kept.add(localId)
+        }
       } finally {
         this.#flights.delete(flight.id)
-        flight.onEnded?.(this.#holding(flight))
-        // A prompt of an earlier run that this one held the draft of is settled now.
+        flight.onEnded?.(null)
         if (this.#earlier.length > 0) this.#settleEarlier()
       }
-    })
+      return
+    }
+    const late = localId === undefined ? null : (this.#handovers.get(localId)?.late ?? null)
+    if (localId !== undefined) {
+      this.#handovers.delete(localId)
+      this.#byLocal.set(localId, flight.id)
+    }
+    flight.endedAs = 'unknown'
+    await this.#end(flight, 'unknown', localId)
+    if (late !== null && localId !== undefined) this.sendSettled(localId, late)
+  }
+
+  /**
+   * Retires the drafts a record of a send held when the host says the message was taken, wherever
+   * the record was restored from: each exact version is discarded, or its removal made durable,
+   * and a composer that still holds exactly that version, as it was saved, is emptied. A draft
+   * that is gone, or that the person has changed since, is left. It waits until the store has been
+   * read and rejects when neither the discard nor the record of its removal succeeded.
+   */
+  async retireHeld(refs: readonly StoredRef[]): Promise<void> {
+    if (this.#status !== 'ready') {
+      await new Promise<void>((resolve) => {
+        this.#readyWaiters.push(resolve)
+      })
+    }
+    for (const ref of refs) {
+      const composer = this.#drafts.find((draft) => draft.stored?.id === ref.id)
+      const key = composer?.draftId ?? `held-${ref.id}`
+      await this.#enqueueAwait(key, async () => {
+        try {
+          await this.#port.deviceDraftDiscard({ id: ref.id, expectedRevision: ref.revision })
+        } catch (failure) {
+          // A draft changed since is the person's now, and stays.
+          if (failureCode(failure) !== 'DRAFT_CONFLICT') {
+            await this.#port.deviceDraftMarkRemoval({ id: ref.id, expectedRevision: ref.revision })
+          }
+        }
+        this.#moves += 1
+        const listed = this.#others.filter((other) => other.id !== ref.id)
+        if (listed.length !== this.#others.length) {
+          this.#others = listed
+          this.#changed()
+        }
+        const mine = composer === undefined ? undefined : this.#find(composer.draftId)
+        if (
+          mine?.stored?.id === ref.id &&
+          mine.stored.revision === ref.revision &&
+          contentKey(mine) === this.#track(mine.draftId).savedKey
+        ) {
+          this.#emptied(mine)
+        }
+      })
+    }
   }
 
   /**
