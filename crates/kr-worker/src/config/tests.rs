@@ -331,17 +331,19 @@ fn environment_additions_resolve_on_the_ladder() {
     }
 }
 
-/// KR-REQ-07.64: the resolver lists the package whose usable configuration records reduced
-/// ownership. A missing or unusable document produces an empty list.
+/// KR-REQ-07.64: a document with an agents entry is loaded, and one whose agents section this host
+/// cannot use is refused whole, so no entry in it is read.
 #[test]
-fn an_agents_entry_records_reduced_ownership_for_its_package_only() {
+fn a_document_with_an_agents_entry_is_loaded_and_one_with_an_unusable_entry_is_refused() {
     use kr_protocol::broker::AgentOwnership;
     use kr_protocol::hostinfo::configuration::AgentChoice;
 
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
-    let absent = Resolver::open(&environment);
-    assert!(absent.reduced_agents().is_empty());
+    assert_eq!(
+        Resolver::open(&environment).status().state,
+        DocumentState::Absent
+    );
 
     let mut document = ConfigurationDocument::empty();
     document.agents.insert(
@@ -355,17 +357,20 @@ fn an_agents_entry_records_reduced_ownership_for_its_package_only() {
         configuration::contents(&document).as_bytes(),
     )
     .expect("writes the document");
-    let chosen = Resolver::open(&environment);
-    assert_eq!(chosen.reduced_agents(), vec!["kalareach/codex".to_owned()]);
+    assert_eq!(
+        Resolver::open(&environment).status().state,
+        DocumentState::Loaded
+    );
 
-    // A document this host cannot use records nothing: the resolver never answers reduced from a
-    // document it did not read.
+    // A document this host cannot use records nothing: the resolver never reads an entry out of a
+    // document it refused.
     kr_ipc::paths::write_owner_only_file(
         &document_path(&environment),
         br#"{"version": 1, "agents": {"kalareach/codex": {"ownership": "reduced"}, "x": {}}}"#,
     )
     .expect("writes the document");
-    let unusable = Resolver::open(&environment);
-    assert_eq!(unusable.status().state, DocumentState::Invalid);
-    assert!(unusable.reduced_agents().is_empty());
+    assert_eq!(
+        Resolver::open(&environment).status().state,
+        DocumentState::Invalid
+    );
 }

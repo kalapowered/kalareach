@@ -332,24 +332,6 @@ impl Resolver {
         )
     }
 
-    /// Returns the packages the document names reduced ownership for, in order.
-    #[must_use]
-    pub fn reduced_agents(&self) -> Vec<String> {
-        self.loaded
-            .document
-            .as_ref()
-            .map_or_else(Vec::new, |document| {
-                document
-                    .agents
-                    .iter()
-                    .filter(|(_, choice)| {
-                        choice.ownership == kr_protocol::broker::AgentOwnership::Reduced
-                    })
-                    .map(|(package, _)| package.clone())
-                    .collect()
-            })
-    }
-
     /// Resolves the runtime tree this installation uses.
     ///
     /// The allowlisted variable acts at the request rung, which is where
