@@ -1356,15 +1356,21 @@ impl Installer {
         let Some(record) = recorded else {
             return Ok(None);
         };
-        // Every document this removal would rewrite. A removal that took the package and then
-        // refused the document would leave the agent with an entry pointing at a skill that is no
-        // longer there.
-        for operation in &record.manifest.operations {
-            if let ChangeOperation::AddConfigurationEntry { path, entry, .. } = operation {
-                // Read as the removal will read it, so a document it could not edit, one that
-                // names a member twice among them, is refused here rather than half way through.
-                self.entry_digest_under(Path::new(path), entry_key(entry))?;
-                guard_access_controls(Path::new(path), CONFIGURATION_BY_HAND)?;
+        // The compiled agents' documents are written and removed by paths, outside the walk's
+        // checks (D7 of the contact documents), so each of them is read as the removal will read
+        // it and guarded here, whatever the removal will do to it: a removal that took the package
+        // and then refused the document would leave the agent with an entry pointing at a skill
+        // that is no longer there. Under the walk the guard is made below, for the documents the
+        // removal deletes or rewrites, and not for one it keeps.
+        if !matches!(self.fs, Fs::Walk(_)) {
+            for operation in &record.manifest.operations {
+                if let ChangeOperation::AddConfigurationEntry { path, entry, .. } = operation {
+                    // Read as the removal will read it, so a document it could not edit, one that
+                    // names a member twice among them, is refused here rather than half way
+                    // through.
+                    self.entry_digest_under(Path::new(path), entry_key(entry))?;
+                    guard_access_controls(Path::new(path), CONFIGURATION_BY_HAND)?;
+                }
             }
         }
         // What the removal will do to each recorded name is decided here, by the same reads it
@@ -1398,10 +1404,12 @@ impl Installer {
                         )? {
                             EntryPlan::Keep(_) => {}
                             EntryPlan::Delete { .. } => {
+                                guard_access_controls(path, CONFIGURATION_BY_HAND)?;
                                 walk.refuse_shared_folder(path, anchor::Act::Remove)?;
                                 walk.refuse_shared_file(path, anchor::Act::Remove)?;
                             }
                             EntryPlan::Edit { .. } => {
+                                guard_access_controls(path, CONFIGURATION_BY_HAND)?;
                                 walk.refuse_shared_folder(path, anchor::Act::Write)?;
                                 walk.refuse_shared_file(path, anchor::Act::Write)?;
                             }
@@ -6968,7 +6976,21 @@ mod tests {
     fn a_document_another_installation_holds_is_kept_and_the_removal_goes_ahead_though_it_became_changeable()
      {
         let tree = Tree::create();
-        let first = amp_installed(&tree);
+        let (first, document) = amp_sharing_its_document(&tree);
+        set_mode(&document, 0o666);
+        let removed = first.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around a document it keeps: {removed:?}"
+        );
+        assert_removal_kept_the_held_document(&tree, &document, &removed.expect("a removal"));
+    }
+
+    /// The installer for `amp`, installed, and the document it made, which a second declared word
+    /// has installed into as well, so that a removal of `amp` keeps the entry.
+    #[cfg(unix)]
+    fn amp_sharing_its_document(tree: &Tree) -> (Installer, PathBuf) {
+        let first = amp_installed(tree);
         let second = tree.installer().with_declaration(
             Some(declared_as(
                 "bmp",
@@ -6981,14 +7003,17 @@ mod tests {
         second
             .install(&params(bmp, InstallScope::User))
             .expect("the second word installs into the same document");
-        let document = tree.home().join(".amp/mcp.json");
-        set_mode(&document, 0o666);
-        let removed = first.remove(&params(amp(), InstallScope::User));
-        assert!(
-            removed.is_ok(),
-            "the removal goes ahead around a document it keeps: {removed:?}"
-        );
-        let removed = removed.expect("a removal");
+        (first, tree.home().join(".amp/mcp.json"))
+    }
+
+    /// What a removal of `amp` that went ahead around the document the other word holds left: it
+    /// says why it kept the entry, the entry stays, and `amp`'s own skill files are taken.
+    #[cfg(unix)]
+    fn assert_removal_kept_the_held_document(
+        tree: &Tree,
+        document: &Path,
+        removed: &AgentToolsRemoveResult,
+    ) {
         assert!(
             removed
                 .retained
@@ -6998,7 +7023,7 @@ mod tests {
             removed.retained
         );
         assert!(
-            std::fs::read_to_string(&document)
+            std::fs::read_to_string(document)
                 .expect("the document stays")
                 .contains("kalareach"),
             "the other installation keeps its entry"
@@ -7007,6 +7032,93 @@ mod tests {
             !tree.home().join(SKILL_FILE).exists(),
             "and its own skill files are taken"
         );
+    }
+
+    /// KR-REQ-11.01: a document whose entry another installation still holds is kept by a
+    /// removal, so it is not judged: an access list on it does not stop the removal. On macOS the
+    /// list is a deny entry, which the walk's own check accepts; on Linux it is a POSIX list that
+    /// gives no account write access.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_document_another_installation_holds_is_kept_whatever_its_access_list_says() {
+        let tree = Tree::create();
+        let (first, document) = amp_sharing_its_document(&tree);
+        #[cfg(target_os = "macos")]
+        let _entry = {
+            let restriction = Restriction(document.clone());
+            exacl::setfacl(
+                &[&document],
+                &[exacl::AclEntry::deny_group(
+                    "everyone",
+                    exacl::Perm::DELETE,
+                    None,
+                )],
+                None,
+            )
+            .expect("a deny entry");
+            restriction
+        };
+        #[cfg(target_os = "linux")]
+        if !set_read_only_posix_list(&document) {
+            println!("this file system keeps no POSIX lists, so there is nothing to keep");
+            return;
+        }
+        let removed = first.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around a document it keeps: {removed:?}"
+        );
+        assert_removal_kept_the_held_document(&tree, &document, &removed.expect("a removal"));
+    }
+
+    /// Gives `path` a POSIX access list that lets no account but the owner write: owner rw, user
+    /// 65534 r, group r, mask r, other none. False where the file system keeps no such lists.
+    #[cfg(target_os = "linux")]
+    fn set_read_only_posix_list(path: &Path) -> bool {
+        let mut list = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 6_u16, u32::MAX),
+            (0x02, 4, 65534),
+            (0x04, 4, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
+        ] {
+            list.extend(tag.to_le_bytes());
+            list.extend(permissions.to_le_bytes());
+            list.extend(id.to_le_bytes());
+        }
+        match rustix::fs::setxattr(
+            path,
+            "system.posix_acl_access",
+            &list,
+            rustix::fs::XattrFlags::empty(),
+        ) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::NOTSUP) => false,
+            Err(error) => panic!("a POSIX list is set on the document: {error}"),
+        }
+    }
+
+    /// KR-REQ-11.01: a document whose entry another installation still holds is kept by a
+    /// removal, so it is not judged: a group that a new file in its folder would not get does not
+    /// stop the removal.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_another_installation_holds_is_kept_whatever_its_owner_or_group_is() {
+        let tree = Tree::create();
+        let (first, document) = amp_sharing_its_document(&tree);
+        let Some(group) = crate::catalogue::files::another_group(&tree.home()) else {
+            println!("this user belongs to one group only, so the group case runs as a decision");
+            return;
+        };
+        std::os::unix::fs::chown(&document, None, Some(group))
+            .expect("the document is given a group of this user's");
+        let removed = first.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around a document it keeps: {removed:?}"
+        );
+        assert_removal_kept_the_held_document(&tree, &document, &removed.expect("a removal"));
     }
 
     /// KR-REQ-11.01: a skill file that was changed after the installation is kept by a removal,
