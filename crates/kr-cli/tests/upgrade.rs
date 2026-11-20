@@ -5037,7 +5037,10 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
             ],
         )
         .expect("writes the record of a prompt as the release before makes it");
-    let recorded = || -> Vec<u8> {
+    // The session the journal records for the draft's prompt, or none when the record is gone: the
+    // read ends in `optional`, so a lost record fails the assertion that reads it and not a set-up.
+    let recorded = || -> Option<Vec<u8>> {
+        use rusqlite::OptionalExtension as _;
         rusqlite::Connection::open(&journal)
             .expect("opens the journal")
             .query_row(
@@ -5045,7 +5048,8 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
                 rusqlite::params![written.get().as_bytes().to_vec()],
                 |row| row.get(0),
             )
-            .expect("the record of the prompt is there")
+            .optional()
+            .expect("reads the journal")
     };
 
     // Update again with the release before's `kr`.
@@ -5089,7 +5093,7 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
     // The record the release before made for a prompt is still there and still names its session.
     assert_eq!(
         recorded(),
-        session.get().as_bytes().to_vec(),
+        Some(session.get().as_bytes().to_vec()),
         "the record of the prompt still names its session after the update"
     );
     // The store call a daemon's prompt makes: the draft's own revision is accepted again for the same
@@ -5124,7 +5128,7 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
     );
     assert_eq!(
         recorded(),
-        session.get().as_bytes().to_vec(),
+        Some(session.get().as_bytes().to_vec()),
         "a refused prompt removes no record"
     );
 }
