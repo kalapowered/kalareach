@@ -29,8 +29,8 @@ pub enum Tok {
     Str(String, bool),
     /// A character or byte literal.
     Char,
-    /// A numeric literal.
-    Number,
+    /// A numeric literal, as it is written.
+    Number(String),
     /// One punctuation character.
     Punct(char),
     /// A comment, with its text after the opening marker and before any closing one.
@@ -211,8 +211,10 @@ impl Lexer<'_> {
                 let name = self.word();
                 self.push(Tok::Ident(name), line);
             } else if c.is_ascii_digit() {
+                let from = self.at;
                 self.number();
-                self.push(Tok::Number, line);
+                let written: String = self.chars[from..self.at].iter().collect();
+                self.push(Tok::Number(written), line);
             } else {
                 self.bump();
                 self.push(Tok::Punct(c), line);

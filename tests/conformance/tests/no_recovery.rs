@@ -317,8 +317,8 @@ fn scratch_removal(tokens: &[Token]) -> Option<usize> {
 /// The runs of words, each written once in the block of `impl Group` in `tree.rs`, that start a
 /// step's command as the leader of a process group of its own and signal that group and no other
 /// process: the group's leader is the pid of the child the report started, and the signal is
-/// `TERM`, then `KILL`. The lexer keeps no value for a number, so the `0` of the first run stands
-/// for any number.
+/// `TERM`, then `KILL`. The `0` of the first run is the number `0` as it is written: the lexer keeps
+/// a number's spelling.
 const GROUP_CALLS: [&[&str]; 3] = [
     &[
         "std",
@@ -421,7 +421,7 @@ fn group_calls(tokens: &[Token]) -> Vec<usize> {
                         .is_some_and(|token| match &token.tok {
                             Tok::Ident(name) => name == text,
                             Tok::Punct(c) => text.len() == 1 && text.starts_with(*c),
-                            Tok::Number => *text == "0",
+                            Tok::Number(written) => *text == "0" && written == "0",
                             _ => false,
                         })
                 })
@@ -598,6 +598,21 @@ fn the_check_lets_through_the_groups_own_calls_and_no_other() {
             group_with(&format!("{start} {start}")),
         ),
         (
+            "a start with a decimal number that is not 0",
+            "tree.rs",
+            group_with(&start.replace(", 0)", ", 123)")),
+        ),
+        (
+            "a start with a hexadecimal number",
+            "tree.rs",
+            group_with(&start.replace(", 0)", ", 0x7b)")),
+        ),
+        (
+            "a start with a 0 that is written another way",
+            "tree.rs",
+            group_with(&start.replace(", 0)", ", 0x0)")),
+        ),
+        (
             "another operand, a pid",
             "tree.rs",
             group_with(&term.replace("self.leader", "pid")),
@@ -689,7 +704,6 @@ fn the_check_finds_what_it_is_there_for() {
         "rustix::process::kill_current_process_group(signal)",
         "libc::killpg(group, 15)",
         "let signal: Signal = x;",
-        "command.process_group(0);",
         "command.process_group(0);",
         "let signal = SIGKILL;",
         "let remove = std::fs::remove_file;",
