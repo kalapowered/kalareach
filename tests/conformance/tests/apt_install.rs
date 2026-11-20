@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 
@@ -54,6 +54,7 @@ case "$action" in
   ok | drop | consume) ;;
   fail) echo "E: the $phase failed"; exit 100 ;;
   fail-slow) "$REAL_SLEEP" 1; echo "E: the $phase failed"; exit 100 ;;
+  spend:*) "$REAL_SLEEP" "${action#spend:}" ;;
   fail-replace) cp "$rig"/replacement/* "$rig/pool/"; echo "E: the $phase failed"; exit 100 ;;
   warn:*)
     n=${action#warn:}
@@ -127,18 +128,22 @@ exec "$@"
 /// `timeout` as GNU has it, in the part the script uses: `--kill-after=G N COMMAND...` sends TERM
 /// to the command's process group after N seconds and KILL G seconds later, and answers 124 when
 /// TERM ended it and 137 when KILL did. A bound of less than 1 is refused as 125, and the call is
-/// recorded as `<kill-after> <seconds> <command>`. The rig always uses this one, so that a host
-/// without GNU `timeout` runs the same cases.
+/// recorded as `<kill-after> <seconds> <command>`, and with the time in the clock log. The rig
+/// always uses this one, so that a host without GNU `timeout` runs the same cases.
 const TIMEOUT: &str = r#"#!/usr/bin/perl
 use strict;
 use warnings;
 use POSIX ();
+use Time::HiRes ();
 my $grace = 0;
 while (@ARGV && $ARGV[0] =~ /^--kill-after=(\d+)$/) { $grace = $1; shift @ARGV; }
 my $seconds = shift @ARGV;
 open(my $log, '>>', "$ENV{RIG}/timeout.log") or die;
 print $log "$grace $seconds @ARGV\n";
 close $log;
+open(my $clock, '>>', "$ENV{RIG}/clock.log") or die;
+printf $clock "bound %.3f %d %s\n", Time::HiRes::time(), $grace, $seconds;
+close $clock;
 if (!defined $seconds || $seconds !~ /^\d+$/ || $seconds < 1) { print STDERR "timeout: bad bound\n"; exit 125; }
 my $pid = fork();
 if ($pid == 0) { POSIX::setpgid(0, 0); exec { $ARGV[0] } @ARGV or exit 127; }
@@ -159,9 +164,11 @@ if ($stage == 2) { exit 137; }
 exit($status >> 8);
 "#;
 
-/// `sleep` for the script's waits: it records the seconds and does not wait.
+/// `sleep` for the script's waits: it records the seconds, and the time in the clock log, and does
+/// not wait.
 const SLEEP: &str = r#"#!/bin/bash
 echo "$1" >> "$RIG/sleep.log"
+perl -MTime::HiRes=time -e 'printf "wait %.3f %d\n", time, $ARGV[0]' "$1" >> "$RIG/clock.log"
 "#;
 
 /// `apt-config`, which a Mac does not have: the settings of a runner image.
@@ -279,6 +286,8 @@ impl Rig {
             let _spawning = SPAWNING
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            fs::write(self.path("began"), format!("{:.3}", seconds_since_epoch()))
+                .expect("the start time");
             command.spawn().expect("bash runs the script")
         };
         let output = child.wait_with_output().expect("the script ends");
@@ -324,6 +333,68 @@ impl Rig {
             .collect()
     }
 
+    /// Every bound and wait the stand-ins saw, in order, with the time of each.
+    fn events(&self) -> Vec<Event> {
+        let began: f64 = fs::read_to_string(self.path("began"))
+            .expect("when the script began")
+            .trim()
+            .parse()
+            .expect("a time");
+        self.lines("clock.log")
+            .iter()
+            .map(|line| {
+                let words: Vec<&str> = line.split(' ').collect();
+                let at = words[1].parse::<f64>().expect("a time") - began;
+                match words[0] {
+                    "bound" => Event::Bound {
+                        at,
+                        grace: words[2].parse().expect("a grace"),
+                        seconds: words[3].parse().expect("a bound"),
+                    },
+                    "wait" => Event::Wait {
+                        at,
+                        seconds: words[2].parse().expect("a wait"),
+                    },
+                    other => panic!("an event of kind {other}"),
+                }
+            })
+            .collect()
+    }
+
+    /// Holds each bound and each wait to the time left when it was made. A bound is at least 2 s
+    /// (a grace of at least 1 and a term of at least 1), is not over the time left, and has a grace
+    /// of 10 s, or of its length less 1 s where that is 10 s or less. A wait does not reach the
+    /// deadline.
+    fn assert_inside_the_time_left(&self, deadline: u32, context: &str) {
+        let events = self.events();
+        for event in &events {
+            match *event {
+                Event::Bound { at, grace, seconds } => {
+                    let bound = grace + seconds;
+                    assert!(
+                        grace >= 1 && seconds >= 1,
+                        "{context}: a bound of {grace} and {seconds} at {at:.2} s: {events:?}"
+                    );
+                    let expected = if bound > 10 { 10 } else { bound - 1 };
+                    assert_eq!(
+                        grace, expected,
+                        "{context}: a grace of {grace} for a bound of {bound} at {at:.2} s: {events:?}"
+                    );
+                    assert!(
+                        f64::from(bound) < f64::from(deadline) - at + CLOCK_SLACK,
+                        "{context}: a bound of {bound} s at {at:.2} s, with {deadline} s allowed: {events:?}"
+                    );
+                }
+                Event::Wait { at, seconds } => {
+                    assert!(
+                        seconds >= 1 && f64::from(seconds) < f64::from(deadline) - at + CLOCK_SLACK,
+                        "{context}: a wait of {seconds} s at {at:.2} s, with {deadline} s allowed: {events:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The bounds of the calls, as `(grace, seconds)`.
     fn bounds(&self) -> Vec<(u32, u32)> {
         self.lines("timeout.log")
@@ -337,6 +408,27 @@ impl Rig {
             .collect()
     }
 }
+
+/// The time as the stand-ins log it: seconds since the epoch.
+fn seconds_since_epoch() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a time after the epoch")
+        .as_secs_f64()
+}
+
+/// What a stand-in saw of the clock: a bound that `timeout` was given, or a wait that `sleep` was
+/// given, and the seconds since the script began when it saw it.
+#[derive(Clone, Copy, Debug)]
+enum Event {
+    Bound { at: f64, grace: u32, seconds: u32 },
+    Wait { at: f64, seconds: u32 },
+}
+
+/// What the script's reading of the clock and the stand-ins' logging can differ by: the script
+/// counts whole seconds, so it can be a second off in either direction, and a stand-in logs a few
+/// milliseconds after the script decides.
+const CLOCK_SLACK: f64 = 2.0;
 
 /// Held while a stand-in is written and while a script is started, so that no process is forked
 /// between the writing of one program and the start of it by another case: a child that inherits
@@ -564,13 +656,32 @@ fn a_call_that_ignores_the_termination_signal_is_killed_inside_the_deadline() {
         grace >= 1 && seconds >= 1 && grace + seconds <= 4,
         "{grace} {seconds}"
     );
+    rig.assert_inside_the_time_left(4, "a call that ignores the termination signal");
     assert!(!rig.phases().contains(&"install".to_owned()));
 }
 
-/// No call is bounded by 0, which `timeout` reads as no limit, and none by more than the time
-/// left, for every deadline from the least the script accepts to one with room for its grace.
+/// No call is bounded by less than 2 s (a bound of 0 is no limit to `timeout`) or by more than the
+/// time left, for every deadline the script accepts, and for a run in which an earlier phase has
+/// spent time, which leaves the later calls less than the whole deadline.
 #[test]
 fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
+    // A deadline under 10 s can run out between two calls, so such a run may end without
+    // installing; the bounds it did make are held to the time left either way. At 2 s the first
+    // call itself can find less than 2 s left.
+    for deadline in [2_u32, 3, 4, 5, 6, 7, 8, 9] {
+        let rig = Rig::new();
+        let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
+        assert!(
+            matches!(outcome.status, 0 | 1),
+            "{deadline}: {}{}",
+            outcome.stdout,
+            outcome.stderr
+        );
+        if deadline > 2 {
+            assert!(!rig.bounds().is_empty(), "{deadline}: no call was bounded");
+        }
+        rig.assert_inside_the_time_left(deadline, &deadline.to_string());
+    }
     for deadline in [10_u32, 11, 12, 30, 180, 181, 1800] {
         let rig = Rig::new();
         let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
@@ -581,15 +692,7 @@ fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
         );
         let bounds = rig.bounds();
         assert_eq!(bounds.len(), 3, "{deadline}: {bounds:?}");
-        for (grace, seconds) in bounds {
-            assert!(seconds >= 1, "{deadline}: a bound of {seconds}");
-            assert!(grace >= 1, "{deadline}: a grace of {grace}");
-            assert!(
-                grace + seconds <= deadline.min(1800),
-                "{deadline}: {grace} and {seconds}"
-            );
-            assert!(grace <= 10, "{deadline}: a grace of {grace}");
-        }
+        rig.assert_inside_the_time_left(deadline, &deadline.to_string());
     }
     let rig = Rig::new();
     rig.run(&["--deadline", "1800", "tmux"]);
@@ -599,6 +702,37 @@ fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
         "the update's bound is 180 s: 170 and a grace of 10"
     );
     assert_eq!(rig.bounds()[1], (10, 110), "the plan's bound is 120 s");
+
+    // An update that takes 4 s leaves the plan and the download at most the deadline less 4 s,
+    // and the download is not given the whole deadline.
+    for deadline in [30_u32, 181] {
+        let rig = Rig::new();
+        rig.plan("update", &["spend:4"]);
+        let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
+        assert_eq!(
+            outcome.status, 0,
+            "{deadline}: {}{}",
+            outcome.stdout, outcome.stderr
+        );
+        let bounds = rig.bounds();
+        assert_eq!(bounds.len(), 3, "{deadline}: {bounds:?}");
+        for (grace, seconds) in &bounds[1..] {
+            assert!(
+                grace + seconds <= deadline - 4,
+                "{deadline}: {grace} and {seconds} after an update of 4 s"
+            );
+        }
+        rig.assert_inside_the_time_left(deadline, &format!("{deadline} after an update of 4 s"));
+    }
+
+    // A first attempt that fails after a second leaves its retry less than the whole deadline.
+    let rig = Rig::new();
+    rig.plan("update", &["fail-slow", "ok"]);
+    let outcome = rig.run(&["--deadline", "30", "tmux"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    let (grace, seconds) = *rig.bounds().last().expect("the download's bound");
+    assert!(grace + seconds <= 29, "{grace} and {seconds}");
+    rig.assert_inside_the_time_left(30, "a retry");
 }
 
 /// An install that fails is not retried, and the status the script ends with is the install's.
@@ -632,25 +766,41 @@ fn an_archive_that_goes_missing_between_the_phases_fails_the_install_and_is_not_
     );
 }
 
-/// A wait never passes the deadline: it is cut to what is left less a second, and the script ends
-/// at its deadline.
+/// A wait never passes the deadline: it is cut to what is left less a second, so that the script
+/// ends at its deadline and not after it. With a deadline of 12 s the first wait is the whole 10 s
+/// and the later ones are cut; with 5 s every wait is cut.
 #[test]
 fn the_waits_never_pass_the_deadline() {
-    let rig = Rig::new();
-    rig.plan("update", &["fail-slow"]);
-    let outcome = rig.run(&["--deadline", "5", "tmux"]);
-    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
-    assert!(
-        outcome.elapsed < Duration::from_secs(5 + 3),
-        "{:?}",
-        outcome.elapsed
-    );
-    let waits = rig.waits();
-    assert!(
-        !waits.is_empty() && waits.iter().all(|wait| *wait <= 4),
-        "{waits:?}"
-    );
-    assert!(rig.calls("update").len() >= 2);
+    for deadline in [5_u32, 12] {
+        let rig = Rig::new();
+        rig.plan("update", &["fail-slow"]);
+        let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
+        assert_eq!(
+            outcome.status, 1,
+            "{deadline}: {}{}",
+            outcome.stdout, outcome.stderr
+        );
+        assert!(
+            outcome.elapsed < Duration::from_secs(u64::from(deadline) + 3),
+            "{deadline}: {:?}",
+            outcome.elapsed
+        );
+        let waits = rig.waits();
+        assert!(
+            !waits.is_empty() && waits.iter().all(|wait| *wait < deadline),
+            "{deadline}: {waits:?}"
+        );
+        // Wait number N is 10 s times N and at most 60 s unless the time left cuts it.
+        assert!(
+            waits
+                .iter()
+                .zip(1_u32..)
+                .any(|(wait, attempt)| *wait < (10 * attempt).min(60)),
+            "{deadline}: no wait was cut: {waits:?}"
+        );
+        assert!(rig.calls("update").len() >= 2);
+        rig.assert_inside_the_time_left(deadline, &deadline.to_string());
+    }
 }
 
 /// A program named by `--names-from` is asked after the attempt's last update, so the names it
@@ -876,6 +1026,7 @@ fn new_runner(rig: &Rig) {
         "sudo.log",
         "sleep.log",
         "timeout.log",
+        "clock.log",
         "outputs",
         "count.update",
         "count.list",
