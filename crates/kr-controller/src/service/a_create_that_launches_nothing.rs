@@ -2286,18 +2286,14 @@ async fn a_create_whose_worker_has_no_address_to_meet_its_daemon_at_settles_its_
     assert_eq!(told.code(), ErrorCode::ResourceUnavailable, "{told}");
 }
 
-/// KR-REQ-09.09: a create whose worker could not bind its own address asks for no worker, and says
-/// so at once, with the platform's words, instead of waiting out its window for a worker that has
-/// ended.
+/// A host whose runtime directory is `length` bytes, with the directory it goes under, which is
+/// removed after the host.
 ///
-/// The runtime directory is as long as one can be with the daemon's `c.sock` and the rendezvous's
-/// `r.sock` still fitting a socket address, which leaves the first worker's `w1.sock` one byte over.
+/// The directory the host goes under is sized so that the runtime directory comes out at `length`:
+/// the tree adds `/kr-` and eight digits, `/r`, `/` and the environment's eight digits, which is
+/// 23 bytes beside the directory it goes under.
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_create_whose_worker_would_have_no_address_of_its_own_asks_for_no_worker() {
-    let limit = kr_ipc::paths::MAX_SOCKET_PATH_LEN;
-    // The directory the host goes under, sized so that the runtime directory is `limit - 7` bytes:
-    // the tree adds `/kr-` and eight digits, `/r`, `/` and the environment's eight digits.
+fn a_host_whose_runtime_directory_is(length: usize) -> (DeepParent, kr_ipc::testing::TempHost) {
     let base = std::env::temp_dir();
     let base = if base.as_os_str().len() <= 60 {
         base
@@ -2312,10 +2308,24 @@ async fn a_create_whose_worker_would_have_no_address_of_its_own_asks_for_no_work
         .expect("the temporary directory is text")
         .trim_end_matches('/')
         .len();
-    let name_len = limit - 30 - base_len - 1;
+    let name_len = length - 24 - base_len;
     let parent = DeepParent(base.join(format!("{}{}", "d".repeat(name_len - 8), &suffix[..8])));
     std::fs::create_dir_all(&parent.0).expect("makes the directory the host goes under");
     let temp = kr_ipc::testing::TempHost::create_in(&parent.0);
+    (parent, temp)
+}
+
+/// KR-REQ-09.09: a create whose worker could not bind its own address asks for no worker, and says
+/// so at once, with the platform's words, instead of waiting out its window for a worker that has
+/// ended.
+///
+/// The runtime directory is as long as one can be with the daemon's `c.sock` and the rendezvous's
+/// `r.sock` still fitting a socket address, which leaves the first worker's `w1.sock` one byte over.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_worker_would_have_no_address_of_its_own_asks_for_no_worker() {
+    let limit = kr_ipc::paths::MAX_SOCKET_PATH_LEN;
+    let (_parent, temp) = a_host_whose_runtime_directory_is(limit - 7);
     let environment = temp.environment();
     assert_eq!(
         environment.runtime_dir().as_os_str().len(),
@@ -2358,6 +2368,13 @@ async fn a_create_whose_worker_would_have_no_address_of_its_own_asks_for_no_work
         refused.to_string().contains("w1.sock"),
         "the refusal names the address that does not fit: {refused}"
     );
+    assert!(
+        refused.to_string().contains(&format!(
+            "is {} bytes, over the {limit}-byte platform limit",
+            limit + 1
+        )),
+        "the refusal says by how much: {refused}"
+    );
     let registry = controller.registry.lock().await;
     let reservation = registry
         .reservation_for_token(&actor_id, request.action_id.get())
@@ -2368,6 +2385,74 @@ async fn a_create_whose_worker_would_have_no_address_of_its_own_asks_for_no_work
         registry.occupancy().expect("counts"),
         0,
         "the reservation stops occupying the environment"
+    );
+}
+
+/// KR-REQ-09.09: the address a create measures is the one its worker's own display number gives, which
+/// grows a byte at the tenth worker, so a runtime directory that holds nine workers' addresses
+/// refuses the tenth by name.
+///
+/// The runtime directory is a byte shorter than the one that refuses the first worker: `w1.sock` to
+/// `w9.sock` fit a socket address exactly, `w10.sock` is one byte over. Each create is numbered, and a
+/// refused one takes its number too, so the tenth create is the one whose number is 10.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_whose_tenth_worker_would_have_no_address_of_its_own_is_refused_naming_it() {
+    let limit = kr_ipc::paths::MAX_SOCKET_PATH_LEN;
+    let (_parent, temp) = a_host_whose_runtime_directory_is(limit - 8);
+    let environment = temp.environment();
+    assert_eq!(
+        environment.runtime_dir().as_os_str().len(),
+        limit - 8,
+        "the runtime directory is of the length this case is about"
+    );
+    for number in 1..=9 {
+        environment
+            .worker_endpoint(kr_protocol::session::DisplayNumber::new(number))
+            .expect("the first nine workers' addresses fit");
+    }
+    environment
+        .worker_endpoint(kr_protocol::session::DisplayNumber::new(10))
+        .expect_err("the tenth worker's address is one byte over");
+
+    let (controller, asked) = daemon_running(&temp, temp.root().join("kr-worker"), None).await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    for attempt in 1..=9 {
+        let request = create_request(environment_id);
+        let carried = carried(&controller, connection_id, half_a_minute(&controller));
+        let told = controller
+            .session_create(&actor_id, &request, carried)
+            .await
+            .into_answer_for_test()
+            .expect_err("this test starts no workers");
+        assert!(
+            told.to_string().contains("this test starts no workers"),
+            "create {attempt} went as far as the supervisor: {told}"
+        );
+    }
+    assert_eq!(
+        asked.lock().expect("the record is not poisoned").len(),
+        9,
+        "the first nine creates each asked for a worker"
+    );
+
+    let request = create_request(environment_id);
+    let carried = carried(&controller, connection_id, half_a_minute(&controller));
+    let refused = controller
+        .session_create(&actor_id, &request, carried)
+        .await
+        .into_answer_for_test()
+        .expect_err("a worker with no address of its own is not started");
+    assert_eq!(refused.code(), ErrorCode::HostNotConfigured, "{refused}");
+    assert!(
+        refused.to_string().contains("w10.sock"),
+        "the refusal names the address that does not fit: {refused}"
+    );
+    assert_eq!(
+        asked.lock().expect("the record is not poisoned").len(),
+        9,
+        "the tenth create asked for no worker: {refused}"
     );
 }
 
