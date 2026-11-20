@@ -214,42 +214,52 @@ A group that no step uses is refused. The identifier grammar is compiled into th
 
 ### How a step runs
 
-A step runs in its `directory`: a path relative to the repository, which is the repository's root
-when the plan names none. The build of a `cargo test` step, the listing of its tests and its run all
-use that directory, and a script the step runs is looked up there. A `cargo` step's directory has to
-be the root of a workspace that `[rust] manifests` names. A directory is a literal path: it holds no
-placeholder, no `..`, is not absolute, and has to be a directory of the repository when the plan loads.
+A step runs in its `directory`, a path relative to the repository, or in the repository's root when
+the plan names none. The build of a `cargo` step, the listing of its tests and its run all use that
+directory, and a script the step runs is looked up there. A `cargo` step runs in the root of a
+workspace that `[rust] manifests` names, whether it names its directory or takes the repository's
+root, and the loader refuses any other. A directory is a literal path. It is not absolute, it holds
+no `..` and no placeholder, it is not a link, no link on its way leads out of the repository, and it
+is a directory of the repository when the plan loads.
 
-A step is run with the plan's `[env]` and its own `env`; its value of a name replaces the plan's.
-A name in `env`, in `[env]` or in `needs` has to be a variable name.
+A step runs with the plan's `[env]` and its own `env`, and its value of a name replaces the plan's.
+Every name in `env`, in `[env]` and in `needs` has to be a variable name.
 
 The placeholders are `{evidence}` (the evidence directory), `{root}` (the repository), `{scratch}`
-and `{output}` (the step's own output). `{scratch}` is a directory the run makes for itself under
-the temporary directory it keeps its own files in, never inside the evidence directory, and removes
-when the run ends. The placeholders are filled in a step's `command`, in the values of `env` and
-`[env]` and in `output`, and nowhere else: a reason or a witness line stays as it is written. `{output}`
-is not filled in `[env]`, because it belongs to one step. A path a placeholder stands for has forward
-slashes on every platform. Any other word in braces is refused when the plan loads.
+and `{output}` (the step's own output). `{scratch}` is a directory the run makes under the directory
+it keeps its own files in, outside the evidence directory, and removes when the run ends; one that
+cannot be removed stays where it is. A placeholder is filled in a step's `command`, in the values of
+`env` and `[env]`, and in the `{evidence}` that opens an `output`. Nowhere else: a reason or a
+witness line stays as written, and a `directory` holds none. `{output}` belongs to one step, so
+`[env]` may not hold it, and a step gives it in its own `env`. A path that a placeholder stands for
+has forward slashes on every platform. A `{` with no `}` to close it, or a name in braces that is
+not one of the four, is refused when the plan loads.
 
 A step that writes a file for the report to read names it as its `output`, below
 `{evidence}/conformance/` (a directory, for a JUnit lane), and passes it to its tool as `{output}`
-in its command or in one of its variables. A Vitest step and a lane step each name one, and the
-report reads that file and no word of the command. The run makes the directory that holds the output
-before the step runs; the tool makes the output. Two outputs may not be equal or nested, and an
-output may not be in `logs` or be `result.json`, which are the report's own.
+in its command or in one of its variables. A step that names an `output` has to hold `{output}`, and
+a step that holds `{output}` has to name an `output`. A Vitest step and a lane step each name one,
+and the report reads that file and no word of the command. The run makes the directory that holds
+the output before the step runs, and the tool makes the output. Two outputs may not be equal or
+nested, and an output may not be in `logs` or be `result.json`, which are the report's own.
 
 A set-up step (`setup = true`) reads `exit`: the report records its exit status and nothing else. A
-step names the set-up steps it needs in `after`; each is an earlier step of the plan that runs on
-every platform the step runs on. A selection that holds a step holds its set-up steps too, whatever
-their groups, and in the plan's order. When a set-up step does not exit 0, or cannot be run, each
-step that names it is not run: it has no log and no exit status, its error says `not run because its
-set-up step <number> (<what>) ...`, the tests it would have run are not run with the same words, and
-the run fails because the set-up step failed. A set-up step writes nothing back to the environment:
-the plan fixes every `env` before any step runs, and a set-up step leaves what the next steps need
-in `{scratch}`.
+step names the set-up steps it needs in `after`. Each is an earlier step of the plan that runs on
+every platform the step runs on. The loader refuses an `after` that names no step, a later step or
+a step that is not a set-up step, and a set-up step that reads anything but `exit`. A selection that
+holds a step holds its set-up steps too, whatever their groups, in the plan's order. When a set-up
+step does not exit 0, or cannot be run, each step that names it is not run. It has no log and no
+exit status, its error says `not run because its set-up step <number> (<what>) ...`, the tests it
+would have run are not run, with those words in their reasons, and the run fails because the set-up
+step failed. A
+set-up step writes nothing back to the environment: the plan fixes every `env` before any step
+runs, and a set-up step leaves what the next steps need in `{scratch}`.
 
-In a plan run in parts, a set-up step is not cut by count. It goes into every part that holds a step
-that names it, so a set-up step runs once in each of those parts.
+In a plan run in parts, a set-up step that a step names is not cut by count. It goes into every
+part that holds a step naming it, directly or through another set-up step, so it runs once in each
+of those parts. A set-up step that no step names is cut by count like any other step.
+
+The result's record of a step does not name its `directory` or its `env`.
 
 ## How a test names what it proves
 
