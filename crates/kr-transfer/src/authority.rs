@@ -3532,7 +3532,10 @@ mod tests {
         }
         // The record of a directory made before filesystems were recorded is decided by the
         // numbers, and takes the filesystem found.
-        let legacy = RecordedIdentity::without_filesystem(found.object);
+        let legacy = RecordedIdentity {
+            object: found.object,
+            filesystem: None,
+        };
         assert_eq!(
             authority
                 .check_recorded(legacy)

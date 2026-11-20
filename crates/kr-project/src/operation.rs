@@ -1608,7 +1608,10 @@ mod tests {
 
         // A witness recorded without a filesystem is decided as it was, by the numbers.
         let before = StagedWitness {
-            identity: kr_transfer::RecordedIdentity::without_filesystem(witness.identity.object),
+            identity: kr_transfer::RecordedIdentity {
+                object: witness.identity.object,
+                filesystem: None,
+            },
             ..witness
         };
         assert!(before.is_the_object_in(&staged));
