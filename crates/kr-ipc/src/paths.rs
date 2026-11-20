@@ -2474,6 +2474,14 @@ mod windows {
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         )
         .and_then(|descriptor| read_descriptor(&descriptor));
+        #[cfg(test)]
+        let read = if matches!(seen, Some(tests::Seen::Unreadable)) {
+            Err(AccessListRefusal::Unreadable(
+                "a seam made the read fail".to_owned(),
+            ))
+        } else {
+            read
+        };
         let as_set = match read {
             Ok(read) => {
                 let owner = read.owner;
@@ -2592,6 +2600,8 @@ mod windows {
             /// The file's owner reads back as Everyone, an account this process could not have
             /// created it as.
             OtherOwner,
+            /// The list cannot be read back.
+            Unreadable,
         }
 
         /// Everyone, `S-1-1-0`.
@@ -2928,6 +2938,76 @@ mod windows {
                 expected.sort();
                 assert_eq!(folder.names(), expected, "{writer}");
             }
+        }
+
+        /// A list that cannot be read back refuses both writers before any content is written. The
+        /// read is replaced here; no volume makes a list that cannot be read.
+        #[test]
+        fn a_list_that_cannot_be_read_back_refuses_both_writers_before_any_content() {
+            refused_before_any_content(
+                |_| {},
+                Some(Seen::Unreadable),
+                "the access list of the new file could not be read back: a seam made the read fail",
+            );
+        }
+
+        /// A check that refuses a file that already stood at the name leaves its bytes as they were:
+        /// the check runs on the file with its content still in it, before the caller empties it.
+        fn refused_existing_file(act: fn(&Path), seen: Option<Seen>, words: &str) {
+            let folder = Folder::new("refused-existing");
+            let path = folder.0.join("kit");
+            create_file_with_descriptor(
+                &path,
+                &format!("D:P(A;;GA;;;OW)(A;;GA;;;{})(A;;GR;;;AU)", user_text()),
+            )
+            .expect("a file that grants Authenticated Users");
+            std::fs::write(&path, b"what was there").expect("content");
+
+            let lengths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let recorded = std::rc::Rc::clone(&lengths);
+            let _hooked = Hooked::install(move |path, file| {
+                recorded
+                    .borrow_mut()
+                    .push(file.metadata().map_or(u64::MAX, |metadata| metadata.len()));
+                act(path);
+                seen
+            });
+            let error = crate::paths::open_owner_only_in_place(&path)
+                .expect_err("the list does not read back, so the file is not opened");
+
+            assert!(error.to_string().contains(words), "{error}");
+            assert_eq!(
+                *lengths.borrow(),
+                vec![14],
+                "the check ran on the file with its content in it"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("reads"),
+                b"what was there",
+                "the file keeps its bytes"
+            );
+            assert_eq!(folder.names(), vec!["kit".to_owned()]);
+        }
+
+        /// A list that reads back other than as set refuses an existing file and leaves its bytes.
+        #[test]
+        fn a_list_that_reads_back_other_than_set_refuses_an_existing_file_and_keeps_its_bytes() {
+            refused_existing_file(
+                widen_the_list,
+                None,
+                "the access list of the file reads back other than as set, so it cannot be made \
+                 readable by its owner alone",
+            );
+        }
+
+        /// A list that cannot be read back refuses an existing file and leaves its bytes.
+        #[test]
+        fn a_list_that_cannot_be_read_back_refuses_an_existing_file_and_keeps_its_bytes() {
+            refused_existing_file(
+                |_| {},
+                Some(Seen::Unreadable),
+                "the access list of the file could not be read back: a seam made the read fail",
+            );
         }
 
         /// This process's user, as SDDL writes an account.
