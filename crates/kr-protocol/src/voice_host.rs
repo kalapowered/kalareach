@@ -362,7 +362,8 @@ pub enum VoiceControlArm {
     },
 }
 
-/// The answer to `voice.control`.
+/// What the registry keeps of a `voice.control` answer for a repeated request. The answer on the
+/// wire is [`VoiceControlAnswer`]; its four kept arms have this type's wire form.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VoiceControlResult {
@@ -370,9 +371,8 @@ pub enum VoiceControlResult {
     // every type it names, this one too. No host sends this arm: a heartbeat is answered with
     // `VoiceControlAnswer::Heartbeat`. Do not change this arm, or `VoiceHostCallState`,
     // `VoiceNews` or `VoiceNewsItem`, which it names; a new fact about a heartbeat goes on
-    // `VoiceControlAnswer`. These are line comments because a doc comment is part of the schema
-    // the lock digests.
-    /// The answer to a heartbeat. Never kept.
+    // `VoiceControlAnswer`.
+    /// Never sent: a heartbeat is answered with [`VoiceControlAnswer::Heartbeat`].
     Heartbeat {
         /// Where the call stands.
         state: VoiceHostCallState,

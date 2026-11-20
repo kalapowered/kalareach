@@ -2853,7 +2853,8 @@ export type VoiceControlArm =
       }
     }
 /**
- * The answer to `voice.control`.
+ * What the registry keeps of a `voice.control` answer for a repeated request. The answer on the
+ * wire is [`VoiceControlAnswer`]; its four kept arms have this type's wire form.
  */
 export type VoiceControlResult =
   | {

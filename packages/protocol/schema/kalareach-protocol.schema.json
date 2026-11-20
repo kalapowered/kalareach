@@ -41732,11 +41732,11 @@
       "type": "object"
     },
     "VoiceControlResult": {
-      "description": "The answer to `voice.control`.",
+      "description": "What the registry keeps of a `voice.control` answer for a repeated request. The answer on the\nwire is [`VoiceControlAnswer`]; its four kept arms have this type's wire form.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "The answer to a heartbeat. Never kept.",
+          "description": "Never sent: a heartbeat is answered with [`VoiceControlAnswer::Heartbeat`].",
           "properties": {
             "heartbeat": {
               "additionalProperties": false,
