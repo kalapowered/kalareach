@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, WaitOptions, kill_process_group, waitpid};
 
 use kr_conformance::tree::{self, Captured, Deadline, GRACE, Waited};
 
@@ -194,6 +194,37 @@ fn the_controller_of_a_fixture_ends_the_group_of_a_call_that_does_not_return_onc
     );
     assert!(call.is_none(), "the call returned in time");
     assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: when the leader was reaped by another waiter,
+/// the report's wait for it fails, and the report gives that error and signals nothing: the leader's
+/// number may be another process's. The case reaps the leader itself while a process of its group
+/// holds the pipe, and a process of the group that writes a line when it is asked to end is
+/// looked at after the grace: its file stays empty.
+#[test]
+fn a_leader_reaped_by_another_waiter_gives_the_error_and_no_signal_is_sent() {
+    let place = tempfile::tempdir().expect("a directory");
+    let pids = place.path().join("pids.txt");
+    let marker = place.path().join("asked.txt");
+    // The leader records its pid, and leaves a process of its group that writes `term` to the file
+    // when it is asked to end and holds no pipe, and `sleep 5`, which holds the pipe.
+    let script = "printf '%s\\n' \"$$\" > \"$1\"\n( trap 'printf \"%s\\n\" term >> \"$2\"; exit 0' TERM; sleep 20 & wait ) >/dev/null 2>&1 &\nsleep 5 &\nexit 0";
+    let began = Instant::now();
+    let call = start(bash(script, &[&pids, &marker]), deadline_in(20));
+    let leader = recorded_pids(&pids, 1);
+    let leader = Pid::from_raw(leader[0].parse().expect("a pid")).expect("a process");
+    // The report waits for the leader only when the pipe has closed, 5 s on.
+    waitpid(Some(leader), WaitOptions::empty()).expect("the leader, which this case reaps");
+    let call = call.join().expect("the controller");
+    let took = began.elapsed();
+    std::thread::sleep(GRACE + Duration::from_secs(1));
+    let asked = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        matches!(call, Some(Err(_))),
+        "the call gave {call:?}, not the error of a wait that failed"
+    );
+    assert!(took < Duration::from_secs(15), "the call took {took:?}");
+    assert_eq!(asked, "", "a signal was sent to the group");
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: a command whose time is spent before it is
