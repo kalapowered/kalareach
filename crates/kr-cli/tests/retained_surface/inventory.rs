@@ -138,9 +138,6 @@ impl Scope {
         let Some(first) = path.first() else {
             return false;
         };
-        if path.len() > 1 && is_own_prefix(first) {
-            return true;
-        }
         match self.imports.get(first) {
             Some(fulls) => fulls.iter().all(|full| {
                 let mut resolved = full.clone();

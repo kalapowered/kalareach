@@ -19,6 +19,11 @@ fn enabled(attributes: &str) -> Result<bool, String> {
 fn a_place_is_read_when_some_configuration_without_test_enables_every_condition_around_it() {
     for (attributes, expected) in [
         ("", true),
+        ("#[cfg(true)]", true),
+        ("#[cfg(false)]", false),
+        ("#[cfg(any(false, unix))]", true),
+        ("#[cfg(not(false))]", true),
+        ("#[cfg(not(true))]", false),
         ("#[cfg(test)]", false),
         ("#[cfg(all(test, unix))]", false),
         ("#[cfg(not(not(test)))]", false),
@@ -777,6 +782,8 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
         "use kr_client::{debug_fields as shown};\nshown!(E { a });",
         "use schemars::json_schema;\nmacro_rules! schema { () => { json_schema!({}) }; }",
         "macro_rules! schema { () => { schemars::json_schema!({}) }; }",
+        // A macro that a transcriber defines and calls is that crate's own.
+        "macro_rules! outer { () => { macro_rules! inner { () => {}; } inner!(); }; }",
     ] {
         assert_eq!(
             read_names(&format!("{call}\n"), &[]),
@@ -849,6 +856,22 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
         assert_eq!(scan, Err(text(name)), "{lib}");
         assert_eq!(lookup, Lookup::Failed(text(name)), "{lib}");
     }
+    // A name that one file imports from the accepted provider and another from a different one is
+    // refused: the call is read as each of them.
+    let (scan, _) = scanned(
+        "mod a;\nmod b;\n",
+        &[
+            (
+                "src/a.rs",
+                "use schemars::json_schema;\njson_schema!({});\n",
+            ),
+            ("src/b.rs", "use foreign::json_schema;\n"),
+        ],
+    );
+    assert_eq!(
+        scan,
+        Err("crates/kr-sender/src/a.rs: json_schema! is called at item position, is not defined in kr_sender and is not one the scan accepts".to_owned())
+    );
 }
 
 #[test]
@@ -922,13 +945,20 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
     assert_eq!(across(lib, "shared"), Ok(2));
     let lib = "macro_rules! shared { ($m:expr) => { $m }; }\nfn f() { crate::shared!(Method::AgentTurnCancel); }\n";
     assert_eq!(across(lib, "shared"), Ok(2));
+    // A transcriber that calls the other crate's macro by a path, where this crate defines one of the
+    // same name: what an expanded macro calls through a path is the other crate's.
+    let lib = "macro_rules! json_schema { ($m:expr) => { $m }; }\nmacro_rules! fwd { ($x:expr) => { schemars::json_schema!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "json_schema"), refused("json_schema"));
+    // A call at item position by a path, with a sighting in its arguments.
+    let lib = "schemars::json_schema!({ \"x\": \"agent.turn.cancel\" });\nmacro_rules! json_schema { ($m:expr) => { $m }; }\n";
+    assert_eq!(across(lib, "json_schema"), refused("json_schema"));
 }
 
 #[test]
 fn a_macro_defined_in_a_function_body_is_a_macro_of_its_own() {
     use SightKind::{Expands, Names};
     let folder = small_tree(
-        "fn f() {\n    macro_rules! inner { ($m:expr) => { $m }; }\n    inner!(Method::AgentTurnCancel);\n}\n#[cfg(test)]\nfn hidden() {\n    macro_rules! gone { () => {}; }\n}\n",
+        "fn f() {\n    macro_rules! inner { ($m:expr) => { $m }; }\n    inner!(Method::AgentTurnCancel);\n}\nfn g() {\n    macro_rules! holds { () => { Method::AgentTurnSteer }; }\n    #[cfg(test)]\n    macro_rules! gone { () => {}; }\n}\n",
     );
     let tree = tree_at(folder.path()).expect("the tree");
     let found = tree
@@ -938,6 +968,8 @@ fn a_macro_defined_in_a_function_body_is_a_macro_of_its_own() {
         found,
         Ok(BTreeMap::from([
             ("f".to_owned(), vec![Names]),
+            ("g".to_owned(), vec![Names]),
+            ("macro:holds".to_owned(), vec![Names]),
             ("macro:inner".to_owned(), vec![Expands]),
         ]))
     );
@@ -1008,6 +1040,23 @@ fn a_cfg_attr_that_adds_macro_export_or_macro_use_counts_where_some_configuratio
         read_names("#[cfg_attr(test, macro_use)]\nmod a;\nmod b;\n", &files),
         none
     );
+    // `macro_use` on an inline module reaches beyond the module, whether the module is in a file
+    // or in another inline module, and one without it does not.
+    let inline = |attributes: &str| {
+        read_names(
+            "mod a;\nmod b;\n",
+            &[
+                (
+                    "src/a.rs",
+                    &format!("{attributes}\nmod inside {{ {define} }}\n"),
+                ),
+                ("src/b.rs", define),
+            ],
+        )
+    };
+    assert!(hides(inline("#[macro_use]")));
+    assert_eq!(inline(""), none);
+    assert_eq!(inline("#[cfg_attr(test, macro_use)]"), none);
     // A predicate the rule cannot read is its error.
     assert_eq!(
         siblings("mod a;\nmod b;\n", "#[cfg_attr(some_atom, macro_export)]\n"),
