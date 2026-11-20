@@ -170,7 +170,7 @@ pub fn terminal_profile(root: &Path) -> TerminalProfile {
 
 /// The versions of the TypeScript packages in `directories`.
 #[must_use]
-pub fn typescript_packages(root: &Path, directories: &[&str]) -> Vec<PackageVersion> {
+pub fn typescript_packages(root: &Path, directories: &[String]) -> Vec<PackageVersion> {
     directories
         .iter()
         .filter_map(|directory| {

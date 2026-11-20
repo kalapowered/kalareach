@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use kr_conformance::lane::{self, Case};
 use kr_conformance::libtest::Outcome as LibtestOutcome;
 use kr_conformance::map::{self, Declarations, Map, Place};
-use kr_conformance::plan::{self, Group, Platform, Reading, Step, Tests};
+use kr_conformance::plan::{self, Platform, Reading, Step, Tests};
+use kr_conformance::plan_file::Plan;
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Verdict};
 use kr_conformance::run::Executed;
 
@@ -25,13 +26,27 @@ fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
 
+/// Core's own plan file.
+fn core_plan() -> Plan {
+    Plan::load(&repository(), None).expect("core's plan file")
+}
+
+fn phones() -> Vec<String> {
+    vec!["phones".to_owned()]
+}
+
+fn rust() -> Vec<String> {
+    vec!["rust".to_owned()]
+}
+
 fn map_of(root: &Path) -> Map {
     map::build(
         root,
         &Declarations {
             case_tables: &[],
-            lanes: plan::LANES,
+            lanes: &core_plan().lanes,
             ignored_runs: None,
+            plan_commands: &[],
             typescript: None,
             scripts: &[],
         },
@@ -42,14 +57,12 @@ fn options(platform: Platform) -> Options {
     Options {
         root: fixtures().join("lanes"),
         evidence: PathBuf::from("/tmp/e"),
-        selection: Some(vec![Group::Phones]),
+        selection: Some(phones()),
         all_terminals: false,
         platform,
-        case_tables: &[],
-        lanes: plan::LANES,
-        ignored_runs: None,
+        plan: core_plan(),
+        held_to_ignored_runs: false,
         applications: None,
-        steps: None,
         lister: PathBuf::from("/tmp/l"),
         part: None,
         environment: Vec::new(),
@@ -58,7 +71,8 @@ fn options(platform: Platform) -> Options {
 }
 
 fn step(platform: Platform) -> Step {
-    plan::steps(platform, &[Group::Phones], "/tmp/e", None)
+    core_plan()
+        .steps(platform, &phones(), "/tmp/e", None)
         .pop()
         .expect("a phones step")
 }
@@ -95,7 +109,7 @@ fn xcode(name: &str) -> Vec<Case> {
 fn assemble(platform: Platform, map: &Map, steps: &[Executed]) -> Document {
     report::assemble(
         &options(platform),
-        &[Group::Phones],
+        &phones(),
         map,
         steps,
         Gathered::default(),
@@ -597,10 +611,10 @@ fn a_class_given_to_the_wrong_single_file_still_fails_the_run() {
 fn a_selection_without_the_phones_group_leaves_the_lane_files_out() {
     let map = map_of(&fixtures().join("lanes"));
     let mut selected = options(Platform::Linux);
-    selected.selection = Some(vec![Group::Rust]);
+    selected.selection = Some(rust());
     let document = report::assemble(
         &selected,
-        &[Group::Rust],
+        &rust(),
         &map,
         &[],
         Gathered::default(),
@@ -638,7 +652,7 @@ fn a_windows_run_that_selects_the_phones_group_gives_no_rust_test_the_phones_rea
     windows.selection = None;
     let document = report::assemble(
         &windows,
-        &[Group::Rust, Group::Phones],
+        &["rust".to_owned(), "phones".to_owned()],
         &map,
         &[],
         Gathered::default(),
@@ -657,7 +671,8 @@ fn a_windows_run_that_selects_the_phones_group_gives_no_rust_test_the_phones_rea
 
 #[test]
 fn the_phones_group_is_planned_for_linux_and_macos_and_not_for_windows() {
-    let runs = |platform| plan::steps(platform, &[Group::Phones], "/tmp/e", None);
+    let plan = core_plan();
+    let runs = |platform| plan.steps(platform, &phones(), "/tmp/e", None);
     assert_eq!(
         runs(Platform::Linux)[0].reading,
         Reading::Lane(Tests::Junit)
@@ -667,8 +682,12 @@ fn the_phones_group_is_planned_for_linux_and_macos_and_not_for_windows() {
         Reading::Lane(Tests::Xcode)
     );
     assert!(runs(Platform::Windows).is_empty());
-    assert!(plan::group_absent_reason(Group::Phones, Platform::Windows).is_some());
-    assert_eq!(Group::ALL.last(), Some(&Group::Phones));
+    assert!(
+        plan.group_absent
+            .iter()
+            .any(|absent| absent.group == "phones" && absent.platform == Platform::Windows)
+    );
+    assert_eq!(plan.groups.last().map(String::as_str), Some("phones"));
 }
 
 #[test]
@@ -864,7 +883,7 @@ fn the_report_runs_a_lane_step_and_reads_what_it_left_in_the_evidence() {
     ];
     let mut run = options(Platform::Linux);
     run.evidence = checked;
-    run.steps = Some(vec![step]);
+    run.plan.steps = Plan::of_steps("phones", vec![step]).steps;
     run.lister = PathBuf::from(env!("CARGO_BIN_EXE_kr-conformance"));
     let base = tempfile::tempdir().expect("a directory for the copy");
     run.runner_base = base.path().to_path_buf();
@@ -1064,9 +1083,10 @@ fn every_phone_test_file_of_the_repository_that_names_a_row_declares_the_class_o
     let keyed: Vec<&String> = keyed
         .into_iter()
         .filter(|file| {
-            plan::LANES
+            core_plan()
+                .lanes
                 .iter()
-                .any(|lane| lane.reads.is_some() && plan::matches(lane.files, file))
+                .any(|lane| lane.reads.is_some() && plan::matches(&lane.files, file))
         })
         .collect();
     assert!(!keyed.is_empty());

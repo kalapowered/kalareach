@@ -5,7 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
-use kr_conformance::plan::{Group, Platform, Step};
+use kr_conformance::plan::{Platform, Step};
+use kr_conformance::plan_file::Plan;
 use kr_conformance::report::{self, Options, Outcome, Stopped};
 
 fn tree(name: &str) -> PathBuf {
@@ -22,18 +23,19 @@ fn options(evidence: &Path, base: &Path, lister: PathBuf, target: &Path) -> Opti
         root: tree("forms"),
         evidence: kr_conformance::evidence::check_directory(evidence)
             .expect("inside the temporary directory"),
-        selection: Some(vec![Group::Rust]),
+        selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        case_tables: &[],
-        lanes: &[],
-        ignored_runs: None,
+        held_to_ignored_runs: false,
         applications: None,
-        steps: Some(vec![Step::cargo(
+        plan: Plan::of_steps(
             "rust",
-            "the tree's tests",
-            &["test", "--locked", "--workspace", "--no-fail-fast"],
-        )]),
+            vec![Step::cargo(
+                "rust",
+                "the tree's tests",
+                &["test", "--locked", "--workspace", "--no-fail-fast"],
+            )],
+        ),
         lister,
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),

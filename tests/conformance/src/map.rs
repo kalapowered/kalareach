@@ -22,12 +22,12 @@
 //! * a `const` or `static` case table names identifiers in its `covers` fields, and those key every
 //!   test of the same package whose body names the table.
 //!
-//! In data files, a case table's `covers` field keys the tests `plan::CASE_TABLES` says run its
-//! cases. In TypeScript, `crate::typescript` states the rules. A Kotlin or Swift test file in one
-//! of `plan::LANES` is built by another toolchain, and `crate::lane` states the rules for its
-//! comments: one directly above a test, or inside it, keys that test; one directly above a class
-//! keys the class's tests; one before the first line of code keys the whole file; the lane's tool
-//! reports the cases that belong to each.
+//! In data files, a case table's `covers` field keys the tests the plan file's `[[case_table]]`
+//! entries say run its cases. In TypeScript, `crate::typescript` states the rules. A Kotlin or
+//! Swift test file in one of the plan file's `[[lane]]` entries is built by another toolchain, and
+//! `crate::lane` states the rules for its comments: one directly above a test, or inside it, keys
+//! that test; one directly above a class keys the class's tests; one before the first line of code
+//! keys the whole file; the lane's tool reports the cases that belong to each.
 //!
 //! Every other mention (a comment on product code, a script) is a reference: it is listed with the
 //! identifier, and it is never a test. Every mention of any kind is checked against the grammar,
@@ -40,7 +40,8 @@ use serde::Serialize;
 
 use crate::id::{self, Identifier, Refusal};
 use crate::lane::{self, Part, Stands};
-use crate::plan::{CaseTable, Lane, matches};
+use crate::plan::matches;
+use crate::plan_file::{CaseTable, IgnoredRun, Lane};
 use crate::rust_items::{
     self, Breach, Entry, FN_TRAITS, Import, KEYWORDS, Module, STANDARD_ROOTS, Sources, Visibility,
 };
@@ -147,12 +148,15 @@ pub struct Declarations<'a> {
     /// The lanes.
     pub lanes: &'a [Lane],
     /// The TypeScript packages' directories, when TypeScript is read.
-    pub typescript: Option<&'a [&'a str]>,
+    pub typescript: Option<&'a [String]>,
     /// Directories whose files are read as scripts.
     pub scripts: &'a [&'a str],
     /// The steps that run the keyed tests an ordinary run leaves out, when the map holds the tests
     /// to them.
-    pub ignored_runs: Option<&'a [crate::plan::IgnoredRun]>,
+    pub ignored_runs: Option<&'a [IgnoredRun]>,
+    /// Every step of the plan on Linux, each as the words of its command: where an ignored-run
+    /// entry that names a step of the plan finds it.
+    pub plan_commands: &'a [String],
 }
 
 /// The map.
@@ -250,7 +254,7 @@ pub fn build(root: &Path, declarations: &Declarations<'_>) -> Map {
     }
     lane_files(&mut map, root, declarations.lanes);
     if let Some(runs) = declarations.ignored_runs {
-        let findings = crate::ignored::check(&map, root, runs);
+        let findings = crate::ignored::check(&map, root, runs, declarations.plan_commands);
         map.problems.extend(findings.problems);
         map.warnings.extend(findings.unrun);
     }
@@ -1283,8 +1287,8 @@ fn data_tables(map: &mut Map, root: &Path, tables: &[CaseTable]) {
             name: table.target.to_owned(),
         };
         if let Some(known) = map.rust_tests.get(&target) {
-            for test in table.tests {
-                if !known.contains(*test) {
+            for test in &table.tests {
+                if !known.contains(test.as_str()) {
                     map.problems.push(format!(
                         "the case table {} is run by {test} in {target}, which has no such test",
                         table.files
@@ -1298,7 +1302,7 @@ fn data_tables(map: &mut Map, root: &Path, tables: &[CaseTable]) {
             .next()
             .unwrap_or_default()
             .trim_end_matches('/');
-        for file in walk(root, base, &|path| matches(table.files, path)) {
+        for file in walk(root, base, &|path| matches(&table.files, path)) {
             let Ok(text) = std::fs::read_to_string(root.join(&file)) else {
                 map.problems.push(format!("{file} could not be read"));
                 continue;
@@ -1308,12 +1312,12 @@ fn data_tables(map: &mut Map, root: &Path, tables: &[CaseTable]) {
                 continue;
             }
             for (identifier, source) in covers_in_json(map, &text, &file) {
-                for test in table.tests {
+                for test in &table.tests {
                     map.key(
                         identifier,
                         Place::Rust {
                             target: target.clone(),
-                            name: (*test).to_owned(),
+                            name: test.clone(),
                         },
                         Binding::CaseTable,
                         source.clone(),
@@ -1352,7 +1356,7 @@ fn covers_in_json(map: &mut Map, text: &str, file: &str) -> Vec<(Identifier, Str
     found
 }
 
-fn typescript_sources(map: &mut Map, root: &Path, directories: &[&str], lanes: &[Lane]) {
+fn typescript_sources(map: &mut Map, root: &Path, directories: &[String], lanes: &[Lane]) {
     const EXTENSIONS: &[&str] = &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
     const SKIPPED: &[&str] = &[
         "node_modules",
@@ -1382,9 +1386,9 @@ fn typescript_sources(map: &mut Map, root: &Path, directories: &[&str], lanes: &
             }
         };
         for file in facts {
-            let lane = lanes.iter().find(|lane| matches(lane.files, &file.file));
+            let lane = lanes.iter().find(|lane| matches(&lane.files, &file.file));
             let place = |index: usize| Place::TypeScript {
-                package: (*directory).to_owned(),
+                package: directory.clone(),
                 file: file.file.clone(),
                 line: file.calls[index].reported,
                 title: file.full_title(index),
@@ -1455,7 +1459,7 @@ fn lane_files(map: &mut Map, root: &Path, lanes: &[Lane]) {
             let Ok(text) = std::fs::read_to_string(root.join(&file)) else {
                 continue;
             };
-            let lane = lanes.iter().find(|lane| matches(lane.files, &file));
+            let lane = lanes.iter().find(|lane| matches(&lane.files, &file));
             let reads = lane.is_some_and(|lane| lane.reads.is_some());
             // The comments that name rows, with the identifiers each names.
             let named: Vec<_> = crate::clike::comments(&text)

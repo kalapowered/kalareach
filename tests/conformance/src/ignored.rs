@@ -3,7 +3,7 @@
 //! A test with `#[ignore]` is skipped by `cargo test` until a command asks for it, with
 //! `--ignored` or `--include-ignored`. One that names an acceptance row is that row's evidence, so
 //! some step of this repository has to ask for it. This module holds
-//! [`crate::plan::IGNORED_RUNS`] to the sources in both directions. Every keyed ignored test has an
+//! the plan's `[[ignored_run]]` entries to the sources in both directions. Every keyed ignored test has an
 //! entry that runs it, and every entry's command is still where the entry says, so a test cannot
 //! become ignored, or lose the command that runs it, without the map saying so.
 //!
@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::map::{Map, Place};
-use crate::plan::{ApplicationsPlan, Group, IgnoredRun, Platform, Runs};
+use crate::plan_file::{IgnoredRun, Runs};
 use crate::workspace::TargetId;
 
 /// What the keyed ignored tests in a map and the steps that run them come to.
@@ -49,7 +49,7 @@ pub struct Findings {
 
 /// Holds the keyed ignored tests in `map` to the steps `runs` names.
 #[must_use]
-pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun]) -> Findings {
+pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun], plan: &[String]) -> Findings {
     let mut found = Vec::new();
     let mut unrun_notes = Vec::new();
 
@@ -75,14 +75,13 @@ pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun]) -> Findings {
     for (target, names) in unrun {
         found.push(format!(
             "{target}: {} keyed test{} left out of an ordinary run and run by no step \
-             `plan::IGNORED_RUNS` names: {}",
+             the plan's `[[ignored_run]]` entries name: {}",
             names.len(),
             if names.len() == 1 { " is" } else { "s are" },
             names.join(", ")
         ));
     }
 
-    let plan = plan_commands();
     for (run, matched) in runs.iter().zip(&matched) {
         let name = format!("{} {}", run.package, run.target);
         if matched.is_empty() {
@@ -92,7 +91,7 @@ pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun]) -> Findings {
                 format!(" ({})", run.cases.join(", "))
             };
             found.push(format!(
-                "`plan::IGNORED_RUNS` names a step for {name}{cases} that no keyed ignored test needs"
+                "the plan's `[[ignored_run]]` entry names a step for {name}{cases} that no keyed ignored test needs"
             ));
         } else {
             for case in run
@@ -101,18 +100,21 @@ pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun]) -> Findings {
                 .filter(|case| !matched.iter().any(|name| case_matches(case, name)))
             {
                 found.push(format!(
-                    "`plan::IGNORED_RUNS` names {case} of {name}, which is not a keyed ignored test"
+                    "the plan's `[[ignored_run]]` entry names {case} of {name}, which is not a keyed ignored test"
                 ));
             }
         }
-        let problem = match run.runs {
+        let problem = match &run.runs {
             Runs::Command { file, line } => missing_command(root, file, line, None, matched),
             Runs::Supplied {
                 file,
                 line,
                 names_with,
-            } => missing_command(root, file, line, Some(names_with), matched),
-            Runs::Plan { line } => missing_step(&plan, line, matched),
+            } => {
+                let words: Vec<&str> = names_with.iter().map(String::as_str).collect();
+                missing_command(root, file, line, Some(&words), matched)
+            }
+            Runs::Plan { line } => missing_step(plan, line, matched),
             Runs::Helper { file } => missing_helper(root, file, matched),
             Runs::ByHand { why } => {
                 unrun_notes.push(format!("{name} is run by hand: {why}"));
@@ -396,21 +398,6 @@ fn contains_token(text: &str, word: &str) -> bool {
                 .next()
                 .is_none_or(|c| !joins(c))
     })
-}
-
-/// Every step of the report's plan on Linux, each as the words of its command.
-fn plan_commands() -> Vec<String> {
-    crate::plan::steps(
-        Platform::Linux,
-        &Group::ALL,
-        "evidence",
-        Some(&ApplicationsPlan {
-            left_out: Vec::new(),
-        }),
-    )
-    .into_iter()
-    .map(|step| step.command.join(" "))
-    .collect()
 }
 
 /// The commands of a script or a workflow, one to a line: a backslash and the new line after it

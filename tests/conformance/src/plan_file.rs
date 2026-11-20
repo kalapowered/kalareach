@@ -355,8 +355,9 @@ impl Default for Unrun {
 ///
 /// A `cargo test` that leaves each test's output captured is given `--show-output` after a `--`
 /// that is added when the command has none. One that shows the output as it is written, with
-/// `--nocapture`, is left as it is. Then each of `skips` is added as `--skip <name>`, after a `--`
-/// when the command still has none. A `--skip` the command already holds stays as it is written.
+/// `--nocapture`, or that already holds `--show-output`, is left as it is. Then each of `skips` is
+/// added as `--skip <name>`, after a `--` when the command still has none. A `--skip` the command
+/// already holds stays as it is written.
 #[must_use]
 pub fn expand(
     definition: &StepDef,
@@ -371,7 +372,9 @@ pub fn expand(
     if words.first().map(String::as_str) == Some("cargo")
         && words.get(1).map(String::as_str) == Some("test")
         && definition.reading == ReadingKind::Cargo
-        && !words.iter().any(|word| word == "--nocapture")
+        && !words
+            .iter()
+            .any(|word| word == "--nocapture" || word == "--show-output")
     {
         if !words.iter().any(|word| word == "--") {
             words.push("--".to_owned());
@@ -609,12 +612,23 @@ impl Plan {
     }
 
     /// A plan of `steps` only, for a tree that is not a repository with a plan file: every step
-    /// runs on every platform, in one group named `group`.
+    /// runs on every platform, in one group named `group`, and a test no step runs is not run for
+    /// one reason.
     #[must_use]
     pub fn of_steps(group: &str, steps: Vec<Step>) -> Self {
+        let reason = "no step of this run's selection runs this target on this platform";
         Self {
             repository: "test".to_owned(),
             groups: vec![group.to_owned()],
+            unrun: Unrun {
+                rust: PerPlatform {
+                    linux: reason.to_owned(),
+                    macos: reason.to_owned(),
+                    windows: reason.to_owned(),
+                },
+                bench: reason.to_owned(),
+                typescript: reason.to_owned(),
+            },
             steps: steps
                 .into_iter()
                 .enumerate()

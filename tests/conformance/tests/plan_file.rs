@@ -277,3 +277,150 @@ fn the_steps_are_the_plans_in_its_own_order_for_a_platform_and_a_selection() {
     );
     assert!(plan.steps(Platform::Linux, &[], "/tmp/e", None).is_empty());
 }
+
+/// Runs the program with `arguments` and returns its exit code and what it wrote to stderr.
+fn program(arguments: &[&str]) -> (Option<i32>, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kr-conformance"))
+        .args(arguments)
+        .output()
+        .expect("the program runs");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// A root with no plan file is refused with exit status 2 and the reason, and nothing is mapped:
+/// the program never falls back to another plan.
+#[test]
+fn a_root_with_no_plan_file_is_refused_with_exit_2() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = directory.path().to_string_lossy().into_owned();
+    for command in ["map", "run"] {
+        let mut arguments = vec![command, "--root", root.as_str()];
+        if command == "run" {
+            arguments.extend(["--evidence", "/tmp/kr-no-such-evidence"]);
+        }
+        let (code, stderr) = program(&arguments);
+        assert_eq!(code, Some(2), "{command}: {stderr}");
+        assert!(
+            stderr.contains("kr-conformance: refused: the plan ")
+                && stderr.contains("could not be read")
+                && stderr.contains("--plan"),
+            "{command}: {stderr}"
+        );
+    }
+    let (code, stderr) = program(&[
+        "map",
+        "--root",
+        root.as_str(),
+        "--plan",
+        "/no/such/plan.toml",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("/no/such/plan.toml could not be read"),
+        "{stderr}"
+    );
+}
+
+/// Each planted fault of the table is exit status 2 from the program, before anything runs, with
+/// the plan's path and the fault's own reason.
+#[test]
+fn a_plan_named_by_the_option_is_refused_with_exit_2_for_each_fault() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = repository();
+    let root = root.to_string_lossy();
+    for (index, (name, text, reason)) in faults().into_iter().enumerate() {
+        let file = directory.path().join(format!("plan-{index}.toml"));
+        std::fs::write(&file, text).expect("the planted file");
+        let file = file.to_string_lossy().into_owned();
+        let (code, stderr) = program(&["map", "--root", &root, "--plan", &file]);
+        assert_eq!(code, Some(2), "{name}: {stderr}");
+        assert!(
+            stderr.contains("kr-conformance: refused: the plan ")
+                && stderr.contains(&file)
+                && stderr.contains(reason),
+            "{name}: {stderr}"
+        );
+    }
+}
+
+/// A group the plan does not have is refused after the plan is read, with the groups it has.
+#[test]
+fn a_group_the_plan_does_not_have_is_refused_with_exit_2() {
+    let root = repository();
+    let root = root.to_string_lossy();
+    let (code, stderr) = program(&[
+        "run",
+        "--root",
+        &root,
+        "--evidence",
+        "/tmp/kr-no-such-evidence",
+        "--group",
+        "bogus",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--group bogus is not a group of the plan; it has rust, end-to-end"),
+        "{stderr}"
+    );
+}
+
+/// No constant or static of the plan or the report holds a step, a table row or a reason, and the
+/// code names none of the groups that carry behaviour: the plan file is the one place for both.
+#[test]
+fn the_tables_are_not_in_the_code() {
+    // The names of two variables, the schema's version, and the two `const fn` of `Platform`.
+    let kept = [
+        "SECRET_STORE_VARIABLE",
+        "APPLICATIONS_VARIABLE",
+        "SCHEMA",
+        "current",
+        "name",
+    ];
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    for file in ["plan.rs", "report.rs"] {
+        let text = std::fs::read_to_string(source.join(file)).expect("the source");
+        for (index, line) in text.lines().enumerate() {
+            let words: Vec<&str> = line
+                .trim_start()
+                .trim_start_matches("pub ")
+                .split_whitespace()
+                .collect();
+            let (Some(&("const" | "static")), rest) = (words.first(), &words[1.min(words.len())..])
+            else {
+                continue;
+            };
+            let name = rest
+                .iter()
+                .find(|word| **word != "fn")
+                .and_then(|word| word.split([':', '(', '<']).next())
+                .unwrap_or_default();
+            if !kept.contains(&name) {
+                found.push(format!(
+                    "src/{file}:{}: `{name}` is a table in the code",
+                    index + 1
+                ));
+            }
+        }
+    }
+    for entry in std::fs::read_dir(&source).expect("the sources") {
+        let path = entry.expect("an entry").path();
+        let text = std::fs::read_to_string(&path).expect("the source");
+        for (index, line) in text.lines().enumerate() {
+            for group in ["TypeScript", "Phones", "EndToEnd", "Performance"] {
+                if line.contains(&format!("Group::{group}")) && !line.trim_start().starts_with("//")
+                {
+                    found.push(format!(
+                        "{}:{}: names the group `{group}`",
+                        path.display(),
+                        index + 1
+                    ));
+                }
+            }
+        }
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
