@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 use kr_protocol::error::ProtocolError;
-use kr_protocol::ids::{ConnectionId, DeviceId, RequestId};
+use kr_protocol::ids::{ConnectionId, DeviceId, RequestId, SessionId};
 use kr_transport::listener::{AuthorisedSession, ControlSender};
 
 use crate::grants::policy::{BoundIdentity, BoundSnapshot, HeldBound, Stands};
@@ -121,8 +121,8 @@ impl FrameSink for ControlStream {
 /// A read made with [`ReadUnder::now`] stands while privacy mode is off in the generation it was
 /// read in. One made while privacy mode is on is never released by it: the daemon publishes the mode
 /// before it tells a worker to remove what it retained, so a worker can still answer with output
-/// that is about to go. [`ReadUnder::now_settled`] releases a read made while the mode is on once
-/// its own session owes no removal, and [`ReadUnder::now_carrying_none_while_private`] releases one
+/// that is about to go. [`ReadUnder::now_settled`] releases a read of a session's own content made
+/// while the mode is on once that session owes no removal, and [`ReadUnder::now_carrying_none_while_private`] releases one
 /// whose own code carries nothing the removal takes while the mode is on. Both stand only while the
 /// state they began under stands. Output a worker read before privacy mode started is not sent after
 /// it, however long the answer waited to be written.
@@ -160,22 +160,25 @@ impl ReadUnder {
         })
     }
 
-    /// As [`Self::now`], for a read that is answered while privacy mode is on once its removal has
-    /// been reported complete.
+    /// As [`Self::now`], for a read of what `session_id` retained that is answered while privacy
+    /// mode is on once that session owes no removal.
     ///
-    /// The generation and the completion are taken at the start of the read. A read that began
-    /// before the completion is never released, and one that began after it is released for as long
-    /// as the state it began under stands.
+    /// The generation and the session's debt are taken at the start of the read, in one reading of
+    /// the environment's privacy record, which the session's worker clears by saying that it applied
+    /// the generation and that its cleanup is complete. A read that began while the session still
+    /// owed its removal is never released, even if the removal finishes while the answer waits, and
+    /// one that began after is released for as long as the state it began under stands. Another
+    /// session's debt does not hold it. A read that names no session is not released.
     pub(super) async fn now_settled(
         controller: &Controller,
+        session_id: Option<SessionId>,
     ) -> Result<Self, kr_protocol::error::ProtocolError> {
         let mut read_under = Self::now(controller).await?;
-        if read_under.decided.private {
+        if let (true, Some(session_id)) = (read_under.decided.private, session_id) {
             let privacy = std::sync::Arc::clone(&controller.privacy);
-            let report = tokio::task::spawn_blocking(move || {
-                privacy.report_now(kr_protocol::scalars::TimestampMs::new(
-                    kr_ipc::now_ms().get(),
-                ))
+            let generation = read_under.decided.generation;
+            read_under.settled = tokio::task::spawn_blocking(move || {
+                privacy.session_is_settled(session_id, generation)
             })
             .await
             .map_err(|_| {
@@ -184,9 +187,6 @@ impl ReadUnder {
                     "privacy mode's state could not be read",
                 )
             })?;
-            read_under.settled = report.enabled
-                && report.generation == read_under.decided.generation
-                && report.completion.is_complete();
         }
         Ok(read_under)
     }

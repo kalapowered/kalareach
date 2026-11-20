@@ -54,7 +54,7 @@ pub(super) struct Asked {
     /// receipt's result, or an answer with text a model wrote, the privacy state it was read under,
     /// which the answer is released under ([`RemoteConnection::write_answer`]). A page and a
     /// snapshot read while privacy mode is on are never released; a receipt read then is released
-    /// once the removal had been reported complete when the read began; a voice context read then
+    /// if its own session owed no removal when the read began; a voice context read then
     /// is released only while that same state stands, and any change of it gives the refusal a
     /// context read that privacy mode moved under is given.
     pub(super) read_under: Option<ReadUnder>,
