@@ -2170,43 +2170,47 @@ pub fn conversations_relative_in(account: &Account, config_directory: &str) -> P
     Path::new(config_directory).join(base.trim_end_matches('/'))
 }
 
+/// Calls `attempt` again, up to `attempts` calls in all with `pause` between them, while the
+/// system refuses it because the program it runs is open for writing, and for no other error.
+fn retried_while_busy<T>(
+    attempts: u32,
+    pause: std::time::Duration,
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut tried = 1;
+    loop {
+        match attempt() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy && tried < attempts =>
+            {
+                tried += 1;
+                std::thread::sleep(pause);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Starts `command`, a program that was written a moment ago. Another thread's `fork` can still
+/// hold the file open for writing until that child has run its own `exec`, and the system then
+/// refuses the start as busy; it is tried again a bounded number of times (a hundred, fifty
+/// milliseconds apart), and no other error is tried again.
+///
+/// # Errors
+///
+/// Returns the system's refusal where the program is still busy after the last try, or any other.
+pub fn spawn_retrying_when_busy(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    retried_while_busy(100, std::time::Duration::from_millis(50), || {
+        command.spawn()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::account::run_files_holding;
-
-    /// Calls `attempt` again, up to `attempts` calls in all with `pause` between them, while the
-    /// system refuses it because the program it runs is open for writing, and for no other error.
-    fn retried_while_busy<T>(
-        attempts: u32,
-        pause: std::time::Duration,
-        mut attempt: impl FnMut() -> std::io::Result<T>,
-    ) -> std::io::Result<T> {
-        let mut tried = 1;
-        loop {
-            match attempt() {
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && tried < attempts =>
-                {
-                    tried += 1;
-                    std::thread::sleep(pause);
-                }
-                other => return other,
-            }
-        }
-    }
-
-    /// Starts a copy of this test program that was written a moment ago. Another test's `fork` can
-    /// still hold the copy open for writing until that child has run its own `exec`, and the
-    /// system then refuses the start as busy; it is tried again a bounded number of times.
-    fn starts_the_copy(
-        command: &mut std::process::Command,
-    ) -> std::io::Result<std::process::Child> {
-        retried_while_busy(100, std::time::Duration::from_millis(50), || {
-            command.spawn()
-        })
-    }
 
     /// A refusal as busy is tried again and nothing else is, and the number of tries is bounded.
     #[test]
@@ -2621,7 +2625,7 @@ mod tests {
                 ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null());
-            starts_the_copy(&mut command).expect("it starts")
+            spawn_retrying_when_busy(&mut command).expect("it starts")
         };
         let mut children = [
             start("codex", "unrelated-name"),
@@ -2687,7 +2691,7 @@ mod tests {
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let mut running = starts_the_copy(&mut command).expect("it starts");
+        let mut running = spawn_retrying_when_busy(&mut command).expect("it starts");
         let id = running.id();
         let started = std::time::Instant::now();
         let seen = loop {

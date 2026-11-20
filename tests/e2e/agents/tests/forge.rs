@@ -10,6 +10,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use kr_e2e_agents::held::spawn_retrying_when_busy;
 use kr_ipc::testing::PrivateTempDir;
 
 /// What a test stands on: a run's directory with a launch directory, a launch record, a socket the
@@ -63,14 +64,20 @@ impl Scene {
 
     /// Runs the forging launcher with `arguments`, where `registration` names the launch.
     fn run(&self, registration: &Path, arguments: &[&str]) -> (i32, String, String) {
-        let output = Command::new(self.root.join("b/kr-hook"))
+        let mut command = Command::new(self.root.join("b/kr-hook"));
+        command
             .args(arguments)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("KALAREACH_E2E_FORGE_ROOT", &self.root)
             .env("KR_REGISTRATION", registration)
-            .output()
-            .expect("the forging launcher runs");
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = spawn_retrying_when_busy(&mut command)
+            .expect("the forging launcher runs")
+            .wait_with_output()
+            .expect("the forging launcher's output");
         (
             output.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -214,16 +221,16 @@ impl Scene {
         arguments: &[&str],
         limit: std::time::Duration,
     ) -> Option<(i32, String, String)> {
-        let mut child = Command::new(self.root.join("b/kr-hook"))
+        let mut command = Command::new(self.root.join("b/kr-hook"));
+        command
             .args(arguments)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("KALAREACH_E2E_FORGE_ROOT", &self.root)
             .env("KR_REGISTRATION", registration)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("the forging launcher runs");
+            .stderr(std::process::Stdio::piped());
+        let mut child = spawn_retrying_when_busy(&mut command).expect("the forging launcher runs");
         let started = std::time::Instant::now();
         while child.try_wait().expect("the helper's state").is_none() {
             if started.elapsed() >= limit {
