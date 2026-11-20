@@ -11,7 +11,6 @@
 //! | [`time`] | The host time contract's answer, as the engine receives it. Nothing here reads a clock |
 //! | [`event`] | The typed events the engine runs from, the cursors that make a replay safe, and whose sources they are |
 //! | [`key`] | Deriving an item's key from the subject its condition is about |
-//! | [`rule`] | The rule set, each rule's escalation ladder and its de-duplication window |
 //! | [`engine`] | The inbox: raising, de-duplicating, deferring, escalating, resolving and acknowledging |
 //! | [`scope`] | What one caller may see of it |
 //! | [`review`] | Review acknowledgements, bound to versions, per actor |
@@ -94,7 +93,6 @@ pub mod host;
 pub mod key;
 pub mod numbering;
 pub mod review;
-pub mod rule;
 pub mod scope;
 pub mod store;
 pub mod subject;
@@ -105,7 +103,6 @@ pub use crate::engine::{Content, Engine, Item, Outcome, Text};
 pub use crate::error::{Error, Result};
 pub use crate::event::{EventCursor, EventKind, Origin, SourceEvent};
 pub use crate::host::{ActionKey, Answer, Attention, ChangedPage, InboxPage, Mutation, Performed};
-pub use crate::rule::{RULES, Rule};
 pub use crate::scope::{DeviceScope, Viewer};
 pub use crate::store::{ActionRecord, Claimant, Liveness};
 pub use crate::subject::Subject;

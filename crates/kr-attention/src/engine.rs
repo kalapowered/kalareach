@@ -65,10 +65,10 @@ use kr_protocol::ids::{ActorId, GrantId, QuestionId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
 use crate::event::{EventCursor, EventKind, Origin, SourceEvent, numbers_every_record};
-use crate::rule::rule;
 use crate::scope::Viewer;
 use crate::subject::Subject;
 use crate::time::{Anchor, Elapsed, HostReading, MS_IN_MINUTE, PrivacyStamp};
+use kr_protocol::attention_rule::rule;
 
 /// Largest number of gaps the engine keeps. The oldest is dropped past it.
 pub const MAX_GAPS: usize = 64;

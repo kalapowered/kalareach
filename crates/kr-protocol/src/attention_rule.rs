@@ -15,7 +15,7 @@
 //! out. A step that has already been passed is never taken again, so a restart cannot walk an item
 //! up the ladder a second time.
 
-use kr_protocol::attention::{AttentionLevel, AttentionRule, DEDUPLICATION_WINDOW_MS};
+use crate::attention::{AttentionLevel, AttentionRule, DEDUPLICATION_WINDOW_MS};
 
 /// One step of an escalation ladder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn the_idle_reminder_counts_the_interval_section_twenty_five_fixes() {
-        assert_eq!(kr_protocol::attention::IDLE_REMINDER_MS, 300_000);
+        assert_eq!(crate::attention::IDLE_REMINDER_MS, 300_000);
         assert_eq!(
             rule(AttentionRule::InputIdleReminder).initial,
             AttentionLevel::Urgent

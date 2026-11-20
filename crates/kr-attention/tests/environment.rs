@@ -2450,7 +2450,7 @@ fn a_replay_that_finds_a_held_condition_again_keeps_the_time_of_the_held_decisio
 /// repeat nothing holds back is a new announcement, dated when it was decided.
 #[test]
 fn a_held_repeat_leaves_the_time_of_the_announcement_still_waiting_to_be_taken() {
-    use kr_attention::rule::REMINDER_INTERVAL_MS;
+    use kr_protocol::attention_rule::REMINDER_INTERVAL_MS;
 
     let mut attention = engine();
     attention
@@ -2571,7 +2571,7 @@ fn a_decision_keeps_the_privacy_state_it_was_made_under() {
 #[test]
 fn a_decision_held_over_an_untaken_one_keeps_the_privacy_state_of_the_one_before_it() {
     use kr_attention::PrivacyStamp;
-    use kr_attention::rule::REMINDER_INTERVAL_MS;
+    use kr_protocol::attention_rule::REMINDER_INTERVAL_MS;
 
     let normal = PrivacyStamp {
         generation: 2,
