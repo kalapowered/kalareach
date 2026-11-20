@@ -860,7 +860,14 @@ impl DraftStore {
                         &error,
                         ClientError::Draft(held) if matches!(**held, DraftError::Unknown { .. })
                     );
-                    return if gone { Ok(None) } else { Err(error) };
+                    if !gone {
+                        return Err(error);
+                    }
+                    // A draft that is not there was removed by someone: the name's absence is
+                    // proved durable here, because the caller relies on it as on one this call made.
+                    flush_directory(&self.directory, NameKind::File)
+                        .map_err(|source| storage(Shown::root(&self.directory), source))?;
+                    return Ok(None);
                 }
             };
             self.check_owner(&stored)?;
@@ -1340,7 +1347,13 @@ fn owner_only_builder() -> std::fs::DirBuilder {
 /// accepted. On Windows the directory takes whatever access list it inherits, which this store does
 /// not narrow: what protects it there is the access list of the directory the caller chose, so a
 /// caller puts the store under its own per-user application data rather than somewhere shared.
-pub(crate) fn private_directory(directory: &Path) -> std::io::Result<()> {
+///
+/// # Errors
+///
+/// Returns the operating system's error when a level cannot be created, when the name is taken by
+/// something that is not a directory, when the directory cannot be narrowed, or when a name along
+/// the path cannot be made durable.
+pub fn private_directory(directory: &Path) -> std::io::Result<()> {
     // Each missing level is created in turn rather than all at once, because a directory is a name
     // in the directory above it and a name is durable only once *that* directory's entry is
     // flushed. One recursive create would make several names and leave every one of them in
@@ -1401,7 +1414,12 @@ fn holder_of(path: &Path) -> &Path {
 /// moment afterwards: a file that was briefly readable is a file that was readable. A failure after
 /// it was created removes it; a process that dies here leaves it, and the next
 /// [`DraftStore::open`] sweeps it away.
-pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// # Errors
+///
+/// Returns the operating system's error when the file cannot be created (an error of kind
+/// [`std::io::ErrorKind::AlreadyExists`] when something is named `path`), written or flushed.
+pub fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
     let mut options = std::fs::OpenOptions::new();
