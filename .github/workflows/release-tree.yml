@@ -181,11 +181,13 @@ jobs:
 
       # What the shells need to configure and build from their own release tarballs: the fish package
       # is a Rust shell built through CMake, whose build turns the message catalogues with gettext.
+      # On Linux the install goes through scripts/apt-install.sh, with a deadline of 15 minutes. The
+      # packages are never restored from a cache: this workflow builds what the release workflow
+      # seals and publishes, and a release build restores nothing that another job could have written.
       - name: Install the shells' build dependencies
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends --yes libncurses-dev cmake gettext
+            bash scripts/apt-install.sh --deadline 900 libncurses-dev cmake gettext
           else
             command -v cmake >/dev/null 2>&1 || brew install cmake
             if ! command -v msgfmt >/dev/null 2>&1; then

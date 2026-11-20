@@ -148,6 +148,14 @@ LINES
 
 /// A program that stands for what `--names-from` runs: it prints the number of updates made so far
 /// in the name it gives, so that a name shows which indexes it was asked against.
+/// `pnpm` for the Playwright package list: it records its arguments and answers with the output
+/// and the status the case put in the rig.
+const PNPM: &str = r#"#!/bin/bash
+echo "pnpm $*" >> "$RIG/pnpm.log"
+cat "$RIG/pnpm.out"
+exit "$(cat "$RIG/pnpm.status")"
+"#;
+
 const NAMES: &str = r#"#!/bin/bash
 echo "plain-library"
 echo "library-after-$(cat "$RIG/count.update" 2>/dev/null || echo 0)-updates"
@@ -176,6 +184,7 @@ impl Rig {
             ("timeout", TIMEOUT),
             ("sleep", SLEEP),
             ("apt-config", APT_CONFIG),
+            ("pnpm", PNPM),
         ] {
             write_program(&bin.join(name), text);
         }
@@ -197,10 +206,14 @@ impl Rig {
     }
 
     fn run(&self, arguments: &[&str]) -> Outcome {
+        self.run_script("scripts/apt-install.sh", arguments)
+    }
+
+    fn run_script(&self, script: &str, arguments: &[&str]) -> Outcome {
         let began = Instant::now();
         let mut command = Command::new("/bin/bash");
         command
-            .arg("scripts/apt-install.sh")
+            .arg(script)
             .args(arguments)
             .current_dir(repository())
             .env_clear()
@@ -714,5 +727,66 @@ fn a_bad_command_line_is_refused() {
             outcome.stdout, outcome.stderr
         );
         assert!(rig.phases().is_empty(), "{arguments:?}");
+    }
+}
+
+/// What Playwright's dry run prints, with the status it exits with, and what the package list
+/// script makes of it.
+fn playwright_names(printed: &str, status: i32) -> (Outcome, Vec<String>) {
+    let rig = Rig::new();
+    fs::write(rig.path("pnpm.out"), printed).expect("the dry run's output");
+    fs::write(rig.path("pnpm.status"), status.to_string()).expect("the dry run's status");
+    let outcome = rig.run_script("scripts/playwright-system-packages.sh", &[]);
+    (outcome, rig.lines("pnpm.log"))
+}
+
+/// The package list is the names Playwright's dry run prints under its header, one per line, and
+/// the dry run is asked for the two browsers the end-to-end run drives.
+#[test]
+fn the_playwright_package_list_is_the_names_its_dry_run_prints() {
+    let (outcome, calls) = playwright_names(
+        "Missing system dependencies (3):\n  libasound2t64\n  libgbm1\n  libwoff1\n",
+        1,
+    );
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(outcome.stdout, "libasound2t64\nlibgbm1\nlibwoff1\n");
+    assert_eq!(
+        calls,
+        ["pnpm --silent -C apps/companion exec playwright install-deps --dry-run chromium webkit"]
+    );
+}
+
+/// Where Playwright says that every package is installed, the list is empty and the script
+/// succeeds.
+#[test]
+fn the_playwright_package_list_is_empty_when_every_package_is_installed() {
+    let (outcome, _) = playwright_names("All system dependencies are installed.\n", 0);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(outcome.stdout, "");
+}
+
+/// Any other result stops the step by the script's name, with what Playwright printed: a count
+/// that is not the number of names, a list with another line in it, a header with no names, an
+/// error with no list, a list with the wrong status, and no output at all.
+#[test]
+fn the_playwright_package_list_fails_on_any_other_shape() {
+    for (printed, status) in [
+        ("Missing system dependencies (3):\n  libgbm1\n  libwoff1\n", 1),
+        ("Missing system dependencies (1):\n  libgbm1\nWarning: something\n", 1),
+        ("Missing system dependencies (0):\n", 1),
+        ("Failed to install browser dependencies\nE: Unable to locate package\n", 1),
+        ("Missing system dependencies (1):\n  libgbm1\n", 0),
+        ("All system dependencies are installed.\n", 1),
+        ("Missing system dependencies (1):\n  libgbm1\n", 2),
+        ("", 0),
+    ] {
+        let (outcome, _) = playwright_names(printed, status);
+        assert_eq!(outcome.status, 1, "{printed:?} {status}: {}{}", outcome.stdout, outcome.stderr);
+        assert_eq!(outcome.stdout, "", "{printed:?}");
+        assert!(
+            outcome.stderr.starts_with("playwright-system-packages: "),
+            "{printed:?}: {}",
+            outcome.stderr
+        );
     }
 }
