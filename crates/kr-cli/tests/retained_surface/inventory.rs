@@ -25,6 +25,9 @@ use syn::visit::Visit;
 use super::condition;
 use super::walker::{VARIANTS, is_own_prefix, normalised, path_before, transcribers};
 
+/// The crate that defines `Method`.
+const PROTOCOL_CRATE: &str = "kr_protocol";
+
 /// The macros of other crates that product code may call at item position and in a transcriber, each
 /// with the paths that name its provider (`""` is a bare call) and why none of them can make a module
 /// file or a sender. A name from any other provider is refused.
@@ -158,14 +161,17 @@ impl Scope {
                 || STD_MACROS.contains(&name.as_str())
                 || Self::provided(name, "");
         }
+        // The crate's own prefix, or one of its modules, names a macro the crate defines: a name that a
+        // `use` brought from elsewhere, or that a re-export holds, is none.
         if is_own_prefix(first) {
-            return true;
+            return self.defined.contains(name);
         }
         if matches!(first.as_str(), "std" | "core" | "alloc") && STD_MACROS.contains(&name.as_str())
         {
             return true;
         }
-        self.modules.contains(first) || Self::provided(name, &path[..path.len() - 1].join("::"))
+        (self.modules.contains(first) && self.defined.contains(name))
+            || Self::provided(name, &path[..path.len() - 1].join("::"))
     }
 
     /// Whether `provider` is one of those the family `name` is accepted from.
@@ -186,6 +192,8 @@ pub struct Inventory {
     pub exported: BTreeSet<String>,
     /// The files that import `Method::*` or `Method` under another name.
     pub method_uses: Vec<String>,
+    /// For each name a `use` gives under a name of its own (`use a::b as c`): the name it came as.
+    pub imported_as: BTreeMap<String, BTreeSet<String>>,
     /// The item-position macros that nothing in the crate defines and the scan does not accept:
     /// the file and the name of the first call of each.
     pub unaccepted: Vec<(String, String)>,
@@ -238,9 +246,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
     let mut calls: Vec<(String, Vec<String>)> = Vec::new();
     let mut imports: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
     let mut module_set: BTreeSet<String> = BTreeSet::new();
-    let mut token_defined: BTreeSet<String> = BTreeSet::new();
     let mut method_uses = Vec::new();
-    let mut defines_method = false;
     while let Some(visit) = todo.pop() {
         if !seen.insert(visit.clone()) {
             continue;
@@ -282,11 +288,9 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             declared: Vec::new(),
             defined: Vec::new(),
             calls: Vec::new(),
-            token_defined: Vec::new(),
             imports: Vec::new(),
             module_names: Vec::new(),
             method_use: false,
-            defines_method: false,
             in_method_impl: false,
             error: None,
         };
@@ -305,11 +309,9 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             imports.entry(local).or_default().insert(full);
         }
         module_set.extend(reader.module_names);
-        token_defined.extend(reader.token_defined);
         if reader.method_use {
             method_uses.push(at.clone());
         }
-        defines_method |= reader.defines_method;
         for declared in reader.declared {
             let mut found: Vec<&PathBuf> = Vec::new();
             for candidate in &declared.candidates {
@@ -349,8 +351,21 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             }
         }
     }
+    let mut imported_as: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (local, fulls) in &imports {
+        for full in fulls {
+            if let Some(original) = full.last()
+                && original != local
+            {
+                imported_as
+                    .entry(local.clone())
+                    .or_default()
+                    .insert(original.clone());
+            }
+        }
+    }
     let scope = Scope {
-        defined: defined.iter().cloned().chain(token_defined).collect(),
+        defined: defined.clone(),
         modules: module_set,
         imports,
     };
@@ -366,9 +381,10 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
         files: reached.into_iter().collect(),
         defined,
         exported,
-        // The crate that defines `Method` names its own variants (`Self::Variant`, a glob of them,
-        // an alias) and matches them: it is the definition and is not read as a sender.
-        method_uses: if defines_method {
+        imported_as,
+        // The protocol crate defines `Method`: it names its own variants (`Self::Variant`, a glob of
+        // them, an alias) and matches them, and is not read as a sender.
+        method_uses: if krate == PROTOCOL_CRATE {
             Vec::new()
         } else {
             method_uses
@@ -393,15 +409,11 @@ struct Reader<'a> {
     defined: Vec<(String, bool)>,
     /// The macros called at item position and in the transcribers of a definition, as written.
     calls: Vec<Vec<String>>,
-    /// The `macro_rules!` names written in those transcribers.
-    token_defined: Vec<String>,
     /// What each `use` brings in: the name it gives, and the path it stands for.
     imports: Vec<(String, Vec<String>)>,
     /// The modules declared.
     module_names: Vec<String>,
     method_use: bool,
-    /// Whether an `enum Method` is defined.
-    defines_method: bool,
     /// Whether the visit is inside an `impl` for `Method`.
     in_method_impl: bool,
     error: Option<String>,
@@ -516,11 +528,12 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         visit_trait_item_type => visit_trait_item_type(syn::TraitItemType);
     }
 
-    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
-        if self.enter(&node.attrs) {
-            self.defines_method |= node.ident == "Method";
-            syn::visit::visit_item_enum(self, node);
+    /// `<Method>::<Variant>` names the variant through the type in angle brackets.
+    fn visit_qself(&mut self, node: &'ast syn::QSelf) {
+        if node.as_token.is_none() && ends_in_method(&node.ty) {
+            self.method_use = true;
         }
+        syn::visit::visit_qself(self, node);
     }
 
     /// An alias of `Method` names its variants under another name.
@@ -620,7 +633,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                 let exported = self.carries(&node.attrs, "macro_export");
                 self.defined.push((name.to_string(), exported));
                 for expansion in transcribers(&node.mac.tokens) {
-                    token_calls(&expansion, &mut self.calls, &mut self.token_defined);
+                    token_calls(&expansion, &mut self.calls);
                 }
             }
             _ => self.call(&node.mac.path),
@@ -660,6 +673,12 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                     Some(Form::Module(module)) => {
                         self.error = Some(format!(
                             "{}: the scan does not read a module declared in a macro (mod {module}; in the tokens of {name}!)",
+                            self.at
+                        ));
+                    }
+                    Some(Form::Rules(rules)) => {
+                        self.error = Some(format!(
+                            "{}: the scan does not read a macro_rules! written in the tokens of another macro (macro_rules! {rules} in the tokens of {name}!)",
                             self.at
                         ));
                     }
@@ -712,6 +731,8 @@ enum Form {
     /// A module declaration, with the name as written: `name`, `$name`, or `$(...)` for a
     /// repetition.
     Module(String),
+    /// A `macro_rules!` definition, with its name.
+    Rules(String),
 }
 
 /// The first form the inventory refuses in some tokens, in a macro's arguments or in its
@@ -730,6 +751,14 @@ fn form_in(tokens: &TokenStream) -> Option<Form> {
                     && matches!(flat.get(at + 2), Some(TokenTree::Group(_)))
                 {
                     return Some(Form::Include);
+                }
+            }
+            TokenTree::Ident(word) if word == "macro_rules" => {
+                if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Ident(name)), Some(TokenTree::Group(_))) =
+                    (flat.get(at + 1), flat.get(at + 2), flat.get(at + 3))
+                    && bang.as_char() == '!'
+                {
+                    return Some(Form::Rules(name.to_string()));
                 }
             }
             TokenTree::Ident(word) if word == "mod" => {
@@ -763,31 +792,15 @@ fn form_in(tokens: &TokenStream) -> Option<Form> {
     None
 }
 
-/// The macros the tokens of a transcriber call, at any depth, each as the path it is written with,
-/// and the names of the `macro_rules!` definitions written in them. The matchers of a definition
-/// written in them are not read, and a call through a metavariable (`$m!(..)`) names no macro.
-fn token_calls(stream: &TokenStream, calls: &mut Vec<Vec<String>>, defined: &mut Vec<String>) {
+/// The macros the tokens of a transcriber call, at any depth, each as the path it is written with.
+/// A call through a metavariable (`$m!(..)`) names no macro, and a `macro_rules!` written in the
+/// tokens is refused before this is read.
+fn token_calls(stream: &TokenStream, calls: &mut Vec<Vec<String>>) {
     let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
     let mut at = 0;
     while at < flat.len() {
         match &flat[at] {
-            TokenTree::Ident(word) if word == "macro_rules" => {
-                if let (
-                    Some(TokenTree::Punct(bang)),
-                    Some(TokenTree::Ident(name)),
-                    Some(TokenTree::Group(arms)),
-                ) = (flat.get(at + 1), flat.get(at + 2), flat.get(at + 3))
-                    && bang.as_char() == '!'
-                {
-                    defined.push(name.to_string());
-                    for expansion in transcribers(&arms.stream()) {
-                        token_calls(&expansion, calls, defined);
-                    }
-                    at += 4;
-                    continue;
-                }
-            }
-            TokenTree::Group(group) => token_calls(&group.stream(), calls, defined),
+            TokenTree::Group(group) => token_calls(&group.stream(), calls),
             TokenTree::Ident(_)
                 if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
                     && matches!(flat.get(at + 2), Some(TokenTree::Group(_)))
