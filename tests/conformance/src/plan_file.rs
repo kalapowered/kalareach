@@ -567,7 +567,7 @@ impl Plan {
             }
             if let Some(filter) = &step.filter {
                 let words = expand(step, "", &[]);
-                if !words.iter().any(|word| *word == filter.name) {
+                if !words.contains(&filter.name) {
                     return refuse(format!(
                         "step `{id}` filters by `{}`, which is not a word of its command",
                         filter.name
