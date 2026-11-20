@@ -162,13 +162,28 @@ describe('a message handed over to the channel store', () => {
       const { book, token } = await pressed(of)
       const record = token.pressed()[0]
       const told: (string | null)[] = []
-      book.endSend(token, 'handed_over', LOCAL, (id) => told.push(id), rejecting ?? keeping(of))
+      const seen: HeldPrompt[] = []
+      const attempt = rejecting ?? keeping(of)
+      book.endSend(
+        token,
+        'handed_over',
+        LOCAL,
+        (id) => told.push(id),
+        async (held) => {
+          seen.push(held)
+          return attempt(held)
+        }
+      )
       await book.settled()
       expect(book.handedOver(LOCAL)).toBeNull()
       expect(book.draft(MAIN).text).toBe('the message')
       expect(told).toHaveLength(1)
       // The press record is the one that stays, with the text: the composer takes it back under the same identity.
       expect(of.drafts.all().map((draft) => [draft.id, draft.text])).toEqual([[record?.id, 'the message']])
+      // The keep was asked with the press record's exact version, and the record took the text back after it.
+      expect(seen.map((held) => held.drafts.map((ref) => [ref.id, ref.revision]))).toEqual([
+        [[record?.id, record?.revision]]
+      ])
     }
   )
 
@@ -221,8 +236,12 @@ describe('a message handed over to the channel store', () => {
       expect(book.handedOver(LOCAL)).toBe('pending')
       type(book, MAIN, 'the message')
       book.sendSettled(LOCAL, state)
+      const before = of.drafts.calls.length
       release()
       await book.settled()
+      // The store saw the keep's own removal of the press record and the typed words, and nothing
+      // else: no receipt cleared a composer and none returned text to it.
+      expect(of.drafts.calls.slice(before)).toEqual([{ kind: 'discard' }, { kind: 'save', text: 'the message' }])
       expect(book.draft(MAIN).text).toBe('the message')
       expect(of.messages.all()).toHaveLength(1)
       expect(book.handedOver(LOCAL)).toBe('kept')
@@ -260,13 +279,24 @@ describe('a message handed over to the channel store', () => {
         release = resolve
       })
       const inner = keeping(of)
-      book.endSend(token, 'handed_over', LOCAL, undefined, async (held) => {
+      const seen: HeldPrompt[] = []
+      const told: (string | null)[] = []
+      book.endSend(token, 'handed_over', LOCAL, (id) => told.push(id), async (held) => {
+        seen.push(held)
         await gate
         return inner(held)
       })
       book.sendSettled(LOCAL, state)
+      const before = of.drafts.calls.length
       release()
       await book.settled()
+      // One keep, one end told once, and one application of the receipt: the press record's removal
+      // when it was taken, the text stored back when it was refused.
+      expect(seen).toHaveLength(1)
+      expect(told).toHaveLength(1)
+      expect(of.drafts.calls.slice(before)).toEqual(
+        state === 'applied' ? [{ kind: 'discard' }] : [{ kind: 'save', text: 'the message' }]
+      )
       // Taken: the unknown path ran and the late receipt removed the draft; refused: the text is back, once.
       if (state === 'applied') {
         expect(of.drafts.all()).toEqual([])
