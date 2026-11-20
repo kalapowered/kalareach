@@ -59,12 +59,24 @@ impl Budgets {
         }))
     }
 
-    /// Takes into account that `step`, the `number`th of the run, ran for `elapsed`. When the budget's
-    /// own deadline ended it, `by_the_budget`, all the budget is spent, whatever the clock said.
-    pub fn spend(&mut self, step: &Step, number: usize, elapsed: Duration, by_the_budget: bool) {
+    /// Takes into account that `step`, the `number`th of the run, took `elapsed`. A step that was
+    /// not `ran` took no time, whatever `elapsed` says: it spends none of its budget. When the
+    /// budget's own deadline ended it, `by_the_budget`, all the budget is spent, whatever the clock
+    /// said.
+    pub fn spend(
+        &mut self,
+        step: &Step,
+        number: usize,
+        elapsed: Duration,
+        ran: bool,
+        by_the_budget: bool,
+    ) {
         let Some((id, seconds)) = &step.budget else {
             return;
         };
+        if !ran {
+            return;
+        }
         let whole = Duration::from_secs(*seconds);
         let spent = self.spent.entry(id.clone()).or_default();
         spent.time = if by_the_budget {
@@ -140,8 +152,8 @@ mod tests {
         let mut budgets = Budgets::default();
         let now = Instant::now();
         let first = step(None, Some(("b", 10)));
-        budgets.spend(&first, 1, Duration::from_secs(3), false);
-        budgets.spend(&first, 2, Duration::from_secs(4), false);
+        budgets.spend(&first, 1, Duration::from_secs(3), true, false);
+        budgets.spend(&first, 2, Duration::from_secs(4), true, false);
         assert_eq!(
             seconds_of(budgets.deadline(&first, now).unwrap(), now),
             Some((3, true, 10))
@@ -163,9 +175,9 @@ mod tests {
         let mut budgets = Budgets::default();
         let now = Instant::now();
         let sharing = step(None, Some(("b", 10)));
-        budgets.spend(&sharing, 1, Duration::from_secs(6), false);
+        budgets.spend(&sharing, 1, Duration::from_secs(6), true, false);
         // The step that ran into the budget's own deadline took all of it, whatever the clock read.
-        budgets.spend(&sharing, 2, Duration::from_secs(1), true);
+        budgets.spend(&sharing, 2, Duration::from_secs(1), true, true);
         for later in [step(None, Some(("b", 10))), step(Some(1), Some(("b", 10)))] {
             assert_eq!(budgets.deadline(&later, now).unwrap_err(), 2);
         }
@@ -176,7 +188,19 @@ mod tests {
     fn a_step_that_ends_exactly_when_the_budget_does_spends_it() {
         let mut budgets = Budgets::default();
         let sharing = step(None, Some(("b", 4)));
-        budgets.spend(&sharing, 1, Duration::from_secs(4), false);
+        budgets.spend(&sharing, 1, Duration::from_secs(4), true, false);
         assert_eq!(budgets.deadline(&sharing, Instant::now()).unwrap_err(), 1);
+    }
+
+    #[test]
+    fn a_step_that_was_not_run_spends_none_of_its_budget_whatever_time_it_is_given() {
+        let mut budgets = Budgets::default();
+        let now = Instant::now();
+        let sharing = step(None, Some(("b", 10)));
+        budgets.spend(&sharing, 1, Duration::from_secs(9), false, false);
+        assert_eq!(
+            seconds_of(budgets.deadline(&sharing, now).unwrap(), now),
+            Some((10, true, 10))
+        );
     }
 }
