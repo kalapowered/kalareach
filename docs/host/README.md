@@ -9671,17 +9671,19 @@ a report whose hook started in a later tick settles it. That suspension is the b
 a suspension placed for another reason does not lift it, and it lifts no other. Every observation
 goes into the instance's observed history.
 
-The end of a turn that Claude Code or Qoder CLI reports (their `Stop` hook) is a completed turn, and
-so review work, only when this host can vouch for it: the hook is the launched application process's
-own, the selected thread is verified and is the one the report names, and the hook started strictly
-after the report that began the binding's current revision, by the clock above. A missing start time
-on either side refuses it. Linux, macOS and Windows keep the record, so only a build for another
-platform loses turn notices this way. A `Stop` that is applied after a later start or end of the
-thread gives none either. No released package registers `Stop` yet, so no turn notice comes from the
-hook route until one does. A `Stop` that another hook blocks still gives a notice, and the agent
-continues. The turn is named by its thread, so each end of one thread is a later version of the same
-turn and new review work, and a frame that the hook sends twice is told from a second end by nothing
-here: it is one more version, never a second item.
+The end of a turn that a hook reports (`turn_ended`: the `Stop` hook of Claude Code and Qoder CLI
+under the default map, or the event that a package's
+[`hook_events`](../plugins/README.md#hook-events) map to it) is a completed turn, and so review
+work, only when this host can vouch for it: the hook is the launched application process's own, the
+selected thread is verified and is the one the report names, and the hook started strictly after the
+report that began the binding's current revision, by the clock above. A missing start time on either
+side refuses it. Linux, macOS and Windows keep the record, so only a build for another platform
+loses turn notices this way. A `Stop` that is applied after a later start or end of the thread gives
+none either. No released package registers `Stop` yet, so no turn notice comes from the hook route
+until one does. A `Stop` that another hook blocks still gives a notice, and the agent continues. The
+turn is named by its thread, so each end of one thread is a later version of the same turn and new
+review work, and a frame that the hook sends twice is told from a second end by nothing here: it is
+one more version, never a second item.
 
 A contact question records, when it is asked, the thread the bridge vouches is selected and its
 revision. The hook's report of a finished call names the call by its request identifier, and only a

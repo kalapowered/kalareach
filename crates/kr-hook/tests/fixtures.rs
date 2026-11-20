@@ -568,9 +568,9 @@ fn released_events(application: &str) -> Vec<String> {
     names
 }
 
-/// The forwarder reads an event for each application that no released package registers yet: the
-/// end of a turn, `Stop`. Every released event is one the forwarder reads, and a later event the
-/// forwarder reads and no package selects is a decision this case holds.
+/// The forwarder reads an event for Claude Code and Qoder CLI that no released package registers
+/// yet: the end of a turn, `Stop`. Every released event is one the forwarder reads, and a later
+/// event the forwarder reads and no package selects is a decision this case holds.
 #[test]
 fn the_events_no_released_package_selects_are_exactly_stop() {
     let default = kr_plugin_sdk::hook_events::HookEvents::claude_code();

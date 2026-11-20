@@ -7,11 +7,12 @@
 //! Code starts both itself, so both run under its permissions and outside the KalaReach plugin
 //! sandbox, and both inherit the environment of the session Claude Code runs in.
 //!
-//! [`kr_plugin_sdk::hook_events::HookEvents::claude_code`] also reports `Stop`, which Claude Code runs when the main agent has finished
-//! responding, and does not run when the person interrupted it or when an API error ended the turn
-//! (`StopFailure` is that event, and is not reported). Both are the hooks reference's words under
-//! `Stop`, at code.claude.com/docs/en/hooks, read 2026-11-20; its `Stop` input is the payload the
-//! forwarder reads, the common fields (`session_id`, `hook_event_name`) with `stop_hook_active` and
+//! [`kr_plugin_sdk::hook_events::HookEvents::claude_code`] also maps `Stop` to a turn's end. Claude
+//! Code runs `Stop` when the main agent has finished responding, and does not run it when the
+//! person interrupted it or when an API error ended the turn (`StopFailure` is that event, and is
+//! not mapped). Both are the hooks reference's words under `Stop`, at
+//! code.claude.com/docs/en/hooks, read 2026-11-20; its `Stop` input is the payload the forwarder
+//! reads, the common fields (`session_id`, `hook_event_name`) with `stop_hook_active` and
 //! `last_assistant_message`. No released package registers `Stop` yet, so a worker hears of a
 //! turn's end only from a package that does. A valid run answers `{}` and exits 0 on `Stop` as on
 //! every event, after an operational error or a timeout too; a command line it refuses exits 64, or
