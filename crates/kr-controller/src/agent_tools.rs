@@ -6332,8 +6332,8 @@ mod tests {
                 .collect();
             *look.borrow_mut() = Some(entries);
         });
-        walk.write(&place, b"one", 0o600, None)
-            .expect("a private folder is used");
+        let written = walk.write(&place, b"one", 0o600, None);
+        assert!(written.is_ok(), "a private folder is used: {written:?}");
         assert_eq!(
             seen.borrow().as_deref(),
             Some(&[(true, 0o700)][..]),
