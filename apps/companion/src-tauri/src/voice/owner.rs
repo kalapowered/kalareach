@@ -4464,9 +4464,11 @@ mod tests {
 
     /// A host control on a stand-in host, whose first heartbeat has been answered and told, and
     /// whose feed nobody has read.
-    async fn a_control_whose_news_is_unread(host: HeartbeatAnswers) -> (HostControl, ControlFeed) {
+    async fn a_control_whose_news_is_unread(
+        host: Arc<HeartbeatAnswers>,
+    ) -> (HostControl, ControlFeed) {
         let (control, events) = HostControl::open(
-            Arc::new(host),
+            host,
             VoiceSessionId::new(kr_ipc::new_uuid()),
             HostLimits {
                 beat: Duration::from_secs(3_600),
@@ -4484,9 +4486,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_word_is_read_after_the_news_a_stopped_control_still_held() {
         let evidence = CloseEvidence::default();
-        let (control, feed) =
-            a_control_whose_news_is_unread(HeartbeatAnswers(Some(VoiceProviderClose::Confirmed)))
-                .await;
+        let (control, feed) = a_control_whose_news_is_unread(Arc::new(HeartbeatAnswers(Some(
+            VoiceProviderClose::Confirmed,
+        ))))
+        .await;
         let draining = super::drain_control_news(feed, &evidence);
         let word = super::read_the_word_of_a_stopped_control(
             Some(&control),
@@ -4503,25 +4506,28 @@ mod tests {
         assert_eq!(evidence.get(), Some(VoiceProviderClose::Confirmed));
     }
 
-    /// A control that would tell for ever is stopped before its news is collected, so the collection
-    /// ends with its feed and not at its bound, and no word was told.
+    /// A control that would tell for ever is stopped before its news is collected: its heartbeat task
+    /// is over, and so no longer holds the host, once the collection returns, and an open call told
+    /// no word.
     #[tokio::test(start_paused = true)]
     async fn a_control_that_would_tell_for_ever_is_stopped_before_its_news_is_collected() {
-        let within = Duration::from_secs(20);
         let evidence = CloseEvidence::default();
-        let (control, feed) = a_control_whose_news_is_unread(HeartbeatAnswers(None)).await;
+        let host = Arc::new(HeartbeatAnswers(None));
+        let (control, feed) = a_control_whose_news_is_unread(Arc::clone(&host)).await;
+        // This case, the control and the control's heartbeat task hold the host.
+        let holders_while_it_runs = Arc::strong_count(&host);
         let draining = super::drain_control_news(feed, &evidence);
-        let began = Instant::now();
         let word = super::read_the_word_of_a_stopped_control(
             Some(&control),
             Some(draining),
             &evidence,
-            within,
+            Duration::from_secs(20),
         )
         .await;
-        assert!(
-            began.elapsed() < within,
-            "the collection ends with the stopped control's feed and not at its bound"
+        assert_eq!(
+            Arc::strong_count(&host),
+            holders_while_it_runs - 1,
+            "the stopped control's heartbeat task is over when the collection returns"
         );
         assert_eq!(word, CloseWord::Unheard, "an open call told no word");
     }
