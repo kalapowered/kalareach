@@ -837,10 +837,6 @@ async fn an_answer_the_worker_never_replies_to_is_kept_within_the_time_an_exchan
 
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
-    page.app
-        .state::<companion_tauri::AppState>()
-        .questions()
-        .exchange_within(Duration::from_millis(200));
     let read = page.call("question_read", read_params(&worker));
     let mut link = worker.link().await;
     let call = link.expect(Method::QuestionRead).await;
@@ -851,6 +847,12 @@ async fn an_answer_the_worker_never_replies_to_is_kept_within_the_time_an_exchan
     .await;
     answered(read).await.expect("the questions");
 
+    // The time is set only now that the read is answered: the read is set-up, and on a loaded
+    // machine it can take longer than the exchange this case bounds.
+    page.app
+        .state::<companion_tauri::AppState>()
+        .questions()
+        .exchange_within(Duration::from_millis(200));
     let asked = page.call(
         "question_answer",
         answer_params(&worker, 2, &choice("main")),
