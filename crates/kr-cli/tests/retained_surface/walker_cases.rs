@@ -225,6 +225,14 @@ fn caller() { via_fn!(Method::AgentTurnCancel); }
 struct Maker;
 impl Maker { via_impl!(Method::AgentPromptQueue); }
 macro_rules! own { () => { Method::AgentTurnCancel }; }
+macro_rules! forwards { () => { via_body!(Method::AgentTurnSteer) }; }
+wrapper!(outer_made, inner_call!(Method::AgentPromptQueue));
+fn mixed() { let _ = Method::AgentTurnCancel; idle!(); }
+impl Sends for [u8] {
+    const X: Method = Method::AgentTurnSteer;
+    fn m(&self) { let _ = Method::AgentTurnCancel; }
+    via_slice!(Method::AgentPromptQueue);
+}
 idle!();
 unnamed!("agent.turn.cancel");
 unnamed!("agent.turn.steer");
@@ -288,7 +296,7 @@ fn sender_tree() -> tempfile::TempDir {
         ),
         (
             "mac.rs",
-            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\n",
+            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! via_body { ($m:expr) => { $m }; }\nmacro_rules! wrapper { ($($t:tt)*) => {}; }\nmacro_rules! inner_call { ($m:expr) => { $m }; }\nmacro_rules! via_slice { ($m:expr) => { const Y: u8 = 0; }; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\n",
         ),
     ] {
         write(folder.path(), &format!("{src}/{path}"), text);
@@ -351,6 +359,15 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("macro:via_fn", vec![Expands]),
         ("macro:via_impl", vec![Expands]),
         ("macro:own", vec![Names]),
+        ("macro:forwards", vec![Names]),
+        ("macro:via_body", vec![Expands]),
+        ("outer_made", vec![Names]),
+        ("macro:wrapper", vec![Expands]),
+        ("macro:inner_call", vec![Expands]),
+        ("mixed", vec![Names]),
+        ("impl:lib.rs", vec![Names]),
+        ("::m", vec![Names]),
+        ("macro:via_slice", vec![Expands]),
         ("macro:unnamed", vec![Expands]),
         ("unnamed! invocation @lib.rs", vec![Names]),
         ("unnamed! invocation @sub.rs", vec![Names]),
@@ -365,7 +382,10 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         let Lookup::Found(digest) = tree.item("kr_sender", name) else {
             panic!("{name} does not resolve");
         };
-        if !name.starts_with("use:") && !name.contains("! invocation @") {
+        if !name.starts_with("use:")
+            && !name.starts_with("impl:")
+            && !name.contains("! invocation @")
+        {
             assert_eq!(
                 tree.lookup("kr_sender", &[name.as_str()], Depth::Alone),
                 Lookup::Found(digest),
@@ -386,29 +406,48 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         .expect("a source");
     assert!(shown.text.contains("agent.turn.cancel") && shown.text.contains("agent.turn.steer"));
     assert_eq!(shown.files, vec!["crates/kr-sender/src/lib.rs".to_owned()]);
+    // The constant and the macro call of an impl block whose type has no path are one sighting
+    // named by the file, with both texts; its method keeps the walker's own label.
+    let slice = tree
+        .source("kr_sender", "impl:lib.rs")
+        .expect("a lookup")
+        .expect("a source");
+    assert!(slice.text.contains("AgentTurnSteer") && slice.text.contains("via_slice"));
+    assert_eq!(slice.files, vec!["crates/kr-sender/src/lib.rs".to_owned()]);
 }
 
 #[test]
 fn the_digest_of_a_name_only_the_scan_gives_moves_on_a_token() {
-    let digests = |lib: &str| {
-        let folder = small_tree(lib);
+    let digests = |import: &str, call: &str, constant: &str| {
+        let lib = format!(
+            "use kr_protocol::Method::{import};\nunnamed!(\"{call}\");\nimpl T for [u8] {{ const NAME: &'static str = \"{constant}\"; }}\n"
+        );
+        let folder = small_tree(&lib);
         let tree = Tree::at(folder.path()).expect("the tree");
-        let take = |name: &str| match tree.item("kr_sender", name) {
-            Lookup::Found(digest) => digest,
-            other => panic!("{name}: {other:?}"),
+        let take = |name: &str| {
+            let found = tree.item("kr_sender", name);
+            assert!(matches!(found, Lookup::Found(_)), "{name}: {found:?}");
+            let Lookup::Found(digest) = found else {
+                unreachable!("{name}");
+            };
+            digest
         };
-        (take("use:lib.rs"), take("unnamed! invocation @lib.rs"))
+        (
+            take("use:lib.rs"),
+            take("unnamed! invocation @lib.rs"),
+            take("impl:lib.rs"),
+        )
     };
-    let before =
-        digests("use kr_protocol::Method::AgentTurnCancel;\nunnamed!(\"agent.turn.cancel\");\n");
-    let import =
-        digests("use kr_protocol::Method::AgentTurnSteer;\nunnamed!(\"agent.turn.cancel\");\n");
+    let before = digests("AgentTurnCancel", "agent.turn.cancel", "agent.turn.cancel");
+    let import = digests("AgentTurnSteer", "agent.turn.cancel", "agent.turn.cancel");
     assert_ne!(import.0, before.0);
-    assert_eq!(import.1, before.1);
-    let call =
-        digests("use kr_protocol::Method::AgentTurnCancel;\nunnamed!(\"agent.turn.steer\");\n");
-    assert_eq!(call.0, before.0);
+    assert_eq!((&import.1, &import.2), (&before.1, &before.2));
+    let call = digests("AgentTurnCancel", "agent.turn.steer", "agent.turn.cancel");
     assert_ne!(call.1, before.1);
+    assert_eq!((&call.0, &call.2), (&before.0, &before.2));
+    let constant = digests("AgentTurnCancel", "agent.turn.cancel", "agent.turn.steer");
+    assert_ne!(constant.2, before.2);
+    assert_eq!((&constant.0, &constant.1), (&before.0, &before.1));
 }
 
 const MODULE_LIB: &str = r##"

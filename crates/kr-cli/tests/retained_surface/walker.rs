@@ -1500,8 +1500,8 @@ fn reached(
 
 /// The module declarations of the file at `path`; `mod_rs` is whether its modules sit beside it.
 fn declarations_of(path: &Path, mod_rs: bool) -> Result<Vec<Declared>, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     if !may_declare_modules(&text) {
         return Ok(Vec::new());
     }
@@ -1608,11 +1608,34 @@ impl Scanner {
     /// The tokens of an item: its kinds, and the macros it calls when it is a sighting, whose
     /// bodies then give the parameters' target.
     fn body(&mut self, name: String, tokens: TokenStream) {
+        called_macros(&tokens, &mut self.expanded);
+        self.sight(name, kinds_of(&tokens));
+    }
+
+    /// The tokens of an item that only the scan names: when they hold a sighting, their text
+    /// joins the text and the digest of `name`.
+    fn scan_only_body(&mut self, name: String, file: &str, tokens: TokenStream) {
         let kinds = kinds_of(&tokens);
-        if !kinds.is_empty() {
-            called_macros(&tokens, &mut self.expanded);
+        if kinds.is_empty() {
+            return;
         }
+        called_macros(&tokens, &mut self.expanded);
+        self.scan_only
+            .entry(name.clone())
+            .or_insert_with(|| (file.to_owned(), Vec::new()))
+            .1
+            .push(tokens.to_string());
         self.sight(name, kinds);
+    }
+
+    /// A constant or a macro call of an `impl` block: named by the block's type, and by the file
+    /// where the type has no path (`impl T for [u8]`), as a `use` is.
+    fn impl_item(&mut self, owner: &str, file: &str, under_src: &str, tokens: TokenStream) {
+        if owner.is_empty() {
+            self.scan_only_body(format!("impl:{under_src}"), file, tokens);
+        } else {
+            self.body(owner.to_owned(), tokens);
+        }
     }
 
     fn sight(&mut self, name: String, kinds: BTreeSet<SightKind>) {
@@ -1634,36 +1657,30 @@ impl Scanner {
                     }
                 }
                 syn::Item::Use(_) => {
-                    let kinds = kinds_of(&text());
-                    if !kinds.is_empty() {
-                        let name = format!("use:{under_src}");
-                        self.scan_only
-                            .entry(name.clone())
-                            .or_insert_with(|| (file.to_owned(), Vec::new()))
-                            .1
-                            .push(text().to_string());
-                        self.sight(name, kinds);
-                    }
+                    self.scan_only_body(format!("use:{under_src}"), file, text());
                 }
                 syn::Item::Impl(block) => {
                     let owner = type_name(&block.self_ty);
                     for inner in &block.items {
-                        let (name, tokens) = match inner {
-                            syn::ImplItem::Fn(method) if !attrs_are_cfg_test(&method.attrs) => (
-                                format!("{owner}::{}", method.sig.ident),
-                                method.to_token_stream(),
-                            ),
+                        match inner {
+                            syn::ImplItem::Fn(method) if !attrs_are_cfg_test(&method.attrs) => {
+                                self.body(
+                                    format!("{owner}::{}", method.sig.ident),
+                                    without_docs(method.to_token_stream()),
+                                );
+                            }
                             syn::ImplItem::Const(constant)
                                 if !attrs_are_cfg_test(&constant.attrs) =>
                             {
-                                (owner.clone(), constant.to_token_stream())
+                                let tokens = without_docs(constant.to_token_stream());
+                                self.impl_item(&owner, file, under_src, tokens);
                             }
                             syn::ImplItem::Macro(call) if !attrs_are_cfg_test(&call.attrs) => {
-                                (owner.clone(), call.to_token_stream())
+                                let tokens = without_docs(call.to_token_stream());
+                                self.impl_item(&owner, file, under_src, tokens);
                             }
-                            _ => continue,
-                        };
-                        self.body(name, without_docs(tokens));
+                            _ => {}
+                        }
                     }
                 }
                 syn::Item::Trait(definition) => {
@@ -1688,6 +1705,7 @@ impl Scanner {
                     if let (Some(name), true) = (&call.ident, call.mac.path.is_ident("macro_rules"))
                     {
                         self.macro_rules.insert(name.to_string());
+                        called_macros(&call.mac.tokens, &mut self.expanded);
                         self.sight(format!("macro:{name}"), kinds);
                         continue;
                     }
@@ -1697,6 +1715,7 @@ impl Scanner {
                     if let Some(last) = call.mac.path.segments.last() {
                         self.expanded.insert(last.ident.to_string());
                     }
+                    called_macros(&call.mac.tokens, &mut self.expanded);
                     match defined_name(&call.mac.tokens) {
                         Some(name) => self.sight(name, kinds),
                         None => {
@@ -1706,13 +1725,11 @@ impl Scanner {
                                 .segments
                                 .last()
                                 .map_or_else(String::new, |segment| segment.ident.to_string());
-                            let name = format!("{macro_name}! invocation @{under_src}");
-                            self.scan_only
-                                .entry(name.clone())
-                                .or_insert_with(|| (file.to_owned(), Vec::new()))
-                                .1
-                                .push(text().to_string());
-                            self.sight(name, kinds);
+                            self.scan_only_body(
+                                format!("{macro_name}! invocation @{under_src}"),
+                                file,
+                                text(),
+                            );
                         }
                     }
                 }
@@ -1818,7 +1835,8 @@ fn scan_crate(krate: &str, source: &Path, root: &Path) -> Result<CrateScan, Stri
     })
 }
 
-/// The names of the macros the tokens call, at any depth.
+/// The names of the macros the tokens call, at any depth, with a sighting in their own arguments:
+/// a call that holds none expands to nothing the scan names, whatever else its item holds.
 fn called_macros(stream: &TokenStream, out: &mut BTreeSet<String>) {
     let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
     for (at, tree) in flat.iter().enumerate() {
@@ -1826,7 +1844,8 @@ fn called_macros(stream: &TokenStream, out: &mut BTreeSet<String>) {
             TokenTree::Group(group) => called_macros(&group.stream(), out),
             TokenTree::Ident(ident)
                 if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
-                    && matches!(flat.get(at + 2), Some(TokenTree::Group(_))) =>
+                    && matches!(flat.get(at + 2), Some(TokenTree::Group(arguments))
+                        if !kinds_of(&arguments.stream()).is_empty()) =>
             {
                 out.insert(ident.to_string());
             }
