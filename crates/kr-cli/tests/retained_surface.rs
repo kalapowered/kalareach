@@ -38,6 +38,10 @@ use std::path::{Path, PathBuf};
 use kr_protocol::retained::{RETAINED, RetainedLevel};
 use serde_json::{Value, json};
 
+#[path = "retained_surface/held.rs"]
+mod held;
+#[path = "retained_surface/held_cases.rs"]
+mod held_cases;
 #[path = "retained_surface/history.rs"]
 mod history;
 #[path = "retained_surface/history_cases.rs"]
@@ -62,7 +66,10 @@ mod walker;
 #[path = "retained_surface/walker_cases.rs"]
 mod walker_cases;
 
-use narrower::{DAEMON_CRATES, Input, LevelRecord, Narrower, RECEIVER_CRATES, check_narrower};
+use narrower::{
+    DAEMON_CRATES, Input, LevelRecord, Narrower, RECEIVER_CRATES, Reader, check_held,
+    check_narrower,
+};
 use walker::{Depth, Followed, Tree};
 
 /// A rule of the surface: where it is rooted, and the names it is followed from.
@@ -426,6 +433,42 @@ fn the_entries_of_the_narrower_table_hold() {
         release: release.as_ref().map(|tree| tree as &dyn narrower::Reader),
     };
     let problems = check_narrower(&input);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The root and the helpers of each entry are, in every release at the entry's level, what the
+/// entry names. Run by `scripts/check-narrower-entries.sh`, which lists the releases in the file
+/// `KR_LEVEL_RELEASES` names: it extracts the crates the rules are made of from each of them.
+#[test]
+#[ignore = "reads every release at the level; run by scripts/check-narrower-entries.sh"]
+fn narrower_rules_are_in_every_release_of_their_level() {
+    let list = std::env::var_os("KR_LEVEL_RELEASES")
+        .expect("KR_LEVEL_RELEASES is not set: run scripts/check-narrower-entries.sh");
+    let text = std::fs::read_to_string(&list)
+        .unwrap_or_else(|error| panic!("{}: {error}", Path::new(&list).display()));
+    let listed = held::parse_list(&text).unwrap_or_else(|error| panic!("{error}"));
+    let entries = narrower_table::NARROWER;
+    let current = Tree::at(&repository()).expect("this checkout");
+    let roots = roots(&current);
+    let work = tempfile::tempdir().expect("a folder for the releases");
+    let trees = held::read_releases(
+        entries,
+        &roots,
+        &listed,
+        &held::Git::new(repository()),
+        work.path(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let releases: Vec<(&str, &dyn Reader)> = trees
+        .iter()
+        .map(|(tag, tree)| (tag.as_str(), tree as &dyn Reader))
+        .collect();
+    println!(
+        "narrower: {} entries, {} releases read",
+        entries.len(),
+        listed.len()
+    );
+    let problems = check_held(entries, &roots, &releases);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 

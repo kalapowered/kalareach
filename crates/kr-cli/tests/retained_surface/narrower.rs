@@ -768,3 +768,68 @@ impl Checker<'_> {
         }
     }
 }
+
+/// Holds what an entry's rule is made of to every release at its level: the root, digested alone,
+/// and each helper the entry lists. A release that has another digest of one of them, or none, or
+/// cannot be read, is named with its tag, for the root and for each helper apart. The senders, the
+/// daemon's items and the accounts are not read here: they change with the code that sends, and a
+/// reviewer reads them again.
+///
+/// No entry and no release give no problem.
+pub fn check_held(
+    entries: &[Narrower],
+    roots: &[Root],
+    releases: &[(&str, &dyn Reader)],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let say = |out: &mut Vec<String>, text: String| {
+            out.push(format!("narrower {}: {text}", entry.root));
+        };
+        let Some(root) = roots.iter().find(|root| root.label == entry.root) else {
+            say(
+                &mut out,
+                "no root has this label, so no release can be held to it".to_owned(),
+            );
+            continue;
+        };
+        for (tag, release) in releases {
+            match release.root(root) {
+                Lookup::Found(digest) if digest == entry.digest => {}
+                Lookup::Found(digest) => say(
+                    &mut out,
+                    format!(
+                        "{tag} has the digest {digest} for the root, the entry names {}",
+                        entry.digest
+                    ),
+                ),
+                Lookup::Absent => say(&mut out, format!("the root is absent in {tag}")),
+                Lookup::Failed(error) => say(
+                    &mut out,
+                    format!("the root cannot be read in {tag}: {error}"),
+                ),
+            }
+            for helper in entry.helpers {
+                let name = format!("{}::{}", helper.krate, helper.name);
+                match release.item(helper.krate, helper.name) {
+                    Lookup::Found(digest) if digest == helper.now => {}
+                    Lookup::Found(digest) => say(
+                        &mut out,
+                        format!(
+                            "{tag} has the digest {digest} for the helper {name}, the entry names {}",
+                            helper.now
+                        ),
+                    ),
+                    Lookup::Absent => {
+                        say(&mut out, format!("the helper {name} is absent in {tag}"));
+                    }
+                    Lookup::Failed(error) => say(
+                        &mut out,
+                        format!("the helper {name} cannot be read in {tag}: {error}"),
+                    ),
+                }
+            }
+        }
+    }
+    out
+}
