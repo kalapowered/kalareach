@@ -7,10 +7,13 @@
 //! | [`restore`] | The restore itself: the plan, its digest, the confirmation, the files, the record |
 //! | [`kit`] | Reading the recovery kit from a file, a pipe or the terminal, and clearing it |
 //! | [`protect`] | The access lists that keep other programs of the account from setup on Windows |
+//! | `console` (Windows) | The console held for a dialogue, and put back |
 //! | [`directory`] | The folder the files go into, held open for the run |
 //! | [`source`] | The control daemon's relay as the place ciphertext is read from |
 //! | [`interrupt`] | What ends a run early |
 
+#[cfg(windows)]
+pub mod console;
 pub mod directory;
 pub mod interrupt;
 pub mod kit;

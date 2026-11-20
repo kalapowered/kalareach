@@ -382,8 +382,7 @@ mod protection {
     }
 
     fn own_token(held: &Option<OwnedHandle>) -> io::Result<HANDLE> {
-        held
-            .as_ref()
+        held.as_ref()
             .map(|token| token.as_raw_handle().cast())
             .ok_or_else(|| io::Error::other("the token was not opened"))
     }
@@ -744,6 +743,66 @@ mod console {
                     "discard the console's queued input: the console refused",
                 )))
             }
+        }
+
+        /// Whether all three standard handles of this process are consoles. A pseudo-terminal of
+        /// the MSYS or Cygwin kind passes the standard library's terminal check and is not one, and
+        /// `CONOUT$` could name a console other than the one the command's output goes to.
+        #[must_use]
+        pub fn standard_handles_are_a_console() -> bool {
+            use windows_sys::Win32::System::Console::{
+                GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            };
+
+            [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+                .into_iter()
+                .all(|which| {
+                    let mut mode = 0_u32;
+                    // SAFETY: the call takes a constant and returns a handle or an invalid value,
+                    // and the mode call is given that handle and a live `u32`.
+                    unsafe { GetConsoleMode(GetStdHandle(which), &raw mut mode) != 0 }
+                })
+        }
+
+        /// Puts the console into the modes a line dialogue needs, and returns what it replaced:
+        /// line input, echo and processed input, so that a console another program left raw reads
+        /// lines and takes Ctrl-C; processed output on and the output's own return at a line feed
+        /// back, so that a line feed does not leave the next line where the last one ended.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the modes cannot be read or set. A console whose output mode
+        /// cannot be set is given its input mode back first, so a failure leaves it as it was.
+        pub fn enter_dialogue_modes(&self) -> Result<SavedModes> {
+            use windows_sys::Win32::System::Console::{
+                DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+                ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+            };
+
+            let saved = self.modes()?;
+            set_console_mode(
+                &self.input,
+                saved.input | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT,
+            )?;
+            let output = (saved.output | ENABLE_PROCESSED_OUTPUT) & !DISABLE_NEWLINE_AUTO_RETURN;
+            if let Err(error) = set_console_mode(&self.output, output) {
+                let _ = set_console_mode(&self.input, saved.input);
+                return Err(error);
+            }
+            Ok(saved)
+        }
+
+        /// Puts back both mode words and nothing else: no sequence is written, because a console
+        /// without virtual-terminal output would show one as text. Both are attempted, and the first
+        /// failure is the answer.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when either mode cannot be set.
+        pub fn put_modes_back(&self, saved: &SavedModes) -> Result<()> {
+            let input = set_console_mode(&self.input, saved.input);
+            let output = set_console_mode(&self.output, saved.output);
+            input.and(output)
         }
 
         /// Puts the console into the mode a command that reads bytes needs, and returns what it
