@@ -34,7 +34,12 @@
 #                          and close to it (13.09); a draft is the same text in the conversation and the
 #                          terminal and is kept when the host is switched off, the inbox says the host is
 #                          out of contact, and the host switched on again at its address is sent the
-#                          draft once (13.03, 13.13, 13.01); the host asks the phone to confirm the
+#                          draft once (13.03, 13.13, 13.01); a second draft is written and the host
+#                          switched off, the agent in the session is replaced while the phone is out of
+#                          contact, and the host switched on again: the phone holds the draft, says the
+#                          conversation changed, and the host's agents have been sent nothing; the draft
+#                          is kept for the new conversation by the person's choice and sent there once
+#                          (13.13); the host asks the phone to confirm the
 #                          hand-over of a session to another device, which the phone shows by the role
 #                          and each kind of action and confirms with its ceremony (18.15)
 #   a host that refuses    a second host, a daemon of its own, issues the phone a guest invitation that
@@ -273,6 +278,8 @@ required_checks=(
     "the draft is the same text in both views"
     "the inbox shows the host as out of contact above what it last read from it"
     "the draft was kept across the views and the host being out of contact, and sent once"
+    "a draft written for a conversation that ended is held with its words and sent to no agent"
+    "a draft is kept for the new conversation only by the person's choice, and sent there once, to the new agent and not the old one"
     "the hand-over is shown with the role and each kind of action it allows"
     "the second host is paired by the same scan and listed beside the first, which stays in use"
     "the inbox shows a host that refused it, in the host's words, above what the host in use holds"
@@ -411,6 +418,13 @@ judge() { # <driver output>
         say "check=the agent was sent the draft once, after the host came back ok=1"
     else
         say "check=the agent was sent the draft once, after the host came back ok=0 detail=${result:-no record}"
+        bad=1
+    fi
+    result="$(host_file rebound-result.txt)"
+    if [ "$result" = "old=0 new=1 text=Tag the release once the notes have been read" ]; then
+        say "check=the agent that ended was sent no second draft and the agent that replaced it was sent it once ok=1"
+    else
+        say "check=the agent that ended was sent no second draft and the agent that replaced it was sent it once ok=0 detail=${result:-no record}"
         bad=1
     fi
     result="$(host_file handover-result.txt)"

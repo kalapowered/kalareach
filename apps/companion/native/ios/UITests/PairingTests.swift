@@ -248,6 +248,10 @@ final class PairingTests: DeviceTestCase {
     /// The text a person writes as the draft, which the host's agent is later sent.
     private let draft = "Check the release notes before tagging"
 
+    /// The text of a second draft, written for the conversation that the host's agent ends before
+    /// the host is reached again.
+    private let draftAgain = "Tag the release once the notes have been read"
+
     /// Opens a tab of the shell by its name.
     private func openTab(_ name: String) {
         let tab = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", name)).firstMatch
@@ -655,6 +659,52 @@ final class PairingTests: DeviceTestCase {
         waitFor("sent-result.txt", timeout: 90)
         XCTAssertEqual(read("sent-result.txt"), "prompts=1 text=\(draft)", "the agent was not sent the draft once")
         say("PAIRING the draft was kept across the views and the host being out of contact, and sent once")
+    }
+
+    /// A draft is written for the conversation the agent is in. The host stops answering, the agent
+    /// in the session is replaced by another while the phone is out of contact, and the host is
+    /// reached again: the draft is held, its words say why, nothing is sent by itself, and it goes to
+    /// the new conversation only when the person chooses that and then sends it (13.13).
+    func test9bAChangedConversationHoldsTheDraftForThePersonsChoice() {
+        let lost = "Not in contact with this host. The draft is kept here."
+        let changed = "The conversation changed since this was written. Choose whether it goes to the new one."
+        let choose = "Keep it for the new conversation"
+        openShell("Sessions")
+        openTheSession()
+        composer.tap()
+        composer.typeText(draftAgain)
+        eventually("the composer to hold the second draft") { composerText() == draftAgain }
+        askHost("down", timeout: 120)
+        waitToShow(lost, timeout: 90)
+        XCTAssertEqual(composerText(), draftAgain, "the second draft was changed when the host stopped answering")
+        askHost("replace", timeout: 60)
+        // The person leaves the session, and the host comes back while they are elsewhere.
+        press("Back to sessions")
+        askHost("up", timeout: 180)
+        openTheSession()
+        waitToShow(changed, timeout: 180)
+        XCTAssertEqual(composerText(), draftAgain, "the second draft was changed while its conversation changed")
+        XCTAssertFalse(app.buttons["Send"].firstMatch.isEnabled, "a draft whose conversation changed can be sent")
+        XCTAssertTrue(app.buttons[choose].firstMatch.exists, "a draft whose conversation changed offers no choice of the new conversation")
+        screenshot("draft-conversation-changed")
+        askHost("held", timeout: 60)
+        XCTAssertEqual(read("held-result.txt"), "old=0 new=0", "a draft whose conversation changed was sent")
+        say("PAIRING a draft written for a conversation that ended is held with its words and sent to no agent")
+        press(choose)
+        eventually("the draft to be kept for the new conversation", timeout: 60) { !shows(changed) && app.buttons["Send"].firstMatch.isEnabled }
+        XCTAssertEqual(composerText(), draftAgain, "the second draft was changed when it was kept for the new conversation")
+        screenshot("draft-kept-for-new-conversation")
+        askHost("held", timeout: 60)
+        XCTAssertEqual(read("held-result.txt"), "old=0 new=0", "keeping a draft for the new conversation sent it")
+        // Only the person's own Send sends it, and it reaches the agent that replaced the first, once.
+        press("Send")
+        touch("go-rebound")
+        waitFor("rebound-first.txt", timeout: 90)
+        waitToShow("Applied", timeout: 60)
+        touch("go-rebound-counted")
+        waitFor("rebound-result.txt", timeout: 90)
+        XCTAssertEqual(read("rebound-result.txt"), "old=0 new=1 text=\(draftAgain)", "the replacing agent was not sent the second draft once")
+        say("PAIRING a draft is kept for the new conversation only by the person's choice, and sent there once, to the new agent and not the old one")
     }
 
     /// The host asks the owner to confirm the hand-over of a session to another device. The phone

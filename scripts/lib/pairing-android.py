@@ -558,6 +558,9 @@ def owner_confirmations(phone: Phone, directory: Path) -> None:
 
 # The text the person writes as a draft in the session, which the host's agent is later sent.
 DRAFT = "Check the release notes before tagging"
+# The text of a second draft, written for the conversation that the host's agent ends before the host
+# is reached again.
+DRAFT_AGAIN = "Tag the release once the notes have been read"
 
 
 def start_on(phone: Phone, tab: str) -> None:
@@ -826,6 +829,64 @@ def paired_host_used(phone: Phone, directory: Path) -> None:
     if read(directory, "sent-result.txt") != f"prompts=1 text={DRAFT}":
         raise SystemExit(f"the agent was not sent the draft once: {read(directory, 'sent-result.txt')}")
     say("the draft was kept across the views and the host being out of contact, and sent once")
+
+    # A draft is written for the conversation the agent is in. The host stops answering, the agent in
+    # the session is replaced by another while the phone is out of contact, and the host is reached
+    # again: the draft is held, its words say why, nothing is sent by itself, and it goes to the new
+    # conversation only when the person chooses that and then sends it (13.13).
+    changed = "The conversation changed since this was written. Choose whether it goes to the new one."
+    choose = "Keep it for the new conversation"
+    phone.tap(composer_of(phone))
+    phone.run("shell", "input", "text", DRAFT_AGAIN.replace(" ", "%s"))
+    phone.wait_screen(lambda nodes: any(each["label"] == DRAFT_AGAIN for each in nodes), "the composer to hold the second draft", 30)
+    hide_keyboard(phone)
+    ask_host(directory, "down", 120)
+    phone.wait(lambda each: each == lost, "the words for the second draft that lost its host", 90)
+    if composer_text(phone) != DRAFT_AGAIN:
+        phone.give_up("the second draft was changed when the host stopped answering")
+    ask_host(directory, "replace", 60)
+    phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
+    wait_after_touch(
+        phone, lambda each: each == "No host is being reached.", "the sessions list, which says no host is reached", 30, at=(0.5, 0.07)
+    )
+    ask_host(directory, "up", 180)
+    open_the_session(phone)
+    phone.wait(lambda each: each == changed, "the words for a draft whose conversation changed", 180)
+    if composer_text(phone) != DRAFT_AGAIN:
+        phone.give_up("the second draft was changed while its conversation changed")
+    send = phone.find(lambda each: each == "Send")
+    if send is None or send["enabled"]:
+        phone.give_up("a draft whose conversation changed can be sent")
+    if phone.find(lambda each: each == choose) is None:
+        phone.give_up("a draft whose conversation changed offers no choice of the new conversation")
+    phone.shot("draft-conversation-changed")
+    ask_host(directory, "held", 60)
+    if read(directory, "held-result.txt") != "old=0 new=0":
+        raise SystemExit(f"a draft whose conversation changed was sent: {read(directory, 'held-result.txt')}")
+    say("a draft written for a conversation that ended is held with its words and sent to no agent")
+    phone.press(choose)
+    phone.wait_screen(
+        lambda nodes: not any(each["label"] == changed for each in nodes)
+        and any(each["label"] == "Send" and each["enabled"] for each in nodes),
+        "the draft to be kept for the new conversation",
+        60,
+    )
+    if composer_text(phone) != DRAFT_AGAIN:
+        phone.give_up("the second draft was changed when it was kept for the new conversation")
+    phone.shot("draft-kept-for-new-conversation")
+    ask_host(directory, "held", 60)
+    if read(directory, "held-result.txt") != "old=0 new=0":
+        raise SystemExit(f"keeping a draft for the new conversation sent it: {read(directory, 'held-result.txt')}")
+    # Only the person's own Send sends it, and it reaches the agent that replaced the first, once.
+    phone.press("Send")
+    touch(directory, "go-rebound")
+    wait_for_file(directory, "rebound-first.txt", 90)
+    phone.wait_screen(lambda nodes: any(each["label"] == "Applied" for each in nodes), "the phone to say the second send is applied", 60)
+    touch(directory, "go-rebound-counted")
+    wait_for_file(directory, "rebound-result.txt", 90)
+    if read(directory, "rebound-result.txt") != f"old=0 new=1 text={DRAFT_AGAIN}":
+        raise SystemExit(f"the replacing agent was not sent the second draft once: {read(directory, 'rebound-result.txt')}")
+    say("a draft is kept for the new conversation only by the person's choice, and sent there once, to the new agent and not the old one")
 
     # The host asks the owner to confirm a hand-over of the session to another device.
     confirm = "Confirm with your screen lock"

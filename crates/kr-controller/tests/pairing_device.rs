@@ -27,6 +27,9 @@
 //! | `down` | `go-down` | the host ends, and says so with `done-down`; the phone reaches nothing until `up`. It can be asked again: the suite takes `go-down` away when it is done, and the script takes `done-down` away before it asks |
 //! | `up` | `go-up` | the host starts again on the same address, with every record it kept, and says so with `done-up`; asked again as `down` is |
 //! | `sent` | `go-sent`, then `go-counted` | `sent-first.txt` once the agent in the session was sent the draft the phone wrote (`DRAFT`); `sent-result.txt`, how many times it was, once the script has seen the phone itself say the send is applied and asks for the count |
+//! | `replace` | `go-replace` | the agent in the first session ends and another takes its place, so that a draft written for the first conversation is not for the one the session holds now; `replace-result.txt` |
+//! | `held` | `go-held` | `held-result.txt`: how many times each agent was sent the second draft (`DRAFT_AGAIN`) so far, as `old=<n> new=<n>`; asked again as `down` is |
+//! | `rebound` | `go-rebound`, then `go-rebound-counted` | `rebound-first.txt` once the replacing agent was sent the second draft; `rebound-result.txt`, how many times each agent was, once the script has seen the phone say the send is applied |
 //! | `handover` | `go-handover` | a session shared with a second device is to be handed to a third: `handover-asked.txt` once the host asks, `handover-result.txt` with the record of the phone's answer and who holds the session after the transfer |
 //! | `second` | `go-second`, then `second-approve` | the second host, a daemon of its own that the phone reaches at its own address, issues a guest invitation: `second-environment.txt`, its environment; `second.png`, the invitation's QR; `second-value.txt`, the value that host shows once a candidate redeemed; `second-paired.txt` once approved |
 //! | `bound` | `go-bound` | once the second host is serving a connection of the phone, its owner bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds how many connections of the phone the host was serving at the choice (all the host keeps of the phone), and, as a control beside the phone's own screen, what that host answers another guest of its, paired as the phone is: the inbox read before the choice (served, empty), and after it what it answers the host's identity, the opening of the connection and the inbox read, in the order a phone's connection makes them (each is refused alike, with the lapsed words) |
@@ -87,6 +90,10 @@ const PICTURE: u32 = 1024;
 
 /// The text the phone's person writes as a draft in the session, which the agent there is later sent.
 const DRAFT: &str = "Check the release notes before tagging";
+
+/// The text of a second draft, written for the conversation an agent is in and held for the person's
+/// choice when that agent is replaced while the phone is out of contact.
+const DRAFT_AGAIN: &str = "Tag the release once the notes have been read";
 
 /// The fixture's code invitation, whose code a phone's scanner reads. Only its origin is replaced.
 const FIXTURES: &str = include_str!("../../../fixtures/pairing/codes.json");
@@ -331,6 +338,8 @@ struct Run {
     workers: Vec<Worker>,
     /// What the agent in the first session was sent.
     upstream: Arc<Upstream>,
+    /// What the agent that replaces it in the `replace` phase was sent.
+    replacement: Arc<Upstream>,
     /// The device the second host made of the phone, once it approved it.
     phone_of_second: std::sync::Mutex<Option<DeviceId>>,
     // Declared last: the directory is removed after every field above has let go of its files.
@@ -928,6 +937,71 @@ impl Run {
         panic!("the agent was not sent the draft before the wait ended or the run finished");
     }
 
+    /// The agent in the session ends and another takes its place, as a conversation ends and a new
+    /// one starts: the instance and its binding are not the ones the phone's draft was written for.
+    async fn replace(&self) {
+        self.workers[0].end_agent_numbered(2);
+        self.workers[0].register_agent_numbered(3, self.replacement.clone());
+        self.say("replace-result.txt", "replaced\n");
+    }
+
+    /// How many times each agent was sent the second draft, so far: the draft written for the
+    /// conversation that ended is not sent to either by itself.
+    async fn held(&self) {
+        self.say(
+            "held-result.txt",
+            &format!(
+                "old={} new={}\n",
+                self.count_of(&self.upstream, DRAFT_AGAIN),
+                self.count_of(&self.replacement, DRAFT_AGAIN)
+            ),
+        );
+    }
+
+    /// The second draft reaches the agent that replaced the first, once the person chose that
+    /// conversation for it and sent it, and reaches the agent that ended never.
+    async fn rebound(&self) {
+        let end = Instant::now() + STEP;
+        while self.waiting(end) {
+            if self.count_of(&self.replacement, DRAFT_AGAIN) > 0 {
+                self.say("rebound-first.txt", "sent\n");
+                // As the first draft is counted: after the script has seen the phone say the send
+                // is applied, and not after a time chosen here.
+                let counted = self.directory.join("go-rebound-counted");
+                while !counted.exists() {
+                    assert!(
+                        self.waiting(end),
+                        "the script never asked how many times the second draft was sent"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                self.say(
+                    "rebound-result.txt",
+                    &format!(
+                        "old={} new={} text={}\n",
+                        self.count_of(&self.upstream, DRAFT_AGAIN),
+                        self.count_of(&self.replacement, DRAFT_AGAIN),
+                        DRAFT_AGAIN
+                    ),
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!(
+            "the replacing agent was not sent the second draft before the wait ended or the run finished"
+        );
+    }
+
+    /// How many prompts of `upstream` are `text`.
+    fn count_of(&self, upstream: &Upstream, text: &str) -> usize {
+        upstream
+            .prompts()
+            .iter()
+            .filter(|prompt| *prompt == text)
+            .count()
+    }
+
     /// A session an owner device gave to a second device is to be handed to a third: the host asks
     /// the phone, an owner device, to confirm the hand-over, and once it has the host sends it.
     async fn handover(&self) {
@@ -1098,6 +1172,7 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         environment,
         workers,
         upstream,
+        replacement: Arc::new(Upstream::default()),
         second_host: second,
         phone_of_second: std::sync::Mutex::new(None),
     };
@@ -1113,10 +1188,10 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         let connections = &connections;
         async move {
             let go = run.directory.join(format!("go-{name}"));
-            // The host being switched off and on is asked for more than once: those two phases take
-            // their `go-` file away when they are done, and the script takes `done-` away before it
-            // asks again.
-            let again = matches!(name, "down" | "up");
+            // The host being switched off and on, and the count of the second draft, are asked for
+            // more than once: those phases take their `go-` file away when they are done, and the
+            // script takes `done-` away before it asks again.
+            let again = matches!(name, "down" | "up" | "held");
             loop {
                 while !go.exists() {
                     if Instant::now() >= end || run.directory.join("finish").exists() {
@@ -1133,6 +1208,9 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
                     "down" => run.down().await,
                     "up" => run.up().await,
                     "sent" => run.sent().await,
+                    "replace" => run.replace().await,
+                    "held" => run.held().await,
+                    "rebound" => run.rebound().await,
                     "handover" => run.handover().await,
                     "second" => run.second().await,
                     "bound" => run.bound().await,
@@ -1158,6 +1236,9 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         phase("down"),
         phase("up"),
         phase("sent"),
+        phase("replace"),
+        phase("held"),
+        phase("rebound"),
         phase("handover"),
         phase("second"),
         phase("bound")

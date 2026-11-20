@@ -657,6 +657,24 @@ impl Worker {
         self.register_agent_on(upstream)
     }
 
+    /// Ends the agent registered under `number`, as the session announces the end of a launch: the
+    /// instance is no longer live, and a view of the session's agents finds the ones that remain.
+    pub fn end_agent_numbered(&self, number: u8) {
+        let instance = ApplicationInstanceId::new(Uuid::from_bytes([number; 16]));
+        self._runtime
+            .session()
+            .announce_instance(kr_protocol::projection::AgentInstanceSummary {
+                application_instance_id: instance,
+                plugin_id: Nullable::null(),
+                profile_id: Nullable::null(),
+                mode: IntegrationMode::Gateway,
+                bypass: Nullable::null(),
+                started_at: TimestampMs::new(1),
+                ended_at: Nullable::some(TimestampMs::new(3)),
+                refusal: Nullable::null(),
+            });
+    }
+
     /// As [`Self::register_agent`], with any upstream a test gives.
     pub fn register_agent_on(&self, upstream: Arc<dyn UpstreamDispatch>) -> ApplicationInstanceId {
         self.register_agent_numbered(2, upstream)
