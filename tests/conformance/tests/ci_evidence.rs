@@ -9,7 +9,8 @@
 //! names still in the matrix; the landing workflow's triggers; the evidence check and the strict
 //! uploads, neither disabled, each made by the upload action of the directory the tests write to,
 //! after the step that writes last, none of them cut short or kept for less than the repository's
-//! default; and the table of those jobs in the conformance document. It reads the workflow as text,
+//! default; the table of those jobs in the conformance document; and the bound that every workflow
+//! that runs Cargo puts on a Git fetch that stops moving. It reads the workflow as text,
 //! line by line, which holds its layout (jobs at two spaces, steps at six, a trigger or a key on a
 //! line of its own, no comment after a compared value, though a comment after a job's name is read
 //! as that job's header): a reformatting fails it loudly. What it
@@ -2585,5 +2586,81 @@ fn a_listed_file_holds_exactly_its_listed_lines() {
     assert!(
         elsewhere.iter().any(|f| f.starts_with("scripts/z.sh:")),
         "{elsewhere:?}"
+    );
+}
+
+/// The lines of a workflow's own `env:` block, the one at the left margin that every job reads, with
+/// the comment lines left out.
+fn top_env(workflow: &str) -> String {
+    workflow
+        .lines()
+        .skip_while(|line| *line != "env:")
+        .skip(1)
+        .take_while(|line| line.is_empty() || line.starts_with([' ', '#']))
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The workflows that run no Cargo that fetches a source: the two advisory checks read the RustSec
+/// database through `cargo-audit`'s own client, and the other two build nothing.
+const WITHOUT_CARGO: [&str; 4] = [
+    "advisories.yml",
+    "keep-evidence-test.yml",
+    "shell-advisories.yml",
+    "wsl-probe.yml",
+];
+
+/// Cargo's own Git library has no timeout, so a Git dependency whose connection stops moving held a
+/// job's step to its limit, four hours with nothing printed. Cargo runs `git fetch` instead, and git
+/// ends a transfer under a low speed for a time. Every workflow that runs Cargo says so in the
+/// `env:` block every one of its jobs reads (one workflow's variables do not reach another), and a
+/// workflow added without the three values fails here unless it is listed as one that runs no
+/// Cargo.
+#[test]
+fn every_workflow_that_runs_cargo_bounds_a_git_fetch_that_stops_moving() {
+    let directory = repository().join(".github").join("workflows");
+    let mut paths: Vec<PathBuf> = fs::read_dir(&directory)
+        .expect("the workflows directory is readable")
+        .map(|entry| entry.expect("a workflow file is listed").path())
+        .collect();
+    paths.sort();
+    let mut checked = Vec::new();
+    for path in paths {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("yml") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a workflow has a name")
+            .to_owned();
+        let workflow =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{name} is readable: {error}"));
+        if WITHOUT_CARGO.contains(&name.as_str()) {
+            assert!(
+                !workflow.lines().any(|line| starts(line, "cargo")),
+                "{name} is listed as running no Cargo and has a step that starts it"
+            );
+            continue;
+        }
+        let env = top_env(&workflow);
+        for (key, wanted) in [
+            ("CARGO_NET_GIT_FETCH_WITH_CLI", "\"true\""),
+            ("GIT_HTTP_LOW_SPEED_LIMIT", "\"1000\""),
+            ("GIT_HTTP_LOW_SPEED_TIME", "\"120\""),
+        ] {
+            assert_eq!(
+                value_at(&env, 2, key).as_deref(),
+                Some(wanted),
+                "{name}: the workflow's own env block must set {key} to {wanted}, or {name} must be \
+                 listed as running no Cargo"
+            );
+        }
+        checked.push(name);
+    }
+    assert!(
+        checked.iter().any(|name| name == "core-ci.yml"),
+        "the landing workflow was not read: {checked:?}"
     );
 }

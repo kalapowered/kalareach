@@ -41,6 +41,13 @@ env:
   # Intel leg's cache key holds the variable, so no C object restored from the cache was built for
   # another floor. Nothing reads it on the other platforms.
   MACOSX_DEPLOYMENT_TARGET: "14.0"
+  # Cargo's own Git library has no timeout, so a Git dependency whose fetch stops moving holds its
+  # step to the step's limit with nothing printed. Cargo runs `git fetch` instead, and git ends a
+  # transfer that stays under a thousand bytes a second for two minutes; Cargo retries that error and
+  # then fails the step. A fetch that moves is not touched.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+  GIT_HTTP_LOW_SPEED_TIME: "120"
 
 defaults:
   run:

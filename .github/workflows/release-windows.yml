@@ -57,6 +57,13 @@ env:
   # The name the certificate profile issues under. Every signature is held to it, because a trusted
   # signature somebody else made is not this project's signature.
   KR_SIGNING_SUBJECT: 'CN=Kala Holdings Inc., O=Kala Holdings Inc., L=Newark, S=Delaware, C=US'
+  # Cargo's own Git library has no timeout, so a Git dependency whose fetch stops moving holds its
+  # step to the step's limit with nothing printed. Cargo runs `git fetch` instead, and git ends a
+  # transfer that stays under a thousand bytes a second for two minutes; Cargo retries that error and
+  # then fails the step. A fetch that moves is not touched.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  GIT_HTTP_LOW_SPEED_LIMIT: "1000"
+  GIT_HTTP_LOW_SPEED_TIME: "120"
 
 defaults:
   run:
