@@ -52,7 +52,7 @@ use crate::journal::{
     StagedObject, StoredBudget, TakenEvent,
 };
 use crate::preview::{self, PreviewBody, PreviewTarget};
-use crate::push::{self, MAX_EXPIRY_AHEAD_MS};
+use crate::push;
 
 /// How long a notification is worth delivering for, unless a caller says otherwise.
 ///
@@ -1828,9 +1828,6 @@ pub fn message_json(message: &ExternalMessage) -> serde_json::Value {
             .collect::<Vec<_>>(),
     })
 }
-
-/// The furthest ahead a notice may expire, repeated here so a caller building one can check.
-pub const MAX_NOTICE_LIFETIME_MS: u64 = MAX_EXPIRY_AHEAD_MS;
 
 #[cfg(test)]
 mod tests {

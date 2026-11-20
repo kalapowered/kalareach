@@ -65,8 +65,7 @@ use kr_crypto::envelope::PreviewRefusal;
 use kr_crypto::keys::{NotificationPreviewKeyPair, key_id};
 use kr_protocol::ids::{EnvelopeId, EnvironmentId, NotificationId, SessionId};
 use kr_protocol::mailbox::{
-    EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, MailboxPayloadType, SEAL_OVERHEAD_BYTES,
-    mailbox_granularity,
+    EnvelopePlaintext, EnvelopeRouting, EnvelopeVersion, MailboxPayloadType,
 };
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::push::{
@@ -364,18 +363,6 @@ pub fn provider_payload_bytes(request: &PushDeliveryRequest) -> Result<u64> {
     Ok(encode(&android)?.max(encode(&apple)?))
 }
 
-/// The length of the request body a host will send to the gateway, in bytes.
-///
-/// It is not the figure section 16's bound is about - [`provider_payload_bytes`] is - but it is
-/// what this host actually writes to a socket, so it is what the journal records.
-///
-/// # Errors
-///
-/// Returns [`DeliveryError::Encoding`] when the request cannot be serialised.
-pub fn measure_payload(request: &PushDeliveryRequest) -> Result<u64> {
-    Ok(encode_request(request)?.len() as u64)
-}
-
 /// Serialises a delivery request the way it travels.
 ///
 /// # Errors
@@ -410,21 +397,6 @@ pub fn check_payload_bound(request: &PushDeliveryRequest) -> Result<u64> {
 #[must_use]
 pub fn base64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Returns the ciphertext length a padded plaintext of `bucket` bytes seals to.
-///
-/// [`PushDeliveryRequest::preview_is_well_formed`] checks exactly this, so a producer that builds
-/// a preview any other way has built one the gateway refuses.
-#[must_use]
-pub const fn sealed_length(bucket: u64) -> u64 {
-    bucket.saturating_add(SEAL_OVERHEAD_BYTES)
-}
-
-/// Returns the granularity a preview of `plaintext_len` bytes is padded to.
-#[must_use]
-pub const fn preview_granularity(plaintext_len: u64) -> u64 {
-    mailbox_granularity(plaintext_len)
 }
 
 /// The generic alert text a device shows when it cannot open a preview.
@@ -468,6 +440,7 @@ pub fn detail_object_id(secret: &[u8; 32], notification_id: NotificationId) -> E
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::mailbox::{SEAL_OVERHEAD_BYTES, mailbox_granularity};
     use kr_protocol::scalars::Uuid;
 
     fn body(summary: &str) -> PreviewBody {
@@ -602,7 +575,7 @@ mod tests {
         );
         assert_eq!(
             preview.envelope.ciphertext.as_slice().len() as u64,
-            sealed_length(preview.envelope.routing.size_bucket_bytes.get())
+            preview.envelope.routing.size_bucket_bytes.get() + SEAL_OVERHEAD_BYTES
         );
     }
 
@@ -687,7 +660,7 @@ mod tests {
             provider_payload_bytes(&request).expect("the provider document"),
         );
         assert!(
-            measured > measure_payload(&request).expect("the request body"),
+            measured > encode_request(&request).expect("the request body").len() as u64,
             "the provider document is the larger of the two, because the gateway adds to it"
         );
         assert!(
@@ -789,9 +762,9 @@ mod tests {
     #[test]
     fn base64url_of_a_bucket_is_what_the_payload_measurement_carries() {
         let bucket = 2 * 1024;
-        let sealed = vec![0u8; sealed_length(bucket) as usize];
+        let sealed = vec![0u8; (bucket + SEAL_OVERHEAD_BYTES) as usize];
         assert_eq!(base64url(&sealed).len(), (sealed.len() * 4).div_ceil(3));
-        assert_eq!(preview_granularity(1_800), 1_024);
+        assert_eq!(mailbox_granularity(1_800), 1_024);
     }
 
     #[test]
