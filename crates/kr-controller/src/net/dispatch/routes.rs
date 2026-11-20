@@ -464,16 +464,18 @@ impl RemoteConnection {
                 }
             }
             DeviceRead::Worker => {
-                // A page of retained output is released only under the privacy state it was read
-                // under, which is taken before the worker is asked.
-                let read_under = if entry.method == Method::HistoryPage {
-                    match super::output::ReadUnder::now(&self.controller).await {
-                        Ok(read_under) => Some(read_under),
-                        Err(error) => return failure(request.request_id, error),
-                    }
-                } else {
-                    None
-                };
+                // A page of retained output, or an agent's retained entries, is released only
+                // under the privacy state it was read under, which is taken before the worker is
+                // asked.
+                let read_under =
+                    if matches!(entry.method, Method::HistoryPage | Method::AgentSnapshot) {
+                        match super::output::ReadUnder::now(&self.controller).await {
+                            Ok(read_under) => Some(read_under),
+                            Err(error) => return failure(request.request_id, error),
+                        }
+                    } else {
+                        None
+                    };
                 let answer = self.proxied_read(request, entry, validated, &decided).await;
                 if let Some(asked) = asked.as_mut() {
                     asked.read_under = read_under;

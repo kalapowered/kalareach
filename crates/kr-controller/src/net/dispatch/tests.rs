@@ -1973,6 +1973,153 @@ async fn a_description_is_withheld_when_privacy_mode_starts_before_it_is_sent() 
     world.serving.abort();
 }
 
+/// An agent's retained entries as a worker answers a read of them.
+fn a_snapshot_of_retained_entries() -> kr_protocol::agent::AgentSnapshotResult {
+    use kr_protocol::agent::{AgentBindingState, AgentSnapshotEntry, AgentSnapshotResult};
+    use kr_protocol::scalars::{TimestampMs, U64};
+
+    AgentSnapshotResult {
+        binding: AgentBindingState {
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
+            thread_id: Nullable::null(),
+            turn_id: Nullable::null(),
+            profile_id: Nullable::null(),
+            mode: kr_protocol::broker::IntegrationMode::Gateway,
+            rich_mutations_suspended: false,
+            suspension_reason: Nullable::null(),
+        },
+        entries: vec![AgentSnapshotEntry {
+            node: U64::new(2),
+            kind: "message".to_owned(),
+            text: "retained entry".to_owned(),
+            omitted_text_bytes: U64::ZERO,
+            observed_at: TimestampMs::new(2_500),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
+            turn_id: Nullable::null(),
+        }],
+        continuation: Nullable::null(),
+        history_gap: false,
+        withheld_entries: U64::new(1),
+    }
+}
+
+/// A daemon whose session's worker answers a read of an agent's retained entries with `snapshot`.
+async fn worker_answering_a_snapshot_with(
+    snapshot: &kr_protocol::agent::AgentSnapshotResult,
+) -> crate::service::a_close_a_worker_never_answers::Silent {
+    use std::sync::Arc;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let recorded: fake::Recorded = Arc::default();
+    let world = answering_worker(
+        {
+            let snapshot = snapshot.clone();
+            Arc::new(move |request: &kr_protocol::envelope::Request| {
+                match request.method.method()? {
+                    Method::AgentSnapshot => ParamsValue::from_typed(&snapshot).ok(),
+                    _ => None,
+                }
+            })
+        },
+        recorded,
+        reads_scopes(),
+    )
+    .await;
+    fake::acknowledged(&world.controller, world.session_id);
+    world
+}
+
+fn snapshot_request_of(session_id: SessionId, request_id: u64) -> kr_protocol::envelope::Request {
+    device_request(
+        request_id,
+        Method::AgentSnapshot,
+        &kr_protocol::agent::AgentSnapshotParams {
+            subject: kr_protocol::agent::AgentSubject {
+                session_id,
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    Uuid::from_bytes([5; 16]),
+                ),
+            },
+            from_node: Nullable::null(),
+        },
+    )
+}
+
+/// KR-REQ-24.28: an agent's retained entries go to a device whole when no change of privacy mode
+/// falls between the worker's answer and the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_is_written_whole_under_the_privacy_state_it_was_read_in() {
+    use kr_protocol::agent::AgentSnapshotResult;
+    use kr_protocol::envelope::ControlFrame;
+
+    let snapshot = a_snapshot_of_retained_entries();
+    let world = worker_answering_a_snapshot_with(&snapshot).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 65);
+
+    let answer = connection
+        .answer_now(ControlFrame::Request(snapshot_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let stands = connection.write_answer(connection.output(), answer).await;
+    assert!(stands, "the connection stands");
+    let written: AgentSnapshotResult = answered(kept.frames()[0].clone());
+    assert_eq!(written, snapshot);
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: an agent's retained entries that a worker answered while privacy mode was off are
+/// not published after privacy mode has started, and the device is told the entries are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_a_worker_answered_is_withheld_when_privacy_mode_starts_before_it_is_sent() {
+    use kr_protocol::agent::AgentSnapshotResult;
+    use kr_protocol::envelope::ControlFrame;
+
+    let snapshot = a_snapshot_of_retained_entries();
+    let world = worker_answering_a_snapshot_with(&snapshot).await;
+    let controller = &world.controller;
+    let (connection, kept) = viewing_connection(controller, 66);
+
+    // Read while privacy mode is off, then held at the writer while the mode starts.
+    let answer = connection
+        .answer_now(ControlFrame::Request(snapshot_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let turn = connection.output.hold_the_turn().await;
+    let (stands, ()) = tokio::join!(
+        connection.write_answer(connection.output(), answer),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while connection.output.writes_queued() < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the answer is waiting for the writer");
+            privacy_mode_is_turned_on(controller).await;
+            drop(turn);
+        }
+    );
+    assert!(stands, "the connection stands");
+    let withheld: AgentSnapshotResult = answered(kept.frames()[0].clone());
+    assert!(
+        withheld.entries.is_empty(),
+        "no entry goes once privacy mode has started: {withheld:?}"
+    );
+    assert!(withheld.history_gap, "the range is said to be gone");
+    assert_eq!(withheld.continuation, Nullable::null());
+    assert_eq!(withheld.binding, snapshot.binding);
+    assert_eq!(withheld.withheld_entries, snapshot.withheld_entries);
+    world.serving.abort();
+}
+
 /// A page a worker answers after the daemon published privacy mode and before the worker was told,
 /// which still holds the output that privacy mode removes, is withheld.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

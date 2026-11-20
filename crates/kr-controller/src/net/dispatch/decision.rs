@@ -50,8 +50,9 @@ pub(super) struct Asked {
     /// door's own stores, a service), and is written only while the standing it was checked under
     /// holds ([`Answers::Conflict`]).
     admitted: Option<Footing>,
-    /// For a page of retained output, or an answer with text a model wrote, the privacy state it
-    /// was read under, which the answer is released under ([`RemoteConnection::write_answer`]).
+    /// For a page of retained output, an agent's retained entries, or an answer with text a model
+    /// wrote, the privacy state it was read under, which the answer is released under
+    /// ([`RemoteConnection::write_answer`]).
     pub(super) read_under: Option<ReadUnder>,
     /// For an answer with text a model wrote, the same answer without it, which is written in its
     /// place once `read_under` no longer stands.
@@ -124,11 +125,12 @@ impl Answered {
     }
 }
 
-/// A page of retained output answered with none of its output and the range it covered said to be
-/// gone, and any other answer as it is.
+/// A page of retained output, or a snapshot of an agent's retained entries, answered with none of
+/// its text and the range it covered said to be gone, as privacy mode left it, and any other answer
+/// as it is.
 ///
-/// An answer that is not a page this host can read is not passed on in its place.
-fn without_its_output(frame: &ControlFrame) -> ControlFrame {
+/// An answer that is not one this host can read is not passed on in its place.
+fn without_its_output(frame: &ControlFrame, method: Method) -> ControlFrame {
     use kr_protocol::envelope::{Outcome, Response};
 
     let ControlFrame::Response(Response {
@@ -138,10 +140,17 @@ fn without_its_output(frame: &ControlFrame) -> ControlFrame {
     else {
         return frame.clone();
     };
-    let withheld = value
-        .to_typed::<kr_protocol::recovery::HistoryPageResult>()
-        .ok()
-        .and_then(|page| ParamsValue::from_typed(&crate::service::withheld_page(&page)).ok());
+    let withheld = if method == Method::AgentSnapshot {
+        value
+            .to_typed::<kr_protocol::agent::AgentSnapshotResult>()
+            .ok()
+            .and_then(|snapshot| ParamsValue::from_typed(&withheld_snapshot(snapshot)).ok())
+    } else {
+        value
+            .to_typed::<kr_protocol::recovery::HistoryPageResult>()
+            .ok()
+            .and_then(|page| ParamsValue::from_typed(&crate::service::withheld_page(&page)).ok())
+    };
     match withheld {
         Some(value) => ControlFrame::Response(Response {
             request_id: *request_id,
@@ -151,9 +160,23 @@ fn without_its_output(frame: &ControlFrame) -> ControlFrame {
             *request_id,
             ProtocolError::new(
                 ErrorCode::ResourceUnavailable,
-                "this page of retained output cannot be shown",
+                "this retained output cannot be shown",
             ),
         ),
+    }
+}
+
+/// A snapshot of an agent's retained entries as a read made after privacy mode removed them is
+/// answered: no entry, nowhere to continue from, and the range said to be gone. The binding and the
+/// count of entries the history filter withheld are as they were read.
+fn withheld_snapshot(
+    snapshot: kr_protocol::agent::AgentSnapshotResult,
+) -> kr_protocol::agent::AgentSnapshotResult {
+    kr_protocol::agent::AgentSnapshotResult {
+        entries: Vec::new(),
+        continuation: kr_protocol::scalars::Nullable::null(),
+        history_gap: true,
+        ..snapshot
     }
 }
 
@@ -187,10 +210,10 @@ impl RemoteConnection {
                 &asked.decision.decided.permitted.rights,
                 &asked.acting.grant.history,
             );
-            // A page of retained output goes only under the privacy state it was read under. Once
-            // that has moved it goes with none of its output, and says the range it covered is
-            // gone, as privacy mode left it. An answer with text a model wrote goes the same way:
-            // the answer without that text is written in its place.
+            // A page of retained output, or an agent's retained entries, goes only under the
+            // privacy state it was read under. Once that has moved it goes with none of its text,
+            // and says the range it covered is gone, as privacy mode left it. An answer with text a
+            // model wrote goes the same way: the answer without that text is written in its place.
             let (shown, read_under) = match asked.read_under.as_ref() {
                 Some(read_under) if !read_under.stands() => {
                     let held_back = match asked.withheld.as_ref() {
@@ -204,7 +227,7 @@ impl RemoteConnection {
                             &asked.acting.grant.history,
                         )
                         .into_owned(),
-                        None => without_its_output(&shown),
+                        None => without_its_output(&shown, asked.shown_as),
                     };
                     (std::borrow::Cow::Owned(held_back), None)
                 }
