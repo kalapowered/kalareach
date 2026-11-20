@@ -1677,7 +1677,7 @@ fn kr_req_12_06_a_draft_keeps_the_binding_revision_it_was_written_under() {
     assert!(
         refused
             .to_string()
-            .contains("before this host kept the binding revision"),
+            .contains("holds no binding revision for this draft"),
         "{refused}"
     );
 
@@ -1860,10 +1860,10 @@ fn kr_req_12_06_no_draft_that_names_an_application_is_made_while_the_journal_is_
 }
 
 /// KR-REQ-12.06: a journal that a build before the binding revision wrote, with a draft and a
-/// session that can still run a worker, is opened by the service at its version with the column
-/// added, and holds the first draft that names an application back until that session has ended and
-/// the journal is settled. The draft the earlier build wrote stays unsendable, and the same create
-/// that was refused is made once the journal is settled.
+/// session that can still run a worker, is opened by the service at its version, and holds the first
+/// draft that names an application back until that session has ended and the journal is settled.
+/// The draft the earlier build wrote stays unsendable, and the same create that was refused is made
+/// once the journal is settled.
 #[test]
 fn kr_req_12_06_a_journal_of_an_earlier_build_with_a_session_still_active_refuses_the_first_draft_that_names_an_application()
  {
@@ -1936,9 +1936,10 @@ fn kr_req_12_06_a_journal_of_an_earlier_build_with_a_session_still_active_refuse
         std::sync::Arc::new(kr_transfer::ManualClock::new(support::START_MS)),
     )
     .expect("the service opens the journal and migrates it");
-    // The migration added the column and left the version for the settling.
+    // The migration left the version for the settling and added no column: the binding revisions are
+    // kept in the store beside the journal.
     assert_eq!(recorded_version(), 2);
-    assert!(has_the_column());
+    assert!(!has_the_column());
     assert_eq!(
         service.noting().expect("reads the noting"),
         kr_transfer::Noting::Owed
@@ -1957,7 +1958,7 @@ fn kr_req_12_06_a_journal_of_an_earlier_build_with_a_session_still_active_refuse
     assert_eq!(old.code(), ErrorCode::DraftConflict);
     assert!(
         old.to_string()
-            .contains("before this host kept the binding revision"),
+            .contains("holds no binding revision for this draft"),
         "{old}"
     );
 
