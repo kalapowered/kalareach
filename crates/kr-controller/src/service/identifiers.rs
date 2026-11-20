@@ -31,9 +31,8 @@
 //! another copy that is refused as well.
 //!
 //! What this does not cover: a mutation forwarded to a worker (a close, a prompt) is kept in that
-//! worker's journal, which the daemon does not read here; and four methods keep no record of their
-//! action and so spend no identifier (`organisation.policy.apply`, `membership.present`,
-//! `backup.enable` and `backup.bundle.write`).
+//! worker's journal, which the daemon does not read here; and a method that keeps no record of its
+//! action spends no identifier (`Domain::of` gives it no domain).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
