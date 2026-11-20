@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs apt packages on a hosted Linux runner whose Ubuntu mirror is slow or failing.
 #
-#   bash scripts/apt-install.sh [--deadline SECONDS] [--names-from SCRIPT] [PACKAGE...]
+#   bash scripts/apt-install.sh [--deadline SECONDS] [--archive DIR] [--names-from SCRIPT] [PACKAGE...]
 #
 # apt has no minimum transfer rate. A mirror that answers slowly keeps one download going for as
 # long as bytes arrive, and the image's timeout and its failover to the next mirror act on a silent
@@ -22,25 +22,40 @@
 #   3. `apt-get install --simulate`, bound 120 s, with no network. When the update printed no
 #      warning, a failure is the packages' own (an unknown name, a conflict) and ends the script
 #      at once with apt's lines; otherwise the indexes may be the cause and the attempt is retried.
+#      With --archive the call is `apt-get install --print-uris` instead, against an empty archive
+#      directory, so that it lists every archive the install needs as `FILE SIZE SHA256`; the
+#      archives of DIR (a directory a cache step restored) that match the list in name, size and
+#      SHA-256 are copied to apt's archive directory, and the others are printed as dropped and
+#      fetched again. apt itself accepts a cached archive by its size alone.
 #   4. `apt-get install --download-only`, bound by the time left. Exit 0 ends the attempts.
 #   A failed attempt prints its number, its status (124 means that a bound cut it) and the last
 #   three lines of its output, waits 10 s times its number (at most 60 s, never past the deadline)
 #   and starts again, until the deadline.
 #   5. `apt-get install --no-download`, once and not under a bound: a package whose archive is
 #      missing fails the install and is not fetched. Its status is the script's.
+#   6. With --archive, after an install that succeeded, DIR is replaced by a new directory made of
+#      the listed archives that apt now holds, each checked again against its SHA-256, and a
+#      MANIFEST of their sorted names, sizes and hashes. The new directory is built from the list
+#      and never from the old one, so a file that is no longer listed does not stay. When the
+#      workflow's cache step is to save it, the script writes `save=true` to $GITHUB_OUTPUT: the
+#      manifest's digest is not that of the manifest DIR had when the script began, or a restored
+#      archive was dropped, which is a repair. The cache entry's name is the `entry` output, the
+#      digest, with a suffix from the run when the entry repairs one, since a cache entry cannot be
+#      replaced under its own name.
 #
 # Every bound is `sudo timeout --kill-after=G T ...`, with `timeout` inside `sudo` so that it can
 # signal the root process on every runner image, and G + T equal to the bound, where G is 10 s or,
 # for a bound of 10 s or less, the bound less 1 s. A call is never given less than 2 s and never
-# given 0, which `timeout` reads as no limit.
+# given 0, which `timeout` reads as no limit. The last line of the output is the summary.
 set -euo pipefail
 
 usage() {
-  echo "usage: apt-install.sh [--deadline SECONDS] [--names-from SCRIPT] [PACKAGE...]" >&2
+  echo "usage: apt-install.sh [--deadline SECONDS] [--archive DIR] [--names-from SCRIPT] [PACKAGE...]" >&2
   exit 2
 }
 
 deadline=1800
+archive=
 names_from=
 packages=()
 while [ "$#" -gt 0 ]; do
@@ -48,6 +63,11 @@ while [ "$#" -gt 0 ]; do
     --deadline)
       [ "$#" -ge 2 ] || usage
       deadline=$2
+      shift 2
+      ;;
+    --archive)
+      [ "$#" -ge 2 ] && [ -n "$2" ] || usage
+      archive=$2
       shift 2
       ;;
     --names-from)
@@ -71,6 +91,8 @@ while [ "$#" -gt 0 ]; do
 done
 case "$deadline" in '' | *[!0-9]*) usage ;; esac
 [ "$deadline" -ge 2 ] || usage
+# The directory is replaced as a whole, so it is a path of its own and never the root.
+case "$archive" in '' | /?*) ;; *) usage ;; esac
 
 start=$SECONDS
 work=$(mktemp -d)
@@ -120,6 +142,26 @@ total_warnings=0
 last_warnings=0
 failed_log=
 all=()
+listed=$work/listed.txt
+: > "$listed"
+: > "$work/seeded.txt"
+: > "$work/dropped.txt"
+cache_dir=
+restored_digest=none
+fetch_count=0
+
+sha256_of() {
+  sha256sum "$1" | cut -d' ' -f1
+}
+
+size_of() {
+  wc -c < "$1" | tr -d ' '
+}
+
+# valid_file SIZE SHA256 PATH: PATH is a regular file of that size with that hash.
+valid_file() {
+  [ -f "$3" ] && [ ! -L "$3" ] && [ "$(size_of "$3")" = "$1" ] && [ "$(sha256_of "$3")" = "$2" ]
+}
 
 # update_indexes: step 1.
 update_indexes() {
@@ -171,10 +213,15 @@ find_names() {
 resolve() {
   local bound status=0
   bound=$(bound_for 120) || return 124
-  if run_apt "$bound" "$work/resolve.log" install --simulate --no-install-recommends "${all[@]}"; then
-    return 0
+  if [ -n "$archive" ]; then
+    mkdir -p "$work/empty"
+    run_apt "$bound" "$work/resolve.log" install --print-uris -qq --no-install-recommends \
+      -o Acquire::ForceHash=SHA256 -o "Dir::Cache::Archives=$work/empty" "${all[@]}" || status=$?
   else
-    status=$?
+    run_apt "$bound" "$work/resolve.log" install --simulate --no-install-recommends "${all[@]}" || status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
+    return 0
   fi
   if [ "$last_warnings" -eq 0 ]; then
     echo "apt-install: apt cannot plan the install of: ${all[*]}" >&2
@@ -183,6 +230,104 @@ resolve() {
   fi
   failed_log=$work/resolve.log
   return "$status"
+}
+
+# list_archives: the archives of the plan as `FILE SIZE SHA256` lines. A line with no hash is left
+# out: nothing can be checked against it, so it is neither seeded nor saved.
+list_archives() {
+  awk -v quote="'" 'substr($1, 1, 1) == quote && NF == 4 && $4 ~ /^SHA256:[0-9a-f]+$/ { print $2, $3, substr($4, 8) }' \
+    "$work/resolve.log" > "$listed"
+}
+
+# seed_archives: copies each listed archive that DIR holds, and that matches its name, size and
+# hash, to apt's archive directory.
+seed_archives() {
+  local file size hash
+  [ -d "$archive" ] || return 0
+  while read -r file size hash; do
+    case "$file" in */* | '') continue ;; esac
+    if grep -qxF -- "$file" "$work/seeded.txt" || grep -qxF -- "$file" "$work/dropped.txt"; then
+      continue
+    fi
+    [ -e "$archive/$file" ] || [ -L "$archive/$file" ] || continue
+    if valid_file "$size" "$hash" "$archive/$file"; then
+      sudo cp -- "$archive/$file" "$cache_dir/$file"
+      echo "$file" >> "$work/seeded.txt"
+      echo "apt-install: seeded $file"
+    else
+      echo "$file" >> "$work/dropped.txt"
+      echo "apt-install: dropped $file"
+    fi
+  done < "$listed"
+}
+
+# count_fetches: the listed archives that apt's archive directory does not hold at their size, which
+# the download will fetch.
+count_fetches() {
+  local file size hash
+  fetch_count=0
+  while read -r file size hash; do
+    if ! [ -f "$cache_dir/$file" ] || [ "$(size_of "$cache_dir/$file")" != "$size" ]; then
+      fetch_count=$((fetch_count + 1))
+    fi
+  done < "$listed"
+}
+
+# count_lines FILE: the number of distinct lines.
+count_lines() {
+  sort -u "$1" | awk 'END { print NR }'
+}
+
+# write_outputs save=... [digest=... entry=...]: the step outputs, shown and written to the file the
+# workflow reads them from.
+write_outputs() {
+  local line
+  for line in "$@"; do
+    echo "apt-install: $line"
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then
+      echo "$line" >> "$GITHUB_OUTPUT"
+    fi
+  done
+}
+
+# save_archives: step 6.
+save_archives() {
+  local file size hash new digest save=false entry kept dropped
+  if [ ! -s "$listed" ]; then
+    write_outputs save=false
+    return 0
+  fi
+  new=$archive.new
+  rm -rf -- "$new"
+  mkdir -p "$new"
+  : > "$work/manifest.txt"
+  while read -r file size hash; do
+    if valid_file "$size" "$hash" "$cache_dir/$file"; then
+      cp -- "$cache_dir/$file" "$new/$file"
+      echo "$file $size $hash" >> "$work/manifest.txt"
+    else
+      echo "apt-install: not saved $file"
+    fi
+  done < "$listed"
+  kept=$(count_lines "$work/manifest.txt")
+  if [ "$kept" -eq 0 ]; then
+    rm -rf -- "$new"
+    write_outputs save=false
+    return 0
+  fi
+  LC_ALL=C sort "$work/manifest.txt" > "$new/MANIFEST"
+  digest=$(sha256_of "$new/MANIFEST")
+  rm -rf -- "$archive"
+  mv -- "$new" "$archive"
+  dropped=$(count_lines "$work/dropped.txt")
+  entry=$digest
+  if [ "$dropped" -gt 0 ]; then
+    entry=$digest-repair-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}
+  fi
+  if [ "$digest" != "$restored_digest" ] || [ "$dropped" -gt 0 ]; then
+    save=true
+  fi
+  write_outputs "digest=$digest" "save=$save" "entry=$entry"
 }
 
 # attempt: steps 1 to 4, once.
@@ -194,6 +339,11 @@ attempt() {
     return 0
   fi
   resolve || return $?
+  if [ -n "$archive" ]; then
+    list_archives
+    seed_archives
+    count_fetches
+  fi
   bound=$(bound_for "$deadline") || return 124
   if run_apt "$bound" "$work/download.log" install --download-only --no-install-recommends --yes "${all[@]}"; then
     return 0
@@ -213,6 +363,16 @@ for file in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list
     cat "$file"
   fi
 done
+
+if [ -n "$archive" ]; then
+  cache_dir=$(apt-config shell dir Dir::Cache::Archives/ | sed -n "s/^dir='\(.*\)'\$/\1/p")
+  cache_dir=${cache_dir%/}
+  [ -n "$cache_dir" ] || cache_dir=/var/cache/apt/archives
+  if [ -f "$archive/MANIFEST" ]; then
+    restored_digest=$(sha256_of "$archive/MANIFEST")
+  fi
+  echo "apt-install: archive directory $archive, restored manifest ${restored_digest}"
+fi
 
 attempts=0
 status=1
@@ -241,5 +401,14 @@ if [ "${#all[@]}" -gt 0 ]; then
   echo "apt-install: sudo env DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --no-download --yes ${all[*]}"
   sudo env DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --no-download --yes "${all[@]}" || install_status=$?
 fi
-echo "apt-install: packages=${#all[@]} attempts=$attempts warnings=$total_warnings elapsed=$((SECONDS - start))s"
+if [ -n "$archive" ]; then
+  if [ "$install_status" -eq 0 ]; then
+    save_archives
+  else
+    write_outputs save=false
+  fi
+  echo "apt-install: packages=${#all[@]} archives=$(awk 'END { print NR }' "$listed") seeded=$(count_lines "$work/seeded.txt") fetched=$fetch_count dropped=$(count_lines "$work/dropped.txt") attempts=$attempts warnings=$total_warnings elapsed=$((SECONDS - start))s"
+else
+  echo "apt-install: packages=${#all[@]} attempts=$attempts warnings=$total_warnings elapsed=$((SECONDS - start))s"
+fi
 exit "$install_status"

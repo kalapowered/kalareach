@@ -31,6 +31,7 @@ case "$1" in
       case "$argument" in
         --simulate) phase=simulate ;;
         --download-only) phase=download ;;
+        --print-uris) phase=list ;;
       esac
     done
     ;;
@@ -50,7 +51,7 @@ for argument in "${@:2}"; do
   case "$argument" in -*) ;; *) packages+=("$argument") ;; esac
 done
 case "$action" in
-  ok | drop) ;;
+  ok | drop | consume) ;;
   fail) echo "E: the $phase failed"; exit 100 ;;
   fail-slow) "$REAL_SLEEP" 1; echo "E: the $phase failed"; exit 100 ;;
   warn:*)
@@ -64,17 +65,44 @@ case "$action" in
   ignore-term) exec /bin/bash -c "trap '' TERM; while :; do $REAL_SLEEP 1; done" ;;
   e:*) echo "E: ${action#e:}"; exit 100 ;;
 esac
+# With a pool the archives are named and hashed as a mirror's are; without one they are empty files.
+file_of() {
+  if [ -d "$rig/pool" ]; then echo "${1}_1.0_all.deb"; else echo "$1.deb"; fi
+}
 case "$phase" in
+  list)
+    for package in "${packages[@]}"; do
+      file=$(file_of "$package")
+      [ -f "$rig/pool/$file" ] || continue
+      size=$(wc -c < "$rig/pool/$file" | tr -d ' ')
+      if [ "$(cat "$rig/nohash" 2>/dev/null)" = "$package" ]; then
+        echo "'http://mirror.test/pool/$file' $file $size "
+      else
+        echo "'http://mirror.test/pool/$file' $file $size SHA256:$(sha256sum "$rig/pool/$file" | cut -d' ' -f1)"
+      fi
+    done
+    ;;
   download)
     mkdir -p "$rig/archives"
-    for package in "${packages[@]}"; do : > "$rig/archives/$package.deb"; done
-    if [ "$action" = drop ]; then rm -f "$rig/archives/${packages[0]}.deb"; fi
+    for package in "${packages[@]}"; do
+      file=$(file_of "$package")
+      if [ -d "$rig/pool" ]; then
+        # apt keeps an archive of the listed size and fetches the others.
+        if [ "$(wc -c < "$rig/archives/$file" 2>/dev/null | tr -d ' ')" != "$(wc -c < "$rig/pool/$file" | tr -d ' ')" ]; then
+          cp "$rig/pool/$file" "$rig/archives/$file"
+          echo "$file" >> "$rig/fetched.log"
+        fi
+      else
+        : > "$rig/archives/$file"
+      fi
+    done
+    if [ "$action" = drop ]; then rm -f "$rig/archives/$(file_of "${packages[0]}")"; fi
     ;;
   install)
     nodownload=
     for argument in "$@"; do [ "$argument" = --no-download ] && nodownload=1; done
     for package in "${packages[@]}"; do
-      if [ ! -f "$rig/archives/$package.deb" ]; then
+      if [ ! -f "$rig/archives/$(file_of "$package")" ]; then
         if [ -n "$nodownload" ]; then
           echo "E: Unable to fetch some archives, maybe run apt-get update or try with --fix-missing?"
           exit 100
@@ -82,6 +110,8 @@ case "$phase" in
         echo "$package" >> "$rig/network-fetch"
       fi
     done
+    # An action that stands for apt's deleting an archive once it is installed.
+    if [ "$action" = consume ]; then rm -f "$rig/archives/$(file_of "${packages[0]}")"; fi
     ;;
 esac
 exit 0
@@ -135,6 +165,10 @@ echo "$1" >> "$RIG/sleep.log"
 
 /// `apt-config`, which a Mac does not have: the settings of a runner image.
 const APT_CONFIG: &str = r#"#!/bin/bash
+if [ "$1" = shell ]; then
+  echo "$2='$RIG/archives/'"
+  exit 0
+fi
 cat <<'LINES'
 Acquire::Retries "1";
 Acquire::http::Timeout "15";
@@ -148,6 +182,11 @@ LINES
 
 /// A program that stands for what `--names-from` runs: it prints the number of updates made so far
 /// in the name it gives, so that a name shows which indexes it was asked against.
+/// `sha256sum` where the host has none: `shasum` prints the same.
+const SHA256SUM: &str = r#"#!/bin/bash
+exec shasum -a 256 "$@"
+"#;
+
 /// `pnpm` for the Playwright package list: it records its arguments and answers with the output
 /// and the status the case put in the rig.
 const PNPM: &str = r#"#!/bin/bash
@@ -178,6 +217,7 @@ impl Rig {
         let bin = dir.path().join("bin");
         fs::create_dir_all(&bin).expect("the stand-ins' folder");
         fs::create_dir_all(dir.path().join("tmp")).expect("the temporary folder");
+        fs::create_dir_all(dir.path().join("archives")).expect("apt's archive directory");
         for (name, text) in [
             ("apt-get", APT_GET),
             ("sudo", SUDO),
@@ -185,6 +225,7 @@ impl Rig {
             ("sleep", SLEEP),
             ("apt-config", APT_CONFIG),
             ("pnpm", PNPM),
+            ("sha256sum", SHA256SUM),
         ] {
             write_program(&bin.join(name), text);
         }
@@ -227,6 +268,9 @@ impl Rig {
             .env("RIG", self.dir.path())
             .env("TMPDIR", self.path("tmp"))
             .env("REAL_SLEEP", "/bin/sleep")
+            .env("GITHUB_OUTPUT", self.path("outputs"))
+            .env("GITHUB_RUN_ID", "77")
+            .env("GITHUB_RUN_ATTEMPT", "2")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -788,5 +832,288 @@ fn the_playwright_package_list_fails_on_any_other_shape() {
             "{printed:?}: {}",
             outcome.stderr
         );
+    }
+}
+
+// The archive directory: what a cache step restores before the script and saves after it.
+
+/// The archives a mirror would serve: one file per package, named as apt names them.
+fn pool(rig: &Rig, packages: &[(&str, &str)]) {
+    let pool = rig.path("pool");
+    fs::create_dir_all(&pool).expect("a pool");
+    for (package, bytes) in packages {
+        fs::write(pool.join(format!("{package}_1.0_all.deb")), bytes).expect("an archive");
+    }
+}
+
+/// A new runner: apt's archive directory and every record of the last run are gone, and the cache
+/// directory, the pool and the plans are not.
+fn new_runner(rig: &Rig) {
+    fs::remove_dir_all(rig.path("archives")).expect("apt's archives");
+    fs::create_dir_all(rig.path("archives")).expect("apt's archive directory");
+    for name in [
+        "calls.log",
+        "phases.log",
+        "fetched.log",
+        "sudo.log",
+        "sleep.log",
+        "timeout.log",
+        "outputs",
+        "count.update",
+        "count.list",
+        "count.download",
+        "count.install",
+    ] {
+        let _ = fs::remove_file(rig.path(name));
+    }
+}
+
+fn sha256_hex(path: &Path) -> String {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .expect("shasum runs");
+    String::from_utf8(output.stdout)
+        .expect("a digest")
+        .split(' ')
+        .next()
+        .expect("a digest")
+        .to_owned()
+}
+
+fn cache(rig: &Rig) -> PathBuf {
+    rig.path("cache/desktop")
+}
+
+fn archive_run(rig: &Rig, packages: &[&str]) -> Outcome {
+    let directory = cache(rig);
+    let directory = directory.to_str().expect("a path");
+    let mut arguments = vec!["--deadline", "600", "--archive", directory];
+    arguments.extend(packages);
+    rig.run(&arguments)
+}
+
+/// The last value the run wrote for a step output.
+fn output_of(rig: &Rig, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    rig.lines("outputs")
+        .iter()
+        .rev()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+}
+
+/// The manifest line of one archive of the pool: its name, size and SHA-256.
+fn manifest_line(rig: &Rig, package: &str) -> String {
+    let path = rig.path("pool").join(format!("{package}_1.0_all.deb"));
+    let size = fs::metadata(&path).expect("an archive").len();
+    format!("{package}_1.0_all.deb {size} {}", sha256_hex(&path))
+}
+
+fn manifest(rig: &Rig) -> Vec<String> {
+    fs::read_to_string(cache(rig).join("MANIFEST"))
+        .expect("a manifest")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A run with no archive of its own lists every archive of the plan against an empty archive
+/// directory, fetches them, installs, and keeps a new directory of the verified archives with a
+/// manifest, which it tells the workflow to save under the manifest's digest.
+#[test]
+fn a_cold_run_with_an_archive_directory_lists_fetches_and_keeps_a_verified_set() {
+    let rig = Rig::new();
+    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(rig.phases(), ["update", "list", "download", "install"]);
+    let list = &rig.calls("list")[0];
+    assert!(
+        list.contains("install --print-uris -qq --no-install-recommends -o Acquire::ForceHash=SHA256 -o Dir::Cache::Archives="),
+        "{list}"
+    );
+    assert!(!list.contains(&rig.path("archives").display().to_string()), "an empty directory: {list}");
+    assert!(
+        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=0 fetched=2 dropped=0 attempts=1 "),
+        "{}",
+        summary(&outcome)
+    );
+    let mut expected = vec![manifest_line(&rig, "tmux"), manifest_line(&rig, "fuse3")];
+    expected.sort();
+    assert_eq!(manifest(&rig), expected);
+    let digest = sha256_hex(&cache(&rig).join("MANIFEST"));
+    assert_eq!(output_of(&rig, "digest"), Some(digest.clone()));
+    assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
+    assert_eq!(output_of(&rig, "entry"), Some(digest));
+    assert!(cache(&rig).join("tmux_1.0_all.deb").is_file());
+    assert!(!rig.path("cache/desktop.new").exists());
+}
+
+/// On a new runner that restores the directory, every archive is seeded and none is fetched, the
+/// download phase has nothing to get, and the same set is not saved again.
+#[test]
+fn a_run_that_restores_a_verified_directory_fetches_nothing_and_saves_nothing() {
+    let rig = Rig::new();
+    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    assert_eq!(archive_run(&rig, &["tmux", "fuse3"]).status, 0);
+    let digest = output_of(&rig, "digest");
+    new_runner(&rig);
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=2 fetched=0 dropped=0 attempts=1 "),
+        "{}",
+        summary(&outcome)
+    );
+    assert!(outcome.stdout.contains("apt-install: seeded tmux_1.0_all.deb"));
+    assert!(rig.lines("fetched.log").is_empty(), "the download fetched: {:?}", rig.lines("fetched.log"));
+    assert_eq!(output_of(&rig, "save"), Some("false".to_owned()));
+    assert_eq!(sha256_hex(&cache(&rig).join("MANIFEST")), digest.expect("a digest"));
+}
+
+/// An archive that has the right name and size and other bytes is not copied: it is dropped and
+/// fetched again, apt installs the fetched bytes, and, though the manifest is the same, the
+/// repaired directory is saved under an entry of its own, which a later run restores whole.
+#[test]
+fn an_archive_with_the_right_size_and_other_bytes_is_dropped_fetched_again_and_saved_as_a_repair() {
+    let rig = Rig::new();
+    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    assert_eq!(archive_run(&rig, &["tmux", "fuse3"]).status, 0);
+    let digest = output_of(&rig, "digest").expect("a digest");
+    fs::write(cache(&rig).join("tmux_1.0_all.deb"), "tmux BYTES").expect("a changed archive");
+    new_runner(&rig);
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=1 fetched=1 dropped=1 attempts=1 "),
+        "{}",
+        summary(&outcome)
+    );
+    assert!(outcome.stdout.contains("apt-install: dropped tmux_1.0_all.deb"));
+    assert_eq!(rig.lines("fetched.log"), ["tmux_1.0_all.deb"]);
+    let installed = fs::read(rig.path("archives/tmux_1.0_all.deb")).expect("the archive apt holds");
+    assert_eq!(installed, b"tmux bytes");
+    assert_eq!(output_of(&rig, "digest"), Some(digest.clone()), "the manifest is the same");
+    assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
+    assert_eq!(output_of(&rig, "entry"), Some(format!("{digest}-repair-77-2")));
+    assert_eq!(fs::read(cache(&rig).join("tmux_1.0_all.deb")).expect("a repaired archive"), b"tmux bytes");
+
+    new_runner(&rig);
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert!(
+        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=2 fetched=0 dropped=0 attempts=1 "),
+        "{}",
+        summary(&outcome)
+    );
+    assert_eq!(output_of(&rig, "save"), Some("false".to_owned()));
+}
+
+/// The new directory is made of the list and not of the old directory: a file that is no longer
+/// listed, a directory and a link are not in it or in its manifest. A same-name replacement and a
+/// link at a listed name are dropped, and a smaller set has a digest of its own.
+#[test]
+fn the_saved_directory_is_built_from_the_list_and_keeps_nothing_that_is_not_listed() {
+    let rig = Rig::new();
+    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    assert_eq!(archive_run(&rig, &["tmux", "fuse3"]).status, 0);
+    let first = output_of(&rig, "digest").expect("a digest");
+
+    // A smaller set: fuse3 is no longer listed, and what else the directory holds goes with it.
+    fs::write(cache(&rig).join("old_1.0_all.deb"), "an old archive").expect("an old archive");
+    fs::create_dir_all(cache(&rig).join("folder")).expect("a folder");
+    new_runner(&rig);
+    let outcome = archive_run(&rig, &["tmux"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(manifest(&rig), [manifest_line(&rig, "tmux")]);
+    let files: Vec<String> = fs::read_dir(cache(&rig))
+        .expect("the directory")
+        .map(|entry| entry.expect("an entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert_ne!(output_of(&rig, "digest"), Some(first));
+    assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
+    let entry = output_of(&rig, "entry").expect("an entry");
+    assert!(!entry.contains("repair"), "{entry}");
+
+    // A replacement under the same name, and a link where an archive is listed.
+    pool(&rig, &[("tmux", "tmux bytes, replaced"), ("fuse3", "fuse3 bytes, longer")]);
+    std::os::unix::fs::symlink(
+        rig.path("pool/fuse3_1.0_all.deb"),
+        cache(&rig).join("fuse3_1.0_all.deb"),
+    )
+    .expect("a link");
+    new_runner(&rig);
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(
+        summary(&outcome).starts_with("apt-install: packages=2 archives=2 seeded=0 fetched=2 dropped=2 "),
+        "{}",
+        summary(&outcome)
+    );
+    assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
+    assert!(output_of(&rig, "entry").expect("an entry").contains("-repair-77-2"));
+    assert!(!cache(&rig).join("fuse3_1.0_all.deb").is_symlink());
+}
+
+/// An archive that apt no longer holds when the install is done (apt may delete it once it is
+/// installed) is left out of the saved set and said so, and the install is not failed by it.
+#[test]
+fn an_archive_that_apt_no_longer_holds_is_left_out_of_the_saved_set() {
+    let rig = Rig::new();
+    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    rig.plan("install", &["consume"]);
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(outcome.stdout.contains("apt-install: not saved tmux_1.0_all.deb"), "{}", outcome.stdout);
+    assert_eq!(manifest(&rig), [manifest_line(&rig, "fuse3")]);
+    assert_eq!(output_of(&rig, "save"), Some("true".to_owned()));
+}
+
+/// A list line with no hash is neither seeded nor saved: nothing can be checked against it.
+#[test]
+fn an_archive_with_no_hash_in_the_list_is_neither_seeded_nor_saved() {
+    let rig = Rig::new();
+    pool(&rig, &[("tmux", "tmux bytes"), ("fuse3", "fuse3 bytes, longer")]);
+    fs::write(rig.path("nohash"), "tmux").expect("a marker");
+    let outcome = archive_run(&rig, &["tmux", "fuse3"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert!(summary(&outcome).contains(" archives=1 "), "{}", summary(&outcome));
+    assert_eq!(manifest(&rig), [manifest_line(&rig, "fuse3")]);
+}
+
+/// A failed install saves nothing and leaves the directory as it was.
+#[test]
+fn a_failed_install_saves_nothing() {
+    let rig = Rig::new();
+    pool(&rig, &[("tmux", "tmux bytes")]);
+    rig.plan("install", &["fail"]);
+    let outcome = archive_run(&rig, &["tmux"]);
+    assert_eq!(outcome.status, 100, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(output_of(&rig, "save"), Some("false".to_owned()));
+    assert!(!cache(&rig).exists());
+}
+
+/// With an archive directory the plan of the install is the listing, and a failure of it after a
+/// clean update ends the script as it does without one.
+#[test]
+fn with_an_archive_directory_a_listing_that_fails_after_a_clean_update_ends_the_script() {
+    let rig = Rig::new();
+    rig.plan("list", &["e:Unable to locate package nosuchpackage"]);
+    let outcome = archive_run(&rig, &["nosuchpackage"]);
+    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(rig.phases(), ["update", "list"]);
+    assert_eq!(output_of(&rig, "save"), None);
+}
+
+/// An archive directory that is not an absolute path of its own is refused before anything is
+/// called, since the script replaces the directory as a whole.
+#[test]
+fn an_archive_directory_that_is_relative_or_the_root_is_refused() {
+    for directory in ["cache/desktop", "/", ""] {
+        let rig = Rig::new();
+        let outcome = rig.run(&["--archive", directory, "tmux"]);
+        assert_eq!(outcome.status, 2, "{directory:?}: {}{}", outcome.stdout, outcome.stderr);
+        assert!(rig.phases().is_empty(), "{directory:?}");
     }
 }
