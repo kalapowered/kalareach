@@ -188,25 +188,124 @@ fn runs_the_workspace(step: &Step) -> bool {
     step.reading == Reading::Cargo && step.command.iter().any(|word| word == "--workspace")
 }
 
-/// The first budget, in the order of the parts and of the steps in each, whose steps [`part_of`] puts
-/// in more than one of `parts` parts: a budget is spent over the steps that name it in the order they
-/// run, and the parts are run one at a time, each by a run of its own, so a budget cannot be spent
-/// over steps that run in different runs. A build that opens the plan is in every part, and so is
-/// a set-up step in each part that holds a step naming it.
+/// How a plan's steps are cut into parts: which steps are cut by count and which of those open the
+/// plan, which stands alone, and how the rest are shared. [`part_of`] and [`budget_across_parts`]
+/// place the steps by it.
+struct Cut {
+    /// The steps cut by count, by index: every step but the set-up steps that another step names.
+    steps: Vec<usize>,
+    /// How many of them open the plan: the builds that every part runs.
+    opening: usize,
+    /// The place among them of the workspace's tests, which stand alone in part 1 when the plan has
+    /// more than one part.
+    alone: Option<usize>,
+    /// How many parts the remaining steps are cut into.
+    shares: usize,
+    /// How many remaining steps there are.
+    rest: usize,
+}
+
+impl Cut {
+    fn of(steps: &[Step], parts: usize) -> Self {
+        let parts = parts.max(1);
+        let named: BTreeSet<&str> = steps
+            .iter()
+            .flat_map(|step| step.after.iter().map(String::as_str))
+            .collect();
+        let cut: Vec<usize> = (0..steps.len())
+            .filter(|index| !(steps[*index].setup && named.contains(steps[*index].id.as_str())))
+            .collect();
+        let opening = cut
+            .iter()
+            .take_while(|index| steps[**index].reading == Reading::Build)
+            .count();
+        let alone = if parts > 1 {
+            cut.iter()
+                .position(|index| runs_the_workspace(&steps[*index]))
+                .filter(|slot| *slot >= opening)
+        } else {
+            None
+        };
+        let shares = if alone.is_some() { parts - 1 } else { parts };
+        let rest = cut.len() - opening - usize::from(alone.is_some());
+        Self {
+            steps: cut,
+            opening,
+            alone,
+            shares,
+            rest,
+        }
+    }
+
+    /// The part, from 1, that holds the remaining step at `position` among the remaining steps: the
+    /// first part whose share ends after it.
+    fn part_at(&self, position: usize) -> usize {
+        let share = ((position + 1) * self.shares).div_ceil(self.rest);
+        share + usize::from(self.alone.is_some())
+    }
+}
+
+/// The parts that hold a step: every part, or the parts named.
+#[derive(Clone, Default)]
+struct Held {
+    every: bool,
+    parts: BTreeSet<usize>,
+}
+
+/// The first budget, in the order its steps first appear in the plan, whose steps [`part_of`] puts
+/// in more than one of `parts` parts: a budget is spent over the steps that name it in the order
+/// they run, and the parts are run one at a time, each by a run of its own, so a budget cannot be
+/// spent over steps that run in different runs. A build that opens the plan is in every part, and
+/// so is a set-up step in each part that holds a step naming it.
+///
+/// The parts that hold each step are found from the step's place in the cut, and the plan is not
+/// cut once for each part, so the cost does not grow with the number of parts.
 #[must_use]
 pub fn budget_across_parts(steps: &[Step], parts: usize) -> Option<String> {
-    let mut first_part: BTreeMap<String, usize> = BTreeMap::new();
-    for number in 1..=parts.max(1) {
-        for step in part_of(steps.to_vec(), (number, parts)) {
-            let Some((id, _)) = step.budget else {
-                continue;
-            };
-            if *first_part.entry(id.clone()).or_insert(number) != number {
-                return Some(id);
+    if parts < 2 || steps.iter().all(|step| step.budget.is_none()) {
+        return None;
+    }
+    let cut = Cut::of(steps, parts);
+    let mut held = vec![Held::default(); steps.len()];
+    let mut position = 0;
+    for (slot, index) in cut.steps.iter().enumerate() {
+        if slot < cut.opening {
+            held[*index].every = true;
+        } else if cut.alone == Some(slot) {
+            held[*index].parts.insert(1);
+        } else {
+            held[*index].parts.insert(cut.part_at(position));
+            position += 1;
+        }
+    }
+    // A set-up step comes before the steps that name it, so one pass from the end gives each set-up
+    // step the parts of the steps that name it, and each that those name.
+    for index in (0..steps.len()).rev() {
+        for name in &steps[index].after {
+            if let Some(earlier) = steps.iter().position(|step| step.id == *name) {
+                let later = held[index].clone();
+                held[earlier].every |= later.every;
+                held[earlier].parts.extend(later.parts);
             }
         }
     }
-    None
+    let mut order: Vec<&str> = Vec::new();
+    let mut spread: BTreeMap<&str, Held> = BTreeMap::new();
+    for (step, held) in steps.iter().zip(&held) {
+        let Some((id, _)) = &step.budget else {
+            continue;
+        };
+        if !spread.contains_key(id.as_str()) {
+            order.push(id);
+        }
+        let all = spread.entry(id).or_default();
+        all.every |= held.every;
+        all.parts.extend(held.parts.iter().copied());
+    }
+    order
+        .into_iter()
+        .find(|id| spread[id].every || spread[id].parts.len() > 1)
+        .map(str::to_owned)
 }
 
 /// The steps of one part of a platform's plan, for a plan that one job cannot hold and separate runs
@@ -222,40 +321,20 @@ pub fn budget_across_parts(steps: &[Step], parts: usize) -> Option<String> {
 #[must_use]
 pub fn part_of(steps: Vec<Step>, part: (usize, usize)) -> Vec<Step> {
     let (number, parts) = part;
-    let parts = parts.max(1);
-    let named: BTreeSet<&str> = steps
-        .iter()
-        .flat_map(|step| step.after.iter().map(String::as_str))
-        .collect();
-    // The steps cut by count: every step but the set-up steps that another step names.
-    let cut: Vec<usize> = (0..steps.len())
-        .filter(|index| !(steps[*index].setup && named.contains(steps[*index].id.as_str())))
-        .collect();
-    let opening = cut
-        .iter()
-        .take_while(|index| steps[**index].reading == Reading::Build)
-        .count();
-    let alone = if parts > 1 {
-        cut.iter()
-            .position(|index| runs_the_workspace(&steps[*index]))
-            .filter(|slot| *slot >= opening)
+    let cut = Cut::of(&steps, parts);
+    let share = if cut.alone.is_some() {
+        number.saturating_sub(1)
     } else {
-        None
+        number
     };
-    let (share, shares) = if alone.is_some() {
-        (number.saturating_sub(1), parts - 1)
-    } else {
-        (number, parts)
-    };
-    let rest = cut.len() - opening - usize::from(alone.is_some());
-    let from = rest * share.saturating_sub(1) / shares;
-    let to = rest * share / shares;
+    let from = cut.rest * share.saturating_sub(1) / cut.shares;
+    let to = cut.rest * share / cut.shares;
     let mut kept = vec![false; steps.len()];
     let mut position = 0;
-    for (slot, index) in cut.iter().enumerate() {
-        kept[*index] = if slot < opening || (alone == Some(slot) && number == 1) {
+    for (slot, index) in cut.steps.iter().enumerate() {
+        kept[*index] = if slot < cut.opening || (cut.alone == Some(slot) && number == 1) {
             true
-        } else if alone == Some(slot) {
+        } else if cut.alone == Some(slot) {
             false
         } else {
             let at = position;
@@ -438,6 +517,127 @@ mod tests {
         };
         assert_eq!(ids((1, 2)), ["a"]);
         assert_eq!(ids((2, 2)), ["s1", "s2", "t"]);
+    }
+
+    /// `step` naming the budget `id`.
+    fn budgeted(mut step: Step, id: &str) -> Step {
+        step.budget = Some((id.to_owned(), 60));
+        step
+    }
+
+    /// The plan's workspace tests: the one step that stands alone in part 1.
+    fn workspace(id: &str) -> Step {
+        Step {
+            id: id.to_owned(),
+            ..step_of(
+                "the workspace's tests",
+                &["cargo", "test", "--workspace"],
+                Reading::Cargo,
+            )
+        }
+    }
+
+    /// The first budget whose steps [`part_of`] puts in more than one part, by cutting the plan once
+    /// for each part and looking at where each budget's steps went.
+    fn budget_across_parts_by_cutting(steps: &[Step], parts: usize) -> Option<String> {
+        let mut first_part: BTreeMap<String, usize> = BTreeMap::new();
+        let mut across: BTreeSet<String> = BTreeSet::new();
+        for number in 1..=parts.max(1) {
+            for step in part_of(steps.to_vec(), (number, parts)) {
+                let Some((id, _)) = step.budget else {
+                    continue;
+                };
+                if *first_part.entry(id.clone()).or_insert(number) != number {
+                    across.insert(id);
+                }
+            }
+        }
+        steps
+            .iter()
+            .filter_map(|step| step.budget.as_ref())
+            .map(|(id, _)| id)
+            .find(|id| across.contains(*id))
+            .cloned()
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: the budget whose steps fall in more than one
+    /// part is the one that cutting the plan into each part and looking shows, for plans whose
+    /// budgets are on steps cut by count, on an opening build, on set-up steps that dependents in
+    /// different parts name directly and through another set-up step, and on the workspace's tests
+    /// that stand alone, and for every number of parts from 1 to 12.
+    #[test]
+    fn the_budget_across_parts_is_the_one_that_cutting_the_plan_into_each_part_shows() {
+        let t = |id: &str| named(id, Reading::Cargo, false, &[]);
+        let plans: Vec<Vec<Step>> = vec![
+            vec![
+                named("build", Reading::Build, false, &[]),
+                budgeted(t("t0"), "a"),
+                t("t1"),
+                budgeted(t("t2"), "a"),
+                t("t3"),
+                budgeted(t("t4"), "b"),
+                budgeted(t("t5"), "b"),
+            ],
+            vec![
+                budgeted(named("build", Reading::Build, false, &[]), "a"),
+                t("t0"),
+                t("t1"),
+            ],
+            vec![
+                named("build", Reading::Build, false, &[]),
+                budgeted(named("s1", Reading::Exit, true, &[]), "s"),
+                named("s2", Reading::Exit, true, &["s1"]),
+                t("a"),
+                named("t", Reading::Cargo, false, &["s2"]),
+                t("u"),
+                budgeted(named("v", Reading::Cargo, false, &["s1"]), "s"),
+                t("w"),
+            ],
+            vec![
+                named("build", Reading::Build, false, &[]),
+                budgeted(workspace("workspace"), "w"),
+                budgeted(t("t0"), "w"),
+                t("t1"),
+                t("t2"),
+            ],
+            vec![
+                named("build", Reading::Build, false, &[]),
+                t("t0"),
+                t("t1"),
+                t("t2"),
+            ],
+            vec![budgeted(t("t0"), "a"), budgeted(t("t1"), "a")],
+        ];
+        for (number, plan) in plans.iter().enumerate() {
+            for parts in 1..=12 {
+                assert_eq!(
+                    budget_across_parts(plan, parts),
+                    budget_across_parts_by_cutting(plan, parts),
+                    "plan {number} cut into {parts} parts"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: the check for a budget across parts costs
+    /// as much for a trillion parts as for two: it finds where each step falls, and does not cut the
+    /// plan once for each part, empty ones too.
+    #[test]
+    fn the_check_for_a_budget_across_parts_does_not_cut_the_plan_once_for_each_part() {
+        let t = |id: &str| named(id, Reading::Cargo, false, &[]);
+        let plan = vec![budgeted(t("t0"), "a"), budgeted(t("t1"), "a"), t("t2")];
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send((
+                budget_across_parts(&plan, 1_000_000_000_000),
+                budget_across_parts(&plan[2..], 1_000_000_000_000),
+            ));
+        });
+        let (spread, without) = receiver
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the check did not return in 20 s");
+        assert_eq!(spread.as_deref(), Some("a"));
+        assert_eq!(without, None);
     }
 
     fn step_of(what: &str, command: &[&str], reading: Reading) -> Step {
