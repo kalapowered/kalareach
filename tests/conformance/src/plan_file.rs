@@ -278,12 +278,53 @@ pub struct Terminals {
     pub reason: String,
 }
 
-/// The TypeScript packages.
+/// The TypeScript packages, and the directories the report reads besides Rust. A key that is absent
+/// names nothing: no compiler directory, no directory left out, no script directory and no lane
+/// directory.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypeScript {
     /// Their directories, relative to the repository.
     pub packages: Vec<String>,
+    /// The directories of the repository whose own `node_modules` holds the compiler that reads
+    /// the packages; the first that does is used. `--typescript-compiler` replaces them.
+    #[serde(default)]
+    pub compiler_from: Vec<String>,
+    /// The names of the directories that no TypeScript file is read below, at any depth.
+    #[serde(default)]
+    pub skip_directories: Vec<String>,
+    /// The directories whose files are read for the rows they name, as scripts.
+    #[serde(default)]
+    pub scripts: Vec<String>,
+    /// The directories whose Kotlin, Swift and Java files are read for the lanes.
+    #[serde(default)]
+    pub lane_directories: Vec<String>,
+}
+
+/// The Rust workspaces.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rust {
+    /// The manifests `cargo metadata` reads, one workspace each, relative to the repository. Empty
+    /// when the repository has no Rust.
+    pub manifests: Vec<String>,
+}
+
+/// Whether a tree is held to its ignored-run entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoredPolicy {
+    /// `true`: every keyed test an ordinary run leaves out is run by an entry, and every entry is
+    /// still where it says. `false`: the check is off for this tree.
+    pub held: bool,
+}
+
+/// The file that holds the terminal profile the host presents.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalProfileFile {
+    /// The file, relative to the repository.
+    pub path: String,
 }
 
 /// The application matrix's lock.
@@ -302,6 +343,11 @@ pub struct Plan {
     pub repository: String,
     /// The plan's groups, in the order a full run runs them.
     pub groups: Vec<String>,
+    /// The Rust workspaces.
+    pub rust: Rust,
+    /// Whether the tree is held to its ignored-run entries.
+    #[serde(rename = "ignored_runs")]
+    pub ignored_policy: IgnoredPolicy,
     /// Whether every full run lists the rows of the specification's tables.
     #[serde(default)]
     pub list_table_rows: bool,
@@ -334,6 +380,10 @@ pub struct Plan {
     /// The application matrix's lock, when the plan has a step that skips from it.
     #[serde(default)]
     pub applications: Option<Applications>,
+    /// The file that holds the terminal profile, when the plan records one: a result of a plan
+    /// without it leaves the profile out.
+    #[serde(default)]
+    pub terminal_profile: Option<TerminalProfileFile>,
 }
 
 impl Default for Unrun {
@@ -435,28 +485,48 @@ fn script_operands(command: &[String]) -> Vec<&str> {
     }
 }
 
-/// Why `operand` is not a script this plan may run from `root`, or `None`: it is a relative path
-/// inside the repository, a regular file that is not a link, and the very name under which Git's
-/// index holds a file. Git is asked about the name as a literal, never as a pattern.
-fn operand_refused(root: &Path, operand: &str) -> Option<String> {
+/// Why `operand` does not name a place inside the repository, or `None`: it is a relative path that
+/// holds no `..`.
+fn outside_refused(operand: &str) -> Option<String> {
     let path = Path::new(operand);
     if path.is_absolute() || operand.starts_with('/') || operand.contains('\\') {
         return Some("is not a relative path".to_owned());
     }
-    if path
-        .components()
+    path.components()
         .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Some("holds `..`".to_owned());
+        .then(|| "holds `..`".to_owned())
+}
+
+/// Why `operand` is not a file of the repository at `root`, or `None`: a relative path inside it
+/// that names a regular file and not a link.
+fn file_refused(root: &Path, operand: &str) -> Option<String> {
+    if let Some(why) = outside_refused(operand) {
+        return Some(why);
     }
-    match std::fs::symlink_metadata(root.join(path)) {
-        Ok(meta) if meta.file_type().is_symlink() => return Some("is a link".to_owned()),
-        Ok(meta) if !meta.is_file() => return Some("is not a regular file".to_owned()),
-        Ok(_) => {}
+    match std::fs::symlink_metadata(root.join(operand)) {
+        Ok(meta) if meta.file_type().is_symlink() => Some("is a link".to_owned()),
+        Ok(meta) if !meta.is_file() => Some("is not a regular file".to_owned()),
+        Ok(_) => None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Some("does not exist".to_owned());
+            Some("does not exist".to_owned())
         }
-        Err(error) => return Some(format!("cannot be checked: {error}")),
+        Err(error) => Some(format!("cannot be checked: {error}")),
+    }
+}
+
+/// Why `operand` is not a directory of the repository at `root`, or `None`.
+fn directory_refused(root: &Path, operand: &str) -> Option<String> {
+    outside_refused(operand).or_else(|| {
+        (!root.join(operand).is_dir()).then(|| "is not a directory of the repository".to_owned())
+    })
+}
+
+/// Why `operand` is not a script this plan may run from `root`, or `None`: it is a regular file
+/// inside the repository that is not a link, and the very name under which Git's index holds a
+/// file. Git is asked about the name as a literal, never as a pattern.
+fn operand_refused(root: &Path, operand: &str) -> Option<String> {
+    if let Some(why) = file_refused(root, operand) {
+        return Some(why);
     }
     let output = match Command::new("git")
         .arg("-C")
@@ -647,6 +717,22 @@ impl Plan {
                 ));
             }
         }
+        for manifest in &self.rust.manifests {
+            if let Some(why) = file_refused(root, manifest) {
+                return refuse(format!(
+                    "`[rust] manifests` names `{manifest}`, which {why}"
+                ));
+            }
+        }
+        if let Some(typescript) = &self.typescript {
+            for directory in &typescript.compiler_from {
+                if let Some(why) = directory_refused(root, directory) {
+                    return refuse(format!(
+                        "`[typescript] compiler_from` names `{directory}`, which {why}"
+                    ));
+                }
+            }
+        }
         for lane in &self.lanes {
             if let Some(group) = &lane.group
                 && !self.groups.contains(group)
@@ -707,6 +793,11 @@ impl Plan {
                 }
             }
         }
+        for group in &self.groups {
+            if !self.steps.iter().any(|step| &step.group == group) {
+                return refuse(format!("the group `{group}` is used by no step"));
+            }
+        }
         Ok(())
     }
 
@@ -729,6 +820,9 @@ impl Plan {
         Self {
             repository: "test".to_owned(),
             groups: vec![group.to_owned()],
+            rust: Rust {
+                manifests: vec!["Cargo.toml".to_owned()],
+            },
             unrun: Unrun {
                 rust: PerPlatform {
                     linux: reason.to_owned(),
@@ -953,9 +1047,49 @@ impl Plan {
     /// The packages' directories of the TypeScript the plan reads.
     #[must_use]
     pub fn typescript_packages(&self) -> &[String] {
+        self.typescript_list(|typescript| &typescript.packages)
+    }
+
+    /// The directories whose installed compiler reads the TypeScript.
+    #[must_use]
+    pub fn compiler_from(&self) -> &[String] {
+        self.typescript_list(|typescript| &typescript.compiler_from)
+    }
+
+    /// The names of the directories no TypeScript file is read below.
+    #[must_use]
+    pub fn skip_directories(&self) -> &[String] {
+        self.typescript_list(|typescript| &typescript.skip_directories)
+    }
+
+    /// The directories whose files are read as scripts.
+    #[must_use]
+    pub fn script_directories(&self) -> &[String] {
+        self.typescript_list(|typescript| &typescript.scripts)
+    }
+
+    /// The directories whose Kotlin, Swift and Java files are read for the lanes.
+    #[must_use]
+    pub fn lane_directories(&self) -> &[String] {
+        self.typescript_list(|typescript| &typescript.lane_directories)
+    }
+
+    fn typescript_list(&self, list: fn(&TypeScript) -> &Vec<String>) -> &[String] {
         self.typescript
             .as_ref()
-            .map_or(&[], |typescript| typescript.packages.as_slice())
+            .map_or(&[], |typescript| list(typescript).as_slice())
+    }
+
+    /// The manifests of the Rust workspaces.
+    #[must_use]
+    pub fn manifests(&self) -> &[String] {
+        &self.rust.manifests
+    }
+
+    /// Whether the tree is held to its ignored-run entries.
+    #[must_use]
+    pub fn holds_ignored_runs(&self) -> bool {
+        self.ignored_policy.held
     }
 
     /// Every step of the plan on Linux, each as the words of its command, with the evidence

@@ -4,7 +4,9 @@
 //! ```text
 //! kr-conformance run --root <repository> --evidence <directory> [--group <name>]...
 //!                    [--applications <cache>] [--all-terminals] [--plan <file>]
+//!                    [--typescript-compiler <directory>]
 //! kr-conformance map --root <repository> [--typescript] [--plan <file>]
+//!                    [--typescript-compiler <directory>]
 //! ```
 //!
 //! `scripts/run-conformance.sh` is the way in: it fetches the applications, builds this binary and
@@ -26,8 +28,9 @@ fn usage(problem: &str) -> ExitCode {
     eprintln!("kr-conformance: {problem}");
     eprintln!(
         "usage: kr-conformance run --root <repository> --evidence <directory> [--group <name>]... \
-         [--applications <cache>] [--all-terminals] [--part <number>/<parts>] [--plan <file>]\n       kr-conformance map --root <repository> \
-         [--typescript] [--plan <file>]"
+         [--applications <cache>] [--all-terminals] [--part <number>/<parts>] [--plan <file>] \
+         [--typescript-compiler <directory>]\n       kr-conformance map --root <repository> \
+         [--typescript] [--plan <file>] [--typescript-compiler <directory>]"
     );
     ExitCode::from(2)
 }
@@ -52,6 +55,7 @@ fn main() -> ExitCode {
     let mut typescript = false;
     let mut part = None;
     let mut plan_path = None;
+    let mut typescript_compiler = None;
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
@@ -81,6 +85,14 @@ fn main() -> ExitCode {
                 None => return usage("--part takes <number>/<parts>, with 1 <= number <= parts"),
             },
             "--typescript" => typescript = true,
+            "--typescript-compiler" => match value(&mut rest) {
+                Some(path) => typescript_compiler = Some(PathBuf::from(path)),
+                None => {
+                    return usage(
+                        "--typescript-compiler takes the path of a directory with the compiler installed",
+                    );
+                }
+            },
             other => return usage(&format!("{other} is not an option")),
         }
     }
@@ -102,7 +114,7 @@ fn main() -> ExitCode {
         ));
     }
     match command.as_str() {
-        "map" => map(root, plan, typescript),
+        "map" => map(root, plan, typescript, typescript_compiler),
         "run" => {
             let Some(evidence_directory) = evidence_directory else {
                 return usage("--evidence is required");
@@ -111,10 +123,13 @@ fn main() -> ExitCode {
                 root,
                 plan,
                 &evidence_directory,
-                groups,
-                applications,
-                all_terminals,
-                part,
+                Asked {
+                    groups,
+                    applications,
+                    all_terminals,
+                    part,
+                    typescript_compiler,
+                },
             )
         }
         other => usage(&format!("{other} is not a command")),
@@ -135,7 +150,12 @@ fn parse_part(text: &str) -> Option<(usize, usize)> {
     (1..=parts).contains(&number).then_some((number, parts))
 }
 
-fn map(root: PathBuf, plan: Plan, typescript: bool) -> ExitCode {
+fn map(
+    root: PathBuf,
+    plan: Plan,
+    typescript: bool,
+    typescript_compiler: Option<PathBuf>,
+) -> ExitCode {
     let options = Options {
         root,
         evidence: PathBuf::new(),
@@ -143,7 +163,7 @@ fn map(root: PathBuf, plan: Plan, typescript: bool) -> ExitCode {
         all_terminals: false,
         platform: Platform::current(),
         plan,
-        held_to_ignored_runs: true,
+        typescript_compiler,
         applications: None,
         environment: Vec::new(),
         lister: PathBuf::new(),
@@ -178,15 +198,23 @@ fn map(root: PathBuf, plan: Plan, typescript: bool) -> ExitCode {
     }
 }
 
-fn run(
-    root: PathBuf,
-    plan: Plan,
-    evidence_directory: &std::path::Path,
+/// What a run is asked for besides the repository, its plan and the evidence directory.
+struct Asked {
     groups: Vec<String>,
     applications: Option<PathBuf>,
     all_terminals: bool,
     part: Option<(usize, usize)>,
-) -> ExitCode {
+    typescript_compiler: Option<PathBuf>,
+}
+
+fn run(root: PathBuf, plan: Plan, evidence_directory: &std::path::Path, asked: Asked) -> ExitCode {
+    let Asked {
+        groups,
+        applications,
+        all_terminals,
+        part,
+        typescript_compiler,
+    } = asked;
     let evidence = match evidence::check_directory(evidence_directory) {
         Ok(evidence) => evidence,
         Err(refused) => {
@@ -237,7 +265,7 @@ fn run(
         all_terminals,
         platform: Platform::current(),
         plan,
-        held_to_ignored_runs: true,
+        typescript_compiler,
         applications,
         environment: Vec::new(),
         lister,

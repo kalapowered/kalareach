@@ -1,40 +1,42 @@
-// Reads TypeScript and JavaScript sources with the TypeScript compiler the packages already depend
-// on, and prints, for each file, its test calls and its comments as JSON on standard output.
+// Reads TypeScript and JavaScript sources with a TypeScript compiler installed in one of the
+// directories it is given, and prints, for each file, its test calls and its comments as JSON on
+// standard output, with the compiler's version.
 //
-//   node tests/conformance/typescript-facts.mjs <repository> <file>...
+//   node --input-type=module - <repository> <compiler directory>... -- <file>...
 //
-// A test call is a call of `it`, `test`, `describe` or `suite`, including their modifiers
-// (`it.skip`, `test.describe`, `describe.each(table)`), whose first argument is the title. The
-// conformance report decides which test each comment keys; this script only says where things are.
-// It uses the compiler's parser rather than a pattern so that a comment marker inside a string, a
-// template or JSX text is never read as a comment.
+// The program embeds this script and gives it on standard input. A compiler directory is a directory
+// whose own `node_modules` holds `typescript`; the first that does is used. A test call is a call of
+// `it`, `test`, `describe` or `suite`, including their modifiers (`it.skip`, `test.describe`,
+// `describe.each(table)`), whose first argument is the title. The conformance report decides which test each comment keys;
+// this script only says where things are. It uses the compiler's parser rather than a pattern so
+// that a comment marker inside a string, a template or JSX text is never read as a comment.
 
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 
-const [repository, ...files] = process.argv.slice(2)
-if (!repository) {
-  process.stderr.write('usage: typescript-facts.mjs <repository> <file>...\n')
+const [repository, ...rest] = process.argv.slice(2)
+const separator = rest.indexOf('--')
+const directories = separator < 0 ? [] : rest.slice(0, separator)
+const files = separator < 0 ? [] : rest.slice(separator + 1)
+if (!repository || separator < 0) {
+  process.stderr.write('usage: typescript-facts.mjs <repository> <compiler directory>... -- <file>...\n')
   process.exit(2)
 }
 
-// The compiler, from the first package of this script's own repository that depends on it, so a
-// tree the report reads need not have one installed.
-const own = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 let ts
-for (const directory of ['apps/companion', 'packages/protocol', 'packages/plugin-sdk']) {
+for (const directory of directories) {
   try {
-    ts = createRequire(join(own, directory, 'package.json'))('typescript')
+    ts = createRequire(join(directory, 'package.json'))('typescript')
     break
   } catch {
-    // The next package, or the error below.
+    // The next directory, or the error below.
   }
 }
 if (!ts) {
+  const where = directories.length > 0 ? `in ${directories.join(', ')}` : 'because no directory names one'
   process.stderr.write(
-    'typescript-facts: the TypeScript compiler is not installed; run `pnpm install --frozen-lockfile`\n'
+    `typescript-facts: the TypeScript compiler is not installed ${where}; run \`pnpm install --frozen-lockfile\`, name a directory of the tree in the plan's \`compiler_from\`, or pass \`--typescript-compiler <directory>\`\n`
   )
   process.exit(3)
 }
@@ -144,4 +146,4 @@ for (const file of files) {
     firstStatement
   })
 }
-process.stdout.write(JSON.stringify({ files: results }))
+process.stdout.write(JSON.stringify({ version: ts.version, files: results }))

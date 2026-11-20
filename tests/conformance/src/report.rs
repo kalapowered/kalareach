@@ -24,7 +24,7 @@ use crate::id::{Family, Identifier};
 use crate::identity::{self, Commit, PackageVersion, System, TerminalProfile, Toolchain};
 use crate::lane::{self, Part};
 use crate::libtest::Outcome as LibtestOutcome;
-use crate::map::{self, Binding, Declarations, Map, Place, Reference};
+use crate::map::{self, Binding, Declarations, Map, Place, Reference, TypeScriptRead};
 use crate::observe::{self, Observed};
 use crate::plan::{self, ApplicationsPlan, Platform};
 use crate::plan_file::Plan;
@@ -242,8 +242,9 @@ pub struct RunRecordHeader {
     pub commit: Commit,
     /// The toolchain.
     pub toolchain: Toolchain,
-    /// The terminal profile.
-    pub terminal_profile: TerminalProfile,
+    /// The terminal profile, when the plan names the file that holds it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_profile: Option<TerminalProfile>,
     /// The workspace's packages and the TypeScript packages, with their versions.
     pub packages: Vec<PackageVersion>,
     /// The applications, where that group ran.
@@ -365,9 +366,9 @@ pub struct Options {
     pub platform: Platform,
     /// The plan: the steps, tables and reasons the run takes from the repository's plan file.
     pub plan: Plan,
-    /// Whether the tree is held to the plan's ignored-run entries: every keyed test an ordinary
-    /// run leaves out is run by an entry, and every entry is still where it says.
-    pub held_to_ignored_runs: bool,
+    /// A directory whose installed compiler reads the TypeScript, in place of the plan's
+    /// `compiler_from`.
+    pub typescript_compiler: Option<PathBuf>,
     /// The applications the fetch step recorded, when that group runs.
     pub applications: Option<Vec<ApplicationRecord>>,
     /// Variables every step is run with, beyond the report's own environment.
@@ -446,12 +447,19 @@ pub fn map_declared(options: &Options, typescript: bool) -> Map {
         &Declarations {
             case_tables: &plan.case_tables,
             lanes: &plan.lanes,
-            ignored_runs: options
-                .held_to_ignored_runs
+            manifests: plan.manifests(),
+            ignored_runs: plan
+                .holds_ignored_runs()
                 .then_some(plan.ignored_runs.as_slice()),
             plan_commands: &commands,
-            typescript: typescript.then_some(plan.typescript_packages()),
-            scripts: &["scripts"],
+            typescript: typescript.then(|| TypeScriptRead {
+                packages: plan.typescript_packages(),
+                skip_directories: plan.skip_directories(),
+                compiler_from: plan.compiler_from(),
+                compiler: options.typescript_compiler.as_deref(),
+            }),
+            scripts: plan.script_directories(),
+            lane_directories: plan.lane_directories(),
         },
     )
 }
@@ -741,6 +749,7 @@ pub fn assemble(
         });
     let javascript = options.plan.uses_javascript_tools(options.platform, groups);
     let mut toolchain = identity::toolchain(&options.root, javascript);
+    toolchain.typescript.clone_from(&map.typescript_version);
     for step in executed {
         if matches!(step.step.reading, plan::Reading::Lane(_)) {
             for (name, value) in &step.tools {
@@ -774,7 +783,11 @@ pub fn assemble(
             system: identity::system(&options.root),
             commit: identity::commit(&options.root),
             toolchain,
-            terminal_profile: identity::terminal_profile(&options.root),
+            terminal_profile: options
+                .plan
+                .terminal_profile
+                .as_ref()
+                .map(|file| identity::terminal_profile(&options.root, &file.path)),
             packages,
             applications: options.applications.clone(),
             selection: groups.to_vec(),

@@ -31,6 +31,9 @@ pub struct Toolchain {
     pub node: Option<String>,
     /// `pnpm --version`, where the TypeScript group ran.
     pub pnpm: Option<String>,
+    /// The version of the TypeScript compiler that read the map, where the map read TypeScript.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typescript: Option<String>,
     /// What the phone applications' unit tests ran with, as their scripts report it: the JDK and
     /// Gradle, or Xcode and the simulator. Empty where that group did not run.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -108,6 +111,7 @@ pub fn toolchain(root: &Path, typescript: bool) -> Toolchain {
         pnpm: typescript
             .then(|| output("pnpm", &["--version"], root))
             .flatten(),
+        typescript: None,
         phones: BTreeMap::new(),
     }
 }
@@ -154,10 +158,10 @@ pub fn system(root: &Path) -> System {
     }
 }
 
-/// The terminal profile, from its committed fixture.
+/// The terminal profile, from the file the plan names, relative to `root`.
 #[must_use]
-pub fn terminal_profile(root: &Path) -> TerminalProfile {
-    let value: Value = std::fs::read_to_string(root.join("fixtures/terminal/profile.json"))
+pub fn terminal_profile(root: &Path, path: &str) -> TerminalProfile {
+    let value: Value = std::fs::read_to_string(root.join(path))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or(Value::Null);

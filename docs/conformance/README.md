@@ -185,6 +185,31 @@ The phone jobs run the x86_64 emulator and the arm64 simulator. The `android` an
 compile and lint the other Android architectures and the iOS device architecture, and do not run
 them.
 
+### What the plan names to read
+
+`[rust] manifests` lists the manifest of each Rust workspace, relative to the repository; an empty
+list means no Rust. The report runs one `cargo metadata` for each manifest and reads each workspace's
+lock from that workspace's root. A lock that is absent is a problem of the map. A package name that
+two workspaces hold is refused, naming both manifests, because a target is named by its package, its
+kind and its name. A manifest that is absent, absolute, holds `..` or is a link is refused when the
+plan loads. The files of the map are named relative to the tested root.
+
+`[typescript]` names the packages, `compiler_from`, `skip_directories` (names of directories that no
+file is read below), `scripts` (directories whose files are read for the rows they name) and
+`lane_directories` (directories whose Kotlin, Swift and Java files are read for the lanes). A key
+that is absent names nothing, and a `compiler_from` entry has to be a directory of the tested root.
+The suffixes of the files read stay constants of the program, because they are the suffixes its
+parsers read.
+
+`[ignored_runs] held` is `true` for a tree that is held to its `[[ignored_run]]` entries and `false`
+for one that is not. `[terminal_profile] path` names the file that holds the terminal profile the
+result records; a plan without it leaves the profile out of the result.
+
+A plan that names no manifest and no package maps nothing, which is not an error. A group that no
+step uses is refused. The table of identifiers is compiled into the program and holds three bounds
+only (30 sections, 35 acceptance rows, 10 performance rows), so a tool release does not prove which
+revision of the specification a repository cites.
+
 ## How a test names what it proves
 
 ### The identifiers
@@ -374,9 +399,13 @@ A test annotated with `#[ignore]` will not run under `cargo test` unless either 
 
 ### TypeScript
 
-The report reads TypeScript with the compiler the packages already depend on
-(`tests/conformance/typescript-facts.mjs`), so a comment marker inside a string, a template or JSX
-text is never taken for a comment.
+The report reads TypeScript with a compiler that the tested tree has installed, or that the command
+line names (`tests/conformance/typescript-facts.mjs`, which the program embeds), so a comment marker
+inside a string, a template or JSX text is never taken for a comment. The compiler comes from the
+first directory of the plan's `[typescript] compiler_from` whose own `node_modules` holds it, or from
+the directory that `--typescript-compiler <directory>` gives, which replaces them. A tree with
+neither has no compiler: the map says so and names the install command. The result records the
+compiler's version in `run.toolchain.typescript`.
 
 - A comment inside a test's body keys that test.
 - A comment directly above a test call, with no blank line between, keys that test; one above a

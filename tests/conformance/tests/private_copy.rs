@@ -46,7 +46,7 @@ fn options(evidence: &Path, base: &Path, lister: PathBuf, steps: Vec<Step>) -> O
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps("rust", steps),
         lister,

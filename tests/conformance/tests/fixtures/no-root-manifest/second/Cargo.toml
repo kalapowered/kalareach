@@ -1,0 +1,8 @@
+# A workspace under a directory of its own: the repository has no manifest at its root.
+[package]
+name = "beta"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]

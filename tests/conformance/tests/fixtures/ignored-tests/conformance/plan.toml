@@ -1,0 +1,25 @@
+repository = 'ignored-tests'
+groups = ['rust']
+
+[rust]
+manifests = ['Cargo.toml']
+
+[ignored_runs]
+held = false
+
+[unrun]
+bench = 'a benchmark'
+typescript = 'no step runs TypeScript'
+
+[unrun.rust]
+linux = 'no step runs this target'
+macos = 'no step runs this target'
+windows = 'no step runs this target'
+
+[[step]]
+id = 'tests'
+group = 'rust'
+what = 'the tests'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked']
