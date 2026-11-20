@@ -131,6 +131,31 @@ describe('recovery', () => {
     expect(within(recovery).getByTestId('recovery-status')).toHaveFocus()
   })
 
+  it('says on Windows where the recovery seed is kept, and who can read it there', async () => {
+    const { controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ platform: 'windows' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    expect(within(recovery).getByTestId('recovery-seed-kept')).toHaveTextContent(
+      'On Windows the recovery seed is kept in the Credential Manager, where programs that run as ' +
+        'your Windows account can read it, the agents of KalaReach sessions that run as your ' +
+        'account on this computer among them.'
+    )
+  })
+
+  it('says nothing about where the seed is kept on another desktop', async () => {
+    const { controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ platform: 'macos' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    expect(recovery).toHaveAttribute('data-state', 'off')
+    expect(within(recovery).queryByTestId('recovery-seed-kept')).toBeNull()
+  })
+
   it('says what stops it, and offers only what mends that', async () => {
     const { person, controls, sheet } = await openSheet()
     act(() => {
