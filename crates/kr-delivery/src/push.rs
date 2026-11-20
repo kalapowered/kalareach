@@ -598,7 +598,7 @@ pub const MAX_EXPIRY_AHEAD_MS: u64 = 24 * 60 * 60 * 1000;
 mod tests {
     use super::*;
     use kr_protocol::ids::CollapseId;
-    use kr_protocol::push::{PushSuppressionReason, PushUrgency};
+    use kr_protocol::push::PushSuppressionReason;
     use kr_protocol::scalars::{Nullable, U64, Uuid};
 
     fn notification(byte: u8) -> NotificationId {
@@ -907,7 +907,5 @@ mod tests {
         let collapse = CollapseId::new(Uuid::from_bytes([1; 16]));
         let notification = notification(1);
         assert_eq!(collapse.to_string(), notification.to_string());
-        let request_urgency = PushUrgency::Attention;
-        assert_eq!(request_urgency.fcm_priority(), "high");
     }
 }

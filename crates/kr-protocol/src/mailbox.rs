@@ -170,12 +170,6 @@ impl EnvelopeRouting {
             && self.payload_type == plaintext.payload_type
             && self.thread_id == plaintext.thread_id
     }
-
-    /// Returns true when the declared bucket is a length one of section 20's rules produces.
-    #[must_use]
-    pub const fn bucket_is_declared(&self) -> bool {
-        granularity_for_bucket(self.size_bucket_bytes.get()).is_some()
-    }
 }
 
 /// One envelope sealed for one recipient.
@@ -672,7 +666,6 @@ mod tests {
     fn an_envelope_is_admitted_when_its_shape_is_the_one_the_rules_produce() {
         let envelope = sealed(KIB, 1_000 + MAX_MAILBOX_ITEM_LIFETIME_MS);
         assert_eq!(envelope.check_structure(1_000), Ok(()));
-        assert!(envelope.routing.bucket_is_declared());
     }
 
     #[test]
@@ -688,7 +681,6 @@ mod tests {
             claimed.check_structure(1_000),
             Err(EnvelopeStructureError::UndeclaredBucket { bucket: 18 * KIB })
         );
-        assert!(!claimed.routing.bucket_is_declared());
     }
 
     #[test]

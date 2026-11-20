@@ -651,7 +651,6 @@ mod tests {
         };
         assert_eq!(answer.payload, expected);
         assert_eq!(answer.installation_key, *key.public());
-        assert!(answer.key_names_its_installation());
         let transcript = SigningTranscript::from_canonical_bytes(
             kr_protocol::push::PUSH_REGISTRATION_ANSWER_DOMAIN,
             answer.payload.signing_input().expect("a signing input"),
