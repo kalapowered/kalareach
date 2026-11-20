@@ -41462,6 +41462,147 @@
         }
       ]
     },
+    "VoiceControlAnswer": {
+      "description": "The answer to `voice.control` on the wire.\n\nThe arms after the heartbeat are the ones [`VoiceControlResult`] keeps for a repeated request,\nwith the same words, so the bytes the registry keeps of them read as either type. The heartbeat\nis never kept: it tells where the call stands and, once the call is over, whether the provider\nconfirmed that it closed it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The answer to a heartbeat. Never kept.",
+          "properties": {
+            "heartbeat": {
+              "additionalProperties": false,
+              "properties": {
+                "dropped": {
+                  "description": "The news queue overflowed since the device last heard: the call's outcomes are not\nall known.",
+                  "type": "boolean"
+                },
+                "news": {
+                  "description": "News since `after_seq`, oldest first.",
+                  "items": {
+                    "$ref": "#/$defs/VoiceNews"
+                  },
+                  "type": "array"
+                },
+                "provider_close": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/VoiceProviderClose"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Whether the provider's close of the call was confirmed, once `state` is `closed`;\nnull before."
+                },
+                "remaining_seconds": {
+                  "description": "Seconds until the call's own deadline, or zero.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "state": {
+                  "$ref": "#/$defs/VoiceHostCallState",
+                  "description": "Where the call stands."
+                }
+              },
+              "required": [
+                "state",
+                "remaining_seconds",
+                "news",
+                "dropped",
+                "provider_close"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "heartbeat"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host took the mute or the note. A note names itself in the answer so a repeat can be\nread without the request. Proves admission to the host's writer, not provider execution.",
+          "properties": {
+            "admitted": {
+              "additionalProperties": false,
+              "properties": {
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/VoiceNote"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The note the host took, for a note."
+                }
+              },
+              "required": [
+                "note"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "admitted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host's own side channel heard the delegation.",
+          "properties": {
+            "heard": {
+              "additionalProperties": false,
+              "properties": {
+                "offset_ms": {
+                  "$ref": "#/$defs/U64",
+                  "description": "Where in the call it was heard, in milliseconds."
+                }
+              },
+              "required": [
+                "offset_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "heard"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "not_heard",
+          "description": "The host's own side channel has not heard the delegation. Ask again under a new action.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host did not take it.",
+          "properties": {
+            "refused": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/VoiceHostRefusal",
+                  "description": "Why."
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "refused"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "VoiceControlArm": {
       "description": "What a `voice.control` asks for.\n\nNamed by the arm, as every variant union in this protocol is.",
       "oneOf": [
@@ -42240,18 +42381,13 @@
             "closed": {
               "additionalProperties": false,
               "properties": {
-                "provider_close": {
-                  "$ref": "#/$defs/VoiceProviderClose",
-                  "description": "Whether the provider's close of the call was confirmed."
-                },
                 "reason": {
                   "$ref": "#/$defs/VoiceEndReason",
                   "description": "What ended it."
                 }
               },
               "required": [
-                "reason",
-                "provider_close"
+                "reason"
               ],
               "type": "object"
             }
@@ -42584,18 +42720,13 @@
             "ended": {
               "additionalProperties": false,
               "properties": {
-                "provider_close": {
-                  "$ref": "#/$defs/VoiceProviderClose",
-                  "description": "Whether the provider's close of the call was confirmed."
-                },
                 "reason": {
                   "$ref": "#/$defs/VoiceEndReason",
                   "description": "What ended it."
                 }
               },
               "required": [
-                "reason",
-                "provider_close"
+                "reason"
               ],
               "type": "object"
             }
@@ -47459,6 +47590,9 @@
     },
     "voice_context_stop": {
       "$ref": "#/$defs/VoiceContextStop"
+    },
+    "voice_control_answer": {
+      "$ref": "#/$defs/VoiceControlAnswer"
     },
     "voice_control_arm": {
       "$ref": "#/$defs/VoiceControlArm"

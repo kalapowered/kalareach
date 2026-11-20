@@ -1304,12 +1304,12 @@ fn answer_keeps_nothing(method: Method, outcome: &Result<ParamsValue>) -> bool {
                 })
         }
         Method::VoiceControl => answer
-            .to_typed::<kr_protocol::voice_host::VoiceControlResult>()
+            .to_typed::<kr_protocol::voice_host::VoiceControlAnswer>()
             .ok()
             .is_some_and(|result| {
                 matches!(
                     result,
-                    kr_protocol::voice_host::VoiceControlResult::Heartbeat { .. }
+                    kr_protocol::voice_host::VoiceControlAnswer::Heartbeat { .. }
                 )
             }),
         _ => false,
