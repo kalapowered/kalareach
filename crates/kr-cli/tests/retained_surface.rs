@@ -38,6 +38,10 @@ use std::path::{Path, PathBuf};
 use kr_protocol::retained::{RETAINED, RetainedLevel};
 use serde_json::{Value, json};
 
+#[path = "retained_surface/history.rs"]
+mod history;
+#[path = "retained_surface/history_cases.rs"]
+mod history_cases;
 #[path = "retained_surface/narrower.rs"]
 mod narrower;
 #[path = "retained_surface/narrower_cases.rs"]
@@ -49,6 +53,10 @@ mod probes;
 // The reader that `kr-protocol-gen` records a level's table of public majors with.
 #[path = "../../kr-protocol/src/bin/kr-protocol-gen/public_majors.rs"]
 mod public_majors;
+// The tags of the repository and origin's list, which `kr-protocol-gen` reads the same way.
+#[allow(dead_code)]
+#[path = "../../kr-protocol/src/bin/kr-protocol-gen/releases.rs"]
+mod releases;
 #[path = "retained_surface/walker.rs"]
 mod walker;
 #[path = "retained_surface/walker_cases.rs"]
@@ -409,6 +417,27 @@ fn the_entries_of_the_narrower_table_hold() {
     };
     let problems = check_narrower(&input);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The senders of each entry at every release below its level are the ones the entry lists. Run by
+/// hand: it extracts every release tag, which takes minutes.
+#[test]
+#[ignore = "reads every release tag below the level of each entry"]
+fn the_senders_of_each_entry_at_each_release() {
+    for entry in narrower_table::NARROWER {
+        let started = std::time::Instant::now();
+        let (expected, snapshots) = history::read_history(&repository(), entry)
+            .unwrap_or_else(|error| panic!("{}: {error}", entry.root));
+        println!(
+            "read {} releases for {} in {:?}",
+            snapshots.len(),
+            entry.root,
+            started.elapsed()
+        );
+        let report = history::audit_tags(entry, &expected, &snapshots);
+        history::print_report(&report);
+        assert!(report.problems.is_empty(), "{}", report.problems.join("\n"));
+    }
 }
 
 fn before_items(record: &Value) -> Vec<&str> {
