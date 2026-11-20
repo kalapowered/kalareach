@@ -417,9 +417,13 @@ pub enum HostEnd {
         broker_notified: bool,
     },
     /// The host answered the stop with a refusal that says it holds no call of this device by that
-    /// name: it ended the call, it started again, or the call is another device's. A stop from
-    /// this device can end nothing more there. It does not say a grant is gone, or that a fence the
-    /// host owes its workers is done; the host keeps what it owes.
+    /// name: it took the call out of its list, it started again, or the call is another device's.
+    /// A stop from this device can end nothing more there. It does not say that the provider
+    /// closed the call (the host takes a call out of its list before it closes it there), that a
+    /// grant is gone, or that a fence the host owes its workers is done; the host keeps what it
+    /// owes. For a call the host controls, the device then looks for the provider's close word in
+    /// the host's final status, and with none it tells the person that it did not hear from the
+    /// host that the provider closed the call.
     NotHeld {
         /// What the host said.
         words: String,
