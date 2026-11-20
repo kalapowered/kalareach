@@ -1513,7 +1513,7 @@ fn a_set_aside_never_replaces_a_name_that_is_used() {
 fn a_set_aside_whose_flush_failed_is_owed_and_completed_before_any_adoption() {
     let data = data();
     let window = Window::over(data.path());
-    window.draft("a draft");
+    let (owed_id, owed_revision) = window.draft("a draft");
     let damaged = b"[ truncated".to_vec();
     std::fs::write(data.path().join("drafts-removals"), &damaged).expect("damaged");
     let _clock = testing::clock(data.path(), 7);
@@ -1555,6 +1555,17 @@ fn a_set_aside_whose_flush_failed_is_owed_and_completed_before_any_adoption() {
         let refusal = (window.drafts())
             .clone()
             .expect_err("the call is refused again");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
+    {
+        // A change of the list is refused for the same reason, before it writes anything: the
+        // flush is owed to the list that was put in place, whoever asks next.
+        let refusal = (window.call(
+            "device_draft_mark_removal",
+            json!({ "id": owed_id, "expectedRevision": owed_revision }),
+        ))
+        .clone()
+        .expect_err("a change of the list waits for the owed flush");
         assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
     }
     slot.lock().expect("a lock").take();
@@ -1998,10 +2009,18 @@ fn a_repair_and_an_update_sweep_staged_files_and_a_listing_does_not() {
 #[test]
 fn a_later_keep_flushes_nothing_more_of_the_path() {
     let data = data();
-    let window = Window::over(data.path());
+    // A parent of the store's data folder that only this case uses: the temporary folder is shared by
+    // the cases that run together, and a refusal of its flush would reach them.
+    let parent = data.path().join("parent");
+    std::fs::create_dir(&parent).expect("the parent");
+    let store = parent.join("data");
+    std::fs::create_dir(&store).expect("the data folder");
+    let window = Window::over(&store);
     window.keep(message(1, "first", &[])).expect("kept");
-    let parent = data.path().parent().expect("a parent").to_path_buf();
-    let guard = kr_flush::testing::refuse_flushes_of(parent);
+    // The walk that proves a path durable flushes the names as they resolve, so the refusal names the
+    // resolved parent: on a host whose temporary folder sits under a link the spelled one is never met.
+    let resolved = parent.canonicalize().expect("a resolved path");
+    let guard = kr_flush::testing::refuse_flushes_of(resolved);
     let second = window.keep(message(2, "second", &[]));
     drop(guard);
     assert!(
