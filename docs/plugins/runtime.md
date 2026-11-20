@@ -551,7 +551,10 @@ variant, or a member added to a record of one, would meet a worker or a host of 
 that adopted it: it ends the connection, and every binding on it, over a frame it cannot read. A
 change to a frame, or to one of the rules a host reads a request under, would need a new protocol, and no
 release can make one today: a retained level must record this release's protocol name ([the support
-window](../releases/support-window.md)). The rules are these.
+window](../releases/support-window.md)). One frame was added after the release: the start failure
+frame, which a host that could not start sends in place of its claim, on the rendezvous connection
+only, to the launcher that started it. An earlier launcher keeps it as a refusal and waits for its own
+deadline. The rules are these.
 
 - The reading task answers `hello`, `verify`, `event`, `health`, `revise_facts`, `revise_attachments`
   and `privacy` without entering a component. The other requests that name a binding run in a task of

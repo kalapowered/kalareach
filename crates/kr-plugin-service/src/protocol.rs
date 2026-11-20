@@ -137,6 +137,51 @@ pub struct RendezvousAccepted {
     pub endpoint: String,
 }
 
+/// The longest reason a plugin host's start failure carries, in bytes.
+pub const MAX_FAILURE_REASON_BYTES: usize = 400;
+
+/// What a plugin host that could not start tells the launcher that started it, in place of the
+/// claim.
+///
+/// It carries no endpoint and no signature. Only a bind failure says "listen", and the host has no
+/// endpoint to name when an earlier step failed. The kernel's account of the connecting process,
+/// which the launcher checks before it reads anything, is what authenticates the frame, as it does
+/// the claim; the frame asks the launcher to do nothing but report the reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStartFailure {
+    /// The reservation this process was started for.
+    pub reservation_id: ReservationId,
+    /// The environment it was to serve.
+    pub environment_id: EnvironmentId,
+    /// Why it could not start: one line of at most [`MAX_FAILURE_REASON_BYTES`] bytes.
+    pub reason: String,
+}
+
+/// `text` as one line of at most [`MAX_FAILURE_REASON_BYTES`] bytes: each control character
+/// becomes a space, and a longer text is cut at a character boundary.
+#[must_use]
+pub fn failure_reason_line(text: &str) -> String {
+    let mut line: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if line.len() > MAX_FAILURE_REASON_BYTES {
+        let mut end = MAX_FAILURE_REASON_BYTES;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+    }
+    line
+}
+
 /// The plugin host's answer to a verification challenge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

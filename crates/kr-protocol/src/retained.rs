@@ -153,6 +153,13 @@ pub const FROZEN_VARIANTS: &[&str] = &[
 /// Every frame of a released protocol is closed: a request, a response or notice variant, or a
 /// member added to a record after a release exists would meet a host or a worker of the release
 /// before that the level records by this name alone, and no check would see it.
+///
+/// One frame is the exception: `HostStartFailure` was added after the release, and a host that
+/// could not start sends it in place of its claim, on the rendezvous connection only, to the
+/// launcher of the release that started it. An installed daemon starts the host from beside its own
+/// release's worker and takes no `--worker`; a pair of two releases exists only in a layout with no
+/// store, and there a launcher of the earlier release keeps the frame as a refusal and waits to its
+/// own deadline, as it did before.
 pub const PLUGIN_HOST_PROTOCOL: &str = "kr-plugin-host/3";
 
 /// The definition that names the parameters of a read the control daemon makes of a worker itself,
