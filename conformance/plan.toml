@@ -1924,6 +1924,7 @@ command = [
     'a_typescript_call_is_a_test_only_when_it_names_one',
     'every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edited',
     'a_relative_root_finds_the_compiler_the_plan_names',
+    'a_run_reads_typescript_with_the_compiler_the_command_line_names_given_absolute_or_relative',
     'the_compiler_is_the_package_a_directory_holds_and_no_directory_above_it_is_searched',
 ]
 
@@ -2276,11 +2277,12 @@ cases = [
     'a_typescript_call_is_a_test_only_when_it_names_one',
     'every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edited',
     'a_relative_root_finds_the_compiler_the_plan_names',
+    'a_run_reads_typescript_with_the_compiler_the_command_line_names_given_absolute_or_relative',
     'the_compiler_is_the_package_a_directory_holds_and_no_directory_above_it_is_searched',
 ]
 [ignored_run.runs]
 kind = 'plan'
-line = 'cargo test --locked -p kr-conformance --test discovery -- --ignored --exact a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names a_typescript_call_is_a_test_only_when_it_names_one every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edited a_relative_root_finds_the_compiler_the_plan_names the_compiler_is_the_package_a_directory_holds_and_no_directory_above_it_is_searched --show-output'
+line = 'cargo test --locked -p kr-conformance --test discovery -- --ignored --exact a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names a_typescript_call_is_a_test_only_when_it_names_one every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edited a_relative_root_finds_the_compiler_the_plan_names a_run_reads_typescript_with_the_compiler_the_command_line_names_given_absolute_or_relative the_compiler_is_the_package_a_directory_holds_and_no_directory_above_it_is_searched --show-output'
 
 [[ignored_run]]
 package = 'kr-controller'
