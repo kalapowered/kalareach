@@ -3,8 +3,8 @@
 //!
 //! A channel message is never a draft: no draft reader lists it, no composer takes it, and drafts
 //! synchronisation never sees it, because it lives in a directory of its own beside the drafts.
-//! Only the person removes a message, and only a final receipt, "I checked; send anyway" or a keep
-//! removes a record of a send that was under way.
+//! Only the person removes a message. A record of a send that was under way is removed by a final
+//! receipt, by a keep that ends it, or by the person; "I checked; send anyway" leaves it.
 //!
 //! * **One layout, version 1.** `channel-messages/` holds `<action_id>.message` (the whole text and
 //!   what the page needs to show it), `<hold_id>.held` (a send that is under way: no text), the
@@ -23,6 +23,7 @@
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use kr_flush::{NameKind, flush_directory};
@@ -449,10 +450,24 @@ const MESSAGE_SUFFIX: &str = ".message";
 const HOLD_SUFFIX: &str = ".held";
 /// What a name that a write staged under holds.
 const STAGED_MARK: &str = ".staged-";
+/// What a person reads when the store's folder or lock cannot be used. The cause follows it.
+const STORE: &str = "This device could not read or write its channel messages";
+/// What a person reads when the list of removals could not be set aside. The cause follows it.
+const NOT_SET_ASIDE: &str =
+    "This device could not set the list aside. The original list is still in place";
 /// The layout of both kinds of file.
 const VERSION: u32 = 1;
-const MAX_LABEL_BYTES: usize = 256;
 const MAX_DRAFT_REFERENCES: usize = 2;
+
+/// A member that is in the file, null or not: serde reads a missing `Option` as null unless told,
+/// and a file with a member less is of another layout.
+fn required<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 
 /// One message, as its file holds it. Exactly these members: a file with another `version` or a
 /// member more or fewer is of another layout and is never read.
@@ -461,15 +476,20 @@ const MAX_DRAFT_REFERENCES: usize = 2;
 struct MessageFile {
     version: u32,
     action_id: ActionId,
+    #[serde(deserialize_with = "required")]
     hold_id: Option<String>,
     local_id: String,
     session_id: SessionId,
+    #[serde(deserialize_with = "required")]
     application_instance_id: Option<ApplicationInstanceId>,
+    #[serde(deserialize_with = "required")]
     agent_binding_revision: Option<AgentBindingRevision>,
+    #[serde(deserialize_with = "required")]
     environment_id: Option<EnvironmentId>,
     host_name: String,
     text: String,
-    sent_at_ms: TimestampMs,
+    /// Milliseconds, as a JSON number.
+    sent_at_ms: u64,
     drafts: Vec<DiscardParams>,
 }
 
@@ -487,14 +507,19 @@ struct HoldFile {
     version: u32,
     kind: HeldKind,
     hold_id: String,
+    #[serde(deserialize_with = "required")]
     action_id: Option<ActionId>,
     local_id: String,
     session_id: SessionId,
+    #[serde(deserialize_with = "required")]
     application_instance_id: Option<ApplicationInstanceId>,
+    #[serde(deserialize_with = "required")]
     agent_binding_revision: Option<AgentBindingRevision>,
+    #[serde(deserialize_with = "required")]
     environment_id: Option<EnvironmentId>,
     host_name: String,
-    sent_at_ms: TimestampMs,
+    /// Milliseconds, as a JSON number.
+    sent_at_ms: u64,
     drafts: Vec<DiscardParams>,
 }
 
@@ -553,17 +578,13 @@ fn failed(what: &str, error: &std::io::Error) -> CommandError {
     CommandError::local_failure(format!("{what}: {error}"))
 }
 
-fn reference_key(reference: &DiscardParams) -> String {
-    serde_json::to_string(reference).unwrap_or_default()
-}
-
+/// Whether two lists name the same drafts, as sets: an order or a repeat makes no difference.
 fn same_references(left: &[DiscardParams], right: &[DiscardParams]) -> bool {
-    let sorted = |references: &[DiscardParams]| {
-        let mut keys: Vec<String> = references.iter().map(reference_key).collect();
-        keys.sort();
-        keys
-    };
-    sorted(left) == sorted(right)
+    left.iter()
+        .all(|reference| names_reference(right, reference))
+        && right
+            .iter()
+            .all(|reference| names_reference(left, reference))
 }
 
 fn names_reference(references: &[DiscardParams], line: &DiscardParams) -> bool {
@@ -697,7 +718,7 @@ impl Scan {
                     environment_id: file.environment_id,
                     host_name: file.host_name,
                     text: with_text.then_some(file.text),
-                    sent_at_ms: file.sent_at_ms,
+                    sent_at_ms: TimestampMs::new(file.sent_at_ms),
                 })
                 .collect(),
             holds: self
@@ -712,7 +733,7 @@ impl Scan {
                     agent_binding_revision: file.agent_binding_revision,
                     environment_id: file.environment_id,
                     host_name: file.host_name,
-                    sent_at_ms: file.sent_at_ms,
+                    sent_at_ms: TimestampMs::new(file.sent_at_ms),
                     drafts: file.drafts,
                 })
                 .collect(),
@@ -782,6 +803,9 @@ fn now_ms(data: &Path) -> u64 {
 pub struct ChannelDesk {
     /// The application data directory, once it is known.
     data: Mutex<Option<PathBuf>>,
+    /// Whether the folder was made and every name on its path proved durable once by this desk: a
+    /// later lock flushes nothing more while the folder is there.
+    prepared: AtomicBool,
 }
 
 impl std::fmt::Debug for ChannelDesk {
@@ -803,11 +827,7 @@ impl ChannelDesk {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-            .ok_or_else(|| {
-                CommandError::unsupported(
-                    "messages cannot be kept on this device: it has no place for them",
-                )
-            })
+            .ok_or_else(|| CommandError::unsupported(STORE))
     }
 
     /// Takes the store's lock. With `create` the folder is made first, each new name along the path
@@ -817,14 +837,17 @@ impl ChannelDesk {
         let directory = kept_in(&self.data()?);
         let gate = CHANNEL_GATE.lock().unwrap_or_else(PoisonError::into_inner);
         if create {
-            kr_client::drafts::private_directory(&directory)
-                .map_err(|error| failed("the channel messages' folder cannot be made", &error))?;
+            if !(self.prepared.load(Ordering::Acquire) && directory.is_dir()) {
+                kr_client::drafts::private_directory(&directory)
+                    .map_err(|error| failed(STORE, &error))?;
+                self.prepared.store(true, Ordering::Release);
+            }
         } else {
             match std::fs::metadata(&directory) {
                 Ok(held) if held.is_dir() => {}
                 Ok(_) => {
                     return Err(storage(
-                        "the channel messages' folder",
+                        STORE,
                         &std::io::Error::new(ErrorKind::NotADirectory, "it is not a directory"),
                     ));
                 }
@@ -836,11 +859,11 @@ impl ChannelDesk {
                         _lock: None,
                     });
                 }
-                Err(error) => return Err(storage("the channel messages' folder", &error)),
+                Err(error) => return Err(storage(STORE, &error)),
             }
         }
         let report = |error: &std::io::Error| {
-            let what = "the channel messages' lock cannot be taken";
+            let what = STORE;
             if create {
                 failed(what, error)
             } else {
@@ -860,7 +883,7 @@ impl ChannelDesk {
     /// Proves the folder and its name in the data directory durable, which a read of what they hold
     /// relies on.
     fn make_durable(&self, held: &Held) -> Result<()> {
-        let what = "the channel messages' folder cannot be proved durable";
+        let what = STORE;
         flush_directory(&held.directory, NameKind::File).map_err(|error| storage(what, &error))?;
         flush_directory(&self.data()?, NameKind::Directory).map_err(|error| storage(what, &error))
     }
@@ -877,8 +900,7 @@ impl ChannelDesk {
             return Ok(Scan::default().into_list(with_text, limits));
         }
         self.make_durable(&held)?;
-        let found = scan(&held.directory)
-            .map_err(|error| storage("the channel messages cannot be read", &error))?;
+        let found = scan(&held.directory).map_err(|error| storage(STORE, &error))?;
         Ok(found.into_list(with_text, limits))
     }
 
@@ -892,15 +914,23 @@ impl ChannelDesk {
     /// Returns why the drafts cannot be read, or why the folder and the data directory cannot be
     /// proved durable: no draft may be put in a composer while that is unknown.
     pub fn read_drafts(&self, drafts: &DraftDesk) -> Result<Stored> {
-        drafts.settle_owed_flush()?;
         let held = self.lock(false)?;
+        // Under the lock, before any draft is read: the data directory that holds the list of
+        // removals is proved durable at every read, whichever process published the list, and
+        // whether or not there is a folder of messages.
+        drafts.settle_owed_flush()?;
+        if held.present {
+            self.make_durable(&held)?;
+        } else {
+            flush_directory(&self.data()?, NameKind::Directory)
+                .map_err(|error| storage(STORE, &error))?;
+        }
+        held.sweep();
         let mut stored = drafts.read()?;
         if !held.present {
             return Ok(stored);
         }
-        self.make_durable(&held)?;
-        let found = scan(&held.directory)
-            .map_err(|error| storage("the channel messages cannot be read", &error))?;
+        let found = scan(&held.directory).map_err(|error| storage(STORE, &error))?;
         let mut owed: Vec<DiscardParams> = Vec::new();
         for message in &found.messages {
             for reference in &message.drafts {
@@ -920,11 +950,7 @@ impl ChannelDesk {
                         || hold.action_id == Some(message.action_id)
                 });
                 if ended {
-                    let _ = remove_durably(
-                        &held
-                            .directory
-                            .join(format!("{}{HOLD_SUFFIX}", hold.hold_id)),
-                    );
+                    let _ = remove_hold(&held.directory, &hold.hold_id, false);
                 }
             }
         }
@@ -963,7 +989,7 @@ impl ChannelDesk {
             environment_id: params.environment_id,
             host_name: params.host_name,
             text: params.text,
-            sent_at_ms: params.sent_at_ms,
+            sent_at_ms: params.sent_at_ms.get(),
             drafts: params.drafts,
         };
         let mut wrote = false;
@@ -979,55 +1005,51 @@ impl ChannelDesk {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 let encoded = serde_json::to_vec(&entry)
                     .map_err(|error| CommandError::local_failure(error.to_string()))?;
-                let used = usage(&directory)
-                    .map_err(|error| storage("the channel messages cannot be counted", &error))?;
-                reach(&directory, Point::AfterCountRead)
-                    .map_err(|error| failed("the message cannot be kept", &error))?;
+                let used = usage(&directory).map_err(|error| storage(STORE, &error))?;
+                reach(&directory, Point::AfterCountRead).map_err(|error| failed(STORE, &error))?;
                 let limits = limits_of(&directory);
                 if used.entries >= limits.entries
                     || used.bytes.saturating_add(length_of(&encoded)) > limits.bytes
                 {
                     return Err(CommandError::too_large(
-                        "Channel messages is full: nothing was kept and nothing was removed",
+                        "Channel messages is full. Remove some on the Kept drafts page.",
                     ));
                 }
-                publish(&path, &encoded, || Ok(()))
-                    .map_err(|fault| failed("the message cannot be kept", &fault.error))?;
+                publish(&path, &encoded, || Ok(())).map_err(|fault| failed(STORE, &fault.error))?;
                 wrote = true;
             }
-            Err(error) => return Err(storage("the kept message cannot be read", &error)),
+            Err(error) => return Err(storage(STORE, &error)),
         }
         if !wrote {
-            flush_directory(&directory, NameKind::File)
-                .map_err(|error| failed("the kept message cannot be proved durable", &error))?;
+            flush_directory(&directory, NameKind::File).map_err(|error| failed(STORE, &error))?;
         }
-        reach(&directory, Point::AfterEntry)
-            .map_err(|error| failed("the message cannot be kept", &error))?;
-        if !entry.drafts.is_empty() {
-            match drafts.mark_removals(&entry.drafts) {
-                Ok(_) => {}
-                Err(fault) => {
-                    if wrote && !fault.renamed {
-                        let named = match drafts.ledger() {
-                            Ledger::Whole(lines) => lines
-                                .iter()
-                                .any(|line| names_reference(&entry.drafts, line)),
-                            // A ledger that cannot be read may name them.
-                            _ => true,
-                        };
-                        if !named {
-                            let _ = remove_durably(&path);
-                        }
+        reach(&directory, Point::AfterEntry).map_err(|error| failed(STORE, &error))?;
+        // Every keep, a resume and one with no references included, takes the ledger step: over a
+        // ledger that cannot be read it fails, and it proves the data directory durable.
+        match drafts.mark_removals(&entry.drafts) {
+            Ok(_) => {}
+            Err(fault) => {
+                if wrote && !fault.renamed {
+                    let named = match drafts.ledger() {
+                        Ledger::Whole(lines) => lines
+                            .iter()
+                            .any(|line| names_reference(&entry.drafts, line)),
+                        // A ledger that cannot be read may name them.
+                        _ => true,
+                    };
+                    if !named {
+                        let _ = remove_durably(&path);
                     }
-                    return Err(fault.error);
                 }
+                return Err(fault.error);
             }
         }
         if let Some(hold_id) = &entry.hold_id
             && reach(&directory, Point::HoldRemoval).is_ok()
         {
             // The repair removes a record that an entry names, so a failure here is not the keep's.
-            let _ = remove_durably(&directory.join(format!("{hold_id}{HOLD_SUFFIX}")));
+            // A record that is damaged or of a later layout is not this release's to remove.
+            let _ = remove_hold(&directory, hold_id, false);
         }
         Ok(Kept { resumed: !wrote })
     }
@@ -1048,8 +1070,7 @@ impl ChannelDesk {
         if !held.present {
             return Ok(Removed { removed: 0 });
         }
-        let found = scan(&held.directory)
-            .map_err(|error| storage("the channel messages cannot be read", &error))?;
+        let found = scan(&held.directory).map_err(|error| storage(STORE, &error))?;
         let mut removed = 0;
         for message in &found.messages {
             let chosen = params.action_id == Some(message.action_id)
@@ -1063,11 +1084,10 @@ impl ChannelDesk {
             ) {
                 Ok(()) => removed += 1,
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(failed("the message cannot be removed", &error)),
+                Err(error) => return Err(failed(STORE, &error)),
             }
         }
-        flush_directory(&held.directory, NameKind::File)
-            .map_err(|error| failed("the removal cannot be proved durable", &error))?;
+        flush_directory(&held.directory, NameKind::File).map_err(|error| failed(STORE, &error))?;
         Ok(Removed { removed })
     }
 
@@ -1097,11 +1117,10 @@ impl ChannelDesk {
                 "a record is already kept under this identity",
             ));
         }
-        let readable = readable_holds(&held.directory)
-            .map_err(|error| storage("the records of sends cannot be read", &error))?;
+        let readable = readable_holds(&held.directory).map_err(|error| storage(STORE, &error))?;
         if readable >= limits_of(&held.directory).holds {
             return Err(CommandError::too_large(
-                "too many records of messages being sent are kept",
+                "Too many messages have no confirmed outcome. Check the sessions, then send again.",
             ));
         }
         let file = HoldFile {
@@ -1115,7 +1134,7 @@ impl ChannelDesk {
             agent_binding_revision: params.agent_binding_revision,
             environment_id: params.environment_id,
             host_name: params.host_name,
-            sent_at_ms: params.sent_at_ms,
+            sent_at_ms: params.sent_at_ms.get(),
             drafts: params.drafts,
         };
         write_hold(&path, &file)
@@ -1133,6 +1152,7 @@ impl ChannelDesk {
             return Err(CommandError::invalid("this is not a record's identity"));
         }
         let held = self.lock(false)?;
+        held.sweep();
         let path = held
             .directory
             .join(format!("{}{HOLD_SUFFIX}", params.hold_id));
@@ -1143,11 +1163,11 @@ impl ChannelDesk {
                     "no record is kept under this identity",
                 ));
             }
-            Err(error) => return Err(storage("the record cannot be read", &error)),
+            Err(error) => return Err(storage(STORE, &error)),
         };
         let Parsed::Whole(mut file) = parse_hold(&bytes, &params.hold_id) else {
             return Err(CommandError::invalid(
-                "this record cannot be read by this version of the application",
+                "This record could not be read by this version of the application. It was left as it is.",
             ));
         };
         if file
@@ -1176,17 +1196,8 @@ impl ChannelDesk {
         if !held.present {
             return Ok(());
         }
-        let path = held
-            .directory
-            .join(format!("{}{HOLD_SUFFIX}", params.hold_id));
-        if let Ok(bytes) = std::fs::read(&path)
-            && matches!(parse_hold(&bytes, &params.hold_id), Parsed::Layout)
-        {
-            return Err(CommandError::invalid(
-                "this record belongs to another version of the application",
-            ));
-        }
-        remove_durably(&path).map_err(|error| failed("the record cannot be removed", &error))
+        // The person's own removal also takes a record that is damaged, which nothing else removes.
+        remove_hold(&held.directory, &params.hold_id, true)
     }
 
     /// Sets a damaged ledger aside and starts a rebuilt one: the bytes are copied to a file of
@@ -1205,12 +1216,17 @@ impl ChannelDesk {
         let _ = reach(&data, Point::SetAsideLocked);
         if !matches!(locked.read(), Ledger::Damaged) {
             return Err(CommandError::invalid(
-                "the list of removals is not damaged, so it is not set aside",
+                "The list of removals is not damaged, so it was not set aside.",
             ));
         }
+        // The rebuilt list names the sources of the entries it lists, and a name in it is removed at
+        // the next start: the entries' names are proved durable first, under this lock, or nothing
+        // moves.
+        if held.present {
+            self.make_durable(&held)?;
+        }
         let rebuilt = if held.present {
-            let found = scan(&held.directory)
-                .map_err(|error| storage("the channel messages cannot be read", &error))?;
+            let found = scan(&held.directory).map_err(|error| storage(STORE, &error))?;
             let mut rebuilt: Vec<DiscardParams> = Vec::new();
             for message in &found.messages {
                 for reference in &message.drafts {
@@ -1224,17 +1240,15 @@ impl ChannelDesk {
             Vec::new()
         };
         let bytes = std::fs::read(locked.file())
-            .map_err(|error| failed("the list of removals cannot be read", &error))?;
+            .map_err(|error| failed("This device could not read its list of removals", &error))?;
         // Owed before anything moves: a flush that fails from here on is finished by the next read
         // of the drafts or change of the ledger, whichever comes first.
         drafts.owe_flush();
         let copy = data.join(format!("drafts-removals.set-aside-{}", now_ms(&data)));
         kr_client::drafts::write_whole(&copy, &bytes)
-            .map_err(|error| failed("the list of removals cannot be copied", &error))?;
-        flush_directory(&data, NameKind::File)
-            .map_err(|error| failed("the copy cannot be proved durable", &error))?;
-        reach(&data, Point::SetAsideCopied)
-            .map_err(|error| failed("the list of removals cannot be set aside", &error))?;
+            .map_err(|error| failed(NOT_SET_ASIDE, &error))?;
+        flush_directory(&data, NameKind::File).map_err(|error| failed(NOT_SET_ASIDE, &error))?;
+        reach(&data, Point::SetAsideCopied).map_err(|error| failed(NOT_SET_ASIDE, &error))?;
         match locked.publish(&rebuilt) {
             Ok(()) => {
                 drafts.clear_owed_flush();
@@ -1243,20 +1257,44 @@ impl ChannelDesk {
                     confirmed: true,
                 })
             }
-            Err(fault) if fault.renamed => Ok(SetAside {
-                moved: true,
-                confirmed: false,
-            }),
-            Err(fault) => Err(failed(
-                "the list of removals cannot be set aside: nothing was moved",
-                &fault.error,
-            )),
+            Err(fault) if fault.renamed => {
+                // Owed again: another window's read may have settled the flag before the rename.
+                drafts.owe_flush();
+                Ok(SetAside {
+                    moved: true,
+                    confirmed: false,
+                })
+            }
+            Err(fault) => Err(failed(NOT_SET_ASIDE, &fault.error)),
         }
     }
 }
 
+/// Removes the record of a send under `hold_id`, once its bytes are read: a record that is absent is
+/// already removed (and the folder is flushed all the same), one of a later layout is left alone,
+/// and one that is damaged goes only when `damaged_too` says the person asked for it. A read error
+/// other than absence refuses and removes nothing.
+fn remove_hold(directory: &Path, hold_id: &str, damaged_too: bool) -> Result<()> {
+    let path = directory.join(format!("{hold_id}{HOLD_SUFFIX}"));
+    match std::fs::read(&path) {
+        Ok(bytes) => match parse_hold(&bytes, hold_id) {
+            Parsed::Whole(_) => {}
+            Parsed::Damaged if damaged_too => {}
+            Parsed::Damaged => return Ok(()),
+            Parsed::Layout => {
+                return Err(CommandError::invalid(
+                    "This record could not be read by this version of the application. It was left as it is.",
+                ));
+            }
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(storage(STORE, &error)),
+    }
+    remove_durably(&path).map_err(|error| failed(STORE, &error))
+}
+
 fn check_label(what: &str, value: &str, least: usize) -> Result<()> {
-    if value.len() < least || value.len() > MAX_LABEL_BYTES {
+    if value.len() < least {
         return Err(CommandError::invalid(format!(
             "{what} is not of a length that can be kept"
         )));
@@ -1283,6 +1321,5 @@ fn check_keep(params: &KeepParams) -> Result<()> {
 fn write_hold(path: &Path, file: &HoldFile) -> Result<()> {
     let encoded =
         serde_json::to_vec(file).map_err(|error| CommandError::local_failure(error.to_string()))?;
-    publish(path, &encoded, || Ok(()))
-        .map_err(|fault| failed("the record cannot be kept", &fault.error))
+    publish(path, &encoded, || Ok(())).map_err(|fault| failed(STORE, &fault.error))
 }

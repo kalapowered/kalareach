@@ -435,7 +435,7 @@ impl DraftDesk {
         flush_directory(&data, NameKind::File).map_err(|error| {
             CommandError::new(
                 ErrorCode::StorageUnavailable,
-                format!("the removals still to be made cannot yet be proved durable: {error}"),
+                format!("This device could not read or write its channel messages: {error}"),
             )
         })?;
         self.flush_owed.store(false, Ordering::SeqCst);
@@ -447,11 +447,11 @@ impl DraftDesk {
     /// first.
     pub(crate) fn lock_ledger(&self) -> Result<LedgerLocked<'_>> {
         let data = self.data().ok_or_else(|| {
-            CommandError::unsupported("removals cannot be kept: there is no place for them")
+            CommandError::unsupported("This device could not read or write its channel messages")
         })?;
         let unavailable = |error: std::io::Error| {
             CommandError::local_failure(format!(
-                "the removals still to be made cannot be kept: {error}"
+                "This device could not read or write its channel messages: {error}"
             ))
         };
         let gate = LEDGER_GATE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -508,7 +508,7 @@ impl DraftDesk {
                 return Err(RemovalFault {
                     renamed: false,
                     error: CommandError::local_failure(format!(
-                        "the removals still to be made cannot be read: {error}"
+                        "This device could not read its list of removals: {error}"
                     )),
                 });
             }
@@ -516,7 +516,7 @@ impl DraftDesk {
                 return Err(RemovalFault {
                     renamed: false,
                     error: CommandError::local_failure(
-                        "the list of removals still to be made is damaged and cannot be read",
+                        "This device could not read its list of removals",
                     ),
                 });
             }
@@ -525,7 +525,7 @@ impl DraftDesk {
             flush_directory(&locked.data, NameKind::File).map_err(|error| RemovalFault {
                 renamed: true,
                 error: CommandError::local_failure(format!(
-                    "the removals still to be made cannot be proved durable: {error}"
+                    "This device could not read or write its channel messages: {error}"
                 )),
             })?;
             return Ok(Change::Unchanged);
@@ -533,7 +533,7 @@ impl DraftDesk {
         locked.publish(&removals).map_err(|fault| RemovalFault {
             renamed: fault.renamed,
             error: CommandError::local_failure(format!(
-                "the removals still to be made cannot be kept: {}",
+                "This device could not read or write its channel messages: {}",
                 fault.error
             )),
         })?;
