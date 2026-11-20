@@ -528,6 +528,10 @@ impl UpstreamDispatch for ChannelDispatch {
         ActionProvenance::AuthenticatedHookResponse
     }
 
+    fn queues_through_gate(&self, _request: &UpstreamRequest) -> bool {
+        true
+    }
+
     fn submit_gated(
         &self,
         request: &UpstreamRequest,
@@ -1050,6 +1054,23 @@ mod tests {
             turn_id: None,
             body,
         }
+    }
+
+    /// A channel queues what it carries through the gate it is handed, so that a caller that stops
+    /// waiting before the queue took it can say that nothing was sent.
+    #[test]
+    fn a_channel_queues_through_its_gate() {
+        let (queue, _outgoing) = tokio::sync::mpsc::channel(MAX_QUEUED_ANSWERS);
+        let channel = ChannelDispatch {
+            connection: GatewayConnectionId::new(7),
+            queue: Mutex::new(Some(queue)),
+            counted: None,
+            shape: None,
+            prompts: Arc::new(AtomicUsize::new(0)),
+        };
+        assert!(
+            channel.queues_through_gate(&request(RichOperation::PromptQueue, UpstreamBody::Cancel))
+        );
     }
 
     /// A submit into the session, a steer, a cancellation and a package's action are refused on

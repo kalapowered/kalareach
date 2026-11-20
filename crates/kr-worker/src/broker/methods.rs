@@ -75,6 +75,16 @@ pub struct UpstreamRequest {
     pub body: UpstreamBody,
 }
 
+impl UpstreamRequest {
+    /// What a channel's queue would take for this request, in the words of a refusal.
+    pub(crate) const fn taking(&self) -> &'static str {
+        match self.body {
+            UpstreamBody::Prompt { .. } => "message",
+            _ => "answer",
+        }
+    }
+}
+
 /// What one prepared operation actually asks for.
 ///
 /// It is a union rather than bytes because the connector encodes it, and a connector cannot encode
@@ -306,6 +316,16 @@ pub trait UpstreamDispatch: Send + Sync + core::fmt::Debug {
     fn provenance(&self) -> ActionProvenance {
         ActionProvenance::UpstreamTypedRpc
     }
+
+    /// Whether this transport queues `request` through the gate it is handed in
+    /// [`UpstreamDispatch::submit_gated`].
+    ///
+    /// A caller that stops waiting for such a transport before its queue took the operation can
+    /// say that nothing was sent. For any other transport it can only say that it does not know.
+    fn queues_through_gate(&self, request: &UpstreamRequest) -> bool {
+        let _ = request;
+        false
+    }
 }
 
 /// What the caller of a transport's call and the transport agree on about one operation: whether
@@ -359,13 +379,7 @@ impl SubmitGate {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if matches!(*state, GateState::GivenUp) {
-            return Err(BrokerError::NotTransmitted(Box::new(
-                BrokerError::UpstreamUnavailable {
-                    detail: format!(
-                        "the worker stopped waiting before the channel's queue took the {taking}"
-                    ),
-                },
-            )));
+            return Err(Self::stopped_waiting(taking));
         }
         let queued = queue()?;
         *state = GateState::Queued(detail.to_owned());
@@ -373,6 +387,17 @@ impl SubmitGate {
         #[cfg(feature = "testing")]
         self.at_queueing_pause();
         Ok(queued)
+    }
+
+    /// What a caller is told when it stopped waiting before a channel's queue took `taking`, which
+    /// is an answer or a message: nothing was sent.
+    pub(crate) fn stopped_waiting(taking: &str) -> BrokerError {
+        BrokerError::NotTransmitted(Box::new(BrokerError::UpstreamUnavailable {
+            detail: format!(
+                "The worker stopped waiting before the channel's queue took the {taking}. \
+                 Nothing was sent."
+            ),
+        }))
     }
 
     /// Stops waiting for the operation. Returns the channel end it is if a queue took it, and
