@@ -296,15 +296,17 @@ is due to start is not started.
 When the time is spent, the report asks the step's process group to end, waits two seconds, then
 kills whatever is left of the group, whether or not the step's own process has gone. The step fails
 with the error `ran out of its time limit: <n> s`, where `<n>` is the seconds of the limit that was
-spent, the `timeout` or the budget. The log ends with the same words. The step has no exit status,
-and the run fails.
+spent, the `timeout` or the budget. The report's last line in the log has the same words. The step
+has no exit status, and the run fails.
 
 When the budget is spent, each later step that names it is not run. It has no log and no exit status,
-and its error is `not run because its budget was spent by step <number>`. A step that names it in
-`after` is not run either, and its error ends
+and its error is `not run because its budget was spent by step <number>`. A failed set-up step comes
+first: a step that names in `after` a set-up step that failed, timed out or was not run is not run,
+whatever its budget has left. When the budget stopped that set-up step, the error ends
 `was not run, because its budget was spent by step <number>`. A step that is not run takes no time
-from its budget. A step that its own `timeout` ends before the budget is spent does not stop the
-later steps of the budget.
+from its budget. A step that its own `timeout` ends spends the time it took, with the two seconds
+the kill waits, and stops the later steps of the budget only when that time takes the budget to its
+end. A `timeout` alone does not stop them.
 
 A budget is spent in one run, and `--part` runs one part of a plan, so the steps of a budget must
 fall in one part. A plan cut into parts that puts them in more than one part, or gives a budget to a
@@ -312,24 +314,27 @@ build that opens the plan (every part runs it), is refused before any step runs,
 ``the steps of budget `<id>` fall in more than one part: a budget's steps run in one part``.
 
 On macOS and Linux a step with a limit runs each command as the leader of a process group of its own;
-a step without a limit runs as before. The report does not reap the leader before it has ended the
-group, so the group's number is never another process's. A process of the group that holds open a
-pipe the report reads, after the command has ended, keeps the step waiting until its deadline, and
-the step then runs out of time. The kill does not reach:
+a step without a limit runs as before. When the time is spent, the report sends both signals before
+it reaps the leader, so they go to the step's group and to no other. A process that holds open a
+pipe the report reads after the command has ended (the output of the build, and the output and
+error output of the listing and of the call that asks `rustc` for the host), whether it is in the
+group or not, keeps the step waiting while it holds the pipe. If it still holds the pipe at the
+deadline, the step runs out of time and the report closes the pipe. The kill does not reach:
 
 - a process that leaves the group by starting a session or a group of its own, or that joins another
   group (a daemon, a job-control shell, Node's `detached`, Python's `start_new_session`);
 - a process that the command leaves in the group when it ends in its time and that holds no pipe the
   report reads, because the kill comes only at the deadline;
-- a process that runs as another user, and a process that a service starts for the step (launchd,
-  systemd, a simulator, the adb server);
+- a process that the report has no permission to signal (one that runs as another user, for
+  example), and a process that a service starts for the step (launchd, systemd, a simulator, the
+  adb server);
 - a process in uninterruptible sleep: it outlives the kill until its I/O ends, and when it is the
   step's own process, the report waits for it.
 
 Ctrl-C and a closed terminal reach the report and not the step's group, so an interrupted run can
-leave a step's processes running. A process of the step that opens the terminal, for example to ask
-for a password, stops until the deadline, because the step's group is not the terminal's foreground
-group.
+leave a step's processes running. An interactive command in the step's group stops when it reads
+the controlling terminal, for example to ask for a password, because the group is not the
+terminal's foreground group; it stays stopped until the deadline.
 
 Playwright 1.63.0 starts each browser in a session of its own, so the kill does not reach a browser.
 Playwright's test workers are in the step's group. On the request to end they start to close their
