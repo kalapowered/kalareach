@@ -81,6 +81,10 @@ mod wss;
 pub use error::{ClientError, Result};
 pub use session::{LaunchSurfaceRead, Session, Settled};
 pub use shown::{IoFault, Plain, Said, Shown};
+// The proxy a login is for and the login the daemon is given, which the command line names
+// through this crate and not through the transport's.
+pub use kr_transport::config::ProxyUrl;
+pub use kr_transport::proxy::{ProxyCredential, ProxyLoginKind};
 
 #[cfg(test)]
 mod tests {

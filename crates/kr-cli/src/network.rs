@@ -22,6 +22,7 @@ use kr_client::services::description::{self, Description, Ignored, Trust, Unread
 use kr_client::services::matrix::Pins;
 use kr_client::shown;
 use kr_client::shown::Shown;
+use kr_client::{ProxyCredential, ProxyLoginKind, ProxyUrl};
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_protocol::delivery::SecretText;
 use kr_protocol::hostinfo::configuration::{
@@ -33,8 +34,6 @@ use kr_protocol::network_proxy::{
     NetworkProxyLoginClearParams, NetworkProxyLoginResult, NetworkProxyLoginSetParams,
 };
 use kr_protocol::service::GatewayOrigin;
-use kr_transport::config::ProxyUrl;
-use kr_transport::proxy::{ProxyCredential, ProxyLoginKind};
 
 use crate::cli::{EnvironmentSelector, NetworkArguments};
 use crate::daemon::Daemon;
