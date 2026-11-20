@@ -378,18 +378,18 @@ makes the launch's `agent.approval` capability available until the channel close
 connector's table declares how a message is written, the same evidence makes `agent.prompt.queue`
 available.
 
-A queued message goes out on the channel through the same writer as a verdict, in the order
-admitted. The text is `content`. `meta` holds the `sender` and `sender_id` that the host verified:
+A queued message goes out on the channel through the same writer as a verdict, and the writer
+sends frames in queue order. The text is `content`. `meta` holds the `sender` and `sender_id` that the host verified:
 `local_user` for this computer's own account, `paired_device` for a paired device that holds a
 grant. Neither value proves who is typing. The channel holds at most eight messages waiting to be
 written, so they never take the room an answer needs.
 
 Claude Code acknowledges no message, so a message ends as an outcome nobody can establish and is
-never recorded as applied. A new message can still be sent. Text shaped like an answer to an
-approval, or like the channel's own tag, is refused. `agent.prompt` has no evidence, and a submit, a
-steer, a cancellation and any other action of the package are refused with their reasons. A frame
-the table does not route towards the worker closes the channel, since the forwarder relays nothing
-else.
+never recorded as applied. This message's unknown outcome does not hold back the next message.
+Text shaped like an answer to an approval, or like the channel's own tag, is refused.
+`agent.prompt` has no evidence, and a submit, a steer, a cancellation and any other action of the
+package are refused with their reasons. A frame the table does not route towards the worker closes
+the channel, since the forwarder relays nothing else.
 
 The worker interprets an approval when the session holds a binding of the connector's exact package
 (its identifier, publisher and installed hash) whose installation was granted `approval.decode`. The
