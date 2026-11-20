@@ -56,9 +56,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
-    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
@@ -184,39 +183,12 @@ impl SessionJob {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Creates a session's job that also carries user-interface restrictions, for this host's own
-    /// tests: the job a vendor sandbox that makes a desktop of its own cannot run under.
-    ///
-    /// The product's jobs set none; a worker that runs in a job somebody else made may be under
-    /// one, and this is how a test stands one in front of a launch. It is compiled away in every
-    /// shipped build.
-    ///
-    /// # Errors
-    ///
-    /// Returns what [`Self::create`] does, and the operating system's failure when the
-    /// restrictions cannot be set.
-    #[cfg(feature = "testing")]
-    pub fn create_restricting(ui_restrictions: u32) -> std::io::Result<Self> {
-        let created = Self::create()?;
-        created.job.restrict_ui(ui_restrictions)?;
-        Ok(created)
-    }
-
     /// Returns the handle a process creation names this job by.
     ///
     /// The creation's job-list attribute takes the job's own handle, which is how the operating
     /// system performs the assignment itself rather than leaving it to a second call.
     pub(super) fn handle(&self) -> HANDLE {
         self.job.raw()
-    }
-
-    /// Returns the user-interface restrictions this job carries, as the kernel reads them back.
-    ///
-    /// # Errors
-    ///
-    /// Returns the operating system's failure when the limits cannot be read.
-    pub fn ui_restrictions(&self) -> std::io::Result<u32> {
-        self.job.ui_restrictions()
     }
 
     /// Admits a launch to this session, or says the session is closing.
@@ -432,15 +404,6 @@ impl AgentJob {
         self.job.raw()
     }
 
-    /// Returns the user-interface restrictions this job carries, as the kernel reads them back.
-    ///
-    /// # Errors
-    ///
-    /// Returns the operating system's failure when the limits cannot be read.
-    pub fn ui_restrictions(&self) -> std::io::Result<u32> {
-        self.job.ui_restrictions()
-    }
-
     /// Returns whether a process is inside this job.
     ///
     /// # Errors
@@ -602,14 +565,13 @@ impl Job {
         Ok(inside != 0)
     }
 
-    /// Returns the user-interface restrictions this job carries.
-    fn ui_restrictions(&self) -> std::io::Result<u32> {
-        query_ui_restrictions(self.raw())
-    }
-
     /// Restricts the user interface of the processes this job holds, for a test.
     #[cfg(feature = "testing")]
     fn restrict_ui(&self, flags: u32) -> std::io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_UI_RESTRICTIONS, JobObjectBasicUIRestrictions,
+        };
+
         let restrictions = JOBOBJECT_BASIC_UI_RESTRICTIONS {
             UIRestrictionsClass: flags,
         };
@@ -839,30 +801,6 @@ impl Job {
     fn raw(&self) -> HANDLE {
         self.handle.as_raw_handle().cast()
     }
-}
-
-/// Reads the user-interface restrictions of a job, or of the job the calling process is in when
-/// `job` is null.
-fn query_ui_restrictions(job: HANDLE) -> std::io::Result<u32> {
-    // SAFETY: all zeroes is the state of a structure of one integer, which the call fills in.
-    let mut restrictions: JOBOBJECT_BASIC_UI_RESTRICTIONS = unsafe { std::mem::zeroed() };
-    let mut written = 0_u32;
-    // SAFETY: the handle is open for the call or null, which names the caller's own job; the
-    // structure and the count are locals this thread owns, and the declared size is the
-    // structure's own.
-    let read = unsafe {
-        QueryInformationJobObject(
-            job,
-            JobObjectBasicUIRestrictions,
-            std::ptr::from_mut(&mut restrictions).cast(),
-            u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>()).unwrap_or(0),
-            &raw mut written,
-        )
-    };
-    if read == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(restrictions.UIRestrictionsClass)
 }
 
 /// The job each live session's root shell is held by, found by that shell's identifier.
