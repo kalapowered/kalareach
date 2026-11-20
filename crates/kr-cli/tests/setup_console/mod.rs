@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{FILETIME, GetLastError, LUID};
+use windows_sys::Win32::Foundation::{
+    ERROR_NO_MORE_FILES, FILETIME, GetLastError, INVALID_HANDLE_VALUE, LUID,
+};
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
     TOKEN_PRIVILEGES,
@@ -718,19 +720,43 @@ pub struct Thread {
     pub created: u64,
 }
 
-/// The threads of the process `pid` now, each with its creation time.
+/// The threads of the process `pid` now, each with its creation time. The case fails when the
+/// snapshot cannot be taken or the enumeration ends for any reason but the system's end of the
+/// entries: a snapshot that was cut short would let a case read a thread as gone that is live.
+///
+/// # Panics
+///
+/// When the system refuses the snapshot, or an enumeration call fails with an error other than
+/// `ERROR_NO_MORE_FILES`.
 #[must_use]
 pub fn threads_of(pid: u32) -> Vec<Thread> {
     // SAFETY: the call takes integers and returns a handle.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    let snapshot = owned(snapshot).expect("the thread snapshot is taken");
+    // The call says `INVALID_HANDLE_VALUE`, not null, when it fails.
+    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+        // SAFETY: the call reads the calling thread's last error.
+        let code = unsafe { GetLastError() };
+        panic!("the thread snapshot is taken, and the system said {code}");
+    }
+    // SAFETY: the snapshot was just opened and nothing else owns it.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.cast()) };
     // SAFETY: the structure is plain data that the calls fill.
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
     entry.dwSize = u32::try_from(std::mem::size_of::<THREADENTRY32>()).expect("a small size");
     let mut threads = Vec::new();
     // SAFETY: the snapshot is open and the pointer is a live structure.
-    let mut more = unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
-    while more {
+    let mut found = unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
+    loop {
+        if !found {
+            // SAFETY: the call reads the calling thread's last error, which the failed call set.
+            let code = unsafe { GetLastError() };
+            assert_eq!(
+                code, ERROR_NO_MORE_FILES,
+                "the enumeration of the threads ends only at the system's end of the entries, and \
+                 the system said {code}"
+            );
+            return threads;
+        }
         if entry.th32OwnerProcessID == pid {
             let created = open_thread(entry.th32ThreadID, rights::THREAD_QUERY_LIMITED)
                 .map_or(0, |thread| creation_time(&thread));
@@ -740,9 +766,8 @@ pub fn threads_of(pid: u32) -> Vec<Thread> {
             });
         }
         // SAFETY: as above.
-        more = unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
+        found = unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
     }
-    threads
 }
 
 fn creation_time(thread: &OwnedHandle) -> u64 {
