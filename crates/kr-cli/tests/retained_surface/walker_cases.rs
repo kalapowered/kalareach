@@ -162,25 +162,39 @@ fn the_body_of_a_macro_and_an_invocation_have_digests_that_move_on_a_token() {
     assert_ne!(argument.2, before.2);
 }
 
-const SENDER_LIB: &str = r#"
+const SENDER_LIB: &str = r##"
 use kr_protocol::Method::AgentTurnCancel;
 #[cfg(test)]
 mod hidden;
 #[cfg(test)]
 #[path = "x.rs"]
 mod moved;
+#[cfg(test)]
+#[path = "shared/mod.rs"]
+mod test_support;
+#[cfg(test)]
+mod tests_outer;
+#[path = "shared/send.rs"]
+mod sender;
 #[path = "y.rs"]
 mod through_path;
 mod sub;
+mod grouped;
+mod wire;
+mod req;
+mod tgt;
+mod mac;
 fn names_a_method() { let _ = Method::AgentPromptSubmit; }
-fn names_by_wire() -> &'static str { "agent.turn.steer" }
+fn raw() -> &'static str { r#"agent.turn.cancel"# }
 fn names_a_right() { let _ = ActionRight::AgentApprovalRespond; }
 /// Sends `Method::AgentTurnCancel` and says "agent.turn.cancel".
 fn documented() {}
 #[cfg(test)]
 fn under_test() { let _ = Method::AgentTurnCancel; }
+fn takes(_r: MutationRequest, _t: &ActionTarget) { let _ = Method; }
 struct Holder;
 impl Holder {
+    const STEER: Method = Method::AgentTurnSteer;
     fn in_method(&self) { let _ = Method::PluginActionInvoke; }
     #[cfg(test)]
     fn test_method(&self) { let _ = Method::AgentTurnCancel; }
@@ -195,19 +209,92 @@ mod inline {
     #[cfg(test)]
     mod tests { fn deep() { let _ = Method::AgentTurnCancel; } }
 }
-fn builds_request() { let _ = MutationRequest { a: 1 }; }
-fn target() -> ActionTarget { ActionTarget { x: 1 } }
 #[cfg(any(test, feature = "testing"))]
 fn kept_by_feature() { let _ = Method::AgentPromptQueue; }
-macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }
+const SUBMIT: Method = Method::AgentPromptSubmit;
+static QUEUE: &str = "agent.prompt.queue";
+#[serde(rename = "agent.turn.cancel")]
+struct Renamed;
+enum Tag { #[serde(rename = "agent.turn.steer")] Steer }
+#[serde(rename = "agent.prompt.submit")]
+union U { a: u8 }
+type Alias = [u8; Method::AgentTurnCancel as usize];
 sends!(first, Method::AgentTurnCancel);
 sends!(second, Method::AgentTurnSteer);
+fn caller() { via_fn!(Method::AgentTurnCancel); }
+struct Maker;
+impl Maker { via_impl!(Method::AgentPromptQueue); }
 macro_rules! own { () => { Method::AgentTurnCancel }; }
-macro_rules! idle { () => {}; }
-macro_rules! unnamed { ($($t:tt)*) => {}; }
+idle!();
 unnamed!("agent.turn.cancel");
 unnamed!("agent.turn.steer");
-"#;
+"##;
+
+/// The files of the sender tree beside its library.
+fn sender_tree() -> tempfile::TempDir {
+    let folder = small_tree(SENDER_LIB);
+    let src = "crates/kr-sender/src";
+    for (path, text) in [
+        (
+            "hidden.rs",
+            "fn from_hidden() { let _ = Method::AgentTurnCancel; }\n",
+        ),
+        ("x.rs", "fn from_x() { let _ = Method::AgentTurnCancel; }\n"),
+        (
+            "shared/mod.rs",
+            "mod child;\nfn from_shared_mod() { let _ = Method::AgentTurnCancel; }\n",
+        ),
+        (
+            "shared/child.rs",
+            "fn from_child() { let _ = Method::AgentTurnCancel; }\n",
+        ),
+        (
+            "shared/send.rs",
+            "fn from_shared_send() { let _ = Method::AgentTurnSteer; }\n",
+        ),
+        (
+            "tests_outer.rs",
+            "#[path = \"elsewhere/inner.rs\"]\nmod inner;\nfn from_outer() { let _ = Method::AgentTurnCancel; }\n",
+        ),
+        (
+            "elsewhere/inner.rs",
+            "fn from_inner() { let _ = Method::AgentTurnCancel; }\n",
+        ),
+        (
+            "y.rs",
+            "mod grand;\n#[cfg(test)]\nmod t;\nfn from_y() { let _ = Method::AgentTurnSteer; }\n",
+        ),
+        (
+            "grand.rs",
+            "fn from_grand() { let _ = Method::AgentTurnSteer; }\n",
+        ),
+        ("t.rs", "fn from_t() { let _ = Method::AgentTurnCancel; }\n"),
+        ("sub.rs", "unnamed!(\"agent.prompt.queue\");\n"),
+        (
+            "grouped.rs",
+            "use kr_protocol::Method::{AgentTurnCancel, AgentTurnSteer};\n",
+        ),
+        (
+            "wire.rs",
+            "fn names_by_wire() -> &'static str { \"agent.turn.steer\" }\n",
+        ),
+        (
+            "req.rs",
+            "fn builds_request() { let _ = MutationRequest { a: 1 }; }\n",
+        ),
+        (
+            "tgt.rs",
+            "fn target() -> ActionTarget { ActionTarget { x: 1 } }\nfn returns_only() -> ActionTarget { build() }\n",
+        ),
+        (
+            "mac.rs",
+            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\n",
+        ),
+    ] {
+        write(folder.path(), &format!("{src}/{path}"), text);
+    }
+    folder
+}
 
 fn names(sightings: &[super::walker::Sighting], krate: &str) -> BTreeMap<String, Vec<SightKind>> {
     sightings
@@ -224,28 +311,7 @@ fn names(sightings: &[super::walker::Sighting], krate: &str) -> BTreeMap<String,
 
 #[test]
 fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
-    let folder = small_tree(SENDER_LIB);
-    let src = "crates/kr-sender/src";
-    write(
-        folder.path(),
-        &format!("{src}/hidden.rs"),
-        "fn from_hidden() { let _ = Method::AgentTurnCancel; }\n",
-    );
-    write(
-        folder.path(),
-        &format!("{src}/x.rs"),
-        "fn from_x() { let _ = Method::AgentTurnCancel; }\n",
-    );
-    write(
-        folder.path(),
-        &format!("{src}/y.rs"),
-        "fn from_y() { let _ = Method::AgentTurnSteer; }\n",
-    );
-    write(
-        folder.path(),
-        &format!("{src}/sub.rs"),
-        "unnamed!(\"agent.prompt.queue\");\n",
-    );
+    let folder = sender_tree();
     let tree = Tree::at(folder.path()).expect("the tree");
     let root_before = tree
         .follow("kr_sender", &["names_a_method"])
@@ -256,18 +322,34 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
     use SightKind::{Expands, Names, Request, Target};
     let expected: BTreeMap<String, Vec<SightKind>> = [
         ("use:lib.rs", vec![Names]),
+        ("use:grouped.rs", vec![Names]),
         ("names_a_method", vec![Names]),
         ("names_by_wire", vec![Names]),
+        ("raw", vec![Names]),
         ("Holder::in_method", vec![Names]),
+        ("Holder", vec![Names]),
         ("Sends", vec![Names]),
         ("in_inline", vec![Request]),
         ("builds_request", vec![Request]),
         ("target", vec![Target]),
+        ("returns_only", vec![Target]),
         ("kept_by_feature", vec![Names]),
+        ("SUBMIT", vec![Names]),
+        ("QUEUE", vec![Names]),
+        ("Renamed", vec![Names]),
+        ("Tag", vec![Names]),
+        ("U", vec![Names]),
+        ("Alias", vec![Names]),
         ("from_y", vec![Names]),
+        ("from_grand", vec![Names]),
+        ("from_shared_send", vec![Names]),
         ("first", vec![Names]),
         ("second", vec![Names]),
+        ("caller", vec![Names]),
+        ("Maker", vec![Names]),
         ("macro:sends", vec![Expands]),
+        ("macro:via_fn", vec![Expands]),
+        ("macro:via_impl", vec![Expands]),
         ("macro:own", vec![Names]),
         ("macro:unnamed", vec![Expands]),
         ("unnamed! invocation @lib.rs", vec![Names]),
@@ -277,12 +359,19 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
     .map(|(name, kinds)| (name.to_owned(), kinds))
     .collect();
     assert_eq!(found, expected);
-    // Every name resolves through the walker or the scan, and a root's digest is the one it had.
+    // Every name resolves through the walker or the scan; a walker name's digest is the one the
+    // walker gives it alone, and a root's digest is the one it had.
     for name in found.keys() {
-        assert!(
-            matches!(tree.item("kr_sender", name), Lookup::Found(_)),
-            "{name}"
-        );
+        let Lookup::Found(digest) = tree.item("kr_sender", name) else {
+            panic!("{name} does not resolve");
+        };
+        if !name.starts_with("use:") && !name.contains("! invocation @") {
+            assert_eq!(
+                tree.lookup("kr_sender", &[name.as_str()], Depth::Alone),
+                Lookup::Found(digest),
+                "{name}"
+            );
+        }
     }
     assert_eq!(
         tree.follow("kr_sender", &["names_a_method"])
@@ -300,9 +389,64 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
 }
 
 #[test]
+fn the_digest_of_a_name_only_the_scan_gives_moves_on_a_token() {
+    let digests = |lib: &str| {
+        let folder = small_tree(lib);
+        let tree = Tree::at(folder.path()).expect("the tree");
+        let take = |name: &str| match tree.item("kr_sender", name) {
+            Lookup::Found(digest) => digest,
+            other => panic!("{name}: {other:?}"),
+        };
+        (take("use:lib.rs"), take("unnamed! invocation @lib.rs"))
+    };
+    let before =
+        digests("use kr_protocol::Method::AgentTurnCancel;\nunnamed!(\"agent.turn.cancel\");\n");
+    let import =
+        digests("use kr_protocol::Method::AgentTurnSteer;\nunnamed!(\"agent.turn.cancel\");\n");
+    assert_ne!(import.0, before.0);
+    assert_eq!(import.1, before.1);
+    let call =
+        digests("use kr_protocol::Method::AgentTurnCancel;\nunnamed!(\"agent.turn.steer\");\n");
+    assert_eq!(call.0, before.0);
+    assert_ne!(call.1, before.1);
+}
+
+#[test]
+fn a_root_lookup_in_a_crate_that_is_absent_or_unreadable_says_so_and_a_failed_follow_says_why() {
+    let folder = small_tree("pub fn present() { kr_worker::nothing_of_this_name(); }\n");
+    let tree = Tree::at(folder.path()).expect("the tree");
+    assert_eq!(
+        tree.lookup("kr_nothing", &["x"], Depth::Alone),
+        Lookup::Absent
+    );
+    assert!(matches!(
+        tree.follow("kr_sender", &["missing"]),
+        Err(super::walker::WalkError::Undefined(_))
+    ));
+    assert!(matches!(
+        tree.follow("kr_sender", &["present"]),
+        Err(super::walker::WalkError::Other(_))
+    ));
+    assert!(matches!(
+        tree.lookup("kr_sender", &["present"], Depth::Everything),
+        Lookup::Failed(_)
+    ));
+    write(folder.path(), "crates/odd/Cargo.toml", "[workspace]\n");
+    let tree = Tree::at(folder.path()).expect("the tree");
+    assert!(matches!(
+        tree.lookup("kr_nothing", &["x"], Depth::Alone),
+        Lookup::Failed(_)
+    ));
+    // Only a missing `apps` folder is an absence: one that cannot be read is an error.
+    let file_for_apps = small_tree("");
+    write(file_for_apps.path(), "apps", "not a folder\n");
+    assert!(Tree::at(file_for_apps.path()).is_err());
+}
+
+#[test]
 fn a_scan_reads_only_what_it_may_hold_a_sighting_in() {
     // A file with none of the words is not parsed, so what does not parse there raises nothing.
-    let quiet = small_tree("pub fn quiet() {}\n");
+    let quiet = small_tree("mod other;\npub fn quiet() {}\n");
     write(quiet.path(), "crates/kr-sender/src/other.rs", "fn (\n");
     let tree = Tree::at(quiet.path()).expect("the tree");
     assert_eq!(
@@ -318,6 +462,22 @@ fn a_scan_reads_only_what_it_may_hold_a_sighting_in() {
     );
     let tree = Tree::at(loud.path()).expect("the tree");
     assert!(tree.sightings(&|krate| krate == "kr_sender").is_err());
+    // The crates the caller leaves out are not scanned.
+    let two = small_tree("pub fn quiet() {}\n");
+    write(
+        two.path(),
+        "crates/kr-worker/src/extra.rs",
+        "fn x() { let _ = Method::AgentTurnSteer; }\n",
+    );
+    let tree = Tree::at(two.path()).expect("the tree");
+    assert_eq!(
+        tree.sightings(&|krate| krate == "kr_sender"),
+        Ok(Vec::new())
+    );
+    assert_eq!(
+        names(&tree.sightings(&|_| true).expect("the scan"), "kr_worker"),
+        BTreeMap::from([("x".to_owned(), vec![SightKind::Names])])
+    );
     // A manifest that cannot be read leaves the scan incomplete.
     let odd = small_tree("pub fn quiet() {}\n");
     write(odd.path(), "crates/odd/Cargo.toml", "[workspace]\n");
@@ -348,4 +508,27 @@ fn a_sighting_in_the_companions_crate_under_apps_is_found() {
         tree.item("companion_tauri", "send"),
         Lookup::Found(_)
     ));
+}
+
+#[test]
+fn the_reader_of_a_tree_does_not_scan_the_receiver_crates() {
+    use super::narrower::Reader;
+    let folder = small_tree("fn sends() { let _ = Method::AgentTurnSteer; }\n");
+    write(
+        folder.path(),
+        "crates/kr-worker/src/extra.rs",
+        "fn receives() { let _ = Method::AgentTurnSteer; }\n",
+    );
+    let tree = Tree::at(folder.path()).expect("the tree");
+    let sightings = Reader::sightings(&tree).expect("the scan");
+    assert_eq!(
+        names(&sightings, "kr_sender"),
+        BTreeMap::from([("sends".to_owned(), vec![SightKind::Names])])
+    );
+    assert!(
+        sightings
+            .iter()
+            .all(|sighting| sighting.krate == "kr_sender")
+    );
+    assert!(Reader::sightings(&tree).expect("the scan").len() == 1);
 }

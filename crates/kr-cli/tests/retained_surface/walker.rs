@@ -168,21 +168,37 @@ impl Tree {
         {
             manifests.push(entry.map_err(|error| error.to_string())?.path());
         }
-        if let Ok(applications) = std::fs::read_dir(root.join("apps")) {
-            for entry in applications {
-                manifests.push(
-                    entry
-                        .map_err(|error| error.to_string())?
-                        .path()
-                        .join("src-tauri"),
-                );
+        match std::fs::read_dir(root.join("apps")) {
+            Ok(applications) => {
+                for entry in applications {
+                    manifests.push(
+                        entry
+                            .map_err(|error| error.to_string())?
+                            .path()
+                            .join("src-tauri"),
+                    );
+                }
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", root.join("apps").display())),
         }
         manifests.sort();
         for directory in manifests {
             let manifest = directory.join("Cargo.toml");
-            if !manifest.exists() {
-                continue;
+            match std::fs::metadata(&manifest) {
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => {
+                    unreadable.push(manifest.display().to_string());
+                    continue;
+                }
             }
             let package = std::fs::read_to_string(&manifest).ok().and_then(|text| {
                 text.lines()
@@ -1289,15 +1305,14 @@ impl Tree {
             Lookup::Found(_) => {}
             other => return other,
         }
-        let index = match self.index(krate) {
-            Ok(index) => index,
-            Err(error) => return Lookup::Failed(error),
-        };
-        let undefined: Vec<&str> = names
-            .iter()
-            .copied()
-            .filter(|name| index.roots_named(name).is_empty())
-            .collect();
+        let mut undefined: Vec<&str> = Vec::new();
+        for name in names {
+            match self.followed_set(krate, &[*name], Depth::Alone) {
+                Ok(_) => {}
+                Err(WalkError::Undefined(_)) => undefined.push(name),
+                Err(WalkError::Other(error)) => return Lookup::Failed(error),
+            }
+        }
         if undefined.len() == names.len() {
             return Lookup::Absent;
         }
@@ -1322,30 +1337,30 @@ impl Tree {
             Lookup::Absent => return Ok(None),
             Lookup::Failed(error) => return Err(error),
         }
-        let index = self.index(krate)?;
-        if !index.roots_named(name).is_empty() {
-            let ordered = self
-                .followed_set(krate, &[name], Depth::Alone)
-                .map_err(|error| error.to_string())?;
-            let mut digest = Vec::new();
-            let mut text = Vec::new();
-            let mut files: Vec<String> = Vec::new();
-            for (krate, at) in ordered {
-                let index = self.index(&krate)?;
-                let item = &index.items[at];
-                digest.extend_from_slice(
-                    format!("{krate} {} {}\n{}\n", item.file, item.label, item.text).as_bytes(),
-                );
-                text.push(item.text.clone());
-                if !files.contains(&item.file) {
-                    files.push(item.file.clone());
+        match self.followed_set(krate, &[name], Depth::Alone) {
+            Err(WalkError::Undefined(_)) => {}
+            Err(WalkError::Other(error)) => return Err(error),
+            Ok(ordered) => {
+                let mut digest = Vec::new();
+                let mut text = Vec::new();
+                let mut files: Vec<String> = Vec::new();
+                for (krate, at) in ordered {
+                    let index = self.index(&krate)?;
+                    let item = &index.items[at];
+                    digest.extend_from_slice(
+                        format!("{krate} {} {}\n{}\n", item.file, item.label, item.text).as_bytes(),
+                    );
+                    text.push(item.text.clone());
+                    if !files.contains(&item.file) {
+                        files.push(item.file.clone());
+                    }
                 }
+                return Ok(Some(Source {
+                    digest: hex(&kr_cbor::sha256(&digest)),
+                    text: text.join("\n"),
+                    files,
+                }));
             }
-            return Ok(Some(Source {
-                digest: hex(&kr_cbor::sha256(&digest)),
-                text: text.join("\n"),
-                files,
-            }));
         }
         Ok(self.scan(krate)?.scan_names.get(name).cloned())
     }
@@ -1397,15 +1412,11 @@ fn mentions_a_sighting(text: &str) -> bool {
         || WIRE_NAMES.iter().any(|name| text.contains(name))
 }
 
-/// Whether the text may declare a module file that is test-only or reached by a path: a `#[path]`
-/// attribute, or `cfg(test)` and a module with no body.
-fn may_declare_files(text: &str) -> bool {
+/// Whether the text may declare a module file: a `#[path]` attribute, or a module with no body.
+fn may_declare_modules(text: &str) -> bool {
     let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-    if compact.contains("path=\"") {
-        return true;
-    }
-    compact.contains("cfg(test)")
-        && compact.match_indices("mod").any(|(at, _)| {
+    compact.contains("path=\"")
+        || compact.match_indices("mod").any(|(at, _)| {
             let rest = &compact[at + 3..];
             let name: String = rest
                 .chars()
@@ -1415,13 +1426,49 @@ fn may_declare_files(text: &str) -> bool {
         })
 }
 
-/// The files that a module declared `#[cfg(test)]` is, as rustc finds them, and what they declare.
-fn test_only_files(files: &[PathBuf]) -> Result<BTreeSet<PathBuf>, String> {
-    let mut found = BTreeSet::new();
-    for path in files {
-        let text = std::fs::read_to_string(path)
+/// The files of a crate that only a `#[cfg(test)]` module declaration reaches, as rustc finds
+/// module files: from the crate's roots through the declarations of each file, a declaration under
+/// `#[cfg(test)]` giving the status to what it reaches. A file that a declaration outside
+/// `#[cfg(test)]` also reaches is product code.
+fn test_only_files(files: &[PathBuf], source: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let present: BTreeSet<&PathBuf> = files.iter().collect();
+    let binaries = source.join("bin");
+    let roots = || -> Vec<(PathBuf, bool)> {
+        files
+            .iter()
+            .filter(|path| {
+                let directory = path.parent();
+                let name = path.file_name().and_then(|name| name.to_str());
+                (directory == Some(source) && matches!(name, Some("lib.rs" | "main.rs")))
+                    || directory == Some(binaries.as_path())
+                    || (name == Some("main.rs")
+                        && directory.and_then(Path::parent) == Some(binaries.as_path()))
+            })
+            .map(|path| (path.clone(), true))
+            .collect()
+    };
+    let every = reached(&present, roots(), true)?;
+    let product = reached(&present, roots(), false)?;
+    Ok(every.difference(&product).cloned().collect())
+}
+
+/// The files reachable from `roots` (each with whether it is a `mod.rs`-like file, whose modules
+/// sit beside it), through the module declarations of every file; those under `#[cfg(test)]` only
+/// when `with_tests`.
+fn reached(
+    present: &BTreeSet<&PathBuf>,
+    roots: Vec<(PathBuf, bool)>,
+    with_tests: bool,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mut seen = BTreeSet::new();
+    let mut todo = roots;
+    while let Some((path, mod_rs)) = todo.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        if !may_declare_files(&text) {
+        if !may_declare_modules(&text) {
             continue;
         }
         let file =
@@ -1431,46 +1478,38 @@ fn test_only_files(files: &[PathBuf]) -> Result<BTreeSet<PathBuf>, String> {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or_default();
-        let is_root = matches!(stem, "lib" | "main" | "mod")
-            || directory.file_name().is_some_and(|name| name == "bin");
-        let modules = if is_root {
+        let modules = if mod_rs {
             directory.to_owned()
         } else {
             directory.join(stem)
         };
         let mut declared = Vec::new();
         declared_modules(&file.items, directory, &modules, false, &mut declared);
-        for (declared, test) in declared {
-            if !test {
+        for (candidates, test, explicit) in declared {
+            if test && !with_tests {
                 continue;
             }
-            found.insert(declared.clone());
-            // What a test-only file declares is test-only too.
-            let below = if declared.file_name().is_some_and(|name| name == "mod.rs") {
-                declared.parent().map(Path::to_owned)
-            } else {
-                declared
-                    .file_stem()
-                    .map(|stem| declared.with_file_name(stem))
-            };
-            if let Some(below) = below {
-                for other in files.iter().filter(|other| other.starts_with(&below)) {
-                    found.insert(other.clone());
+            for candidate in candidates {
+                if present.contains(&candidate) {
+                    // A file that a `#[path]` loads holds its modules beside it, as `mod.rs` does.
+                    let beside = explicit || candidate.file_name().is_some_and(|n| n == "mod.rs");
+                    todo.push((candidate, beside));
                 }
             }
         }
     }
-    Ok(found)
+    Ok(seen)
 }
 
-/// The module files `items` declare, with whether each is declared test-only. `path_base` is what
-/// a `#[path]` is relative to, `modules` what a module's file is looked up under.
+/// The module files `items` declare: the paths each may be at, whether it is declared test-only,
+/// and whether a `#[path]` names it. `path_base` is what a `#[path]` is relative to, `modules`
+/// what a module's file is looked up under.
 fn declared_modules(
     items: &[syn::Item],
     path_base: &Path,
     modules: &Path,
     under_test: bool,
-    out: &mut Vec<(PathBuf, bool)>,
+    out: &mut Vec<(Vec<PathBuf>, bool, bool)>,
 ) {
     for item in items {
         let syn::Item::Mod(module) = item else {
@@ -1499,11 +1538,15 @@ fn declared_modules(
             }
         });
         match explicit {
-            Some(explicit) => out.push((path_base.join(explicit), test)),
-            None => {
-                out.push((modules.join(format!("{name}.rs")), test));
-                out.push((modules.join(&name).join("mod.rs"), test));
-            }
+            Some(explicit) => out.push((vec![path_base.join(explicit)], test, true)),
+            None => out.push((
+                vec![
+                    modules.join(format!("{name}.rs")),
+                    modules.join(&name).join("mod.rs"),
+                ],
+                test,
+                false,
+            )),
         }
     }
 }
@@ -1517,8 +1560,18 @@ struct Scanner {
 }
 
 impl Scanner {
-    fn sight(&mut self, name: String, kinds: BTreeSet<SightKind>) {
+    /// The tokens of an item: its kinds, and the macros it calls when it is a sighting, whose
+    /// bodies then give the parameters' target.
+    fn body(&mut self, name: String, tokens: TokenStream) {
+        let kinds = kinds_of(&tokens);
         if !kinds.is_empty() {
+            called_macros(&tokens, &mut self.expanded);
+        }
+        self.sight(name, kinds);
+    }
+
+    fn sight(&mut self, name: String, kinds: BTreeSet<SightKind>) {
+        if !kinds.is_empty() && !name.is_empty() {
             self.sightings.entry(name).or_default().extend(kinds);
         }
     }
@@ -1549,11 +1602,6 @@ impl Scanner {
                 }
                 syn::Item::Impl(block) => {
                     let owner = type_name(&block.self_ty);
-                    let owner = if owner.is_empty() {
-                        "impl".to_owned()
-                    } else {
-                        owner
-                    };
                     for inner in &block.items {
                         let (name, tokens) = match inner {
                             syn::ImplItem::Fn(method) if !attrs_are_cfg_test(&method.attrs) => (
@@ -1565,9 +1613,12 @@ impl Scanner {
                             {
                                 (owner.clone(), constant.to_token_stream())
                             }
+                            syn::ImplItem::Macro(call) if !attrs_are_cfg_test(&call.attrs) => {
+                                (owner.clone(), call.to_token_stream())
+                            }
                             _ => continue,
                         };
-                        self.sight(name, kinds_of(&without_docs(tokens)));
+                        self.body(name, without_docs(tokens));
                     }
                 }
                 syn::Item::Trait(definition) => {
@@ -1582,8 +1633,10 @@ impl Scanner {
                         };
                         !attrs_are_cfg_test(attrs)
                     });
-                    let kinds = kinds_of(&without_docs(kept.to_token_stream()));
-                    self.sight(definition.ident.to_string(), kinds);
+                    self.body(
+                        definition.ident.to_string(),
+                        without_docs(kept.to_token_stream()),
+                    );
                 }
                 syn::Item::Macro(call) => {
                     let kinds = kinds_of(&text());
@@ -1619,25 +1672,25 @@ impl Scanner {
                     }
                 }
                 syn::Item::Fn(definition) => {
-                    self.sight(definition.sig.ident.to_string(), kinds_of(&text()));
+                    self.body(definition.sig.ident.to_string(), text());
                 }
                 syn::Item::Struct(definition) => {
-                    self.sight(definition.ident.to_string(), kinds_of(&text()));
+                    self.body(definition.ident.to_string(), text());
                 }
                 syn::Item::Enum(definition) => {
-                    self.sight(definition.ident.to_string(), kinds_of(&text()));
+                    self.body(definition.ident.to_string(), text());
                 }
                 syn::Item::Union(definition) => {
-                    self.sight(definition.ident.to_string(), kinds_of(&text()));
+                    self.body(definition.ident.to_string(), text());
                 }
                 syn::Item::Type(definition) => {
-                    self.sight(definition.ident.to_string(), kinds_of(&text()));
+                    self.body(definition.ident.to_string(), text());
                 }
                 syn::Item::Const(definition) => {
-                    self.sight(definition.ident.to_string(), kinds_of(&text()));
+                    self.body(definition.ident.to_string(), text());
                 }
                 syn::Item::Static(definition) => {
-                    self.sight(definition.ident.to_string(), kinds_of(&text()));
+                    self.body(definition.ident.to_string(), text());
                 }
                 _ => {}
             }
@@ -1649,7 +1702,7 @@ fn scan_crate(krate: &str, source: &Path, root: &Path) -> Result<CrateScan, Stri
     let mut files = Vec::new();
     collect_files(source, &mut files)?;
     files.sort();
-    let test_only = test_only_files(&files)?;
+    let test_only = test_only_files(&files, source)?;
     let mut scanner = Scanner {
         sightings: BTreeMap::new(),
         scan_only: BTreeMap::new(),
@@ -1720,6 +1773,24 @@ fn scan_crate(krate: &str, source: &Path, root: &Path) -> Result<CrateScan, Stri
     })
 }
 
+/// The names of the macros the tokens call, at any depth.
+fn called_macros(stream: &TokenStream, out: &mut BTreeSet<String>) {
+    let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
+    for (at, tree) in flat.iter().enumerate() {
+        match tree {
+            TokenTree::Group(group) => called_macros(&group.stream(), out),
+            TokenTree::Ident(ident) => {
+                if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
+                    && matches!(flat.get(at + 2), Some(TokenTree::Group(_)))
+                {
+                    out.insert(ident.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The kinds of sighting the tokens hold: a `Method::<V>` path or wire name, a `MutationRequest`
 /// or an `ActionTarget` with a brace group after it.
 fn kinds_of(stream: &TokenStream) -> BTreeSet<SightKind> {
@@ -1735,11 +1806,8 @@ fn collect_kinds(stream: &TokenStream, kinds: &mut BTreeSet<SightKind>) {
         match tree {
             TokenTree::Group(group) => collect_kinds(&group.stream(), kinds),
             TokenTree::Literal(literal) => {
-                let text = literal.to_string();
-                if let Some(inner) = text
-                    .strip_prefix('"')
-                    .and_then(|rest| rest.strip_suffix('"'))
-                    && WIRE_NAMES.contains(&inner)
+                if let Ok(text) = syn::parse_str::<syn::LitStr>(&literal.to_string())
+                    && WIRE_NAMES.contains(&text.value().as_str())
                 {
                     kinds.insert(SightKind::Names);
                 }
