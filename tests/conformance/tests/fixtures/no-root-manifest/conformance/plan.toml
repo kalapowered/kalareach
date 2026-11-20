@@ -1,0 +1,33 @@
+repository = 'no-root-manifest'
+groups = ['rust']
+
+[rust]
+manifests = ['first/Cargo.toml', 'second/Cargo.toml']
+
+[ignored_runs]
+held = false
+
+[unrun]
+bench = 'a benchmark'
+typescript = 'no step runs TypeScript'
+
+[unrun.rust]
+linux = 'no step runs this target'
+macos = 'no step runs this target'
+windows = 'no step runs this target'
+
+[[step]]
+id = 'first'
+group = 'rust'
+what = 'the first workspace'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '--manifest-path', 'first/Cargo.toml']
+
+[[step]]
+id = 'second'
+group = 'rust'
+what = 'the second workspace'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '--manifest-path', 'second/Cargo.toml']

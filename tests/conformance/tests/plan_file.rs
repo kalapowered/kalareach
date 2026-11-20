@@ -20,6 +20,10 @@ fn selection(names: &[&str]) -> Vec<String> {
 
 const HEAD: &str = "repository = 'planted'
 groups = ['rust']
+[rust]
+manifests = []
+[ignored_runs]
+held = false
 [unrun]
 bench = 'b'
 typescript = 't'
@@ -930,6 +934,10 @@ fn every_decision_a_group_takes_is_what_core_s_file_says() {
     let planted = r"
 repository = 'planted'
 groups = ['unit', 'browsers', 'node']
+[rust]
+manifests = []
+[ignored_runs]
+held = false
 [unrun]
 bench = 'b'
 typescript = 't'
@@ -952,6 +960,13 @@ what = 'a build'
 platforms = ['linux']
 reading = 'build'
 command = ['cargo', 'build']
+[[step]]
+id = 'browser-tests'
+group = 'browsers'
+what = 'the browser tests'
+platforms = ['linux']
+reading = 'build'
+command = ['cargo', 'build']
 ";
     let plan = Plan::parse(planted, &repository()).expect("the planted plan loads");
     let unit = selection(&["unit"]);
@@ -968,10 +983,12 @@ command = ['cargo', 'build']
 #[test]
 fn the_reason_of_an_unrun_target_is_the_plans_first_group_whatever_the_selection_order() {
     let plan = Plan::parse(
-        &with(
+        &with(&format!(
             "[[group_absent]]\ngroup = 'rust'\nplatform = 'windows'\nreason = 'first'\nexplains_unrun_rust = true\n\
-             [[group_absent]]\ngroup = 'other'\nplatform = 'windows'\nreason = 'second'\nexplains_unrun_rust = true\n",
-        )
+             [[group_absent]]\ngroup = 'other'\nplatform = 'windows'\nreason = 'second'\nexplains_unrun_rust = true\n\
+             {STEP}{}",
+            STEP.replace("id = 'one'", "id = 'two'").replace("group = 'rust'", "group = 'other'")
+        ))
         .replace("groups = ['rust']", "groups = ['rust', 'other']"),
         &repository(),
     )

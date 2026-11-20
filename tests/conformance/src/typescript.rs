@@ -1,7 +1,7 @@
 //! TypeScript and JavaScript tests, and the identifiers their comments and titles name.
 //!
-//! `tests/conformance/typescript-facts.mjs` reads each file with the TypeScript compiler the
-//! packages already depend on and says where its test calls and comments are. This module decides
+//! `tests/conformance/typescript-facts.mjs` reads each file with a TypeScript compiler that the tree
+//! read, or the command line, names and says where its test calls and comments are. This module decides
 //! what each comment keys, with the same rules as Rust source:
 //!
 //! * a comment inside a test's body keys that test;
@@ -11,8 +11,9 @@
 //! * a test's title keys it, and a `describe`'s title keys every test inside it;
 //! * any other comment is a reference, not a test.
 
-use std::path::Path;
-use std::process::Command;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 
@@ -68,28 +69,58 @@ pub struct FileFacts {
 
 #[derive(Deserialize)]
 struct Facts {
+    version: String,
     files: Vec<FileFacts>,
 }
 
-/// Reads `files` (relative to `root`) with the TypeScript compiler.
+/// The script that reads a file with the compiler. The program gives it to `node` on standard
+/// input, so the tool needs no file beside it and names no directory of its own.
+const SCRIPT: &str = include_str!("../typescript-facts.mjs");
+
+/// What reading a set of files found.
+#[derive(Debug)]
+pub struct Read {
+    /// The facts of each file.
+    pub files: Vec<FileFacts>,
+    /// The version of the compiler that read them, when `node` ran.
+    pub version: Option<String>,
+}
+
+/// Reads `files` (relative to `root`) with the first compiler that one of `compilers` (directories
+/// whose own `node_modules` holds it) has installed.
 ///
 /// # Errors
 ///
 /// Returns why the compiler could not be run or what it wrote could not be read.
-pub fn read(root: &Path, files: &[String]) -> Result<Vec<FileFacts>, String> {
+pub fn read(root: &Path, compilers: &[PathBuf], files: &[String]) -> Result<Read, String> {
     if files.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Read {
+            files: Vec::new(),
+            version: None,
+        });
     }
-    // The script beside this crate, which reads a tree with its own repository's compiler.
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("typescript-facts.mjs");
-    let output = Command::new("node")
-        .arg(&script)
+    let mut child = Command::new("node")
+        .args(["--input-type=module", "-"])
         .arg(root)
+        .args(compilers)
+        .arg("--")
         .args(files)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| {
             format!("node could not be started to read the TypeScript sources: {error}")
         })?;
+    child
+        .stdin
+        .take()
+        .ok_or("node gave no standard input to read the TypeScript sources with")?
+        .write_all(SCRIPT.as_bytes())
+        .map_err(|error| format!("the TypeScript reading could not be given to node: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("node did not finish reading the TypeScript sources: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "the TypeScript sources could not be read: {}",
@@ -98,7 +129,10 @@ pub fn read(root: &Path, files: &[String]) -> Result<Vec<FileFacts>, String> {
     }
     let facts: Facts = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("the TypeScript facts are not what was expected: {error}"))?;
-    Ok(facts.files)
+    Ok(Read {
+        files: facts.files,
+        version: Some(facts.version),
+    })
 }
 
 /// What one comment or title keys.

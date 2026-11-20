@@ -4,7 +4,7 @@
 //! target Cargo discovers on its own, one a manifest declares with its own path and one that sets
 //! `test = false` are all what Cargo says they are.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -93,6 +93,13 @@ pub struct Package {
     /// The names its dependencies are known by in its source: a rename where the manifest gives
     /// one, the package's name otherwise.
     pub dependency_names: BTreeSet<String>,
+    /// The directory of its workspace's manifest, relative to the tested root as the plan names
+    /// it: `.` for the root.
+    pub workspace: String,
+    /// The names of the workspace's members.
+    pub workspace_members: Vec<String>,
+    /// The names of the members that Cargo runs when no package is named.
+    pub workspace_default_members: Vec<String>,
 }
 
 /// The sources Cargo names crates.io by.
@@ -127,12 +134,71 @@ fn locked_from_crates_io(lock: &str, name: &str) -> bool {
     found
 }
 
-/// Reads the workspace whose manifest is at `root`, through `cargo metadata`.
-///
-/// # Errors
-///
-/// Returns what Cargo said when it could not describe the workspace.
-pub fn read(root: &Path) -> Result<Vec<Package>, String> {
+/// What reading the plan's workspaces found.
+#[derive(Debug, Default)]
+pub struct Workspaces {
+    /// Every package of every workspace, by name.
+    pub packages: Vec<Package>,
+    /// What stops the map being trusted: a workspace Cargo could not describe, a lock that is
+    /// absent, a package name that two workspaces hold.
+    pub problems: Vec<String>,
+}
+
+/// Reads the workspace of each of `manifests` (relative to `root`), through one `cargo metadata`
+/// each. A package name that two workspaces hold is a problem naming both manifests: a target's
+/// identifier is its package, its kind and its name, so two such packages cannot be told apart.
+#[must_use]
+pub fn read(root: &Path, manifests: &[String]) -> Workspaces {
+    let mut found = Workspaces::default();
+    // The manifest of the plan, and the package's own, that each name was first read from.
+    let mut from: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
+    for manifest in manifests {
+        match read_one(root, manifest) {
+            Ok(packages) => {
+                for package in packages {
+                    match from.get(&package.name) {
+                        // The same package, reached through two manifests of one workspace.
+                        Some((_, path)) if *path == package.manifest => {}
+                        Some((first, _)) => found.problems.push(format!(
+                            "the package `{}` is in two workspaces, `{first}` and `{manifest}`",
+                            package.name
+                        )),
+                        None => {
+                            from.insert(
+                                package.name.clone(),
+                                (manifest.clone(), package.manifest.clone()),
+                            );
+                            found.packages.push(package);
+                        }
+                    }
+                }
+            }
+            Err(problem) => found.problems.push(problem),
+        }
+    }
+    found.packages.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
+/// `path` relative to `root`, with forward slashes, or as it is when it lies elsewhere.
+fn shown(root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .ok()
+        .or_else(|| {
+            root.canonicalize()
+                .ok()
+                .and_then(|canonical| path.strip_prefix(canonical).map(Path::to_path_buf).ok())
+        });
+    relative
+        .as_deref()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn read_one(root: &Path, manifest: &str) -> Result<Vec<Package>, String> {
     let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .args([
             "metadata",
@@ -141,20 +207,42 @@ pub fn read(root: &Path) -> Result<Vec<Package>, String> {
             "--no-deps",
             "--manifest-path",
         ])
-        .arg(root.join("Cargo.toml"))
+        .arg(root.join(manifest))
         .output()
-        .map_err(|error| format!("cargo metadata could not start: {error}"))?;
+        .map_err(|error| format!("cargo metadata could not start for `{manifest}`: {error}"))?;
     if !output.status.success() {
         return Err(format!(
-            "cargo metadata failed: {}",
+            "cargo metadata failed for `{manifest}`: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let value: Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("cargo metadata wrote something that is not JSON: {error}"))?;
+    let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        format!("cargo metadata wrote something that is not JSON for `{manifest}`: {error}")
+    })?;
     let mut packages = parse(&value)?;
-    // What a manifest asks for is not always what the build gets: a `[patch]` can replace it.
-    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap_or_default();
+    // The workspace is where its manifest is, as the plan names it.
+    let workspace = Path::new(manifest)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || ".".to_owned(),
+            |parent| parent.to_string_lossy().replace('\\', "/"),
+        );
+    for package in &mut packages {
+        package.workspace.clone_from(&workspace);
+    }
+    // What a manifest asks for is not always what the build gets: a `[patch]` can replace it. The
+    // lock is the one Cargo keeps in the workspace's root.
+    let lock_path =
+        Path::new(value["workspace_root"].as_str().unwrap_or_default()).join("Cargo.lock");
+    let lock = std::fs::read_to_string(&lock_path).map_err(|error| {
+        let lock = shown(root, &lock_path);
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("the lock `{lock}` of the workspace `{manifest}` is absent")
+        } else {
+            format!("the lock `{lock}` could not be read: {error}")
+        }
+    })?;
     for package in &mut packages {
         package
             .registry_crates
@@ -228,6 +316,7 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
         .filter_map(Value::as_str)
         .collect();
     let mut packages = Vec::new();
+    let mut ids: Vec<&str> = Vec::new();
     for package in value["packages"]
         .as_array()
         .ok_or("cargo metadata listed no packages")?
@@ -327,7 +416,41 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
             manifest,
             registry_crates,
             dependency_names,
+            workspace: String::new(),
+            workspace_members: Vec::new(),
+            workspace_default_members: Vec::new(),
         });
+        ids.push(id);
+    }
+    // Cargo names members by their ids; the packages above are the members. A Cargo that names no
+    // default members runs every member.
+    let names_of = |wanted: &[&str]| -> Vec<String> {
+        let mut names: Vec<String> = ids
+            .iter()
+            .zip(&packages)
+            .filter(|(id, _)| wanted.contains(id))
+            .map(|(_, package)| package.name.clone())
+            .collect();
+        names.sort();
+        names
+    };
+    let members_named = names_of(&members);
+    let defaults_named = value["workspace_default_members"].as_array().map_or_else(
+        || members_named.clone(),
+        |defaults| {
+            names_of(
+                &defaults
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>(),
+            )
+        },
+    );
+    for package in &mut packages {
+        package.workspace_members.clone_from(&members_named);
+        package
+            .workspace_default_members
+            .clone_from(&defaults_named);
     }
     packages.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(packages)

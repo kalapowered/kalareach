@@ -34,7 +34,7 @@
 //! and a refused one stops the report.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -140,6 +140,19 @@ pub struct Refused {
     pub refusal: Refusal,
 }
 
+/// What the map reads of TypeScript, and with what.
+#[derive(Clone, Copy, Debug)]
+pub struct TypeScriptRead<'a> {
+    /// The packages' directories.
+    pub packages: &'a [String],
+    /// The names of the directories that no file is read below.
+    pub skip_directories: &'a [String],
+    /// The directories of the tested root whose installed compiler reads the files.
+    pub compiler_from: &'a [String],
+    /// A directory whose compiler reads them instead of `compiler_from`.
+    pub compiler: Option<&'a Path>,
+}
+
 /// What the map is built from besides the Rust workspace.
 #[derive(Clone, Copy, Debug)]
 pub struct Declarations<'a> {
@@ -147,10 +160,14 @@ pub struct Declarations<'a> {
     pub case_tables: &'a [CaseTable],
     /// The lanes.
     pub lanes: &'a [Lane],
-    /// The TypeScript packages' directories, when TypeScript is read.
-    pub typescript: Option<&'a [String]>,
+    /// The manifests of the Rust workspaces, relative to the tested root.
+    pub manifests: &'a [String],
+    /// The TypeScript to read, when TypeScript is read.
+    pub typescript: Option<TypeScriptRead<'a>>,
     /// Directories whose files are read as scripts.
-    pub scripts: &'a [&'a str],
+    pub scripts: &'a [String],
+    /// Directories whose Kotlin, Swift and Java files are read for the lanes.
+    pub lane_directories: &'a [String],
     /// The steps that run the keyed tests an ordinary run leaves out, when the map holds the tests
     /// to them.
     pub ignored_runs: Option<&'a [IgnoredRun]>,
@@ -182,6 +199,8 @@ pub struct Map {
     pub packages: Vec<Package>,
     /// The TypeScript files read, with their tests.
     pub typescript: Vec<FileFacts>,
+    /// The version of the compiler that read them, when any file was read.
+    pub typescript_version: Option<String>,
     /// The classes each file of a lane declares, whether or not it names a row: the cases a lane's
     /// tool reports belong to the file that declares their class.
     pub lane_classes: BTreeMap<String, Vec<String>>,
@@ -238,21 +257,23 @@ impl Map {
 #[must_use]
 pub fn build(root: &Path, declarations: &Declarations<'_>) -> Map {
     let mut map = Map::default();
-    match workspace::read(root) {
-        Ok(packages) => {
-            let mut sources = Sources::default();
-            for package in &packages {
-                rust_package(&mut map, &mut sources, root, package);
-            }
-            map.packages = packages;
-        }
-        Err(problem) => map.problems.push(problem),
+    let workspaces = workspace::read(root, declarations.manifests);
+    map.problems.extend(workspaces.problems);
+    let mut sources = Sources::default();
+    for package in &workspaces.packages {
+        rust_package(&mut map, &mut sources, root, package);
     }
+    map.packages = workspaces.packages;
     data_tables(&mut map, root, declarations.case_tables);
-    if let Some(directories) = declarations.typescript {
-        typescript_sources(&mut map, root, directories, declarations.lanes);
+    if let Some(read) = declarations.typescript {
+        typescript_sources(&mut map, root, &read, declarations.lanes);
     }
-    lane_files(&mut map, root, declarations.lanes);
+    lane_files(
+        &mut map,
+        root,
+        declarations.lanes,
+        declarations.lane_directories,
+    );
     if let Some(runs) = declarations.ignored_runs {
         let findings = crate::ignored::check(&map, root, runs, declarations.plan_commands);
         map.problems.extend(findings.problems);
@@ -1356,36 +1377,40 @@ fn covers_in_json(map: &mut Map, text: &str, file: &str) -> Vec<(Identifier, Str
     found
 }
 
-fn typescript_sources(map: &mut Map, root: &Path, directories: &[String], lanes: &[Lane]) {
+fn typescript_sources(map: &mut Map, root: &Path, read: &TypeScriptRead<'_>, lanes: &[Lane]) {
+    // The suffixes of the files the facts script parses.
     const EXTENSIONS: &[&str] = &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
-    const SKIPPED: &[&str] = &[
-        "node_modules",
-        "dist",
-        "build",
-        "coverage",
-        "target",
-        "src-tauri",
-        "native",
-        "test-results",
-        "playwright-report",
-        ".vite",
-    ];
-    for directory in directories {
+    let compilers: Vec<PathBuf> = match read.compiler {
+        Some(directory) => {
+            vec![std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf())]
+        }
+        None => read
+            .compiler_from
+            .iter()
+            .map(|directory| root.join(directory))
+            .collect(),
+    };
+    for directory in read.packages {
         let files = walk(root, directory, &|path| {
             EXTENSIONS.iter().any(|extension| path.ends_with(extension))
-                && !path
-                    .split('/')
-                    .any(|component| SKIPPED.contains(&component))
+                && !path.split('/').any(|component| {
+                    read.skip_directories
+                        .iter()
+                        .any(|skipped| skipped == component)
+                })
                 && !path.ends_with(".d.ts")
         });
-        let facts = match typescript::read(root, &files) {
+        let facts = match typescript::read(root, &compilers, &files) {
             Ok(facts) => facts,
             Err(problem) => {
                 map.problems.push(problem);
                 continue;
             }
         };
-        for file in facts {
+        if map.typescript_version.is_none() {
+            map.typescript_version = facts.version;
+        }
+        for file in facts.files {
             let lane = lanes.iter().find(|lane| matches(&lane.files, &file.file));
             let place = |index: usize| Place::TypeScript {
                 package: directory.clone(),
@@ -1438,7 +1463,9 @@ fn typescript_sources(map: &mut Map, root: &Path, directories: &[String], lanes:
 }
 
 /// The lanes' Kotlin and Swift files, and the rest of those languages' files as references.
-fn lane_files(map: &mut Map, root: &Path, lanes: &[Lane]) {
+fn lane_files(map: &mut Map, root: &Path, lanes: &[Lane], directories: &[String]) {
+    // The suffixes of the files of the lanes' languages, and the directories their tools write
+    // their output to.
     const EXTENSIONS: &[&str] = &[".kt", ".kts", ".swift", ".java"];
     const SKIPPED: &[&str] = &[
         "node_modules",
@@ -1449,7 +1476,7 @@ fn lane_files(map: &mut Map, root: &Path, lanes: &[Lane]) {
         "target",
         "gen",
     ];
-    for directory in ["apps", "packages"] {
+    for directory in directories {
         for file in walk(root, directory, &|path| {
             EXTENSIONS.iter().any(|extension| path.ends_with(extension))
                 && !path
@@ -1592,6 +1619,9 @@ mod tests {
             version: "0.1.0".to_owned(),
             targets: Vec::new(),
             manifest: "/p/Cargo.toml".into(),
+            workspace: ".".to_owned(),
+            workspace_members: Vec::new(),
+            workspace_default_members: Vec::new(),
             registry_crates: registry.iter().map(|name| (*name).to_owned()).collect(),
             dependency_names: dependencies.iter().map(|name| (*name).to_owned()).collect(),
         }
@@ -1627,6 +1657,9 @@ mod tests {
         .expect("writes");
         let named = |names: &[&str]| Package {
             manifest: manifest.clone(),
+            workspace: ".".to_owned(),
+            workspace_members: Vec::new(),
+            workspace_default_members: Vec::new(),
             ..package(&[], names)
         };
         let found = standard_dependencies(root.path(), &named(&["tokio", "core"]));

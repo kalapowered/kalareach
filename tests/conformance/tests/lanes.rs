@@ -12,7 +12,7 @@ use kr_conformance::lane::{self, Case};
 use kr_conformance::libtest::Outcome as LibtestOutcome;
 use kr_conformance::map::{self, Declarations, Map, Place};
 use kr_conformance::plan::{self, Platform, Reading, Step, Tests};
-use kr_conformance::plan_file::Plan;
+use kr_conformance::plan_file::{IgnoredPolicy, Plan};
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Verdict};
 use kr_conformance::run::Executed;
 
@@ -45,10 +45,12 @@ fn map_of(root: &Path) -> Map {
         &Declarations {
             case_tables: &[],
             lanes: &core_plan().lanes,
+            manifests: &["Cargo.toml".to_owned()],
             ignored_runs: None,
             plan_commands: &[],
             typescript: None,
             scripts: &[],
+            lane_directories: &["apps".to_owned(), "packages".to_owned()],
         },
     )
 }
@@ -60,8 +62,11 @@ fn options(platform: Platform) -> Options {
         selection: Some(phones()),
         all_terminals: false,
         platform,
-        plan: core_plan(),
-        held_to_ignored_runs: false,
+        plan: Plan {
+            ignored_policy: IgnoredPolicy { held: false },
+            ..core_plan()
+        },
+        typescript_compiler: None,
         applications: None,
         lister: PathBuf::from("/tmp/l"),
         part: None,

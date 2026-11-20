@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use kr_conformance::plan::Platform;
+use kr_conformance::plan::{ApplicationsPlan, Platform};
 use kr_conformance::plan_file::Plan;
 use kr_conformance::report::{self, Options};
 
@@ -37,7 +37,7 @@ fn the_key_map_is_written_whole_to_the_file_named_by_the_variable() {
             all_terminals: false,
             platform: Platform::current(),
             plan: plan.clone(),
-            held_to_ignored_runs: true,
+            typescript_compiler: None,
             applications: None,
             environment: Vec::new(),
             lister: PathBuf::new(),
@@ -54,6 +54,54 @@ fn the_key_map_is_written_whole_to_the_file_named_by_the_variable() {
         writeln!(text, "rust_tests {:#?}", map.rust_tests).expect("a string");
         writeln!(text, "ignored_tests {:#?}", map.ignored_tests).expect("a string");
         writeln!(text, "lane_classes {:#?}", map.lane_classes).expect("a string");
+    }
+    std::fs::write(&out, text).expect("the file is written");
+}
+
+/// Writes the steps of every platform's plan for every selection of groups, to the file named by
+/// `KR_COMMAND_LINES_OUT`: each platform with all the plan's groups and with each group alone, with
+/// no applications and with every application run. The file lies outside the repository; two
+/// files, one from each tree of the code, are equal when the code selects the same command lines.
+#[test]
+#[ignore = "writes every selection's command lines to the file named by KR_COMMAND_LINES_OUT; run by hand"]
+fn the_command_lines_of_every_selection_are_written_whole_to_the_file_named_by_the_variable() {
+    let out = std::env::var_os("KR_COMMAND_LINES_OUT")
+        .expect("KR_COMMAND_LINES_OUT names the file to write");
+    let out = PathBuf::from(out);
+    assert!(
+        out.is_absolute() && !out.starts_with(repository().canonicalize().expect("the root")),
+        "the file lies outside the repository: {}",
+        out.display()
+    );
+    let plan = Plan::load(&repository(), None).expect("the repository's plan file loads");
+    let mut selections: Vec<(String, Vec<String>)> =
+        vec![("all groups".to_owned(), plan.all_groups())];
+    selections.extend(
+        plan.all_groups()
+            .into_iter()
+            .map(|group| (format!("group {group}"), vec![group])),
+    );
+    let every_application = ApplicationsPlan {
+        left_out: Vec::new(),
+    };
+    let mut text = String::new();
+    for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+        for (name, groups) in &selections {
+            for (applications, given) in [("none", None), ("all", Some(&every_application))] {
+                writeln!(
+                    text,
+                    "== {} {name} applications {applications}",
+                    platform.name()
+                )
+                .expect("a string");
+                writeln!(
+                    text,
+                    "{:#?}",
+                    plan.steps(platform, groups, "evidence", given)
+                )
+                .expect("a string");
+            }
+        }
     }
     std::fs::write(&out, text).expect("the file is written");
 }

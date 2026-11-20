@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use kr_conformance::id::{Identifier, Refusal};
 use kr_conformance::libtest::{Binary, Outcome as LibtestOutcome};
 use kr_conformance::map::Key;
-use kr_conformance::map::{self, Binding, Declarations, Map, Place};
+use kr_conformance::map::{self, Binding, Declarations, Map, Place, TypeScriptRead};
 use kr_conformance::plan::{self, Platform, Reading, Step};
 use kr_conformance::plan_file::{IgnoredRun, Plan, Runs};
 use kr_conformance::report::{self, Document, Gathered, Options, Outcome, Stopped, Verdict};
@@ -42,17 +42,35 @@ fn identifier(text: &str) -> Identifier {
     text.parse().expect("an identifier")
 }
 
+/// The directory whose installed compiler reads the TypeScript of the fixtures, which have no
+/// `node_modules` of their own.
+fn compiler_directory() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("apps")
+        .join("companion")
+}
+
 fn map_of(name: &str, typescript: bool) -> Map {
     let directories = vec![".".to_owned()];
+    let compiler = compiler_directory();
     map::build(
         &tree(name),
         &Declarations {
             case_tables: &[],
             lanes: &[],
+            manifests: &["Cargo.toml".to_owned()],
             ignored_runs: None,
             plan_commands: &[],
-            typescript: typescript.then_some(directories.as_slice()),
+            typescript: typescript.then_some(TypeScriptRead {
+                packages: directories.as_slice(),
+                skip_directories: &[],
+                compiler_from: &[],
+                compiler: Some(&compiler),
+            }),
             scripts: &[],
+            lane_directories: &[],
         },
     )
 }
@@ -111,7 +129,7 @@ fn run_step_through(
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps(
             "rust",
@@ -653,7 +671,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         all_terminals: false,
         platform: Platform::Windows,
         plan: core_plan(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         lister: PathBuf::from("/tmp/l"),
         environment: Vec::new(),
@@ -710,7 +728,7 @@ fn a_typescript_test_that_a_windows_run_selects_is_not_run_and_says_where_it_is_
         all_terminals: false,
         platform: Platform::Windows,
         plan: core_plan(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         lister: PathBuf::from("/tmp/l"),
         environment: Vec::new(),
@@ -772,10 +790,12 @@ fn held_to(runs: &[IgnoredRun]) -> Map {
         &Declarations {
             case_tables: &[],
             lanes: &[],
+            manifests: &["Cargo.toml".to_owned()],
             ignored_runs: Some(runs),
             plan_commands: &core_plan().linux_commands(),
             typescript: None,
             scripts: &[],
+            lane_directories: &[],
         },
     )
 }
@@ -1578,7 +1598,7 @@ fn a_file_a_macro_writes_while_a_crate_compiles_does_not_have_the_listing_build_
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps(
             "rust",
@@ -1634,7 +1654,7 @@ fn a_file_two_test_programs_may_write_and_read_at_once_keeps_its_time() {
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps(
             "rust",
@@ -1677,7 +1697,7 @@ fn a_file_a_library_wrote_and_two_test_programs_read_leaves_the_listing_nothing_
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps(
             "rust",
@@ -1805,9 +1825,13 @@ fn the_result_names_every_command_and_no_path_of_the_checkout() {
     assert!(evidence.path().join(&document.steps[0].log).is_file());
     assert_eq!(document.schema, report::SCHEMA);
     assert!(!document.run.commit.id.is_empty());
-    assert_eq!(
-        document.run.terminal_profile.profile, "unknown",
-        "this tree has no terminal profile"
+    assert!(
+        document.run.terminal_profile.is_none(),
+        "the plan of this tree names no terminal profile"
+    );
+    assert!(
+        !text.contains("terminal_profile"),
+        "a result leaves the profile out when the plan names no file"
     );
 }
 
@@ -1822,7 +1846,7 @@ fn an_evidence_directory_that_holds_an_earlier_report_is_refused() {
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps(
             "rust",
@@ -1859,7 +1883,7 @@ fn a_target_no_step_runs_is_not_run_with_the_reason() {
         selection: None,
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan {
             list_table_rows: true,
@@ -1921,7 +1945,7 @@ fn a_test_whose_step_stopped_after_building_it_is_not_run_with_the_steps_error()
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps(
             "rust",
@@ -1966,7 +1990,7 @@ fn a_test_its_step_stopped_before_reaching_is_not_run_with_the_steps_error() {
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps(
             "rust",
@@ -2016,7 +2040,7 @@ fn a_run_asked_for_every_terminal_names_each_one_as_not_run_and_fails_until_its_
         selection: None,
         all_terminals: true,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan {
             terminals: core_plan().terminals,
@@ -2080,7 +2104,7 @@ fn a_test_a_steps_own_flags_leave_out_is_not_run_rather_than_not_built() {
         selection: Some(vec!["rust".to_owned()]),
         all_terminals: false,
         platform: Platform::current(),
-        held_to_ignored_runs: false,
+        typescript_compiler: None,
         applications: None,
         plan: Plan::of_steps(
             "rust",

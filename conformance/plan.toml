@@ -6,8 +6,32 @@ repository = 'kalareach'
 groups = ['rust', 'end-to-end', 'performance', 'typescript', 'applications', 'phones']
 list_table_rows = true
 
+[rust]
+manifests = ['Cargo.toml']
+
+[ignored_runs]
+held = true
+
+[terminal_profile]
+path = 'fixtures/terminal/profile.json'
+
 [typescript]
 packages = ['packages/protocol', 'packages/plugin-sdk', 'apps/companion']
+compiler_from = ['apps/companion', 'packages/protocol', 'packages/plugin-sdk']
+skip_directories = [
+    'node_modules',
+    'dist',
+    'build',
+    'coverage',
+    'target',
+    'src-tauri',
+    'native',
+    'test-results',
+    'playwright-report',
+    '.vite',
+]
+scripts = ['scripts']
+lane_directories = ['apps', 'packages']
 
 [applications]
 lock = 'tests/conformance/applications.lock'
@@ -1843,6 +1867,27 @@ command = [
 ]
 
 [[step]]
+id = 'typescript-the-report-s-discovery-of-typescript'
+group = 'typescript'
+what = '''the report's discovery of TypeScript from a plan'''
+platforms = ['linux', 'macos']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-conformance',
+    '--test',
+    'discovery',
+    '--',
+    '--ignored',
+    '--exact',
+    'a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names',
+    'every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edited',
+]
+
+[[step]]
 id = 'typescript-packages-protocol-s-tests'
 group = 'typescript'
 what = '''packages/protocol's tests'''
@@ -2177,6 +2222,17 @@ cases = ['typescript_comment_forms_and_titles_key_their_tests']
 [ignored_run.runs]
 kind = 'plan'
 line = 'cargo test --locked -p kr-conformance --test report -- --ignored --exact typescript_comment_forms_and_titles_key_their_tests --show-output'
+
+[[ignored_run]]
+package = 'kr-conformance'
+target = '--test discovery'
+cases = [
+    'a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names',
+    'every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edited',
+]
+[ignored_run.runs]
+kind = 'plan'
+line = 'cargo test --locked -p kr-conformance --test discovery -- --ignored --exact a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names every_key_that_steers_the_typescript_reading_changes_the_map_when_it_is_edited --show-output'
 
 [[ignored_run]]
 package = 'kr-controller'
