@@ -6757,6 +6757,17 @@ mod tests {
     #[cfg(unix)]
     const RECORDED_FILES: [&str; 2] = [SKILL_FILE, ".amp/mcp.json"];
 
+    /// A skill file that the installation writes after `SKILL_FILE`, so a removal takes
+    /// `SKILL_FILE` first.
+    #[cfg(unix)]
+    const TOOLS_FILE: &str = ".amp/skills/kalareach-contact/TOOLS.md";
+
+    /// The recorded files that the cases make changeable, in the order a removal reaches them: a
+    /// skill file that comes after another, so that the check made before the first removal is
+    /// what refuses it and not the removal's own check of that file, and the document.
+    #[cfg(unix)]
+    const SHARED_FILES: [&str; 2] = [TOOLS_FILE, ".amp/mcp.json"];
+
     /// The recorded files of `amp_installed` that no longer stand.
     #[cfg(unix)]
     fn recorded_files_gone(tree: &Tree) -> Vec<&'static str> {
@@ -6771,7 +6782,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_recorded_file_every_user_can_change_is_refused_before_any_removal() {
-        for shared in RECORDED_FILES {
+        for shared in SHARED_FILES {
             let tree = Tree::create();
             let installer = amp_installed(&tree);
             let file = tree.home().join(shared);
@@ -6805,14 +6816,15 @@ mod tests {
     /// that a group other than the user's private group can change. A document that another group
     /// owns is refused earlier still, by the check of the documents an installation cannot carry the
     /// protection of, so on Linux, where the case gives the file another group, only the skill file
-    /// is judged here.
+    /// is judged here. The skill file is one that is taken after another, so the check made before
+    /// the first removal is what refuses it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_recorded_file_its_group_can_change_is_refused_before_any_removal() {
         let files: &[&str] = if cfg!(target_os = "macos") {
-            &RECORDED_FILES
+            &SHARED_FILES
         } else {
-            &[SKILL_FILE]
+            &[TOOLS_FILE]
         };
         for &shared in files {
             let tree = Tree::create();
@@ -6865,10 +6877,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_recorded_file_with_an_allow_entry_is_refused_before_any_removal() {
-        const LATER_SKILL_FILE: &str = ".amp/skills/kalareach-contact/TOOLS.md";
         let tree = Tree::create();
         let installer = amp_installed(&tree);
-        let file = tree.home().join(LATER_SKILL_FILE);
+        let file = tree.home().join(TOOLS_FILE);
         let _entry = Restriction(file.clone());
         exacl::setfacl(
             &[&file],
@@ -6885,7 +6896,7 @@ mod tests {
             .expect_err("a file with an allow entry is refused");
         assert!(
             matches!(&refused, ControllerError::PermissionDenied { detail }
-                if detail.contains(LATER_SKILL_FILE) && detail.contains(FILE_ENTRY_REMOVING)),
+                if detail.contains(TOOLS_FILE) && detail.contains(FILE_ENTRY_REMOVING)),
             "{refused}"
         );
         assert_eq!(
