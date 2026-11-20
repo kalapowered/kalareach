@@ -638,6 +638,29 @@ fn scan(directory: &Path) -> std::io::Result<Scan> {
     Ok(found)
 }
 
+/// How many records of sends under way can be read: the bound counts these alone, so that an
+/// unreadable file adds no work at a start and cannot shut a person out.
+fn readable_holds(directory: &Path) -> std::io::Result<usize> {
+    let mut readable = 0;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.contains(STAGED_MARK) {
+            continue;
+        }
+        let Some(stem) = name.strip_suffix(HOLD_SUFFIX) else {
+            continue;
+        };
+        if valid_id(stem)
+            && std::fs::read(entry.path())
+                .is_ok_and(|bytes| matches!(parse_hold(&bytes, stem), Parsed::Whole(_)))
+        {
+            readable += 1;
+        }
+    }
+    Ok(readable)
+}
+
 /// What the entries take, read from the directory's own sizes.
 fn usage(directory: &Path) -> std::io::Result<Used> {
     let mut used = Used::default();
@@ -1069,9 +1092,9 @@ impl ChannelDesk {
                 "a record is already kept under this identity",
             ));
         }
-        let found = scan(&held.directory)
-            .map_err(|error| storage("the channel messages cannot be read", &error))?;
-        if found.holds.len() >= limits_of(&held.directory).holds {
+        let readable = readable_holds(&held.directory)
+            .map_err(|error| storage("the records of sends cannot be read", &error))?;
+        if readable >= limits_of(&held.directory).holds {
             return Err(CommandError::too_large(
                 "too many records of messages being sent are kept",
             ));
