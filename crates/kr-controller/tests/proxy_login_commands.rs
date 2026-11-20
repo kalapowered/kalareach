@@ -389,6 +389,91 @@ async fn a_repeated_set_and_a_repeated_clear_leave_the_state_the_first_one_made(
     }
 }
 
+/// KR-REQ-10.02, KR-REQ-26.10: a set that is sent again exactly as it was first sent, after a clear
+/// under another action, keeps its login again and is answered as it was the first time; the
+/// daemon keeps no record of the request, so the registry's receipts do not change. The repeat
+/// cancels the clear, as the method's text says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_set_sent_again_after_a_clear_keeps_its_login_again_and_leaves_no_receipt() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let mut control = host.client().await;
+    let store = open_store_in(&host.tree().environment().secrets_dir())
+        .expect("the store the daemon keeps its secrets in")
+        .store;
+    let name = item_name(host.environment_id).expect("the item's name");
+    let receipts = || -> i64 {
+        rusqlite::Connection::open(host.registry_database())
+            .expect("opens the registry")
+            .query_row("SELECT COUNT(*) FROM authority_receipts", [], |row| {
+                row.get(0)
+            })
+            .expect("counts the receipts")
+    };
+    let before = receipts();
+
+    let composed = control
+        .compose(
+            Method::NetworkProxyLoginSet,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params("http://proxy.example.com:3128", &format!("user:{PASSWORD}")),
+        )
+        .await
+        .expect("the request is composed");
+    let first = control
+        .repeat(&composed)
+        .await
+        .expect("the call reaches the daemon");
+    assert!(
+        first.is_ok(),
+        "the first send is accepted: {}",
+        rendered(&first)
+    );
+    let kept = store
+        .get(&name)
+        .expect("the store reads")
+        .expect("the first send kept an item")
+        .expose()
+        .to_vec();
+
+    control
+        .mutate(
+            Method::NetworkProxyLoginClear,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &NetworkProxyLoginClearParams::default(),
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the owner clears the login");
+    assert!(store.get(&name).expect("the store reads").is_none());
+
+    let again = control
+        .repeat(&composed)
+        .await
+        .expect("the call reaches the daemon");
+    assert_eq!(
+        rendered(&first),
+        rendered(&again),
+        "the set sent again is answered as it was the first time"
+    );
+    assert_eq!(
+        store
+            .get(&name)
+            .expect("the store reads")
+            .expect("the set sent again put the item back")
+            .expose(),
+        kept.as_slice(),
+        "the set sent again kept the login the request names"
+    );
+    assert_eq!(
+        receipts(),
+        before,
+        "a set, a clear and a set sent again claimed a receipt in the registry"
+    );
+}
+
 /// KR-REQ-10.02, KR-REQ-26.10: a set and a clear of the proxy login leave no row in the registry's
 /// receipts. The answer is one fixed word and the repeat of either change writes or removes the same
 /// item, so the host keeps no record of the action; a record of it in the registry would be a change

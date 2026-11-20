@@ -453,8 +453,9 @@ methods! {
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: keyed("The daemon keeps no record of the request. Asked \
-                                            again, it keeps the same login and gives the same \
-                                            answer."),
+                                            again, it keeps the login the request names, in \
+                                            place of any login kept since, and gives the same \
+                                            answer when it succeeds."),
     doc: "Keep a login for the given proxy in this host's secret store. No method answers it \
           back or reads it. The daemon sends it from its next start, and only while \
           network.proxy_url names that proxy.";
@@ -463,8 +464,9 @@ methods! {
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: keyed("The daemon keeps no record of the request. Asked \
-                                            again, it finds nothing to remove and gives the \
-                                            same answer."),
+                                            again, it removes any login kept since, or finds \
+                                            nothing to remove, and gives the same answer when \
+                                            it succeeds."),
     doc: "Remove the proxy login kept in this host's secret store. The daemon that is running \
           keeps the login it started with, and sends none from its next start.";
 

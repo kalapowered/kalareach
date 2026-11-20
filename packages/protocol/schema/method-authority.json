@@ -352,7 +352,7 @@
       "history_filter": "not_applicable",
       "idempotency": {
         "keyed": {
-          "key": "The daemon keeps no record of the request. Asked again, it keeps the same login and gives the same answer."
+          "key": "The daemon keeps no record of the request. Asked again, it keeps the login the request names, in place of any login kept since, and gives the same answer when it succeeds."
         }
       },
       "ingress": [
@@ -385,7 +385,7 @@
       "history_filter": "not_applicable",
       "idempotency": {
         "keyed": {
-          "key": "The daemon keeps no record of the request. Asked again, it finds nothing to remove and gives the same answer."
+          "key": "The daemon keeps no record of the request. Asked again, it removes any login kept since, or finds nothing to remove, and gives the same answer when it succeeds."
         }
       },
       "ingress": [

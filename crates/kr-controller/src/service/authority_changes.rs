@@ -1420,11 +1420,12 @@ impl Controller {
     /// The owner's own act at this machine, on the local socket alone. The proxy and the login are
     /// checked for their shape, and the login goes to the store and nowhere else: not to the
     /// registry, not to an answer, not to a log. The action is not claimed and no answer is kept:
-    /// the answer is one fixed word, and a repeat keeps the same login again and gives the same
-    /// answer, so nothing of the request, not even a digest of it, is written down. The admission
-    /// is asked again under the registry lock, which is held across the write, so a withdrawal
-    /// that completes while this waited stops it. The daemon that is running keeps the login it
-    /// started with: the change is marked for the doctor and applies at the next start.
+    /// the answer is one fixed word, and a repeat keeps the login the request names, in place of
+    /// any login kept since, and gives the same answer when it succeeds, so nothing of the
+    /// request, not even a digest of it, is written to the registry. The admission is asked again
+    /// under the registry lock, which is held across the write, so a withdrawal that completes
+    /// while this waited stops it. The daemon that is running keeps the login it started with:
+    /// the change is marked for the doctor and applies at the next start.
     pub(super) async fn network_proxy_login_set(
         &self,
         mutation: &MutationRequest,
@@ -1452,8 +1453,8 @@ impl Controller {
     }
 
     /// Removes the login the host's proxy asks for from the host's secret store, on the same terms
-    /// as [`Self::network_proxy_login_set`]: a repeat finds nothing to remove and gives the same
-    /// answer.
+    /// as [`Self::network_proxy_login_set`]: a repeat removes any login kept since, or finds
+    /// nothing to remove, and gives the same answer when it succeeds.
     pub(super) async fn network_proxy_login_clear(
         &self,
         mutation: &MutationRequest,
