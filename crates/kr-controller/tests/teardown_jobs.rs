@@ -758,3 +758,79 @@ fn a_tree_that_could_not_establish_what_its_test_started_has_ended_fails_the_tes
     );
     assert!(kept, "the tree was kept");
 }
+
+/// A tree made without a service manager calls none when it ends, and one made as usual does.
+///
+/// The case runs twice as a child of its own, with the account's manager replaced by a stand-in
+/// that records every call: a runtime directory that holds the private socket a user manager
+/// keeps, and a `systemctl` first on the path. The parent holds neither of the account's own
+/// variables, so a run of it that has them fails by its own check and no call can reach the
+/// account's manager.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run by name with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS removed from the environment"]
+fn a_tree_without_a_service_manager_calls_none_at_its_end() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const MODE: &str = "KR_TEARDOWN_CASE_MODE";
+    const MARKER: &str = "KR_TEARDOWN_CASE_MARKER";
+
+    // The child: drops a tree of the mode it is told, beside the stand-in manager.
+    if let Ok(mode) = std::env::var(MODE) {
+        let tree = teardown::Tree::create();
+        drop(if mode == "without" {
+            tree.without_service_manager()
+        } else {
+            tree
+        });
+        return;
+    }
+    for variable in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        assert!(
+            std::env::var_os(variable).is_none(),
+            "{variable} is set: run this case by name with \
+             `env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS`"
+        );
+    }
+    let folder = kr_ipc::testing::PrivateTempDir::create();
+    let runtime = folder.path().join("runtime");
+    std::fs::create_dir_all(runtime.join("systemd/private")).expect("a runtime directory");
+    let bin = folder.path().join("bin");
+    std::fs::create_dir(&bin).expect("a folder for the stand-in");
+    let marker = folder.path().join("calls");
+    let stand_in = bin.join("systemctl");
+    std::fs::write(
+        &stand_in,
+        format!("#!/bin/sh\necho \"$@\" >> \"${MARKER}\"\n"),
+    )
+    .expect("the stand-in manager's tool");
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
+        .expect("an executable stand-in");
+    let run = |mode: &str| {
+        let status = Command::new(std::env::current_exe().expect("this program"))
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "a_tree_without_a_service_manager_calls_none_at_its_end",
+            ])
+            .env(MODE, mode)
+            .env(MARKER, &marker)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .status()
+            .expect("the program starts itself");
+        assert!(status.success(), "the {mode} child ends well: {status}");
+    };
+    run("without");
+    assert!(
+        !marker.exists(),
+        "a tree made without a service manager called one"
+    );
+    // The same child with an ordinary tree does call it, so the stand-in can show a call.
+    run("with");
+    assert!(
+        marker.exists(),
+        "an ordinary tree calls the service manager at its end"
+    );
+}
