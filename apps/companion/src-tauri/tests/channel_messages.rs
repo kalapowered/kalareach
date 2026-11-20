@@ -156,13 +156,6 @@ fn code_of(refusal: &Value) -> &str {
     refusal["code"].as_str().unwrap_or("not a refusal")
 }
 
-fn refused_with(result: &Result<Value, Value>, code: &str) {
-    match result {
-        Err(refusal) => assert_eq!(code_of(refusal), code, "{refusal}"),
-        Ok(answer) => panic!("expected {code}, the call answered {answer}"),
-    }
-}
-
 fn dir(data: &Path) -> PathBuf {
     kept_in(data)
 }
@@ -379,7 +372,10 @@ fn a_file_of_another_layout_is_counted_and_left_and_never_replaced() {
     assert_eq!(list["unreadableMessages"]["now"], 0);
     for (n, bytes) in [(2, &newer), (3, &with_extra)] {
         let refused = window.keep(message(n, "mine", &[]));
-        refused_with(&refused, "INVALID_ARGUMENT");
+        {
+            let refusal = (refused).clone().expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+        }
         let path = folder.join(format!("{}.message", action(n)));
         assert_eq!(&std::fs::read(path).expect("still there"), bytes);
     }
@@ -411,10 +407,12 @@ fn a_keep_under_a_used_identity_is_a_resume_only_when_it_is_the_same_message() {
     assert_eq!(first["resumed"], false);
     let again = window.keep(message(1, "same", &[])).expect("a resume");
     assert_eq!(again["resumed"], true);
-    refused_with(
-        &window.keep(message(1, "different", &[])),
-        "INVALID_ARGUMENT",
-    );
+    {
+        let refusal = (window.keep(message(1, "different", &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     assert_eq!(messages(&window.list())[0]["text"], "same");
 }
 
@@ -453,7 +451,10 @@ fn an_entry_whose_flush_failed_is_finished_by_the_next_keep_and_names_the_draft_
     let refs = vec![(id, revision)];
     let guard = kr_flush::testing::refuse_flushes_of(dir(data.path()));
     let failed = window.keep(message(1, "the text", &refs));
-    refused_with(&failed, "RESOURCE_UNAVAILABLE");
+    {
+        let refusal = (failed).clone().expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
     drop(guard);
     assert!(
         names(&dir(data.path())).contains(&format!("{}.message", action(1))),
@@ -477,14 +478,18 @@ fn a_directory_whose_name_cannot_be_flushed_keeps_no_entry_and_fails_again() {
     let root = temporary.path().canonicalize().expect("a resolved path");
     let window = Window::over(&root);
     let guard = kr_flush::testing::refuse_flushes_of(&root);
-    refused_with(
-        &window.keep(message(1, "text", &[])),
-        "RESOURCE_UNAVAILABLE",
-    );
-    refused_with(
-        &window.keep(message(1, "text", &[])),
-        "RESOURCE_UNAVAILABLE",
-    );
+    {
+        let refusal = (window.keep(message(1, "text", &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
+    {
+        let refusal = (window.keep(message(1, "text", &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
     assert!(
         !names(&dir(&root)).contains(&format!("{}.message", action(1))),
         "nothing is kept while the folder's name is not durable"
@@ -505,10 +510,12 @@ fn a_resume_whose_lines_are_present_still_proves_the_ledger_durable() {
     window.keep(message(1, "text", &refs)).expect("kept");
     // Entry flushed again first, then the ledger step.
     let stop = kr_flush::testing::refuse_flushes_of(dir(data.path()));
-    refused_with(
-        &window.keep(message(1, "text", &refs)),
-        "RESOURCE_UNAVAILABLE",
-    );
+    {
+        let refusal = (window.keep(message(1, "text", &refs)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
     drop(stop);
     let first = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&first);
@@ -518,10 +525,12 @@ fn a_resume_whose_lines_are_present_still_proves_the_ledger_durable() {
         Ok(())
     });
     // The keep is a resume, so the hook at the entry still runs, and the ledger flush then fails.
-    refused_with(
-        &window.keep(message(1, "text", &refs)),
-        "RESOURCE_UNAVAILABLE",
-    );
+    {
+        let refusal = (window.keep(message(1, "text", &refs)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
     first.lock().expect("a lock").take();
     assert_eq!(ledger_refs(data.path()), sorted(refs));
 }
@@ -539,10 +548,12 @@ fn a_ledger_that_fails_leaves_none_or_both_lines_and_undoes_only_an_unnamed_entr
         let _at = testing::at(data.path(), Point::LedgerBeforeRename, || {
             Err(io_fault("the ledger is refused"))
         });
-        refused_with(
-            &window.keep(message(1, "ab", &refs)),
-            "RESOURCE_UNAVAILABLE",
-        );
+        {
+            let refusal = (window.keep(message(1, "ab", &refs)))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     assert!(ledger_refs(data.path()).is_empty(), "no line, not one");
     assert!(
@@ -569,10 +580,12 @@ fn a_ledger_renamed_and_not_flushed_keeps_the_entry_and_the_next_start_removes()
         Ok(())
     });
     // The first keep makes the directory; its entry is then durable, and the ledger flush is refused.
-    refused_with(
-        &window.keep(message(1, "text", &refs)),
-        "RESOURCE_UNAVAILABLE",
-    );
+    {
+        let refusal = (window.keep(message(1, "text", &refs)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
     slot.lock().expect("a lock").take();
     drop(at);
     assert!(
@@ -600,10 +613,12 @@ fn a_stop_between_the_entry_and_the_ledger_is_finished_by_a_repeat_of_the_keep()
         let _at = testing::at(dir(data.path()), Point::AfterEntry, || {
             Err(io_fault("the process stopped"))
         });
-        refused_with(
-            &window.keep(message(1, "text", &refs)),
-            "RESOURCE_UNAVAILABLE",
-        );
+        {
+            let refusal = (window.keep(message(1, "text", &refs)))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     assert!(ledger_refs(data.path()).is_empty());
     let done = window.keep(message(1, "text", &refs)).expect("a resume");
@@ -636,7 +651,12 @@ fn the_bounds_refuse_and_evict_nothing_and_a_bad_text_is_not_a_quota() {
     );
     window.keep(message(1, "one", &[])).expect("one");
     window.keep(message(2, "two", &[])).expect("two");
-    refused_with(&window.keep(message(3, "three", &[])), "QUOTA_EXCEEDED");
+    {
+        let refusal = (window.keep(message(3, "three", &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "QUOTA_EXCEEDED", "{refusal}");
+    }
     assert_eq!(messages(&window.list()).len(), 2, "nothing was evicted");
     window
         .keep(message(1, "one", &[]))
@@ -649,18 +669,27 @@ fn the_bounds_refuse_and_evict_nothing_and_a_bad_text_is_not_a_quota() {
             holds: 1_000,
         },
     );
-    refused_with(
-        &window.keep(message(4, &"y".repeat(2_000), &[])),
-        "QUOTA_EXCEEDED",
-    );
+    {
+        let refusal = (window.keep(message(4, &"y".repeat(2_000), &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "QUOTA_EXCEEDED", "{refusal}");
+    }
     let list = window.list();
     assert_eq!(list["limits"]["bytes"], 1_000);
     assert_eq!(messages(&list).len(), 2);
-    refused_with(&window.keep(message(5, "", &[])), "INVALID_ARGUMENT");
-    refused_with(
-        &window.keep(message(5, &"z".repeat(64 * 1024 + 1), &[])),
-        "INVALID_ARGUMENT",
-    );
+    {
+        let refusal = (window.keep(message(5, "", &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
+    {
+        let refusal = (window.keep(message(5, &"z".repeat(64 * 1024 + 1), &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
 }
 
 /// KR-REQ-12.26: two windows that each keep one message into a store with one place left never pass
@@ -707,7 +736,10 @@ fn two_keeps_over_one_folder_with_one_place_left_never_pass_the_bound() {
             .expect("the first ends")
             .expect("the first is kept");
         let second = two.recv_timeout(WAIT).expect("the second ends");
-        refused_with(&second, "QUOTA_EXCEEDED");
+        {
+            let refusal = (second).clone().expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "QUOTA_EXCEEDED", "{refusal}");
+        }
         assert_eq!(
             messages(&first.list()).len(),
             1,
@@ -727,10 +759,12 @@ fn a_repair_and_a_keep_never_run_together() {
         let _at = testing::at(dir(data.path()), Point::AfterEntry, || {
             Err(io_fault("the process stopped"))
         });
-        refused_with(
-            &window.keep(message(1, "text", &refs)),
-            "RESOURCE_UNAVAILABLE",
-        );
+        {
+            let refusal = (window.keep(message(1, "text", &refs)))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     let (hook, reached, release) = a_wait();
     let _at = testing::at(dir(data.path()), Point::RepairNamed, hook);
@@ -780,11 +814,16 @@ fn a_message_directory_that_cannot_be_read_refuses_the_drafts() {
     assert_eq!(read["drafts"].as_array().expect("drafts").len(), 1);
     assert_eq!(read["sources"], "known");
     std::fs::write(dir(data.path()), b"not a directory").expect("a file at the folder's name");
-    refused_with(&window.drafts(), "STORAGE_UNAVAILABLE");
-    refused_with(
-        &window.call("device_channel_messages", json!({ "withText": false })),
-        "STORAGE_UNAVAILABLE",
-    );
+    {
+        let refusal = (window.drafts()).clone().expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
+    {
+        let refusal = (window.call("device_channel_messages", json!({ "withText": false })))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
 }
 
 /// KR-REQ-12.26: the repair makes both directories durable before it writes a line, and a refused
@@ -796,11 +835,16 @@ fn a_repair_that_cannot_flush_either_directory_refuses_both_reads() {
     window.keep(message(1, "text", &[])).expect("kept");
     for refused in [dir(data.path()), data.path().to_path_buf()] {
         let guard = kr_flush::testing::refuse_flushes_of(refused);
-        refused_with(&window.drafts(), "STORAGE_UNAVAILABLE");
-        refused_with(
-            &window.call("device_channel_messages", json!({ "withText": false })),
-            "STORAGE_UNAVAILABLE",
-        );
+        {
+            let refusal = (window.drafts()).clone().expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+        }
+        {
+            let refusal = (window.call("device_channel_messages", json!({ "withText": false })))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+        }
         drop(guard);
         window.drafts().expect("answers once the flush works");
     }
@@ -842,10 +886,12 @@ fn a_discard_of_a_draft_already_gone_proves_the_removal_durable() {
         .call("device_draft_discard", params.clone())
         .expect("removed");
     let guard = kr_flush::testing::refuse_flushes_of(data.path().join("drafts"));
-    refused_with(
-        &window.call("device_draft_discard", params.clone()),
-        "STORAGE_UNAVAILABLE",
-    );
+    {
+        let refusal = (window.call("device_draft_discard", params.clone()))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
     drop(guard);
     window
         .call("device_draft_discard", params)
@@ -863,10 +909,12 @@ fn the_repair_names_nothing_for_a_draft_saved_again_after_the_entry() {
         let _at = testing::at(dir(data.path()), Point::AfterEntry, || {
             Err(io_fault("the process stopped"))
         });
-        refused_with(
-            &window.keep(message(1, "text", &[(id.clone(), revision.clone())])),
-            "RESOURCE_UNAVAILABLE",
-        );
+        {
+            let refusal = (window.keep(message(1, "text", &[(id.clone(), revision.clone())])))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     window
         .call(
@@ -898,7 +946,12 @@ fn a_repair_removes_a_record_an_entry_names_only_after_the_ledger_is_published()
         let _at = testing::at(dir(data.path()), Point::AfterEntry, || {
             Err(io_fault("the process stopped"))
         });
-        refused_with(&window.keep(params), "RESOURCE_UNAVAILABLE");
+        {
+            let refusal = (window.keep(params))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     {
         let _at = testing::at(data.path(), Point::LedgerBeforeRename, || {
@@ -931,10 +984,12 @@ fn a_removal_a_failed_repair_owed_is_returned_by_every_later_read() {
         let _at = testing::at(dir(data.path()), Point::AfterEntry, || {
             Err(io_fault("the process stopped"))
         });
-        refused_with(
-            &first.keep(message(1, "text", &refs)),
-            "RESOURCE_UNAVAILABLE",
-        );
+        {
+            let refusal = (first.keep(message(1, "text", &refs)))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     {
         let _at = testing::at(data.path(), Point::LedgerBeforeRename, || {
@@ -964,10 +1019,12 @@ fn a_restart_between_the_entry_and_the_ledger_is_repaired_by_the_first_read() {
         let _at = testing::at(dir(data.path()), Point::AfterEntry, || {
             Err(io_fault("the process stopped"))
         });
-        refused_with(
-            &first.keep(message(1, "text", &refs)),
-            "RESOURCE_UNAVAILABLE",
-        );
+        {
+            let refusal = (first.keep(message(1, "text", &refs)))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     drop(first);
     let restarted = Window::over(data.path());
@@ -1014,7 +1071,12 @@ fn a_record_of_a_send_is_made_once_updated_with_its_action_and_cleared() {
     let window = Window::over(data.path());
     let refs = vec![window.draft("text")];
     window.create_hold("hold-a", &refs).expect("made");
-    refused_with(&window.create_hold("hold-a", &refs), "INVALID_ARGUMENT");
+    {
+        let refusal = (window.create_hold("hold-a", &refs))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     let list = window.list();
     assert_eq!(list["holds"][0]["holdId"], "hold-a", "{list}");
     assert_eq!(list["holds"][0]["actionId"], Value::Null);
@@ -1026,10 +1088,20 @@ fn a_record_of_a_send_is_made_once_updated_with_its_action_and_cleared() {
             json!({ "holdId": hold, "actionId": action(n) }),
         )
     };
-    refused_with(&update("hold-absent", 1), "INVALID_ARGUMENT");
+    {
+        let refusal = (update("hold-absent", 1))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     update("hold-a", 1).expect("null to a value");
     update("hold-a", 1).expect("the same value again");
-    refused_with(&update("hold-a", 2), "INVALID_ARGUMENT");
+    {
+        let refusal = (update("hold-a", 2))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     let list = window.list();
     assert_eq!(list["holds"][0]["actionId"], action(1));
     assert_eq!(
@@ -1051,13 +1123,15 @@ fn an_update_whose_flush_failed_after_its_rename_may_have_left_the_identity() {
     window.create_hold("hold-a", &[]).expect("made");
     {
         let _guard = kr_flush::testing::refuse_flushes_of(dir(data.path()));
-        refused_with(
-            &window.call(
+        {
+            let refusal = (window.call(
                 "device_channel_hold_update",
                 json!({ "holdId": "hold-a", "actionId": action(1) }),
-            ),
-            "RESOURCE_UNAVAILABLE",
-        );
+            ))
+            .clone()
+            .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     let list = window.list();
     assert_eq!(
@@ -1068,13 +1142,15 @@ fn an_update_whose_flush_failed_after_its_rename_may_have_left_the_identity() {
     window
         .call("device_channel_hold_clear", json!({ "holdId": "hold-a" }))
         .expect("cleared");
-    refused_with(
-        &window.call(
+    {
+        let refusal = (window.call(
             "device_channel_hold_update",
             json!({ "holdId": "hold-a", "actionId": action(1) }),
-        ),
-        "INVALID_ARGUMENT",
-    );
+        ))
+        .clone()
+        .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     assert!(window.list()["holds"].as_array().expect("holds").is_empty());
 }
 
@@ -1103,7 +1179,12 @@ fn only_readable_records_count_towards_the_bound() {
     window
         .create_hold("hold-3", &[])
         .expect("999 of 1,000 readable and one unreadable: made");
-    refused_with(&window.create_hold("hold-4", &[]), "QUOTA_EXCEEDED");
+    {
+        let refusal = (window.create_hold("hold-4", &[]))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "QUOTA_EXCEEDED", "{refusal}");
+    }
     window
         .call(
             "device_channel_hold_update",
@@ -1142,13 +1223,15 @@ fn a_damaged_record_is_listed_by_its_name_and_a_later_one_is_left_alone() {
     window
         .call("device_channel_hold_clear", json!({ "holdId": "hold-bad" }))
         .expect("a damaged record is removed by name");
-    refused_with(
-        &window.call(
+    {
+        let refusal = (window.call(
             "device_channel_hold_clear",
             json!({ "holdId": "hold-later" }),
-        ),
-        "INVALID_ARGUMENT",
-    );
+        ))
+        .clone()
+        .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     assert_eq!(
         std::fs::read(folder.join("hold-later.held")).expect("left"),
         later
@@ -1165,28 +1248,36 @@ fn a_removal_or_clear_whose_flush_is_refused_fails_even_for_an_absent_record() {
     window.create_hold("hold-a", &[]).expect("made");
     {
         let _guard = kr_flush::testing::refuse_flushes_of(dir(data.path()));
-        refused_with(
-            &window.call(
+        {
+            let refusal = (window.call(
                 "device_channel_message_remove",
                 json!({ "actionId": action(1) }),
-            ),
-            "RESOURCE_UNAVAILABLE",
-        );
-        refused_with(
-            &window.call("device_channel_hold_clear", json!({ "holdId": "hold-a" })),
-            "RESOURCE_UNAVAILABLE",
-        );
-        refused_with(
-            &window.call("device_channel_hold_clear", json!({ "holdId": "hold-a" })),
-            "RESOURCE_UNAVAILABLE",
-        );
-        refused_with(
-            &window.call(
+            ))
+            .clone()
+            .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
+        {
+            let refusal = (window.call("device_channel_hold_clear", json!({ "holdId": "hold-a" })))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
+        {
+            let refusal = (window.call("device_channel_hold_clear", json!({ "holdId": "hold-a" })))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
+        {
+            let refusal = (window.call(
                 "device_channel_hold_clear",
                 json!({ "holdId": "hold-gone" }),
-            ),
-            "RESOURCE_UNAVAILABLE",
-        );
+            ))
+            .clone()
+            .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
     }
     window
         .call(
@@ -1233,10 +1324,12 @@ fn a_ledger_that_cannot_be_parsed_is_damaged_and_is_never_written_over() {
     let read = window.drafts().expect("read");
     assert_eq!(read["ledger"], "damaged", "{read}");
     assert_eq!(read["sources"], "unknown");
-    refused_with(
-        &window.keep(message(1, "text", &refs)),
-        "RESOURCE_UNAVAILABLE",
-    );
+    {
+        let refusal = (window.keep(message(1, "text", &refs)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
     assert!(
         names(&dir(data.path())).contains(&format!("{}.message", action(1))),
         "the entry stays: a damaged ledger may name its references"
@@ -1263,10 +1356,12 @@ fn a_ledger_that_cannot_be_read_is_unreadable_and_cannot_be_set_aside() {
     let read = window.drafts().expect("read");
     assert_eq!(read["ledger"], "unreadable", "{read}");
     assert_eq!(read["sources"], "unknown");
-    refused_with(
-        &window.call("device_drafts_ledger_set_aside", json!(null)),
-        "INVALID_ARGUMENT",
-    );
+    {
+        let refusal = (window.call("device_drafts_ledger_set_aside", json!(null)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     assert!(data.path().join("drafts-removals").is_dir());
 }
 
@@ -1284,10 +1379,12 @@ fn a_damaged_ledger_is_set_aside_as_a_copy_and_replaced_by_the_rebuilt_list() {
         .expect("kept");
     let damaged = b"[ truncated".to_vec();
     let _clock = testing::clock(data.path(), 1_700_000_000_123);
-    refused_with(
-        &window.call("device_drafts_ledger_set_aside", json!(null)),
-        "INVALID_ARGUMENT",
-    );
+    {
+        let refusal = (window.call("device_drafts_ledger_set_aside", json!(null)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     std::fs::write(data.path().join("drafts-removals"), &damaged).expect("damaged");
     let done = window
         .call("device_drafts_ledger_set_aside", json!(null))
@@ -1320,10 +1417,12 @@ fn a_damaged_ledger_is_set_aside_as_a_copy_and_replaced_by_the_rebuilt_list() {
         .keep(message(2, "next", &[]))
         .expect("a keep succeeds now");
     // A ledger that parses is never moved.
-    refused_with(
-        &window.call("device_drafts_ledger_set_aside", json!(null)),
-        "INVALID_ARGUMENT",
-    );
+    {
+        let refusal = (window.call("device_drafts_ledger_set_aside", json!(null)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
     assert!(copy.exists());
 }
 
@@ -1337,10 +1436,12 @@ fn a_set_aside_never_replaces_a_name_that_is_used() {
     let used = data.path().join("drafts-removals.set-aside-5");
     std::fs::write(&used, b"an earlier set-aside").expect("a used name");
     let _clock = testing::clock(data.path(), 5);
-    refused_with(
-        &window.call("device_drafts_ledger_set_aside", json!(null)),
-        "RESOURCE_UNAVAILABLE",
-    );
+    {
+        let refusal = (window.call("device_drafts_ledger_set_aside", json!(null)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
     assert_eq!(std::fs::read(&used).expect("kept"), b"an earlier set-aside");
     assert_eq!(
         ledger_bytes(data.path()).expect("bytes"),
@@ -1362,10 +1463,12 @@ fn a_set_aside_whose_flush_failed_is_owed_and_completed_before_any_adoption() {
     let _clock = testing::clock(data.path(), 7);
     {
         let _early = kr_flush::testing::refuse_flushes_of(data.path());
-        refused_with(
-            &window.call("device_drafts_ledger_set_aside", json!(null)),
-            "RESOURCE_UNAVAILABLE",
-        );
+        {
+            let refusal = (window.call("device_drafts_ledger_set_aside", json!(null)))
+                .clone()
+                .expect_err("the call is refused");
+            assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        }
         assert_eq!(
             ledger_bytes(data.path()).expect("bytes"),
             damaged,
@@ -1387,14 +1490,19 @@ fn a_set_aside_whose_flush_failed_is_owed_and_completed_before_any_adoption() {
         .expect("the move is made");
     assert_eq!(done["moved"], true);
     assert_eq!(done["confirmed"], false);
-    refused_with(&window.drafts(), "STORAGE_UNAVAILABLE");
+    {
+        let refusal = (window.drafts()).clone().expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
     slot.lock().expect("a lock").take();
     let read = window.drafts().expect("answers once the flush is made");
     assert_eq!(read["ledger"], "ok", "a retry shows no control");
-    refused_with(
-        &window.call("device_drafts_ledger_set_aside", json!(null)),
-        "INVALID_ARGUMENT",
-    );
+    {
+        let refusal = (window.call("device_drafts_ledger_set_aside", json!(null)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
 }
 
 /// KR-REQ-12.26: the owed flush of a set-aside is kept with no message directory too, and every
@@ -1474,7 +1582,10 @@ fn a_set_aside_with_no_message_directory_keeps_its_flush_owed() {
         .call("device_drafts_ledger_set_aside", json!(null))
         .expect("moved");
     assert!(!dir(data.path()).exists(), "no message directory exists");
-    refused_with(&window.drafts(), "STORAGE_UNAVAILABLE");
+    {
+        let refusal = (window.drafts()).clone().expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
     slot.lock().expect("a lock").take();
     window.drafts().expect("answers once the flush is made");
 }
@@ -1509,5 +1620,289 @@ fn a_set_aside_loses_the_removal_of_a_message_the_person_removed() {
             .iter()
             .any(|draft| draft["id"] == kept.0),
         "the source is a draft again"
+    );
+}
+
+/// KR-REQ-12.26: a set-aside names the sources of the entries it lists only once those entries' names
+/// are proved durable, and refuses, moving nothing, while that proof fails.
+#[test]
+fn a_set_aside_refuses_while_an_entrys_name_is_not_proved_durable() {
+    let data = data();
+    let window = Window::over(data.path());
+    window
+        .keep(message(9, "first", &[]))
+        .expect("the directory exists");
+    let (id, revision) = window.draft("the text");
+    let refs = vec![(id, revision)];
+    // The entry is renamed in and its folder's flush is refused: an entry with no line.
+    let guard = kr_flush::testing::refuse_flushes_of(dir(data.path()));
+    {
+        let refusal = (window.keep(message(1, "the text", &refs)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
+    assert!(
+        names(&dir(data.path())).contains(&format!("{}.message", action(1))),
+        "the entry is visible and not proved durable"
+    );
+    let ledger = data.path().join("drafts-removals");
+    std::fs::write(&ledger, b"not a list").expect("a damaged list");
+    {
+        let refusal = (window.call("device_drafts_ledger_set_aside", json!(null)))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
+    assert_eq!(
+        std::fs::read(&ledger).ok(),
+        Some(b"not a list".to_vec()),
+        "the original list is in place"
+    );
+    assert!(
+        !names(data.path())
+            .iter()
+            .any(|name| name.starts_with("drafts-removals.set-aside-")),
+        "nothing was copied"
+    );
+    drop(guard);
+    let done = window
+        .call("device_drafts_ledger_set_aside", json!(null))
+        .expect("the list is set aside once the proof can be made");
+    assert_eq!(done["moved"], true, "{done}");
+    assert_eq!(ledger_refs(data.path()), sorted(refs));
+}
+
+/// KR-REQ-12.26: another state over the data directory, which owes nothing itself, proves a
+/// set-aside durable before it reads, whether or not there is a folder of messages.
+#[test]
+fn another_state_proves_a_set_aside_durable_before_it_reads_with_no_message_folder() {
+    let data = data();
+    let first = Window::over(data.path());
+    std::fs::write(data.path().join("drafts-removals"), b"not a list").expect("a damaged list");
+    let slot = Arc::new(Mutex::new(None));
+    let hold_slot = Arc::clone(&slot);
+    let root = data.path().to_path_buf();
+    let at = testing::at(data.path(), Point::SetAsideCopied, move || {
+        *hold_slot.lock().expect("a lock") =
+            Some(kr_flush::testing::refuse_flushes_of(root.clone()));
+        Ok(())
+    });
+    let done = first
+        .call("device_drafts_ledger_set_aside", json!(null))
+        .expect("the list is moved");
+    drop(at);
+    assert_eq!(done["moved"], true, "{done}");
+    assert_eq!(done["confirmed"], false, "{done}");
+    let second = Window::over(data.path());
+    {
+        let refusal = (second.drafts()).clone().expect_err("the read is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
+    slot.lock().expect("a lock").take();
+    assert!(
+        second.drafts().is_ok(),
+        "the read answers once the flush can be made"
+    );
+    assert!(!dir(data.path()).exists(), "there is no folder of messages");
+}
+
+/// A change to the members of a stored file, as a case under test makes it.
+type Edit = dyn Fn(&mut serde_json::Map<String, Value>);
+
+/// KR-REQ-12.26: a file is of this layout only with every member, nullable ones included, a numeric
+/// time and no member more.
+#[test]
+fn a_message_or_record_file_is_of_this_layout_only_with_every_member_and_no_other() {
+    let data = data();
+    let window = Window::over(data.path());
+    window.keep(message(1, "valid", &[])).expect("kept");
+    let path = dir(data.path()).join(format!("{}.message", action(1)));
+    let valid: Value = serde_json::from_slice(&std::fs::read(&path).expect("the entry"))
+        .expect("the entry's json");
+    assert!(valid["sent_at_ms"].is_u64(), "a JSON number: {valid}");
+    let variant = |n: u8, edit: &Edit| {
+        let mut file = valid.clone();
+        let members = file.as_object_mut().expect("an object");
+        members.insert("action_id".to_owned(), json!(action(n)));
+        edit(members);
+        std::fs::write(
+            dir(data.path()).join(format!("{}.message", action(n))),
+            serde_json::to_vec(&file).expect("bytes"),
+        )
+        .expect("a file");
+    };
+    // The control changes nothing but the identity, and is read.
+    variant(2, &|_| {});
+    assert_eq!(messages(&window.list()).len(), 2, "a valid variant is read");
+    let breaks: [(u8, &Edit); 4] = [
+        (3, &|members| {
+            members.remove("environment_id");
+        }),
+        (4, &|members| {
+            members.remove("hold_id");
+        }),
+        (5, &|members| {
+            members.insert("extra".to_owned(), json!(1));
+        }),
+        (6, &|members| {
+            members.insert("sent_at_ms".to_owned(), json!("5"));
+        }),
+    ];
+    for (n, edit) in breaks {
+        variant(n, edit);
+        let list = window.list();
+        assert_eq!(messages(&list).len(), 2, "variant {n} is not read: {list}");
+        assert_eq!(
+            list["unreadableMessages"]["layout"], 1,
+            "variant {n} is of another layout: {list}"
+        );
+        std::fs::remove_file(dir(data.path()).join(format!("{}.message", action(n))))
+            .expect("the variant goes");
+    }
+    // A record of a send with a member less is damaged: listed by its name for the person to remove.
+    window.create_hold("a-hold", &[]).expect("a hold");
+    let held = dir(data.path()).join("a-hold.held");
+    let mut record: Value =
+        serde_json::from_slice(&std::fs::read(&held).expect("the record")).expect("json");
+    assert!(record["sent_at_ms"].is_u64(), "a JSON number: {record}");
+    record
+        .as_object_mut()
+        .expect("an object")
+        .remove("action_id");
+    std::fs::write(&held, serde_json::to_vec(&record).expect("bytes")).expect("a file");
+    assert_eq!(window.list()["damagedHolds"], json!(["a-hold"]));
+}
+
+/// KR-REQ-12.26: a keep with no references takes the ledger step: a damaged list fails it, and a
+/// flush that is refused fails it until a repeat completes.
+#[test]
+fn a_keep_with_no_references_takes_the_ledger_step_too() {
+    let data = data();
+    let window = Window::over(data.path());
+    window
+        .keep(message(9, "first", &[]))
+        .expect("the directory exists");
+    let ledger = data.path().join("drafts-removals");
+    std::fs::write(&ledger, b"not a list").expect("a damaged list");
+    {
+        let refusal = (window.keep(message(1, "no draft", &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
+    assert_eq!(
+        std::fs::read(&ledger).ok(),
+        Some(b"not a list".to_vec()),
+        "a damaged list is never written over"
+    );
+    std::fs::remove_file(&ledger).expect("the damaged list goes");
+    window.drafts().expect("the list now reads as empty");
+    let guard = kr_flush::testing::refuse_flushes_of(data.path().to_path_buf());
+    {
+        let refusal = (window.keep(message(2, "no draft either", &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
+    drop(guard);
+    // The keep reported the failure, so the page sends nothing; the same keep, repeated, completes.
+    let done = window
+        .keep(message(2, "no draft either", &[]))
+        .expect("the repeated keep completes");
+    assert_eq!(done["resumed"], true, "{done}");
+}
+
+/// KR-REQ-12.26: a keep removes the record of its send only when it reads as this layout, and a
+/// removal that cannot read a record removes nothing.
+#[test]
+fn a_record_of_a_later_layout_or_that_cannot_be_read_is_never_removed_by_cleanup() {
+    let data = data();
+    let window = Window::over(data.path());
+    window.create_hold("later", &[]).expect("a hold");
+    let later = dir(data.path()).join("later.held");
+    std::fs::write(&later, br#"{"version":2,"kind":"held","hold_id":"later"}"#)
+        .expect("a later layout");
+    let mut request = message(1, "text", &[]);
+    request["holdId"] = json!("later");
+    window.keep(request).expect("the keep succeeds");
+    assert!(later.exists(), "a record of a later layout is left");
+    {
+        let refusal = (window.call("device_channel_hold_clear", json!({ "holdId": "later" })))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
+    assert!(later.exists(), "a clear leaves it as well");
+    // A record that cannot be read now: a folder of that name.
+    std::fs::create_dir(dir(data.path()).join("unread.held")).expect("a folder");
+    {
+        let refusal = (window.call("device_channel_hold_clear", json!({ "holdId": "unread" })))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
+    assert!(
+        dir(data.path()).join("unread.held").is_dir(),
+        "nothing was removed"
+    );
+    // A damaged record goes by the person's own clear, and not by a keep.
+    let damaged = dir(data.path()).join("damaged.held");
+    std::fs::write(&damaged, b"not json").expect("a damaged record");
+    let mut next = message(2, "text", &[]);
+    next["holdId"] = json!("damaged");
+    window.keep(next).expect("the keep succeeds");
+    assert!(damaged.exists(), "a keep leaves a damaged record");
+    window
+        .call("device_channel_hold_clear", json!({ "holdId": "damaged" }))
+        .expect("the person's clear");
+    assert!(!damaged.exists(), "a clear removes it");
+}
+
+/// KR-REQ-12.26: a repair and a record's update sweep the staged files an unfinished write left,
+/// and a listing leaves them alone.
+#[test]
+fn a_repair_and_an_update_sweep_staged_files_and_a_listing_does_not() {
+    let data = data();
+    let window = Window::over(data.path());
+    window.create_hold("held-one", &[]).expect("a hold");
+    let staged_message = dir(data.path()).join(format!("{}.message.staged-1-1", action(7)));
+    let staged_hold = dir(data.path()).join("x.held.staged-1-1");
+    std::fs::write(&staged_message, b"half").expect("a staged file");
+    std::fs::write(&staged_hold, b"half").expect("a staged file");
+    window.list();
+    assert!(
+        staged_message.exists() && staged_hold.exists(),
+        "a listing changes nothing"
+    );
+    window.drafts().expect("a repair");
+    assert!(
+        !staged_message.exists() && !staged_hold.exists(),
+        "a repair sweeps them"
+    );
+    std::fs::write(&staged_hold, b"half").expect("a staged file");
+    window
+        .call(
+            "device_channel_hold_update",
+            json!({ "holdId": "held-one", "actionId": action(1) }),
+        )
+        .expect("an update");
+    assert!(!staged_hold.exists(), "an update sweeps them");
+}
+
+/// KR-REQ-12.26: after the first keep made the folder durable, a later keep flushes no name of the
+/// path again, so a case that refuses one flush refuses only that one.
+#[test]
+fn a_later_keep_flushes_nothing_more_of_the_path() {
+    let data = data();
+    let window = Window::over(data.path());
+    window.keep(message(1, "first", &[])).expect("kept");
+    let parent = data.path().parent().expect("a parent").to_path_buf();
+    let guard = kr_flush::testing::refuse_flushes_of(parent);
+    let second = window.keep(message(2, "second", &[]));
+    drop(guard);
+    assert!(
+        second.is_ok(),
+        "a refused flush of the path's parent does not reach a later keep: {second:?}"
     );
 }
