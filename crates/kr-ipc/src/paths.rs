@@ -1633,6 +1633,52 @@ mod windows {
             let owner = account_in(accounts.owner(), &accounts.owner, usize::MAX)?;
             Ok(owner == self.owner)
         }
+
+        /// Returns true when the file carries exactly the list the owner-only writers set: see
+        /// [`AccessList::is_the_owner_only_list`]. The account is this process's user.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`AccessListRefusal::Unreadable`] when this process's own token cannot be read.
+        #[cfg(test)]
+        pub(crate) fn is_the_owner_only_list(
+            &self,
+        ) -> std::result::Result<bool, AccessListRefusal> {
+            let accounts = TokenAccounts::read()?;
+            let user = account_in(accounts.user(), &accounts.user, usize::MAX)?;
+            Ok(self.discretionary.is_the_owner_only_list(&user))
+        }
+    }
+
+    impl AccessList {
+        /// Returns true when the list is protected from what its directory passes down and holds
+        /// exactly two entries: each allows every file right, sets no inheritance flag, and names
+        /// OWNER RIGHTS or `user`, one each.
+        #[cfg(test)]
+        fn is_the_owner_only_list(&self, user: &Account) -> bool {
+            let Some(entries) = &self.entries else {
+                return false;
+            };
+            let allows_all = |account: &Account| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.kind == EntryKind::Allow
+                            && entry.flags == 0
+                            && entry.mask == FILE_ALL_ACCESS
+                            && &entry.account == account
+                    })
+                    .count()
+                    == 1
+            };
+            self.protected && entries.len() == 2 && allows_all(&owner_rights()) && allows_all(user)
+        }
+    }
+
+    /// OWNER RIGHTS, `S-1-3-4`, the placeholder that stands for whoever owns the object.
+    #[cfg(test)]
+    fn owner_rights() -> Account {
+        Account(vec![1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0])
     }
 
     /// Reads the security descriptor a handle holds, every class [`ACCESS_CLASSES`] names, into
@@ -2360,6 +2406,114 @@ mod windows {
                 "the Administrators group exactly when the token is elevated"
             );
             assert!(!could_have_created(users.as_psid(), &accounts));
+        }
+
+        /// KR-REQ-03.08: under an elevated token whose default owner is the Administrators group, a
+        /// file the owner-only writers make is owned by that group and carries the same list as
+        /// any other: OWNER RIGHTS, which then names the group, and this user, so a program of
+        /// this user that is not elevated can still open it. The reader accepts the file.
+        ///
+        /// The case needs an elevated token to take the group as default owner. On a token that is
+        /// not elevated it fails, and says it could not make its condition.
+        #[test]
+        fn a_file_written_under_an_administrators_default_owner_names_only_that_owner_and_the_account()
+         {
+            use windows_sys::Win32::Security::{
+                DuplicateTokenEx, RevertToSelf, SecurityImpersonation, SetTokenInformation,
+                TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TokenImpersonation,
+            };
+            use windows_sys::Win32::System::Threading::SetThreadToken;
+
+            /// Ends the impersonation of the thread however the case ends.
+            struct Reverted;
+            impl Drop for Reverted {
+                fn drop(&mut self) {
+                    // SAFETY: this only ends the calling thread's impersonation.
+                    unsafe {
+                        RevertToSelf();
+                    }
+                }
+            }
+
+            let own = TokenHandle::open().expect("this process's token");
+            assert!(
+                elevated(&own),
+                "this case could not make its condition: it needs an elevated token, which can take \
+                 the Administrators group as its default owner, and this process's token is not \
+                 elevated"
+            );
+            let mut original: HANDLE = std::ptr::null_mut();
+            // SAFETY: the process handle is a pseudo-handle that needs no release, and `original`
+            // is a live out parameter.
+            let opened = unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &raw mut original,
+                )
+            };
+            assert!(opened != 0, "{}", std::io::Error::last_os_error());
+            let original = TokenHandle(original);
+            let mut copy: HANDLE = std::ptr::null_mut();
+            // SAFETY: `original` is open for the call and `copy` is a live out parameter; no
+            // attributes are given.
+            let duplicated = unsafe {
+                DuplicateTokenEx(
+                    original.0,
+                    TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_IMPERSONATE,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &raw mut copy,
+                )
+            };
+            assert!(duplicated != 0, "{}", std::io::Error::last_os_error());
+            let token = TokenHandle(copy);
+            let administrators = OwnedSid::parse(ADMINISTRATORS).expect("the Administrators group");
+            let owner = TOKEN_OWNER {
+                Owner: administrators.as_psid(),
+            };
+            // SAFETY: the token is open with the right to change its defaults, and the structure
+            // points at an identifier that outlives the call.
+            let set = unsafe {
+                SetTokenInformation(
+                    token.0,
+                    TokenOwner,
+                    std::ptr::from_ref(&owner).cast(),
+                    u32::try_from(std::mem::size_of::<TOKEN_OWNER>()).unwrap_or(0),
+                )
+            };
+            assert!(set != 0, "{}", std::io::Error::last_os_error());
+
+            let folder = std::env::temp_dir().join(format!("kr-owner-{}", crate::new_uuid()));
+            std::fs::create_dir(&folder).expect("a folder that inherits its list");
+            let path = folder.join("setting");
+            {
+                // SAFETY: a null thread pointer means the calling thread, and the token is an
+                // impersonation token that is open with the right to impersonate.
+                let impersonating = unsafe { SetThreadToken(std::ptr::null(), token.0) };
+                assert!(impersonating != 0, "{}", std::io::Error::last_os_error());
+                let _reverted = Reverted;
+                crate::paths::write_owner_only_file(&path, b"a setting").expect("writes");
+            }
+
+            let access = FileAccess::of(&path).expect("reads who can reach the file");
+            let group = Account(vec![1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0]);
+            assert_eq!(
+                access.owner, group,
+                "the file is owned by the group: {access:?}"
+            );
+            assert!(
+                access.is_the_owner_only_list().expect("the token"),
+                "the file carries the owner and the account and nothing else: {access:?}"
+            );
+            let read = crate::paths::read_owner_only_file(&path, 64);
+            assert_eq!(
+                read.as_ref().ok().and_then(Option::as_deref),
+                Some(b"a setting".as_slice()),
+                "the reader accepts the file: {read:?}"
+            );
+            std::fs::remove_dir_all(&folder).ok();
         }
 
         /// An account the tests name: the local system.
@@ -3619,6 +3773,11 @@ mod tests {
             "refused once while the new file was held, and given its name once it was let go"
         );
         assert_eq!(std::fs::read(&target).expect("reads"), b"published");
+        let published = access(&target);
+        assert!(
+            published.is_the_owner_only_list().expect("the token"),
+            "the published file carries the protected list: {published:?}"
+        );
         assert_eq!(names_in(&root), vec!["identity".to_owned()], "one name");
         std::fs::remove_file(&target).expect("the published name is removed");
         assert_eq!(
@@ -3646,6 +3805,11 @@ mod tests {
         replaced.expect("replaced once it is let go");
         assert_eq!(refusals.get(), 1, "refused once while it was held");
         assert_eq!(std::fs::read(&target).expect("reads"), b"second");
+        let replacement = access(&target);
+        assert!(
+            replacement.is_the_owner_only_list().expect("the token"),
+            "the replacement carries the protected list: {replacement:?}"
+        );
         assert_eq!(names_in(&root), vec!["descriptor.kr".to_owned()]);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -4785,6 +4949,195 @@ mod tests {
     fn access(path: &Path) -> FileAccess {
         FileAccess::of(path)
             .unwrap_or_else(|refusal| panic!("{} is read: {refusal:?}", path.display()))
+    }
+
+    /// A directory under the system's temporary directory whose list passes Authenticated Users to
+    /// everything made in it, as the list of a data drive or of a folder under `C:\` does.
+    #[cfg(windows)]
+    fn folder_granting_authenticated_users(name: &str) -> Inheriting {
+        let folder = Inheriting::new(name);
+        run(
+            "icacls.exe",
+            &[
+                folder.0.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-5-11:(OI)(CI)(R)".as_ref(),
+            ],
+        );
+        folder
+    }
+
+    /// KR-REQ-03.08: a file the writer makes is owner-only whatever list its folder passes down,
+    /// so the owner-only reader accepts it where the folder grants another account. Without a
+    /// list of its own the file inherits that account's entry, and the next read refuses it.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_written_owner_only_reads_back_where_its_folder_grants_another_account() {
+        let folder = folder_granting_authenticated_users("written");
+        let path = folder.0.join("setting");
+        write_owner_only_file(&path, b"a setting").expect("writes");
+        let read = read_owner_only_file(&path, 64);
+        assert_eq!(
+            read.as_ref().ok().and_then(Option::as_deref),
+            Some(b"a setting".as_slice()),
+            "the file reads back where its folder grants Authenticated Users: {read:?}"
+        );
+        let written = access(&path);
+        assert!(
+            written.is_the_owner_only_list().expect("the token"),
+            "the file carries its own protected list and nothing its folder passes down: {written:?}"
+        );
+    }
+
+    /// The same for the writer that never replaces a file.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_created_owner_only_reads_back_where_its_folder_grants_another_account() {
+        let folder = folder_granting_authenticated_users("created");
+        let path = folder.0.join("identity");
+        create_new_owner_only_file(&path, b"an identity").expect("writes");
+        let read = read_owner_only_file(&path, 64);
+        assert_eq!(
+            read.as_ref().ok().and_then(Option::as_deref),
+            Some(b"an identity".as_slice()),
+            "the file reads back where its folder grants Authenticated Users: {read:?}"
+        );
+        let created = access(&path);
+        assert!(
+            created.is_the_owner_only_list().expect("the token"),
+            "the file carries its own protected list and nothing its folder passes down: {created:?}"
+        );
+    }
+
+    /// A file the writers made and that is then granted to Everyone is still refused by the
+    /// reader, and is read again when the grant is taken away: the list they set does not make the
+    /// reader take an entry for another account. A guard, with a folder that passes nothing down.
+    #[cfg(windows)]
+    #[test]
+    fn a_widened_owner_only_file_is_still_refused_after_the_explicit_list() {
+        let root = temporary_root("widened-again");
+        for (name, replacing) in [("replaced", true), ("created", false)] {
+            let path = root.join(name);
+            if replacing {
+                write_owner_only_file(&path, b"kept").expect("writes");
+            } else {
+                create_new_owner_only_file(&path, b"kept").expect("writes");
+            }
+            assert!(
+                read_owner_only_file(&path, 64).is_ok(),
+                "{name}: as written it reads"
+            );
+            run(
+                "icacls.exe",
+                &[path.as_os_str(), "/grant".as_ref(), "*S-1-1-0:(R)".as_ref()],
+            );
+            let error =
+                read_owner_only_file(&path, 64).expect_err("a file granted to Everyone is refused");
+            assert_eq!(
+                error.code(),
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "{name}"
+            );
+            run(
+                "icacls.exe",
+                &[path.as_os_str(), "/remove:g".as_ref(), "*S-1-1-0".as_ref()],
+            );
+            assert!(
+                read_owner_only_file(&path, 64).is_ok(),
+                "{name}: it reads again once the grant is gone"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A name that holds a NUL is refused by both writers, whether the NUL is in the file's name or
+    /// in its directory's, and nothing is made. A guard on the conversion of the name.
+    #[cfg(windows)]
+    #[test]
+    fn a_name_that_holds_a_nul_is_refused_by_both_writers_and_makes_nothing() {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let folder = Inheriting::new("nul");
+        let units: Vec<u16> = "before\0after".encode_utf16().collect();
+        let with_nul = std::ffi::OsString::from_wide(&units);
+        for path in [
+            folder.0.join(&with_nul),
+            folder.0.join(&with_nul).join("file"),
+        ] {
+            for (writer, outcome) in [
+                ("write_owner_only_file", write_owner_only_file(&path, b"x")),
+                (
+                    "create_new_owner_only_file",
+                    create_new_owner_only_file(&path, b"x"),
+                ),
+            ] {
+                match outcome.expect_err("a name with a NUL is refused") {
+                    IpcError::Io { source, .. } => assert_eq!(
+                        source.kind(),
+                        std::io::ErrorKind::InvalidInput,
+                        "{writer} of {}",
+                        path.display()
+                    ),
+                    other => panic!("{writer} of {}: {other:?}", path.display()),
+                }
+            }
+        }
+        assert_eq!(names_in(&folder.0), Vec::<String>::new(), "nothing is made");
+    }
+
+    /// A path past the old limit of 260 characters is written, replaced and read back by both
+    /// writers, and the reader accepts it. A guard on the conversion of the name.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_past_the_old_limit_is_written_and_read_back() {
+        let root = temporary_root("long-path");
+        let mut directory = root.clone();
+        while directory.as_os_str().len() < 300 {
+            directory.push("a-directory-with-a-name-of-some-length");
+        }
+        std::fs::create_dir_all(&directory).expect("a long path is made");
+        let replaced = directory.join("replaced");
+        write_owner_only_file(&replaced, b"first").expect("writes");
+        write_owner_only_file(&replaced, b"second").expect("replaces");
+        let created = directory.join("created");
+        create_new_owner_only_file(&created, b"third").expect("creates");
+        for (path, held) in [(&replaced, b"second".as_slice()), (&created, b"third")] {
+            let read = read_owner_only_file(path, 64);
+            assert_eq!(
+                read.as_ref().ok().and_then(Option::as_deref),
+                Some(held),
+                "{read:?}"
+            );
+        }
+        assert_eq!(
+            names_in(&directory),
+            vec!["created".to_owned(), "replaced".to_owned()],
+            "no temporary name is left"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A name that is taken is refused by the writer that never replaces, and the file keeps its
+    /// bytes and its list. A guard.
+    #[cfg(windows)]
+    #[test]
+    fn a_taken_name_is_refused_and_keeps_its_bytes_and_its_list() {
+        let root = temporary_root("taken-name");
+        let path = root.join("identity");
+        write_owner_only_file(&path, b"the first").expect("writes");
+        let before = access(&path);
+        let error =
+            create_new_owner_only_file(&path, b"the second").expect_err("a taken name is refused");
+        match error {
+            IpcError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).expect("reads"), b"the first");
+        assert_eq!(access(&path), before, "its list is as it was");
+        assert_eq!(names_in(&root), vec!["identity".to_owned()]);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Two files made in one directory have the same access, which records nothing set on either
