@@ -11081,7 +11081,7 @@ async fn a_batch_whose_authority_ends_while_the_writer_waits_for_room_is_given_u
         .session()
         .attach(&params, params.requested.clone(), challenger)
         .expect("attaches");
-    let queued = wired.runtime.input().lock().queued_input_bytes();
+    let owed_against_the_lease = wired.runtime.input().lock().queued_lease_bytes();
     let sent = more_than_the_terminal_takes().len();
 
     // The clock reads zero, so the batch has a minute of authority left while the writer waits.
@@ -11100,27 +11100,17 @@ async fn a_batch_whose_authority_ends_while_the_writer_waits_for_room_is_given_u
         "the terminal has taken what the batch is short of"
     );
 
-    // The end of the authority passes with the writer waiting for room.
+    // The end of the authority passes with the writer waiting for room. The writer gives the batch
+    // up at its next look at the end, and the last thing it does then is give back what the batch
+    // still owed against the lease, so that is what the case waits for.
     clock.advance(Duration::from_millis(AUTHORITY_ENDS_AT_MS + 1_000));
     let settled = std::time::Instant::now() + SOON;
-    while queued.load(std::sync::atomic::Ordering::Acquire) != 0
-        && std::time::Instant::now() < settled
-    {
+    while owed_against_the_lease.load() != 0 && std::time::Instant::now() < settled {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(
-        queued.load(std::sync::atomic::Ordering::Acquire),
-        0,
-        "the writer gave the batch up once its authority had ended while it waited for room"
-    );
-    assert_eq!(
-        lease_bytes_the_terminal_has_taken(&wired),
-        taken,
-        "nothing more of the batch reached the terminal after its authority ended"
-    );
+    let handed = lease_bytes_the_terminal_has_taken(&wired);
 
-    // The writer released what it gave up against the lease, so a takeover has none of it to count
-    // as lost.
+    // A takeover reports what the lease left unwritten: nothing, if the writer gave the batch up.
     let acquired = wired
         .runtime
         .session()
@@ -11129,7 +11119,11 @@ async fn a_batch_whose_authority_ends_while_the_writer_waits_for_room_is_given_u
     assert_eq!(
         acquired.discarded_bytes.get(),
         0,
-        "the lease owes nothing for a batch the writer gave up"
+        "the writer gave the batch up once its authority had ended while it waited for room, so the lease has none of it unwritten"
+    );
+    assert_eq!(
+        handed, taken,
+        "nothing more of the batch reached the terminal after its authority ended"
     );
     wired.close().await;
 }
