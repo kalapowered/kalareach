@@ -4958,7 +4958,13 @@ mod tests {
         );
         assert_eq!(recorded_version(&path), COLUMN_VERSION);
 
-        let store = Store::open(&path, environment()).expect("brings the journal back and opens");
+        let opened = Store::open(&path, environment());
+        assert!(
+            opened.is_ok(),
+            "the step from the column version brings the journal back and opens it: {:?}",
+            opened.as_ref().err()
+        );
+        let store = opened.expect("opened");
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
         assert_eq!(revision_of(&store, 1), Some(7));
         assert_eq!(revision_of(&store, 2), None);
@@ -5052,7 +5058,13 @@ mod tests {
         drop(side);
         assert_eq!(recorded_version(&path), COLUMN_VERSION);
 
-        let store = Store::open(&path, environment()).expect("repeats the step");
+        let opened = Store::open(&path, environment());
+        assert!(
+            opened.is_ok(),
+            "the step repeats with the rows that are there: {:?}",
+            opened.as_ref().err()
+        );
+        let store = opened.expect("opened");
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
         assert_eq!(revision_of(&store, 1), Some(7));
         assert_eq!(side_rows(&path), 1);
