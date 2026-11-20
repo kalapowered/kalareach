@@ -13,9 +13,11 @@
 //!
 //! It runs once every daemon has stopped and every environment's lock is held, before anything is
 //! brought forward, and changes nothing but what a daemon that ended by a signal left in a log,
-//! which is taken into its file first. What a command registered is read before that too, under the
-//! install lock and before any daemon is told to stop ([`look_ahead`]), so a registration that
-//! cannot be read refuses the switch with every daemon still serving.
+//! which is taken into its file first. The one exception is a rollback's lowering of a transfers
+//! journal ([`bring_the_journals_back`]), which comes first and stays done when a later journal or
+//! store refuses the switch. What a command registered is read before that too, under the install
+//! lock and before any daemon is told to stop ([`look_ahead`]), so a registration that cannot be
+//! read refuses the switch with every daemon still serving.
 
 use std::path::{Path, PathBuf};
 
@@ -718,7 +720,10 @@ fn look(listed: &ReleaseStore, file: &Path, carries: bool) -> Option<Why> {
     .then(|| u32::try_from(kr_controller::registry::SCHEMA_VERSION).unwrap_or(u32::MAX));
     let met = brought_to.unwrap_or(found);
     // A release reads a store up to the version it writes, and, for one it says so of, as far as it
-    // reads through without writing it.
+    // reads through without writing it. The transfers journal is the exception to "without writing
+    // it": a daemon of the release brings a journal at the version it reads through to the version
+    // it writes. A journal that a rollback has already brought back is read here at the version it
+    // was brought to.
     let highest = listed.reads_through.unwrap_or(listed.version);
     if (listed.migrates_from..=highest).contains(&met) {
         None
