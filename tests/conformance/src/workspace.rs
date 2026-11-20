@@ -150,24 +150,19 @@ pub struct Workspaces {
 #[must_use]
 pub fn read(root: &Path, manifests: &[String]) -> Workspaces {
     let mut found = Workspaces::default();
-    // The manifest of the plan, and the package's own, that each name was first read from.
-    let mut from: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
+    // The manifest of the plan that each package name was first read from.
+    let mut from: BTreeMap<String, String> = BTreeMap::new();
     for manifest in manifests {
         match read_one(root, manifest) {
             Ok(packages) => {
                 for package in packages {
                     match from.get(&package.name) {
-                        // The same package, reached through two manifests of one workspace.
-                        Some((_, path)) if *path == package.manifest => {}
-                        Some((first, _)) => found.problems.push(format!(
+                        Some(first) => found.problems.push(format!(
                             "the package `{}` is in two workspaces, `{first}` and `{manifest}`",
                             package.name
                         )),
                         None => {
-                            from.insert(
-                                package.name.clone(),
-                                (manifest.clone(), package.manifest.clone()),
-                            );
+                            from.insert(package.name.clone(), manifest.clone());
                             found.packages.push(package);
                         }
                     }
@@ -187,9 +182,9 @@ fn shown(root: &Path, path: &Path) -> String {
         .map(Path::to_path_buf)
         .ok()
         .or_else(|| {
-            root.canonicalize()
-                .ok()
-                .and_then(|canonical| path.strip_prefix(canonical).map(Path::to_path_buf).ok())
+            let canonical = root.canonicalize().ok()?;
+            let place = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            place.strip_prefix(canonical).map(Path::to_path_buf).ok()
         });
     relative
         .as_deref()
@@ -219,22 +214,56 @@ fn read_one(root: &Path, manifest: &str) -> Result<Vec<Package>, String> {
     let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         format!("cargo metadata wrote something that is not JSON for `{manifest}`: {error}")
     })?;
-    let mut packages = parse(&value)?;
-    // The workspace is where its manifest is, as the plan names it.
-    let workspace = Path::new(manifest)
+    describe(root, manifest, &value)
+}
+
+/// The packages of the workspace that `cargo metadata` described for `manifest` in `value`, each
+/// with the workspace it belongs to and what its manifests say about its harnesses.
+fn describe(root: &Path, manifest: &str, value: &Value) -> Result<Vec<Package>, String> {
+    let mut packages = parse(value).map_err(|why| format!("{why} for `{manifest}`"))?;
+    // The workspace is where Cargo says its root is, relative to the tested root.
+    let workspace_root = value["workspace_root"]
+        .as_str()
+        .ok_or_else(|| format!("cargo metadata gave no `workspace_root` for `{manifest}`"))?;
+    let workspace = match shown(root, Path::new(workspace_root)).as_str() {
+        "" => ".".to_owned(),
+        outside if Path::new(outside).is_absolute() => {
+            return Err(format!(
+                "the workspace of `{manifest}` is at `{outside}`, which is not inside the tested root"
+            ));
+        }
+        inside => inside.to_owned(),
+    };
+    // The plan names each workspace by its root manifest: a member's manifest describes the same
+    // workspace, and naming it would list the workspace under a name that is not its own.
+    let named = Path::new(manifest)
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(
-            || ".".to_owned(),
-            |parent| parent.to_string_lossy().replace('\\', "/"),
-        );
+        .map(|parent| {
+            parent
+                .components()
+                .filter(|part| !matches!(part, std::path::Component::CurDir))
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .filter(|directory| !directory.is_empty())
+        .unwrap_or_else(|| ".".to_owned());
+    if named != workspace {
+        let root_manifest = if workspace == "." {
+            "Cargo.toml".to_owned()
+        } else {
+            format!("{workspace}/Cargo.toml")
+        };
+        return Err(format!(
+            "`{manifest}` is a manifest inside the workspace at `{workspace}`: name the workspace's own manifest `{root_manifest}` in `[rust] manifests`"
+        ));
+    }
     for package in &mut packages {
         package.workspace.clone_from(&workspace);
     }
     // What a manifest asks for is not always what the build gets: a `[patch]` can replace it. The
     // lock is the one Cargo keeps in the workspace's root.
-    let lock_path =
-        Path::new(value["workspace_root"].as_str().unwrap_or_default()).join("Cargo.lock");
+    let lock_path = Path::new(workspace_root).join("Cargo.lock");
     let lock = std::fs::read_to_string(&lock_path).map_err(|error| {
         let lock = shown(root, &lock_path);
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -422,8 +451,7 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
         });
         ids.push(id);
     }
-    // Cargo names members by their ids; the packages above are the members. A Cargo that names no
-    // default members runs every member.
+    // Cargo names members by their ids; the packages above are the members.
     let names_of = |wanted: &[&str]| -> Vec<String> {
         let mut names: Vec<String> = ids
             .iter()
@@ -435,16 +463,13 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
         names
     };
     let members_named = names_of(&members);
-    let defaults_named = value["workspace_default_members"].as_array().map_or_else(
-        || members_named.clone(),
-        |defaults| {
-            names_of(
-                &defaults
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>(),
-            )
-        },
+    let defaults_named = names_of(
+        &value["workspace_default_members"]
+            .as_array()
+            .ok_or("cargo metadata gave no `workspace_default_members`")?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>(),
     );
     for package in &mut packages {
         package.workspace_members.clone_from(&members_named);
@@ -464,6 +489,7 @@ mod tests {
     fn a_crate_is_the_registrys_only_under_its_own_name() {
         let value = serde_json::json!({
             "workspace_members": ["path+file:///w/a#0.1.0"],
+            "workspace_default_members": ["path+file:///w/a#0.1.0"],
             "packages": [{
                 "id": "path+file:///w/a#0.1.0",
                 "name": "a",
@@ -508,6 +534,7 @@ mod tests {
     fn members_and_their_targets_are_read_and_a_build_script_is_not_a_target() {
         let value = serde_json::json!({
             "workspace_members": ["path+file:///w/a#0.1.0"],
+            "workspace_default_members": ["path+file:///w/a#0.1.0"],
             "packages": [
                 {
                     "id": "path+file:///w/a#0.1.0",
@@ -585,14 +612,32 @@ harness = false
             assert_eq!(package.workspace_members, ["a", "b"]);
             assert_eq!(package.workspace_default_members, ["b"]);
         }
-        // A Cargo that names no default members runs every member.
+        // A description that names no default members is refused: nothing stands in for the field.
         value
             .as_object_mut()
             .expect("an object")
             .remove("workspace_default_members");
-        for package in parse(&value).expect("parses") {
-            assert_eq!(package.workspace_default_members, ["a", "b"]);
-        }
+        assert_eq!(
+            parse(&value).expect_err("refused"),
+            "cargo metadata gave no `workspace_default_members`"
+        );
+        assert_eq!(
+            describe(Path::new("/r"), "w/Cargo.toml", &value).expect_err("refused"),
+            "cargo metadata gave no `workspace_default_members` for `w/Cargo.toml`"
+        );
+    }
+
+    #[test]
+    fn a_description_with_no_workspace_root_is_refused_naming_the_field_and_the_manifest() {
+        let value = serde_json::json!({
+            "workspace_members": [],
+            "workspace_default_members": [],
+            "packages": []
+        });
+        assert_eq!(
+            describe(Path::new("/r"), "w/Cargo.toml", &value).expect_err("refused"),
+            "cargo metadata gave no `workspace_root` for `w/Cargo.toml`"
+        );
     }
 
     #[test]

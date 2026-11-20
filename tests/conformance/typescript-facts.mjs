@@ -5,16 +5,17 @@
 //   node --input-type=module - <repository> <compiler directory>... -- <file>...
 //
 // The program embeds this script and gives it on standard input. A compiler directory is a directory
-// whose own `node_modules` holds `typescript`; the first that does is used. A test call is a call of
-// `it`, `test`, `describe` or `suite`, including their modifiers (`it.skip`, `test.describe`,
-// `describe.each(table)`), that names a test: its first argument is a string or a template, or a
-// function follows its first argument. The conformance report decides which test each comment keys;
-// this script only says where things are. It uses the compiler's parser rather than a pattern so
-// that a comment marker inside a string, a template or JSX text is never read as a comment.
+// whose own `node_modules` holds `typescript`, and only that one: no parent directory is searched.
+// The first directory that holds it is used. A test call is a call of `it`, `test`, `describe` or
+// `suite`, including their modifiers (`it.skip`, `test.describe`, `describe.each(table)`), that names
+// a test: its first argument is a string or a template, or an arrow function or a function
+// expression follows its first argument. The conformance report decides which test each comment
+// keys; this script only says where things are. It uses the compiler's parser rather than a pattern
+// so that a comment marker inside a string, a template or JSX text is never read as a comment.
 
 import { createRequire } from 'node:module'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 
 const [repository, ...rest] = process.argv.slice(2)
 const separator = rest.indexOf('--')
@@ -25,17 +26,27 @@ if (!repository || separator < 0) {
   process.exit(2)
 }
 
+// The compiler is the package a directory holds in its own `node_modules`, loaded by its absolute
+// path: Node's search of the parent directories, and of NODE_PATH, never finds another.
 let ts
+const failures = []
 for (const directory of directories) {
+  const installed = resolve(directory, 'node_modules', 'typescript')
+  if (!existsSync(installed)) continue
   try {
-    ts = createRequire(join(directory, 'package.json'))('typescript')
+    ts = createRequire(join(installed, 'package.json'))(installed)
     break
-  } catch {
-    // The next directory, or the error below.
+  } catch (error) {
+    failures.push(`${installed}: ${error.message}`)
   }
 }
 if (!ts) {
-  const where = directories.length > 0 ? `in ${directories.join(', ')}` : 'because no directory names one'
+  const where =
+    directories.length === 0
+      ? 'because no directory names one'
+      : failures.length > 0
+        ? `in ${directories.join(', ')} (it could not be loaded: ${failures.join('; ')})`
+        : `in ${directories.join(', ')}`
   process.stderr.write(
     `typescript-facts: the TypeScript compiler is not installed ${where}; run \`pnpm install --frozen-lockfile\`, name a directory of the tree in the plan's \`compiler_from\`, or pass \`--typescript-compiler <directory>\`\n`
   )

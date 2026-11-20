@@ -151,7 +151,7 @@ fn plant_compiler(root: &Path, directory: &str, version: Option<&str>) {
     let entry = match version {
         None => format!("module.exports = require({installed:?})\n"),
         Some(version) => format!(
-            "module.exports = Object.assign(Object.create(require({installed:?})), {{ version: {version:?} }})\n"
+            "module.exports = Object.create(require({installed:?}), {{ version: {{ value: {version:?} }} }})\n"
         ),
     };
     std::fs::write(package.join("index.js"), entry).expect("an entry");
@@ -295,6 +295,99 @@ fn a_compiler_directory_that_is_not_a_directory_of_the_tested_root_is_refused() 
         );
     }
     assert!(Plan::parse(&planted("web"), &root).is_ok());
+}
+
+/// A package belongs to the workspace that Cargo says holds it, named relative to the tested root:
+/// the workspace of a manifest spelled with a `.` is the same as without it, and a manifest that is
+/// a member's, not the workspace's own, is refused naming the workspace's manifest.
+#[test]
+fn a_package_belongs_to_the_workspace_cargo_names_and_a_members_manifest_is_refused() {
+    let (_directory, root) = copy("no-root-manifest");
+    let member = root.join("first").join("member");
+    std::fs::create_dir_all(member.join("src")).expect("a directory");
+    std::fs::write(
+        member.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n",
+    )
+    .expect("a manifest");
+    std::fs::write(member.join("src").join("lib.rs"), "").expect("a source");
+    let first = root.join("first").join("Cargo.toml");
+    let text = std::fs::read_to_string(&first).expect("the manifest");
+    std::fs::write(
+        &first,
+        text.replace("[workspace]", "[workspace]\nmembers = [\"member\"]"),
+    )
+    .expect("the manifest is written");
+    git(&root, &["add", "-A"]);
+    let base = plan_text(&root);
+    let owners = |manifests: &str| -> (Vec<(String, String)>, Vec<String>) {
+        let text = base.replace("'first/Cargo.toml', 'second/Cargo.toml'", manifests);
+        let map = map_of(
+            &root,
+            Plan::parse(&text, &root).expect("a planted plan"),
+            None,
+            false,
+        );
+        let owners = map
+            .packages
+            .iter()
+            .map(|package| (package.name.clone(), package.workspace.clone()))
+            .collect();
+        (owners, map.problems)
+    };
+    let own = |name: &str, workspace: &str| (name.to_owned(), workspace.to_owned());
+    // The workspace's own manifest, spelled plainly and with a `.`: every package of its workspace,
+    // the member too, belongs to `first`.
+    for manifests in [
+        "'first/Cargo.toml', 'second/Cargo.toml'",
+        "'./first/Cargo.toml', 'second/Cargo.toml'",
+    ] {
+        let (owners, problems) = owners(manifests);
+        assert!(problems.is_empty(), "{manifests}: {problems:?}");
+        assert_eq!(
+            owners,
+            [
+                own("alpha", "first"),
+                own("beta", "second"),
+                own("member", "first")
+            ],
+            "{manifests}"
+        );
+    }
+    // A member's manifest names the workspace's own.
+    let (_, problems) = owners("'first/member/Cargo.toml', 'second/Cargo.toml'");
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("`first/member/Cargo.toml`")
+            && problems[0].contains("workspace at `first`")
+            && problems[0].contains("`first/Cargo.toml`"),
+        "{}",
+        problems[0]
+    );
+    std::fs::write(
+        root.join("conformance").join("plan.toml"),
+        base.replace(
+            "'first/Cargo.toml', 'second/Cargo.toml'",
+            "'first/member/Cargo.toml', 'second/Cargo.toml'",
+        ),
+    )
+    .expect("the plan is written");
+    let (code, stdout, stderr) = program(&["map", "--root", &root.to_string_lossy()]);
+    assert_eq!(code, Some(2), "{stdout}{stderr}");
+    assert!(stdout.contains("`first/Cargo.toml`"), "{stdout}");
+}
+
+/// A workspace at the tested root is named `.`, and a root manifest that names a member of its own
+/// is one workspace.
+#[test]
+fn the_workspace_of_a_root_manifest_is_the_tested_root() {
+    let (_directory, root) = copy("ignored-tests");
+    let map = map_of(&root, load(&root), None, false);
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    assert!(!map.packages.is_empty());
+    for package in &map.packages {
+        assert_eq!(package.workspace, ".", "{}", package.name);
+    }
 }
 
 /// A lock that a workspace lacks is a problem of the map, found beside the manifest that names it.
@@ -516,6 +609,74 @@ fn a_typescript_only_tree_is_mapped_with_the_compiler_the_command_line_names() {
         program(&["map", "--root", &root.to_string_lossy(), "--typescript"]);
     assert_eq!(code, Some(2), "{stdout}{stderr}");
     assert!(stdout.contains("pnpm install"), "{stdout}");
+}
+
+/// The version of the compiler that is installed in `compiler()`.
+fn installed_version() -> String {
+    let manifest = compiler()
+        .join("node_modules")
+        .join("typescript")
+        .join("package.json");
+    let text = std::fs::read_to_string(manifest).expect("the installed compiler's manifest");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    value["version"].as_str().expect("a version").to_owned()
+}
+
+/// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: the compiler
+/// is the package a directory of `compiler_from` holds in its own `node_modules`, and no directory
+/// above it is searched; the first directory that holds one is used, whatever empty directory
+/// comes before it; `--typescript-compiler` replaces the plan's directories.
+#[test]
+#[ignore = "reads TypeScript with the packages' own compiler, which `pnpm install --frozen-lockfile` installs; the report's typescript group runs it"]
+fn the_compiler_is_the_package_a_directory_holds_and_no_directory_above_it_is_searched() {
+    let (_directory, root) = copy("typescript-only");
+    let base = plan_text(&root);
+    let mapped = |directories: &str, compiler: Option<&Path>| -> Map {
+        let text = base.replace(
+            "compiler_from = []",
+            &format!("compiler_from = [{directories}]"),
+        );
+        map_of(
+            &root,
+            Plan::parse(&text, &root).expect("a planted plan"),
+            compiler,
+            true,
+        )
+    };
+    // A compiler above the directory the plan names is not that directory's own.
+    plant_compiler(&root, "above", None);
+    std::fs::create_dir_all(root.join("above").join("inner")).expect("a directory");
+    std::fs::write(root.join("above").join("inner").join("package.json"), "{}")
+        .expect("a manifest");
+    std::fs::create_dir_all(root.join("empty")).expect("a directory");
+    std::fs::write(root.join("empty").join("package.json"), "{}").expect("a manifest");
+    git(&root, &["add", "-A"]);
+    let map = mapped("'above/inner'", None);
+    assert!(
+        map.problems
+            .iter()
+            .any(|problem| problem.contains("is not installed in") && problem.contains("inner")),
+        "{:?}",
+        map.problems
+    );
+    // A directory with no compiler does not displace a later directory that has one.
+    let map = mapped("'empty', 'above'", None);
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    assert_eq!(sources(&map, "KR-REQ-05.01"), ["web/forms.test.ts:3"]);
+    // The first directory that holds a compiler is the one used.
+    plant_compiler(&root, "first", Some("first"));
+    plant_compiler(&root, "second", Some("second"));
+    git(&root, &["add", "-A"]);
+    let map = mapped("'empty', 'first', 'second'", None);
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    assert_eq!(map.typescript_version.as_deref(), Some("first"));
+    // The command line's directory replaces the plan's.
+    let map = mapped("'empty', 'first', 'second'", Some(&compiler()));
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    assert_eq!(
+        map.typescript_version.as_deref(),
+        Some(installed_version().as_str())
+    );
 }
 
 /// KR-REQ-29.01, the part about mapping tests to acceptance identifiers, in TypeScript: the root may
