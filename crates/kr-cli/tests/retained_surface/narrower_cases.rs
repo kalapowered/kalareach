@@ -1614,8 +1614,10 @@ fn an_entry_whose_root_no_root_has_is_told_once_and_nothing_else_is_read() {
     let mut world = control();
     world.roots.clear();
     let same = a_release_with(found("dig"), found("h-now"));
+    // The second release lacks the helper too, and the one text still stands alone.
+    let lacking = a_release_with(found("dig"), Lookup::Absent);
     assert_eq!(
-        the_entry_holds_in(&world, &[(EARLY, &same), (LATE, &same)]),
+        the_entry_holds_in(&world, &[(EARLY, &same), (LATE, &lacking)]),
         vec![said(
             "no root has this label, so no release can be held to it"
         )]
@@ -1631,5 +1633,131 @@ fn no_entry_and_no_release_are_no_problem() {
     assert_eq!(
         check_held(&[], &roots, &[(EARLY, &wrong as &dyn Reader)]),
         none()
+    );
+}
+
+const SECOND: &str = "the second root";
+
+/// Two entries that hold two helpers each, over the roots `ROOT` and `SECOND`.
+fn two_entries() -> (Vec<Narrower>, Vec<Root>) {
+    let first = control().entry;
+    let helpers = leak(vec![
+        first.helpers[0].clone(),
+        Helper {
+            krate: "kr_worker",
+            name: "helper_two",
+            now: "h2-now",
+            before: "h2-before",
+            what: "a second helper",
+        },
+    ]);
+    let second = Narrower {
+        root: SECOND,
+        digest: "dig-b",
+        helpers,
+        ..first.clone()
+    };
+    let first = Narrower { helpers, ..first };
+    let roots = vec![
+        the_root(ROOT, "kr_worker", Depth::Alone),
+        the_root(SECOND, "kr_worker", Depth::Alone),
+    ];
+    (vec![first, second], roots)
+}
+
+/// What a release holds of the two entries' rules.
+fn a_release_of_two(first: Lookup, second: Lookup, helper: Lookup, helper_two: Lookup) -> Fixed {
+    Fixed {
+        krates: BTreeMap::new(),
+        roots: BTreeMap::from([(ROOT.to_owned(), first), (SECOND.to_owned(), second)]),
+        items: BTreeMap::from([
+            (at("kr_worker", "helper_fn"), helper),
+            (at("kr_worker", "helper_two"), helper_two),
+        ]),
+        sightings: Ok(Vec::new()),
+    }
+}
+
+fn said_of(root: &str, text: &str) -> String {
+    format!("narrower {root}: {text}")
+}
+
+#[test]
+fn every_entry_every_helper_and_every_release_is_held() {
+    let (entries, roots) = two_entries();
+    let held = |roots: &[Root], releases: &[(&str, &Fixed)]| {
+        let releases: Vec<(&str, &dyn Reader)> = releases
+            .iter()
+            .map(|(tag, release)| (*tag, *release as &dyn Reader))
+            .collect();
+        check_held(&entries, roots, &releases)
+    };
+    let good = || {
+        a_release_of_two(
+            found("dig"),
+            found("dig-b"),
+            found("h-now"),
+            found("h2-now"),
+        )
+    };
+    assert_eq!(held(&roots, &[(EARLY, &good()), (LATE, &good())]), none());
+
+    // The second helper of both entries is wrong in the first release: one text for each entry,
+    // in the order of the entries.
+    let bad_helper = a_release_of_two(found("dig"), found("dig-b"), found("h-now"), found("zz"));
+    let helper_two = |entry: &str| {
+        said_of(
+            entry,
+            &format!(
+                "{EARLY} has the digest zz for the helper kr_worker::helper_two, the entry names h2-now"
+            ),
+        )
+    };
+    assert_eq!(
+        held(&roots, &[(EARLY, &bad_helper), (LATE, &good())]),
+        vec![helper_two(ROOT), helper_two(SECOND)]
+    );
+
+    // The second entry's root is wrong in the second release only.
+    let bad_second = a_release_of_two(found("dig"), found("zz"), found("h-now"), found("h2-now"));
+    assert_eq!(
+        held(&roots, &[(EARLY, &good()), (LATE, &bad_second)]),
+        vec![said_of(
+            SECOND,
+            &format!("{LATE} has the digest zz for the root, the entry names dig-b")
+        )]
+    );
+
+    // The first entry's root is in no root: its text, and the second entry is held all the same.
+    assert_eq!(
+        held(&roots[1..], &[(EARLY, &good()), (LATE, &bad_second)]),
+        vec![
+            said_of(
+                ROOT,
+                "no root has this label, so no release can be held to it"
+            ),
+            said_of(
+                SECOND,
+                &format!("{LATE} has the digest zz for the root, the entry names dig-b")
+            ),
+        ]
+    );
+
+    // Entries before releases: the first entry's two releases, then the second entry's one.
+    let wrong = |tag: &str, entry: &str, digest: &str, names: &str| {
+        said_of(
+            entry,
+            &format!("{tag} has the digest {digest} for the root, the entry names {names}"),
+        )
+    };
+    let bad_first = a_release_of_two(found("zz"), found("dig-b"), found("h-now"), found("h2-now"));
+    let bad_both = a_release_of_two(found("zz"), found("yy"), found("h-now"), found("h2-now"));
+    assert_eq!(
+        held(&roots, &[(EARLY, &bad_both), (LATE, &bad_first)]),
+        vec![
+            wrong(EARLY, ROOT, "zz", "dig"),
+            wrong(LATE, ROOT, "zz", "dig"),
+            wrong(EARLY, SECOND, "yy", "dig-b"),
+        ]
     );
 }
