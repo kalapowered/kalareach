@@ -231,6 +231,24 @@ fn answer_lapsed(expires_at_ms: Option<u64>, delivered: usize, now_ms: u64) -> b
     delivered == 0 && expires_at_ms.is_some_and(|deadline| now_ms > deadline)
 }
 
+/// The lease's fence as the writer reads it: whether the lease a batch was accepted under has been
+/// ended by a later epoch. Holding only an epoch and a reference to the published word, it is
+/// what the writer reads inside its boundary.
+struct LeaseFence<'a> {
+    /// The epoch the batch belongs to, or none for a batch no lease owns, which no change of the
+    /// lease ends.
+    epoch: Option<u64>,
+    /// The epoch the lease has published.
+    published: &'a std::sync::atomic::AtomicU64,
+}
+
+impl LeaseFence<'_> {
+    fn ended(&self) -> bool {
+        self.epoch
+            .is_some_and(|epoch| epoch < self.published.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
 /// What became of a batch the writer offered the terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Delivery {
@@ -260,11 +278,19 @@ struct Terminal<'a, W: std::io::Write> {
 /// Hands one batch to the terminal a piece at a time, and says how far it got.
 ///
 /// `gate` is the boundary this shares with whatever changes the lease: inside it are the fence,
-/// one write that refuses to wait, and the accounting for what that write sent. `stale` is the
-/// fence, asked inside that boundary; `wrote` is told what the application now has that it did not
-/// have before, which is what the write returned rather than what was offered, and it is told
-/// inside the boundary too. Nothing waits while the boundary is held, so a lease change never waits
-/// for a terminal, and no write of an ended lease's bytes can begin after that change.
+/// one write that refuses to wait, and the accounting for what that write sent. `fence` is the
+/// lease's fence, read inside that boundary; `wrote` is told what the application now has that it
+/// did not have before, which is what the write returned rather than what was offered, and it is
+/// told inside the boundary too. Nothing waits while the boundary is held, so a lease change never
+/// waits for a terminal or for a look at storage, and no write of an ended lease's bytes can begin
+/// after that change.
+///
+/// `lapsed` says whether what the batch was accepted under has run out: the end of its authority
+/// and the end of an answer's lane. It is asked outside the boundary, before each piece is
+/// offered, because its answer can wait on storage: a UTC end is decided against a floor whose name
+/// is looked at. A change of the lease that happens meanwhile is caught by the fence read inside
+/// the boundary, before anything is written. What the boundary does not make one step with the
+/// write is that look, which still comes before every piece.
 ///
 /// What makes this a boundary and not a wait is that the write inside it cannot wait. Every terminal
 /// this host opens answers rather than waits - that is what the ConPTY module (`windows::conpty`)
@@ -289,13 +315,19 @@ fn write_batch(
     bytes: &[u8],
     transition: &crate::session::PasteTransition,
     gate: &std::sync::Mutex<()>,
-    stale: &mut impl FnMut() -> bool,
+    fence: &LeaseFence<'_>,
+    lapsed: &mut impl FnMut() -> bool,
     wrote: &mut impl FnMut(usize),
 ) -> (usize, Delivery) {
     let Terminal { writer, room } = terminal;
     let room = *room;
     let mut delivered = 0_usize;
     while delivered < bytes.len() {
+        // Decided before the boundary is taken: the fence first, so a batch of an ended lease costs
+        // no look, and then what can wait on storage.
+        if fence.ended() || lapsed() {
+            return (delivered, Delivery::Abandoned);
+        }
         // The rest of a delimiter the last piece stopped inside of, already counted as delivered
         // and not yet written. It goes before anything else this writer does.
         let mut owed: Option<std::ops::Range<usize>> = None;
@@ -305,7 +337,7 @@ fn write_batch(
         // the receipt must never say.
         let attempt = {
             let _boundary = gate.lock().expect("the input boundary is not poisoned");
-            if stale() {
+            if fence.ended() {
                 return (delivered, Delivery::Abandoned);
             }
             let offered = delivered.saturating_add(WRITE_PIECE_BYTES).min(bytes.len());
@@ -352,7 +384,7 @@ fn write_batch(
                 // The terminal has no room for more. This is the only wait, it happens outside the
                 // boundary, and it happens only after the terminal itself has said so: a writer
                 // that waited before every piece would pay for room it already had.
-                if !wait_for_room(room, gate, stale) {
+                if !wait_for_room(room, gate, fence, lapsed) {
                     return (
                         delivered,
                         if room.is_some_and(|waiter| {
@@ -426,13 +458,14 @@ fn insist(
 
 /// Waits until the terminal will take more, and says whether the batch is still wanted.
 ///
-/// Returns false when the batch should stop: the lease it belongs to has ended, or the terminal
-/// has. The fence is looked at inside the boundary, because that is the only place its answer
-/// stays true for as long as it takes to act on it.
+/// Returns false when the batch should stop: the lease it belongs to has ended, what it was
+/// accepted under has run out, or the terminal has gone. What can wait on storage is asked before
+/// the boundary is taken, and only the fence inside it.
 fn wait_for_room(
     room: Option<&crate::pty::InputWaiter>,
     gate: &std::sync::Mutex<()>,
-    stale: &mut impl FnMut() -> bool,
+    fence: &LeaseFence<'_>,
+    lapsed: &mut impl FnMut() -> bool,
 ) -> bool {
     let Some(waiter) = room else {
         return true;
@@ -441,8 +474,11 @@ fn wait_for_room(
         match waiter.wait(WRITE_WAIT) {
             crate::pty::Room::Ready => return true,
             crate::pty::Room::NotYet => {
+                if fence.ended() || lapsed() {
+                    return false;
+                }
                 let _boundary = gate.lock().expect("the input boundary is not poisoned");
-                if stale() {
+                if fence.ended() {
                     return false;
                 }
             }
@@ -1132,9 +1168,12 @@ impl SessionRuntime {
                     bytes,
                     &transition,
                     &writer_gate,
+                    &LeaseFence {
+                        epoch,
+                        published: &writer_fence,
+                    },
                     &mut || {
-                        epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire))
-                            || expired(writer_clock.as_ref())
+                        expired(writer_clock.as_ref())
                             || answer_lapsed(
                                 lane_deadline,
                                 delivered_so_far.get(),
@@ -2410,7 +2449,7 @@ fn shell_may_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{Delivery, Terminal, WRITE_PIECE_BYTES, answer_lapsed, write_batch};
+    use super::{Delivery, LeaseFence, Terminal, WRITE_PIECE_BYTES, answer_lapsed, write_batch};
     use crate::input::{Delimiter, PASTE_START};
     use crate::session::PasteTransition;
 
@@ -2518,6 +2557,7 @@ mod tests {
             bytes,
             &PasteTransition::default(),
             &std::sync::Mutex::new(()),
+            &unended(),
             &mut || answer_lapsed(deadline, delivered_so_far.get(), clock.get()),
             &mut |count| delivered_so_far.set(delivered_so_far.get() + count),
         );
@@ -2626,6 +2666,15 @@ mod tests {
         )
     }
 
+    /// A fence that no change of the lease ends.
+    fn unended() -> LeaseFence<'static> {
+        static PUBLISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        LeaseFence {
+            epoch: None,
+            published: &PUBLISHED,
+        }
+    }
+
     #[test]
     fn a_short_write_finishes_the_delimiter_it_stopped_inside_before_it_abandons() {
         let (bytes, transition) = split_delimiter();
@@ -2635,7 +2684,7 @@ mod tests {
         };
         // The lease ends while the first piece is with the terminal, which is the schedule a
         // takeover produces.
-        let mut pieces = 0;
+        let published = std::sync::atomic::AtomicU64::new(0);
         let mut written = 0_usize;
         let (delivered, delivery) = write_batch(
             &mut Terminal {
@@ -2645,11 +2694,15 @@ mod tests {
             &bytes,
             &transition,
             &std::sync::Mutex::new(()),
-            &mut || {
-                pieces += 1;
-                pieces > 1
+            &LeaseFence {
+                epoch: Some(0),
+                published: &published,
             },
-            &mut |count| written += count,
+            &mut || false,
+            &mut |count| {
+                written += count;
+                published.store(1, std::sync::atomic::Ordering::SeqCst);
+            },
         );
 
         assert_eq!(
@@ -2674,7 +2727,7 @@ mod tests {
 
     #[test]
     fn the_rest_of_a_delimiter_is_with_the_application_before_a_takeover_can_count_it_lost() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
         let (bytes, transition) = ends_in_a_delimiter();
         let taken = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2686,7 +2739,7 @@ mod tests {
         };
         let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
         let released = std::sync::Arc::new(AtomicUsize::new(0));
-        let fence = std::sync::Arc::new(AtomicBool::new(false));
+        let fence = std::sync::Arc::new(AtomicU64::new(0));
         let (announce, announced) = std::sync::mpsc::channel();
 
         // The takeover, doing what `Session::end_lease` does: take the boundary, publish the fence
@@ -2704,7 +2757,7 @@ mod tests {
                 let _boundary = gate.lock().expect("the input boundary is not poisoned");
                 let with_the_application = taken.lock().expect("the record is not poisoned").len();
                 let counted = released.load(Ordering::SeqCst);
-                fence.store(true, Ordering::SeqCst);
+                fence.store(1, Ordering::SeqCst);
                 (with_the_application, counted)
             }
         });
@@ -2718,7 +2771,11 @@ mod tests {
             &bytes,
             &transition,
             &gate,
-            &mut || fence.load(Ordering::SeqCst),
+            &LeaseFence {
+                epoch: Some(0),
+                published: &fence,
+            },
+            &mut || false,
             &mut |count| {
                 released.fetch_add(count, Ordering::SeqCst);
                 if let Some(announce) = announce.take() {
@@ -2778,6 +2835,7 @@ mod tests {
             &bytes,
             &transition,
             &std::sync::Mutex::new(()),
+            &unended(),
             &mut || false,
             &mut |count| written += count,
         );
@@ -2812,6 +2870,7 @@ mod tests {
             &bytes,
             &PasteTransition::default(),
             &std::sync::Mutex::new(()),
+            &unended(),
             &mut || false,
             &mut |count| written += count,
         );
@@ -2837,6 +2896,7 @@ mod tests {
             b"kr",
             &PasteTransition::default(),
             &std::sync::Mutex::new(()),
+            &unended(),
             &mut || false,
             &mut |count| written += count,
         );
