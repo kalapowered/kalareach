@@ -40,6 +40,8 @@ use serde_json::{Value, json};
 
 #[path = "retained_surface/narrower.rs"]
 mod narrower;
+#[path = "retained_surface/narrower_cases.rs"]
+mod narrower_cases;
 #[path = "retained_surface/narrower_table.rs"]
 mod narrower_table;
 #[path = "retained_surface/probes.rs"]
@@ -52,7 +54,7 @@ mod walker;
 #[path = "retained_surface/walker_cases.rs"]
 mod walker_cases;
 
-use narrower::{LevelRecord, Narrower};
+use narrower::{DAEMON_CRATES, Input, LevelRecord, Narrower, RECEIVER_CRATES, check_narrower};
 use walker::{Depth, Followed, Tree};
 
 /// A rule of the surface: where it is rooted, and the names it is followed from.
@@ -206,6 +208,9 @@ fn roots(tree: &Tree) -> Vec<Root> {
     ));
     roots
 }
+
+/// The labels of the roots that are the rules a worker applies to what it receives.
+const WORKER_INPUT_ROOTS: &[&str] = &["the envelope a worker checks"];
 
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -374,6 +379,36 @@ impl Records {
             })
             .collect()
     }
+}
+
+/// The entries of the narrower table, held against this checkout, or against the release tree that
+/// `KR_RELEASE_TREE` names.
+#[test]
+fn the_entries_of_the_narrower_table_hold() {
+    let current = Tree::at(&repository()).expect("this checkout");
+    let release = std::env::var_os("KR_RELEASE_TREE")
+        .map(|root| Tree::at(Path::new(&root)).expect("the release's tree"));
+    let roots = roots(&current);
+    let records = level_records();
+    let levels = records.levels();
+    let input = Input {
+        entries: narrower_table::NARROWER,
+        roots: &roots,
+        worker_input_roots: WORKER_INPUT_ROOTS,
+        receiver_crates: RECEIVER_CRATES,
+        daemon_crates: DAEMON_CRATES,
+        peer_classes: narrower::PEER_CLASSES,
+        this_level: &kr_protocol::update::THIS_LEVEL.to_string(),
+        frozen: repository()
+            .join("crates/kr-protocol/retained/PUBLIC_FREEZE")
+            .exists(),
+        same: SAME,
+        retained: &levels,
+        current: &current,
+        release: release.as_ref().map(|tree| tree as &dyn narrower::Reader),
+    };
+    let problems = check_narrower(&input);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 fn before_items(record: &Value) -> Vec<&str> {
