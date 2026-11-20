@@ -342,10 +342,6 @@ fn an_agents_entry_records_reduced_ownership_for_its_package_only() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let absent = Resolver::open(&environment);
-    assert_eq!(
-        absent.agent_ownership("kalareach/codex"),
-        AgentOwnership::Full
-    );
     assert!(absent.reduced_agents().is_empty());
 
     let mut document = ConfigurationDocument::empty();
@@ -361,14 +357,6 @@ fn an_agents_entry_records_reduced_ownership_for_its_package_only() {
     )
     .expect("writes the document");
     let chosen = Resolver::open(&environment);
-    assert_eq!(
-        chosen.agent_ownership("kalareach/codex"),
-        AgentOwnership::Reduced
-    );
-    assert_eq!(
-        chosen.agent_ownership("kalareach/claude-code"),
-        AgentOwnership::Full
-    );
     assert_eq!(chosen.reduced_agents(), vec!["kalareach/codex".to_owned()]);
 
     // A document this host cannot use records nothing: the resolver never answers reduced from a
@@ -380,8 +368,5 @@ fn an_agents_entry_records_reduced_ownership_for_its_package_only() {
     .expect("writes the document");
     let unusable = Resolver::open(&environment);
     assert_eq!(unusable.status().state, DocumentState::Invalid);
-    assert_eq!(
-        unusable.agent_ownership("kalareach/codex"),
-        AgentOwnership::Full
-    );
+    assert!(unusable.reduced_agents().is_empty());
 }

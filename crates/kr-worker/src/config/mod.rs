@@ -332,19 +332,6 @@ impl Resolver {
         )
     }
 
-    /// Returns what the document records for the agent of one package: its explicit choice for
-    /// it, and full ownership where there is none or where this host cannot use the document. No
-    /// launch asks it.
-    #[must_use]
-    pub fn agent_ownership(&self, package: &str) -> kr_protocol::broker::AgentOwnership {
-        self.loaded
-            .document
-            .as_ref()
-            .map_or(kr_protocol::broker::AgentOwnership::Full, |document| {
-                document.agent_ownership(package)
-            })
-    }
-
     /// Returns the packages the document names reduced ownership for, in order.
     #[must_use]
     pub fn reduced_agents(&self) -> Vec<String> {
