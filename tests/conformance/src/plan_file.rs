@@ -10,7 +10,9 @@
 //! from a selection of groups is derived from the steps the selection holds, by the functions of
 //! [`Plan`] that say so.
 //!
-//! The schema grows by optional fields. This module holds the fields that core's own plan needs.
+//! A key whose absence means "none" is optional (`scripts`, `lane_directories`, the `[typescript]`
+//! lists and `[terminal_profile]`). The Rust manifests and the ignored-run policy are required: a
+//! plan states them, and no default stands in for a repository's own values.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -278,9 +280,8 @@ pub struct Terminals {
     pub reason: String,
 }
 
-/// The TypeScript packages, and the directories the report reads besides Rust. A key that is absent
-/// names nothing: no compiler directory, no directory left out, no script directory and no lane
-/// directory.
+/// The TypeScript packages and what steers how they are read. A key that is absent names nothing:
+/// no compiler directory and no directory left out.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypeScript {
@@ -293,12 +294,6 @@ pub struct TypeScript {
     /// The names of the directories that no TypeScript file is read below, at any depth.
     #[serde(default)]
     pub skip_directories: Vec<String>,
-    /// The directories whose files are read for the rows they name, as scripts.
-    #[serde(default)]
-    pub scripts: Vec<String>,
-    /// The directories whose Kotlin, Swift and Java files are read for the lanes.
-    #[serde(default)]
-    pub lane_directories: Vec<String>,
 }
 
 /// The Rust workspaces.
@@ -351,6 +346,14 @@ pub struct Plan {
     /// Whether every full run lists the rows of the specification's tables.
     #[serde(default)]
     pub list_table_rows: bool,
+    /// The directories whose files are read for the rows they name, as scripts, relative to the
+    /// repository. Absent means none: no script is read.
+    #[serde(default)]
+    pub scripts: Vec<String>,
+    /// The directories whose Kotlin, Swift and Java files are read for the lanes, relative to the
+    /// repository. Absent means none: no lane file is read.
+    #[serde(default)]
+    pub lane_directories: Vec<String>,
     /// The steps, in the order every platform runs them.
     #[serde(default, rename = "step")]
     pub steps: Vec<StepDef>,
@@ -486,19 +489,38 @@ fn script_operands(command: &[String]) -> Vec<&str> {
 }
 
 /// Why `operand` does not name a place inside the repository, or `None`: it is a relative path that
-/// holds no `..`.
+/// holds no `..` and no pattern character (`*`, `?`, `[` or `]`). A pattern names several files and
+/// so is no path, and a Windows file system refuses the characters before it looks for the file, so
+/// a path that holds one is refused on every platform. This is a check of the text and looks at no
+/// file.
 fn outside_refused(operand: &str) -> Option<String> {
     let path = Path::new(operand);
     if path.is_absolute() || operand.starts_with('/') || operand.contains('\\') {
         return Some("is not a relative path".to_owned());
     }
-    path.components()
+    if path
+        .components()
         .any(|part| matches!(part, std::path::Component::ParentDir))
-        .then(|| "holds `..`".to_owned())
+    {
+        return Some("holds `..`".to_owned());
+    }
+    operand
+        .contains(['*', '?', '[', ']'])
+        .then(|| "holds a pattern character".to_owned())
+}
+
+/// Why the place that exists at `root`/`operand` is not inside `root`, or `None`: a link on its way
+/// leads out of the repository.
+fn left_through_a_link(root: &Path, operand: &str) -> Option<String> {
+    match (root.canonicalize(), root.join(operand).canonicalize()) {
+        (Ok(root), Ok(place)) => (!place.starts_with(root))
+            .then(|| "leads out of the repository through a link".to_owned()),
+        (Err(error), _) | (_, Err(error)) => Some(format!("cannot be checked: {error}")),
+    }
 }
 
 /// Why `operand` is not a file of the repository at `root`, or `None`: a relative path inside it
-/// that names a regular file and not a link.
+/// that names a regular file and not a link, by a way that no link takes out of the repository.
 fn file_refused(root: &Path, operand: &str) -> Option<String> {
     if let Some(why) = outside_refused(operand) {
         return Some(why);
@@ -506,7 +528,7 @@ fn file_refused(root: &Path, operand: &str) -> Option<String> {
     match std::fs::symlink_metadata(root.join(operand)) {
         Ok(meta) if meta.file_type().is_symlink() => Some("is a link".to_owned()),
         Ok(meta) if !meta.is_file() => Some("is not a regular file".to_owned()),
-        Ok(_) => None,
+        Ok(_) => left_through_a_link(root, operand),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Some("does not exist".to_owned())
         }
@@ -514,11 +536,23 @@ fn file_refused(root: &Path, operand: &str) -> Option<String> {
     }
 }
 
-/// Why `operand` is not a directory of the repository at `root`, or `None`.
+/// Why `operand` is not a directory of the repository at `root`, or `None`: a relative path inside
+/// it that names a directory and not a link, by a way that no link takes out of the repository.
 fn directory_refused(root: &Path, operand: &str) -> Option<String> {
-    outside_refused(operand).or_else(|| {
-        (!root.join(operand).is_dir()).then(|| "is not a directory of the repository".to_owned())
-    })
+    if let Some(why) = outside_refused(operand) {
+        return Some(why);
+    }
+    match std::fs::symlink_metadata(root.join(operand)) {
+        Ok(meta) if meta.file_type().is_symlink() => Some("is a link".to_owned()),
+        Ok(_) if root.join(operand).is_dir() => left_through_a_link(root, operand),
+        _ => Some("is not a directory of the repository".to_owned()),
+    }
+}
+
+/// Why `name` is not the name of one directory, or `None`.
+fn name_refused(name: &str) -> Option<String> {
+    (name.is_empty() || name.contains(['/', '\\']))
+        .then(|| "is not the name of one directory".to_owned())
 }
 
 /// Why `operand` is not a script this plan may run from `root`, or `None`: it is a regular file
@@ -717,18 +751,47 @@ impl Plan {
                 ));
             }
         }
+        let mut manifests = BTreeSet::new();
         for manifest in &self.rust.manifests {
             if let Some(why) = file_refused(root, manifest) {
                 return refuse(format!(
                     "`[rust] manifests` names `{manifest}`, which {why}"
                 ));
             }
+            if !manifests.insert(manifest.as_str()) {
+                return refuse(format!("`[rust] manifests` names `{manifest}` twice"));
+            }
+        }
+        for (key, directories) in [
+            ("scripts", &self.scripts),
+            ("lane_directories", &self.lane_directories),
+        ] {
+            for directory in directories {
+                if let Some(why) = directory_refused(root, directory) {
+                    return refuse(format!("`{key}` names `{directory}`, which {why}"));
+                }
+            }
+        }
+        if let Some(profile) = &self.terminal_profile
+            && let Some(why) = file_refused(root, &profile.path)
+        {
+            return refuse(format!(
+                "`[terminal_profile] path` names `{}`, which {why}",
+                profile.path
+            ));
         }
         if let Some(typescript) = &self.typescript {
             for directory in &typescript.compiler_from {
                 if let Some(why) = directory_refused(root, directory) {
                     return refuse(format!(
                         "`[typescript] compiler_from` names `{directory}`, which {why}"
+                    ));
+                }
+            }
+            for name in &typescript.skip_directories {
+                if let Some(why) = name_refused(name) {
+                    return refuse(format!(
+                        "`[typescript] skip_directories` names `{name}`, which {why}"
                     ));
                 }
             }
@@ -785,10 +848,9 @@ impl Plan {
         }
         if let Some(typescript) = &self.typescript {
             for package in &typescript.packages {
-                if !root.join(package).is_dir() {
+                if let Some(why) = directory_refused(root, package) {
                     return refuse(format!(
-                        "`[typescript] packages` names `{package}`, which is not a directory of \
-                         the repository"
+                        "`[typescript] packages` names `{package}`, which {why}"
                     ));
                 }
             }
@@ -1065,13 +1127,13 @@ impl Plan {
     /// The directories whose files are read as scripts.
     #[must_use]
     pub fn script_directories(&self) -> &[String] {
-        self.typescript_list(|typescript| &typescript.scripts)
+        &self.scripts
     }
 
     /// The directories whose Kotlin, Swift and Java files are read for the lanes.
     #[must_use]
     pub fn lane_directories(&self) -> &[String] {
-        self.typescript_list(|typescript| &typescript.lane_directories)
+        &self.lane_directories
     }
 
     fn typescript_list(&self, list: fn(&TypeScript) -> &Vec<String>) -> &[String] {

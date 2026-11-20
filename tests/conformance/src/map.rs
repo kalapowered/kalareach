@@ -1380,14 +1380,14 @@ fn covers_in_json(map: &mut Map, text: &str, file: &str) -> Vec<(Identifier, Str
 fn typescript_sources(map: &mut Map, root: &Path, read: &TypeScriptRead<'_>, lanes: &[Lane]) {
     // The suffixes of the files the facts script parses.
     const EXTENSIONS: &[&str] = &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
+    // Node resolves a package from an absolute path only, and the root may be given relative.
+    let absolute = |directory: PathBuf| std::path::absolute(&directory).unwrap_or(directory);
     let compilers: Vec<PathBuf> = match read.compiler {
-        Some(directory) => {
-            vec![std::path::absolute(directory).unwrap_or_else(|_| directory.to_path_buf())]
-        }
+        Some(directory) => vec![absolute(directory.to_path_buf())],
         None => read
             .compiler_from
             .iter()
-            .map(|directory| root.join(directory))
+            .map(|directory| absolute(root.join(directory)))
             .collect(),
     };
     for directory in read.packages {

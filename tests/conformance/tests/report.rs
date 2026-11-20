@@ -159,7 +159,8 @@ fn run_plan_through(
 
 /// KR-REQ-29.01, the part about reproducible commands and the identity of a run: the terminal
 /// profile of a result is read from the file the plan names, relative to the tested root, and a
-/// file that is not there gives `unknown`.
+/// file that holds no profile gives `unknown`. A file that is not there never gets this far: the
+/// loader refuses the plan.
 #[test]
 fn the_terminal_profile_of_a_result_is_what_the_file_the_plan_names_holds() {
     let step = || {
@@ -171,7 +172,7 @@ fn the_terminal_profile_of_a_result_is_what_the_file_the_plan_names_holds() {
     };
     for (path, profile, term) in [
         ("profile.json", "xterm-test/1", "xterm-256color"),
-        ("absent.json", "unknown", "unknown"),
+        ("Cargo.toml", "unknown", "unknown"),
     ] {
         let plan = Plan {
             terminal_profile: Some(TerminalProfileFile {

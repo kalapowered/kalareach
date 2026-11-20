@@ -1,6 +1,9 @@
 repository = 'typescript-only'
 groups = ['typescript']
 
+scripts = ['scripts']
+lane_directories = ['mobile']
+
 [rust]
 manifests = []
 
@@ -11,8 +14,6 @@ held = false
 packages = ['web']
 compiler_from = []
 skip_directories = ['node_modules', 'generated']
-scripts = ['scripts']
-lane_directories = ['mobile']
 
 [unrun]
 bench = 'a benchmark'
