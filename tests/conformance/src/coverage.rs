@@ -8,8 +8,9 @@
 //!
 //! The words are read against `cargo test --help` of Cargo 1.97: a flag that is not one of its own is
 //! refused, so a flag that could change what Cargo selects is never passed over unread. A feature
-//! flag and `--target` change which targets build; a target that Cargo leaves out for one of them is
-//! covered here and reads as not run, because no listing returned it.
+//! flag changes which targets build, because Cargo leaves out a target whose `required-features` are
+//! not on: [`Selection::covers`] reads how the command turns them on, and any other way that Cargo
+//! turns one on is not read.
 
 use std::collections::BTreeSet;
 
@@ -275,6 +276,10 @@ pub struct Selection {
     tests: Rule,
     benches: Rule,
     all_targets: bool,
+    /// The features that `--features` names, each as written: `f` or `<package>/f`.
+    features: Vec<String>,
+    all_features: bool,
+    no_default_features: bool,
     carried: Vec<String>,
 }
 
@@ -319,9 +324,22 @@ impl Parsed {
             "--bench" => selection.benches.name(&value)?,
             "--all-targets" => selection.all_targets = true,
             "--release" | "--all-features" | "--no-default-features" => {
+                match flag {
+                    "--all-features" => selection.all_features = true,
+                    "--no-default-features" => selection.no_default_features = true,
+                    _ => {}
+                }
                 selection.carried.push(flag.to_owned());
             }
             "--profile" | "--features" => {
+                if flag == "--features" {
+                    selection.features.extend(
+                        value
+                            .split([',', ' '])
+                            .filter(|item| !item.is_empty())
+                            .map(str::to_owned),
+                    );
+                }
                 selection.carried.push(flag.to_owned());
                 selection.carried.push(value);
             }
@@ -361,6 +379,9 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
             tests: Rule::Off,
             benches: Rule::Off,
             all_targets: false,
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
             carried: Vec::new(),
         },
         named: Vec::new(),
@@ -457,8 +478,12 @@ impl Selection {
         packages
             .iter()
             .filter(|package| self.selects_package(package))
-            .flat_map(|package| &package.targets)
-            .filter(|target| self.selects_target(target))
+            .flat_map(|package| {
+                package
+                    .targets
+                    .iter()
+                    .filter(move |target| self.selects_target(package, target))
+            })
             .map(|target| target.id.clone())
             .collect()
     }
@@ -471,6 +496,45 @@ impl Selection {
                 !excluded.iter().any(|spec| spec.matches(&package.name))
             }
         }
+    }
+
+    /// The features of `package` that the command turns on: `--all-features` turns on every one;
+    /// otherwise the `default` feature is on unless `--no-default-features` is given, and so is each
+    /// feature `--features` names for the package (`f` or `<package>/f`) and each feature of its
+    /// dev-dependency on itself. Each feature turns on the features its table lists.
+    fn enabled(&self, package: &Package) -> BTreeSet<String> {
+        let mut pending: Vec<String> = Vec::new();
+        if self.all_features {
+            pending.extend(package.features.keys().cloned());
+        } else if !self.no_default_features {
+            pending.push("default".to_owned());
+        }
+        for item in &self.features {
+            match item.split_once('/') {
+                None => pending.push(item.clone()),
+                Some((owner, feature)) if owner.trim_end_matches('?') == package.name => {
+                    pending.push(feature.to_owned());
+                }
+                Some(_) => {}
+            }
+        }
+        pending.extend(package.self_dev_features.iter().cloned());
+        let mut on = BTreeSet::new();
+        while let Some(feature) = pending.pop() {
+            if !on.insert(feature.clone()) {
+                continue;
+            }
+            for turned_on in package.features.get(&feature).into_iter().flatten() {
+                match turned_on.split_once('/') {
+                    None => pending.push(turned_on.clone()),
+                    Some((owner, own)) if owner.trim_end_matches('?') == package.name => {
+                        pending.push(own.to_owned());
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        on
     }
 
     fn asks_for_targets(&self) -> bool {
@@ -487,19 +551,23 @@ impl Selection {
     /// kind, and `--tests` and `--benches` take every target of any kind that is tested or
     /// benchmarked, a library and the binaries among them; a singular flag takes the targets whose
     /// name it matches, and any of them builds the target to test it whatever its manifest says.
-    fn selects_target(&self, target: &Target) -> bool {
+    fn selects_target(&self, package: &Package, target: &Target) -> bool {
+        // Cargo leaves out a target whose features are not on, however the command asks for it.
+        if !target.required_features.is_empty() {
+            let on = self.enabled(package);
+            if !target
+                .required_features
+                .iter()
+                .all(|feature| on.contains(feature))
+            {
+                return false;
+            }
+        }
         if !self.asks_for_targets() {
             return target.tested_by_default;
         }
         let all = self.all_targets;
         let name = &target.id.name;
-        // A library, a binary and a benchmark are benchmarked unless their manifest says they are
-        // not; the metadata does not carry that, so a target that says `bench = false` is covered
-        // here and listed by Cargo as not built.
-        let benchmarked = matches!(
-            target.id.kind,
-            TargetKind::Lib | TargetKind::Bin | TargetKind::Bench
-        );
         let by_kind = match target.id.kind {
             TargetKind::Lib => self.lib || all,
             TargetKind::Bin => all || self.bins.holds(name),
@@ -509,13 +577,14 @@ impl Selection {
         };
         by_kind
             || ((all || self.tests == Rule::All) && target.tested_by_default)
-            || ((all || self.benches == Rule::All) && benchmarked)
+            || ((all || self.benches == Rule::All) && target.benchmarked)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn words(line: &str) -> Vec<String> {
@@ -531,6 +600,8 @@ mod tests {
             },
             src_path: PathBuf::from("x.rs"),
             tested_by_default: tested,
+            benchmarked: matches!(kind, TargetKind::Lib | TargetKind::Bin | TargetKind::Bench),
+            required_features: Vec::new(),
             harness: true,
             edition: "2024".to_owned(),
         }
@@ -541,6 +612,8 @@ mod tests {
             name: name.to_owned(),
             version: "0.1.0".to_owned(),
             targets,
+            features: BTreeMap::new(),
+            self_dev_features: BTreeSet::new(),
             manifest: PathBuf::from("Cargo.toml"),
             registry_crates: BTreeSet::new(),
             dependency_names: BTreeSet::new(),
@@ -818,6 +891,201 @@ mod tests {
             ["a --bin x", "a --test t"]
         );
         assert_eq!(found("cargo test smoke --lib"), ["a --lib"]);
+    }
+
+    #[test]
+    fn a_target_is_benchmarked_by_its_bench_key_and_by_its_kind_where_it_has_none() {
+        use TargetKind::{Bench, Bin, Example, Lib, Test};
+        let with = |kind, name: &str, tested: bool, benchmarked: bool| {
+            let mut one = target("a", kind, name, tested);
+            one.benchmarked = benchmarked;
+            one
+        };
+        let packages = [package(
+            "a",
+            vec![
+                with(Lib, "a", true, false),
+                with(Bin, "x", true, true),
+                with(Test, "t", true, true),
+                with(Test, "u", false, true),
+                with(Example, "e", false, true),
+                with(Example, "f", false, false),
+                with(Bench, "m", false, true),
+                with(Bench, "n", false, false),
+            ],
+            &["a"],
+        )];
+        let members: Vec<&Package> = packages.iter().collect();
+        let found = |line: &str| -> Vec<String> {
+            parse(&words(line))
+                .expect("a command")
+                .covers(&members)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let sorted = |names: &[&str]| -> Vec<String> {
+            let mut names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            found("cargo test --benches"),
+            sorted(&[
+                "a --bin x",
+                "a --bench m",
+                "a --test t",
+                "a --test u",
+                "a --example e"
+            ])
+        );
+        assert_eq!(
+            found("cargo test --all-targets"),
+            sorted(&[
+                "a --lib",
+                "a --bin x",
+                "a --bench m",
+                "a --test t",
+                "a --test u",
+                "a --example e",
+                "a --example f"
+            ])
+        );
+        assert_eq!(found("cargo test --bench n"), ["a --bench n"]);
+        assert_eq!(
+            found("cargo test --tests"),
+            sorted(&["a --lib", "a --bin x", "a --test t"])
+        );
+    }
+
+    #[test]
+    fn a_target_with_required_features_is_covered_when_the_command_turns_each_one_on() {
+        use TargetKind::{Lib, Test};
+        let needs = |package: &str, name: &str, features: &[&str]| {
+            let mut one = target(package, Test, name, true);
+            one.required_features = features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect();
+            one
+        };
+        let table = |entries: &[(&str, &[&str])]| -> BTreeMap<String, Vec<String>> {
+            entries
+                .iter()
+                .map(|(name, on)| {
+                    (
+                        (*name).to_owned(),
+                        on.iter().map(|feature| (*feature).to_owned()).collect(),
+                    )
+                })
+                .collect()
+        };
+        let mut first = package(
+            "a",
+            vec![
+                target("a", Lib, "a", true),
+                needs("a", "free", &[]),
+                needs("a", "f", &["f"]),
+                needs("a", "d", &["d"]),
+                needs("a", "g", &["g"]),
+                needs("a", "fd", &["f", "d"]),
+            ],
+            &["a"],
+        );
+        first.features = table(&[
+            ("default", &["d"]),
+            ("d", &[]),
+            ("f", &[]),
+            ("g", &["f", "x?/y", "dep:x"]),
+            ("x", &["dep:x"]),
+        ]);
+        // The second package turns on `s` through a dev-dependency on itself that leaves the default
+        // features off, and the third turns on `default` through one that does not.
+        let mut second = package(
+            "b",
+            vec![needs("b", "s", &["s"]), needs("b", "d", &["d"])],
+            &["a"],
+        );
+        second.features = table(&[("default", &["d"]), ("d", &[]), ("s", &[])]);
+        second.self_dev_features = BTreeSet::from(["s".to_owned()]);
+        let mut third = package("c", vec![needs("c", "d", &["d"])], &["a"]);
+        third.features = table(&[("default", &["d"]), ("d", &[])]);
+        third.self_dev_features = BTreeSet::from(["default".to_owned()]);
+        let packages = [first, second, third];
+        let members: Vec<&Package> = packages.iter().collect();
+        let found = |line: &str| -> Vec<String> {
+            parse(&words(line))
+                .expect("a command")
+                .covers(&members)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let a = |names: &[&str]| -> Vec<String> {
+            let mut shown: Vec<String> = names
+                .iter()
+                .map(|name| match *name {
+                    "lib" => "a --lib".to_owned(),
+                    other => format!("a --test {other}"),
+                })
+                .collect();
+            shown.sort();
+            shown
+        };
+        assert_eq!(found("cargo test"), a(&["lib", "d", "free"]));
+        assert_eq!(
+            found("cargo test --features f"),
+            a(&["lib", "d", "f", "fd", "free"])
+        );
+        assert_eq!(
+            found("cargo test -F a/f"),
+            a(&["lib", "d", "f", "fd", "free"])
+        );
+        assert_eq!(
+            found("cargo test --features f,g"),
+            a(&["lib", "d", "f", "fd", "g", "free"])
+        );
+        assert_eq!(
+            found("cargo test --features=g"),
+            a(&["lib", "d", "f", "fd", "g", "free"])
+        );
+        assert_eq!(found("cargo test --features b/f"), a(&["lib", "d", "free"]));
+        assert_eq!(
+            found("cargo test --no-default-features"),
+            a(&["lib", "free"])
+        );
+        assert_eq!(
+            found("cargo test --no-default-features --features f"),
+            a(&["lib", "f", "free"])
+        );
+        assert_eq!(
+            found("cargo test --all-features"),
+            a(&["lib", "d", "f", "fd", "g", "free"])
+        );
+        assert_eq!(found("cargo test --test f"), Vec::<String>::new());
+        assert_eq!(found("cargo test --test f --features f"), a(&["f"]));
+        let own = |line: &str, package: &str| -> Vec<String> {
+            found(line)
+                .into_iter()
+                .filter(|target| target.starts_with(package))
+                .collect()
+        };
+        assert_eq!(
+            own("cargo test --workspace --no-default-features", "b"),
+            ["b --test s"]
+        );
+        assert_eq!(
+            own("cargo test --workspace --no-default-features", "c"),
+            ["c --test d"]
+        );
+        assert_eq!(
+            own("cargo test --workspace", "b"),
+            ["b --test d", "b --test s"]
+        );
     }
 
     #[test]
