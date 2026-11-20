@@ -95,12 +95,14 @@ fn plan_text(root: &Path) -> String {
     std::fs::read_to_string(root.join("conformance").join("plan.toml")).expect("the fixture's plan")
 }
 
-/// The fixture's plan with its steps run no `cargo`: a `cargo` step runs in a workspace root the
-/// plan's manifests name, and a case that plants other manifests is about the map, not the steps.
+/// The fixture's plan with its steps run no `cargo` and read an exit status: a step that reads the
+/// output of `cargo test` runs `cargo test`, a `cargo` step runs in a workspace root the plan's
+/// manifests name, and a case that plants other manifests is about the map, not the steps.
 fn without_cargo(text: &str) -> String {
     let words = "command = ['cargo', 'test', '--locked']";
     assert!(text.contains(words), "the fixture's steps");
-    text.replace(words, "command = ['pnpm', 'test']")
+    text.replace("reading = 'cargo'", "reading = 'exit'")
+        .replace(words, "command = ['pnpm', 'test']")
 }
 
 fn load(root: &Path) -> Plan {
