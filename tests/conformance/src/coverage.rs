@@ -280,7 +280,10 @@ pub struct Selection {
     features: Vec<String>,
     all_features: bool,
     no_default_features: bool,
-    carried: Vec<String>,
+    release: bool,
+    profile: Option<String>,
+    target: Option<String>,
+    configs: Vec<String>,
 }
 
 /// The words read so far.
@@ -323,26 +326,18 @@ impl Parsed {
             "--benches" => selection.benches = Rule::All,
             "--bench" => selection.benches.name(&value)?,
             "--all-targets" => selection.all_targets = true,
-            "--release" | "--all-features" | "--no-default-features" => {
-                match flag {
-                    "--all-features" => selection.all_features = true,
-                    "--no-default-features" => selection.no_default_features = true,
-                    _ => {}
-                }
-                selection.carried.push(flag.to_owned());
-            }
-            "--profile" | "--features" => {
-                if flag == "--features" {
-                    selection.features.extend(
-                        value
-                            .split([',', ' '])
-                            .filter(|item| !item.is_empty())
-                            .map(str::to_owned),
-                    );
-                }
-                selection.carried.push(flag.to_owned());
-                selection.carried.push(value);
-            }
+            "--release" => selection.release = true,
+            "--all-features" => selection.all_features = true,
+            "--no-default-features" => selection.no_default_features = true,
+            "--profile" => selection.profile = Some(value),
+            "--target" => selection.target = Some(value),
+            "--config" => selection.configs.push(value),
+            "--features" => selection.features.extend(
+                value
+                    .split([',', ' '])
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_owned),
+            ),
             _ => {}
         }
         Ok(())
@@ -382,7 +377,10 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
             features: Vec::new(),
             all_features: false,
             no_default_features: false,
-            carried: Vec::new(),
+            release: false,
+            profile: None,
+            target: None,
+            configs: Vec::new(),
         },
         named: Vec::new(),
         excluded: Vec::new(),
@@ -465,11 +463,57 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
 }
 
 impl Selection {
-    /// The words of the command that choose the features and the profile, which a command that runs
-    /// one test of the step repeats.
+    /// The words of the command that choose the profile, the target and the configuration, and the
+    /// features as a command for `package` alone can say them: a feature of the package (`f` or
+    /// `<package>/f`) and a feature of a dependency of it (`<dependency>/f`) stay, and the features of
+    /// the other packages go, because a command that names one package refuses them.
     #[must_use]
-    pub fn carried(&self) -> &[String] {
-        &self.carried
+    pub fn reproduce(&self, package: &Package) -> Vec<String> {
+        let mut words = Vec::new();
+        if self.release {
+            words.push("--release".to_owned());
+        }
+        if let Some(profile) = &self.profile {
+            words.extend(["--profile".to_owned(), profile.clone()]);
+        }
+        if let Some(target) = &self.target {
+            words.extend(["--target".to_owned(), target.clone()]);
+        }
+        for config in &self.configs {
+            words.extend(["--config".to_owned(), config.clone()]);
+        }
+        let mut features: Vec<String> = Vec::new();
+        for item in &self.features {
+            let kept = match item.split_once('/') {
+                None if package.features.contains_key(item) => Some(item.clone()),
+                Some((owner, feature)) if owner.trim_end_matches('?') == package.name => {
+                    Some(feature.to_owned())
+                }
+                Some((owner, _))
+                    if package
+                        .dependency_names
+                        .contains(owner.trim_end_matches('?')) =>
+                {
+                    Some(item.clone())
+                }
+                _ => None,
+            };
+            if let Some(kept) = kept
+                && !features.contains(&kept)
+            {
+                features.push(kept);
+            }
+        }
+        if !features.is_empty() {
+            words.extend(["--features".to_owned(), features.join(",")]);
+        }
+        if self.all_features {
+            words.push("--all-features".to_owned());
+        }
+        if self.no_default_features {
+            words.push("--no-default-features".to_owned());
+        }
+        words
     }
 
     /// The targets of `packages`, which are the members of one workspace, that the command selects.
@@ -1234,31 +1278,57 @@ mod tests {
     }
 
     #[test]
-    fn a_command_repeats_the_features_and_the_profile_it_was_given_and_nothing_else() {
-        let carried = |line: &str| parse(&words(line)).expect("a command").carried().to_vec();
+    fn a_command_repeats_the_profile_the_target_the_configuration_and_the_features_of_its_package()
+    {
+        let mut one = package("a", Vec::new(), &["a"]);
+        one.features = BTreeMap::from([
+            ("f".to_owned(), Vec::new()),
+            ("g".to_owned(), Vec::new()),
+            ("dep".to_owned(), vec!["dep:dep".to_owned()]),
+        ]);
+        one.dependency_names = BTreeSet::from(["dep".to_owned(), "other".to_owned()]);
+        let mut two = package("b", Vec::new(), &["a"]);
+        two.features = BTreeMap::from([("h".to_owned(), Vec::new())]);
+        let reproduced = |line: &str, package: &Package| {
+            parse(&words(line)).expect("a command").reproduce(package)
+        };
         assert_eq!(
-            carried(
-                "cargo test --locked -p a --release --features f,g --all-features --no-default-features --profile ci -j 2 -- --nocapture"
+            reproduced(
+                "cargo test --locked -p a --release --features f,b/h,dep/x --all-features --no-default-features --target t --config c=1 --config d=2 -j 2 -- --nocapture",
+                &one
             ),
             [
                 "--release",
+                "--target",
+                "t",
+                "--config",
+                "c=1",
+                "--config",
+                "d=2",
                 "--features",
-                "f,g",
+                "f,dep/x",
                 "--all-features",
-                "--no-default-features",
-                "--profile",
-                "ci"
+                "--no-default-features"
             ]
         );
+        let line = "cargo test --workspace --features a/f,b/h,g,h,dep?/x,other/y --profile ci";
         assert_eq!(
-            carried("cargo test -F f -r"),
-            ["--features", "f", "--release"]
+            reproduced(line, &one),
+            ["--profile", "ci", "--features", "f,g,dep?/x,other/y"]
         );
-        assert_eq!(carried("cargo test -qr"), ["--release"]);
         assert_eq!(
-            carried("cargo test --features=f --profile=ci"),
-            ["--features", "f", "--profile", "ci"]
+            reproduced(line, &two),
+            ["--profile", "ci", "--features", "h"]
         );
-        assert!(carried("cargo test --workspace --locked").is_empty());
+        assert_eq!(
+            reproduced("cargo test -F a/f -r", &one),
+            ["--release", "--features", "f"]
+        );
+        assert_eq!(reproduced("cargo test -qr", &two), ["--release"]);
+        assert_eq!(
+            reproduced("cargo test --features=b/h --profile=ci", &one),
+            ["--profile", "ci"]
+        );
+        assert!(reproduced("cargo test --workspace --locked", &one).is_empty());
     }
 }

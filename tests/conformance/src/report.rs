@@ -1504,7 +1504,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// The variables the step its command is taken from reads, and those of its own `env` that hold
-    /// a placeholder, whose values that step's set-up gave them (see [`Self::reproducing_step`]).
+    /// a placeholder, which the run gives their values (see [`Self::reproducing_step`]).
     fn needs(&self, target: &TargetId, runs: &[RunRecord]) -> Vec<String> {
         let Some(done) = self.reproducing_step(target, runs) else {
             return Vec::new();
@@ -1641,25 +1641,16 @@ impl<'a> Resolver<'a> {
                     line.push_str(&format!("{variable}={} ", plan::quote(value)));
                 }
             }
-            if let Ok(selection) = coverage::parse(&step.command) {
-                words.extend(selection.carried().iter().cloned());
+            if let (Ok(selection), Some(package)) = (
+                coverage::parse(&step.command),
+                self.map
+                    .packages
+                    .iter()
+                    .find(|package| package.name == target.package),
+            ) {
+                words.extend(selection.reproduce(package));
             }
-            let mut after = step
-                .command
-                .iter()
-                .skip_while(|word| *word != "--")
-                .skip(1)
-                .peekable();
-            while let Some(word) = after.next() {
-                match word.as_str() {
-                    "--skip" => {
-                        after.next();
-                    }
-                    "--exact" | "--show-output" => {}
-                    flag if flag.starts_with("--") => test_arguments.push(flag.to_owned()),
-                    _ => {}
-                }
-            }
+            test_arguments = test_options(step);
         }
         words.push("-p".to_owned());
         words.push(target.package.clone());
@@ -1975,6 +1966,57 @@ fn covered_by(step: &plan::Step, packages: &[Package]) -> BTreeSet<TargetId> {
         .filter(|package| package.workspace == here)
         .collect();
     selection.covers(&members)
+}
+
+/// The options a step passes to each test binary, as a command that runs one test repeats them, each
+/// with its value. The filters, the options that choose or list tests (`--exact`, `--skip`, `--list`),
+/// `--show-output` and `--logfile` go, and so does an option, with its value, whose word holds a
+/// placeholder, because the run gives a placeholder its value. The options that take a value are those
+/// of the standard test harness: `--skip`, `--logfile`, `--test-threads`, `--color`, `--format`,
+/// `--shuffle-seed` and `-Z`, as `--option value` or `--option=value`.
+fn test_options(step: &plan::Step) -> Vec<String> {
+    let Some(start) = step.command.iter().position(|word| word == "--") else {
+        return Vec::new();
+    };
+    let held = |index: usize| step.placeholder_words.contains(&index);
+    let mut kept = Vec::new();
+    let mut at = start + 1;
+    while at < step.command.len() {
+        let index = at;
+        let word = step.command[index].as_str();
+        at += 1;
+        let (name, inline) = match word.split_once('=') {
+            Some((name, value)) if word.starts_with("--") => (name, Some(value)),
+            _ => (word, None),
+        };
+        if matches!(
+            name,
+            "--skip"
+                | "--logfile"
+                | "--test-threads"
+                | "--color"
+                | "--format"
+                | "--shuffle-seed"
+                | "-Z"
+        ) {
+            let operand = if inline.is_none() && at < step.command.len() {
+                at += 1;
+                Some(&step.command[at - 1])
+            } else {
+                None
+            };
+            let holds = held(index) || (operand.is_some() && held(at - 1));
+            if !holds && !matches!(name, "--skip" | "--logfile") {
+                kept.push(word.to_owned());
+                kept.extend(operand.cloned());
+            }
+        } else if word.starts_with('-') && !held(index) {
+            if !matches!(word, "--exact" | "--show-output" | "--list") {
+                kept.push(word.to_owned());
+            }
+        }
+    }
+    kept
 }
 
 /// A step as a reason names it: its command, and the directory it runs in when that is not the

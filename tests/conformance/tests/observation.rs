@@ -46,6 +46,7 @@ fn shell(what: &str, script: &str, arguments: &[&Path]) -> Step {
         timeout: None,
         budget: None,
         placeholder_env: Vec::new(),
+        placeholder_words: Vec::new(),
     }
 }
 

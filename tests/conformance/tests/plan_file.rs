@@ -1189,6 +1189,24 @@ fn a_step_names_the_variables_whose_value_held_a_placeholder() {
         ]
     );
     assert_eq!(steps[0].placeholder_env, ["ALSO", "WHERE"]);
+    // The plan's own text decides, not whether the value given to a placeholder differs from it.
+    let text = step_adding(
+        "env = { WHERE = '{evidence}', PLAIN = 'x' }\n",
+        "['cargo', 'test', '--', '--log={evidence}/x', '--other', '{root}', 'plain']",
+    );
+    let plan = Plan::parse(&text, &repository()).expect("a variable can hold a placeholder");
+    let steps = plan.steps(
+        Platform::Linux,
+        &selection(&["rust"]),
+        &Values::evidence("{evidence}"),
+        None,
+    );
+    assert_eq!(
+        steps[0].env[1],
+        ("WHERE".to_owned(), "{evidence}".to_owned())
+    );
+    assert_eq!(steps[0].placeholder_env, ["WHERE"]);
+    assert_eq!(steps[0].placeholder_words, [3, 5]);
 }
 
 /// A set-up step, `prep`, on `platforms`, and a step, `one`, that holds `after` and its own
@@ -1480,9 +1498,19 @@ fn a_cargo_test_step_whose_flags_the_report_cannot_read_is_refused_for_each_faul
             "step `one` names the pattern `a[b`, which has a `[` that no `]` closes",
         ),
         (
-            "the documentation tests beside a library",
-            "'cargo', 'test', '--doc', '--lib'",
-            "step `one` gives `--doc` with another flag that selects targets, which Cargo refuses",
+            "the documentation tests",
+            "'cargo', 'test', '--doc', '--no-fail-fast'",
+            "step `one` gives `--doc`: the report reads no doc test, and the run adds `--no-run`, which Cargo refuses with `--doc`",
+        ),
+        (
+            "a timing report with a value",
+            "'cargo', 'test', '--timings=html'",
+            "step `one` gives `--timings=html`, but `--timings` takes no value",
+        ),
+        (
+            "a request for help",
+            "'cargo', 'test', '-qh'",
+            "step `one` gives `-h`, which prints help and builds nothing",
         ),
         (
             "a command that is not `cargo test`",
@@ -1513,9 +1541,9 @@ fn a_cargo_test_step_whose_flags_the_report_cannot_read_is_refused_for_each_faul
         "'cargo', 'test', '-pa', '-p=b', '--package=c'",
         "'cargo', 'test', '--lib', '--bin=x', '--test', 't', '--bench', 'm', '--example', 'e'",
         "'cargo', 'test', '--bins', '--tests', '--benches', '--examples', '--all-targets'",
-        "'cargo', 'test', '--doc', '--no-fail-fast'",
+        "'cargo', 'test', '-qp', 'a', '-j', '-1', '--timings', '--jobs=-1'",
         "'cargo', 'test', '-F', 'f', '--all-features', '--no-default-features', '--release', '--profile', 'ci'",
-        "'cargo', 'test', '-qr', '-vv', '-j', '4', '--target', 'x86_64-unknown-linux-gnu', '--timings=html'",
+        "'cargo', 'test', '-qr', '-vv', '-j', '4', '--target', 'x86_64-unknown-linux-gnu', '--timings'",
         "'cargo', 'test', '--offline', '--frozen', '--ignore-rust-version', '--color', 'never', 'a_name_filter'",
         "'cargo', 'test', '-p', 'a', '--', '--manifest-path', '--bogus', '-Z'",
     ] {

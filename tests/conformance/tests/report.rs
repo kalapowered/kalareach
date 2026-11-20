@@ -2647,9 +2647,10 @@ fn a_target_a_step_ran_that_no_step_covers_is_a_problem_and_fails_the_run() {
 }
 
 /// The command of a test is its step's own, in the directory of the test's workspace and with the
-/// step's features and profile and the variables that hold no placeholder; a variable that holds one
-/// is named in `needs`, as its step's set-up gave it. Where no step ran the test, the step that
-/// selects it gives the command.
+/// step's features, profile and variables that hold no placeholder; a variable that holds one is
+/// named in `needs`, because the run gives a placeholder its value. Where no step ran the test, the
+/// step that selects it gives the command. A profile is chosen by `--release` or by `--profile`,
+/// and Cargo takes one of them, so the two are two commands.
 #[test]
 fn a_command_reproduces_the_step_in_its_directory_with_its_features_profile_and_variables() {
     let lib = target_of("p", TargetKind::Lib, "p");
@@ -2657,42 +2658,262 @@ fn a_command_reproduces_the_step_in_its_directory_with_its_features_profile_and_
         packages: vec![package_of("p", "first", &[(TargetKind::Lib, "p", true)])],
         ..Map::default()
     };
+    map.packages[0].features =
+        BTreeMap::from([("f".to_owned(), Vec::new()), ("g".to_owned(), Vec::new())]);
     key_in(&mut map, "KR-REQ-03.01", &lib, "a");
-    let step = Step {
-        directory: "first".to_owned(),
-        env: vec![
-            ("A".to_owned(), "on".to_owned()),
-            ("B".to_owned(), "two words".to_owned()),
-            ("C".to_owned(), "/e/x".to_owned()),
-        ],
-        placeholder_env: vec!["C".to_owned()],
-        needs: vec!["S".to_owned()],
-        ..Step::cargo(
-            "rust",
-            "the library",
-            &[
-                "test",
-                "--locked",
-                "-p",
-                "p",
-                "--lib",
-                "--release",
-                "--features",
-                "f,g",
-                "--profile",
-                "ci",
-                "--",
-                "--nocapture",
+    for (profile, expected) in [
+        (
+            vec!["--release", "--features", "f,g"],
+            "cd first && A=on B='two words' cargo test --locked --release --features f,g -p p --lib -- --nocapture --exact a",
+        ),
+        (
+            vec!["--profile", "ci", "--features", "f"],
+            "cd first && A=on B='two words' cargo test --locked --profile ci --features f -p p --lib -- --nocapture --exact a",
+        ),
+    ] {
+        let mut words = vec!["test", "--locked", "-p", "p", "--lib"];
+        words.extend(profile);
+        words.extend(["--", "--nocapture"]);
+        let step = Step {
+            directory: "first".to_owned(),
+            env: vec![
+                ("A".to_owned(), "on".to_owned()),
+                ("B".to_owned(), "two words".to_owned()),
+                ("C".to_owned(), "/e/x".to_owned()),
             ],
-        )
+            placeholder_env: vec!["C".to_owned()],
+            needs: vec!["S".to_owned()],
+            ..Step::cargo("rust", "the library", &words)
+        };
+        let plan = Plan::of_steps("rust", vec![step.clone()]);
+        for executed in [passing(step.clone(), &lib, &["a"]), quiet(step.clone())] {
+            let document = assembled(plan.clone(), &map, &[executed]);
+            let record = &document.identifiers["KR-REQ-03.01"].tests[0];
+            assert_eq!(record.command.as_deref(), Some(expected), "{record:?}");
+            assert_eq!(record.needs, ["S", "C"], "{record:?}");
+        }
+    }
+}
+
+/// The command that reproduces the test `a` of the library `p` for `step`, where `package` is the
+/// package `p` in the root workspace.
+fn reproduction(step: &Step, package: Package) -> String {
+    let lib = target_of("p", TargetKind::Lib, "p");
+    let mut map = Map {
+        packages: vec![package],
+        ..Map::default()
     };
+    key_in(&mut map, "KR-REQ-03.01", &lib, "a");
     let plan = Plan::of_steps("rust", vec![step.clone()]);
-    let expected = "cd first && A=on B='two words' cargo test --locked --release --features f,g --profile ci -p p --lib -- --nocapture --exact a";
-    for executed in [passing(step.clone(), &lib, &["a"]), quiet(step.clone())] {
-        let document = assembled(plan.clone(), &map, &[executed]);
-        let record = &document.identifiers["KR-REQ-03.01"].tests[0];
-        assert_eq!(record.command.as_deref(), Some(expected), "{record:?}");
-        assert_eq!(record.needs, ["S", "C"], "{record:?}");
+    let document = assembled(plan, &map, &[passing(step.clone(), &lib, &["a"])]);
+    document.identifiers["KR-REQ-03.01"].tests[0]
+        .command
+        .clone()
+        .expect("a command")
+}
+
+/// A command that reproduces a test passes the test binary the step's options with their values,
+/// and leaves out the filters, the options that choose or list tests, and an option, with its value,
+/// that holds a placeholder.
+#[test]
+fn a_command_keeps_the_options_a_step_passes_the_test_binary_with_their_values() {
+    let step = |options: &[&str], held: &[&str]| {
+        let mut words = vec!["test", "--locked", "-p", "p", "--lib", "--"];
+        words.extend(options);
+        let step = Step::cargo("rust", "the library", &words);
+        let placeholder_words = held
+            .iter()
+            .map(|word| {
+                step.command
+                    .iter()
+                    .position(|one| one.as_str() == *word)
+                    .expect("a word")
+            })
+            .collect();
+        Step {
+            placeholder_words,
+            ..step
+        }
+    };
+    let rows: &[(&[&str], &[&str], &str)] = &[
+        (
+            &["--test-threads", "1", "--nocapture"],
+            &[],
+            "-- --test-threads 1 --nocapture --exact a",
+        ),
+        (
+            &["--format", "terse", "--color=never", "--quiet"],
+            &[],
+            "-- --format terse --color=never --quiet --exact a",
+        ),
+        (
+            &[
+                "--test-threads=2",
+                "-Z",
+                "unstable-options",
+                "--report-time",
+            ],
+            &[],
+            "-- --test-threads=2 -Z unstable-options --report-time --exact a",
+        ),
+        (
+            &[
+                "--skip",
+                "slow",
+                "--logfile",
+                "out.txt",
+                "--logfile=x",
+                "--show-output",
+                "--exact",
+                "--list",
+                "filter",
+            ],
+            &[],
+            "-- --exact a",
+        ),
+        (
+            &["--format", "/e/x", "--nocapture"],
+            &["/e/x"],
+            "-- --nocapture --exact a",
+        ),
+        (
+            &["--shuffle-seed=/e/s", "--test-threads", "1"],
+            &["--shuffle-seed=/e/s"],
+            "-- --test-threads 1 --exact a",
+        ),
+        (
+            &["--ensure-time", "--color", "always"],
+            &["--ensure-time"],
+            "-- --color always --exact a",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (options, held, expected) in rows {
+        let package = package_of("p", ".", &[(TargetKind::Lib, "p", true)]);
+        let have = reproduction(&step(options, held), package);
+        let want = format!("cargo test --locked -p p --lib {expected}");
+        if have != want {
+            wrong.push(format!("{options:?}: {have}, not {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A command for one package gives the features of that package and of its dependencies, and not
+/// the features of the other packages that the step's command named.
+#[test]
+fn a_command_gives_the_features_of_the_package_it_runs_and_not_those_of_the_others() {
+    let mut package = package_of("p", ".", &[(TargetKind::Lib, "p", true)]);
+    package.features = BTreeMap::from([("f".to_owned(), Vec::new())]);
+    package.dependency_names = BTreeSet::from(["dep".to_owned()]);
+    let step = Step::cargo(
+        "rust",
+        "the workspace",
+        &[
+            "test",
+            "--locked",
+            "--workspace",
+            "--features",
+            "p/f,q/g,f,h,dep/x",
+            "--target",
+            "t",
+            "--config",
+            "build.jobs=2",
+        ],
+    );
+    assert_eq!(
+        reproduction(&step, package),
+        "cargo test --locked --target t --config build.jobs=2 --features f,dep/x -p p --lib -- --exact a"
+    );
+}
+
+/// The command a report gives for a test runs: in a workspace of two packages that each have a
+/// feature, a step that turns both on, with options for the test binary, gives a command for one
+/// package that Cargo accepts and that runs the test.
+#[cfg(unix)]
+#[test]
+fn a_reproduced_command_runs_for_each_package_of_a_workspace_that_a_step_gave_features() {
+    use std::process::Command;
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = directory.path();
+    let write = |relative: &str, text: &str| {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+        std::fs::write(path, text).expect("a file");
+    };
+    write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"a\", \"b\"]\n",
+    );
+    for (name, feature) in [("a", "f"), ("b", "g")] {
+        write(
+            &format!("{name}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[features]\n{feature} = []\n"
+            ),
+        );
+        write(&format!("{name}/src/lib.rs"), "");
+        write(
+            &format!("{name}/tests/t{name}.rs"),
+            "#[test]\nfn works() {}\n",
+        );
+    }
+    let target = root.join("target");
+    let lock = Command::new("cargo")
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", &target)
+        .args(["generate-lockfile", "--offline"])
+        .output()
+        .expect("cargo runs");
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let read = kr_conformance::workspace::read(root, &["Cargo.toml".to_owned()]);
+    assert!(read.problems.is_empty(), "{:?}", read.problems);
+    let step = Step::cargo(
+        "rust",
+        "the workspace",
+        &[
+            "test",
+            "--locked",
+            "--workspace",
+            "--features",
+            "a/f,b/g",
+            "--",
+            "--test-threads",
+            "1",
+            "--format",
+            "terse",
+        ],
+    );
+    for name in ["a", "b"] {
+        let test = target_of(name, TargetKind::Test, &format!("t{name}"));
+        let mut map = Map {
+            packages: read.packages.clone(),
+            ..Map::default()
+        };
+        key_in(&mut map, "KR-REQ-03.01", &test, "works");
+        let plan = Plan::of_steps("rust", vec![step.clone()]);
+        let document = assembled(plan, &map, &[passing(step.clone(), &test, &["works"])]);
+        let command = document.identifiers["KR-REQ-03.01"].tests[0]
+            .command
+            .clone()
+            .expect("a command");
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(root)
+            .env("CARGO_TARGET_DIR", &target)
+            .output()
+            .expect("a shell runs");
+        let shown = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && shown.contains("1 passed"),
+            "{command}\n{shown}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 

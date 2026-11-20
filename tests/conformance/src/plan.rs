@@ -128,9 +128,11 @@ pub struct Step {
     pub timeout: Option<u64>,
     /// The time budget it spends from, by `id`, and the budget's seconds.
     pub budget: Option<(String, u64)>,
-    /// The names in `env` whose value held a placeholder. A command that reproduces one of the
-    /// step's tests cannot repeat their values, which the step's own set-up gave them.
+    /// The names in `env` whose value holds a placeholder. A command that reproduces one of the
+    /// step's tests cannot repeat their values, because the run gives a placeholder its value.
     pub placeholder_env: Vec<String>,
+    /// The positions in `command` of the words that hold a placeholder, for the same reason.
+    pub placeholder_words: Vec<usize>,
 }
 
 impl Step {
@@ -158,6 +160,7 @@ impl Step {
             timeout: None,
             budget: None,
             placeholder_env: Vec::new(),
+            placeholder_words: Vec::new(),
         }
     }
 
@@ -467,6 +470,7 @@ mod tests {
             timeout: None,
             budget: None,
             placeholder_env: Vec::new(),
+            placeholder_words: Vec::new(),
         };
         let mut steps = vec![step("a", Reading::Build), step("b", Reading::Build)];
         steps.extend((0..7).map(|n| step(&format!("t{n}"), Reading::Cargo)));
@@ -489,6 +493,7 @@ mod tests {
             timeout: None,
             budget: None,
             placeholder_env: Vec::new(),
+            placeholder_words: Vec::new(),
             ..step_of(id, &["cargo"], reading)
         }
     }
@@ -698,6 +703,7 @@ mod tests {
             timeout: None,
             budget: None,
             placeholder_env: Vec::new(),
+            placeholder_words: Vec::new(),
         }
     }
 
