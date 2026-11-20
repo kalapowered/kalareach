@@ -1777,3 +1777,82 @@ async fn a_write_whose_readiness_check_flushed_nothing_leaves_the_count_of_pings
         "the Pongs are owed: the count is what the read ahead took"
     );
 }
+
+/// 512 Pings and a closure come while the Pongs' write waits, and the read waits at the limit. The
+/// writes then fail: the wake comes, and the same read gives the end. The closure behind the full
+/// queue is not read.
+#[tokio::test]
+async fn a_read_at_the_ping_limit_whose_flush_then_fails_gives_the_end() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    let task = Wakes::new();
+    gate.set(Writes::Park);
+    pinged_times(&mut provider, 512).await;
+    said(&mut provider, &[closure()]).await;
+    settle().await;
+    let mut read = sideband.next();
+    assert_eq!(
+        poll_once(&mut read, &task),
+        Poll::Pending,
+        "the read waits at the limit"
+    );
+    let woken = task.count();
+    gate.set(Writes::Fail);
+    assert_eq!(
+        task.count(),
+        woken + 1,
+        "the write that waited woke the task"
+    );
+    assert_eq!(
+        poll_once(&mut read, &task),
+        Poll::Ready(SocketRead::Closed),
+        "the failed flush ends the read"
+    );
+}
+
+/// 300 Pings come while the Pongs' write waits, then a closure and 300 more Pings. One read-ahead
+/// call saves the closure and reaches the 512th Ping: the read gives the closure at once.
+#[tokio::test]
+async fn a_closure_read_ahead_with_the_512th_ping_is_given_while_the_flush_waits() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    let task = Wakes::new();
+    gate.set(Writes::Park);
+    pinged_times(&mut provider, 300).await;
+    settle().await;
+    let mut read = sideband.next();
+    assert_eq!(
+        poll_once(&mut read, &task),
+        Poll::Pending,
+        "300 Pings, and the read waits"
+    );
+    said(&mut provider, &[closure()]).await;
+    pinged_times(&mut provider, 300).await;
+    settle().await;
+    assert_eq!(
+        poll_once(&mut read, &task),
+        Poll::Ready(SocketRead::Text(closure())),
+        "the closure read ahead is given at once"
+    );
+    drop(read);
+    assert_eq!(
+        sideband.pings, 512,
+        "the read ahead stopped at the 512th Ping"
+    );
+}
+
+/// 300 Pings and a closure are ready, and the first write fails: one read-ahead call takes 256
+/// items, control frames counted, so the closure is not read (a limit by design).
+#[tokio::test]
+async fn a_closure_behind_300_pings_is_not_read_after_the_first_write_fails() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    pinged_times(&mut provider, 300).await;
+    said(&mut provider, &[closure()]).await;
+    settle().await;
+    gate.set(Writes::Fail);
+    assert!(!sideband.send("{}".to_owned()).await, "the write failed");
+    assert_eq!(sideband.pings, 256, "one read-ahead call took 256 Pings");
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Closed),
+        "the end, not the closure"
+    );
+}
