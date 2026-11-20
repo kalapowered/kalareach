@@ -1113,6 +1113,52 @@ fn kr_req_12_07_a_gateway_that_cannot_bind_tells_the_launcher_why() {
     });
 }
 
+/// KR-REQ-12.07: a backend whose bind of the gateway's socket failed leaves what stands there alone
+/// through the launch's rollback: a file, and another program's live listener, which still accepts
+/// afterwards. (What the backend's own endpoint removes when it ends is held by the worker's
+/// endpoint cases; a session's close takes its whole private folder.)
+#[test]
+fn kr_req_12_07_a_backend_whose_bind_failed_leaves_what_stands_at_gw_sock() {
+    for (case, other_listener) in [("a file", false), ("another listener", true)] {
+        let shell = Gateway::new();
+        let answer = shell
+            .establish(&["codex"])
+            .expect("a backend is established");
+        let directory = directory_of(&answer);
+        let socket = directory.join("gw.sock");
+        let listener = if other_listener {
+            Some(std::os::unix::net::UnixListener::bind(&socket).expect("another listener"))
+        } else {
+            std::fs::write(&socket, b"").expect("a file where the socket belongs");
+            None
+        };
+        let mut launched = shell.launch(&answer, "left-alone", &[]);
+        let status = launched.ends();
+        assert_eq!(status.code(), Some(2), "{case}: {}", launched.said());
+        // The launch is given back with its server ended, as the cases above wait for.
+        eventually("the launch is given back and its server ended", || {
+            shell.last_launch_failure().is_some()
+                && shell.servers().iter().all(|server| {
+                    kr_ipc::identity::process_state(server) == kr_ipc::identity::ProcessState::Ended
+                })
+        });
+        let left = std::fs::symlink_metadata(&socket).expect("what stood there still stands");
+        if listener.is_some() {
+            assert!(
+                std::os::unix::fs::FileTypeExt::is_socket(&left.file_type()),
+                "{case}: the other listener's socket stands"
+            );
+            assert!(
+                std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+                "{case}: and still takes a connection"
+            );
+        } else {
+            assert!(left.is_file(), "{case}: the file stands");
+        }
+        drop(listener);
+    }
+}
+
 /// KR-REQ-12.07: a gateway that did not start for a reason that is not a bind says the gateway did
 /// not start, and not that it could not listen.
 #[test]
