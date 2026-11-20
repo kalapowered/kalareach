@@ -586,19 +586,22 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
             .chain(&step.env)
             .cloned()
             .collect();
-        let mut done = run::execute(
-            step,
-            index + 1,
-            &run::Place {
-                root: &options.root,
-                directory: &directory,
-                evidence: &options.evidence,
-                environment: &environment,
-                lister: &runner,
-            },
-            &map.packages,
-        );
-        if done.error.is_some() || done.exit != Some(0) {
+        let mut done = match failed_set_up(step, &executed) {
+            Some((number, what, why)) => run::not_run(step, number, &what, &why),
+            None => run::execute(
+                step,
+                index + 1,
+                &run::Place {
+                    root: &options.root,
+                    directory: &directory,
+                    evidence: &options.evidence,
+                    environment: &environment,
+                    lister: &runner,
+                },
+                &map.packages,
+            ),
+        };
+        if done.blocked_by.is_none() && (done.error.is_some() || done.exit != Some(0)) {
             done.observation = observe::observe_log(
                 &options.evidence.join(&done.log),
                 &runner_records,
@@ -634,6 +637,25 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
     Ok(assemble(
         options, &groups, &map, &executed, gathered, started,
     ))
+}
+
+/// The first set-up step that `step` names in `after` and that did not exit 0 or could not be run or
+/// read: its number, what it runs and what became of it. A set-up step that has not run is not one:
+/// the plan puts each before the steps that name it.
+fn failed_set_up(step: &plan::Step, executed: &[Executed]) -> Option<(usize, String, String)> {
+    step.after.iter().find_map(|name| {
+        let (index, set_up) = executed
+            .iter()
+            .enumerate()
+            .find(|(_, done)| done.step.id == *name)?;
+        let why = match (&set_up.error, set_up.exit) {
+            (Some(error), _) => format!("could not be run or read: {error}"),
+            (None, Some(0)) => return None,
+            (None, Some(code)) => format!("exited with status {code}"),
+            (None, None) => "ended without an exit status".to_owned(),
+        };
+        Some((index + 1, set_up.step.what.clone(), why))
+    })
 }
 
 /// What the tests left in the evidence directory during a run.
@@ -990,7 +1012,15 @@ impl<'a> Resolver<'a> {
     fn selected(&self, place: &Place) -> bool {
         match place {
             Place::Rust { target, .. } | Place::RustModule { target, .. } => {
-                self.ran.contains_key(target) || self.built.contains(target)
+                self.ran.contains_key(target)
+                    || self.built.contains(target)
+                    // A step that was not run because a set-up step failed still holds its targets
+                    // in the selection: their tests are listed, not run.
+                    || self.executed.iter().any(|done| {
+                        done.blocked_by.is_some()
+                            && matches!(done.step.reading, plan::Reading::Cargo)
+                            && command_holds(&done.step.command, target)
+                    })
             }
             Place::TypeScript { package, .. } => {
                 self.options.plan.selects_package(self.groups, package)
@@ -1079,6 +1109,21 @@ impl<'a> Resolver<'a> {
                 None,
             )]
         };
+        if let (Some(_), Some(why)) = (step.blocked_by, &step.error) {
+            let reason = format!("the step that runs the lane's tests was {why}");
+            let run = RunRecord {
+                step: index + 1,
+                outcome: Outcome::NotRun,
+                reason: Some(reason.clone()),
+            };
+            return vec![record(
+                named,
+                Outcome::NotRun,
+                Some(reason),
+                vec![run],
+                None,
+            )];
+        }
         let Some(cases) = &step.lane else {
             return failed(format!(
                 "the lane's tests did not report: {}",
@@ -1381,11 +1426,18 @@ impl<'a> Resolver<'a> {
                 && matches!(step.step.reading, plan::Reading::Cargo)
                 && command_holds(&step.step.command, target)
         }) {
-            return format!(
-                "no step that ran listed this target; `{}` did not build ({})",
-                failed.step.line(),
-                failed.error.clone().unwrap_or_default()
-            );
+            let why = failed.error.clone().unwrap_or_default();
+            return if failed.blocked_by.is_some() {
+                format!(
+                    "no step that ran listed this target; `{}` was {why}",
+                    failed.step.line()
+                )
+            } else {
+                format!(
+                    "no step that ran listed this target; `{}` did not build ({why})",
+                    failed.step.line()
+                )
+            };
         }
         // Only the groups that run Rust targets say why a Rust target was not run.
         let absent = plan.unrun_rust_reason(self.options.platform, self.groups);
@@ -1518,6 +1570,20 @@ impl<'a> Resolver<'a> {
                 Some(unreported),
             )];
         };
+        if let (Some(_), Some(why)) = (step.blocked_by, &step.error) {
+            let run = RunRecord {
+                step: index + 1,
+                outcome: Outcome::NotRun,
+                reason: Some(format!("the step that runs the package's tests was {why}")),
+            };
+            return vec![record(
+                format!("{file} {title}"),
+                Outcome::NotRun,
+                run.reason.clone(),
+                vec![run],
+                Some(unreported),
+            )];
+        }
         let Some(results) = &step.vitest else {
             let run = RunRecord {
                 step: index + 1,

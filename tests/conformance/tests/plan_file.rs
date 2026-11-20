@@ -790,6 +790,184 @@ fn execution_faults() -> Vec<(&'static str, String, &'static str)> {
     ]
 }
 
+/// A set-up step, `prep`, on `platforms`, and a step, `one`, that holds `after` and its own
+/// `platforms`, in a plan of one group.
+fn set_up_and_one(
+    prep_reading: &str,
+    prep_platforms: &str,
+    one_platforms: &str,
+    after: &str,
+    prep_is_set_up: bool,
+) -> String {
+    with(&format!(
+        "[[step]]
+id = 'prep'
+group = 'rust'
+what = 'the set-up'
+platforms = {prep_platforms}
+reading = '{prep_reading}'
+{}command = ['cargo', 'test']
+[[step]]
+id = 'one'
+group = 'rust'
+what = 'the first'
+platforms = {one_platforms}
+reading = 'cargo'
+after = {after}
+command = ['cargo', 'test']
+",
+        if prep_is_set_up { "setup = true\n" } else { "" }
+    ))
+}
+
+/// The planted files of the set-up steps: a name, the text, and the words the refusal holds.
+fn set_up_faults() -> Vec<(&'static str, String, &'static str)> {
+    vec![
+        (
+            "an `after` that names no step",
+            set_up_and_one("exit", "['linux']", "['linux']", "['gone']", true),
+            "step `one` is `after` `gone`, which names no step of the plan",
+        ),
+        (
+            "an `after` that names a later step",
+            with(
+                "[[step]]
+id = 'one'
+group = 'rust'
+what = 'the first'
+platforms = ['linux']
+reading = 'cargo'
+after = ['prep']
+command = ['cargo', 'test']
+[[step]]
+id = 'prep'
+group = 'rust'
+what = 'the set-up'
+platforms = ['linux']
+reading = 'exit'
+setup = true
+command = ['cargo', 'test']
+",
+            ),
+            "step `one` is `after` `prep`, which does not come before it in the plan",
+        ),
+        (
+            "an `after` that names its own step",
+            step_adding("after = ['one']\n", "['cargo', 'test']"),
+            "step `one` is `after` `one`, which does not come before it in the plan",
+        ),
+        (
+            "an `after` that names a step that is not a set-up step",
+            set_up_and_one("cargo", "['linux']", "['linux']", "['prep']", false),
+            "step `one` is `after` `prep`, which is not a set-up step",
+        ),
+        (
+            "a set-up step that reads more than its exit status",
+            set_up_and_one("cargo", "['linux']", "['linux']", "['prep']", true),
+            "step `prep` is a set-up step and reads `cargo`: a set-up step reads `exit`",
+        ),
+        (
+            "a step on a platform where its set-up step does not run",
+            set_up_and_one(
+                "exit",
+                "['linux']",
+                "['linux', 'windows']",
+                "['prep']",
+                true,
+            ),
+            "step `one` runs on windows, where its set-up step `prep` does not run",
+        ),
+    ]
+}
+
+/// Each planted file of the set-up steps is refused with its own reason, and the same plan with the
+/// fault taken out loads.
+#[test]
+fn a_set_up_step_or_an_after_is_refused_for_each_fault_by_its_reason() {
+    let root = repository();
+    let control = Plan::parse(
+        &set_up_and_one(
+            "exit",
+            "['linux', 'windows']",
+            "['linux', 'windows']",
+            "['prep']",
+            true,
+        ),
+        &root,
+    );
+    assert!(control.is_ok(), "the control file loads: {control:?}");
+    let mut wrong = Vec::new();
+    for (name, text, reason) in set_up_faults() {
+        match Plan::parse(&text, &root) {
+            Ok(_) => wrong.push(format!("{name}: the loader refused nothing")),
+            Err(refusal) if refusal.to_string().contains(reason) => {}
+            Err(refusal) => wrong.push(format!(
+                "{name}: refused as `{refusal}`, which lacks `{reason}`"
+            )),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A selection holds, in the plan's order, every set-up step that a step of it names, directly or
+/// through another set-up step, whatever the set-up step's group; a set-up step that no selected
+/// step names is in the selection only when its own group is.
+#[test]
+fn a_selection_holds_the_set_up_steps_its_steps_name_from_any_group() {
+    let set_up = |id: &str, after: &str| {
+        format!(
+            "[[step]]
+id = '{id}'
+group = 'prepare'
+what = '{id}'
+platforms = ['linux', 'macos']
+reading = 'exit'
+setup = true
+after = [{after}]
+command = ['cargo', 'test']
+"
+        )
+    };
+    let text = format!(
+        "{}{}{}{}[[step]]
+id = 'last'
+group = 'rust'
+what = 'the last'
+platforms = ['linux', 'macos']
+reading = 'cargo'
+after = ['second']
+command = ['cargo', 'test']
+",
+        HEAD.replace("groups = ['rust']", "groups = ['prepare', 'rust']"),
+        set_up("first", ""),
+        set_up("second", "'first'"),
+        set_up("alone", ""),
+    );
+    let plan = Plan::parse(&text, &repository()).expect("the plan loads");
+    let ids = |platform: Platform, groups: &[&str]| -> Vec<String> {
+        plan.steps(
+            platform,
+            &selection(groups),
+            &Values::evidence("/tmp/e"),
+            None,
+        )
+        .into_iter()
+        .map(|step| step.id)
+        .collect()
+    };
+    assert_eq!(ids(Platform::Linux, &["rust"]), ["first", "second", "last"]);
+    assert_eq!(ids(Platform::MacOs, &["rust"]), ["first", "second", "last"]);
+    assert_eq!(
+        ids(Platform::Linux, &["prepare"]),
+        ["first", "second", "alone"]
+    );
+    assert_eq!(
+        ids(Platform::Linux, &["prepare", "rust"]),
+        ["first", "second", "alone", "last"]
+    );
+    assert!(ids(Platform::Windows, &["rust"]).is_empty());
+}
+
 /// Each planted file of the execution model is refused with its own reason. A step whose `{output}`
 /// is held by a variable and not by a command word is accepted.
 #[test]
