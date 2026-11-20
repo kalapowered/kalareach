@@ -8009,6 +8009,33 @@ async fn until_more_heartbeats(scene: &Scene, count: usize) -> bool {
     .is_ok()
 }
 
+/// Waits until what is on the connection's book satisfies `settled`, and returns the book as it
+/// then stands, or as it stood when the wait ran out. A write the phone gave up on is settled on a
+/// task of its own, so the book is read for it once that task has had its turn, not at the moment
+/// the next write is carried.
+async fn until_the_book(
+    session: &kr_client::Session,
+    settled: impl Fn(&[kr_protocol::ids::ActionId]) -> bool,
+) -> Vec<kr_protocol::ids::ActionId> {
+    let book_now = || async {
+        session
+            .submitted_actions()
+            .await
+            .iter()
+            .map(|action| action.action_id)
+            .collect::<Vec<_>>()
+    };
+    let mut book = book_now().await;
+    let _ = tokio::time::timeout(WATCHDOG, async {
+        while !settled(&book) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            book = book_now().await;
+        }
+    })
+    .await;
+    book
+}
+
 /// Whether the phone asked the managed voice service or the account for anything: the service saw
 /// no request and no control, and the account's token source was never used to refresh.
 fn what_reached_kalareach(scene: &Scene) -> (usize, usize, usize) {
@@ -8922,12 +8949,10 @@ async fn a_write_the_phone_gave_up_on_is_settled_in_the_connections_book() {
         "the phone goes on writing after it gave up on the held write"
     );
     // A write the phone gave up on is not left on the book.
-    let book: Vec<_> = session
-        .submitted_actions()
-        .await
-        .iter()
-        .map(|action| action.action_id)
-        .collect();
+    let book = until_the_book(&session, |book| {
+        held.iter().all(|action| !book.contains(action))
+    })
+    .await;
     assert!(
         held.iter().all(|action| !book.contains(action)),
         "the write the phone gave up on is still on the book: {held:?} in {book:?}"
