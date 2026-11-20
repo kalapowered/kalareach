@@ -1125,4 +1125,26 @@ fn an_item_keeps_its_written_tokens_and_a_nested_place_no_configuration_builds_g
     let (_, other) = read("let _ = Method::AgentTurnSteer;");
     assert_ne!(source.digest, other.digest);
     assert_ne!(source.text, other.text);
+    // The same holds for a name that only the scan gives: an `impl` const of a type with no path
+    // holds a sighting of its own, and its text and digest keep the nested place.
+    let scan_only = |nested: &str| {
+        let lib = format!(
+            "impl Tr for [u8] {{ const C: u8 = {{ #[cfg(test)] fn t() {{ {nested} }} let _ = Method::AgentTurnSteer; 1 }}; }}\n"
+        );
+        let folder = small_tree(&lib);
+        let tree = tree_at(folder.path()).expect("the tree");
+        let sightings = tree
+            .sightings(&|krate| krate == "kr_sender")
+            .expect("the scan");
+        let source = tree
+            .source("kr_sender", "impl:lib.rs")
+            .expect("the source")
+            .expect("a name the scan gives");
+        (names(&sightings, "kr_sender"), source)
+    };
+    let (found, source) = scan_only("let _ = Method::AgentTurnCancel;");
+    assert_eq!(found, one("impl:lib.rs", SightKind::Names));
+    assert!(source.text.contains("AgentTurnCancel"), "{}", source.text);
+    let (_, other) = scan_only("let _ = Method::AgentTurnSteer;");
+    assert_ne!(source.digest, other.digest);
 }

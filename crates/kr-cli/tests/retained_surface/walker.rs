@@ -1828,9 +1828,16 @@ impl Scanner {
         self.sight(name, kinds_in(&tokens, self.self_kind));
     }
 
-    /// The tokens of an item that only the scan names: when they hold a sighting, their text
-    /// joins the text and the digest of `name`.
-    fn scan_only_body(&mut self, name: String, file: &str, tokens: TokenStream) {
+    /// The tokens of an item that only the scan names: when `tokens` (the item without the nested
+    /// places that no configuration builds) hold a sighting, the item's `written` tokens join the
+    /// text and the digest of `name`.
+    fn scan_only_body(
+        &mut self,
+        name: String,
+        file: &str,
+        tokens: TokenStream,
+        written: &TokenStream,
+    ) {
         let kinds = kinds_in(&tokens, self.self_kind);
         if kinds.is_empty() {
             return;
@@ -1840,15 +1847,22 @@ impl Scanner {
             .entry(name.clone())
             .or_insert_with(|| (file.to_owned(), Vec::new()))
             .1
-            .push(tokens.to_string());
+            .push(written.to_string());
         self.sight(name, kinds);
     }
 
     /// A constant or a macro call of an `impl` block: named by the block's type, and by the file
     /// where the type has no path (`impl T for [u8]`), as a `use` is.
-    fn impl_item(&mut self, owner: &str, file: &str, under_src: &str, tokens: TokenStream) {
+    fn impl_item(
+        &mut self,
+        owner: &str,
+        file: &str,
+        under_src: &str,
+        tokens: TokenStream,
+        written: &TokenStream,
+    ) {
         if owner.is_empty() {
-            self.scan_only_body(format!("impl:{under_src}"), file, tokens);
+            self.scan_only_body(format!("impl:{under_src}"), file, tokens, written);
         } else {
             self.body(owner.to_owned(), tokens);
         }
@@ -1878,7 +1892,7 @@ impl Scanner {
                     }
                 }
                 syn::Item::Use(_) => {
-                    self.scan_only_body(format!("use:{under_src}"), file, plain());
+                    self.scan_only_body(format!("use:{under_src}"), file, plain(), &plain());
                 }
                 syn::Item::Impl(block) => {
                     let owner = type_name(&block.self_ty);
@@ -1910,11 +1924,12 @@ impl Scanner {
                                     strip.visit_impl_item_const_mut(node);
                                 })?;
                                 let tokens = without_docs(kept.to_token_stream());
-                                self.impl_item(&owner, file, under_src, tokens);
+                                let written = without_docs(constant.to_token_stream());
+                                self.impl_item(&owner, file, under_src, tokens, &written);
                             }
                             syn::ImplItem::Macro(call) => {
                                 let tokens = without_docs(call.to_token_stream());
-                                self.impl_item(&owner, file, under_src, tokens);
+                                self.impl_item(&owner, file, under_src, tokens.clone(), &tokens);
                             }
                             _ => {}
                         }
@@ -1964,6 +1979,7 @@ impl Scanner {
                                 format!("{macro_name}! invocation @{under_src}"),
                                 file,
                                 plain(),
+                                &plain(),
                             );
                         }
                     }
