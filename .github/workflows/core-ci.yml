@@ -267,6 +267,14 @@ jobs:
           KR_REQUIRE_SEGMENTATION: "1"
         run: cargo test --locked --workspace
 
+      # The cases that start a daemon through test trees made without a service manager are ignored
+      # in the run above, which has this runner's account and so its own user manager. Each checks
+      # that neither the account's runtime directory nor its message bus is in its environment, so
+      # these steps remove both, and no call can reach the account's manager.
+      - name: A test tree made without a service manager calls none
+        if: ${{ !cancelled() }}
+        run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-controller --test teardown_jobs -- --nocapture --ignored --exact a_tree_without_a_service_manager_calls_none_at_its_end
+
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
       # item its reader cannot see, fails here rather than going unnoticed. These are the crates
       # whose documentation builds without one. The client library is built a second time without
