@@ -2278,7 +2278,8 @@ const READ_AHEAD_MESSAGES: usize = 256;
 /// each Ping it reads and keeps the queue without a limit until a flush writes it. At this many
 /// the adapter reads no more input: the flush goes on with the task's context, and the poll waits
 /// for it. Reading goes on when a flush has finished, which writes every Pong queued: the flush of
-/// a read, or the one a write finishes before its text goes into the library's queue.
+/// a read, the one a write finishes before its text goes into the library's queue, or the one that
+/// ends the write.
 const UNFLUSHED_PINGS: usize = 512;
 
 /// The stream of a side channel, whose writes can be held back. While they are, a write that the
@@ -2350,7 +2351,8 @@ struct WebSocketSideband<S = crate::wss::Io> {
     /// Messages a read ahead took, in the order they came, and not yet handed on. A closing
     /// frame or a failure the read ahead met is the last of them.
     ahead: VecDeque<SocketRead>,
-    /// Pings read since the last flush that finished: the library holds a Pong for each of them.
+    /// Pings read since the last flush that finished: the library holds at most one Pong for each
+    /// of them.
     pings: usize,
 }
 

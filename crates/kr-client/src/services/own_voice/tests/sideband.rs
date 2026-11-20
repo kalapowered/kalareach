@@ -1850,6 +1850,54 @@ async fn a_write_whose_pongs_go_out_across_polls_counts_the_pings_back_before_it
     );
 }
 
+/// 511 Pings are read while the stream takes no write, under the limit. A write is then polled: the
+/// stream takes the 511 Pongs and holds the text. One more Ping and a closure come, and the write
+/// fails: the closure is read ahead, because the Pongs went out before the text was queued and the
+/// count went back to zero, though it never reached the limit.
+#[tokio::test]
+async fn a_write_with_511_pings_counted_sends_their_pongs_before_its_text_and_keeps_a_closure_behind_one_more_ping()
+ {
+    let (mut sideband, mut provider, gate) = connected().await;
+    let task = Wakes::new();
+    gate.set(Writes::Park);
+    pinged_times(&mut provider, 511).await;
+    settle().await;
+    {
+        let mut read = sideband.next();
+        assert_eq!(poll_once(&mut read, &task), Poll::Pending, "the read waits");
+    }
+    assert_eq!(
+        sideband.pings, 511,
+        "511 Pings are read, and no Pong is out"
+    );
+    // Each Pong of a "keep-alive" Ping is 10 bytes of payload and 6 of header and mask: 8,176
+    // bytes, under the library's flush threshold of 8,192.
+    gate.set(Writes::PassFor(511 * (6 + 10)));
+    let mut sending = sideband.send("{}".to_owned());
+    assert_eq!(
+        poll_once_in_full(&mut sending, &task),
+        Poll::Pending,
+        "the stream holds the text"
+    );
+    settle().await;
+    assert_eq!(pongs(&mut provider), 511, "every Pong went out");
+    pinged(&mut provider).await;
+    said(&mut provider, &[closure()]).await;
+    settle().await;
+    gate.set(Writes::Fail);
+    assert_eq!(
+        poll_once(&mut sending, &task),
+        Poll::Ready(false),
+        "the write failed"
+    );
+    drop(sending);
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
+        "the closure behind the one Ping that came while the text waited is read ahead"
+    );
+}
+
 /// No Ping is counted and the stream takes no write: the text waits with the task's waker, and the
 /// stream wakes that task.
 #[tokio::test]
