@@ -133,16 +133,41 @@ impl Refusal {
 /// not list it keeps no binding revision for a draft.
 pub const DRAFT_REVISIONS_STORE: &str = "draft-revisions";
 
+/// The entry for the transfers journal in `target`'s manifest, when the release reads the journal
+/// below the schema version that keeps each draft's binding revision in the journal.
+///
+/// Such a release keeps that revision in no column of the journal: a journal at that version is one
+/// it cannot take as it is, and what it records for a prompt that names a draft is the one the
+/// rollback states the limit of. A release that reads that version, as one does that reads the
+/// journal through it, is not one of them, and neither is one that lists no transfers journal.
+#[must_use]
+pub fn reads_the_journal_below_the_column(target: &ReleaseManifest) -> Option<&ReleaseStore> {
+    target
+        .stores
+        .iter()
+        .find(|listed| {
+            listed.store == "transfers"
+                && listed.scope == StoreScope::Environment
+                && listed.records().is_none()
+        })
+        .filter(|listed| {
+            i64::from(listed.reads_through.unwrap_or(listed.version))
+                < kr_controller::transfer::JOURNAL_VERSION_WITH_THE_COLUMN
+        })
+}
+
 /// Brings every environment's transfers journal that is at the schema version that keeps each
 /// draft's binding revision in the journal back to the schema `target` reads, before the stores are
 /// checked, so the check reads the journal as the release will.
 ///
-/// It does so only when `target` lists the transfers journal and reads it below that version: a
-/// release that reads that version, as a release that reads it through does, takes the journal as it
-/// is. The version is read first and a journal is opened only at exactly that version, and a journal
-/// that is not there is left alone. The revisions the journal holds are kept beside it before the
-/// version moves, and a failure leaves the journal at the version it was. Each journal brought back
-/// is added to `done` as it is, so a refusal that follows says what was already done.
+/// It does so only for a `target` that [`reads_the_journal_below_the_column`]: a release that reads
+/// that version, as a release that reads it through does, takes the journal as it is. The version
+/// is read first and a journal is opened only at exactly that version, and a journal that is not
+/// there is left alone. The revisions the journal holds are kept beside it before the version
+/// moves, and a failure leaves the journal at the version it was. Each journal brought back is
+/// added to `done` as it is, so a refusal that follows says what was already done, and a journal
+/// that was brought back stays at the version it was brought back to when a later journal or
+/// store refuses the switch.
 ///
 /// Every daemon has stopped and every environment's lock is held.
 ///
@@ -155,16 +180,9 @@ pub fn bring_the_journals_back(
     done: &mut Vec<LoweredJournal>,
 ) -> Result<(), CliError> {
     let at = kr_controller::transfer::JOURNAL_VERSION_WITH_THE_COLUMN;
-    let Some(listed) = target.stores.iter().find(|listed| {
-        listed.store == "transfers"
-            && listed.scope == StoreScope::Environment
-            && listed.records().is_none()
-    }) else {
+    let Some(listed) = reads_the_journal_below_the_column(target) else {
         return Ok(());
     };
-    if i64::from(listed.reads_through.unwrap_or(listed.version)) >= at {
-        return Ok(());
-    }
     for environment in environments {
         let journal = environment.paths.state_dir().join(&listed.path);
         match kr_controller::transfer::bring_the_journal_back(&journal, environment.environment_id)
