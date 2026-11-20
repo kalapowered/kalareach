@@ -163,6 +163,11 @@ impl ReadUnder {
             .filter(|reading| reading.published() == self.decided)
     }
 
+    /// Answers whether privacy mode was on when the read began.
+    pub(super) const fn was_private(&self) -> bool {
+        self.decided.private
+    }
+
     /// Answers whether the state the page was read under still stands, for a decision that is not
     /// the write of a byte.
     pub(super) fn stands(&self) -> bool {

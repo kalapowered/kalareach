@@ -2287,6 +2287,162 @@ async fn a_summary_of_changes_is_withheld_when_privacy_mode_starts_before_it_is_
     world.serving.abort();
 }
 
+/// A device paired with every right but the voice right, a voice grant of its own, and a connection
+/// of its own that keeps what it is written.
+fn voicing_connection(
+    controller: &std::sync::Arc<crate::service::Controller>,
+    byte: u8,
+) -> (super::RemoteConnection, std::sync::Arc<Kept>) {
+    let viewer = paired(controller, byte, |grant| {
+        grant.actions = kr_protocol::rights::ActionRight::ALL
+            .iter()
+            .copied()
+            .filter(|right| *right != kr_protocol::rights::ActionRight::VoiceUse)
+            .collect();
+        grant.history.lower_bound_ms = Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
+    });
+    // The voice grant of its own that the ordinary grant narrows.
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &crate::grants::GrantRecord {
+                grant: kr_protocol::grant::Grant {
+                    grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+                    issuer_device_id: controller.sharing().host_device_id(),
+                    actions: [
+                        kr_protocol::rights::ActionRight::VoiceUse,
+                        kr_protocol::rights::ActionRight::SessionView,
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..viewer.grant.clone()
+                },
+                session_id: None,
+                issued_at_ms: 1,
+                activated_at_ms: Some(1),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("a live voice grant");
+    let kept = Kept::watching(controller.privacy.state().clone());
+    let connection = super::RemoteConnection::for_test_writing_to(
+        controller,
+        viewer,
+        Box::new(std::sync::Arc::clone(&kept)),
+    );
+    (connection, kept)
+}
+
+/// The read a voice call makes of a session's context, which this daemon has no voice session for,
+/// so that it is the write of an answer that these cases are about: the answer a context read gives
+/// is put in the place of the refusal it got.
+async fn a_voice_context_read_waiting_to_be_written(
+    connection: &super::RemoteConnection,
+    session_id: SessionId,
+) -> super::Answered {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    let mut answer = connection
+        .answer_now(ControlFrame::Request(device_request(
+            1,
+            Method::VoiceContext,
+            &kr_protocol::voice::VoiceContextParams {
+                voice_session_id: kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid()),
+                session_id,
+                selected: CanonicalSet::new(),
+                delegation_id: Nullable::null(),
+            },
+        )))
+        .await
+        .expect("an answer");
+    assert!(
+        answer
+            .asked
+            .as_ref()
+            .is_some_and(|asked| asked.read_under.is_some()),
+        "the read is held to the privacy state it began under: {:?}",
+        answer.frame
+    );
+    answer.frame = ControlFrame::Response(Response {
+        request_id: RequestId::new(1),
+        outcome: Outcome::Ok(ParamsValue::empty()),
+    });
+    answer
+}
+
+/// KR-REQ-24.28: a context for a voice call goes to a device as it was read when no change of
+/// privacy mode falls between the read and the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_context_is_written_whole_under_the_privacy_state_it_was_read_in() {
+    use kr_protocol::envelope::{ControlFrame, Outcome};
+
+    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    let (connection, kept) = voicing_connection(&world.controller, 69);
+    let answer = a_voice_context_read_waiting_to_be_written(&connection, world.session_id).await;
+    let stands = connection.write_answer(connection.output(), answer).await;
+    assert!(stands, "the connection stands");
+    assert!(
+        matches!(
+            kept.frames()[0],
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{:?}",
+        kept.frames()[0]
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: a context for a voice call that was read while privacy mode was off is not sent
+/// after privacy mode has started: the device is told that none was sent, in the words the read's
+/// own refusal has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_context_is_refused_when_privacy_mode_starts_before_it_is_sent() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    let controller = &world.controller;
+    let (connection, kept) = voicing_connection(controller, 70);
+    let answer = a_voice_context_read_waiting_to_be_written(&connection, world.session_id).await;
+    let turn = connection.output.hold_the_turn().await;
+    let (stands, ()) = tokio::join!(
+        connection.write_answer(connection.output(), answer),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while connection.output.writes_queued() < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the answer is waiting for the writer");
+            privacy_mode_is_turned_on(controller).await;
+            drop(turn);
+        }
+    );
+    assert!(stands, "the connection stands");
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Error(refusal),
+        ..
+    }) = kept.frames()[0].clone()
+    else {
+        panic!(
+            "no context goes once privacy mode has started: {:?}",
+            kept.frames()[0]
+        );
+    };
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable
+    );
+    assert_eq!(refusal.message, crate::voice::CONTEXT_MOVED);
+    world.serving.abort();
+}
+
 /// A page a worker answers after the daemon published privacy mode and before the worker was told,
 /// which still holds the output that privacy mode removes, is withheld.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
