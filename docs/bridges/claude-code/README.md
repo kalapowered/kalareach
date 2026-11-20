@@ -355,7 +355,7 @@ Only three notifications cross, in the connector's own shapes, correlated at `pa
 
 | Notification | Direction | Checked |
 | --- | --- | --- |
-| `notifications/claude/channel` | worker to Claude Code | `content` is text; `meta` holds only text under keys of letters, digits and underscores; nothing else |
+| `notifications/claude/channel` | worker to Claude Code | `content` is the text; `meta` holds only text under keys of letters, digits and underscores, which for a message are `sender` and `sender_id`; nothing else |
 | `notifications/claude/channel/permission_request` | Claude Code to worker | `request_id`, five lowercase letters without `l`; `tool_name`, `description` and `input_preview` are text; only those four go on |
 | `notifications/claude/channel/permission` | worker to Claude Code | `behavior` is `allow` or `deny`; `request_id` is one this channel relayed and has not answered |
 
@@ -373,12 +373,23 @@ connector's table is qualified for that version. Any other channel is closed, an
 dialog answers.
 
 Each relayed `permission_request` becomes a pending approval, recorded with its frame, and every
-attached view is told of it. The first one is the evidence that the channel is registered, and it
-makes the launch's `agent.approval` capability available until the channel closes. Claude Code
-acknowledges no message into the session and no sender stands behind one, so the channel carries
-none: `agent.prompt` has no evidence, and a steer, a cancellation and any other action of the
-package are refused with their reasons. A frame the table does not route towards the worker closes
-the channel, since the forwarder relays nothing else.
+attached view is told of it. The first one is the evidence that the channel is registered. It
+makes the launch's `agent.approval` capability available until the channel closes. When the
+connector's table declares how a message is written, the same evidence makes `agent.prompt.queue`
+available.
+
+A queued message goes out on the channel through the same writer as a verdict, in the order
+admitted. The text is `content`. `meta` holds the `sender` and `sender_id` that the host verified:
+`local_user` for this computer's own account, `paired_device` for a paired device that holds a
+grant. Neither value proves who is typing. The channel holds at most eight messages waiting to be
+written, so they never take the room an answer needs.
+
+Claude Code acknowledges no message, so a message ends as an outcome nobody can establish and is
+never recorded as applied. A new message can still be sent. Text shaped like an answer to an
+approval, or like the channel's own tag, is refused. `agent.prompt` has no evidence, and a submit, a
+steer, a cancellation and any other action of the package are refused with their reasons. A frame
+the table does not route towards the worker closes the channel, since the forwarder relays nothing
+else.
 
 The worker interprets an approval when the session holds a binding of the connector's exact package
 (its identifier, publisher and installed hash) whose installation was granted `approval.decode`. The
