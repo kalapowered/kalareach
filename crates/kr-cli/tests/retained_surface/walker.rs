@@ -1701,7 +1701,9 @@ impl Scanner {
                     if let (Some(name), true) = (&call.ident, call.mac.path.is_ident("macro_rules"))
                     {
                         self.macro_rules.insert(name.to_string());
-                        called_macros(&call.mac.tokens, &mut self.expanded);
+                        for expansion in transcribers(&call.mac.tokens) {
+                            called_macros(&expansion, &mut self.expanded);
+                        }
                         self.sight(format!("macro:{name}"), kinds);
                         continue;
                     }
@@ -1829,6 +1831,27 @@ fn scan_crate(krate: &str, source: &Path, root: &Path) -> Result<CrateScan, Stri
         sightings,
         scan_names,
     })
+}
+
+/// The expansions of the arms of a `macro_rules!` body: what follows each `=>` outside the
+/// matchers, where a call is only syntax to match.
+fn transcribers(arms: &TokenStream) -> Vec<TokenStream> {
+    let flat: Vec<TokenTree> = arms.clone().into_iter().collect();
+    flat.iter()
+        .enumerate()
+        .filter_map(
+            |(at, tree)| match (tree, flat.get(at + 1), flat.get(at + 2)) {
+                (
+                    TokenTree::Punct(equals),
+                    Some(TokenTree::Punct(greater)),
+                    Some(TokenTree::Group(expansion)),
+                ) if equals.as_char() == '=' && greater.as_char() == '>' => {
+                    Some(expansion.stream())
+                }
+                _ => None,
+            },
+        )
+        .collect()
 }
 
 /// The names of the macros the tokens call, at any depth, with a sighting in their own arguments:

@@ -231,6 +231,7 @@ struct Maker;
 impl Maker { via_impl!(Method::AgentPromptQueue); }
 macro_rules! own { () => { Method::AgentTurnCancel }; }
 macro_rules! forwards { () => { via_body!(Method::AgentTurnSteer) }; }
+macro_rules! check { (idle!(Method::AgentTurnCancel)) => {}; }
 wrapper!(outer_made, inner_call!(Method::AgentPromptQueue));
 fn mixed() { let _ = Method::AgentTurnCancel; idle!(); }
 impl Sends for [u8] {
@@ -369,6 +370,7 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("macro:via_impl", vec![Expands]),
         ("macro:own", vec![Names]),
         ("macro:forwards", vec![Names]),
+        ("macro:check", vec![Names]),
         ("macro:via_body", vec![Expands]),
         ("outer_made", vec![Names]),
         ("macro:wrapper", vec![Expands]),
