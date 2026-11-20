@@ -130,6 +130,61 @@ impl StartBudget {
         self.starts.push_back(now);
         Ok(())
     }
+
+    /// How long until the window admits a start, read at `now` without spending one: zero when it
+    /// admits one now.
+    fn wait_at(&self, now: Instant) -> Duration {
+        let mut lately = self
+            .starts
+            .iter()
+            .filter(|at| now.duration_since(**at) < START_WINDOW);
+        let count = lately.clone().count();
+        match lately.next() {
+            Some(oldest) if count >= START_ATTEMPTS => {
+                START_WINDOW.saturating_sub(now.duration_since(*oldest))
+            }
+            _ => Duration::ZERO,
+        }
+    }
+}
+
+/// A wait in the words an answer says it in: whole seconds under a minute and whole minutes from
+/// one, rounded up and never less than one.
+fn said_wait(wait: Duration) -> String {
+    let seconds = wait.as_secs().max(1) + u64::from(wait.subsec_nanos() > 0 && wait.as_secs() >= 1);
+    if seconds < 60 {
+        format!("{seconds} second{}", if seconds == 1 { "" } else { "s" })
+    } else {
+        let minutes = seconds.div_ceil(60);
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    }
+}
+
+/// `reason`, a start attempt's own, with when kr can start the runtime again.
+fn with_restart(reason: &str, wait: Duration) -> String {
+    format!(
+        "{reason}; kr can start it again in about {}, when a worker asks",
+        said_wait(wait)
+    )
+}
+
+/// The answer that the start budget is spent: how long until it admits another start, and, where
+/// an attempt gave a reason, the last attempt's.
+fn budget_words(kept: Option<&str>, wait: Duration) -> String {
+    let spent = format!(
+        "the plugin runtime has been started {START_ATTEMPTS} times in the last {} minutes, so it \
+         is not started again for about {}",
+        START_WINDOW.as_secs() / 60,
+        said_wait(wait)
+    );
+    match kept {
+        Some(reason) => {
+            format!(
+                "{spent}; the last start said: {reason}; kr can start it again after that wait, when a worker asks"
+            )
+        }
+        None => spent,
+    }
 }
 
 /// A runtime this daemon can answer for.
@@ -144,7 +199,14 @@ enum State {
     Idle,
     Starting(watch::Receiver<Option<PluginRuntimeState>>),
     Running(Running),
-    Failed { reason: String, until: Instant },
+    /// A failure, answered from memory until `until`. `restart` is set for a reason a start
+    /// attempt gave, which is the only reason the answer adds a restart time to: a runtime found
+    /// silent, or an attempt that ended abnormally, may not be started again by the wait.
+    Failed {
+        reason: String,
+        until: Instant,
+        restart: bool,
+    },
 }
 
 /// What a look at the descriptor a previous daemon published found.
@@ -166,6 +228,8 @@ pub struct PluginRuntime {
     packages: PathBuf,
     state: tokio::sync::Mutex<State>,
     budget: std::sync::Mutex<StartBudget>,
+    /// The reason the latest start attempt gave for failing, until a start succeeds.
+    last_start_failure: std::sync::Mutex<Option<String>>,
     /// The instant the start window is counted at, where this host's own tests hold it still.
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -206,6 +270,7 @@ impl PluginRuntime {
             packages,
             state: tokio::sync::Mutex::new(State::Idle),
             budget: std::sync::Mutex::new(StartBudget::default()),
+            last_start_failure: std::sync::Mutex::new(None),
             #[cfg(feature = "testing")]
             window_held: std::sync::Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -235,6 +300,42 @@ impl PluginRuntime {
             .window_held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
+    }
+
+    /// Keeps the reason a start attempt gave, until a start succeeds.
+    fn keep_failure(&self, reason: &str) {
+        *self
+            .last_start_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_owned());
+    }
+
+    /// Forgets the kept reason: a start succeeded.
+    fn forget_failure(&self) {
+        *self
+            .last_start_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// The reason the latest start attempt gave, where no start has succeeded since.
+    fn kept_failure(&self) -> Option<String> {
+        self.last_start_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How long before another start can happen after a failed attempt: the later of what is left
+    /// of the failure memory and the start budget's next admitted start, which is read and not
+    /// spent.
+    fn restart_wait(&self, memory_left: Duration) -> Duration {
+        let budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wait_at(self.window_now());
+        memory_left.max(budget)
     }
 
     /// Remembers a failure for as long as `memory` instead, for tests that decide by what was
@@ -268,10 +369,19 @@ impl PluginRuntime {
                     drop(state);
                     return Self::answer_of(attempt, self.failure_memory).await;
                 }
-                State::Failed { reason, until } => {
+                State::Failed {
+                    reason,
+                    until,
+                    restart,
+                } => {
                     let now = Instant::now();
                     if now < *until {
-                        return unavailable(reason, until.duration_since(now));
+                        let left = until.duration_since(now);
+                        if !*restart {
+                            return unavailable(reason, left);
+                        }
+                        let wait = self.restart_wait(left);
+                        return unavailable(&with_restart(reason, wait), wait);
                     }
                     *state = State::Idle;
                 }
@@ -283,6 +393,7 @@ impl PluginRuntime {
                         *state = State::Failed {
                             reason: reason.clone(),
                             until: Instant::now() + self.failure_memory,
+                            restart: false,
                         };
                         return unavailable(&reason, self.failure_memory);
                     }
@@ -293,14 +404,8 @@ impl PluginRuntime {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .spend(self.window_now());
                         if let Err(wait) = spent {
-                            return unavailable(
-                                &format!(
-                                    "the plugin runtime has been started {START_ATTEMPTS} times \
-                                     in the last {} minutes, so it is not started again yet",
-                                    START_WINDOW.as_secs() / 60
-                                ),
-                                wait,
-                            );
+                            let kept = self.kept_failure();
+                            return unavailable(&budget_words(kept.as_deref(), wait), wait);
                         }
                         let (finished, attempt) = watch::channel(None);
                         *state = State::Starting(attempt.clone());
@@ -322,6 +427,7 @@ impl PluginRuntime {
                                                      ended abnormally"
                                                 .to_owned(),
                                             until: Instant::now() + runtime.failure_memory,
+                                            restart: false,
                                         };
                                     }
                                 }
@@ -363,6 +469,7 @@ impl PluginRuntime {
         let mut state = self.state.lock().await;
         let answer = match started {
             Ok((descriptor, fence)) => {
+                self.forget_failure();
                 *state = State::Running(Running {
                     descriptor,
                     _fence: Some(fence),
@@ -375,11 +482,14 @@ impl PluginRuntime {
                 // cannot finish starting and ends. Either way the next attempt is made after the
                 // failure has been answered from memory for a moment.
                 let reason = cut(&error.to_string());
+                self.keep_failure(&reason);
                 *state = State::Failed {
                     reason: reason.clone(),
                     until: Instant::now() + self.failure_memory,
+                    restart: true,
                 };
-                unavailable(&reason, self.failure_memory)
+                let wait = self.restart_wait(self.failure_memory);
+                unavailable(&with_restart(&reason, wait), wait)
             }
         };
         drop(state);
@@ -928,5 +1038,245 @@ mod tests {
 
         assert_eq!(runtime.request().await, PluginRuntimeState::Running);
         assert_eq!(supervisor.asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// The same wait in the words an answer says it in: rounded up, never under one, and in
+    /// minutes from one.
+    #[test]
+    fn a_wait_is_said_rounded_up_in_seconds_and_then_in_minutes() {
+        let said = |milliseconds| said_wait(Duration::from_millis(milliseconds));
+        assert_eq!(said(0), "1 second");
+        assert_eq!(said(400), "1 second");
+        assert_eq!(said(1000), "1 second");
+        assert_eq!(said(10_000), "10 seconds");
+        assert_eq!(said(10_001), "11 seconds");
+        assert_eq!(said(59_000), "59 seconds");
+        assert_eq!(said(60_000), "1 minute");
+        assert_eq!(said(61_000), "2 minutes");
+        assert_eq!(said(600_000), "10 minutes");
+    }
+
+    /// The budget is read without being spent: its wait is zero until it is spent and then the time
+    /// until its oldest start leaves the window.
+    #[test]
+    fn the_budget_names_the_next_admitted_start_without_spending_one() {
+        let base = Instant::now();
+        let mut budget = StartBudget::default();
+        for second in 0..START_ATTEMPTS as u64 - 1 {
+            budget.spend(after(base, second)).expect("a start");
+            assert_eq!(budget.wait_at(after(base, second)), Duration::ZERO);
+        }
+        budget.spend(after(base, 4)).expect("the fifth start");
+        assert_eq!(
+            budget.wait_at(after(base, 5)),
+            START_WINDOW - Duration::from_secs(5)
+        );
+        // Asking did not spend: the same wait, and the window moving admits a start.
+        assert_eq!(
+            budget.wait_at(after(base, 5)),
+            START_WINDOW - Duration::from_secs(5)
+        );
+        assert_eq!(
+            budget.wait_at(after(base, START_WINDOW.as_secs())),
+            Duration::ZERO
+        );
+        assert!(budget.spend(after(base, START_WINDOW.as_secs())).is_ok());
+    }
+
+    /// A supervisor that plays the plugin host of the start: it reports why it could not start, on
+    /// the rendezvous connection it is given, as the host does.
+    struct FailingHost {
+        reason: &'static str,
+        handle: tokio::runtime::Handle,
+    }
+
+    impl std::fmt::Debug for FailingHost {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("FailingHost")
+        }
+    }
+
+    impl WorkerSupervisor for FailingHost {
+        fn start(&self, _launch: &crate::supervision::WorkerLaunch) -> LaunchOutcome {
+            LaunchOutcome::NotStarted {
+                detail: "this supervisor starts no worker".to_owned(),
+            }
+        }
+
+        fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+            let value = |flag: &str| {
+                let at = launch
+                    .arguments
+                    .iter()
+                    .position(|argument| argument == flag)
+                    .expect("the flag is among the arguments");
+                launch.arguments[at + 1].clone()
+            };
+            let rendezvous = kr_ipc::paths::Endpoint::from_path(value("--rendezvous"))
+                .expect("a rendezvous endpoint");
+            let failure = kr_plugin_service::protocol::HostStartFailure {
+                reservation_id: kr_protocol::worker::ReservationId::new(
+                    value("--reservation").parse().expect("a reservation"),
+                ),
+                environment_id: kr_protocol::ids::EnvironmentId::new(
+                    value("--environment").parse().expect("an environment"),
+                ),
+                reason: self.reason.to_owned(),
+            };
+            self.handle.spawn(async move {
+                let connection = kr_ipc::endpoint::Connection::connect(&rendezvous)
+                    .await
+                    .expect("the host connects");
+                let (mut reader, mut writer) =
+                    kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                writer
+                    .write_message(&failure)
+                    .await
+                    .expect("the failure is written");
+                // The launcher closes the connection when it has read.
+                let _ = reader.read_payload().await;
+            });
+            LaunchOutcome::Started(
+                kr_ipc::identity::process_start_identity(std::process::id()).expect("this process"),
+            )
+        }
+
+        fn describe(&self) -> &'static str {
+            "a supervisor that plays a plugin host that cannot start"
+        }
+    }
+
+    /// A host that says why it could not start is heard by the worker's binding with its reason,
+    /// and with when kr can start the runtime again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_host_failure_reaches_the_workers_binding_with_its_reason() {
+        let host = kr_ipc::testing::TempHost::create();
+        let runtime = Arc::new(
+            PluginRuntime::new(
+                host.environment(),
+                Arc::new(FailingHost {
+                    reason: "the plugin host could not listen on /run/p3.sock: it holds a file",
+                    handle: tokio::runtime::Handle::current(),
+                }),
+                host.root().join("kr-plugin-host"),
+                host.root().join("repositories"),
+            )
+            .remembering_for(Duration::from_secs(10)),
+        );
+        let answer = runtime.request().await;
+        let PluginRuntimeState::Unavailable(told) = &answer else {
+            panic!("a host that could not start was answered {answer:?}");
+        };
+        assert_eq!(
+            told.reason,
+            "the plugin host could not listen on /run/p3.sock: it holds a file; kr can start it \
+             again in about 10 seconds, when a worker asks"
+        );
+    }
+
+    /// A failure that is answered from memory names when kr can start the runtime again, and a
+    /// reason no start attempt gave does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cached_failure_names_when_a_start_can_happen_again() {
+        let host = kr_ipc::testing::TempHost::create();
+        let supervisor = Arc::new(Gated::default());
+        supervisor.let_go();
+        let runtime =
+            Arc::new(runtime_over(&host, &supervisor).remembering_for(Duration::from_secs(3600)));
+        for _ in 0..2 {
+            let answer = runtime.request().await;
+            let PluginRuntimeState::Unavailable(told) = &answer else {
+                panic!("a failure was answered {answer:?}");
+            };
+            assert!(
+                told.reason
+                    .ends_with("kr can start it again in about 60 minutes, when a worker asks"),
+                "{}",
+                told.reason
+            );
+        }
+        // A runtime found silent, or an attempt that ended abnormally, keeps its own words: the
+        // wait does not start anything.
+        *runtime.state.lock().await = State::Failed {
+            reason: "the published plugin runtime could not be looked at".to_owned(),
+            until: Instant::now() + Duration::from_secs(60),
+            restart: false,
+        };
+        let answer = runtime.request().await;
+        let PluginRuntimeState::Unavailable(told) = &answer else {
+            panic!("a failure was answered {answer:?}");
+        };
+        assert_eq!(
+            told.reason,
+            "the published plugin runtime could not be looked at"
+        );
+    }
+
+    /// Five starts that fail at once spend the budget; the answer after the fifth, and the one that
+    /// is refused for the budget, say when another start can happen and why the last one failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_cause_survives_the_start_budget() {
+        let host = kr_ipc::testing::TempHost::create();
+        let supervisor = Arc::new(Gated::default());
+        supervisor.let_go();
+        let runtime =
+            Arc::new(runtime_over(&host, &supervisor).remembering_for(Duration::from_millis(1)));
+        let mut last = None;
+        for _ in 0..START_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let PluginRuntimeState::Unavailable(told) = runtime.request().await else {
+                panic!("a start that failed was answered that the runtime is running");
+            };
+            last = Some(told);
+        }
+        // The fifth failure is answered with the budget's wait and not the memory's.
+        let told = last.expect("five answers");
+        assert!(
+            told.reason
+                .ends_with("in about 10 minutes, when a worker asks"),
+            "{}",
+            told.reason
+        );
+        assert!(
+            told.retry_after_ms.get() > 590_000,
+            "{}",
+            told.retry_after_ms.get()
+        );
+        assert_eq!(supervisor.asked.load(Ordering::SeqCst), START_ATTEMPTS);
+        // The sixth is refused for the budget, and says what the last start said.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let PluginRuntimeState::Unavailable(told) = runtime.request().await else {
+            panic!("a start the budget refused was answered that the runtime is running");
+        };
+        assert_eq!(
+            told.reason,
+            "the plugin runtime has been started 5 times in the last 10 minutes, so it is not \
+             started again for about 10 minutes; the last start said: the plugin host was not \
+             started: this supervisor starts nothing; kr can start it again after that wait, when \
+             a worker asks"
+        );
+        assert_eq!(supervisor.asked.load(Ordering::SeqCst), START_ATTEMPTS);
+    }
+
+    /// The reason a start gave is kept until a start succeeds, and then it is not said.
+    #[tokio::test]
+    async fn a_start_that_succeeds_clears_the_kept_reason() {
+        let host = kr_ipc::testing::TempHost::create();
+        let supervisor = Arc::new(Gated::default());
+        let runtime = runtime_over(&host, &supervisor);
+        assert_eq!(runtime.kept_failure(), None);
+        runtime.keep_failure("the last start's reason");
+        assert_eq!(
+            budget_words(runtime.kept_failure().as_deref(), Duration::from_secs(60)),
+            "the plugin runtime has been started 5 times in the last 10 minutes, so it is not \
+             started again for about 1 minute; the last start said: the last start's reason; kr \
+             can start it again after that wait, when a worker asks"
+        );
+        runtime.forget_failure();
+        assert_eq!(
+            budget_words(runtime.kept_failure().as_deref(), Duration::from_secs(60)),
+            "the plugin runtime has been started 5 times in the last 10 minutes, so it is not \
+             started again for about 1 minute"
+        );
     }
 }
