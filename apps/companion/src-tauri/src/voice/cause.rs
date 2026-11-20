@@ -217,6 +217,7 @@ impl Cause {
                      was ended."
                         .to_owned()
                 }
+                // No end shows these words: `ended_words` words these two causes itself.
                 HostEnding::NotKnown(_) | HostEnding::Silent => HOST_UNHEARD.to_owned(),
             },
             Self::Deadline => "The call reached its time limit.".to_owned(),

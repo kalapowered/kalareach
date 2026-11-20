@@ -1093,7 +1093,7 @@ impl Shared {
                 .map(|ended| ended.host.clone())
         };
         // What the call is left to, in words, by the answer the owner wrote when it wrote one; nothing
-        // when that answer says the host closed it.
+        // when the host said it closed the call, in that answer or in the final status the look read.
         let left_words = cause::unsettled_words(
             word,
             written.as_ref().unwrap_or(&host_end),
