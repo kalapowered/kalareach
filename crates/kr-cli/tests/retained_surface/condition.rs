@@ -179,6 +179,64 @@ impl Condition {
     }
 }
 
+impl Condition {
+    /// Whether `attrs` carry `#[name]` in some configuration without `test` that this condition
+    /// allows: written as it is, or added by a `cfg_attr` whose predicate some such configuration
+    /// enables. A predicate the rule cannot read is its error.
+    pub fn carries(&self, attrs: &[Attribute], name: &str, at: &str) -> Result<bool, String> {
+        for attribute in attrs {
+            if attribute.path().is_ident(name) {
+                return Ok(true);
+            }
+            if attribute.path().is_ident("cfg_attr") {
+                let listed = attribute
+                    .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                    .map_err(|_| unreadable(at, &attribute.to_token_stream().to_string()))?;
+                if self.added_by(&listed, name, &mut Vec::new(), at)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the `cfg_attr` whose arguments are `listed`, under the predicates `guards` of the
+    /// `cfg_attr`s around it, adds `#[name]` where some configuration enables all of them.
+    fn added_by(
+        &self,
+        listed: &Punctuated<Meta, Token![,]>,
+        name: &str,
+        guards: &mut Vec<Meta>,
+        at: &str,
+    ) -> Result<bool, String> {
+        let mut parts = listed.iter();
+        let Some(guard) = parts.next() else {
+            return Ok(false);
+        };
+        guards.push(guard.clone());
+        let mut found = false;
+        for meta in parts {
+            if meta.path().is_ident(name) {
+                let all: Vec<&Meta> = guards.iter().collect();
+                let tested: Attribute = syn::parse_quote!(#[cfg(all(#(#all),*))]);
+                found = self.within(&[tested], at)?.is_some();
+            } else if let Meta::List(list) = meta
+                && list.path.is_ident("cfg_attr")
+            {
+                let inner = list
+                    .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+                    .map_err(|_| unreadable(at, &meta.to_token_stream().to_string()))?;
+                found = self.added_by(&inner, name, guards, at)?;
+            }
+            if found {
+                break;
+            }
+        }
+        guards.pop();
+        Ok(found)
+    }
+}
+
 /// Whether the attributes a `cfg_attr` adds (after its predicate) set a path or a condition,
 /// looking into a `cfg_attr` it holds.
 fn sets_path_or_condition(listed: &Punctuated<Meta, Token![,]>) -> bool {
