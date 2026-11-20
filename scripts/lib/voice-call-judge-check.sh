@@ -14,12 +14,13 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-say() { :; }
+said="$(mktemp "${TMPDIR:-/tmp}/kr-judge-said.XXXXXX")"
+say() { printf '%s\n' "$*" >>"$said"; }
 # shellcheck source=scripts/lib/voice-call-judge.sh
 . "$here/voice-call-judge.sh"
 
 dir="$(mktemp -d "${TMPDIR:-/tmp}/kr-judge-check.XXXXXX")"
-trap 'rm -rf "${dir:?}"' EXIT
+trap 'rm -rf "${dir:?}" "${said:?}"' EXIT
 run=RUN1
 required=("open" "a name with (parentheses) and 'quotes'" "the end is told" "audio reaches the call?")
 
@@ -247,6 +248,97 @@ replay_case "a break and a wrong reply to a delegation" 1 2 "$wrong" "$broke" "d
 replay_case "a break and a stray delegation" 1 2 "$stray" "$broke" "done=1"
 replay_case "a failure that is not a break" 1 2 none "check=open ok=0 detail=nothing" "done=1"
 replay_case "no failure" 1 0 none "check=open ok=1 detail=fine" "done=1"
+
+# An attempt whose application the system ended for the install of a package (the emulator's Play
+# Store updating the WebView, which ends every application that shows one) is played again too: the
+# result never says done, and the run log names the install as the reason the process ended. It is
+# played again only when no check of the application failed before the end and the host judge gave a
+# verdict; the process ending for any other reason, or for none that the system recorded, is the leg's.
+ended="== [voice-call-device] the application's process ended before the result said done"
+killed="am_kill : [0,4200,to.kala.reach,0,stop com.google.android.webview due to installPackageLI,140976]"
+ended_case() { # <name> <expected status> <host judge status, or none> <run log lines, one per line> <result lines...>
+    local name=$1 want=$2 rc=$3 lines=$4 status=0
+    shift 4
+    printf '%s\n' "$@" >"$replay_result"
+    { host "the service created one call ok=1 detail=1"; printf '%s\n' "$lines"; } >"$replay_log"
+    if [ "$rc" = none ]; then rm -f "$replay_rc"; else printf '%s\n' "$rc" >"$replay_rc"; fi
+    leg_is_replayable "$replay_result" "$replay_log" "$replay_rc" || status=$?
+    if [ "$status" != "$want" ]; then
+        echo "FAILED: the replay case $name decided $status, expected $want"
+        failed=1
+    fi
+}
+ended_case "a process ended for a package install, nothing failed" 0 0 "$ended: $killed" "check=open ok=1 detail=fine"
+ended_case "a process ended for a package install, the host judged it failed" 0 2 "$ended: $killed" "check=open ok=1 detail=fine"
+ended_case "a process ended for a package install, no check made yet" 0 4 "$ended: $killed" "run=$run"
+ended_case "a process ended for a package install after a failed check" 1 0 "$ended: $killed" "check=open ok=0 detail=nothing"
+ended_case "a process ended for a package install, the host wrote no verdict" 1 none "$ended: $killed" "check=open ok=1 detail=fine"
+ended_case "a process ended for a package install, the host judge stopped" 1 1 "$ended: $killed" "check=open ok=1 detail=fine"
+ended_case "a process ended and the system recorded no reason" 1 0 "$ended" "check=open ok=1 detail=fine"
+ended_case "a process ended for low memory" 1 0 "$ended: am_kill : [0,4200,to.kala.reach,0,empty #17,140976]" "check=open ok=1 detail=fine"
+ended_case "a package install ended another process and this one stopped without a record" 1 0 "$ended
+$killed" "check=open ok=1 detail=fine"
+ended_case "a result that never says done and a process that was never reported ended" 1 0 "the result never says done" "check=open ok=1 detail=fine"
+
+# The wait for the result: it ends when the result says done, and when the application's process has been
+# gone at two looks in a row and the result still does not say done (it names the process and the
+# system's record of why it ended), and otherwise at its limit. The commands it is given are answered
+# here from `wait_done_at`, the look from which the result says done (0: never), and `wait_gone`, the
+# looks at which the process is gone.
+wait_polls="$dir/wait-polls"
+wait_cues="$dir/wait-cues"
+# shellcheck disable=SC2329 # called by name from `wait_for_result`
+wait_reader() {
+    local n
+    n=$(($(cat "$wait_polls") + 1))
+    echo "$n" >"$wait_polls"
+    echo "run=$run"
+    { [ "$wait_done_at" = 0 ] || [ "$n" -lt "$wait_done_at" ]; } || echo "done=1"
+}
+# shellcheck disable=SC2329 # called by name from `wait_for_result`
+wait_alive() {
+    case " $wait_gone " in *" $(cat "$wait_polls") "*) return 1 ;; esac
+    return 0
+}
+# shellcheck disable=SC2329 # called by name from `wait_for_result`
+wait_cue() { printf '%s\n' "$1" >>"$wait_cues"; }
+# shellcheck disable=SC2329 # called by name from `wait_for_result`
+wait_why() { echo "$killed"; }
+wait_case() { # <name> <expected status> <limit> <most seconds it may take> <fewest seconds it may take> <said, or none>
+    local name=$1 want=$2 limit=$3 most=$4 fewest=$5 words=$6 status=0 began=$SECONDS took
+    echo 0 >"$wait_polls"
+    : >"$wait_cues"
+    : >"$said"
+    wait_for_result "$limit" 1 wait_reader wait_alive wait_cue wait_why || status=$?
+    took=$((SECONDS - began))
+    if [ "$status" != "$want" ]; then
+        echo "FAILED: the wait case $name ended $status, expected $want"
+        failed=1
+    fi
+    if [ "$took" -gt "$most" ] || [ "$took" -lt "$fewest" ]; then
+        echo "FAILED: the wait case $name took $took s, expected from $fewest to $most"
+        failed=1
+    fi
+    case "$words" in
+        none) ! grep -q "the application's process ended" "$said" || { echo "FAILED: the wait case $name said the process ended"; failed=1; } ;;
+        *) grep -q -F "$words" "$said" || { echo "FAILED: the wait case $name did not say: $words"; failed=1; } ;;
+    esac
+}
+all_looks="1 2 3 4 5 6 7 8 9 10"
+wait_done_at=0 wait_gone="$all_looks"
+wait_case "a process that is gone and a result that never says done" 5 8 3 0 "the application's process ended before the result said done: $killed"
+wait_done_at=0 wait_gone=""
+wait_case "a process that runs and a result that never says done" 1 3 5 3 none
+if ! grep -q "^run=$run\$" "$wait_cues"; then
+    echo "FAILED: the wait gave its cue no lines of the result"
+    failed=1
+fi
+wait_done_at=3 wait_gone="1"
+wait_case "a process gone at one look only" 0 8 4 1 none
+wait_done_at=3 wait_gone="1 3"
+wait_case "a process gone at two looks that are not in a row" 0 8 4 1 none
+wait_done_at=1 wait_gone="$all_looks"
+wait_case "a result that says done though the process is gone" 0 8 1 0 none
 
 [ "$failed" = 0 ] && echo "the judges decide every case as they should"
 exit "$failed"
