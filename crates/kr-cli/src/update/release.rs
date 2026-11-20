@@ -86,8 +86,8 @@ impl ChannelRoot {
     /// # Errors
     ///
     /// Returns a refusal when the root cannot be read, is not root metadata, gives one key to two
-    /// roles, names one key twice in a role or a key that is not an Ed25519 key of 32 bytes, or is
-    /// not signed by its own root keys.
+    /// roles, names one key under two identifiers in a role or a key that is not an Ed25519 key of
+    /// 32 bytes, or is not signed by its own root keys.
     pub fn read(release: &Path) -> Result<Option<Self>> {
         let path = release.join(CHANNEL_ROOT);
         let bytes = match read_bounded(&path, MAX_ROOT_LEN) {
@@ -119,7 +119,7 @@ impl ChannelRoot {
                 ),
                 kr_release::VerifyError::ReusedKey { .. } => shown!(
                     "the update channel's root at {} names one key under two identifiers for one \
-                     role, which counts it twice toward the role's threshold",
+                     role",
                     Shown::root(&path)
                 ),
                 kr_release::VerifyError::UnsupportedKey { .. } => shown!(
@@ -140,8 +140,9 @@ impl ChannelRoot {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when it gives one key to two roles, names one key twice in a role or a key
-    /// that is not an Ed25519 key of 32 bytes, or is not signed by its own root keys.
+    /// Returns a refusal when it gives one key to two roles, names one key under two identifiers in
+    /// a role or a key that is not an Ed25519 key of 32 bytes, or is not signed by its own root
+    /// keys.
     pub fn kept(signed: tough::schema::Signed<tough::schema::Root>) -> Result<Self> {
         kr_release::verify_root_itself(&signed).map_err(|error| {
             CliError::Other(Shown::said(match error {
