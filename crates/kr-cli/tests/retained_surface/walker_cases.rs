@@ -1096,3 +1096,33 @@ fn a_request_or_a_target_is_a_sighting_where_a_brace_group_follows_its_name_or_s
         assert_eq!(kinds_found(lib, &[]), expected, "{lib}");
     }
 }
+
+#[test]
+fn an_item_keeps_its_written_tokens_and_a_nested_place_no_configuration_builds_gives_no_sighting() {
+    let lib = |nested: &str| {
+        format!(
+            "pub fn built() {{\n    #[cfg(test)]\n    fn only_in_test() {{ {nested} }}\n    let _ = 1;\n}}\n\
+             pub fn plain() {{ let _ = Method::AgentTurnSteer; }}\n"
+        )
+    };
+    let read = |nested: &str| {
+        let folder = small_tree(&lib(nested));
+        let tree = tree_at(folder.path()).expect("the tree");
+        let sightings = tree
+            .sightings(&|krate| krate == "kr_sender")
+            .expect("the scan");
+        let source = tree
+            .source("kr_sender", "built")
+            .expect("the source")
+            .expect("an item");
+        (names(&sightings, "kr_sender"), source)
+    };
+    let (found, source) = read("let _ = Method::AgentTurnCancel;");
+    // The nested place is no sighting: only `plain` is one.
+    assert_eq!(found, one("plain", SightKind::Names));
+    // The item's text and digest are all its written tokens, the nested place among them.
+    assert!(source.text.contains("AgentTurnCancel"), "{}", source.text);
+    let (_, other) = read("let _ = Method::AgentTurnSteer;");
+    assert_ne!(source.digest, other.digest);
+    assert_ne!(source.text, other.text);
+}
