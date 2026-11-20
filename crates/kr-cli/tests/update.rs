@@ -3501,6 +3501,173 @@ fn a_channel_root_that_gives_one_key_to_two_roles_is_not_trusted() {
     }
 }
 
+/// The three channel roots a host refuses for their keys: one that gives a key to two roles, one
+/// that names a key twice in a role under two identifiers, and one that names a key that is not an
+/// Ed25519 key of 32 bytes, the targets key in its 44-byte wrapper. Each is the harness's own root
+/// with that one change.
+struct RootsRefusedForTheirKeys {
+    shared: String,
+    twice: String,
+    wrapped: String,
+}
+
+fn roots_refused_for_their_keys() -> RootsRefusedForTheirKeys {
+    let k = keys();
+    let identifier_of = |key: &serde_json::Value| -> String {
+        serde_json::from_value::<tough::schema::key::Key>(key.clone())
+            .expect("a key")
+            .key_id()
+            .expect("an identifier")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
+    let sound = channel_root_over(
+        1,
+        [&k.root, &k.targets, &k.snapshot, &k.timestamp],
+        &[&k.root],
+    );
+    let altered = |change: &dyn Fn(&mut serde_json::Value, &str)| {
+        let mut document: serde_json::Value = serde_json::from_str(&sound).expect("a root");
+        let targets = document["signed"]["roles"]["targets"]["keyids"][0]
+            .as_str()
+            .expect("an identifier")
+            .to_owned();
+        change(&mut document, &targets);
+        document.to_string()
+    };
+    RootsRefusedForTheirKeys {
+        shared: channel_root_over(1, [&k.root, &k.targets, &k.root, &k.timestamp], &[&k.root]),
+        // The targets key named a second time under another identifier: a member added to its
+        // description gives it another name and leaves the key as it was.
+        twice: altered(&|document, targets| {
+            let mut key = document["signed"]["keys"][targets].clone();
+            key["note"] = serde_json::json!("a second description of the same key");
+            let alias = identifier_of(&key);
+            document["signed"]["keys"][&alias] = key;
+            document["signed"]["roles"]["targets"]["keyids"]
+                .as_array_mut()
+                .expect("identifiers")
+                .push(serde_json::json!(alias));
+        }),
+        // The targets key in the 44-byte `SubjectPublicKeyInfo` wrapper, which the signature library
+        // reads as the same key and a release key is not.
+        wrapped: altered(&|document, targets| {
+            let mut key = document["signed"]["keys"][targets].clone();
+            let public = key["keyval"]["public"]
+                .as_str()
+                .expect("hexadecimal")
+                .to_owned();
+            key["keyval"]["public"] =
+                serde_json::json!(format!("302a300506032b6570032100{public}"));
+            let name = identifier_of(&key);
+            document["signed"]["keys"]
+                .as_object_mut()
+                .expect("keys")
+                .remove(targets);
+            document["signed"]["keys"][&name] = key;
+            document["signed"]["roles"]["targets"]["keyids"] = serde_json::json!([name]);
+        }),
+    }
+}
+
+/// What a host says of a root a release carries, when it refuses it.
+fn said_of_a_carried_root(text: &str) -> String {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join(kr_cli::update::release::CHANNEL_ROOT);
+    std::fs::create_dir_all(path.parent().expect("share")).expect("share");
+    std::fs::write(&path, text).expect("the root");
+    kr_cli::update::release::ChannelRoot::read(directory.path())
+        .err()
+        .expect("a host refuses the root a release carries")
+        .to_string()
+}
+
+/// What a host says of a root it kept, when it refuses it.
+fn said_of_a_kept_root(text: &str) -> String {
+    let signed: tough::schema::Signed<tough::schema::Root> =
+        serde_json::from_str(text).expect("root metadata");
+    kr_cli::update::release::ChannelRoot::kept(signed)
+        .err()
+        .expect("a host refuses the root it kept")
+        .to_string()
+}
+
+/// KR-REQ-26.40: a root that gives a key to two roles is refused as that, and is not said to have
+/// been made by an older tool, since a root made another way can do it too.
+#[cfg(unix)]
+#[test]
+fn a_host_refuses_a_channel_root_that_shares_a_key_and_does_not_say_who_made_it() {
+    let text = roots_refused_for_their_keys().shared;
+    let carried = said_of_a_carried_root(&text);
+    assert!(
+        carried.contains(
+            "gives one key to two roles: a root made by an older `kr-release dev-keys` does, and \
+             a host that holds one is installed again in a new store, from a release made again"
+        ),
+        "{carried}"
+    );
+    let kept = said_of_a_kept_root(&text);
+    assert!(
+        kept.contains(
+            "gives one key to two roles: a root made by an older `kr-release dev-keys` does, so \
+             a host that holds one is installed again in a new store, from a release made again"
+        ),
+        "{kept}"
+    );
+    assert!(
+        !carried.contains("made such a root") && !kept.contains("made such a root"),
+        "{carried} {kept}"
+    );
+}
+
+/// KR-REQ-26.40: a root that names one key twice in a role is refused as that, and is not said to be
+/// unsigned.
+#[cfg(unix)]
+#[test]
+fn a_host_refuses_a_channel_root_that_names_a_key_twice_as_that() {
+    let text = roots_refused_for_their_keys().twice;
+    let carried = said_of_a_carried_root(&text);
+    assert!(
+        carried.contains(
+            "names one key under two identifiers for one role, which counts it twice toward the \
+             role's threshold"
+        ),
+        "{carried}"
+    );
+    let kept = said_of_a_kept_root(&text);
+    assert!(
+        kept.contains("this host kept names one key under two identifiers for one role"),
+        "{kept}"
+    );
+    assert!(
+        !carried.contains("is not signed by") && !kept.contains("is not signed by"),
+        "{carried} {kept}"
+    );
+}
+
+/// KR-REQ-26.40: a root that names a key that is not an Ed25519 key of 32 bytes, here one in its
+/// 44-byte wrapper, is refused as that and is not said to be unsigned.
+#[cfg(unix)]
+#[test]
+fn a_host_refuses_a_channel_root_that_names_a_wrapped_key_as_that() {
+    let text = roots_refused_for_their_keys().wrapped;
+    let carried = said_of_a_carried_root(&text);
+    assert!(
+        carried.contains("names a key that is not an Ed25519 key of 32 bytes"),
+        "{carried}"
+    );
+    let kept = said_of_a_kept_root(&text);
+    assert!(
+        kept.contains("this host kept names a key that is not an Ed25519 key of 32 bytes"),
+        "{kept}"
+    );
+    assert!(
+        !carried.contains("is not signed by") && !kept.contains("is not signed by"),
+        "{carried} {kept}"
+    );
+}
+
 /// KR-REQ-26.09: an archive is refused at its first entry that is not a file or a directory of the
 /// one release under one top directory, and an archive that is only files unpacks.
 #[cfg(unix)]
