@@ -1320,6 +1320,42 @@ async fn every_accepted_change_is_told_once() {
     host.stop().await;
 }
 
+/// KR-REQ-18.01: taking up the host last chosen, as the application does when it starts, is told as
+/// the choice and then as the reach, each once and in order, with the host in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resuming_the_host_in_use_is_told_once_with_its_host() {
+    let (host, phone) = a_host_that_comes_back_and_its_phone().await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let before = companion.told_connection().len();
+    companion_tauri::hosts::resume(companion.app.handle());
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let told = companion.told_connection();
+    let resumed = &told[before..];
+    assert_eq!(
+        resumed.len(),
+        2,
+        "the choice and the reach, each once: {resumed:?}"
+    );
+    assert_eq!(resumed[0]["connected"], false, "{resumed:?}");
+    assert_eq!(resumed[1]["connected"], true, "{resumed:?}");
+    assert_eq!(
+        resumed[1]["revision"].as_u64(),
+        resumed[0]["revision"].as_u64().map(|revision| revision + 1),
+        "in order: {resumed:?}"
+    );
+    for each in resumed {
+        assert_eq!(
+            each["host"]["kind"], "paired",
+            "the host in use: {resumed:?}"
+        );
+        assert_eq!(each["host"]["reference"], resumed[0]["host"]["reference"]);
+    }
+    host.stop().await;
+}
+
 /// KR-REQ-18.01: a connection that ends reads out of contact from the end, and not from the next
 /// attempt that fails after the pause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1396,6 +1432,43 @@ impl Two {
         self.first.stop().await;
         self.second.stop().await;
     }
+}
+
+/// KR-REQ-13.08: the host a session is opened on is the host in use when the answer is given: a
+/// choice that completes while the device's records are being read makes the answer be asked again,
+/// even when no connection is held before or after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paired_context_retries_when_a_choice_completes_during_the_device_read() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    // No host is reached, so the slot stays empty across both choices and the context comes from the
+    // device's records.
+    two.control.unreachable(true);
+    two.uses(&two.references.0);
+    let state = companion.app.state::<companion_tauri::AppState>();
+    assert!(state.session().is_err(), "no connection is held");
+    let mut hold = state.hold_the_device_read();
+    let app = companion.app.handle().clone();
+    let asking = tokio::task::spawn_blocking(move || {
+        app.state::<companion_tauri::AppState>().paired_context()
+    });
+    hold.reached().await;
+    two.uses(&two.references.1);
+    hold.release();
+
+    let context = asking
+        .await
+        .expect("the read ran")
+        .expect("a host is in use");
+    let second = companion
+        .device()
+        .host_by_reference(&two.references.1)
+        .expect("the second host is listed");
+    assert_eq!(
+        context.host.host_device_id, second.host_device_id,
+        "the host in use after the choice, not the one read before it"
+    );
+    two.stop().await;
 }
 
 /// KR-REQ-18.01: a host that refuses the connection at admission is in contact and has refused;
@@ -1521,6 +1594,57 @@ async fn a_choice_made_with_a_stale_pairing_changes_nothing() {
     host.stop().await;
 }
 
+/// KR-REQ-18.01: a choice that is resolved and then waits for the choice gate while the host it names
+/// is forgotten is refused when it gets the gate: no choice, no revision, and the host in use, the
+/// device's own record of it and its connection stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_choice_that_waits_at_the_gate_across_a_forget_is_refused_when_it_gets_it() {
+    use companion_tauri::state::testing::ChoicePoint;
+
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let current = companion
+        .device()
+        .host_by_reference(&the_host(companion))
+        .expect("the pairing is listed");
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let session = state.session().expect("connected");
+
+    // The choice has found the pairing and holds the gate, before it asks the device again.
+    let mut hold = state.hold_the_choice_at(ChoicePoint::BeforeStart);
+    let handle = companion.app.handle().clone();
+    let choosing = tokio::spawn({
+        let current = current.clone();
+        async move { companion_tauri::hosts::use_host(&handle, current).await }
+    });
+    hold.reached().await;
+    companion
+        .device()
+        .forget_host(current.host_device_id)
+        .expect("the host is forgotten");
+    let revision = state.contact_owner().revision();
+    let in_use = companion.device().host_in_use().map(|host| host.device_id);
+    hold.release();
+
+    let refused = choosing.await.expect("the choice ran");
+    assert!(refused.is_err(), "the choice names a pairing that is gone");
+    assert_eq!(state.contact_owner().revision(), revision, "no revision");
+    assert_eq!(
+        companion.device().host_in_use().map(|host| host.device_id),
+        in_use,
+        "the device's own record of the host in use"
+    );
+    assert!(
+        Arc::ptr_eq(&state.session().expect("still connected"), &session),
+        "the connection installed stands"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-18.01: a host that refuses and then answers is told refused and then in contact, as the
 /// next revision, with nothing between.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1583,10 +1707,59 @@ async fn a_slow_emit_does_not_reorder() {
             .state::<companion_tauri::AppState>()
             .contact_owner(),
     );
-    let release = contact.hold_the_publisher();
+    let hold = contact.hold_the_publisher();
     drop(contact.choose(&companion_tauri::contact::Target::Local, "first change"));
     drop(contact.choose(&companion_tauri::contact::Target::Local, "second change"));
-    let _ = release.send(());
+    hold.release();
+    companion.told_everything().await;
+    let revisions: Vec<u64> = told_states(companion).iter().map(|each| each.2).collect();
+    assert!(
+        revisions.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "{revisions:?}"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-18.01: a publication the publisher has taken and not yet told is still in the replay
+/// however many follow it: a page that asks for what it missed is not told to read the whole state
+/// again while a change it has not been told is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_held_before_its_emit_stays_in_the_replay() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = phone_paired_with(&host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let contact = Arc::clone(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .contact_owner(),
+    );
+    let told_through = contact.revision();
+    let mut hold = contact.hold_the_publisher();
+    drop(contact.choose(&companion_tauri::contact::Target::Local, "the held change"));
+    hold.reached().await;
+    for turn in 0..300 {
+        drop(contact.choose(
+            &companion_tauri::contact::Target::Local,
+            &format!("change {turn}"),
+        ));
+    }
+
+    let replay = contact.since(told_through);
+    assert!(
+        !replay.resync,
+        "the held publication is still in the log: the page is not asked to read the whole state"
+    );
+    assert_eq!(
+        replay.states.first().map(|state| state.revision),
+        Some(told_through + 1),
+        "the replay starts at the publication that is held"
+    );
+    assert_eq!(replay.states.len(), 301, "every change since is kept");
+    hold.release();
     companion.told_everything().await;
     let revisions: Vec<u64> = told_states(companion).iter().map(|each| each.2).collect();
     assert!(

@@ -4846,3 +4846,60 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
     drop(route);
     adopted.stop().await;
 }
+
+/// KR-REQ-19.08: a session opened while a choice of host is still letting go of the sessions of the
+/// host before keeps its link. The owner has accepted the choice and told the page, and only then is
+/// the choice's cleanup let through: the opening waits for the choice to finish, and is admitted for
+/// the host chosen, after the cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_session_opened_while_a_choice_is_cleaning_up_survives_the_cleanup() {
+    use companion_tauri::state::testing::ChoicePoint;
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, _control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let reference = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen")["hosts"][0]["reference"]
+        .as_str()
+        .expect("a host")
+        .to_owned();
+    let before = state.contact_owner().revision();
+
+    // The host is chosen again, and the choice is held after the owner accepted it and before it
+    // lets go of the sessions of the host before.
+    let mut hold = state.hold_the_choice_at(ChoicePoint::BeforeCleanup);
+    let choosing = companion.start_call("hosts_use", json!({ "reference": reference }));
+    hold.reached().await;
+    assert!(
+        state.contact_owner().revision() > before,
+        "the owner has accepted the choice, and the page is told it"
+    );
+
+    let mut asking = opening_call(companion, session, None, "after-the-choice");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut asking)
+            .await
+            .is_err(),
+        "the opening waits for the choice to finish"
+    );
+    hold.release();
+    choosing
+        .await
+        .expect("the call ran")
+        .expect("the choice is made");
+    let opened = asking
+        .await
+        .expect("the call ran")
+        .expect("the host opens the session");
+    assert_eq!(opened["state"], "open", "{opened}");
+    assert_eq!(
+        state.paired_links().opened(),
+        1,
+        "the choice's cleanup did not close the link the opening made"
+    );
+    adopted.stop().await;
+}

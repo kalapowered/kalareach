@@ -1618,7 +1618,14 @@ async fn a_local_host_that_refuses_the_hello_reads_refused() {
     let _stand_in = StandIn::bind(&endpoint, tree.environment_id(), Hello::Refused);
     let _keeper = keeping_the_host_at(&host, endpoint);
 
-    let state = state_where(&host, |state| state["contact"]["state"] != "unknown").await;
+    // The wait is for the refusal's words, which a refusal and a host not reached both leave; what
+    // the host's answer reads as is asserted after it.
+    let state = state_where(&host, |state| {
+        state["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("the host refused the connection"))
+    })
+    .await;
     assert!(state["contact"].is_object(), "{state}");
     assert_eq!(state["contact"]["state"], "refused", "{state}");
     assert_eq!(state["contact"]["request"], "connection", "{state}");
@@ -1702,13 +1709,52 @@ async fn a_local_host_reached_and_then_absent_reads_out_of_contact_from_the_end(
     let first = eventually("the host is reached", || state.session().ok()).await;
     let before = now_ms();
     first.close();
-    let lost = state_where(&host, |state| state["contact"]["state"] == "out_of_contact").await;
+    // The wait is for the connection to be told gone; what it reads as is asserted after it.
+    let lost = state_where(&host, |state| state["connected"] == false).await;
+    assert_eq!(lost["contact"]["state"], "out_of_contact", "{lost}");
     let since = lost["contact"]["since_ms"].as_u64().expect("a start");
     assert!(
         since >= before,
         "the loss starts when the connection ended: {lost}"
     );
     assert!(since <= now_ms(), "{lost}");
+}
+
+/// KR-REQ-23.22: reaching the host on this machine is told, as the choice and as the reach, each once
+/// and in order, with the host on this machine as the host in use.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_choice_of_the_host_on_this_machine_is_told_once_with_its_host() {
+    let host = Host::start_unconnected().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let _keeper = keeping_the_host_at(&host, host.endpoint());
+    state_where(&host, |state| state["connected"] == true).await;
+    let replay = serde_json::to_value(state.contact_owner().since(0)).expect("the replay");
+    let told: Vec<(u64, bool, Value)> = replay["states"]
+        .as_array()
+        .expect("states")
+        .iter()
+        .map(|each| {
+            (
+                each["revision"].as_u64().expect("a revision"),
+                each["connected"].as_bool().expect("connected"),
+                each["host"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        told.len(),
+        2,
+        "the choice and the reach, each once: {told:?}"
+    );
+    assert_eq!(
+        (told[0].1, told[1].1),
+        (false, true),
+        "the choice, then the reach: {told:?}"
+    );
+    assert_eq!(told[1].0, told[0].0 + 1, "in order: {told:?}");
+    for (_, _, shown) in &told {
+        assert_eq!(shown["kind"], "local", "the host in use: {told:?}");
+    }
 }
 
 /// KR-REQ-23.22: a host on this machine that was reached stays one that was reached across a choice

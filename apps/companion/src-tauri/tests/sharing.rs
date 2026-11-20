@@ -1698,6 +1698,47 @@ async fn the_words_the_repeats_of_a_confirmation_request_end_with_are_the_last_t
     scene.stop().await;
 }
 
+/// KR-REQ-18.15: a connection that the host refuses at its admission when it is opened again ends
+/// the repeats of the confirmation request with the host's own words, and not with the words of a
+/// host that did not answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_reopen_that_is_refused_shows_the_refusals_words() {
+    let mut scene = Scene::start().await;
+    let (body, giving) = scene.hand_over_body().await;
+    let reopen: Reopen = Arc::new(|| {
+        Box::pin(async {
+            Err(
+                companion_tauri::connection::Unopened::of_refused_connection(
+                    kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::PermissionDenied,
+                        "the host withdrew this device",
+                    ),
+                ),
+            )
+        })
+    });
+    let faults = Arc::new(Faults::default());
+    let inner = local_connection(&scene.host, Some(&faults)).await;
+    scene.issuer.state().connected(inner.reopening(reopen));
+    scene.issuer_faults = faults;
+    scene.issuer_faults.request.store(true, Ordering::SeqCst);
+
+    let unknown = scene
+        .issuer
+        .call("transfer_ask", body)
+        .await
+        .expect_err("nothing is known of the request");
+    let words = unknown["message"].as_str().unwrap_or_default();
+    assert!(
+        words.contains("the connection was not opened")
+            && words.contains("the host withdrew this device")
+            && !words.contains("the host did not answer"),
+        "the refusal's words: {unknown}"
+    );
+    giving.close();
+    scene.stop().await;
+}
+
 #[allow(dead_code, reason = "the types a page's parameters are written from")]
 const _: fn(&GrantId, &InvitationId, &GrantCreateParams) = |_, _, _| {};
 #[allow(dead_code, reason = "the actor a local caller is")]

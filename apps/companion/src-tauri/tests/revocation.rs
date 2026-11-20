@@ -4150,8 +4150,8 @@ async fn the_end_of_a_replaced_session_changes_nothing() {
     assert_eq!(told[after]["connected"], true, "{told:?}");
 }
 
-/// KR-REQ-23.22: the keeper supervises the replacement: when it ends while the next dial is held,
-/// the end is told, from the end.
+/// KR-REQ-23.22: the keeper takes the replacement up and supervises it: no dial is made for it, and
+/// when it ends while the next dial is held, the end is told, from the end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_keeper_supervises_the_replacement() {
     let rig = Rig::start().await;
@@ -4160,6 +4160,15 @@ async fn the_keeper_supervises_the_replacement() {
     tokio::time::timeout(Duration::from_secs(30), first.closed())
         .await
         .expect("the withdrawn session ends");
+    let state = rig.app.app.state::<AppState>();
+    let owner = Arc::clone(state.contact_owner());
+    // The keeper takes the replacement up, or, if it did not, it dials: either is a signal.
+    eventually("the keeper takes the replacement up or dials", || {
+        (!owner.adoption_pending() || dials.made() > 1).then_some(())
+    })
+    .await;
+    assert!(!owner.adoption_pending(), "the replacement is taken up");
+    assert_eq!(dials.made(), 1, "no dial is made for the replacement");
     dials.hold(true);
     rig.app.told_everything().await;
     let before = now_ms();
@@ -4195,24 +4204,50 @@ async fn a_replacement_makes_no_redundant_dial() {
     );
 }
 
-/// KR-REQ-23.22: a dial that fails while a replacement is live writes nothing: the replacement
-/// stays the connection held.
+/// KR-REQ-23.22: a dial that fails beside a connection that was installed meanwhile writes nothing:
+/// the connection installed stays the one held, and the page is not told the host was lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_dial_beside_a_live_replacement_writes_nothing() {
     let rig = Rig::start().await;
+    rig.host_polls().await;
     let dials = Arc::new(Dials::default());
-    let (_keeper, first, second) = a_replaced_connection(&rig, &dials).await;
-    tokio::time::timeout(Duration::from_secs(30), first.closed())
-        .await
-        .expect("the withdrawn session ends");
-    dials.fail(true);
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _keeper = keeper_with(&rig, reopens, None, Some(Arc::clone(&dials))).await;
     let state = rig.app.app.state::<AppState>();
+    let first = state.session().expect("connected");
+    // The dial the keeper makes after this connection ends is held while another connection is
+    // installed beside it, and then fails.
+    dials.hold(true);
+    first.close();
+    eventually("the connection is gone", || {
+        state.session().is_err().then_some(())
+    })
+    .await;
+    let held = held_connection(&rig).await;
+    rig.app.told_everything().await;
+    let told_before = rig.app.told_connection().len();
+    let made = dials.made();
+    dials.fail(true);
+    dials.hold(false);
+    // The keeper dials again after the refused one, which a keeper that kept the refusal as the
+    // state of the connection would not need to.
+    eventually("the keeper dials again after the dial that failed", || {
+        (dials.made() > made + 1).then_some(())
+    })
+    .await;
     assert!(
-        Arc::ptr_eq(&state.session().expect("still connected"), &second),
-        "the replacement is still the connection held"
+        Arc::ptr_eq(&state.session().expect("still connected"), &held.session()),
+        "the connection installed meanwhile is still the one held"
     );
-    assert!(state.connection_state().connected);
+    rig.app.told_everything().await;
+    let told = rig.app.told_connection();
+    assert!(
+        told[told_before..]
+            .iter()
+            .all(|state| state["connected"] == true),
+        "no loss is told after the connection was installed: {:?}",
+        &told[told_before..]
+    );
 }
 
 /// KR-REQ-23.22: a dial that reaches the host beside a connection that was installed meanwhile
@@ -4238,9 +4273,17 @@ async fn a_slot_busy_dial_returns_to_adoption_and_the_keeper_keeps_the_choice() 
     let made = dials.made();
     dials.hold(false);
     // The dial reaches the host, finds the slot taken, and is given back; the keeper dials again.
-    eventually("the keeper dials again beside the connection held", || {
-        (dials.made() > made + 1).then_some(())
-    })
+    // A keeper that took the connection it dialled instead would replace the one held.
+    eventually(
+        "the keeper dials again beside the connection held, or the connection held is gone",
+        || {
+            (dials.made() > made + 1
+                || state
+                    .session()
+                    .is_ok_and(|session| !Arc::ptr_eq(&session, &held.session())))
+            .then_some(())
+        },
+    )
     .await;
     assert!(
         Arc::ptr_eq(&state.session().expect("connected"), &held.session()),
@@ -4249,16 +4292,25 @@ async fn a_slot_busy_dial_returns_to_adoption_and_the_keeper_keeps_the_choice() 
 }
 
 /// KR-REQ-23.22: a replacement that ends before the keeper takes it up reaches a typed end, and the
-/// keeper dials a new connection.
+/// keeper dials a new connection. The keeper is held between the end of the connection it
+/// supervised and the replacement it is given, and the replacement is closed there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replacement_that_ends_before_adoption_reaches_a_typed_end_and_a_new_dial() {
     let rig = Rig::start().await;
     let dials = Arc::new(Dials::default());
+    let owner = Arc::clone(rig.app.app.state::<AppState>().contact_owner());
+    let mut hold = owner.hold_adoption();
     let (_keeper, first, second) = a_replaced_connection(&rig, &dials).await;
-    second.close();
     tokio::time::timeout(Duration::from_secs(30), first.closed())
         .await
         .expect("the withdrawn session ends");
+    hold.reached().await;
+    assert!(owner.adoption_pending(), "the replacement is not taken up");
+    second.close();
+    tokio::time::timeout(Duration::from_secs(30), second.closed())
+        .await
+        .expect("the replacement ends");
+    hold.release();
     let told = told_until(&rig, |told| {
         let ended = told.iter().position(|state| {
             state["connected"] == false && state["contact"]["state"] == "out_of_contact"
@@ -4283,10 +4335,17 @@ async fn a_live_replacement_is_adopted_and_supervised_outside_the_owner() {
     tokio::time::timeout(Duration::from_secs(30), first.closed())
         .await
         .expect("the withdrawn session ends");
-    dials.hold(true);
     let state = rig.app.app.state::<AppState>();
+    let owner = Arc::clone(state.contact_owner());
+    // The keeper takes the replacement up, or, if it did not, it dials: either is a signal.
+    eventually("the keeper takes the replacement up or dials", || {
+        (!owner.adoption_pending() || dials.made() > 1).then_some(())
+    })
+    .await;
+    assert!(!owner.adoption_pending(), "the replacement is taken up");
+    assert_eq!(dials.made(), 1, "no dial is made for the replacement");
+    dials.hold(true);
     assert!(Arc::ptr_eq(&state.session().expect("held"), &second));
-    assert_eq!(dials.made(), 1);
     second.close();
     told_until(&rig, |told| {
         told.last().is_some_and(|last| last["connected"] == false)
@@ -4301,16 +4360,28 @@ async fn a_live_replacement_is_adopted_and_supervised_outside_the_owner() {
 }
 
 /// KR-REQ-23.22: a replacement that has ended when the keeper takes it up is taken up all the
-/// same, and its end is typed by the supervision, not by a test of liveness.
+/// same, and its end is typed by the supervision, not by a test of liveness. The keeper is held
+/// between the end of the connection it supervised and the replacement it is given, and the
+/// replacement has ended there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_already_ended_replacement_is_adopted_and_its_end_is_typed_by_the_closed_arm() {
     let rig = Rig::start().await;
     let dials = Arc::new(Dials::default());
     dials.hold(false);
-    let (_keeper, _first, second) = a_replaced_connection(&rig, &dials).await;
+    let owner = Arc::clone(rig.app.app.state::<AppState>().contact_owner());
+    let mut hold = owner.hold_adoption();
+    let (_keeper, first, second) = a_replaced_connection(&rig, &dials).await;
+    tokio::time::timeout(Duration::from_secs(30), first.closed())
+        .await
+        .expect("the withdrawn session ends");
+    hold.reached().await;
     dials.hold(true);
-    second.close();
     let before = now_ms();
+    second.close();
+    tokio::time::timeout(Duration::from_secs(30), second.closed())
+        .await
+        .expect("the replacement ends");
+    hold.release();
     let told = told_until(&rig, |told| {
         told.last().is_some_and(|last| last["connected"] == false)
     })

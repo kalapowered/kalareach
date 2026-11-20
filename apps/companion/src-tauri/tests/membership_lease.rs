@@ -120,6 +120,7 @@ use support::{
     Awaiting, Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, awaiting_under, govern,
     pair_under, parts,
 };
+use tauri::Manager as _;
 use tokio::sync::{oneshot, watch};
 
 /// The account the device is signed in as, and the token it holds for the organisation's service.
@@ -3309,24 +3310,41 @@ async fn a_refusal_the_session_kept_reads_host_full_in_contact_or_not_admitted_l
     );
 }
 
-/// KR-REQ-17.53: a lease that stops is let go: the connection is closed after the stop is reported.
+/// KR-REQ-17.53: a lease that stops is let go: the connection is closed after the stop is reported,
+/// and before the keeper waits for the connection to end. The keeper is held at that place and the
+/// connection's close count is read there, so a close that does not happen shows as a count that did
+/// not move and not as a wait that ends at its bound.
+///
+/// Of the three ways the keeper reaches that place only the first can be made to happen in a case:
+/// a stop the owner accepts. A stop the owner rejects follows a new choice, and the disposal of that
+/// choice ends the keeper's task before it gets there; a stop of `ConnectionEnded` races with the
+/// end of the same connection in one `select`, and what it closes has already ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_lease_arm_closes_the_session_after_every_stop() {
     let rig = Rig::start().await;
     rig.connection(true).await;
     rig.waits.until_asked(1).await;
     rig.control.hold_own();
+    let owner = Arc::clone(
+        rig.companion()
+            .app
+            .state::<companion_tauri::AppState>()
+            .contact_owner(),
+    );
+    let mut stops = owner.watch_stops();
     let closed = rig.control.closed();
 
     rig.signing.removes(ACCOUNT);
     rig.fixture.pass_wall(Duration::from_millis(5 * MINUTE_MS));
     rig.waits.passes();
+    let stop = tokio::time::timeout(WATCHDOG, stops.recv())
+        .await
+        .expect("the stop reaches the keeper's checkpoint")
+        .expect("a stop");
+    assert!(
+        rig.control.closed() > closed,
+        "the connection is closed once the stop is reported, before the keeper waits for it to end"
+    );
+    stop.release();
     rig.down_because("not a member").await;
-    tokio::time::timeout(WATCHDOG, async {
-        while rig.control.closed() <= closed {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the connection is closed once the stop is reported");
 }
