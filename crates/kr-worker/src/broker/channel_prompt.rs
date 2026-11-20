@@ -8,14 +8,36 @@
 //! text shaped like an answer to an approval, or like a channel's own tag, is not a message.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
+use kr_plugin_sdk::connector::{ConnectorManifest, FieldPath, FieldSegment};
+use kr_plugin_sdk::effect::{ActionDeclaration, ActionImplementation, EffectClass, ParameterKind};
+use kr_plugin_sdk::ids::MethodName;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::ids::{ActorId, DeviceId, GrantId};
 use sha2::{Digest as _, Sha256};
 use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization as _;
 
+use crate::broker::connectors::InstalledConnector;
+use crate::broker::error::BrokerError;
 use crate::broker::methods::Caller;
+
+/// The notification a Channels application reads a message in, as it is spelled on the wire.
+pub const CHANNEL_EVENT_WIRE_NAME: &str = "notifications/claude/channel";
+
+/// What a sender is told when no sender can be named from the facts the host verified.
+pub const NO_SENDER: &str = "This message was not sent. On this channel, only this computer's own \
+     account or a paired device can send a message.";
+
+/// What a sender is told when the text looks like an answer to an approval.
+pub const LOOKS_LIKE_AN_ANSWER: &str = "This looks like an answer to an approval, so it was not \
+     sent. To answer an approval, use Allow or Deny on the request. To send this as a message, \
+     change its words.";
+
+/// What a sender is told when the text holds the opening or the closing of a channel's tag.
+pub const TAG_SHAPED: &str = "This message contains text shaped like a channel tag, such as \
+     <channel> or </channel>. It was not sent. Change that text.";
 
 /// The kind of sender the host verified, as the application is told it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +113,179 @@ impl PromptSender {
         }
         id
     }
+}
+
+/// Where a channel's table writes a message, as the package declares it: the one action that
+/// delivers a prompt, the place its text goes, the place the host's own members go, and how long
+/// a text may be.
+///
+/// A channel carries messages only when the shape is whole. The table is asked to write the event
+/// once with empty values and the result must be exactly the frame the forwarder accepts: the
+/// method at `method`, the text at `params.content` and the sender's members at `params.meta`,
+/// and nothing else. A package that declares any other shape has no shape here, so no queue
+/// capability is recorded for its channel and every message on it is refused.
+#[derive(Clone, Debug)]
+pub struct ChannelEventShape {
+    table: Arc<ConnectorManifest>,
+    method: MethodName,
+    content: FieldPath,
+    meta: FieldPath,
+    max_characters: usize,
+}
+
+impl ChannelEventShape {
+    /// The shape an installed connector declares, when it declares a whole one.
+    #[must_use]
+    pub fn of(connector: &InstalledConnector) -> Option<Self> {
+        Self::derive(&connector.manifest().actions, connector.table())
+    }
+
+    /// The shape a package's actions and connector table declare together, when they declare a
+    /// whole one.
+    ///
+    /// Exactly one action delivers a prompt through an upstream method, with exactly one binding,
+    /// of a required text parameter that declares its maximum length, and the table writes the
+    /// event of that method as the forwarder reads it.
+    #[must_use]
+    pub fn derive(actions: &[ActionDeclaration], table: &ConnectorManifest) -> Option<Self> {
+        let mut prompts = actions
+            .iter()
+            .filter(|action| action.effect == EffectClass::UpstreamPrompt);
+        let action = prompts.next()?;
+        if prompts.next().is_some() {
+            return None;
+        }
+        let ActionImplementation::UpstreamMethod { method, bindings } = &action.implementation
+        else {
+            return None;
+        };
+        let [binding] = bindings.as_slice() else {
+            return None;
+        };
+        let parameter = action
+            .parameters
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == binding.parameter)?;
+        let ParameterKind::Text { max_length, .. } = &parameter.kind else {
+            return None;
+        };
+        if !parameter.required {
+            return None;
+        }
+        let content = binding.field.clone();
+        let meta = path(&["params", "meta"]);
+        let empty = table
+            .event(
+                method,
+                &[
+                    (&content, serde_json::Value::String(String::new())),
+                    (&meta, serde_json::json!({})),
+                ],
+            )
+            .ok()?;
+        let permitted = serde_json::json!({
+            "method": CHANNEL_EVENT_WIRE_NAME,
+            "params": { "content": "", "meta": {} },
+        });
+        if empty != permitted {
+            return None;
+        }
+        Some(Self {
+            table: Arc::new(table.clone()),
+            method: method.clone(),
+            content,
+            meta,
+            max_characters: usize::try_from(max_length.get()).ok()?,
+        })
+    }
+
+    /// How many characters a message may hold, as the package declares it.
+    #[must_use]
+    pub const fn max_characters(&self) -> usize {
+        self.max_characters
+    }
+
+    /// Checks a message's text before anything is written: within the declared length, and neither
+    /// shaped like an answer to an approval nor like a channel's own tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] saying why the text is not a message.
+    pub fn check_text(&self, text: &str) -> Result<(), BrokerError> {
+        if text.chars().count() > self.max_characters {
+            return Err(BrokerError::invalid(format!(
+                "This channel accepts messages of up to {} characters. This message was not sent.",
+                with_thousands(self.max_characters)
+            )));
+        }
+        if is_approval_shaped(text) {
+            return Err(BrokerError::invalid(LOOKS_LIKE_AN_ANSWER));
+        }
+        if is_tag_shaped(text) {
+            return Err(BrokerError::invalid(TAG_SHAPED));
+        }
+        Ok(())
+    }
+
+    /// The frame the application reads one message in: the text as the sender typed it, and the
+    /// sender's kind and identifier as the host verified them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when no sender can be named from the facts the
+    /// host verified, and [`BrokerError::InvalidArgument`] when the table cannot write the event.
+    pub fn frame(&self, text: &str, sender: &PromptSender) -> Result<Vec<u8>, BrokerError> {
+        let kind = sender
+            .kind()
+            .ok_or_else(|| BrokerError::denied(NO_SENDER))?;
+        let meta = serde_json::json!({
+            "sender": kind.as_str(),
+            "sender_id": sender.sender_id(),
+        });
+        let event = self
+            .table
+            .event(
+                &self.method,
+                &[
+                    (&self.content, serde_json::Value::String(text.to_owned())),
+                    (&self.meta, meta),
+                ],
+            )
+            .map_err(|error| {
+                BrokerError::invalid(format!(
+                    "the channel's table cannot write this message: {error}"
+                ))
+            })?;
+        serde_json::to_vec(&event).map_err(|error| {
+            BrokerError::invalid(format!("the message cannot be encoded: {error}"))
+        })
+    }
+}
+
+/// A path of member names from the root of a message.
+fn path(names: &[&str]) -> FieldPath {
+    FieldPath {
+        segments: names
+            .iter()
+            .map(|name| FieldSegment::Member {
+                name: (*name).to_owned(),
+            })
+            .collect(),
+    }
+}
+
+/// A count written with a comma between its thousands, as a person reads it.
+fn with_thousands(count: usize) -> String {
+    let digits = count.to_string();
+    let mut written = String::with_capacity(digits.len() + digits.len() / 3);
+    for (at, digit) in digits.chars().enumerate() {
+        if at > 0 && (digits.len() - at) % 3 == 0 {
+            written.push(',');
+        }
+        written.push(digit);
+    }
+    written
 }
 
 /// The words that answer an approval on a channel, in any case.

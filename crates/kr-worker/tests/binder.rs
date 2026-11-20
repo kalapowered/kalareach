@@ -636,6 +636,7 @@ fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and
             &bridge,
             &connector,
             connector.qualified_version(&unnamed),
+            None,
         )
         .expect_err("no channel for a build no record names");
     assert!(
@@ -652,6 +653,7 @@ fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and
             &bridge,
             &connector,
             connector.qualified_version(&named),
+            None,
         )
         .expect("the channel opens for the build a signed record names");
 }
@@ -1699,6 +1701,7 @@ fn relay_approval(
             },
             connector,
             Some(fixture::QUALIFIED_VERSION),
+            None,
         )
         .expect("the application's own channel is opened");
     let frame = serde_json::json!({

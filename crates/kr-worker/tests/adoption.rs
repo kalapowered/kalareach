@@ -340,6 +340,7 @@ fn kr_req_12_07_a_program_the_integration_did_not_launch_is_adopted_without_a_la
             },
             &connector,
             Some(fixture::QUALIFIED_VERSION),
+            None,
         )
         .expect_err("an adopted program's process admits no bridge");
     assert!(

@@ -212,6 +212,9 @@ pub struct ChannelConnection {
     /// The decisions a request this channel relays is offered when the table gives it meaning,
     /// in the table's order and labelled as the package's answer action labels them.
     pub offered: Vec<kr_protocol::broker::OfferedDecision>,
+    /// Whether the package declares a whole shape for a message into the session, so the channel
+    /// can carry one.
+    pub carries_messages: bool,
 }
 
 /// One reverse request the upstream asked this host to perform.

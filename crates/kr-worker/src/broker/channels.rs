@@ -44,6 +44,7 @@ use kr_protocol::scalars::{Nullable, TimestampMs};
 use crate::broker::bridge::{
     AdmittedBridge, BRIDGE_FRAME_DEADLINE, BridgeProcess, BridgeReader, BridgeSurface, BridgeWriter,
 };
+use crate::broker::channel_prompt::ChannelEventShape;
 use crate::broker::connectors::{DECISION_SCHEMA, InstalledConnector};
 use crate::broker::duplex::{Counted, detached};
 use crate::broker::error::{BrokerError, Result};
@@ -143,11 +144,15 @@ pub async fn serve(
         ));
     }
     let broker = Arc::clone(&launch.broker);
+    // Derived once, before the channel opens: a package whose declaration is not a whole shape
+    // carries no message, and nothing is recorded that says it does.
+    let shape = ChannelEventShape::of(&launch.connector);
     let connection = match broker.open_bridge_channel(
         launch.application_instance_id,
         &process,
         &launch.connector,
         launch.version.as_deref(),
+        shape.as_ref(),
     ) {
         Ok(connection) => connection,
         Err(refusal) => {
@@ -472,12 +477,16 @@ impl Broker {
     /// [`BrokerError::PermissionDenied`] for an instance this host did not launch, a channel
     /// another process started, or a second channel; and
     /// [`BrokerError::UnsupportedCapability`] for a version the table is not qualified for.
+    ///
+    /// `shape` is the shape of a message the connector's package declares, when it declares a
+    /// whole one: the channel carries messages only then.
     pub fn open_bridge_channel(
         &self,
         application_instance_id: ApplicationInstanceId,
         bridge: &BridgeProcess,
         connector: &InstalledConnector,
         version: Option<&str>,
+        shape: Option<&ChannelEventShape>,
     ) -> Result<GatewayConnectionId> {
         let mut state = self.state();
         let instance = state
@@ -536,6 +545,7 @@ impl Broker {
             version: version.to_owned(),
             table: Arc::new(table.clone()),
             offered: connector.offered_decisions(),
+            carries_messages: shape.is_some(),
         });
         Ok(connection)
     }
