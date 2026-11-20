@@ -4392,7 +4392,8 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
 ///
 /// On Windows the temporary file carries a list of its own and the list is checked before any
 /// content is written, with the three differences from a file that took the list of its
-/// directory that [`write_owner_only_file`] names.
+/// directory that [`write_owner_only_file`] names. A refusal removes the empty file it made,
+/// through its own handle; if the removal fails, the refusal says so and the empty file stays.
 ///
 /// # Errors
 ///
