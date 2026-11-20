@@ -306,6 +306,141 @@ fn a_terminal_profile_installs_beside_a_startup_entry_and_each_comes_out_alone()
     );
 }
 
+/// What a `kr` that may have failed printed.
+fn printed(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// KR-REQ-26.42: an ordinary user with no account and no managed service installs the shell
+/// integration and takes it out again. The host has no configuration document, so it selects no
+/// managed service, and no daemon, so no account is held; neither command asks for one. The install
+/// puts its marked entry in the startup file and the removal takes it out and leaves the person's
+/// own lines as they were, and no document or runtime state of a host appears.
+#[test]
+fn kr_req_26_42_shell_integration_is_installed_and_removed_with_no_account_and_no_managed_service()
+{
+    let setup = Setup::new(OsStr::new("home"));
+    let zshrc = setup.home.join(".zshrc");
+    std::fs::write(&zshrc, THEIRS).expect("the person's own startup file");
+    let nothing_of_a_host = |when: &str| {
+        let state = everything_under(&setup.state);
+        assert!(
+            state
+                .keys()
+                .all(|path| path.file_name() != Some(OsStr::new("config.json"))),
+            "{when}: the host names no managed service: {:?}",
+            state.keys().collect::<Vec<_>>()
+        );
+        let runtime = everything_under(&setup.runtime);
+        assert!(
+            runtime.is_empty(),
+            "{when}: no daemon was started: {:?}",
+            runtime.keys().collect::<Vec<_>>()
+        );
+    };
+    nothing_of_a_host("on a first run");
+
+    let installed = setup
+        .command(&["shell", "install", "--shell", "zsh"], None)
+        .output()
+        .expect("kr runs");
+    assert!(
+        installed.status.success(),
+        "kr shell install with no account: {}",
+        printed(&installed)
+    );
+    assert!(holds_an_entry(&zshrc), "the entry is in the startup file");
+    nothing_of_a_host("after the install");
+
+    let removed = setup
+        .command(&["shell", "remove", "--shell", "zsh"], None)
+        .output()
+        .expect("kr runs");
+    assert!(
+        removed.status.success(),
+        "kr shell remove with no account: {}",
+        printed(&removed)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&zshrc).expect("the startup file"),
+        THEIRS,
+        "the entry came out and the person's own lines are as they were"
+    );
+    nothing_of_a_host("after the removal");
+}
+
+/// KR-REQ-26.42: an ordinary user with no account and no managed service creates a terminal
+/// profile for a terminal application they use and removes it again. Neither command asks for an
+/// account: the profile is written where the application reads it, it comes out alone, the home is
+/// as it was before, and no document or runtime state of a host appears.
+#[test]
+fn kr_req_26_42_a_terminal_profile_is_made_and_removed_with_no_account_and_no_managed_service() {
+    let setup = Setup::new(OsStr::new("home"));
+    let (application, file) = if cfg!(target_os = "macos") {
+        // The application is in the person's own folder of applications, which the home holds.
+        std::fs::create_dir_all(setup.home.join("Applications/iTerm.app")).expect("an application");
+        (
+            "iterm2",
+            "Library/Application Support/iTerm2/DynamicProfiles/KalaReach.json",
+        )
+    } else {
+        ("konsole", ".local/share/konsole/KalaReach.profile")
+    };
+    let original = everything_under(&setup.home);
+    let nothing_of_a_host = |when: &str| {
+        let state = everything_under(&setup.state);
+        assert!(
+            state
+                .keys()
+                .all(|path| path.file_name() != Some(OsStr::new("config.json"))),
+            "{when}: the host names no managed service: {:?}",
+            state.keys().collect::<Vec<_>>()
+        );
+        let runtime = everything_under(&setup.runtime);
+        assert!(
+            runtime.is_empty(),
+            "{when}: no daemon was started: {:?}",
+            runtime.keys().collect::<Vec<_>>()
+        );
+    };
+    nothing_of_a_host("on a first run");
+
+    let made = setup
+        .command(&["host", "terminal-profile", "install", application], None)
+        .output()
+        .expect("kr runs");
+    assert!(
+        made.status.success(),
+        "kr host terminal-profile install with no account: {}",
+        printed(&made)
+    );
+    assert!(
+        setup.home.join(file).is_file(),
+        "the profile is where the application reads it"
+    );
+    nothing_of_a_host("after the install");
+
+    let removed = setup
+        .command(&["host", "terminal-profile", "remove", application], None)
+        .output()
+        .expect("kr runs");
+    assert!(
+        removed.status.success(),
+        "kr host terminal-profile remove with no account: {}",
+        printed(&removed)
+    );
+    assert_eq!(
+        everything_under(&setup.home),
+        original,
+        "the profile came out and the home is as it was"
+    );
+    nothing_of_a_host("after the removal");
+}
+
 /// Every file and directory under `root`, by its path from it; a file with its bytes.
 fn everything_under(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
     fn walk(
