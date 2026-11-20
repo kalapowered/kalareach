@@ -5019,7 +5019,7 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
     use kr_protocol::scalars::{TimestampMs, Uuid};
     use kr_protocol::transfer::DraftState;
 
-    let updated = Updated::new().await;
+    let mut updated = Updated::new().await;
     let host = &updated.host;
     host.close(&updated.kr_now(), &updated.display);
     host.worker_ended(&updated.worker).await;
@@ -5117,8 +5117,9 @@ async fn a_rollback_keeps_a_draft_written_for_an_application_and_its_binding_rev
 
     // The release before's daemon runs on the journal, and a draft changes as its `draft.update`
     // changes it: text, revision and time.
-    let controller = host.store.stable(Program::Controller);
-    host.start_daemon(&controller).await;
+    let controller = updated.host.store.stable(Program::Controller);
+    updated.host.start_daemon(&controller).await;
+    let host = &updated.host;
     assert_eq!(
         host.daemon_build().await,
         format!("kr-controller/{}", updated.one.name()),
