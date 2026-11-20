@@ -188,8 +188,6 @@ Acquire::Languages "none";
 LINES
 "#;
 
-/// A program that stands for what `--names-from` runs: it prints the number of updates made so far
-/// in the name it gives, so that a name shows which indexes it was asked against.
 /// `sha256sum` where the host has none: `shasum` prints the same.
 const SHA256SUM: &str = r#"#!/bin/bash
 exec shasum -a 256 "$@"
@@ -203,6 +201,8 @@ cat "$RIG/pnpm.out"
 exit "$(cat "$RIG/pnpm.status")"
 "#;
 
+/// A program that stands for what `--names-from` runs: it prints the number of updates made so far
+/// in the name it gives, so that a name shows which indexes it was asked against.
 const NAMES: &str = r#"#!/bin/bash
 echo "plain-library"
 echo "library-after-$(cat "$RIG/count.update" 2>/dev/null || echo 0)-updates"
@@ -830,9 +830,11 @@ fn a_name_program_is_asked_after_the_update_and_its_names_are_installed() {
     );
     assert!(summary(&outcome).starts_with("apt-install: packages=3 "));
 
-    // After a failed first attempt the program is asked again, after the second attempt's update.
+    // The first update and the program succeed and the download fails: the second attempt asks the
+    // program again, after its own update, and its plan, download and install use that list and
+    // not the first.
     let rig = Rig::new();
-    rig.plan("update", &["fail", "ok"]);
+    rig.plan("download", &["fail", "ok"]);
     let outcome = rig.run(&[
         "--deadline",
         "600",
@@ -841,8 +843,22 @@ fn a_name_program_is_asked_after_the_update_and_its_names_are_installed() {
         "tmux",
     ]);
     assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
-    let install = &rig.calls("install")[0];
-    assert!(install.contains("library-after-2-updates"), "{install}");
+    assert_eq!(
+        rig.phases(),
+        [
+            "update", "simulate", "download", "update", "simulate", "download", "install"
+        ]
+    );
+    let first = "library-after-1-updates";
+    let second = "library-after-2-updates";
+    let simulate = rig.calls("simulate");
+    let download = rig.calls("download");
+    let install = rig.calls("install");
+    assert!(simulate[0].contains(first), "{}", simulate[0]);
+    assert!(download[0].contains(first), "{}", download[0]);
+    for call in [&simulate[1], &download[1], &install[0]] {
+        assert!(call.contains(second) && !call.contains(first), "{call}");
+    }
 }
 
 /// A name program that fails ends the script, with nothing downloaded or installed.
@@ -905,6 +921,29 @@ fn a_plan_that_fails_after_a_clean_update_ends_the_script_and_after_a_warning_is
     );
     assert_eq!(rig.phases(), ["update", "simulate"]);
     assert!(rig.waits().is_empty());
+
+    // Every update prints a warning, so the indexes may be the cause of the failed plan: the
+    // attempt is tried again, with three updates of its own, and its plan goes through.
+    let rig = Rig::new();
+    rig.plan("update", &["warn:1"]);
+    rig.plan(
+        "simulate",
+        &["e:Unable to locate package nosuchpackage", "ok"],
+    );
+    let outcome = rig.run(&["--deadline", "600", "tmux"]);
+    assert_eq!(outcome.status, 0, "{}{}", outcome.stdout, outcome.stderr);
+    assert_eq!(
+        rig.phases(),
+        [
+            "update", "update", "update", "simulate", "update", "update", "update", "simulate",
+            "download", "install"
+        ]
+    );
+    assert!(
+        summary(&outcome).starts_with("apt-install: packages=1 attempts=2 warnings=6 "),
+        "{}",
+        summary(&outcome)
+    );
 }
 
 /// A command line the script cannot read is refused with status 2 before it calls anything.
