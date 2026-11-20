@@ -2139,44 +2139,73 @@ mod tests {
         }
     }
 
-    /// A closer whose close waits on a gate and counts its calls.
-    fn held_closer() -> (
-        EndpointCloser,
-        std::sync::Arc<tokio::sync::Notify>,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
+    /// A closer whose close waits on a gate, with the events of that close.
+    struct HeldClose {
+        closer: EndpointCloser,
+        gate: std::sync::Arc<tokio::sync::Notify>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Resolves when the close has started.
+        entered: tokio::sync::oneshot::Receiver<()>,
+        /// Resolves with `Ok` when the close returns, and with an error when the close's future is
+        /// dropped before it returns.
+        completed: tokio::sync::oneshot::Receiver<()>,
+    }
+
+    fn held_closer() -> HeldClose {
         let gate = std::sync::Arc::new(tokio::sync::Notify::new());
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (held, counted) = (std::sync::Arc::clone(&gate), std::sync::Arc::clone(&calls));
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (returned, completed) = tokio::sync::oneshot::channel();
         let closer = EndpointCloser::for_test(Box::new(move || {
             Box::pin(async move {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = started.send(());
                 held.notified().await;
+                let _ = returned.send(());
             })
         }));
-        (closer, gate, calls)
+        HeldClose {
+            closer,
+            gate,
+            calls,
+            entered,
+            completed,
+        }
     }
 
     /// KR-REQ-10.02: two callers of the close wait for the same end: the close runs once, and while
     /// it is held neither caller has returned and `closed()` reads false.
     #[tokio::test]
     async fn two_callers_of_the_close_wait_for_the_same_end() {
-        let (closer, gate, calls) = held_closer();
-        let first = tokio::spawn({
-            let closer = closer.clone();
-            async move { closer.close().await }
-        });
-        let second = tokio::spawn({
-            let closer = closer.clone();
-            async move { closer.close().await }
-        });
-        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!closer.closed() && !first.is_finished() && !second.is_finished());
+        let HeldClose {
+            closer,
+            gate,
+            calls,
+            entered,
+            ..
+        } = held_closer();
+        let mut first = std::pin::pin!(closer.close());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        entered.await.expect("the held close starts");
+        let mut second = std::pin::pin!(closer.close());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        // A task spawned now runs after every task the second call spawned, since the runtime runs
+        // its tasks in the order they were spawned; so when it has returned, the second call's end,
+        // if it started one, has been published.
+        tokio::spawn(async {}).await.expect("the marker task");
+        assert!(
+            !closer.closed(),
+            "no caller publishes an end while the held close is under way"
+        );
+        assert!(
+            futures::poll!(first.as_mut()).is_pending()
+                && futures::poll!(second.as_mut()).is_pending(),
+            "neither caller has returned while the close is held"
+        );
         gate.notify_one();
-        first.await.expect("the first caller");
-        second.await.expect("the second caller");
+        first.await;
+        second.await;
         assert!(closer.closed());
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -2195,7 +2224,13 @@ mod tests {
     /// finish, and the end is published only once the close returns.
     #[tokio::test]
     async fn a_guard_cancelled_during_the_drain_leaves_the_close_to_finish() {
-        let (closer, gate, calls) = held_closer();
+        let HeldClose {
+            closer,
+            gate,
+            entered,
+            completed,
+            ..
+        } = held_closer();
         let login = crate::proxy::ProxyCredential::new(
             kr_crypto::secret::SecretVec::new(b"user".to_vec()),
             kr_crypto::secret::SecretVec::new(b"password".to_vec()),
@@ -2203,26 +2238,17 @@ mod tests {
         .expect("a login");
         let guard = guard_proxy(&closer, &login);
         login.refuse(crate::proxy::StopKind::Refused);
-        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
-        }
+        entered.await.expect("the verdict starts the close");
         drop(guard);
         tokio::task::yield_now().await;
         assert!(!closer.closed(), "the guard's end does not end the drain");
         gate.notify_one();
-        // The owner finishes on its own task, in the few turns the scheduler gives it once the
-        // gate is open; the count bounds the turns, not a span of time.
-        for _ in 0..1000 {
-            if closer.closed() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            closer.closed(),
-            "the close finishes although its guard is gone"
-        );
+        // The close's future sends when the close returns, and its sender is gone when the future
+        // is dropped first: the receiver answers either way, with no wait of a set length.
+        let finished = completed.await.is_ok();
+        assert!(finished, "the close finishes although its guard is gone");
         closer.close().await;
+        assert!(closer.closed());
     }
 
     /// KR-REQ-10.02: a guard that is built after the verdict has started the close before it
@@ -2230,7 +2256,12 @@ mod tests {
     /// guard is in the caller's hands, and it completes by itself.
     #[tokio::test]
     async fn a_guard_built_after_the_verdict_starts_the_close_before_it_returns() {
-        let (closer, gate, calls) = held_closer();
+        let HeldClose {
+            closer,
+            gate,
+            calls,
+            ..
+        } = held_closer();
         gate.notify_one();
         let login = crate::proxy::ProxyCredential::new(
             kr_crypto::secret::SecretVec::new(b"user".to_vec()),
