@@ -1548,17 +1548,6 @@ fn grant_authenticated_users(path: &Path) {
     );
 }
 
-/// Asserts that the file at `path` carries the list the owner-only writers set: protected, and
-/// naming this user and the file's owner and no one else.
-#[cfg(windows)]
-fn assert_owner_only(path: &Path, what: &str) {
-    let access = kr_ipc::paths::FileAccess::of(path).expect("reads who can reach the file");
-    assert!(
-        access.is_the_owner_only_list().expect("this user's token"),
-        "{what} names only its owner and this user: {access:?}"
-    );
-}
-
 /// KR-REQ-20.18: a kit saved as text and as a QR code into a folder that grants another account
 /// is given a list of its own that names only the owner and this user, as a mode of 0600 does on
 /// Unix. The folder is given Authenticated Users here, because a folder under some profiles passes
@@ -1573,7 +1562,11 @@ async fn a_kit_saved_where_its_folder_grants_another_account_is_owner_only() {
     grant_authenticated_users(out.path());
 
     let (path, _) = page.kit(out.path());
-    assert_owner_only(&path, "the kit as text");
+    let access = kr_ipc::paths::FileAccess::of(&path).expect("reads who can reach the file");
+    assert!(
+        access.is_the_owner_only_list().expect("this user's token"),
+        "the kit as text names only its owner and this user: {access:?}"
+    );
 
     let drawn = out.path().join("kit.svg");
     page.dialog_returns(&drawn);
@@ -1582,7 +1575,11 @@ async fn a_kit_saved_where_its_folder_grants_another_account_is_owner_only() {
         json!({ "path": drawn.to_string_lossy() }),
     )
     .expect("the QR code is saved");
-    assert_owner_only(&drawn, "the kit as a QR code");
+    let access = kr_ipc::paths::FileAccess::of(&drawn).expect("reads who can reach the file");
+    assert!(
+        access.is_the_owner_only_list().expect("this user's token"),
+        "the kit as a QR code names only its owner and this user: {access:?}"
+    );
 }
 
 /// KR-REQ-20.18: a kit saved over a file that already exists, whose list grants another account,
@@ -1606,7 +1603,11 @@ async fn a_kit_saved_over_a_file_that_grants_another_account_is_narrowed_and_rep
 
     let (_, kit) = page.kit(out.path());
 
-    assert_owner_only(&path, "the file the kit replaced");
+    let after = kr_ipc::paths::FileAccess::of(&path).expect("reads who can reach the file");
+    assert!(
+        after.is_the_owner_only_list().expect("this user's token"),
+        "the file the kit replaced names only its owner and this user: {after:?}"
+    );
     let text = std::fs::read_to_string(&path).expect("the kit file");
     assert!(
         !text.contains("what was there before"),

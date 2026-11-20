@@ -3011,17 +3011,28 @@ mod windows {
             );
         }
 
-        /// A check that refuses a file that already stood at the name leaves its bytes as they were:
-        /// the check runs on the file with its content still in it, before the caller empties it.
-        fn refused_existing_file(act: fn(&Path), seen: Option<Seen>, words: &str) {
+        /// What a refused opening of an existing file left, for the case that made it to assert on.
+        struct RefusedExisting {
+            /// The result of the opening, with its handle already dropped.
+            result: std::io::Result<()>,
+            /// The length of the file when the check of its list began, once for each check.
+            lengths: Vec<u64>,
+            /// The bytes of the file after the opening.
+            bytes: Vec<u8>,
+            /// The names in the folder after the opening.
+            names: Vec<String>,
+        }
+
+        /// Opens an existing file whose list grants Authenticated Users in place, with the check of
+        /// its list made to see what `seen` says after `act` has acted on the file, and returns what
+        /// the opening left. The check runs on the file with its content still in it, before the
+        /// caller empties it.
+        fn open_existing_file_with_a_check_that_sees(
+            act: fn(&Path),
+            seen: Option<Seen>,
+        ) -> RefusedExisting {
             let folder = Folder::new("refused-existing");
-            let path = folder.0.join("kit");
-            create_file_with_descriptor(
-                &path,
-                &format!("D:P(A;;GA;;;OW)(A;;GA;;;{})(A;;GR;;;AU)", user_text()),
-            )
-            .expect("a file that grants Authenticated Users");
-            std::fs::write(&path, b"what was there").expect("content");
+            let path = wide_file(&folder);
 
             let lengths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let recorded = std::rc::Rc::clone(&lengths);
@@ -3032,42 +3043,60 @@ mod windows {
                 act(path);
                 seen
             });
-            let error = crate::paths::open_owner_only_in_place(&path)
-                .expect_err("the list does not read back, so the file is not opened");
-
-            assert!(error.to_string().contains(words), "{error}");
-            assert_eq!(
-                *lengths.borrow(),
-                vec![14],
-                "the check ran on the file with its content in it"
-            );
-            assert_eq!(
-                std::fs::read(&path).expect("reads"),
-                b"what was there",
-                "the file keeps its bytes"
-            );
-            assert_eq!(folder.names(), vec!["kit".to_owned()]);
+            let result = crate::paths::open_owner_only_in_place(&path).map(drop);
+            RefusedExisting {
+                result,
+                lengths: lengths.borrow().clone(),
+                bytes: std::fs::read(&path).expect("reads"),
+                names: folder.names(),
+            }
         }
 
         /// A list that reads back other than as set refuses an existing file and leaves its bytes.
         #[test]
         fn a_list_that_reads_back_other_than_set_refuses_an_existing_file_and_keeps_its_bytes() {
-            refused_existing_file(
-                widen_the_list,
-                None,
-                "the access list of the file reads back other than as set, so it cannot be made \
-                 readable by its owner alone",
+            let refused = open_existing_file_with_a_check_that_sees(widen_the_list, None);
+
+            let error = refused
+                .result
+                .expect_err("the list does not read back, so the file is not opened");
+            assert!(
+                error.to_string().contains(
+                    "the access list of the file reads back other than as set, so it cannot be \
+                     made readable by its owner alone"
+                ),
+                "{error}"
             );
+            assert_eq!(
+                refused.lengths,
+                vec![14],
+                "the check ran on the file with its content in it"
+            );
+            assert_eq!(refused.bytes, b"what was there", "the file keeps its bytes");
+            assert_eq!(refused.names, vec!["kit".to_owned()]);
         }
 
         /// A list that cannot be read back refuses an existing file and leaves its bytes.
         #[test]
         fn a_list_that_cannot_be_read_back_refuses_an_existing_file_and_keeps_its_bytes() {
-            refused_existing_file(
-                |_| {},
-                Some(Seen::Unreadable),
-                "the access list of the file could not be read back: a seam made the read fail",
+            let refused = open_existing_file_with_a_check_that_sees(|_| {}, Some(Seen::Unreadable));
+
+            let error = refused
+                .result
+                .expect_err("the list cannot be read back, so the file is not opened");
+            assert!(
+                error.to_string().contains(
+                    "the access list of the file could not be read back: a seam made the read fail"
+                ),
+                "{error}"
             );
+            assert_eq!(
+                refused.lengths,
+                vec![14],
+                "the check ran on the file with its content in it"
+            );
+            assert_eq!(refused.bytes, b"what was there", "the file keeps its bytes");
+            assert_eq!(refused.names, vec!["kit".to_owned()]);
         }
 
         /// This process's user, as SDDL writes an account.
@@ -3096,8 +3125,9 @@ mod windows {
                 "the file starts wider than the owner-only list: {before:?}"
             );
 
-            let mut file =
-                crate::paths::open_owner_only_in_place(&path).expect("opens and narrows the file");
+            let opened = crate::paths::open_owner_only_in_place(&path);
+            assert!(opened.is_ok(), "opens and narrows the file: {opened:?}");
+            let mut file = opened.expect("opens and narrows the file");
 
             let after = FileAccess::of(&path).expect("reads who can reach the file");
             assert!(
