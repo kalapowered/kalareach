@@ -330,12 +330,6 @@ impl Broker {
         self.notices_ready.notify_one();
     }
 
-    /// Returns the frame of the admissions this worker holds, where it holds any.
-    #[must_use]
-    pub fn admissions_frame(&self) -> Option<FrameId> {
-        self.state().admitted.frame
-    }
-
     /// Returns true while the admissions held admit any package: what an adoption could bind.
     #[must_use]
     pub fn admits_any(&self) -> bool {

@@ -198,19 +198,6 @@ impl Admissions {
         Some((package, read))
     }
 
-    /// Returns every admitted package this worker read, with what it read.
-    #[must_use]
-    pub fn all_admitted(&self) -> Vec<(AdmittedPackage, ReadPackage)> {
-        let held = self.held();
-        held.packages
-            .iter()
-            .filter_map(|package| {
-                let read = held.read.get(&package.package_digest)?.as_ref().ok()?;
-                Some((package.clone(), read.clone()))
-            })
-            .collect()
-    }
-
     /// Returns the state the held snapshot gives each release.
     #[must_use]
     pub fn releases(&self) -> Vec<ReleaseState> {

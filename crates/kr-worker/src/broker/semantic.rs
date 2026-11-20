@@ -432,12 +432,6 @@ impl SemanticLog {
         Ok(cursor)
     }
 
-    /// Returns the earliest cursor this log still holds.
-    #[must_use]
-    pub const fn first_retained(&self) -> StreamCursor {
-        self.first_retained
-    }
-
     /// Returns the cursor the next entry will take.
     #[must_use]
     pub const fn next_cursor(&self) -> StreamCursor {
@@ -790,7 +784,7 @@ mod tests {
         for index in 1..=(MAX_RETAINED_ENTRIES as u64 + 10) {
             said(&mut log, format!("entry {index}"), index);
         }
-        assert!(log.first_retained().get() > 1);
+        assert!(log.first_retained.get() > 1);
 
         // The adapter checkpointed before the eviction.
         let replay = whole(&log, Some(StreamCursor::new(1)), &EverythingAdmitted);
@@ -801,12 +795,12 @@ mod tests {
         assert_eq!(replay.entries.len(), MAX_RETAINED_ENTRIES);
         assert_eq!(
             replay.entries[0].node.get(),
-            log.first_retained().get(),
+            log.first_retained.get(),
             "the rebuild starts at what is verifiably retained"
         );
 
         // An adapter that is up to date sees no gap.
-        let current = whole(&log, Some(log.first_retained()), &EverythingAdmitted);
+        let current = whole(&log, Some(log.first_retained), &EverythingAdmitted);
         assert!(!current.history_gap);
     }
 
