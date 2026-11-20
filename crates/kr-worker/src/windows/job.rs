@@ -56,14 +56,14 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    JOB_OBJECT_UILIMIT_DESKTOP, JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_BASIC_UI_RESTRICTIONS,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
     JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+    PROCESS_TERMINATE,
 };
 
 /// How many process identifiers one query asks the job for before it asks again with more room.
@@ -269,18 +269,6 @@ impl SessionJob {
             .waiting
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Notice(Box::new(tell)));
-    }
-
-    /// Records an agent that will run under the reduced-ownership profile, before its process is
-    /// created, so this session's closure reads what its job holds and ends it, and never reads the
-    /// session's coverage as complete.
-    pub fn adopt_reduced(&self, agent: Arc<AgentJob>) {
-        self.lock().agents.push(agent);
-    }
-
-    /// Forgets an agent that was recorded and did not stay: its launch failed, or ended it.
-    pub fn release_reduced(&self, agent: &Arc<AgentJob>) {
-        self.lock().agents.retain(|held| !Arc::ptr_eq(held, agent));
     }
 
     /// Returns the jobs of the agents this session ran under the reduced-ownership profile.
@@ -875,66 +863,6 @@ fn query_ui_restrictions(job: HANDLE) -> std::io::Result<u32> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(restrictions.UIRestrictionsClass)
-}
-
-/// Returns the user-interface restrictions of the innermost job this worker's own process is in,
-/// or none when it is in no job.
-///
-/// What a job above this one carries cannot be read from here, and applies to everything this
-/// worker starts all the same.
-///
-/// # Errors
-///
-/// Returns the operating system's failure when it will not say whether the process is in a job or
-/// what the job's restrictions are.
-pub fn own_ui_restrictions() -> std::io::Result<Option<u32>> {
-    let mut inside = 0_i32;
-    // SAFETY: the pseudo-handle names this process, a null job asks about any job, and the answer
-    // is a local this thread owns.
-    let asked =
-        unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &raw mut inside) };
-    if asked == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if inside == 0 {
-        return Ok(None);
-    }
-    query_ui_restrictions(std::ptr::null_mut()).map(Some)
-}
-
-/// What stops a vendor's own sandbox from running in the jobs an agent would start in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SandboxBlock {
-    /// The session's job restricts access to desktops. Starting the agent in a job of its own
-    /// instead, which is the reduced-ownership profile, avoids it.
-    SessionJob,
-    /// The job this worker is itself in restricts access to desktops, and every process it starts
-    /// is under that whatever job the agent is put in. Nothing here avoids it.
-    WorkersOwnJob,
-}
-
-/// Returns what stops a vendor's own sandbox from running under the jobs an agent starts in, when
-/// something does.
-///
-/// A vendor sandbox nests a job of its own under the session's, which is not itself a problem:
-/// active-process, memory and the other user-interface limits it sets are read back and it runs.
-/// What it cannot run under is a chain that restricts desktops, because it makes a desktop of its
-/// own and the operating system refuses. `session` is the job the launch would be held by, absent
-/// for an agent that is to run in a job of its own.
-///
-/// # Errors
-///
-/// Returns the operating system's failure when a restriction cannot be read: an agent is not
-/// started on the strength of a limit nobody could look at.
-pub fn sandbox_block(session: Option<&SessionJob>) -> std::io::Result<Option<SandboxBlock>> {
-    if let Some(session) = session
-        && session.ui_restrictions()? & JOB_OBJECT_UILIMIT_DESKTOP != 0
-    {
-        return Ok(Some(SandboxBlock::SessionJob));
-    }
-    Ok(own_ui_restrictions()?
-        .filter(|restrictions| restrictions & JOB_OBJECT_UILIMIT_DESKTOP != 0)
-        .map(|_| SandboxBlock::WorkersOwnJob))
 }
 
 /// The job each live session's root shell is held by, found by that shell's identifier.
