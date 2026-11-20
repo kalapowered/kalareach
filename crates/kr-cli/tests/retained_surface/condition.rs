@@ -84,7 +84,7 @@ const FREE: [&str; 7] = [
 /// The most free atoms one place may hold: each adds a doubling to the configurations tried.
 const MOST_FREE: usize = 12;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Predicate {
     Always(bool),
     Test,
@@ -102,10 +102,37 @@ enum Predicate {
 }
 
 /// The conditions around a place, all of which must hold.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Condition(Rc<Vec<Predicate>>);
 
 impl Condition {
+    /// The condition of a target that Cargo builds only with these features.
+    pub fn requiring(features: &[String]) -> Self {
+        Self(Rc::new(
+            features
+                .iter()
+                .map(|feature| Predicate::Free(format!("feature={feature}")))
+                .collect(),
+        ))
+    }
+
+    /// The condition under which some one of the `visits` holds: the conditions a file is reached
+    /// under, one for each declaration that reaches it.
+    pub fn any_of(visits: &[Self]) -> Self {
+        if visits.iter().any(|visit| visit.0.is_empty()) {
+            return Self::default();
+        }
+        match visits {
+            [one] => one.clone(),
+            _ => Self(Rc::new(vec![Predicate::Any(
+                visits
+                    .iter()
+                    .map(|visit| Predicate::All((*visit.0).clone()))
+                    .collect(),
+            )])),
+        }
+    }
+
     /// The conditions of a place whose attributes are `attrs` inside this one: `None` where no
     /// configuration enables them all. `at` names the file for the error.
     pub fn within(&self, attrs: &[Attribute], at: &str) -> Result<Option<Self>, String> {
@@ -130,6 +157,9 @@ impl Condition {
                 }
             }
         }
+        // A predicate that already holds around the place adds nothing, so a condition that a
+        // cycle of declarations carries again is the one it had.
+        added.retain(|predicate| !self.0.contains(predicate));
         if added.is_empty() {
             return match sets {
                 Some(error) => Err(error),

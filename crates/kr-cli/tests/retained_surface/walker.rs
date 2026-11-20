@@ -41,66 +41,153 @@ pub struct Tree {
     root: PathBuf,
     /// The crates of the workspace, by the name their code uses (`kr_protocol`).
     crates: BTreeMap<String, PathBuf>,
-    /// What each crate's manifest says about its targets, by crate name.
+    /// What Cargo says about each crate's targets, by crate name.
     manifests: BTreeMap<String, Manifest>,
-    /// The manifests that exist and cannot be read as a package: a crate that no manifest names
-    /// is then unknown and not absent.
-    unreadable: Vec<String>,
     indexes: RefCell<BTreeMap<String, Rc<CrateIndex>>>,
     scans: RefCell<BTreeMap<String, Rc<CrateScan>>>,
     inventories: RefCell<BTreeMap<String, Rc<Inventory>>>,
 }
 
-/// What a crate's manifest says that the inventory needs.
+/// What Cargo says of a crate that the inventory needs.
 struct Manifest {
-    /// The folder of the crate.
-    directory: PathBuf,
     /// The manifest, as a path under the tree.
     shown: String,
-    /// The paths of the library and the binaries, where the manifest names them.
-    targets: Vec<String>,
+    /// The library and binary targets, with the features each requires.
+    roots: Vec<inventory::Root>,
     /// Whether the library is a procedural-macro crate.
     proc_macro: bool,
 }
 
-/// The package name of a manifest, with `-` as `_`, and what it says of the crate's targets;
-/// `None` where it cannot be read as a package.
-fn read_manifest(path: &Path) -> Option<(String, Vec<String>, bool)> {
-    let table = std::fs::read_to_string(path)
-        .ok()?
-        .parse::<toml::Table>()
-        .ok()?;
-    let name = table
-        .get("package")?
-        .get("name")?
-        .as_str()?
-        .replace('-', "_");
-    let library = table.get("lib");
-    let mut targets: Vec<String> = library
-        .and_then(|library| library.get("path"))
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned)
-        .into_iter()
-        .collect();
-    for binary in table
-        .get("bin")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let Some(path) = binary.get("path").and_then(toml::Value::as_str) {
-            targets.push(path.to_owned());
-        }
+/// The kinds of target that are product code: a library of any crate type, and a binary.
+const PRODUCT_KINDS: [&str; 7] = [
+    "lib",
+    "rlib",
+    "dylib",
+    "cdylib",
+    "staticlib",
+    "proc-macro",
+    "bin",
+];
+
+/// The cargo that built this program: the one that runs it, else the one that compiled it. It is
+/// run by its own path, so that no toolchain file of a checked-out release starts an install.
+fn cargo() -> PathBuf {
+    std::env::var_os("CARGO").map_or_else(|| PathBuf::from(env!("CARGO")), PathBuf::from)
+}
+
+/// The members of the workspace at `root` outside `tests/`, as Cargo reads them: by crate name.
+fn workspace(root: &Path) -> Result<BTreeMap<String, (PathBuf, Manifest)>, String> {
+    let cannot = |why: &str| {
+        format!(
+            "{}: cargo cannot read the workspace ({why})",
+            root.display()
+        )
+    };
+    let output = std::process::Command::new(cargo())
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| cannot(&error.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("it failed");
+        return Err(cannot(first.trim()));
     }
-    let proc_macro = library
-        .and_then(|library| {
-            library
-                .get("proc-macro")
-                .or_else(|| library.get("proc_macro"))
-        })
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-    Some((name, targets, proc_macro))
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|error| cannot(&error.to_string()))?;
+    let reported = metadata["workspace_root"]
+        .as_str()
+        .ok_or_else(|| cannot("no workspace root"))?;
+    if std::fs::canonicalize(reported).ok().as_deref() != Some(root) {
+        return Err(cannot(&format!("the workspace root is {reported}")));
+    }
+    let members: BTreeSet<&str> = metadata["workspace_members"]
+        .as_array()
+        .ok_or_else(|| cannot("no workspace members"))?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let mut found = BTreeMap::new();
+    for package in metadata["packages"]
+        .as_array()
+        .ok_or_else(|| cannot("no packages"))?
+    {
+        if !package["id"]
+            .as_str()
+            .is_some_and(|id| members.contains(id))
+        {
+            continue;
+        }
+        let name = package["name"]
+            .as_str()
+            .ok_or_else(|| cannot("a package with no name"))?
+            .replace('-', "_");
+        let manifest = PathBuf::from(
+            package["manifest_path"]
+                .as_str()
+                .ok_or_else(|| cannot("a package with no manifest"))?,
+        );
+        let directory = manifest
+            .parent()
+            .ok_or_else(|| cannot("a manifest with no folder"))?
+            .to_owned();
+        let shown = manifest
+            .strip_prefix(root)
+            .map_err(|_| cannot(&format!("{} is not under the tree", manifest.display())))?;
+        // The test crates of the repository are not product code.
+        if shown.starts_with("tests") {
+            continue;
+        }
+        let mut roots = Vec::new();
+        let mut proc_macro = false;
+        for target in package["targets"].as_array().into_iter().flatten() {
+            let kinds: Vec<&str> = target["kind"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            if !kinds.iter().any(|kind| PRODUCT_KINDS.contains(kind)) {
+                continue;
+            }
+            proc_macro |= kinds.contains(&"proc-macro");
+            let source = target["src_path"]
+                .as_str()
+                .ok_or_else(|| cannot("a target with no source path"))?;
+            roots.push(inventory::Root {
+                path: normalised(Path::new(source)),
+                features: target["required-features"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            });
+        }
+        found.insert(
+            name,
+            (
+                directory,
+                Manifest {
+                    shown: shown.display().to_string(),
+                    roots,
+                    proc_macro,
+                },
+            ),
+        );
+    }
+    Ok(found)
 }
 
 /// Why a root cannot be followed.
@@ -214,8 +301,8 @@ pub struct Followed {
 }
 
 impl Tree {
-    /// Reads the crates of the workspace at `root`: the repository's checkout, or a release's. A
-    /// crate is `crates/*` or an application's `apps/*/src-tauri`, named by its manifest's package.
+    /// Reads the crates of the workspace at `root`: the repository's checkout, or a release's. The
+    /// crates are the members Cargo reports outside `tests/`, named by their package.
     pub fn at(root: &Path) -> Result<Self, String> {
         // The root as the file system names it: a relative root, one with `..` in it (the
         // repository's own is `crates/kr-cli/../..`) and one through a link all give the one path
@@ -224,72 +311,14 @@ impl Tree {
             &std::fs::canonicalize(root).map_err(|error| format!("{}: {error}", root.display()))?;
         let mut crates = BTreeMap::new();
         let mut described = BTreeMap::new();
-        let mut unreadable = Vec::new();
-        let directory = root.join("crates");
-        let mut manifests: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(&directory)
-            .map_err(|error| format!("{}: {error}", directory.display()))?
-        {
-            manifests.push(entry.map_err(|error| error.to_string())?.path());
-        }
-        match std::fs::read_dir(root.join("apps")) {
-            Ok(applications) => {
-                for entry in applications {
-                    manifests.push(
-                        entry
-                            .map_err(|error| error.to_string())?
-                            .path()
-                            .join("src-tauri"),
-                    );
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("{}: {error}", root.join("apps").display())),
-        }
-        manifests.sort();
-        for directory in manifests {
-            let manifest = directory.join("Cargo.toml");
-            match std::fs::metadata(&manifest) {
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    continue;
-                }
-                Err(_) => {
-                    unreadable.push(manifest.display().to_string());
-                    continue;
-                }
-            }
-            match read_manifest(&manifest) {
-                Some((name, targets, proc_macro)) => {
-                    let shown = manifest
-                        .strip_prefix(root)
-                        .unwrap_or(&manifest)
-                        .display()
-                        .to_string();
-                    described.insert(
-                        name.clone(),
-                        Manifest {
-                            directory: directory.clone(),
-                            shown,
-                            targets,
-                            proc_macro,
-                        },
-                    );
-                    crates.insert(name, directory.join("src"));
-                }
-                None => unreadable.push(manifest.display().to_string()),
-            }
+        for (name, (directory, manifest)) in workspace(root)? {
+            crates.insert(name.clone(), directory.join("src"));
+            described.insert(name, manifest);
         }
         Ok(Self {
             root: root.to_owned(),
             crates,
             manifests: described,
-            unreadable,
             indexes: RefCell::new(BTreeMap::new()),
             scans: RefCell::new(BTreeMap::new()),
             inventories: RefCell::new(BTreeMap::new()),
@@ -301,18 +330,11 @@ impl Tree {
         if let Some(found) = self.inventories.borrow().get(krate) {
             return Ok(Rc::clone(found));
         }
-        let source = self
-            .crates
+        let manifest = self
+            .manifests
             .get(krate)
             .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-        let manifest = &self.manifests[krate];
-        let found = inventory::read(
-            krate,
-            &manifest.directory,
-            source,
-            &self.root,
-            &manifest.targets,
-        )?;
+        let found = inventory::read(krate, &manifest.roots, &self.root)?;
         if let Some((at, name)) = found.unaccepted.first() {
             return Err(format!(
                 "{at}: {name}! is called at item position, is not defined in {krate} and is not one the scan accepts"
@@ -665,7 +687,8 @@ impl CrateIndex {
             imports: BTreeMap::new(),
         };
         let workspace: BTreeSet<String> = crates.keys().cloned().collect();
-        for path in &inventory.files {
+        for reached in &inventory.files {
+            let path = &reached.path;
             let text = std::fs::read_to_string(path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             let file =
@@ -680,7 +703,7 @@ impl CrateIndex {
                 .entry(module_of(source, path))
                 .or_default()
                 .insert(relative.clone());
-            let Some(condition) = Condition::default().within(&file.attrs, &relative)? else {
+            let Some(condition) = reached.condition.within(&file.attrs, &relative)? else {
                 continue;
             };
             let mut imports = Imports::default();
@@ -1382,18 +1405,12 @@ struct CrateScan {
 }
 
 impl Tree {
-    /// Whether a manifest names `krate`. A crate that no manifest names is absent only when every
-    /// manifest of the tree could be read.
+    /// Whether the workspace has a crate `krate` outside `tests/`.
     pub fn krate(&self, krate: &str) -> Lookup {
         if self.crates.contains_key(krate) {
             Lookup::Found(String::new())
-        } else if self.unreadable.is_empty() {
-            Lookup::Absent
         } else {
-            Lookup::Failed(format!(
-                "{krate} is in no manifest this tree could read; unreadable: {}",
-                self.unreadable.join(", ")
-            ))
+            Lookup::Absent
         }
     }
 
@@ -1474,12 +1491,6 @@ impl Tree {
 
     /// The sightings of the crates `include` accepts, outside `#[cfg(test)]` and outside `tests/`.
     pub fn sightings(&self, include: &dyn Fn(&str) -> bool) -> Result<Vec<Sighting>, String> {
-        if !self.unreadable.is_empty() {
-            return Err(format!(
-                "manifests this tree could not read: {}",
-                self.unreadable.join(", ")
-            ));
-        }
         let mut all = Vec::new();
         for krate in self.crates.keys().filter(|krate| include(krate)) {
             if self.manifests[krate].proc_macro {
@@ -1789,7 +1800,8 @@ fn scan_crate(
         macro_rules: BTreeSet::new(),
         calls: Calls::default(),
     };
-    for path in &inventory.files {
+    for reached in &inventory.files {
+        let path = &reached.path;
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         if !mentions_a_sighting(&text) {
@@ -1807,7 +1819,7 @@ fn scan_crate(
             .unwrap_or(path)
             .display()
             .to_string();
-        let Some(condition) = Condition::default().within(&parsed.attrs, &relative)? else {
+        let Some(condition) = reached.condition.within(&parsed.attrs, &relative)? else {
             continue;
         };
         scanner.items(&parsed.items, &relative, &under_src, &condition)?;

@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 use super::condition::Condition;
+use super::repository;
 use super::walker::{Lookup, SightKind, Tree};
-use super::walker_cases::{small_tree, write};
+use super::walker_cases::{small_tree, tree_at, write};
 
 /// Whether some configuration without `test` enables a function written with `attributes`.
 fn enabled(attributes: &str) -> Result<bool, String> {
@@ -150,7 +151,7 @@ fn an_item_that_only_a_configuration_with_test_builds_is_not_defined() {
     let lib = "pub fn product() {}\npub fn both() { let _ = 1; }\n\
                #[cfg(all(test, unix))]\nmod t {\n    pub fn both() { let _ = 2; }\n    pub fn only_test() {}\n}\n";
     let folder = small_tree(lib);
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     let source = tree
         .source("kr_sender", "both")
         .expect("a lookup")
@@ -180,7 +181,7 @@ fn scanned(lib: &str, files: &[(&str, &str)]) -> (Result<Vec<String>, String>, L
     for (path, text) in files {
         write(folder.path(), &format!("crates/kr-sender/{path}"), text);
     }
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     (sender_names(&tree), tree.item("kr_sender", "anything"))
 }
 
@@ -212,7 +213,7 @@ fn a_file_that_no_declaration_reaches_is_not_product_code_and_is_not_read() {
     ] {
         write(folder.path(), &format!("crates/kr-sender/src/{path}"), text);
     }
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(sender_names(&tree), Ok(vec!["from_used".to_owned()]));
     // The index reads the same files: a name that only a test file or an orphan defines is not
     // defined, and one that both define has the product text only.
@@ -231,7 +232,7 @@ fn a_file_that_no_declaration_reaches_is_not_product_code_and_is_not_read() {
 fn a_declared_file_that_does_not_parse_is_an_error_where_an_undeclared_one_is_not_read() {
     let folder = small_tree("mod other;\npub fn quiet() {}\n");
     write(folder.path(), "crates/kr-sender/src/other.rs", "fn (\n");
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     let error = sender_names(&tree).expect_err("a parse error");
     assert!(error.contains("other.rs"), "{error}");
     assert!(matches!(tree.item("kr_sender", "quiet"), Lookup::Failed(_)));
@@ -349,7 +350,7 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
             "{import}"
         );
     }
-    // Targets and roots.
+    // Targets and roots: Cargo's own report gives them, so a binary at any path is a root.
     let manifest = |extra: &str| {
         format!(
             "{}{extra}",
@@ -358,22 +359,28 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
     };
     let (scan, _) = scanned(
         "pub fn quiet() {}\n",
-        &[(
-            "Cargo.toml",
-            &manifest("[[bin]]\nname = \"x\"\npath = \"build/x.rs\"\n"),
-        )],
+        &[
+            (
+                "Cargo.toml",
+                &manifest("[[bin]]\nname = \"x\"\npath = \"build/x.rs\"\n"),
+            ),
+            ("build/x.rs", SENDS),
+        ],
     );
-    assert_eq!(
-        scan,
-        Err("crates/kr-sender/Cargo.toml: the target path build/x.rs is not src/lib.rs, src/main.rs, src/bin/*.rs or src/bin/*/main.rs".to_owned())
-    );
+    assert_eq!(scan, Ok(vec!["sends".to_owned()]));
+    // A crate Cargo gives no library or binary (only a test) has no root.
     let folder = small_tree("pub fn quiet() {}\n");
     std::fs::remove_file(folder.path().join("crates/kr-sender/src/lib.rs")).expect("a file");
     write(folder.path(), "crates/kr-sender/src/other.rs", SENDS);
-    let tree = Tree::at(folder.path()).expect("the tree");
+    write(
+        folder.path(),
+        "crates/kr-sender/tests/only.rs",
+        "fn t() {}\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(
         sender_names(&tree),
-        Err("kr_sender: no crate root under src".to_owned())
+        Err("kr_sender: no library or binary target".to_owned())
     );
 }
 
@@ -437,9 +444,9 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
     let link = tempfile::tempdir().expect("a folder");
     let through = link.path().join("through");
     std::os::unix::fs::symlink(folder.path(), &through).expect("a link");
-    let direct = sender_names(&Tree::at(folder.path()).expect("the tree"));
+    let direct = sender_names(&tree_at(folder.path()).expect("the tree"));
     assert_eq!(direct, Ok(vec!["sends".to_owned()]));
-    assert_eq!(sender_names(&Tree::at(&through).expect("the tree")), direct);
+    assert_eq!(sender_names(&tree_at(&through).expect("the tree")), direct);
     // A declared file that is a link, and a `#[path]` that leaves the checkout.
     let folder = small_tree("mod linked;\n");
     write(folder.path(), "crates/kr-sender/src/real.rs", SENDS);
@@ -448,7 +455,7 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
         .join("crates/kr-sender/src/real.rs");
     std::os::unix::fs::symlink(&real, folder.path().join("crates/kr-sender/src/linked.rs"))
         .expect("a link");
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(
         sender_names(&tree),
         Err(format!(
@@ -477,7 +484,7 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
     let escaped = std::fs::canonicalize(outer.path())
         .expect("a path")
         .join("escape.rs");
-    let tree = Tree::at(&inner).expect("the tree");
+    let tree = tree_at(&inner).expect("the tree");
     assert_eq!(
         sender_names(&tree),
         Err(format!(
@@ -502,7 +509,7 @@ fn a_manifest_names_a_target_and_a_procedural_macro_crate_is_refused() {
     );
     write(folder.path(), "crates/kr-sender/src/bin/tool.rs", SENDS);
     assert_eq!(
-        sender_names(&Tree::at(folder.path()).expect("the tree")),
+        sender_names(&tree_at(folder.path()).expect("the tree")),
         Ok(vec!["sends".to_owned()])
     );
     // A binary in a folder of its own and one beside the library are roots without a manifest line.
@@ -519,7 +526,7 @@ fn a_manifest_names_a_target_and_a_procedural_macro_crate_is_refused() {
         "fn main() {}\n",
     );
     assert_eq!(
-        sender_names(&Tree::at(folder.path()).expect("the tree")),
+        sender_names(&tree_at(folder.path()).expect("the tree")),
         Ok(vec!["sends".to_owned()])
     );
     let folder = small_tree("pub fn quiet() {}\n");
@@ -529,7 +536,7 @@ fn a_manifest_names_a_target_and_a_procedural_macro_crate_is_refused() {
         &manifest("[lib]\nproc-macro = true\n"),
     );
     assert_eq!(
-        sender_names(&Tree::at(folder.path()).expect("the tree")),
+        sender_names(&tree_at(folder.path()).expect("the tree")),
         Err("crates/kr-sender/Cargo.toml: a procedural-macro crate; the scan does not read what it generates".to_owned())
     );
 }
@@ -541,6 +548,7 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
         "task_local",
         "bindgen",
         "compile_error",
+        "ios_plugin_binding",
         "debug_as_display",
         "debug_as_name",
         "debug_fields",
@@ -583,7 +591,7 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
         "crates/kr-worker/src/lib.rs",
         "#[macro_export]\nmacro_rules! shared { ($m:expr) => { $m }; }\n",
     );
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(
         tree.sightings(&|_| true),
         Err("kr_sender: shared! is called with a sighting and kr_worker exports it; the scan does not follow it across crates".to_owned())
@@ -599,7 +607,7 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
         "crates/kr-sender/src/lib.rs",
         "fn f() { let _ = Method::AgentTurnSteer; shared!(1); }\n",
     );
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(tree.sightings(&|_| true).map(|found| found.len()), Ok(1));
 }
 
@@ -617,7 +625,7 @@ fn two_private_definitions_of_one_macro_in_different_files_are_merged_by_name() 
         "crates/kr-sender/src/b.rs",
         "macro_rules! m { ($x:expr) => { callee_b!($x) }; }\n",
     );
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     let found = tree
         .sightings(&|krate| krate == "kr_sender")
         .map(|found| super::walker_cases::names(&found, "kr_sender"));
@@ -653,5 +661,143 @@ fn a_file_that_two_declarations_reach_in_different_ways_is_read_for_each() {
     assert_eq!(
         read_names(lib, &files),
         Ok(vec!["from_beside".to_owned(), "from_in_folder".to_owned()])
+    );
+}
+
+fn package(name: &str, extra: &str) -> String {
+    format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n{extra}")
+}
+
+/// What the scan finds in the crate `krate` of `tree`.
+fn names_in(tree: &Tree, krate: &str) -> Result<Vec<String>, String> {
+    tree.sightings(&|found| found == krate)
+        .map(|sightings| sightings.into_iter().map(|found| found.name).collect())
+}
+
+#[test]
+fn a_crate_is_read_from_the_targets_cargo_reports_for_it() {
+    // A member that no convention names is read; a crate of the repository's `tests/` is not.
+    let folder = small_tree("pub fn quiet() {}\n");
+    write(
+        folder.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\", \"apps/x/native/y\", \"tests/support/z\"]\nresolver = \"2\"\n",
+    );
+    for (path, name) in [
+        ("apps/x/native/y", "companion-y"),
+        ("tests/support/z", "kr-z"),
+    ] {
+        write(
+            folder.path(),
+            &format!("{path}/Cargo.toml"),
+            &package(name, ""),
+        );
+        write(folder.path(), &format!("{path}/src/lib.rs"), SENDS);
+    }
+    let tree = tree_at(folder.path()).expect("the tree");
+    assert_eq!(tree.krate("companion_y"), Lookup::Found(String::new()));
+    assert_eq!(names_in(&tree, "companion_y"), Ok(vec!["sends".to_owned()]));
+    assert_eq!(tree.krate("kr_z"), Lookup::Absent);
+    // The repository's own tree has the companion's native crates, and its test crates are not read.
+    let real = tree_at(&repository()).expect("this checkout");
+    for krate in ["companion_platform", "companion_preview", "companion_tauri"] {
+        assert_eq!(real.krate(krate), Lookup::Found(String::new()), "{krate}");
+    }
+    assert_eq!(real.krate("kr_conformance"), Lookup::Absent);
+    // A binary that Cargo builds only with a feature is read under that feature.
+    let folder = small_tree("pub fn quiet() {}\n");
+    write(
+        folder.path(),
+        "crates/kr-sender/Cargo.toml",
+        &package(
+            "kr-sender",
+            "[features]\ntesting = []\n[[bin]]\nname = \"stub\"\npath = \"src/bin/stub.rs\"\nrequired-features = [\"testing\"]\n",
+        ),
+    );
+    write(
+        folder.path(),
+        "crates/kr-sender/src/bin/stub.rs",
+        "#[cfg(not(feature = \"testing\"))]\nfn off() { let _ = Method::AgentTurnCancel; }\n\
+         #[cfg(feature = \"testing\")]\nfn on() { let _ = Method::AgentTurnSteer; }\n",
+    );
+    assert_eq!(
+        sender_names(&tree_at(folder.path()).expect("the tree")),
+        Ok(vec!["on".to_owned()])
+    );
+}
+
+#[test]
+fn a_module_candidate_that_cannot_be_looked_at_is_an_error_and_not_an_absence() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let folder = small_tree("mod sub;\npub fn quiet() {}\n");
+    let shut = folder.path().join("crates/kr-sender/src/sub");
+    std::fs::create_dir_all(&shut).expect("a folder");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0)).expect("permissions");
+    let tree = tree_at(folder.path());
+    let outcome = tree
+        .as_ref()
+        .map(|tree| (sender_names(tree), tree.item("kr_sender", "x")));
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).expect("permissions");
+    let (scan, lookup) = outcome.expect("the tree");
+    let root = std::fs::canonicalize(folder.path()).expect("a folder");
+    let text = format!(
+        "{}: Permission denied (os error 13)",
+        root.join("crates/kr-sender/src/sub/mod.rs").display()
+    );
+    assert_eq!(scan, Err(text.clone()));
+    assert_eq!(lookup, Lookup::Failed(text));
+}
+
+#[test]
+fn a_file_is_read_under_the_condition_of_each_declaration_that_reaches_it() {
+    // A file declared under one platform has that platform's condition around its items, and an
+    // `include!` that no configuration of it builds is no refusal.
+    let folder = small_tree("#[cfg(unix)]\nmod child;\n");
+    write(
+        folder.path(),
+        "crates/kr-sender/src/child.rs",
+        "pub fn plain() { let _ = Method::AgentTurnSteer; }\n\
+         #[cfg(windows)]\npub fn only_windows() { let _ = Method::AgentTurnCancel; }\n\
+         #[cfg(unix)]\npub fn only_unix() { let _ = Method::AgentTurnCancel; }\n\
+         #[cfg(windows)]\ninclude!(\"other.rs\");\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
+    assert_eq!(
+        sender_names(&tree),
+        Ok(vec!["only_unix".to_owned(), "plain".to_owned()])
+    );
+    assert_eq!(tree.item("kr_sender", "only_windows"), Lookup::Absent);
+    assert!(matches!(
+        tree.item("kr_sender", "only_unix"),
+        Lookup::Found(_)
+    ));
+    // Two declarations that reach one file, each under its own condition: the file is read under
+    // both, so an item either of them builds is product code, and one neither builds is not.
+    let lib = "#[cfg(unix)]\n#[path = \"shared.rs\"]\nmod as_unix;\n\
+               #[cfg(windows)]\n#[path = \"shared.rs\"]\nmod as_windows;\n";
+    let folder = small_tree(lib);
+    write(
+        folder.path(),
+        "crates/kr-sender/src/shared.rs",
+        "#[cfg(windows)]\npub fn w() { let _ = Method::AgentTurnCancel; }\n\
+         #[cfg(unix)]\npub fn u() { let _ = Method::AgentTurnCancel; }\n\
+         #[cfg(target_os = \"freebsd\")]\npub fn f() { let _ = Method::AgentTurnCancel; }\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
+    assert_eq!(
+        sender_names(&tree),
+        Ok(vec!["u".to_owned(), "w".to_owned()])
+    );
+    assert!(matches!(tree.item("kr_sender", "w"), Lookup::Found(_)));
+    assert!(matches!(tree.item("kr_sender", "u"), Lookup::Found(_)));
+    assert_eq!(tree.item("kr_sender", "f"), Lookup::Absent);
+    // A declaration that reaches the file it is in under a condition ends the reading: the
+    // condition it carries again is the one it had.
+    let folder = small_tree(&format!(
+        "#[cfg(unix)]\n#[path = \"lib.rs\"]\nmod again;\n{SENDS}"
+    ));
+    assert_eq!(
+        sender_names(&tree_at(folder.path()).expect("the tree")),
+        Ok(vec!["sends".to_owned()])
     );
 }
