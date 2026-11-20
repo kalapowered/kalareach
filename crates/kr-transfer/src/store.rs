@@ -5647,7 +5647,8 @@ mod tests {
 }
 
 /// A store whose previous holder is still letting go of its index opens at once, and holds what that
-/// holder committed. On Windows a process that is ending releases its locks on a store's
+/// holder committed; the journal's and the store of binding revisions beside it, which a daemon
+/// opens together. On Windows a process that is ending releases its locks on a store's
 /// write-ahead index before the system removes its mapping of it, and the next process to open the
 /// store in that interval gets the store: SQLite clears the start of an index it cannot truncate
 /// and goes on.
@@ -5662,6 +5663,37 @@ mod a_previous_holder_that_is_letting_go {
         let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
         kr_flush::release::assert_an_open_succeeds_while_a_holder_maps_the_index(&path, || {
             Store::open(&path, environment_id).map(drop)
+        });
+    }
+
+    /// The store of binding revisions has an index of its own. A side store that did not open would
+    /// stay closed until the daemon restarts, and every draft would read as one that holds no
+    /// revision, so the open is shown to read back a revision that was committed, and not only to
+    /// succeed.
+    #[test]
+    fn the_store_of_binding_revisions_opens_and_reads_back_what_the_previous_holder_committed() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let journal = directory.path().join("transfers.sqlite3");
+        let side = Revisions::beside(&journal);
+        let draft = DraftId::new(Uuid::from_bytes([1; 16]));
+        let application = ApplicationInstanceId::new(Uuid::from_bytes([0x0A; 16]));
+        let made = TimestampMs::new(1000);
+        Revisions::open(&side)
+            .keep(&[Kept {
+                draft_id: draft,
+                application_instance_id: application,
+                created_at_ms: made,
+                agent_binding_revision: AgentBindingRevision::new(7),
+            }])
+            .expect("commits a revision");
+        kr_flush::release::assert_an_open_succeeds_while_a_holder_maps_the_index(&side, || {
+            match Revisions::open(&side).read(draft, application, made) {
+                Some(revision) if revision == AgentBindingRevision::new(7) => Ok(()),
+                other => Err(format!(
+                    "the store of binding revisions reads {other:?} and not the revision its \
+                     previous holder committed"
+                )),
+            }
         });
     }
 }
