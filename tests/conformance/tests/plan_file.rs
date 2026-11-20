@@ -21,7 +21,7 @@ fn selection(names: &[&str]) -> Vec<String> {
 const HEAD: &str = "repository = 'planted'
 groups = ['rust']
 [rust]
-manifests = []
+manifests = ['Cargo.toml']
 [ignored_runs]
 held = false
 [unrun]
@@ -394,12 +394,12 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
         ),
         (
             "a plan with no `[rust]` table",
-            with("").replace("[rust]\nmanifests = []\n", ""),
+            with("").replace("[rust]\nmanifests = ['Cargo.toml']\n", ""),
             "missing field `rust`",
         ),
         (
             "a `[rust]` table with no manifests",
-            with("").replace("manifests = []\n", ""),
+            with("").replace("manifests = ['Cargo.toml']\n", ""),
             "missing field `manifests`",
         ),
         (
@@ -419,13 +419,16 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
         ),
         (
             "a manifest named twice",
-            with("").replace("manifests = []", "manifests = ['Cargo.toml', 'Cargo.toml']"),
+            with("").replace(
+                "manifests = ['Cargo.toml']",
+                "manifests = ['Cargo.toml', 'Cargo.toml']",
+            ),
             "`[rust] manifests` names `Cargo.toml` twice",
         ),
         (
             "a manifest named twice by another spelling",
             with("").replace(
-                "manifests = []",
+                "manifests = ['Cargo.toml']",
                 "manifests = ['Cargo.toml', './Cargo.toml']",
             ),
             "`[rust] manifests` names `./Cargo.toml` twice",
@@ -489,7 +492,10 @@ fn naming(key: &str, operand: &str) -> String {
     };
     let text = match key {
         "scripts" | "lane_directories" => top(&format!("{key} = ['{operand}']")),
-        "[rust] manifests" => HEAD.replace("manifests = []", &format!("manifests = ['{operand}']")),
+        "[rust] manifests" => HEAD.replace(
+            "manifests = ['Cargo.toml']",
+            &format!("manifests = ['{operand}']"),
+        ),
         "[terminal_profile] path" => with(&format!("[terminal_profile]\npath = '{operand}'\n")),
         "[typescript] packages" => with(&format!("[typescript]\npackages = ['{operand}']\n")),
         "[typescript] compiler_from" => with(&format!(
@@ -497,15 +503,21 @@ fn naming(key: &str, operand: &str) -> String {
         )),
         _ => unreachable!("{key}"),
     };
-    format!("{text}{STEP}")
+    // The step runs no `cargo`, so that a manifest the key names is not held to be a root.
+    format!(
+        "{text}{}",
+        STEP.replace("command = ['cargo', 'test']", "command = ['pnpm', 'test']")
+    )
 }
 
-/// A repository of its own that holds `dir/file.txt` and `dir/sub`, and, where a link can be made,
+/// A repository of its own that holds a `Cargo.toml`, `dir/file.txt` and `dir/sub`, and, where a
+/// link can be made,
 /// `dirlink` (to a directory elsewhere), `insidelink` (to `dir`) and `filelink` (to `dir/file.txt`);
 /// and, elsewhere, `sub` and `file.txt`.
 fn tree_with_links() -> (tempfile::TempDir, tempfile::TempDir) {
     let repository = tempfile::tempdir().expect("a directory");
     let elsewhere = tempfile::tempdir().expect("a directory");
+    std::fs::write(repository.path().join("Cargo.toml"), "").expect("a manifest");
     std::fs::create_dir_all(repository.path().join("dir").join("sub")).expect("a directory");
     std::fs::write(repository.path().join("dir").join("file.txt"), "").expect("a file");
     std::fs::create_dir_all(elsewhere.path().join("sub")).expect("a directory");
@@ -1001,6 +1013,70 @@ fn a_step_of_the_execution_model_is_refused_for_each_fault_by_its_reason() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A `cargo` step runs in a workspace root that `[rust] manifests` names: the directory the step
+/// names or, when it names none, the repository's root. A step of another program is not held to
+/// it, and a root named with a `.` in its path is the same root.
+#[test]
+fn a_cargo_step_runs_only_in_a_workspace_root_the_plan_names_with_or_without_a_directory() {
+    let repository = tempfile::tempdir().expect("a directory");
+    let root = repository.path();
+    for manifest in ["Cargo.toml", "first/Cargo.toml", "second/Cargo.toml"] {
+        let path = root.join(manifest);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+        std::fs::write(path, "").expect("a manifest");
+    }
+    let plan = |manifest: &str, directory: &str, program: &str| {
+        let setup = if program == "cargo" {
+            ""
+        } else {
+            "setup = true\n"
+        };
+        let reading = if program == "cargo" { "cargo" } else { "exit" };
+        format!(
+            "{}{}",
+            HEAD.replace(
+                "manifests = ['Cargo.toml']",
+                &format!("manifests = ['{manifest}']")
+            ),
+            STEP.replace("reading = 'cargo'", &format!("reading = '{reading}'"))
+                .replace(
+                    "command = ['cargo', 'test']",
+                    &format!("{setup}{directory}command = ['{program}', 'test']")
+                )
+        )
+    };
+    let refused = |manifest: &str, directory: &str| {
+        Plan::parse(&plan(manifest, directory, "cargo"), root)
+            .expect_err("the step is refused")
+            .to_string()
+    };
+    let why = "which no `[rust] manifests` entry is the workspace root of";
+    // No directory: the root, which `first/Cargo.toml` is not the workspace of.
+    let text = refused("first/Cargo.toml", "");
+    assert!(
+        text.contains("step `one` runs `cargo` in the repository's root") && text.contains(why),
+        "{text}"
+    );
+    // A directory that holds a manifest the plan does not name.
+    let text = refused("first/Cargo.toml", "directory = 'second'\n");
+    assert!(
+        text.contains("step `one` runs `cargo` in `second`") && text.contains(why),
+        "{text}"
+    );
+    for (manifest, directory) in [
+        ("Cargo.toml", ""),
+        ("./Cargo.toml", ""),
+        ("Cargo.toml", "directory = '.'\n"),
+        ("first/Cargo.toml", "directory = 'first'\n"),
+        ("./first/Cargo.toml", "directory = './first'\n"),
+    ] {
+        let loaded = Plan::parse(&plan(manifest, directory, "cargo"), root);
+        assert!(loaded.is_ok(), "{manifest} {directory}: {loaded:?}");
+    }
+    let loaded = Plan::parse(&plan("first/Cargo.toml", "", "pnpm"), root);
+    assert!(loaded.is_ok(), "a step of another program: {loaded:?}");
+}
+
 /// A script that is a link is refused, and so is one that is tracked and is not a link (accepted).
 #[test]
 fn a_script_that_is_a_link_is_refused_and_a_tracked_one_is_accepted() {
@@ -1036,13 +1112,14 @@ fn git(root: &Path, arguments: &[&str]) {
     assert!(status.success(), "git {arguments:?}: {status}");
 }
 
-/// A repository of its own whose index holds `tracked.sh` and `gone.sh`, with `gone.sh` removed
+/// A repository of its own that holds a `Cargo.toml`, and whose index holds `tracked.sh` and `gone.sh`, with `gone.sh` removed
 /// from the tree, `untracked.sh` beside them and, where a name may hold `*`, a file named `*.sh`
 /// that the index does not hold and, where a link can be made, `link.sh`, a link that the index
 /// holds.
 fn planted_repository() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("a directory");
     let root = directory.path();
+    std::fs::write(root.join("Cargo.toml"), "").expect("a manifest");
     for name in ["tracked.sh", "gone.sh", "untracked.sh"] {
         std::fs::write(root.join(name), "").expect("a file");
     }
@@ -1520,7 +1597,7 @@ fn every_decision_a_group_takes_is_what_core_s_file_says() {
 repository = 'planted'
 groups = ['unit', 'browsers', 'node']
 [rust]
-manifests = []
+manifests = ['Cargo.toml']
 [ignored_runs]
 held = false
 [unrun]
