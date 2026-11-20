@@ -28,6 +28,9 @@ enum Writes {
     Park,
     /// The first write waits, keeping no waker, and every write after it fails.
     HoldThenFail,
+    /// The next writes pass until this many bytes have gone through, and every write after them
+    /// waits, keeping no waker. A flush passes as it does for `Pass`.
+    PassFor(usize),
 }
 
 crate::debug_as_name!(Writes);
@@ -119,11 +122,19 @@ impl Gate {
         self.state().flushes == Flushes::Park
     }
 
-    /// What a write is told: `Some` when it is decided, `None` when it waits.
-    fn write(&self, waker: &Waker) -> Option<io::Result<()>> {
+    /// What a write of `len` bytes is told: `Some` when it is decided, `None` when it waits.
+    fn write(&self, waker: &Waker, len: usize) -> Option<io::Result<()>> {
         let mut state = self.state();
         match state.writes {
             Writes::Pass => Some(Ok(())),
+            Writes::PassFor(0) => {
+                state.waits += 1;
+                None
+            }
+            Writes::PassFor(left) => {
+                state.writes = Writes::PassFor(left.saturating_sub(len));
+                Some(Ok(()))
+            }
             Writes::Fail => Some(Err(io::ErrorKind::BrokenPipe.into())),
             Writes::Hold => {
                 state.waits += 1;
@@ -146,14 +157,14 @@ impl Gate {
     fn flush(&self, waker: &Waker) -> Option<io::Result<()>> {
         let mut state = self.state();
         match (state.writes, state.flushes) {
-            (Writes::Pass, Flushes::Follow) => Some(Ok(())),
+            (Writes::Pass | Writes::PassFor(_), Flushes::Follow) => Some(Ok(())),
             (Writes::Fail, _) => Some(Err(io::ErrorKind::BrokenPipe.into())),
             (Writes::Park, _) => {
                 state.waits += 1;
                 state.write_waker = Some(waker.clone());
                 None
             }
-            (Writes::Pass, Flushes::Park) => {
+            (Writes::Pass | Writes::PassFor(_), Flushes::Park) => {
                 state.waits += 1;
                 state.flush_waker = Some(waker.clone());
                 None
@@ -195,6 +206,17 @@ fn poll_once<T>(future: &mut TransportFuture<'_, T>, wakes: &Arc<Wakes>) -> Poll
     future.as_mut().poll(&mut Context::from_waker(&waker))
 }
 
+/// Polls a future once, as the task that owns `wakes` does, outside the task's cooperative budget:
+/// a flush of many frames is written to the end in that one poll, as it is on a stream that takes
+/// them.
+fn poll_once_in_full<T>(future: &mut TransportFuture<'_, T>, wakes: &Arc<Wakes>) -> Poll<T> {
+    tokio::task::unconstrained(std::future::poll_fn(|_| {
+        Poll::Ready(poll_once(future, wakes))
+    }))
+    .now_or_never()
+    .expect("the poll gives its answer at once")
+}
+
 /// The adapter's end of an in-memory connection, with writes under a [`Gate`]. It takes writes as
 /// the library offers them, in one buffer or in several, as `vectored` says.
 struct Wire {
@@ -221,7 +243,7 @@ impl AsyncWrite for Wire {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.gate.write(cx.waker()) {
+        match self.gate.write(cx.waker(), buf.len()) {
             Some(Ok(())) => {}
             Some(Err(error)) => return Poll::Ready(Err(error)),
             None => return Poll::Pending,
@@ -1675,4 +1697,83 @@ async fn a_write_that_waits_for_the_stream_to_take_a_queue_of_pongs_and_then_fai
         "the closure read ahead before the write failed is kept"
     );
     assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
+}
+
+/// 512 Pings with the longest payload are read while the stream takes no write. A write is then
+/// polled: the library's readiness check flushes all 512 Pongs, and the stream holds the text. The
+/// provider closes and the write fails: the closure that came after that flush is read ahead,
+/// because the flush counted the Pings back to zero.
+#[tokio::test]
+async fn a_write_whose_readiness_flush_wrote_every_pong_counts_the_pings_back_and_keeps_a_closure_when_it_then_fails()
+ {
+    let (mut sideband, mut provider, gate) = connected().await;
+    let task = Wakes::new();
+    gate.set(Writes::Park);
+    pinged_in_full(&mut provider, 512).await;
+    settle().await;
+    {
+        let mut read = sideband.next();
+        assert_eq!(
+            poll_once(&mut read, &task),
+            Poll::Pending,
+            "the read waits at 512 Pings"
+        );
+    }
+    assert_eq!(
+        sideband.pings, 512,
+        "512 Pings are read, and no Pong is out"
+    );
+    // Each Pong is 125 bytes of payload and 6 of header and mask: the stream takes all 512 and no more.
+    gate.set(Writes::PassFor(512 * (6 + 125)));
+    let mut sending = sideband.send("{}".to_owned());
+    assert_eq!(
+        poll_once_in_full(&mut sending, &task),
+        Poll::Pending,
+        "the readiness flush wrote the Pongs, and the stream holds the text"
+    );
+    settle().await;
+    assert_eq!(
+        pongs(&mut provider),
+        512,
+        "every Pong went out before the text"
+    );
+    said(&mut provider, &[closure()]).await;
+    settle().await;
+    gate.set(Writes::Fail);
+    assert_eq!(
+        poll_once(&mut sending, &task),
+        Poll::Ready(false),
+        "the write failed"
+    );
+    drop(sending);
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
+        "the closure that came after the flush is read ahead by the write that then failed"
+    );
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
+}
+
+/// 300 Pings are on the socket while the stream takes no write, and a write is polled: its
+/// readiness check has too few bytes queued to flush, and the stream holds the text. The Pongs are
+/// still owed, so the count of Pings stays where the read ahead left it.
+#[tokio::test]
+async fn a_write_whose_readiness_check_flushed_nothing_leaves_the_count_of_pings_as_it_was() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    let task = Wakes::new();
+    gate.set(Writes::Park);
+    pinged_times(&mut provider, 300).await;
+    settle().await;
+    {
+        let mut sending = sideband.send("{}".to_owned());
+        assert_eq!(
+            poll_once(&mut sending, &task),
+            Poll::Pending,
+            "the text waits for the stream"
+        );
+    }
+    assert_eq!(
+        sideband.pings, 256,
+        "the Pongs are owed: the count is what the read ahead took"
+    );
 }
