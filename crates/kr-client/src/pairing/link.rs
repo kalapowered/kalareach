@@ -6,7 +6,8 @@
 //! the host's address lookups are registered under the host's endpoint identity, so a lookup is
 //! asked about that identity and no other, and, for a paired host, its relays go into the relay
 //! map. The relays of a pairing invitation stay out of the map until the pairing completes and the
-//! device dials the host as a paired host.
+//! device dials the host as a paired host, and so do the relays of a recovery, the dial that a
+//! device makes as the identity derived for it before any record holds that identity.
 //!
 //! One key holds one endpoint on a relay at a time: a relay keeps one active client per key and
 //! parks the other. With one endpoint for every host, no request for one host refuses, closes or
@@ -397,9 +398,15 @@ pub enum Standing {
     /// A host that a pairing invitation names and the device is not paired with yet: its address
     /// lookups enter the endpoint and its relays do not.
     Invited,
-    /// A host the device is paired with, by the identity the host gave this device in that pairing:
-    /// its address lookups and its relays enter the endpoint, unless the person forgot that pairing
-    /// in this run.
+    /// A host that has committed this device while it was not listening, and that the device
+    /// reaches as the identity derived for it, which no record holds yet: it enters as an invited
+    /// host does, with its address lookups and no relays, and the pool records no pairing for it,
+    /// so a recovery that does not complete leaves nothing behind. The dial is refused when the
+    /// person forgot that identity in this run.
+    Recovering(DeviceId),
+    /// A host the device is paired with, by the identity the host gave this device in that pairing,
+    /// which a record holds: its address lookups and its relays enter the endpoint, unless the
+    /// person forgot that pairing in this run.
     Paired(DeviceId),
 }
 
@@ -539,10 +546,12 @@ impl EndpointPool {
 
     /// The device's endpoint, bound now if none is open, with `host` introduced to it: the host's
     /// address lookups are registered under its identity, and for a [`Standing::Paired`] host its
-    /// relays go into the relay map. Asking again for a host that is already there changes
-    /// nothing, and a changed configuration for the same identity replaces what it had.
+    /// relays go into the relay map and its pairing is recorded. Asking again for a host that is
+    /// already there changes nothing, and a changed configuration for the same identity replaces
+    /// what it had.
     ///
-    /// A pairing that the person forgot ([`Self::forget`]) is refused. The dial takes the host's own
+    /// A pairing that the person forgot ([`Self::forget`]) is refused, for a [`Standing::Recovering`]
+    /// dial as for a paired one. The dial takes the host's own
     /// lock first and looks at the pairing's mark after it holds the lock, so a dial that waited
     /// behind a forget meets the mark, and one that the forget waits for has finished its
     /// introduction before the forget removes the host. The lock is held through the introduction
@@ -565,17 +574,17 @@ impl EndpointPool {
     ) -> Result<Endpoint, LinkError> {
         let config = EndpointConfig::from_network_config(network)?;
         let services = match standing {
-            Standing::Invited => HostServices::invited(&config, host)?,
+            Standing::Invited | Standing::Recovering(_) => HostServices::invited(&config, host)?,
             Standing::Paired(_) => HostServices::paired(&config, host)?,
         };
-        let pairing = match standing {
-            Standing::Paired(pairing) => Some(pairing),
+        let marked = match standing {
+            Standing::Paired(pairing) | Standing::Recovering(pairing) => Some(pairing),
             Standing::Invited => None,
         };
         let lock = self.lock_of(host);
         let _held = lock.lock().await;
         // The decision: made with the lock held, after any forget that held it first.
-        if pairing.is_some_and(|pairing| self.is_forgotten(pairing)) {
+        if marked.is_some_and(|pairing| self.is_forgotten(pairing)) {
             return Err(not_established());
         }
         let device = self.bound().await?;
@@ -584,7 +593,7 @@ impl EndpointPool {
         // The record is made here, with no await between it and the table's insert, which the
         // first poll of `introduce` makes: a caller that stops waiting inside the introduction
         // leaves the entry in the table, and the record stays with it.
-        if let Some(pairing) = pairing {
+        if let Standing::Paired(pairing) = standing {
             device.introduced_by(host, pairing);
         }
         device.endpoint.introduce(services).await?;
@@ -847,7 +856,10 @@ fn not_established() -> LinkError {
     LinkError::lost(Shown::said("the connection could not be established"))
 }
 
-/// Connects to `host` as the device it became, through the device's one endpoint.
+/// Connects to `host` as the device it became, through the device's one endpoint. A host that a
+/// record names is a paired host. For the credentials of an attempt that has written no record the
+/// device dials as the identity derived for it, as a host it recovers its commitment with: the pool
+/// keeps no pairing for it until a record holds one.
 async fn connect_paired_over(
     pool: &EndpointPool,
     host: &HostCredentials,
@@ -855,12 +867,11 @@ async fn connect_paired_over(
 ) -> Result<Arc<dyn ControlTransport>, LinkError> {
     let address = EndpointConfig::from_network_config(&host.network_config)?
         .peer_addr(&host.host_endpoint_id)?;
+    let standing = host
+        .pairing
+        .map_or(Standing::Recovering(identity.device_id), Standing::Paired);
     let local = pool
-        .endpoint(
-            &host.network_config,
-            &host.host_endpoint_id,
-            Standing::Paired(identity.device_id),
-        )
+        .endpoint(&host.network_config, &host.host_endpoint_id, standing)
         .await?;
     let transport = NetworkTransport::connect(
         &local,
@@ -1327,6 +1338,190 @@ mod tests {
     async fn table_holds(pool: &EndpointPool, host: &EndpointKey) -> bool {
         let endpoint = the_bound(pool).await.endpoint.endpoint().clone();
         !registry_knows_nothing(&registry_yields(&endpoint, host).await)
+    }
+
+    /// A host that accepts every connection and closes it at once, so that a dial reaches it and
+    /// its handshake does not complete: the endpoint, its key and the task that serves it.
+    async fn host_that_closes() -> (Endpoint, EndpointKey, tokio::task::JoinHandle<()>) {
+        let key = TransportIdentityKeyPair::generate().expect("a key");
+        let mut config =
+            EndpointConfig::from_network_config(&NetworkConfig::empty()).expect("a config");
+        config.bind_addr = Some(loopback());
+        let listener = kr_transport::endpoint::bind_listener(&config, &key)
+            .await
+            .expect("a host on loopback");
+        let accepting = listener.clone();
+        let serving = tokio::spawn(async move {
+            while let Some(incoming) = accepting.accept().await {
+                if let Ok(connection) = incoming.await {
+                    connection.close(0u8.into(), b"closed");
+                }
+            }
+        });
+        (listener, *key.public(), serving)
+    }
+
+    /// What a device that has no record of a host dials it with: the credentials of an attempt
+    /// that has written none, and the identity the host derived for the device.
+    fn recovery_of(
+        host: EndpointKey,
+        network_config: NetworkConfig,
+        pairing: DeviceId,
+    ) -> (HostCredentials, LocalIdentity) {
+        let keys = kr_crypto::keys::DeviceKeys::generate().expect("keys");
+        let credentials = HostCredentials {
+            host_device_id: DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+            host_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+            host_keys: kr_crypto::keys::DeviceKeys::generate()
+                .expect("keys")
+                .public_keys(),
+            host_endpoint_id: host,
+            network_config,
+            organisation: Nullable::null(),
+            pairing: None,
+        };
+        let identity = LocalIdentity::new(
+            pairing,
+            kr_protocol::ids::DeviceKeyRevision::new(1),
+            keys.public_keys().transport,
+            keys.authorisation.clone(),
+            kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier"),
+        );
+        (credentials, identity)
+    }
+
+    /// A recovery that does not complete leaves no pairing in the pool. A device that was committed
+    /// while it was not listening dials its host with the identity derived for it before any record
+    /// holds that identity, and when the host does not confirm the commitment no record ever will:
+    /// the dial puts no relay into the map, and the pairing that the person later makes with the
+    /// same host and forgets takes the host out of the endpoint, with the relays and lookups that
+    /// the recovery's dial introduced, while another host stays.
+    #[tokio::test]
+    async fn a_recovery_that_does_not_complete_leaves_no_pairing_behind() {
+        let (listener, host, serving) = host_that_closes().await;
+        let (other_host, other_relay) = (key(), "https://127.0.0.1:11");
+        let own = "https://127.0.0.1:10";
+        let hint = listener.bound_sockets()[0].to_string();
+        let config = network(&[own], Some(RESOLVER), &[&hint]);
+        let other = network(&[other_relay], Some(RESOLVER), &[]);
+        let pool = loopback_pool();
+        pool.endpoint(&other, &other_host, Standing::Paired(pairing(2)))
+            .await
+            .expect("another host is reached");
+
+        let (credentials, identity) = recovery_of(host, config.clone(), pairing(7));
+        let outcome = connect_paired_over(&pool, &credentials, &identity).await;
+        assert!(
+            outcome.is_err(),
+            "the host closes the connection, so the recovery's dial does not complete"
+        );
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(other_relay)]),
+            "the relay of a recovery that has no record is not in the map"
+        );
+
+        pool.endpoint(&config, &host, Standing::Paired(pairing(1)))
+            .await
+            .expect("the pairing that is made later is reached");
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(own), relay(other_relay)]),
+            "the paired host's relay is in the map"
+        );
+        pool.forget(&host, pairing(1)).await;
+        assert!(
+            !table_holds(&pool, &host).await,
+            "the forget took the host's lookups out: no pairing the recovery left holds it"
+        );
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(other_relay)]),
+            "the forget took the host's relay out and left the other host's"
+        );
+        assert!(
+            table_holds(&pool, &other_host).await,
+            "the other host is still in the endpoint"
+        );
+        pool.close().await;
+        listener.close().await;
+        serving.abort();
+    }
+
+    /// A connect with the credentials of a record introduces its host as a paired host, which the
+    /// forget of that pairing takes out again. A recovery as an identity the person forgot is
+    /// refused before it introduces the host, and a recovery as another identity introduces the
+    /// host's lookups and no relay.
+    #[tokio::test]
+    async fn a_forgotten_identity_is_not_recovered_and_a_record_is_dialled_as_paired() {
+        let (listener, host, serving) = host_that_closes().await;
+        let (other_host, other_relay) = (key(), "https://127.0.0.1:11");
+        let own = "https://127.0.0.1:10";
+        let hint = listener.bound_sockets()[0].to_string();
+        let config = network(&[own], Some(RESOLVER), &[&hint]);
+        let pool = loopback_pool();
+        pool.endpoint(
+            &network(&[other_relay], Some(RESOLVER), &[]),
+            &other_host,
+            Standing::Paired(pairing(2)),
+        )
+        .await
+        .expect("another host is reached");
+
+        let (mut credentials, identity) = recovery_of(host, config.clone(), pairing(1));
+        credentials.pairing = Some(pairing(1));
+        assert!(
+            connect_paired_over(&pool, &credentials, &identity)
+                .await
+                .is_err(),
+            "the host closes the connection"
+        );
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(own), relay(other_relay)]),
+            "a record's host is introduced as a paired host, with its relay"
+        );
+        pool.forget(&host, pairing(1)).await;
+        assert!(
+            !table_holds(&pool, &host).await,
+            "the forget of the record's pairing took the host out"
+        );
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(other_relay)])
+        );
+
+        let (credentials, identity) = recovery_of(host, config.clone(), pairing(1));
+        assert!(
+            connect_paired_over(&pool, &credentials, &identity)
+                .await
+                .is_err(),
+            "the recovery as the forgotten identity is refused"
+        );
+        assert!(
+            !table_holds(&pool, &host).await,
+            "the refused recovery introduced nothing"
+        );
+
+        let (credentials, identity) = recovery_of(host, config, pairing(3));
+        assert!(
+            connect_paired_over(&pool, &credentials, &identity)
+                .await
+                .is_err(),
+            "the host closes the connection"
+        );
+        assert!(
+            table_holds(&pool, &host).await,
+            "the control: a recovery as another identity introduces the host's lookups"
+        );
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(other_relay)]),
+            "and no relay"
+        );
+        pool.close().await;
+        listener.close().await;
+        serving.abort();
     }
 
     /// A dial under a pairing the person forgot is refused, and nothing that it does puts the host

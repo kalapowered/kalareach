@@ -943,12 +943,17 @@ Every host is reached through one dialling endpoint. `EndpointPool` binds it at 
 with the device's one transport key, an empty relay map and no relay or discovery service of its own.
 A host enters the endpoint when the device first dials it. Its Pkarr resolver and DNS origin are
 registered under the host's endpoint identity, and an address lookup is asked about the identity of
-the host that owns it and about no other. For a paired host (`HostLink::connect_paired_transport`)
-the host's relays go into the relay map at that first dial, so the map holds the relays of the hosts
-the run has dialled and no others. A host that a pairing invitation names (`HostLink::dial`) enters
-with its lookups only: its relays stay out of the map until the pairing completes and the device
-dials the host as a paired host. Dialling a host again with the same services changes nothing, and a
-changed configuration for the same identity replaces what that identity had.
+the host that owns it and about no other. For a host that a paired record names
+(`HostLink::connect_paired_transport`) the host's relays go into the relay map at that first dial,
+so the map holds the relays of the hosts the run has dialled and no others. A host that a pairing
+invitation names (`HostLink::dial`) enters with its lookups only: its relays stay out of the map
+until the pairing completes and the device dials the host as a paired host. So does the host of a
+recovery, the connect that a device makes as the identity derived for it before any record holds
+that identity: its credentials name no pairing, the dial enters the host with its lookups only, and
+the pool keeps no pairing for it, so a recovery that does not complete leaves nothing behind for the
+forget of a later pairing with the host to miss. The pool refuses the recovery when the person
+forgot that identity. Dialling a host again with the same services changes nothing, and a changed
+configuration for the same identity replaces what that identity had.
 
 A key holds one endpoint on a relay at a time, and with one endpoint for every host that holds by
 construction. No request for one host refuses, closes or restarts the connection of another, and a

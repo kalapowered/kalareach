@@ -106,6 +106,9 @@ pub struct HostCredentials {
     pub network_config: NetworkConfig,
     /// The organisation membership the host's grant to this device requires, if it does.
     pub organisation: Nullable<OrganisationRequirement>,
+    /// The identity the host gave this device in the pairing that a record holds. None for an
+    /// attempt that has written no record, which dials as the identity derived for it.
+    pub pairing: Option<DeviceId>,
 }
 
 crate::debug_fields!(HostCredentials {
@@ -137,6 +140,7 @@ impl PairedHost {
             host_endpoint_id: self.host_endpoint_id,
             network_config: self.network_config.clone(),
             organisation: self.proposed_grant.organisation,
+            pairing: Some(self.device_id),
         }
     }
 
@@ -220,6 +224,7 @@ impl PendingAttempt {
             host_endpoint_id: self.host_endpoint_id,
             network_config: self.network_config.clone(),
             organisation: self.proposed_grant.organisation,
+            pairing: None,
         }
     }
 }
@@ -652,6 +657,34 @@ mod tests {
         assert_eq!(held(&store), 3);
         let reopened = PairedHosts::open(directory.path().join("pairing")).expect("a store");
         assert_eq!(held(&reopened), 3, "it is kept");
+    }
+
+    /// A record's credentials name the pairing the record holds, and an attempt's, which has
+    /// written no record, name none.
+    #[test]
+    fn credentials_name_a_pairing_only_where_a_record_holds_it() {
+        let paired = host(1, &[ActionRight::SessionView]);
+        assert_eq!(paired.credentials().pairing, Some(paired.device_id));
+
+        let pending = PendingAttempt {
+            mode: AttemptMode::Direct,
+            invitation_id: InvitationId::new(Uuid::from_bytes([4; 16])),
+            host_device_id: paired.host_device_id,
+            host_key_revision: paired.host_key_revision,
+            host_keys: paired.host_keys,
+            host_endpoint_id: paired.host_endpoint_id,
+            network_config: NetworkConfig::empty(),
+            proposed_grant: grant(&[ActionRight::SessionView]),
+            verification_value: "f3c146fd".to_owned(),
+            value_confirmed: true,
+            expires_at_ms: None,
+            recover_until_ms: 1,
+            tries_left: None,
+        };
+        let credentials = pending.credentials();
+        assert_eq!(credentials.pairing, None);
+        assert_eq!(credentials.host_device_id, paired.host_device_id);
+        assert_eq!(credentials.host_endpoint_id, paired.host_endpoint_id);
     }
 
     /// Records that cannot be read are an error, never an empty list.
