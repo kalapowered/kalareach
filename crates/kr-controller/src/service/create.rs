@@ -765,9 +765,9 @@ impl Controller {
 
         // The address the worker binds for its own clients is longer than the rendezvous address,
         // by its display number and a letter, so a runtime directory can hold the one and not the
-        // other. A worker that cannot make its address ends before it reports, and the create
-        // would only learn that when its window ran out. It is known from the reservation, so it
-        // is checked here with nothing started.
+        // other. A worker that cannot make its address would start only to report that it cannot
+        // listen. The address is known from the reservation, so it is checked here, with nothing
+        // started.
         if let Err(error) = self.paths.worker_endpoint(reservation.display_number) {
             hold.end_wait().await;
             self.resolve_failed(&reservation).await;
