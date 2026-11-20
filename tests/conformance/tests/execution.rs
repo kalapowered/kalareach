@@ -1101,9 +1101,9 @@ fn a_listing_that_does_not_end_is_ended_at_the_steps_limit_with_the_process_it_s
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: the time of a step is one time for its build,
-/// its listing and its run together. The build waits 5 s and the listing waits 5 s, each less than
-/// the limit of 8 s and both more: the step is out of time in its listing, which a time given again
-/// to each command would not give. The fixture is built once without a limit first.
+/// its listing and its run together. The build waits 10 s and the listing waits 10 s, each less
+/// than the limit of 16 s and both more: the step is out of time in its listing, which a time given
+/// again to each command would not give. The fixture is built once without a limit first.
 #[cfg(unix)]
 #[test]
 fn the_time_of_a_step_is_one_time_for_its_build_its_listing_and_its_run_together() {
@@ -1115,27 +1115,27 @@ fn the_time_of_a_step_is_one_time_for_its_build_its_listing_and_its_run_together
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     assert!(warm.document.passed(), "{:?}", warm.document.steps);
     let env = format!(
-        ", KR_BLOCK = 'both', KR_BLOCK_SECONDS = '5', KR_BLOCK_PIDS = '{}'",
+        ", KR_BLOCK = 'both', KR_BLOCK_SECONDS = '10', KR_BLOCK_PIDS = '{}'",
         pids.display()
     );
-    let ran = run(&root, &cargo_plan(target.path(), "timeout = 8", &env))
+    let ran = run(&root, &cargo_plan(target.path(), "timeout = 16", &env))
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 1);
-    assert_ended_at_its_limit(&ran, 8, &started);
+    assert_ended_at_its_limit(&ran, 16, &started);
     // The step ran out of time in its listing: the log says the listing did not end, before the
     // words of the limit.
     let log = std::fs::read_to_string(ran.evidence.path().join(&ran.document.steps[0].log))
         .expect("the log");
     let kept = log.find("== the listing failed: ").expect(&log);
-    let said = log.find("== ran out of its time limit: 8 s").expect(&log);
+    let said = log.find("== ran out of its time limit: 16 s").expect(&log);
     assert!(kept < said, "{log}");
     assert!(log[kept..said].contains("(time limit reached)"), "{log}");
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: the one time of a step is also the time of
 /// its run, after its build and its listing have taken theirs. The build waits 2 s, the listing
-/// waits 2 s and the run waits 6 s, each less than the limit of 8 s and the three more: the step is
-/// out of time in its run, which a time given again to the run would not give. The fixture is built
+/// waits 2 s and the run waits 12 s, each less than the limit of 16 s and the three more: the step
+/// is out of time in its run, which a time given again to the run would not give. The fixture is built
 /// once without a limit first.
 #[cfg(unix)]
 #[test]
@@ -1148,19 +1148,19 @@ fn the_time_of_a_step_is_also_the_time_of_its_run_after_its_build_and_its_listin
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     assert!(warm.document.passed(), "{:?}", warm.document.steps);
     let env = format!(
-        ", KR_BLOCK = 'both', KR_BLOCK_SECONDS = '2', KR_RUN_SECONDS = '6', KR_BLOCK_PIDS = '{}'",
+        ", KR_BLOCK = 'both', KR_BLOCK_SECONDS = '2', KR_RUN_SECONDS = '12', KR_BLOCK_PIDS = '{}'",
         pids.display()
     );
-    let ran = run(&root, &cargo_plan(target.path(), "timeout = 8", &env))
+    let ran = run(&root, &cargo_plan(target.path(), "timeout = 16", &env))
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 1);
     let step = &ran.document.steps[0];
     assert_eq!(
         (step.exit, step.error.as_deref()),
-        (None, Some("ran out of its time limit: 8 s")),
+        (None, Some("ran out of its time limit: 16 s")),
         "{step:?}"
     );
-    assert_ended_at_its_limit(&ran, 8, &started);
+    assert_ended_at_its_limit(&ran, 16, &started);
     // The step ran out of time in its run: the log has the run's line, and no listing failed.
     let log = std::fs::read_to_string(ran.evidence.path().join(&step.log)).expect("the log");
     assert!(
