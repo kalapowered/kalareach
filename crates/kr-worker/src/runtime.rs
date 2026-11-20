@@ -1143,10 +1143,18 @@ impl SessionRuntime {
                 // already with the application: half a delimiter is what an abandoned batch can
                 // never leave behind, because the next actor's input would complete it.
                 let expired = |clock: &dyn kr_ipc::clock::SharedClock| {
-                    authority_deadline.is_some_and(|deadline| clock.boot_elapsed_ms() >= deadline)
+                    let boot_passed = || {
+                        authority_deadline
+                            .is_some_and(|deadline| clock.boot_elapsed_ms() >= deadline)
+                    };
+                    boot_passed()
                         || authority_utc_deadline.is_some_and(|deadline| {
                             writer_time.check_utc_deadline(deadline)
                                 != crate::action::time::UtcDeadline::Ahead
+                                // What the look answers rests on readings taken before it, and it
+                                // can stand on storage: the continuous clock is read again once it
+                                // has answered.
+                                || boot_passed()
                         })
                 };
                 if expired(writer_clock.as_ref()) {
