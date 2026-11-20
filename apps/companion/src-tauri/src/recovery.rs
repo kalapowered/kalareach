@@ -594,8 +594,10 @@ impl Recovery {
 
     /// Writes the recovery kit to `destination`, flushed to disk, with the owner-only mode (0600)
     /// on Unix; on macOS the file's access list is removed first, and the save fails, leaving the
-    /// file's contents as they were, when it cannot be. On Windows a new file has the permissions of the folder
-    /// the destination is in, and a file that already existed keeps its own.
+    /// file's contents as they were, when it cannot be. On Windows the file is given an access list
+    /// that names this user and the file's owner and no one else, set before the file is emptied,
+    /// and the save fails, leaving the file as it was, when another account owns it, its list
+    /// cannot be set, or its volume keeps no access lists.
     ///
     /// # Errors
     ///
@@ -618,9 +620,7 @@ impl Recovery {
             .map_err(|error| {
                 CommandError::local_failure(format!("the kit was not written: {error}"))
             })?
-            .map_err(|error| {
-                CommandError::local_failure(format!("the kit could not be written: {error}"))
-            })
+            .map_err(|error| write_failure("the kit", &error))
     }
 
     /* ---------------------------------------------------------------------- */
@@ -652,9 +652,7 @@ impl Recovery {
             .map_err(|error| {
                 CommandError::local_failure(format!("the QR code was not written: {error}"))
             })?
-            .map_err(|error| {
-                CommandError::local_failure(format!("the QR code could not be written: {error}"))
-            })
+            .map_err(|error| write_failure("the QR code", &error))
     }
 
     /// The archives the recovery bundle names at the service, each with the newest generation the
@@ -749,9 +747,7 @@ impl Recovery {
             .map_err(|error| {
                 CommandError::local_failure(format!("the export was not written: {error}"))
             })?
-            .map_err(|error| {
-                CommandError::local_failure(format!("the export could not be written: {error}"))
-            })?;
+            .map_err(|error| write_failure("the export", &error))?;
         Ok(ExportSaved {
             path,
             archive_id,
@@ -1196,6 +1192,22 @@ fn qr_svg(code: &qrcodegen::QrCode) -> Zeroizing<String> {
     svg
 }
 
+/// What a refused write of the file the person chose tells them.
+///
+/// A volume that keeps no access lists, such as FAT or exFAT, is refused on Windows, because the
+/// file cannot be made readable by its owner alone there, and the person is told where to go
+/// instead.
+fn write_failure(what: &str, error: &std::io::Error) -> CommandError {
+    if cfg!(windows) && error.kind() == std::io::ErrorKind::Unsupported {
+        CommandError::local_failure(format!(
+            "{what} was not written: {error}. Choose a folder on a volume that keeps access \
+             lists, such as your computer's own drive."
+        ))
+    } else {
+        CommandError::local_failure(format!("{what} could not be written: {error}"))
+    }
+}
+
 /// Writes `body` as the whole of the file the person chose for the kit, readable by this user alone
 /// where the platform has such a thing.
 ///
@@ -1208,22 +1220,28 @@ fn qr_svg(code: &qrcodegen::QrCode) -> Zeroizing<String> {
 ///
 /// An existing file is not emptied until it has been made private to this user: its mode is set,
 /// and on macOS its access list is cleared through the descriptor that goes on to receive the kit.
-/// A file whose mode this user cannot change, or whose list cannot be cleared, keeps its contents
-/// and the save fails. Two limits remain. A process that opened the file before it was made private
-/// (an earlier file that was wider, or a new file made in a folder whose inherited list names
-/// another account) keeps what that open gave it, and only a new file in a folder this program may
-/// write in would take that back. On Windows a file that already exists keeps its own access list.
+/// On Windows its access list is set to the owner-only list through the handle that goes on to
+/// receive the kit, provided its owner is the account that owns the files this program creates.
+/// A file whose mode this user cannot change, or whose list cannot be cleared or set, keeps its
+/// contents and the save fails. A process that opened the file before it was made private (an
+/// earlier file that was wider, or a new file made in a folder whose inherited list names another
+/// account, on a platform whose mode or list is not set at creation) keeps what that open gave it.
 fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
+    #[cfg(windows)]
+    let mut file = kr_ipc::paths::open_owner_only_in_place(path)?;
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(path)?
+    };
     #[cfg(unix)]
     {
         // A file that already existed keeps the mode it had, so it is set again.
@@ -1246,4 +1264,41 @@ pub(crate) fn now() -> TimestampMs {
                 u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
             }),
     )
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// A volume that keeps no access lists refuses the kit, the QR code and the offline copy in the
+    /// words of the refusal and tells the person where to go, and another failure does not.
+    #[test]
+    fn a_volume_that_keeps_no_access_lists_is_refused_with_a_way_forward() {
+        let refused = std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the volume does not keep access lists, so this file cannot be made readable by its \
+             owner alone",
+        );
+        assert_eq!(
+            write_failure("the kit", &refused).message,
+            "the kit was not written: the volume does not keep access lists, so this file cannot \
+             be made readable by its owner alone. Choose a folder on a volume that keeps access \
+             lists, such as your computer's own drive."
+        );
+        assert!(
+            write_failure("the QR code", &refused)
+                .message
+                .starts_with("the QR code was not written: ")
+        );
+        assert!(
+            write_failure("the export", &refused)
+                .message
+                .ends_with("such as your computer's own drive.")
+        );
+        let other = std::io::Error::other("the disk is full");
+        assert_eq!(
+            write_failure("the kit", &other).message,
+            "the kit could not be written: the disk is full"
+        );
+    }
 }
