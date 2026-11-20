@@ -106,6 +106,12 @@ impl Gate {
         self.state().writes
     }
 
+    /// Puts back what writes did before a write that the wire did not take: the budget of
+    /// [`Writes::PassFor`] is spent by the bytes the wire took, and by no others. Nothing is woken.
+    fn restore(&self, mode: Writes) {
+        self.state().writes = mode;
+    }
+
     fn waits(&self) -> usize {
         self.state().waits
     }
@@ -243,6 +249,7 @@ impl AsyncWrite for Wire {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let before = self.gate.mode();
         match self.gate.write(cx.waker(), buf.len()) {
             Some(Ok(())) => {}
             Some(Err(error)) => return Poll::Ready(Err(error)),
@@ -253,7 +260,11 @@ impl AsyncWrite for Wire {
             this.staged.extend_from_slice(buf);
             return Poll::Ready(Ok(buf.len()));
         }
-        Pin::new(&mut this.inner).poll_write(cx, buf)
+        let written = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if written.is_pending() {
+            this.gate.restore(before);
+        }
+        written
     }
 
     fn is_write_vectored(&self) -> bool {
