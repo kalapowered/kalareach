@@ -683,6 +683,57 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
     assert_eq!(record.needs, [plan::SECRET_STORE_VARIABLE], "{record:?}");
 }
 
+/// KR-REQ-29.01, the part about machine-readable results, on Windows: a TypeScript test that a run
+/// selects with `--group typescript` is recorded as not run, with the reason that the suites are
+/// qualified on Linux and macOS, because no step of the Windows plan reads it.
+#[test]
+fn a_typescript_test_that_a_windows_run_selects_is_not_run_and_says_where_it_is_qualified() {
+    let row = identifier("KR-REQ-29.01");
+    let mut map = Map::default();
+    map.keys.entry(row).or_default().insert(
+        Place::TypeScript {
+            package: "packages/protocol".to_owned(),
+            file: "packages/protocol/src/a.test.ts".to_owned(),
+            line: 3,
+            title: "a title".to_owned(),
+        },
+        Key {
+            binding: Binding::Title,
+            source: "packages/protocol/src/a.test.ts:3".to_owned(),
+        },
+    );
+    let groups = vec!["typescript".to_owned()];
+    let options = Options {
+        root: PathBuf::from("/tmp/r"),
+        evidence: PathBuf::from("/tmp/e"),
+        selection: Some(groups.clone()),
+        all_terminals: false,
+        platform: Platform::Windows,
+        plan: core_plan(),
+        held_to_ignored_runs: false,
+        applications: None,
+        lister: PathBuf::from("/tmp/l"),
+        environment: Vec::new(),
+        part: None,
+        runner_base: PathBuf::new(),
+    };
+    let document = report::assemble(
+        &options,
+        &groups,
+        &map,
+        &[],
+        Gathered::default(),
+        "2026-09-26T00:00:00Z".to_owned(),
+    );
+    let record = &document.identifiers["KR-REQ-29.01"].tests[0];
+    assert_eq!(record.outcome, Outcome::NotRun, "{record:?}");
+    assert_eq!(
+        record.reason.as_deref(),
+        Some("the TypeScript suites are qualified on Linux and macOS"),
+        "{record:?}"
+    );
+}
+
 /// KR-REQ-29.01, the part about machine-readable results: a run over a tree that ignores nothing
 /// reports every identifier it keys with a verdict and, for each test that keys it, the outcome; a
 /// test keyed twice is recorded once, by its own comment.
