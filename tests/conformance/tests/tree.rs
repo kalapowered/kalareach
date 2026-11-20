@@ -8,7 +8,12 @@
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
+
+use rustix::process::{Pid, Signal, kill_process_group};
 
 use kr_conformance::tree::{self, Captured, Deadline, GRACE, Waited};
 
@@ -80,44 +85,115 @@ fn left_after(pids: &[String], within: Duration) -> Vec<String> {
     }
 }
 
-/// Ends, when it is dropped, every process that a fixture script recorded in the file it is made
-/// with, so that a case that fails, at any of its assertions, leaves none. A case makes it before it
-/// starts the command.
-struct EndsWhatItRecorded<'a>(&'a Path);
-
-impl Drop for EndsWhatItRecorded<'_> {
-    fn drop(&mut self) {
-        for pid in std::fs::read_to_string(self.0).unwrap_or_default().lines() {
-            let _ = Command::new("sh")
-                .args(["-c", &format!("kill -9 {pid} 2>/dev/null")])
-                .status();
-        }
-    }
-}
-
-/// What a call that was started on a thread of its own gave.
+/// What a call that was supervised gave.
 type Call = std::io::Result<Waited<Output>>;
 
-/// Starts `command` under `deadline` on a thread of its own.
-fn start(mut command: Command, deadline: Deadline) -> std::sync::mpsc::Receiver<Call> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(tree::output(&mut command, Some(deadline)));
+/// What ends a group that its call did not end: it is given the group's number.
+type End = Arc<dyn Fn(Pid) + Send + Sync>;
+
+/// The controller of a fixture command: it starts `command` as the leader of a group of its own and
+/// keeps the leader, which [`tree::watch`] supervises on this thread. A watchdog sends `end` the
+/// group's number only when the call has not returned `within` a time after the start. A call that
+/// has not returned has not reaped the leader, for every wait in `watch` is the last thing it does
+/// before it returns, so the leader holds the group's number then and the signal reaches the
+/// fixture's group and no other process. The watchdog is dismissed when the call returns, and sends
+/// nothing after. Gives none when the watchdog had to send.
+fn controlled(
+    mut command: Command,
+    deadline: Deadline,
+    within: Duration,
+    end: End,
+) -> Option<Call> {
+    let mut child = match tree::spawn(&mut command, true) {
+        Ok(child) => child,
+        Err(error) => return Some(Err(error)),
+    };
+    let group = Pid::from_child(&child);
+    let (dismiss, dismissed) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        let late = dismissed.recv_timeout(within) == Err(RecvTimeoutError::Timeout);
+        if late {
+            end(group);
+        }
+        late
     });
-    receiver
+    let waited = tree::watch(&mut child, deadline);
+    drop(dismiss);
+    let late = watchdog.join().expect("the watchdog");
+    (!late).then_some(waited)
 }
 
-/// What the call gave, or none when it had not returned `within` a time after the start: a call that
-/// does not return is data for the case, which ends what the fixture left before it fails, and does
-/// not hold the program.
-fn within(receiver: &std::sync::mpsc::Receiver<Call>, time: Duration) -> Option<Call> {
-    receiver.recv_timeout(time).ok()
+/// What ends the group of a fixture that did not end: the signal that cannot be caught.
+fn kill_the_group() -> End {
+    Arc::new(|group| {
+        let _ = kill_process_group(group, Signal::KILL);
+    })
+}
+
+/// Runs `command` under `deadline` as a controlled fixture on a thread of its own, which gives what
+/// the call returned, or none when it did not return in a minute.
+fn start(command: Command, deadline: Deadline) -> std::thread::JoinHandle<Option<Call>> {
+    std::thread::spawn(move || {
+        controlled(command, deadline, Duration::from_secs(60), kill_the_group())
+    })
+}
+
+/// [`start`], and waits for its end.
+fn run(command: Command, deadline: Deadline) -> Option<Call> {
+    start(command, deadline).join().expect("the controller")
 }
 
 /// What a call that returned in time gave, for a command that started.
 fn returned(call: Option<Call>) -> Waited<Output> {
     call.expect("the call did not return in time")
         .expect("a started command")
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the controller of a fixture sends nothing once
+/// its call has returned: a command that ends at once, with a watchdog that waits 2 s, and 4 s
+/// after the call, no signal was sent. A signal after the call would go to a number that the
+/// leader no longer holds.
+#[test]
+fn the_controller_of_a_fixture_sends_no_signal_after_its_call_has_returned() {
+    let sent = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&sent);
+    let end: End = Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    });
+    let call = controlled(
+        bash("exit 0", &[]),
+        deadline_in(30),
+        Duration::from_secs(2),
+        end,
+    );
+    assert!(matches!(returned(call), Waited::Done(_)));
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(
+        sent.load(Ordering::SeqCst),
+        0,
+        "the controller sent a signal after its call had returned"
+    );
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the controller of a fixture ends the group
+/// of a call that has not returned `within` its time, once: a command that waits 20 s under a
+/// deadline of 600 s, with a watchdog that waits 2 s, gives none and is sent one signal.
+#[test]
+fn the_controller_of_a_fixture_ends_the_group_of_a_call_that_does_not_return_once() {
+    let sent = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&sent);
+    let end: End = Arc::new(move |group| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        let _ = kill_process_group(group, Signal::KILL);
+    });
+    let call = controlled(
+        bash("sleep 20", &[]),
+        deadline_in(600),
+        Duration::from_secs(2),
+        end,
+    );
+    assert!(call.is_none(), "the call returned in time");
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: a command whose time is spent before it is
@@ -156,8 +232,7 @@ fn a_command_whose_time_is_spent_before_it_starts_is_not_started() {
 fn a_leader_that_ended_while_a_process_of_its_group_holds_the_pipe_is_not_reaped_before_the_end() {
     let place = tempfile::tempdir().expect("a directory");
     let pids = place.path().join("pids.txt");
-    let script = "trap '' TERM\nsleep 300 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"$1\"\nexit 0";
-    let _ends = EndsWhatItRecorded(&pids);
+    let script = "trap '' TERM\nsleep 61 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"$1\"\nexit 0";
     let deadline = deadline_in(3);
     let call = start(bash(script, &[&pids]), deadline);
     let started = recorded_pids(&pids, 2);
@@ -175,7 +250,7 @@ fn a_leader_that_ended_while_a_process_of_its_group_holds_the_pipe_is_not_reaped
         seen.push((alive(&started[0]), alive(&started[1])));
         std::thread::sleep(Duration::from_millis(100));
     }
-    let waited = returned(within(&call, Duration::from_secs(60)));
+    let waited = returned(call.join().expect("the controller"));
     let left = left_after(&started, Duration::from_secs(10));
     assert!(matches!(waited, Waited::TimedOut(_)), "{waited:?}");
     assert!(!seen.is_empty());
@@ -198,12 +273,8 @@ fn the_group_is_asked_to_end_and_has_the_grace_before_it_is_ended_by_force() {
     let place = tempfile::tempdir().expect("a directory");
     let file = place.path().join("ended.txt");
     let pids = place.path().join("pids.txt");
-    let _ends = EndsWhatItRecorded(&pids);
-    let script = "trap 'sleep 1; printf \"%s\\n\" ended >> \"$1\"; printf \"%s\\n\" asked; exit 0' TERM\nsleep 300 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait";
-    let waited = returned(within(
-        &start(bash(script, &[&file, &pids]), deadline_in(3)),
-        Duration::from_secs(60),
-    ));
+    let script = "trap 'sleep 1; printf \"%s\\n\" ended >> \"$1\"; printf \"%s\\n\" asked; exit 0' TERM\nsleep 61 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait";
+    let waited = returned(run(bash(script, &[&file, &pids]), deadline_in(3)));
     let captured = timed_out(waited);
     let written = std::fs::read_to_string(&file).unwrap_or_default();
     assert_eq!(
@@ -222,11 +293,10 @@ fn a_process_that_writes_more_than_a_pipe_holds_when_asked_to_end_is_read_throug
     let place = tempfile::tempdir().expect("a directory");
     let marker = place.path().join("marker.txt");
     let pids = place.path().join("pids.txt");
-    let _ends = EndsWhatItRecorded(&pids);
-    let script = "trap 'head -c 600000 /dev/zero; printf \"%s\\n\" done >> \"$1\"; exit 0' TERM\nsleep 300 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait";
-    let captured = timed_out(returned(within(
-        &start(bash(script, &[&marker, &pids]), deadline_in(3)),
-        Duration::from_secs(60),
+    let script = "trap 'head -c 600000 /dev/zero; printf \"%s\\n\" done >> \"$1\"; exit 0' TERM\nsleep 61 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait";
+    let captured = timed_out(returned(run(
+        bash(script, &[&marker, &pids]),
+        deadline_in(3),
     )));
     let written = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(
@@ -243,13 +313,9 @@ fn a_process_that_writes_more_than_a_pipe_holds_when_asked_to_end_is_read_throug
 fn a_pipe_that_a_process_of_the_group_holds_past_the_leader_s_end_is_ended_at_the_deadline() {
     let place = tempfile::tempdir().expect("a directory");
     let pids = place.path().join("pids.txt");
-    let script = "sleep 300 &\nprintf '%s\\n' \"$!\" > \"$1\"";
-    let _ends = EndsWhatItRecorded(&pids);
+    let script = "sleep 61 &\nprintf '%s\\n' \"$!\" > \"$1\"";
     let began = Instant::now();
-    let call = within(
-        &start(bash(script, &[&pids]), deadline_in(2)),
-        Duration::from_secs(60),
-    );
+    let call = run(bash(script, &[&pids]), deadline_in(2));
     let started = recorded_pids(&pids, 1);
     let left = left_after(&started, Duration::from_secs(10));
     let waited = returned(call);
@@ -273,12 +339,8 @@ fn a_pipe_that_a_process_outside_the_group_holds_is_closed_when_the_call_returns
     // Job control puts the background job in a group of its own.
     let script =
         "set -m\n(while :; do echo tick; sleep 0.2; done) &\nprintf '%s\\n' \"$!\" > \"$1\"";
-    let _ends = EndsWhatItRecorded(&pids);
     let began = Instant::now();
-    let call = within(
-        &start(bash(script, &[&pids]), deadline_in(2)),
-        Duration::from_secs(60),
-    );
+    let call = run(bash(script, &[&pids]), deadline_in(2));
     let started = recorded_pids(&pids, 1);
     let took = began.elapsed();
     // The process has had the whole of the call's time to be written to and is not ended by it.
@@ -301,15 +363,11 @@ fn a_pipe_that_a_process_outside_the_group_holds_is_closed_when_the_call_returns
 fn what_a_command_wrote_before_its_time_was_spent_is_kept() {
     let place = tempfile::tempdir().expect("a directory");
     let pids = place.path().join("pids.txt");
-    let _ends = EndsWhatItRecorded(&pids);
     let script =
-        "printf 'out\\n'; printf 'err\\n' >&2; sleep 300 &\nprintf '%s\\n' \"$!\" > \"$1\"\nwait";
+        "printf 'out\\n'; printf 'err\\n' >&2; sleep 61 &\nprintf '%s\\n' \"$!\" > \"$1\"\nwait";
     let mut command = bash(script, &[&pids]);
     command.stderr(Stdio::piped());
-    let captured = timed_out(returned(within(
-        &start(command, deadline_in(4)),
-        Duration::from_secs(60),
-    )));
+    let captured = timed_out(returned(run(command, deadline_in(4))));
     assert_eq!(
         (captured.stdout.as_slice(), captured.stderr.as_slice()),
         (b"out\n".as_slice(), b"err\n".as_slice())
@@ -324,10 +382,7 @@ fn a_command_that_writes_a_great_deal_to_both_pipes_ends_in_its_time_with_all_it
     let script = "head -c 3000000 /dev/zero >&2; head -c 3000000 /dev/zero";
     let mut command = bash(script, &[]);
     command.stderr(Stdio::piped());
-    let waited = returned(within(
-        &start(command, deadline_in(30)),
-        Duration::from_secs(60),
-    ));
+    let waited = returned(run(command, deadline_in(30)));
     let Waited::Done(output) = waited else {
         panic!("the command did not end in its time");
     };
