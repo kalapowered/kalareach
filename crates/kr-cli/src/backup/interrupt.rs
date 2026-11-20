@@ -10,13 +10,27 @@
 //! Windows polls sockets only, so a command there reads its secret without a handler and installs
 //! one afterwards ([`Interrupt::arm`]): before that, Ctrl-C ends the process, which has written and
 //! changed nothing. A command that asks questions arms it before the first one, and the handler
-//! takes Ctrl-Break as it takes Ctrl-C. Closing the window, signing out and shutting down end the
-//! process after a few seconds whatever a handler says.
+//! takes Ctrl-Break as it takes Ctrl-C, and keeps taking both until the process ends. Closing the
+//! window, signing out and shutting down end the process after a few seconds whatever a handler
+//! says.
 
 use kr_client::shown;
 use kr_client::shown::Shown;
 
 use crate::error::{CliError, Result};
+
+/// The receivers that keep Ctrl-C and Ctrl-Break taken from the moment a command arms its interrupt
+/// to the end of the process, though the command's own are dropped sooner. The handler that tokio
+/// installs gives an event to the system's default handler, which ends the process, as soon as no
+/// receiver is left to take it, and a command's receivers are dropped before `kr` has said that it
+/// stopped.
+#[cfg(windows)]
+static KEPT: std::sync::Mutex<
+    Option<(
+        tokio::signal::windows::CtrlC,
+        tokio::signal::windows::CtrlBreak,
+    )>,
+> = std::sync::Mutex::new(None);
 
 /// The signals that mean stop, and clean up first.
 pub struct Interrupt {
@@ -90,6 +104,15 @@ impl Interrupt {
             if self.ctrl_break.is_none() {
                 self.ctrl_break = Some(tokio::signal::windows::ctrl_break().map_err(failed)?);
             }
+            let mut kept = KEPT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if kept.is_none() {
+                *kept = Some((
+                    tokio::signal::windows::ctrl_c().map_err(failed)?,
+                    tokio::signal::windows::ctrl_break().map_err(failed)?,
+                ));
+            }
         }
         Ok(())
     }
@@ -124,4 +147,26 @@ impl Interrupt {
 #[must_use]
 pub fn stopped() -> CliError {
     CliError::Other(Shown::said("stopped before it finished"))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// The process still holds a receiver for Ctrl-C and for Ctrl-Break after the interrupt that
+    /// armed them is dropped, which is what keeps the system's default handler from ending the
+    /// command in the moment between the command's last receiver and its report that it stopped.
+    #[tokio::test]
+    async fn ctrl_c_and_ctrl_break_stay_taken_after_the_command_that_armed_them_lets_go() {
+        let mut interrupt = Interrupt::install().expect("the interrupt is installed");
+        interrupt.arm().expect("the interrupt is armed");
+        drop(interrupt);
+        let kept = KEPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            kept.is_some(),
+            "a receiver for each of Ctrl-C and Ctrl-Break is held after the command's own are dropped"
+        );
+    }
 }
