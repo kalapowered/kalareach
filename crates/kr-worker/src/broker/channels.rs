@@ -1109,7 +1109,9 @@ mod tests {
         assert!(gate.give_up().is_none(), "nothing had queued");
         let outcome = channel.submit_gated(&a_message("hello"), &gate);
         assert!(outcome.is_err(), "a gate that has given up queues nothing");
-        let refusal = outcome.err().expect("refused");
+        let Err(refusal) = outcome else {
+            unreachable!("the refusal was asserted");
+        };
         assert!(refusal.proven_unsent(), "{refusal}");
         assert!(
             refusal.to_string().contains(
@@ -1151,7 +1153,9 @@ mod tests {
         let outcome = channel_with(queue)
             .submit_gated(&a_message("hello"), &crate::broker::SubmitGate::default());
         assert!(outcome.is_err(), "a full queue takes no message");
-        let refusal = outcome.err().expect("refused");
+        let Err(refusal) = outcome else {
+            unreachable!("the refusal was asserted");
+        };
         assert!(refusal.proven_unsent(), "{refusal}");
         assert!(
             refusal
@@ -1167,7 +1171,9 @@ mod tests {
         let outcome = channel_with(queue)
             .submit_gated(&a_message("hello"), &crate::broker::SubmitGate::default());
         assert!(outcome.is_err(), "a closed queue takes no message");
-        let refusal = outcome.err().expect("refused");
+        let Err(refusal) = outcome else {
+            unreachable!("the refusal was asserted");
+        };
         assert!(refusal.proven_unsent(), "{refusal}");
         assert!(
             refusal
