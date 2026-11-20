@@ -2120,10 +2120,18 @@ async fn a_service_that_is_down_at_the_hang_up_still_stops_the_media_and_revokes
             state["control"] == "unreachable"
         })
         .await;
+    // A call the voice service controls has no final status at the host: the stop that answers a
+    // revoked grant with nothing confirmed asks the host nothing more.
+    let controls_before = scene.link.sent(HostMethod::VoiceControl);
     let closed = scene
         .call("voice_stop", json!({ "voiceSessionId": null }))
         .expect("the hang-up is answered");
     assert_eq!(closed["closed_locally"], true, "{closed}");
+    assert_eq!(
+        scene.link.sent(HostMethod::VoiceControl),
+        controls_before,
+        "no look for a final status is made for a call the voice service controls"
+    );
 
     assert!(
         scene.platform.commands().contains(&"stop".to_owned()),
@@ -8201,6 +8209,11 @@ async fn a_host_that_does_not_confirm_a_close_leaves_an_own_key_call_to_the_host
             kinds.contains(&"host_close") && !kinds.contains(&"service_close"),
             "the notice states the host's rule and no voice service's closure: {kinds:?}"
         );
+        assert_eq!(
+            left_to_host_notice(&ended),
+            Some(json!(HOST_UNHEARD_WORDS)),
+            "the notice kept says what the shown words say (signed in: {signed}): {ended}"
+        );
         let grant_ends = owed
             .iter()
             .find(|entry| entry["kind"] == "revocation")
@@ -8387,6 +8400,11 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
             assert!(
                 owed_kinds.iter().any(|kind| kind == "host_close"),
                 "a call the host did not settle is owed as left to it: {owed_kinds:?}"
+            );
+            assert_eq!(
+                left_to_host_notice(&ended),
+                Some(json!(HOST_UNHEARD_WORDS)),
+                "the notice kept says what the shown words say: {ended}"
             );
         }
         scene.stop_host().await;
@@ -8987,6 +9005,11 @@ async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_throu
         } else {
             assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
             assert!(kinds.contains(&"host_close".to_owned()), "{kinds:?}");
+            assert_eq!(
+                left_to_host_notice(&ended),
+                Some(json!(HOST_UNHEARD_WORDS)),
+                "the notice kept says what the shown words say: {ended}"
+            );
         }
         assert_eq!(
             what_reached_kalareach(&scene),
@@ -9257,10 +9280,10 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
         if cause == "deadline" {
             // The phone's own clock may end the call before the host's news of its deadline: the host
             // then revokes the grant while its sender is held and cannot confirm the provider's
-            // closure, and the call is left to it.
+            // closure, and the call is left to it in the host's words.
             let shown = ended["ended"]["words"].as_str().unwrap_or_default();
             assert!(
-                shown == words || shown == format!("{words} {LEFT_TO_HOST_WORDS}"),
+                shown == words || shown == format!("{words} {HOST_UNCONFIRMED_WORDS}"),
                 "({cause}) {ended}"
             );
         } else if cause == "recovery_unconfirmed" {
