@@ -62,6 +62,7 @@ use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::identity::{ProcessQuery, ProcessState};
+use kr_ipc::listen::{ListenLine, ListenRefusal, ListenRole, ObjectKind};
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
 };
@@ -501,7 +502,29 @@ impl Standalone {
 
     /// A tree that no daemon is started in, or that the caller has made sure may have one.
     fn make() -> Self {
-        let tree = teardown::Tree::create();
+        Self::in_tree(teardown::Tree::create())
+    }
+
+    /// A tree for the cases whose daemons are stubs that start nothing, and for the one case that
+    /// starts the real daemon where the account's runtime directory and message bus are not in its
+    /// environment, so no manager is reachable: nothing is submitted to one and none is asked at
+    /// the tree's end, which is why these run on a Mac without the account's launchd. A case that
+    /// starts the real daemon anywhere else uses [`Self::create`].
+    ///
+    /// The run must have removed both variables, as the line that runs these cases does, and this
+    /// fails by its own check when it has not.
+    fn without_service_manager() -> Self {
+        for variable in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+            assert!(
+                std::env::var_os(variable).is_none(),
+                "{variable} is set: run this case by name with \
+                 `env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS`"
+            );
+        }
+        Self::in_tree(teardown::Tree::create().without_service_manager())
+    }
+
+    fn in_tree(tree: teardown::Tree) -> Self {
         let home = tree.root().join("home");
         std::fs::create_dir_all(&home).expect("a home of this test's own");
         let fifo = tree.root().join(LIFELINE);
@@ -661,7 +684,12 @@ impl Standalone {
     /// `kr` from the installation, against this tree and nothing else, with nothing of this test's
     /// own environment but the temporary directory.
     fn kr(&self, arguments: &[&str]) -> Command {
-        let mut command = Command::new(installation().join("kr"));
+        self.kr_from(installation(), arguments)
+    }
+
+    /// [`Self::kr`] from another installation: the one a case with a stub daemon lays out.
+    fn kr_from(&self, installation: &Path, arguments: &[&str]) -> Command {
+        let mut command = Command::new(installation.join("kr"));
         command
             .args(arguments)
             .env_clear()
@@ -675,7 +703,7 @@ impl Standalone {
                 kr_ipc::paths::STATE_DIR_VARIABLE,
                 self.tree.paths().state_root(),
             )
-            .current_dir(installation())
+            .current_dir(installation)
             .stdin(Stdio::null());
         if let Some(temporary) = std::env::var_os("TMPDIR") {
             command.env("TMPDIR", temporary);
@@ -685,21 +713,29 @@ impl Standalone {
 
     /// `kr new` for an invisible, headless session of `/bin/sh` working in this tree.
     fn new_session(&self) -> Command {
+        self.new_session_from(installation())
+    }
+
+    /// [`Self::new_session`] from another installation.
+    fn new_session_from(&self, installation: &Path) -> Command {
         let cwd = self.tree.root().display().to_string();
-        self.kr(&[
-            "--json",
-            "new",
-            "--shell-mode",
-            "native_compat",
-            "--invisible",
-            "--headless",
-            "--cwd",
-            &cwd,
-            "--shell",
-            "/bin/sh",
-            "--startup",
-            "interactive",
-        ])
+        self.kr_from(
+            installation,
+            &[
+                "--json",
+                "new",
+                "--shell-mode",
+                "native_compat",
+                "--invisible",
+                "--headless",
+                "--cwd",
+                &cwd,
+                "--shell",
+                "/bin/sh",
+                "--startup",
+                "interactive",
+            ],
+        )
     }
 
     /// `kr new` as above, naming no shell mode: the host's default decides.
@@ -1470,6 +1506,345 @@ fn a_daemon_that_does_not_come_up_in_time_is_named_and_no_second_one_is_left() {
     );
     assert!(!host.answers(), "and nothing answers for the environment");
     drop(held);
+}
+
+/// A daemon for a case that needs only what a daemon writes and when it ends: a script that records
+/// that it started, waits for the case to let it go when the case asks it to, runs `prints` and ends
+/// with a failure. It binds nothing and starts nothing.
+fn stub_daemon(started: &Path, go: Option<&Path>, root: &Path, prints: &str) -> String {
+    let wait = go.map_or_else(String::new, |go| {
+        format!(
+            "while [ ! -e {} ]; do [ -d {} ] || exit 1; sleep 0.05; done\n",
+            kr_worker::testing::shell_quoted(go),
+            kr_worker::testing::shell_quoted(root)
+        )
+    });
+    format!(
+        "#!/bin/sh\n: > {}\n{wait}{prints}\nexit 1\n",
+        kr_worker::testing::shell_quoted(started)
+    )
+}
+
+/// `text` as one word of a shell line.
+fn single_quoted(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// The shell command that prints the line a daemon prints when it cannot bind its `role` endpoint
+/// for `refusal`, as the stub itself: the writer is the stub's own process number.
+fn prints_the_listen_line(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    role: ListenRole,
+    refusal: ListenRefusal,
+    tail: &str,
+) -> String {
+    let endpoint = match role {
+        ListenRole::Rendezvous => environment.rendezvous_endpoint(),
+        ListenRole::Control => environment.controller_endpoint(),
+        ListenRole::Transfer => environment.attachment_chunk_endpoint(),
+    }
+    .expect("an endpoint");
+    let written = ListenLine {
+        role,
+        refusal,
+        path: endpoint.as_text(),
+        daemon: 0,
+    }
+    .written(tail)
+    .expect("a line the daemon writes");
+    let (fields, tail) = written
+        .split_once(" daemon=0 -- ")
+        .expect("the line's writer and tail");
+    format!(
+        "printf '%s daemon=%s -- %s\\n' {} \"$$\" {}",
+        single_quoted(fields),
+        single_quoted(tail)
+    )
+}
+
+/// An installation of its own for a case whose daemon is a stub: the real `kr` and its guard, and
+/// the stub as the `kr-controller` `kr` finds beside itself.
+fn stub_installation(host: &Standalone, daemon: &str) -> PathBuf {
+    let directory = host.tree.root().join("stub-installation");
+    std::fs::create_dir(&directory).expect("a folder for the installation");
+    for name in ["kr", "kr-attach-guard"] {
+        kr_ipc::testing::place_program(
+            &support::command_binaries().join(name),
+            &directory.join(name),
+        );
+    }
+    // Written under a name nothing runs, and placed under the one `kr` runs by a copy.
+    let script = host.tree.root().join("stub-daemon.sh");
+    std::fs::write(&script, daemon).expect("writes the stub daemon");
+    kr_ipc::testing::place_program(&script, &directory.join("kr-controller"));
+    directory
+}
+
+/// Waits for `mark` to exist, within the liveness deadline.
+fn wait_for_mark(mark: &Path, what: &str) {
+    let begun = Instant::now();
+    while !mark.exists() {
+        assert!(
+            begun.elapsed() < LIVENESS_DEADLINE,
+            "{what} did not happen within {LIVENESS_DEADLINE:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// What a start says when its daemon ended after writing the line for a file where its rendezvous
+/// endpoint belongs, whichever way the case made the daemon end.
+fn assert_says_the_rendezvous_endpoint_holds_a_file(
+    output: &Output,
+    host: &Standalone,
+    tail: &str,
+) {
+    let failure = document(output, "kr new");
+    assert_eq!(output.status.code(), Some(1), "{failure}");
+    assert_eq!(failure["ok"], false, "{failure}");
+    assert_eq!(failure["code"], "ENVIRONMENT_UNAVAILABLE", "{failure}");
+    let message = failure["message"].as_str().unwrap_or_default();
+    // The command knows this tree's own folders, so it names the path whole.
+    let rendezvous = host
+        .tree
+        .environment()
+        .rendezvous_endpoint()
+        .expect("an endpoint")
+        .as_text();
+    assert!(
+        message.starts_with(&format!(
+            "the control daemon this command started for environment {} (process ",
+            host.tree.environment_id()
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!(
+            ") ended; its log reports that it could not listen on its rendezvous endpoint \
+             {rendezvous}: it holds a file; kr does not remove what it did not make; if you do not \
+             need it, move it away, then run the command again; what it writes is in "
+        )),
+        "the failure says why the daemon ended, in this command's words: {message}"
+    );
+    assert!(
+        !message.contains("seconds"),
+        "and says no bound was waited out: {message}"
+    );
+    assert!(
+        !message.contains(tail),
+        "and repeats nothing of the daemon's own text: {message}"
+    );
+}
+
+/// KR-REQ-07.12: a standalone start whose daemon ended after writing why it could not listen says
+/// why, in this command's words, as soon as the daemon has ended, and does not wait out its bound.
+///
+/// The daemon is a stub that prints, as itself, the line a daemon prints for a file where its
+/// rendezvous endpoint belongs, and ends. It binds nothing and starts no worker, so the case runs
+/// where the run has taken the account's runtime directory and message bus out of its environment:
+/// `env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test
+/// startup -- --nocapture --ignored --exact <the case>`.
+#[test]
+#[ignore = "run by name with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS removed from the environment"]
+fn a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why() {
+    let host = Standalone::without_service_manager();
+    host.select_standalone();
+    let tail = "a tail only the daemon's own log holds";
+    let daemon = stub_daemon(
+        &host.tree.root().join("stub-started"),
+        None,
+        host.tree.root(),
+        &prints_the_listen_line(
+            &host.tree.environment(),
+            ListenRole::Rendezvous,
+            ListenRefusal::NotASocket {
+                object: ObjectKind::File,
+            },
+            tail,
+        ),
+    );
+    let installation = stub_installation(&host, &daemon);
+
+    let output = start(host.new_session_from(&installation)).finish("kr new");
+    assert_says_the_rendezvous_endpoint_holds_a_file(&output, &host, tail);
+}
+
+/// Something that listens on an endpoint, accepts every connection and never says a word.
+struct SilentListener {
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SilentListener {
+    fn on(endpoint: kr_ipc::paths::Endpoint) -> Self {
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&accepted);
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for the listener");
+            runtime.block_on(async move {
+                let listener =
+                    kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+                let mut held = Vec::new();
+                let mut stopped = std::pin::pin!(stopped);
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        accepted = listener.accept() => match accepted {
+                            Ok(connection) => {
+                                held.push(connection);
+                                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            Err(_) => break,
+                        },
+                    }
+                }
+            });
+        });
+        Self {
+            accepted,
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+
+    /// Waits until `count` connections have been accepted, within the liveness deadline.
+    fn wait_for_accepts(&self, count: usize) {
+        let begun = Instant::now();
+        while self.accepted.load(std::sync::atomic::Ordering::SeqCst) < count {
+            assert!(
+                begun.elapsed() < LIVENESS_DEADLINE,
+                "the listener did not accept {count} connections within {LIVENESS_DEADLINE:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for SilentListener {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// KR-REQ-07.12: something that accepts the command's connection and never answers does not hide
+/// that the daemon the command started has ended.
+///
+/// The stub records that it started, and ends only after the case has bound the listener on the
+/// control endpoint, has connected to it itself, and has seen it accept the command's own
+/// connection as well, so the command's wait is on a connection that stays silent when the stub
+/// prints its line. Run by name, as the case above is.
+#[test]
+#[ignore = "run by name with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS removed from the environment"]
+fn a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon() {
+    let host = Standalone::without_service_manager();
+    host.select_standalone();
+    let environment = host.tree.environment();
+    let started = host.tree.root().join("stub-started");
+    let go = host.tree.root().join("stub-go");
+    let tail = "a tail only the daemon's own log holds";
+    let daemon = stub_daemon(
+        &started,
+        Some(&go),
+        host.tree.root(),
+        &prints_the_listen_line(
+            &environment,
+            ListenRole::Rendezvous,
+            ListenRefusal::NotASocket {
+                object: ObjectKind::File,
+            },
+            tail,
+        ),
+    );
+    let installation = stub_installation(&host, &daemon);
+
+    let running = start(host.new_session_from(&installation));
+    wait_for_mark(&started, "the stub daemon's start");
+    // A listener on the endpoint before the command looks would stop its first look; this one
+    // comes after the stub has started the daemon, as a daemon that stalls in its start does.
+    let control = environment.controller_endpoint().expect("an endpoint");
+    let silent = SilentListener::on(control.clone());
+    let begun = Instant::now();
+    let _ready = loop {
+        match std::os::unix::net::UnixStream::connect(control.as_path()) {
+            Ok(connection) => break connection,
+            Err(error) => {
+                assert!(
+                    begun.elapsed() < LIVENESS_DEADLINE,
+                    "the listener never took a connection: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    // This case's own connection, and the command's.
+    silent.wait_for_accepts(2);
+    std::fs::write(&go, b"").expect("lets the stub go");
+
+    let output = running.finish("kr new");
+    assert_says_the_rendezvous_endpoint_holds_a_file(&output, &host, tail);
+    drop(silent);
+}
+
+/// KR-REQ-07.12: a daemon that ended because another daemon holds the environment does not end the
+/// command's wait, so the command that starts a daemon beside another one's is answered by the one
+/// that wins.
+///
+/// The first command's daemon is a stub that prints the daemon's refusal of an environment another
+/// daemon holds and ends. The second command's daemon, the real one, starts more than the command's
+/// last look after that, so a wait that ended with every daemon that ended would be over by then.
+/// Both commands create their sessions. Run by name on Linux, as the cases above are.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run by name with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS removed from the environment"]
+fn a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for() {
+    let host = Standalone::without_service_manager();
+    host.select_standalone();
+    let started = host.tree.root().join("stub-started");
+    let held = format!(
+        "kr-controller: another control daemon already owns environment {}",
+        host.tree.environment_id()
+    );
+    let daemon = stub_daemon(
+        &started,
+        None,
+        host.tree.root(),
+        &format!("printf '%s\\n' {}", single_quoted(&held)),
+    );
+    let installation = stub_installation(&host, &daemon);
+
+    let first = start(host.new_session_from(&installation));
+    wait_for_mark(&started, "the stub daemon's start");
+    std::thread::sleep(Duration::from_millis(2500));
+    let second = start(host.new_session());
+
+    let mut created = Vec::new();
+    for (what, running) in [("the first kr new", first), ("the second kr new", second)] {
+        let output = running.finish(what);
+        let document = document(&output, what);
+        assert!(
+            output.status.success(),
+            "{what} created its session: {document}; it said {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(document["state"], "live", "{what}: {document}");
+        created.push(document);
+    }
+    assert_eq!(
+        host.launched().len(),
+        1,
+        "the real daemon is the one the second command started"
+    );
+    for session in &created {
+        host.close(session);
+    }
 }
 
 /// KR-REQ-07.12: a daemon slow to come up is named when the command gives up, is left to come up,
