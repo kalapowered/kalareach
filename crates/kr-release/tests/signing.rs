@@ -425,8 +425,9 @@ fn a_key_that_two_roles_share_is_refused_wherever_a_root_is_read() {
 /// KR-REQ-26.40: one key that a root describes a second way for another role is still one key, and
 /// every call that reads a root refuses it as shared. What the comparison does not find is a key
 /// derived from another: an Ed25519 key's negation differs from it in the sign bit of its encoding,
-/// so a root that gives a key to one role and its negation to another passes. That is the limit the
-/// crate's text states, and this case holds it where it is.
+/// and its sum with a small-order point is another point, so a root that gives a key to one role and
+/// either of these to another passes. That is the limit the crate's text states, and this case
+/// holds it where it is.
 #[test]
 fn one_key_spelt_two_ways_by_two_roles_is_refused_and_a_derived_key_is_not_found() {
     let only = pair();
@@ -484,6 +485,43 @@ fn one_key_spelt_two_ways_by_two_roles_is_refused_and_a_derived_key_is_not_found
     assert!(
         check_root_keys(&root).is_ok(),
         "a key and its negation in two roles pass: {:?}",
+        check_root_keys(&root)
+    );
+    assert!(verify_root_itself(&signed_root(root, &only)).is_ok());
+
+    // A key and its sum with a point of order 8. The first is the public key of RFC 8032, section
+    // 7.1, test 1; the second differs from it by a point of order 8, so it is not in the
+    // prime-order subgroup, and the private key of the first can sign for it.
+    let from_hex = |hex: &str| -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hexadecimal"))
+            .collect()
+    };
+    let rfc_key = described(
+        "ed25519",
+        "ed25519",
+        &from_hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+    );
+    let shifted = described(
+        "ed25519",
+        "ed25519",
+        &from_hex("9158312a9a8d6e3b34c891d6d61444f8b8211c5117ebad15bdb0bd68b07e0245"),
+    );
+    assert_ne!(
+        rfc_key.key_id().expect("an identifier"),
+        shifted.key_id().expect("an identifier"),
+        "the shifted key is another key to the comparison"
+    );
+    let root = root_of(&[
+        (RoleType::Root, vec![tuf_key(&only)], 1),
+        (RoleType::Targets, vec![tuf_key(&pair())], 1),
+        (RoleType::Snapshot, vec![rfc_key], 1),
+        (RoleType::Timestamp, vec![shifted], 1),
+    ]);
+    assert!(
+        check_root_keys(&root).is_ok(),
+        "a key and its sum with a small-order point in two roles pass: {:?}",
         check_root_keys(&root)
     );
     assert!(verify_root_itself(&signed_root(root, &only)).is_ok());
