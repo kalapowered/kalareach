@@ -275,6 +275,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-controller --test teardown_jobs -- --nocapture --ignored --exact a_tree_without_a_service_manager_calls_none_at_its_end
 
+      - name: A standalone start says why a stub daemon ended
+        if: ${{ !cancelled() }}
+        run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for
+
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
       # item its reader cannot see, fails here rather than going unnoticed. These are the crates
       # whose documentation builds without one. The client library is built a second time without
