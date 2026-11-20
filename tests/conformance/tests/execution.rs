@@ -624,6 +624,93 @@ fn a_set_up_step_that_fails_leaves_its_dependent_not_run_and_fails_the_run() {
     );
 }
 
+/// A plan of the fixture `setup-step` whose steps are two set-up steps, `first` and `second`, which
+/// names `first` in `after`, and a test step, `last`, which names `second`. `first_gets` is what the
+/// first step is given besides the script.
+#[cfg(unix)]
+fn chain_of_set_up_steps(first_gets: &str) -> String {
+    let set_up = |id: &str, what: &str, after: &str, gets: &str| {
+        format!(
+            "[[step]]
+id = '{id}'
+group = 'rust'
+what = '{what}'
+platforms = ['linux', 'macos', 'windows']
+reading = 'exit'
+setup = true
+{after}{gets}command = ['bash', 'scripts/set-up.sh', '{{scratch}}/{id}.txt', '{}']
+",
+            if gets.is_empty() { "1" } else { "0" }
+        )
+    };
+    plan_of(
+        &["Cargo.toml"],
+        &format!(
+            "{}{}[[step]]
+id = 'last'
+group = 'rust'
+what = 'the test that reads the file'
+platforms = ['linux', 'macos', 'windows']
+reading = 'cargo'
+after = ['second']
+env = {{ KR_MADE_BY_SET_UP = '{{scratch}}/second.txt' }}
+command = ['cargo', 'test', '--locked', '--test', 'set_up']
+",
+            set_up("first", "the first set-up", "", first_gets),
+            set_up("second", "the second set-up", "after = ['first']\n", "")
+        ),
+    )
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a step that names a set-up step that was
+/// itself not run, because a set-up step it names failed or could not be run, is not run either,
+/// and says so in words that are true of each: the first set-up step's own failure is named once,
+/// where it happened, and the steps after it read that it was not run.
+#[cfg(unix)]
+#[test]
+fn a_failed_set_up_step_reaches_a_step_through_another_set_up_step() {
+    let (_directory, root) = copy("setup-step");
+    // The first set-up step exits 1.
+    let ran =
+        run(&root, &chain_of_set_up_steps("")).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let steps = &ran.document.steps;
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    assert_eq!(steps[0].exit, Some(1));
+    assert_eq!(
+        steps[1].error.as_deref(),
+        Some("not run because its set-up step 1 (the first set-up) exited with status 1")
+    );
+    assert_eq!(
+        steps[2].error.as_deref(),
+        Some(
+            "not run because its set-up step 2 (the second set-up) was not run, because its \
+             set-up step 1 did not succeed"
+        )
+    );
+    assert_eq!((steps[1].exit, steps[2].exit), (None, None));
+    assert_eq!(ran.document.summary.failed_steps, [1, 2, 3]);
+    // The first set-up step reads a variable that nothing sets, so it cannot be run.
+    let (_directory, root) = copy("setup-step");
+    let ran = run(
+        &root,
+        &chain_of_set_up_steps("needs = ['KR_THAT_NOTHING_SETS']\n"),
+    )
+    .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let steps = &ran.document.steps;
+    assert_eq!(
+        steps[0].error.as_deref(),
+        Some("KR_THAT_NOTHING_SETS is not set, and this step reads it")
+    );
+    assert_eq!(
+        steps[1].error.as_deref(),
+        Some(
+            "not run because its set-up step 1 (the first set-up) could not be run or read: \
+             KR_THAT_NOTHING_SETS is not set, and this step reads it"
+        )
+    );
+    assert_eq!(ran.document.summary.failed_steps, [1, 2, 3]);
+}
+
 /// KR-REQ-29.01, the part about reproducible commands: a set-up step is not run twice in a run that
 /// is one part, and a plan cut into parts gives each part the set-up steps its steps name.
 #[test]

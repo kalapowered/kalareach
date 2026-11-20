@@ -638,8 +638,9 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
     ))
 }
 
-/// The first set-up step that `step` names in `after` and that did not exit 0 or could not be run or
-/// read: its number, what it runs and what became of it. A set-up step that has not run is not one:
+/// The first set-up step that `step` names in `after` and that did not exit 0, could not be run or
+/// read, or was not run because a set-up step of its own failed: its number, what it runs and what
+/// became of it. A set-up step that has not run is not one:
 /// the plan puts each before the steps that name it.
 fn failed_set_up(step: &plan::Step, executed: &[Executed]) -> Option<(usize, String, String)> {
     step.after.iter().find_map(|name| {
@@ -647,11 +648,14 @@ fn failed_set_up(step: &plan::Step, executed: &[Executed]) -> Option<(usize, Str
             .iter()
             .enumerate()
             .find(|(_, done)| done.step.id == *name)?;
-        let why = match (&set_up.error, set_up.exit) {
-            (Some(error), _) => format!("could not be run or read: {error}"),
-            (None, Some(0)) => return None,
-            (None, Some(code)) => format!("exited with status {code}"),
-            (None, None) => "ended without an exit status".to_owned(),
+        let why = match (set_up.blocked_by, &set_up.error, set_up.exit) {
+            (Some(blocker), _, _) => {
+                format!("was not run, because its set-up step {blocker} did not succeed")
+            }
+            (None, Some(error), _) => format!("could not be run or read: {error}"),
+            (None, None, Some(0)) => return None,
+            (None, None, Some(code)) => format!("exited with status {code}"),
+            (None, None, None) => "ended without an exit status".to_owned(),
         };
         Some((index + 1, set_up.step.what.clone(), why))
     })
