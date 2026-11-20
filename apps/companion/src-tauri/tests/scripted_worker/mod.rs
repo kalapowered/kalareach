@@ -596,7 +596,7 @@ pub struct Call {
 #[derive(Debug)]
 pub enum Reached {
     /// The call arrived.
-    Call(Call),
+    Call(Box<Call>),
     /// The page's command ended first, so nothing reached the worker.
     Answered(Result<serde_json::Value, serde_json::Value>),
     /// Neither happened within the watchdog.
@@ -656,7 +656,7 @@ fn session_read_of(descriptor: &WorkerDescriptor) -> kr_protocol::session::Sessi
 
 /// The call a frame carries: a read, a mutation, or a mutation the control daemon forwarded with
 /// the caller's envelope as it arrived. Any other frame is given back.
-fn call_of(frame: ControlFrame) -> Result<Call, ControlFrame> {
+fn call_of(frame: ControlFrame) -> Result<Call, Box<ControlFrame>> {
     match frame {
         ControlFrame::Request(request) => Ok(Call {
             request_id: request.request_id,
@@ -692,7 +692,7 @@ fn call_of(frame: ControlFrame) -> Result<Call, ControlFrame> {
                 deadline_boot_ms: Some(forwarded.accepted_deadline_boot_ms.get()),
             })
         }
-        other => Err(other),
+        other => Err(Box::new(other)),
     }
 }
 
@@ -737,9 +737,8 @@ impl Link {
                 self.writer.write_message(&answer).await.ok()?;
                 continue;
             }
-            match call_of(frame) {
-                Ok(call) => return Some(call),
-                Err(ControlFrame::LocalAccess(access)) => {
+            match frame {
+                ControlFrame::LocalAccess(access) => {
                     self.writer
                         .write_message(&ControlFrame::LocalAccessAck(
                             kr_protocol::worker::LocalAccessAck {
@@ -752,7 +751,7 @@ impl Link {
                 // The control daemon hands a worker the packages it admits, every part in order, and
                 // reads one report part back for each. This worker holds no package, so it
                 // reports none.
-                Err(ControlFrame::PluginAdmissions(part)) => {
+                ControlFrame::PluginAdmissions(part) => {
                     self.writer
                         .write_message(&ControlFrame::PluginAdmissionsAck(Box::new(
                             kr_protocol::admission::PluginAdmissionsAck {
@@ -768,7 +767,10 @@ impl Link {
                         .await
                         .ok()?;
                 }
-                Err(other) => panic!("the view sent {other:?} rather than a call"),
+                other => match call_of(other) {
+                    Ok(call) => return Some(call),
+                    Err(other) => panic!("the view sent {other:?} rather than a call"),
+                },
             }
         }
     }
@@ -783,7 +785,7 @@ impl Link {
         asked: &mut tokio::task::JoinHandle<Result<serde_json::Value, serde_json::Value>>,
     ) -> Reached {
         tokio::select! {
-            call = self.next_call() => Reached::Call(call),
+            call = self.next_call() => Reached::Call(Box::new(call)),
             answer = &mut *asked => {
                 Reached::Answered(answer.expect("the command's thread finished"))
             }

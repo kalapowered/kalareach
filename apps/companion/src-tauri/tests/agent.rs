@@ -1051,8 +1051,8 @@ enum Driven {
     /// The worker was sent the probe that holds no lifetime and then the prompt itself, and the
     /// page was given the command's answer.
     Sent {
-        probe: scripted_worker::Call,
-        live: scripted_worker::Call,
+        probe: Box<scripted_worker::Call>,
+        live: Box<scripted_worker::Call>,
         settled: Result<Value, Value>,
     },
     /// The command ended, or nothing came, before both reached the worker.
@@ -1079,14 +1079,14 @@ impl Draft {
         link.refuse_with(&probe, ErrorCode::PermissionDenied, "no receipt")
             .await;
         let live = match link.reached_by(&mut asked).await {
-            Reached::Call(call) => call,
+            Reached::Call(call) => *call,
             ended => return Driven::Ended(ended),
         };
         link.answer(&live, &mutated()).await;
         let settled = answered(asked).await;
         Driven::Sent {
-            probe,
-            live,
+            probe: Box::new(probe),
+            live: Box::new(live),
             settled,
         }
     }
@@ -1111,7 +1111,10 @@ async fn a_draft_submit_reaches_the_worker_in_envelopes_that_name_its_own_instan
         settled,
     } = driven
     else {
-        unreachable!("asserted to be sent")
+        let Driven::Ended(why) = driven else {
+            unreachable!("asserted to be sent")
+        };
+        unreachable!("asserted to be sent: {why:?}")
     };
     let (own_instance, own_revision) = own(1);
     assert_eq!(
@@ -1187,7 +1190,10 @@ async fn a_draft_queue_reaches_the_worker_in_envelopes_that_name_its_own_instanc
         settled,
     } = driven
     else {
-        unreachable!("asserted to be sent")
+        let Driven::Ended(why) = driven else {
+            unreachable!("asserted to be sent")
+        };
+        unreachable!("asserted to be sent: {why:?}")
     };
     let (own_instance, own_revision) = own(2);
     assert_eq!(
