@@ -460,7 +460,22 @@ impl RemoteConnection {
                         }
                         answer
                     }
-                    None => self.proxied_read(request, entry, validated, &decided).await,
+                    None => {
+                        // The receipt's result is redacted when privacy mode removes what its
+                        // session retained, so it is released only under the privacy state it was
+                        // read under, which is taken before the worker is asked. A read that began
+                        // while privacy mode was on is released once the removal was complete.
+                        let read_under =
+                            match super::output::ReadUnder::now_settled(&self.controller).await {
+                                Ok(read_under) => read_under,
+                                Err(error) => return failure(request.request_id, error),
+                            };
+                        let answer = self.proxied_read(request, entry, validated, &decided).await;
+                        if let Some(asked) = asked.as_mut() {
+                            asked.read_under = Some(read_under);
+                        }
+                        answer
+                    }
                 }
             }
             DeviceRead::Worker => {
