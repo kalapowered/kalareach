@@ -532,7 +532,12 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
                 })
                 .collect(),
         });
-    let root_text = options.root.to_string_lossy().replace('\\', "/");
+    // A step runs in a directory of the root, so a root given relative to the working directory
+    // reaches it only as an absolute path.
+    let root_text = std::path::absolute(&options.root)
+        .unwrap_or_else(|_| options.root.clone())
+        .to_string_lossy()
+        .replace('\\', "/");
     let scratch_path = scratch::path_in(&options.runner_base);
     let scratch_text = scratch_path.to_string_lossy().replace('\\', "/");
     let steps = options.plan.steps(
