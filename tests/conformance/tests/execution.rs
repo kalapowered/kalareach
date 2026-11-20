@@ -1122,6 +1122,109 @@ fn the_time_of_a_step_is_one_time_for_its_build_its_listing_and_its_run_together
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 1);
     assert_ended_at_its_limit(&ran, 8, &started);
+    // The step ran out of time in its listing: the log says the listing did not end, before the
+    // words of the limit.
+    let log = std::fs::read_to_string(ran.evidence.path().join(&ran.document.steps[0].log))
+        .expect("the log");
+    let kept = log.find("== the listing failed: ").expect(&log);
+    let said = log.find("== ran out of its time limit: 8 s").expect(&log);
+    assert!(kept < said, "{log}");
+    assert!(log[kept..said].contains("(time limit reached)"), "{log}");
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the one time of a step is also the time of
+/// its run, after its build and its listing have taken theirs. The build waits 2 s, the listing
+/// waits 2 s and the run waits 6 s, each less than the limit of 8 s and the three more: the step is
+/// out of time in its run, which a time given again to the run would not give. The fixture is built
+/// once without a limit first.
+#[cfg(unix)]
+#[test]
+fn the_time_of_a_step_is_also_the_time_of_its_run_after_its_build_and_its_listing() {
+    let (_directory, root) = copy("time-limits");
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let target = tempfile::tempdir().expect("a target directory");
+    let pids = place.path().join("pids.txt");
+    let warm = run(&root, &cargo_plan(target.path(), "", ""))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    assert!(warm.document.passed(), "{:?}", warm.document.steps);
+    let env = format!(
+        ", KR_BLOCK = 'both', KR_BLOCK_SECONDS = '2', KR_RUN_SECONDS = '6', KR_BLOCK_PIDS = '{}'",
+        pids.display()
+    );
+    let ran = run(&root, &cargo_plan(target.path(), "timeout = 8", &env))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let started = recorded_pids(&pids, 1);
+    let step = &ran.document.steps[0];
+    assert_eq!(
+        (step.exit, step.error.as_deref()),
+        (None, Some("ran out of its time limit: 8 s")),
+        "{step:?}"
+    );
+    assert_ended_at_its_limit(&ran, 8, &started);
+    // The step ran out of time in its run: the log has the run's line, and no listing failed.
+    let log = std::fs::read_to_string(ran.evidence.path().join(&step.log)).expect("the log");
+    assert!(
+        log.lines()
+            .any(|line| line == "== cargo test --offline -- --show-output"),
+        "the step did not reach its run: {log}"
+    );
+    assert!(!log.contains("== the listing failed: "), "{log}");
+}
+
+/// The path of the `rustc` the cases run with: the first on the search path.
+#[cfg(unix)]
+fn real_rustc() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("rustc"))
+        .find(|path| path.is_file())
+        .expect("a rustc on the search path")
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the report's own question to `rustc` for the
+/// host is within the step's time: a `rustc` that does not end when it is asked is ended at the
+/// limit, with the process it started. A `rustc` that waits is put first on the search path of the
+/// step, and Cargo is told to use the real one by `RUSTC`, so only the report's question reaches it.
+#[cfg(unix)]
+#[test]
+fn a_rustc_that_does_not_end_when_asked_for_the_host_is_ended_at_the_steps_limit() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_directory, root) = copy("time-limits");
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let target = tempfile::tempdir().expect("a target directory");
+    let bin = place.path().join("bin");
+    std::fs::create_dir(&bin).expect("a directory for the rustc that waits");
+    let pids = place.path().join("pids.txt");
+    let waiting_rustc = bin.join("rustc");
+    std::fs::write(
+        &waiting_rustc,
+        "#!/bin/bash\nprintf '%s\\n' \"$$\" > \"$KR_RUSTC_PIDS\"\nsleep 40\n",
+    )
+    .expect("the rustc that waits");
+    std::fs::set_permissions(&waiting_rustc, std::fs::Permissions::from_mode(0o755))
+        .expect("a program");
+    let warm = run(&root, &cargo_plan(target.path(), "", ""))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    assert!(warm.document.passed(), "{:?}", warm.document.steps);
+    let search = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("a search path")
+    );
+    let env = format!(
+        ", PATH = '{search}', RUSTC = '{}', KR_RUSTC_PIDS = '{}'",
+        real_rustc().display(),
+        pids.display()
+    );
+    let ran = run(&root, &cargo_plan(target.path(), "timeout = 5", &env))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let started = recorded_pids(&pids, 1);
+    let step = &ran.document.steps[0];
+    assert_eq!(
+        (step.exit, step.error.as_deref()),
+        (None, Some("ran out of its time limit: 5 s")),
+        "{step:?}"
+    );
+    assert_ended_at_its_limit(&ran, 5, &started);
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: a step with a limit that ends in time is
@@ -1323,7 +1426,9 @@ fn a_step_that_is_not_run_spends_none_of_its_budget() {
 /// KR-REQ-29.01, the part about reproducible commands: a step that has a `timeout` and a budget is
 /// out of time at the earlier of the two. A `timeout` of 2 s ends the step before its budget of 100
 /// s, which the step spent little of, so the next step of the budget runs. A budget of 3 s ends the
-/// step before its `timeout` of 100 s, and the next step of the budget is not run.
+/// step before its `timeout` of 100 s, and the next step of the budget is not run. A `timeout` of 2
+/// s with a budget of 3 s ends the step by its own limit, and the wait of the kill spends the
+/// budget.
 #[cfg(unix)]
 #[test]
 fn the_earlier_of_a_steps_timeout_and_its_budget_is_the_end_of_its_time() {
@@ -1361,6 +1466,20 @@ fn the_earlier_of_a_steps_timeout_and_its_budget_is_the_end_of_its_time() {
     assert_eq!(
         (steps[0].exit, steps[0].error.as_deref()),
         (None, Some("ran out of its time limit: 3 s")),
+        "{:?}",
+        steps[0]
+    );
+    assert_eq!(
+        steps[1].error.as_deref(),
+        Some("not run because its budget was spent by step 1")
+    );
+    // A `timeout` of 2 s ends the step before its budget of 3 s, but the 2 s that the kill waits
+    // take the step to the budget's end: the step spent the budget, and the next step is not run.
+    let by_the_kill = run_with(2, 3);
+    let steps = &by_the_kill.document.steps;
+    assert_eq!(
+        (steps[0].exit, steps[0].error.as_deref()),
+        (None, Some("ran out of its time limit: 2 s")),
         "{:?}",
         steps[0]
     );
