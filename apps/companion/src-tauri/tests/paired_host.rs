@@ -1646,22 +1646,34 @@ async fn a_choice_that_waits_at_the_gate_across_a_forget_is_refused_when_it_gets
 }
 
 /// KR-REQ-18.01: a host that refuses and then answers is told refused and then in contact, as the
-/// next revision, with nothing between.
+/// next revision, with nothing between. The publisher is held on the choice's publication while the
+/// refusal and the recovery are both committed, so both wait in the log: each is told as it was
+/// committed, and not as a read of the state taken when the publisher comes to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_followed_by_recovery_is_told_in_order() {
     let two = two_hosts().await;
     let companion = &two.phone.companion;
+    let owner = Arc::clone(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .contact_owner(),
+    );
+    companion.told_everything().await;
     two.control
         .refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
+    let mut hold = owner.hold_the_publisher();
     two.uses(&two.references.0);
+    hold.reached().await;
     two.control.refuse(None);
+    // What the application holds, not what the page was told: the publisher is held.
     connection(companion, true).await;
+    hold.release();
     companion.told_everything().await;
     let told = told_states(companion);
-    let refused = told
-        .iter()
-        .position(|each| !each.0 && each.1 == "refused")
-        .expect("the refusal is told");
+    let Some(refused) = told.iter().position(|each| !each.0 && each.1 == "refused") else {
+        panic!("the refusal is told: {told:?}");
+    };
     let recovered = told[refused + 1].clone();
     assert!(recovered.0 && recovered.1 == "in_contact", "{told:?}");
     assert_eq!(
