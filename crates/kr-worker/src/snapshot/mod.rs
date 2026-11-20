@@ -177,11 +177,6 @@ impl Bases {
         self.held.remove(&attachment_id);
     }
 
-    /// Forgets every attachment, which a projection reset does to all of them at once.
-    pub fn forget_all(&mut self) {
-        self.held.clear();
-    }
-
     /// How many attachments hold a base.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1169,8 +1164,6 @@ mod tests {
             })
         );
         assert_eq!(bases.held(id).map(|held| held.viewport), Some(window));
-        bases.forget_all();
-        assert!(bases.is_empty());
     }
 
     /// KR-REQ-08.83: a delta is measured whole, not by its rows.

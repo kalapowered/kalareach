@@ -527,15 +527,6 @@ impl Questions {
         self.locked()?.read(question_id)
     }
 
-    /// Waits until something changes, or until the bound passes.
-    ///
-    /// The bound is the caller's, and the wait ends early on any change: a waiter re-reads what it
-    /// cares about and waits again if it was somebody else's question that moved. Nothing here
-    /// notifies a person a second time, and nothing recreates a question.
-    pub async fn wait_for_change(&self, within: std::time::Duration) {
-        let _ = tokio::time::timeout(within, self.subscribe()).await;
-    }
-
     /// Takes a subscription that will fire on the next change.
     ///
     /// A caller that means to read the state and then wait takes this *first*: a change between
@@ -870,9 +861,8 @@ mod tests {
             .expect("created");
         let waiting = std::sync::Arc::clone(&questions);
         let waiter = tokio::spawn(async move {
-            waiting
-                .wait_for_change(std::time::Duration::from_secs(10))
-                .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(10), waiting.subscribe()).await;
         });
         // Give the waiter a turn to register before the answer wakes it.
         tokio::task::yield_now().await;
