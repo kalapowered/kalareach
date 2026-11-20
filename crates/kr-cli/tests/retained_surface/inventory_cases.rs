@@ -33,6 +33,11 @@ fn a_place_is_skipped_when_a_condition_around_it_is_false_with_test_false_and_th
         ("#[cfg(not(all(test, unix)))]", true),
         ("#[cfg(not(any(test, windows)))]", true),
         ("#[cfg(not(test))]", true),
+        ("#[cfg(not(any(true, test)))]", false),
+        ("#[cfg(not(all(true, true)))]", false),
+        ("#[cfg(not(any(false, test)))]", true),
+        // A cfg that is false decides before a cfg_attr that no scan could read.
+        ("#[cfg(test)] #[cfg_attr(unix, path = \"x.rs\")]", false),
         // Every other name is unknown, and a place that is not false is read.
         ("#[cfg(any(test, feature = \"testing\"))]", true),
         ("#[cfg(any(all(unix, not(target_os = \"macos\")), test))]", true),
