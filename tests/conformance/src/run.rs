@@ -167,6 +167,22 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
         ));
         return executed;
     }
+    // The evidence directory is new for each run and the plan keeps the outputs of its steps apart,
+    // so an output that is there already was written by a command word or a variable of another
+    // step, and the step's reading would be of that file.
+    if let Some(output) = step.output.as_deref()
+        && std::fs::symlink_metadata(output).is_ok()
+    {
+        let shown = Path::new(output).strip_prefix(place.evidence).map_or_else(
+            |_| output.to_owned(),
+            |below| below.to_string_lossy().replace('\\', "/"),
+        );
+        executed.error = Some(format!(
+            "the output `{shown}` of the step was there before the step ran, so another step or \
+             command wrote it"
+        ));
+        return executed;
+    }
     let started = Instant::now();
     let mut executables: BTreeMap<String, TargetId> = BTreeMap::new();
     let mut environment: Vec<(String, String)> = Vec::new();
