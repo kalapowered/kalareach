@@ -1018,10 +1018,11 @@ mod windows {
         TokenOwner, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_ENCRYPTED,
-        FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GetVolumeInformationByHandleW, READ_CONTROL,
+        CREATE_NEW, CreateDirectoryW, CreateFileW, DELETE, FILE_ALL_ACCESS,
+        FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO,
+        FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+        GetVolumeInformationByHandleW, READ_CONTROL, SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::SystemServices::{
@@ -2190,7 +2191,7 @@ mod windows {
     /// handle that created it.
     ///
     /// The descriptor is part of the creation, so the file never exists under another list. The
-    /// handle holds write, read-control and read-attributes access, shares reading, writing and
+    /// handle holds write, delete, read-control and read-attributes access, shares reading, writing and
     /// deleting as the standard library's own opens do, and is not inherited by a child. The name
     /// goes through [`kr_flush::native_name`], which refuses a NUL and lifts the old length limit.
     ///
@@ -2217,7 +2218,7 @@ mod windows {
         let handle = unsafe {
             CreateFileW(
                 name.as_ptr(),
-                GENERIC_WRITE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+                GENERIC_WRITE | DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 &raw const attributes,
                 CREATE_NEW,
@@ -2259,11 +2260,44 @@ mod windows {
         #[cfg(test)]
         tests::before_the_check(path, &file);
         if let Err(error) = keeps_the_list(&file, &user) {
+            // The file is deleted through the handle that created it, not by its name: the name
+            // can have been given to another file since. It goes when the handle is closed.
+            let removal = delete_through(&file);
             drop(file);
-            let _ = std::fs::remove_file(path);
-            return Err(error);
+            return Err(match removal {
+                Ok(()) => error,
+                Err(failure) => std::io::Error::new(
+                    error.kind(),
+                    format!("{error}; the empty file it made could not be removed: {failure}"),
+                ),
+            });
         }
         Ok(file)
+    }
+
+    /// Marks the file a handle holds to be deleted when its last handle is closed. The handle has
+    /// to hold `DELETE`, which the creation of a new file asks for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's error when the file cannot be marked, as for a file that
+    /// carries the read-only attribute.
+    fn delete_through(file: &std::fs::File) -> std::io::Result<()> {
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: the handle is open for the call, and `disposition` is a live structure of the
+        // size given, which the call reads and keeps no pointer to.
+        let marked = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                (&raw const disposition).cast(),
+                u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()).unwrap_or(0),
+            )
+        };
+        if marked == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Checks that the volume of a new file keeps access lists and that the file's list reads back
