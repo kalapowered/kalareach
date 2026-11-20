@@ -1354,4 +1354,23 @@ fn the_gate_expects_what_the_audit_reports_for_an_entry_that_is_wrong_without_ca
         )),
         "{expected:?}"
     );
+    // A row names an item that no snapshot holds a reading of.
+    let expected = wrong(&|entry| {
+        let mut senders = entry.senders.to_vec();
+        senders[0].evidence = Evidence::Builds {
+            items: leak(vec![Item {
+                krate: "companion_tauri",
+                name: "Link::unread",
+                now: "n",
+                across: &[],
+            }]),
+        };
+        entry.senders = leak(senders);
+    });
+    assert!(
+        expected.iter().any(|problem| problem.ends_with(
+            ": the snapshot has no reading of the item companion_tauri::Link::unread"
+        )),
+        "{expected:?}"
+    );
 }

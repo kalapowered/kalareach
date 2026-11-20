@@ -12,13 +12,34 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::history::{
-    Report, Snapshot, Tagged, audit_tags, client_items, crates_read, none_crates, print_report,
-    read_history, version_of_tag,
+    Report, Snapshot, Tagged, audit_tags, print_report, read_history, version_of_tag,
 };
 use super::narrower::{
     ABSENT, DAEMON_CRATES, Evidence, Item, Narrower, RECEIVER_CRATES, Range, Sender,
 };
 use super::walker::Lookup;
+
+/// Whether the crate is read as a sender: the gate holds its own copy of the rule, apart from the
+/// reader's and the audit's.
+fn client(krate: &str) -> bool {
+    !RECEIVER_CRATES.contains(&krate) && !DAEMON_CRATES.contains(&krate)
+}
+
+/// The items of the entry's rows in client crates, and the crates its rows say send none, read from
+/// the evidence's own variants and not through the audit's helpers or `Evidence::items`.
+fn rows_and_silent(entry: &Narrower) -> (Vec<&'static Item>, BTreeSet<&'static str>) {
+    let mut rows = Vec::new();
+    let mut silent = BTreeSet::new();
+    for sender in entry.senders.iter() {
+        match &sender.evidence {
+            Evidence::Builds { items } | Evidence::Relays { items } => {
+                rows.extend(items.iter().filter(|item| client(item.krate)));
+            }
+            Evidence::SendsNone { crates } => silent.extend(crates.iter().copied()),
+        }
+    }
+    (rows, silent)
+}
 
 const CLIENT_ITEMS: &[Item] = &[Item {
     krate: "companion_tauri",
@@ -187,13 +208,24 @@ pub fn release_problems(listed: &[Tagged], snapshots: &[Snapshot]) -> Vec<String
 /// source.
 pub fn snapshot_problems(entry: &Narrower, snapshots: &[Snapshot]) -> Vec<String> {
     let mut problems = Vec::new();
-    let items = client_items(entry);
+    let (items, silent) = rows_and_silent(entry);
     let wanted_items: BTreeSet<(String, String)> = items
         .iter()
         .map(|item| (item.krate.to_owned(), item.name.to_owned()))
         .collect();
-    let wanted_crates: BTreeSet<String> =
-        crates_read(entry).into_iter().map(str::to_owned).collect();
+    let wanted_crates: BTreeSet<String> = items
+        .iter()
+        .map(|item| item.krate)
+        .chain(
+            entry
+                .accounts
+                .iter()
+                .map(|account| account.krate)
+                .filter(|krate| client(krate)),
+        )
+        .chain(silent.iter().copied())
+        .map(str::to_owned)
+        .collect();
     // A crate may be absent from a tag where one of its items is (the crate came later), where an
     // account of it spans only some tags, and where a row that sends none reads it.
     let may_be_absent: BTreeSet<&str> = items
@@ -201,7 +233,7 @@ pub fn snapshot_problems(entry: &Narrower, snapshots: &[Snapshot]) -> Vec<String
         .filter(|item| item.across.iter().any(|(digest, _)| *digest == ABSENT))
         .map(|item| item.krate)
         .chain(entry.accounts.iter().map(|account| account.krate))
-        .chain(none_crates(entry))
+        .chain(silent.iter().copied())
         .collect();
     let absent_text = |item: &Item| item.across.iter().any(|(digest, _)| *digest == ABSENT);
     for snapshot in snapshots {
@@ -307,7 +339,6 @@ pub fn expected_audit_problems(
     snapshots: &[Snapshot],
 ) -> Vec<String> {
     let said = |text: String| format!("history {}: {text}", entry.root);
-    let client = |krate: &str| !RECEIVER_CRATES.contains(&krate) && !DAEMON_CRATES.contains(&krate);
     let at: BTreeMap<&str, &Snapshot> = snapshots
         .iter()
         .map(|snapshot| (snapshot.at.tag.as_str(), snapshot))
@@ -340,21 +371,7 @@ pub fn expected_audit_problems(
             first.tag, entry.range.first_tag
         )));
     }
-    let rows: Vec<&Item> = entry
-        .senders
-        .iter()
-        .flat_map(|sender| sender.evidence.items())
-        .filter(|item| client(item.krate))
-        .collect();
-    let sends_none: BTreeSet<&str> = entry
-        .senders
-        .iter()
-        .filter_map(|sender| match &sender.evidence {
-            Evidence::SendsNone { crates } => Some(crates.iter().copied()),
-            _ => None,
-        })
-        .flatten()
-        .collect();
+    let (rows, sends_none) = rows_and_silent(entry);
     for item in &rows {
         let key = (item.krate.to_owned(), item.name.to_owned());
         let mut seen: Vec<String> = Vec::new();
@@ -365,7 +382,14 @@ pub fn expected_audit_problems(
             let digest = match snapshot.items.get(&key) {
                 Some(Lookup::Found(digest)) => digest.clone(),
                 Some(Lookup::Absent) => ABSENT.to_owned(),
-                _ => continue,
+                None => {
+                    problems.push(said(format!(
+                        "{}: the snapshot has no reading of the item {}::{}",
+                        tagged.tag, item.krate, item.name
+                    )));
+                    continue;
+                }
+                Some(Lookup::Failed(_)) => continue,
             };
             if seen.contains(&digest) {
                 continue;
