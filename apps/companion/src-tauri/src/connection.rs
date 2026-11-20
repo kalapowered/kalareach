@@ -17,6 +17,7 @@ use kr_client::organisation::LeaseStop;
 use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::{Said as _, Session};
+use kr_ipc::paths::Endpoint;
 use kr_protocol::ids::{BuildId, DeviceId, EnvironmentId};
 use kr_protocol::rights::ActionRight;
 use serde::Serialize;
@@ -793,6 +794,24 @@ pub async fn connect_local() -> Result<Connection> {
     })))
 }
 
+/// Connects to the controller that listens at `endpoint`, in place of the one this machine's paths
+/// name.
+///
+/// The connection is opened again at the same endpoint, where [`connect_local`] finds the paths
+/// again. A caller whose host is not at the user's own endpoint, such as a suite that runs one on
+/// a tree of its own, reaches the same connection and the same refusals through it.
+///
+/// # Errors
+///
+/// As [`connect_local`], bar the paths.
+pub async fn connect_local_at(endpoint: &Endpoint) -> Result<Connection> {
+    let endpoint = endpoint.clone();
+    Ok(dial_local(&endpoint).await?.reopening(Arc::new(move || {
+        let endpoint = endpoint.clone();
+        Box::pin(async move { dial_local(&endpoint).await.map_err(Unopened::Unreached) })
+    })))
+}
+
 /// One connection to the controller on this machine, that cannot be opened again from.
 async fn connect_local_once() -> Result<Connection> {
     let paths = kr_ipc::paths::HostPaths::discover()
@@ -804,7 +823,12 @@ async fn connect_local_once() -> Result<Connection> {
         .environment(environment_id)
         .controller_endpoint()
         .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
-    let transport = kr_client::ipc::IpcTransport::connect_app(&endpoint, build_id()?)
+    dial_local(&endpoint).await
+}
+
+/// One connection to the controller at `endpoint`, that cannot be opened again from.
+async fn dial_local(endpoint: &Endpoint) -> Result<Connection> {
+    let transport = kr_client::ipc::IpcTransport::connect_app(endpoint, build_id()?)
         .await
         .map_err(absent_host)?;
     Connection::over(transport)
