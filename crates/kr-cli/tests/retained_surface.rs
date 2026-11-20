@@ -845,13 +845,67 @@ fn a_serde_path_behind_another_crate_that_cannot_be_followed_is_an_error() {
     assert!(error.contains("kr_cbor::nothing_of_this_name"), "{error}");
 }
 
+/// Copies the named crates, and the repository's root manifest with just those as its members, so
+/// that what the crates inherit from the workspace still resolves.
 fn copy_crates(from: &Path, to: &Path, crates: &[&str]) {
+    let mut root: toml::Table = std::fs::read_to_string(from.join("Cargo.toml"))
+        .expect("the root manifest")
+        .parse()
+        .expect("a manifest");
+    let members: Vec<toml::Value> = crates
+        .iter()
+        .map(|name| toml::Value::String(format!("crates/{name}")))
+        .collect();
+    let workspace = root
+        .get_mut("workspace")
+        .and_then(toml::Value::as_table_mut)
+        .expect("a workspace");
+    workspace.insert("members".to_owned(), toml::Value::Array(members));
+    workspace.remove("exclude");
+    std::fs::create_dir_all(to).expect("a directory");
+    std::fs::write(
+        to.join("Cargo.toml"),
+        toml::to_string(&root).expect("a manifest"),
+    )
+    .expect("the root manifest");
+    // Cargo loads the manifest of every path dependency too: the other crates of the repository
+    // are there as manifests with an empty source file.
+    for folder in ["crates", "apps", "tests"] {
+        stub_manifests(from, to, &from.join(folder));
+    }
     for name in crates {
         let source = from.join("crates").join(name);
-        let target = to.join("crates").join(name);
-        std::fs::create_dir_all(&target).expect("a directory");
-        std::fs::copy(source.join("Cargo.toml"), target.join("Cargo.toml")).expect("the manifest");
-        copy_directory(&source.join("src"), &target.join("src"));
+        copy_directory(
+            &source.join("src"),
+            &to.join("crates").join(name).join("src"),
+        );
+    }
+}
+
+/// Copies the manifests found under `folder`, each with an empty library or main source file where
+/// the crate has one.
+fn stub_manifests(from: &Path, to: &Path, folder: &Path) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.expect("an entry").path();
+        if !path.is_dir() {
+            continue;
+        }
+        let relative = path.strip_prefix(from).expect("under the repository");
+        if path.join("Cargo.toml").is_file() {
+            let target = to.join(relative);
+            std::fs::create_dir_all(target.join("src")).expect("a directory");
+            std::fs::copy(path.join("Cargo.toml"), target.join("Cargo.toml"))
+                .expect("the manifest");
+            for source in ["lib.rs", "main.rs"] {
+                if path.join("src").join(source).is_file() {
+                    std::fs::write(target.join("src").join(source), "").expect("a file");
+                }
+            }
+        }
+        stub_manifests(from, to, &path);
     }
 }
 

@@ -478,41 +478,28 @@ pub fn read_history(
     Ok((expected, snapshots))
 }
 
-/// Extracts the crates of a release into a folder of this function's own, reads the entry's
-/// crates, items and sightings, and lets the folder go.
+/// Extracts a release's tree into a folder of this function's own, reads the entry's crates,
+/// items and sightings, and lets the folder go. The whole tree is extracted: Cargo reads the
+/// workspace from the root manifest and the manifests of its members.
 fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapshot, String> {
     let folder = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let mut paths = vec!["crates".to_owned()];
-    let applications =
-        releases::git_in(repository, &["ls-tree", "--name-only", &at.commit, "apps/"])?;
-    for application in applications.lines() {
-        let source = format!("{application}/src-tauri");
-        let listed =
-            releases::git_in(repository, &["ls-tree", "--name-only", &at.commit, &source])?;
-        if !listed.trim().is_empty() {
-            paths.push(source);
-        }
-    }
     let mut command = Command::new("git");
     command
         .args(["archive", "--format=tar", &at.commit])
-        .args(&paths)
         .current_dir(repository);
     let output = command
         .output()
         .map_err(|error| format!("git archive {}: {error}", at.commit))?;
     if !output.status.success() {
         return Err(format!(
-            "git archive {} {}: {}",
+            "git archive {}: {}",
             at.commit,
-            paths.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     tar::Archive::new(output.stdout.as_slice())
         .unpack(folder.path())
         .map_err(|error| format!("unpacking {}: {error}", at.tag))?;
-    let tree = Tree::at(folder.path())?;
     let method = folder.path().join("crates/kr-protocol/src/method.rs");
     let names_a_method = match std::fs::read_to_string(&method) {
         Ok(text) => Ok(WIRE_NAMES
@@ -520,6 +507,34 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
             .any(|name| text.contains(&format!("\"{name}\"")))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.to_string()),
+    };
+    // A tree Cargo cannot read is read by nothing: every crate, item and the scan of the tag fail
+    // with the text, and the audit names the tag.
+    let tree = match Tree::at(folder.path()) {
+        Ok(tree) => tree,
+        Err(error) => {
+            println!("snapshot {}: the tree cannot be read ({error})", at.tag);
+            return Ok(Snapshot {
+                at,
+                names_a_method,
+                krates: crates_read(entry)
+                    .into_iter()
+                    .map(|krate| (krate.to_owned(), Lookup::Failed(error.clone())))
+                    .collect(),
+                items: client_items(entry)
+                    .iter()
+                    .map(|item| {
+                        (
+                            (item.krate.to_owned(), item.name.to_owned()),
+                            Lookup::Failed(error.clone()),
+                        )
+                    })
+                    .collect(),
+                sightings: Err(error),
+                records: BTreeMap::new(),
+                source_errors: BTreeMap::new(),
+            });
+        }
     };
     let krates = crates_read(entry)
         .into_iter()

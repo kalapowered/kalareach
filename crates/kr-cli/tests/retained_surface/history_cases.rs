@@ -125,6 +125,18 @@ fn repo(unreadable_at: Option<usize>, broken_at: Option<usize>) -> Repo {
     let root = work.path();
     let mut tags = Vec::new();
     for (at, (version, date, step)) in RELEASES.iter().enumerate() {
+        let mut members = vec!["crates/kr-protocol"];
+        if app_lib(*step).is_some() {
+            members.extend(["crates/kr-other", APP]);
+        }
+        if unreadable_at == Some(at) {
+            members.push("crates/odd");
+        }
+        write(
+            root,
+            "Cargo.toml",
+            &format!("[workspace]\nmembers = {members:?}\nresolver = \"2\"\n"),
+        );
         write(
             root,
             "crates/kr-protocol/Cargo.toml",
@@ -669,20 +681,28 @@ fn a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_t
     else {
         panic!("a crate and a scan that failed");
     };
-    assert!(crate_error.contains("unreadable") && scan_error.contains("could not read"));
-    assert_eq!(
-        report.problems,
-        vec![
-            said(&format!(
-                "{}: the crate kr_hook cannot be read: {crate_error}",
-                unreadable.at.tag
-            )),
-            said(&format!(
-                "{}: the scan failed: {scan_error}",
-                unreadable.at.tag
-            )),
-        ]
+    assert_eq!(crate_error, scan_error);
+    assert!(
+        scan_error.contains(": cargo cannot read the workspace (error: "),
+        "{scan_error}"
     );
+    // Every crate, the scan and every item of the tag fail with the text, and the tag is named.
+    let tag = &unreadable.at.tag;
+    let mut expected_problems: Vec<String> = ["companion_tauri", "kr_hook", "kr_other"]
+        .iter()
+        .map(|krate| {
+            said(&format!(
+                "{tag}: the crate {krate} cannot be read: {crate_error}"
+            ))
+        })
+        .collect();
+    expected_problems.push(said(&format!("{tag}: the scan failed: {scan_error}")));
+    for item in ["Link::target", "old_builder", "relay"] {
+        expected_problems.push(said(&format!(
+            "{tag}: the item companion_tauri::{item} cannot be read: {crate_error}"
+        )));
+    }
+    assert_eq!(report.problems, expected_problems);
 }
 
 #[test]

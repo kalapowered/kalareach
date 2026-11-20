@@ -13,6 +13,44 @@ fn manifest(name: &str) -> String {
     format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n")
 }
 
+/// The first line of a root manifest this file writes, so that a fixture that changed since gets a new
+/// one.
+const PLANTED: &str = "# a fixture's workspace\n";
+
+/// Reads the tree at `root`; a fixture that has no root manifest gets one first, with the crates and
+/// the applications' crates it holds as its members.
+pub(super) fn tree_at(root: &Path) -> Result<Tree, String> {
+    let planted = std::fs::read_to_string(root.join("Cargo.toml"))
+        .map_or(true, |text| text.starts_with(PLANTED));
+    if root.is_dir() && planted {
+        let mut members = Vec::new();
+        for entry in std::fs::read_dir(root.join("crates")).into_iter().flatten() {
+            let name = entry.expect("an entry").file_name();
+            if root.join("crates").join(&name).join("Cargo.toml").exists() {
+                members.push(format!("crates/{}", name.to_string_lossy()));
+            }
+        }
+        for entry in std::fs::read_dir(root.join("apps")).into_iter().flatten() {
+            let name = entry.expect("an entry").file_name();
+            let member = format!("apps/{}/src-tauri", name.to_string_lossy());
+            if root.join(&member).join("Cargo.toml").exists() {
+                members.push(member);
+            }
+        }
+        members.sort();
+        let listed: Vec<String> = members.iter().map(|member| format!("{member:?}")).collect();
+        write(
+            root,
+            "Cargo.toml",
+            &format!(
+                "{PLANTED}[workspace]\nmembers = [{}]\nresolver = \"2\"\n",
+                listed.join(", ")
+            ),
+        );
+    }
+    Tree::at(root)
+}
+
 pub(super) fn write(root: &Path, path: &str, text: &str) {
     let full = root.join(path);
     std::fs::create_dir_all(full.parent().expect("a parent")).expect("a directory");
@@ -38,6 +76,19 @@ pub(super) fn small_tree(lib: &str) -> tempfile::TempDir {
     folder
 }
 
+/// The tree is not read: Cargo cannot read its workspace, and the text says so with the folder.
+fn cannot_read(folder: &tempfile::TempDir) {
+    let error = tree_at(folder.path())
+        .err()
+        .expect("a workspace Cargo cannot read");
+    let root = std::fs::canonicalize(folder.path()).expect("a folder");
+    let start = format!(
+        "{}: cargo cannot read the workspace (error: ",
+        root.display()
+    );
+    assert!(error.starts_with(&start) && error.ends_with(')'), "{error}");
+}
+
 fn alone(tree: &Tree, name: &str) -> Lookup {
     tree.lookup("kr_sender", &[name], Depth::Alone)
 }
@@ -55,16 +106,16 @@ fn a_crate_under_apps_is_read_by_its_package_name() {
         "apps/x/src-tauri/src/lib.rs",
         "pub fn app() {}\n",
     );
-    let tree = Tree::at(with.path()).expect("the tree");
+    let tree = tree_at(with.path()).expect("the tree");
     let present = Lookup::Found(String::new());
     assert_eq!(tree.krate("companion_tauri"), present);
     assert_eq!(tree.krate("kr_worker"), present);
     let without = small_tree("");
-    let tree = Tree::at(without.path()).expect("the tree");
+    let tree = tree_at(without.path()).expect("the tree");
     assert_eq!(tree.krate("kr_worker"), present);
     assert_eq!(tree.krate("companion_tauri"), Lookup::Absent);
     // The repository's own tree has the companion's crate, and its roots are followed as before.
-    let real = Tree::at(&repository()).expect("this checkout");
+    let real = tree_at(&repository()).expect("this checkout");
     assert_eq!(real.krate("companion_tauri"), present);
     assert_eq!(real.krate("kr_worker"), present);
     real.follow("kr_protocol", &["opaque_id"])
@@ -74,7 +125,7 @@ fn a_crate_under_apps_is_read_by_its_package_name() {
 #[test]
 fn a_lookup_says_what_it_found_and_why_it_could_not() {
     let folder = small_tree("pub fn present() {}\n");
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(tree.krate("kr_nothing"), Lookup::Absent);
     assert_eq!(tree.item("kr_nothing", "x"), Lookup::Absent);
     assert_eq!(tree.item("kr_sender", "missing"), Lookup::Absent);
@@ -89,18 +140,13 @@ fn a_lookup_says_what_it_found_and_why_it_could_not() {
         Lookup::Failed("kr_sender defines only some of present, missing; not missing".to_owned()),
         "a list of names that is only partly defined is a failure"
     );
-    // A manifest that exists and names no package makes a crate that no manifest names unknown.
+    // A manifest that names no package is a workspace Cargo cannot read: the tree is not read, and
+    // no crate is called absent for it.
     write(folder.path(), "crates/odd/Cargo.toml", "[workspace]\n");
-    let tree = Tree::at(folder.path()).expect("the tree");
-    assert!(matches!(tree.krate("kr_nothing"), Lookup::Failed(_)));
-    assert!(matches!(tree.item("kr_nothing", "x"), Lookup::Failed(_)));
-    assert!(matches!(
-        tree.item("kr_sender", "present"),
-        Lookup::Found(_)
-    ));
+    cannot_read(&folder);
     // A source that does not parse makes every lookup in its crate a failure.
     let broken = small_tree("fn (\n");
-    let tree = Tree::at(broken.path()).expect("the tree");
+    let tree = tree_at(broken.path()).expect("the tree");
     assert!(matches!(
         tree.item("kr_sender", "present"),
         Lookup::Failed(_)
@@ -112,7 +158,7 @@ fn a_lookup_says_what_it_found_and_why_it_could_not() {
 fn a_comment_moves_no_digest_and_a_token_of_a_helper_moves_the_helper_and_not_the_root_alone() {
     let digests = |lib: &str| {
         let folder = small_tree(lib);
-        let tree = Tree::at(folder.path()).expect("the tree");
+        let tree = tree_at(folder.path()).expect("the tree");
         let Lookup::Found(root_alone) = alone(&tree, "root_fn") else {
             panic!("the root is found");
         };
@@ -143,7 +189,7 @@ fn a_comment_moves_no_digest_and_a_token_of_a_helper_moves_the_helper_and_not_th
 fn the_body_of_a_macro_and_an_invocation_have_digests_that_move_on_a_token() {
     let digests = |lib: &str| {
         let folder = small_tree(lib);
-        let tree = Tree::at(folder.path()).expect("the tree");
+        let tree = tree_at(folder.path()).expect("the tree");
         let take = |name: &str| match tree.item("kr_sender", name) {
             Lookup::Found(digest) => digest,
             other => panic!("{name}: {other:?}"),
@@ -355,7 +401,7 @@ pub(super) fn names(
 #[test]
 fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
     let folder = sender_tree();
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     let root_before = tree
         .follow("kr_sender", &["names_a_method"])
         .expect("followed")
@@ -469,7 +515,7 @@ fn the_digest_of_a_name_only_the_scan_gives_moves_on_a_token() {
             "use kr_protocol::Method::{import};\nmacro_rules! unnamed {{ ($($t:tt)*) => {{}}; }}\nunnamed!(\"{call}\");\nimpl T for [u8] {{ const NAME: &'static str = \"{constant}\"; }}\n"
         );
         let folder = small_tree(&lib);
-        let tree = Tree::at(folder.path()).expect("the tree");
+        let tree = tree_at(folder.path()).expect("the tree");
         let take = |name: &str| {
             let found = tree.item("kr_sender", name);
             assert!(matches!(found, Lookup::Found(_)), "{name}: {found:?}");
@@ -616,7 +662,7 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
     .map(|name| (name.to_owned(), vec![SightKind::Names]))
     .collect();
     let scan = |root: &Path| {
-        let tree = Tree::at(root).expect("the tree");
+        let tree = tree_at(root).expect("the tree");
         tree.sightings(&|krate| krate == "kr_sender")
             .map(|sightings| names(&sightings, "kr_sender"))
     };
@@ -660,14 +706,14 @@ fn a_path_keeps_every_step_up_that_nothing_before_it_can_take() {
         assert_eq!(normalised(Path::new(given)), Path::new(expected), "{given}");
     }
     let missing = Path::new("/this/folder/does/not/exist-r5");
-    let error = Tree::at(missing).err().expect("a root that is not there");
+    let error = tree_at(missing).err().expect("a root that is not there");
     assert!(error.contains("exist-r5"), "{error}");
 }
 
 #[test]
 fn a_root_lookup_in_a_crate_that_is_absent_or_unreadable_says_so_and_a_failed_follow_says_why() {
     let folder = small_tree("pub fn present() { kr_worker::nothing_of_this_name(); }\n");
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     assert_eq!(
         tree.lookup("kr_nothing", &["x"], Depth::Alone),
         Lookup::Absent
@@ -685,15 +731,12 @@ fn a_root_lookup_in_a_crate_that_is_absent_or_unreadable_says_so_and_a_failed_fo
         Lookup::Failed(_)
     ));
     write(folder.path(), "crates/odd/Cargo.toml", "[workspace]\n");
-    let tree = Tree::at(folder.path()).expect("the tree");
-    assert!(matches!(
-        tree.lookup("kr_nothing", &["x"], Depth::Alone),
-        Lookup::Failed(_)
-    ));
-    // Only a missing `apps` folder is an absence: one that cannot be read is an error.
+    cannot_read(&folder);
+    // The applications are the workspace's members, so a file called `apps` names none.
     let file_for_apps = small_tree("");
     write(file_for_apps.path(), "apps", "not a folder\n");
-    assert!(Tree::at(file_for_apps.path()).is_err());
+    let tree = tree_at(file_for_apps.path()).expect("the tree");
+    assert_eq!(tree.krate("companion_tauri"), Lookup::Absent);
 }
 
 #[test]
@@ -705,7 +748,7 @@ fn a_scan_reads_only_what_it_may_hold_a_sighting_in() {
         "crates/kr-sender/src/other.rs",
         "fn quiet_two() {}\n",
     );
-    let tree = Tree::at(quiet.path()).expect("the tree");
+    let tree = tree_at(quiet.path()).expect("the tree");
     assert_eq!(
         tree.sightings(&|krate| krate == "kr_sender"),
         Ok(Vec::new())
@@ -717,7 +760,7 @@ fn a_scan_reads_only_what_it_may_hold_a_sighting_in() {
         "crates/kr-sender/src/other.rs",
         "fn ( Method\n",
     );
-    let tree = Tree::at(loud.path()).expect("the tree");
+    let tree = tree_at(loud.path()).expect("the tree");
     assert!(tree.sightings(&|krate| krate == "kr_sender").is_err());
     // The crates the caller leaves out are not scanned.
     let two = small_tree("pub fn quiet() {}\n");
@@ -731,7 +774,7 @@ fn a_scan_reads_only_what_it_may_hold_a_sighting_in() {
         "crates/kr-worker/src/extra.rs",
         "fn x() { let _ = Method::AgentTurnSteer; }\n",
     );
-    let tree = Tree::at(two.path()).expect("the tree");
+    let tree = tree_at(two.path()).expect("the tree");
     assert_eq!(
         tree.sightings(&|krate| krate == "kr_sender"),
         Ok(Vec::new())
@@ -740,11 +783,10 @@ fn a_scan_reads_only_what_it_may_hold_a_sighting_in() {
         names(&tree.sightings(&|_| true).expect("the scan"), "kr_worker"),
         BTreeMap::from([("x".to_owned(), vec![SightKind::Names])])
     );
-    // A manifest that cannot be read leaves the scan incomplete.
+    // A manifest that cannot be read leaves no tree to scan.
     let odd = small_tree("pub fn quiet() {}\n");
     write(odd.path(), "crates/odd/Cargo.toml", "[workspace]\n");
-    let tree = Tree::at(odd.path()).expect("the tree");
-    assert!(tree.sightings(&|_| true).is_err());
+    cannot_read(&odd);
 }
 
 #[test]
@@ -760,7 +802,7 @@ fn a_sighting_in_the_companions_crate_under_apps_is_found() {
         "apps/x/src-tauri/src/lib.rs",
         "fn send() { let _ = Method::AgentTurnSteer; }\n",
     );
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     let sightings = tree.sightings(&|_| true).expect("the scan");
     assert_eq!(
         names(&sightings, "companion_tauri"),
@@ -786,7 +828,7 @@ fn the_reader_of_a_tree_does_not_scan_the_receiver_crates() {
         "crates/kr-worker/src/extra.rs",
         "fn receives() { let _ = Method::AgentTurnSteer; }\n",
     );
-    let tree = Tree::at(folder.path()).expect("the tree");
+    let tree = tree_at(folder.path()).expect("the tree");
     let sightings = Reader::sightings(&tree).expect("the scan");
     assert_eq!(
         names(&sightings, "kr_sender"),

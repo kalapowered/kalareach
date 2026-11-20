@@ -1,17 +1,18 @@
 //! The module inventory of a crate: the files that product code is made of.
 //!
-//! The inventory starts at the crate's roots (`src/lib.rs`, `src/main.rs`, `src/bin/*.rs`,
-//! `src/bin/*/main.rs`) and follows the module declarations that some configuration without `test`
-//! builds (see `condition`), as rustc finds the files: `mod name;` is `name.rs` or `name/mod.rs`
-//! beside the file or in a folder of its name, and `#[path = "..."]` is relative to the file's
-//! folder, or to the inline module's folder inside one. A file no declaration reaches is not read.
-//! The item index and the scan both take their files from here.
+//! The inventory starts at the crate's roots, the library and binary targets Cargo reports for it,
+//! and follows the module declarations that some configuration without `test` builds (see
+//! `condition`), as rustc finds the files: `mod name;` is `name.rs` or `name/mod.rs` beside the file
+//! or in a folder of its name, and `#[path = "..."]` is relative to the file's folder, or to the
+//! inline module's folder inside one. A file is read under the condition of the declaration that
+//! reaches it, and under each when several do. A file no declaration reaches is not read. The item
+//! index and the scan both take their files, with those conditions, from here.
 //!
 //! What the inventory does not read it refuses, with an error that names the file: a path through a
 //! link or outside the checkout, a module declared in a block or by a macro, `include!`, a `#[path]`
-//! that is not one string, a module that is at no file or at two, a target the manifest names
-//! elsewhere than the four roots, a macro defined twice, and an item-position macro of another
-//! crate that is not on the list of those accepted.
+//! that is not one string, a module that is at no file or at two, a crate with no target, a macro
+//! defined twice, and an item-position macro of another crate that is not on the list of those
+//! accepted.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -43,6 +44,10 @@ const ACCEPTED: &[(&str, &str)] = &[
         "makes no item: it stops the build with a message",
     ),
     (
+        "ios_plugin_binding",
+        "tauri's macro makes the iOS plugin's start function; it reads no Rust file module and names no KR method",
+    ),
+    (
         "debug_as_display",
         "kr_client's macro writes a `Debug` impl that prints the failure's `Display`: an impl of a trait of its own and nothing it holds",
     ),
@@ -60,10 +65,26 @@ const ACCEPTED: &[(&str, &str)] = &[
     ),
 ];
 
+/// A target Cargo builds from one source file, which is where the inventory of its crate starts.
+pub struct Root {
+    pub path: PathBuf,
+    /// The features the target requires: it is read under each of them.
+    pub features: Vec<String>,
+}
+
+/// A product file, with the condition it is reached under.
+pub struct File {
+    /// The canonical path.
+    pub path: PathBuf,
+    /// The condition around the declaration that reaches the file, or any one of them when several
+    /// do. The file's own inner attributes and its items add to it.
+    pub condition: Condition,
+}
+
 /// What the product code of a crate is made of.
 pub struct Inventory {
-    /// The product files by canonical path, in path order.
-    pub files: Vec<PathBuf>,
+    /// The product files in path order.
+    pub files: Vec<File>,
     /// The `macro_rules!` names product code defines, at any depth.
     pub defined: BTreeSet<String>,
     /// The names of those that carry `#[macro_export]`.
@@ -84,29 +105,52 @@ struct Declared {
     /// Whether `#[macro_use]` is on the declaration, so that the macros of its file stay in scope
     /// after it.
     macro_use: bool,
+    /// What holds around the declaration: the file is read under it.
+    condition: Condition,
 }
 
-/// Reads the inventory of the crate `krate`, whose folder is `crate_dir` and whose `src` is
-/// `source`, inside the tree at `root`. `targets` are the paths its manifest names.
-pub fn read(
-    krate: &str,
-    crate_dir: &Path,
-    source: &Path,
-    root: &Path,
-    targets: &[String],
-) -> Result<Inventory, String> {
+/// Whether `path` is a file: a path that is not there, or has a file where a folder should be, is
+/// not, and any other failure is an error.
+fn is_file(path: &Path) -> Result<bool, String> {
+    match std::fs::metadata(path) {
+        Ok(found) => Ok(found.is_file()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// Reads the inventory of the crate `krate`, which Cargo builds from `roots`, inside the tree at
+/// `root`.
+pub fn read(krate: &str, roots: &[Root], root: &Path) -> Result<Inventory, String> {
+    if roots.is_empty() {
+        return Err(format!("{krate}: no library or binary target"));
+    }
     let shown = |path: &Path| {
         path.strip_prefix(root)
             .unwrap_or(path)
             .display()
             .to_string()
     };
-    let mut todo: Vec<(PathBuf, bool, bool)> = roots(krate, crate_dir, source, root, targets)?
-        .into_iter()
-        .map(|path| (path, true, false))
+    let mut todo: Vec<(PathBuf, bool, bool, Condition)> = roots
+        .iter()
+        .map(|target| {
+            (
+                target.path.clone(),
+                true,
+                false,
+                Condition::requiring(&target.features),
+            )
+        })
         .collect();
-    let mut seen: BTreeSet<(PathBuf, bool, bool)> = BTreeSet::new();
-    let mut files: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut seen: BTreeSet<(PathBuf, bool, bool, Condition)> = BTreeSet::new();
+    let mut reached: BTreeMap<PathBuf, BTreeSet<Condition>> = BTreeMap::new();
     // For each macro name: where it is defined, and whether the definition's scope reaches
     // beyond its module (`#[macro_export]`, or a module under `#[macro_use]`).
     let mut defined: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
@@ -117,7 +161,7 @@ pub fn read(
         if !seen.insert(visit.clone()) {
             continue;
         }
-        let (path, beside, macro_use) = visit;
+        let (path, beside, macro_use, carried) = visit;
         let at = shown(&path);
         let real = std::fs::canonicalize(&path).map_err(|error| format!("{at}: {error}"))?;
         if real != path || !path.starts_with(root) {
@@ -130,10 +174,13 @@ pub fn read(
             .map_err(|error| format!("{}: {error}", path.display()))?;
         let parsed =
             syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-        let Some(condition) = Condition::default().within(&parsed.attrs, &at)? else {
+        let Some(condition) = carried.within(&parsed.attrs, &at)? else {
             continue;
         };
-        files.insert(path.clone());
+        reached
+            .entry(path.clone())
+            .or_default()
+            .insert(carried.clone());
         let directory = path.parent().unwrap_or(Path::new(""));
         let stem = path
             .file_stem()
@@ -178,11 +225,12 @@ pub fn read(
             method_uses.push(at.clone());
         }
         for declared in reader.declared {
-            let found: Vec<&PathBuf> = declared
-                .candidates
-                .iter()
-                .filter(|candidate| candidate.is_file())
-                .collect();
+            let mut found: Vec<&PathBuf> = Vec::new();
+            for candidate in &declared.candidates {
+                if is_file(candidate)? {
+                    found.push(candidate);
+                }
+            }
             let list = |paths: &[&PathBuf]| {
                 paths
                     .iter()
@@ -195,7 +243,12 @@ pub fn read(
                     // A file that a `#[path]` loads keeps its modules beside it, as `mod.rs` does.
                     let beside =
                         declared.explicit || one.file_name().is_some_and(|name| name == "mod.rs");
-                    todo.push(((*one).clone(), beside, declared.macro_use));
+                    todo.push((
+                        (*one).clone(),
+                        beside,
+                        declared.macro_use,
+                        declared.condition.clone(),
+                    ));
                 }
                 [] => {
                     let tried: Vec<&PathBuf> = declared.candidates.iter().collect();
@@ -241,7 +294,13 @@ pub fn read(
         }
     }
     Ok(Inventory {
-        files: files.into_iter().collect(),
+        files: reached
+            .into_iter()
+            .map(|(path, conditions)| File {
+                path,
+                condition: Condition::any_of(&conditions.into_iter().collect::<Vec<_>>()),
+            })
+            .collect(),
         defined: defined.into_keys().collect(),
         exported,
         method_uses,
@@ -250,59 +309,6 @@ pub fn read(
             .map(|(name, at)| (at, name))
             .collect(),
     })
-}
-
-/// The roots of a crate: the conventional ones that exist and the targets its manifest names, each
-/// of which must be one of the conventional shapes.
-fn roots(
-    krate: &str,
-    crate_dir: &Path,
-    source: &Path,
-    root: &Path,
-    targets: &[String],
-) -> Result<Vec<PathBuf>, String> {
-    let mut found: BTreeSet<PathBuf> = BTreeSet::new();
-    for target in targets {
-        let parts: Vec<&str> = target.split('/').collect();
-        let conventional = match parts.as_slice() {
-            ["src", "lib.rs" | "main.rs"] => true,
-            ["src", "bin", name] => name.ends_with(".rs"),
-            ["src", "bin", _, "main.rs"] => true,
-            _ => false,
-        };
-        if !conventional {
-            return Err(format!(
-                "{}: the target path {target} is not src/lib.rs, src/main.rs, src/bin/*.rs or src/bin/*/main.rs",
-                crate_dir
-                    .join("Cargo.toml")
-                    .strip_prefix(root)
-                    .unwrap_or(crate_dir)
-                    .display()
-            ));
-        }
-        found.insert(normalised(&crate_dir.join(target)));
-    }
-    for name in ["lib.rs", "main.rs"] {
-        let path = source.join(name);
-        if path.is_file() {
-            found.insert(path);
-        }
-    }
-    let binaries = source.join("bin");
-    if let Ok(entries) = std::fs::read_dir(&binaries) {
-        for entry in entries {
-            let path = entry.map_err(|error| error.to_string())?.path();
-            if path.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
-                found.insert(path);
-            } else if path.join("main.rs").is_file() {
-                found.insert(path.join("main.rs"));
-            }
-        }
-    }
-    if found.is_empty() {
-        return Err(format!("{krate}: no crate root under src"));
-    }
-    Ok(found.into_iter().collect())
 }
 
 /// Reads one parsed file: the module declarations product code makes in it, and what the inventory
@@ -451,6 +457,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                         candidates,
                         explicit,
                         macro_use: has_macro_use(&node.attrs),
+                        condition: self.condition.clone(),
                     });
                 }
             },
