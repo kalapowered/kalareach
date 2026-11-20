@@ -1517,6 +1517,97 @@ async fn the_kit_saved_as_a_qr_code_scans_back_to_the_kit_and_is_private() {
     assert!(!page.told().contains(&kit.bundle_locator));
 }
 
+/// Lets Authenticated Users read `path`, and what is made inside it if it is a folder, so that a
+/// file written there takes a list that names another account unless the writer sets its own.
+#[cfg(windows)]
+fn grant_authenticated_users(path: &Path) {
+    let grant = if path.is_dir() {
+        "*S-1-5-11:(OI)(CI)(R)"
+    } else {
+        "*S-1-5-11:(R)"
+    };
+    let granted = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .args(["/grant", grant])
+        .output()
+        .expect("icacls starts");
+    assert!(
+        granted.status.success(),
+        "Authenticated Users are granted: {}",
+        String::from_utf8_lossy(&granted.stdout)
+    );
+}
+
+/// Asserts that the file at `path` carries the list the owner-only writers set: protected, and
+/// naming this user and the file's owner and no one else.
+#[cfg(windows)]
+fn assert_owner_only(path: &Path, what: &str) {
+    let access = kr_ipc::paths::FileAccess::of(path).expect("reads who can reach the file");
+    assert!(
+        access.is_the_owner_only_list().expect("this user's token"),
+        "{what} names only its owner and this user: {access:?}"
+    );
+}
+
+/// KR-REQ-20.18: a kit saved as text and as a QR code into a folder that grants another account
+/// is given a list of its own that names only the owner and this user, as a mode of 0600 does on
+/// Unix. The folder is given Authenticated Users here, because a folder under some profiles passes
+/// no such entry down and the case would show nothing.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kit_saved_where_its_folder_grants_another_account_is_owner_only() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    grant_authenticated_users(out.path());
+
+    let (path, _) = page.kit(out.path());
+    assert_owner_only(&path, "the kit as text");
+
+    let drawn = out.path().join("kit.svg");
+    page.dialog_returns(&drawn);
+    page.call(
+        "recovery_save_kit_qr",
+        json!({ "path": drawn.to_string_lossy() }),
+    )
+    .expect("the QR code is saved");
+    assert_owner_only(&drawn, "the kit as a QR code");
+}
+
+/// KR-REQ-20.18: a kit saved over a file that already exists, whose list grants another account,
+/// narrows that list to the owner and this user before it empties the file, and then holds the
+/// kit and not what was there.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kit_saved_over_a_file_that_grants_another_account_is_narrowed_and_replaced() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let path = out.path().join("recovery-kit.txt");
+    std::fs::write(&path, b"what was there before").expect("a file to save over");
+    grant_authenticated_users(&path);
+    let before = kr_ipc::paths::FileAccess::of(&path).expect("reads who can reach the file");
+    assert!(
+        format!("{before:?}").contains("S-1-5-11"),
+        "the file to save over grants Authenticated Users: {before:?}"
+    );
+
+    let (_, kit) = page.kit(out.path());
+
+    assert_owner_only(&path, "the file the kit replaced");
+    let text = std::fs::read_to_string(&path).expect("the kit file");
+    assert!(
+        !text.contains("what was there before"),
+        "the old bytes are gone"
+    );
+    assert_eq!(
+        parse_kit(&text).expect("a kit").bundle_locator,
+        kit.bundle_locator
+    );
+}
+
 /// KR-REQ-20.18: the bundle exports alone as a file of ciphertext, in the owner-only mode, that is
 /// the bundle as the service holds it; the archives the bundle names are listed; and a request for
 /// an archive the bundle does not name, or while recovery is off, writes nothing.
