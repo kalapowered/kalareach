@@ -6035,9 +6035,18 @@ async fn a_rollback_to_a_release_without_the_store_of_binding_revisions_states_t
         assert!(text.contains(limit), "{text}");
     }
 
-    // The control: the release before lists the store, and the rollback says nothing of the limit.
+    // The control: the release before reads the journal below version 6 as well and lists the store
+    // of binding revisions, and the rollback says nothing of the limit.
     {
-        let (host, _one, _two, archive) = host_to_update().await;
+        let (host, _one, _two, archive) = host_to_update_between(
+            Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+                "transfers",
+                1,
+                5,
+            )),
+            Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2),
+        )
+        .await;
         let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
         assert!(output.status.success(), "kr host update: {said}");
         let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
