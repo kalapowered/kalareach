@@ -358,6 +358,8 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
 struct Records {
     levels: Vec<String>,
     roots: Vec<Value>,
+    /// Whether each level's surface defines a type of that name.
+    defines: Vec<Box<dyn Fn(&str) -> bool>>,
 }
 
 fn level_records() -> Records {
@@ -370,20 +372,26 @@ fn level_records() -> Records {
             .iter()
             .map(|level| read_record(level, "sources.json"))
             .collect(),
+        defines: RETAINED
+            .iter()
+            .map(|level| {
+                Box::new(move |label: &str| level.surface().definition(label).is_some())
+                    as Box<dyn Fn(&str) -> bool>
+            })
+            .collect(),
     }
 }
 
 impl Records {
     fn levels(&self) -> Vec<LevelRecord<'_>> {
-        RETAINED
+        self.levels
             .iter()
-            .zip(self.levels.iter().zip(&self.roots))
-            .map(|(level, (name, record))| LevelRecord {
+            .zip(&self.roots)
+            .zip(&self.defines)
+            .map(|((name, record), defines)| LevelRecord {
                 level: name,
                 roots: record["roots"].as_object().expect("a record of roots"),
-                surface_defines: Box::leak(Box::new(move |label: &str| {
-                    level.surface().definition(label).is_some()
-                })),
+                surface_defines: defines.as_ref(),
             })
             .collect()
     }

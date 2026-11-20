@@ -75,6 +75,8 @@ pub fn the_root(label: &str, krate: &'static str, depth: Depth) -> Root {
 pub struct World {
     pub entry: Narrower,
     pub empty_table: bool,
+    /// Entries after the first, checked in the same run.
+    pub more: Vec<Narrower>,
     pub current: Fixed,
     pub release: Fixed,
     pub roots: Vec<(String, &'static str, Depth)>,
@@ -249,6 +251,7 @@ pub fn control() -> World {
     World {
         entry,
         empty_table: false,
+        more: Vec::new(),
         current,
         release,
         roots: vec![(ROOT.to_owned(), "kr_worker", Depth::Alone)],
@@ -278,10 +281,12 @@ impl World {
                 surface_defines: &defines,
             })
             .collect();
+        let mut table = vec![self.entry.clone()];
+        table.extend(self.more.iter().cloned());
         let entries = if self.empty_table {
             &[][..]
         } else {
-            std::slice::from_ref(&self.entry)
+            &table[..]
         };
         let input = Input {
             entries,
@@ -1245,4 +1250,255 @@ fn a_same_entry_that_matches_no_digest_is_refused_in_an_own_tree_run_only() {
         vec!["a Same entry for T matches no digest now (why)".to_owned()]
     );
     assert_eq!(compare(record, &tree, &stale, &[], false, false), none());
+}
+
+#[test]
+fn a_guard_that_refuses_stops_every_rule_after_it() {
+    // Each input has a later fault, so a guard that goes on gives more than its own text.
+    let two = "an entry of the narrower table is read against exactly one retained record, and this build retains";
+    let mut level = control();
+    level.this_level = "0.79";
+    level.entry.refuses = "";
+    assert_eq!(
+        level.own(),
+        vec![said("level 0.78 is not this build's level 0.79")]
+    );
+    let mut two_records = control();
+    two_records.retained = 2;
+    two_records.entry.refuses = "";
+    assert_eq!(two_records.own(), vec![format!("{two} 2")]);
+    let mut no_record = control();
+    no_record.retained = 0;
+    no_record.entry.refuses = "";
+    assert_eq!(no_record.own(), vec![format!("{two} 0")]);
+    // The public freeze comes first, whatever the number of records.
+    let freeze = said("from the public freeze this change needs a new public major");
+    for retained in [0, 2] {
+        let mut frozen = control();
+        frozen.frozen = true;
+        frozen.retained = retained;
+        assert_eq!(frozen.own(), vec![freeze.clone()], "{retained} records");
+    }
+}
+
+#[test]
+fn every_entry_of_the_table_is_checked() {
+    let mut world = control();
+    let mut second = world.entry.clone();
+    second.refuses = "";
+    world.more = vec![second];
+    assert_eq!(world.own(), vec![said("refuses is empty")]);
+    let mut third = control();
+    let mut bad = third.entry.clone();
+    bad.refuses = "";
+    third.more = vec![third.entry.clone(), bad];
+    assert_eq!(third.own(), vec![said("refuses is empty")]);
+}
+
+#[test]
+fn the_rules_of_the_shape_do_not_stop_each_other() {
+    let mut world = control();
+    world.entry.refuses = "";
+    world.edit_items("kr", |items| items.clear());
+    assert_eq!(
+        world.own(),
+        vec![said("refuses is empty"), said("sender kr lists no item")]
+    );
+}
+
+#[test]
+fn a_root_that_differs_does_not_stop_the_sightings() {
+    let mut world = control();
+    world.entry.digest = "other";
+    world.current.sightings = Ok(vec![sighting("kr_cli", "uncovered", &[SightKind::Names])]);
+    assert_eq!(
+        world.own(),
+        vec![
+            said("this checkout's digest of the root is dig, the entry names other"),
+            said(
+                "the sighting kr_cli::uncovered ({Names}) is no item of a row and no account covers it"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_record_and_the_lookups_of_a_release_do_not_stop_each_other() {
+    let mut world = control();
+    world.entry.recorded = "x";
+    assert_eq!(
+        world.release(),
+        vec![
+            said("stale: the record holds rec, the entry names x"),
+            said("the release's tree has the digest rec for the root, the entry records x"),
+        ]
+    );
+    let mut lookups = control();
+    lookups
+        .release
+        .roots
+        .insert(ROOT.to_owned(), found("other"));
+    lookups
+        .release
+        .items
+        .insert(at("kr_worker", "helper_fn"), found("zz"));
+    lookups
+        .release
+        .items
+        .insert(at("kr_client", "Link::target"), found("yy"));
+    assert_eq!(
+        lookups.release(),
+        vec![
+            said("the release's tree has the digest other for the root, the entry records rec"),
+            said(
+                "the helper kr_worker::helper_fn has the digest zz in the release's tree, the entry names h-before"
+            ),
+            said(
+                "the item kr_client::Link::target has a text (yy) in the release's tree that the entry does not list"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_same_entry_for_another_root_or_another_digest_excuses_nothing_here() {
+    let mut another_digest = control();
+    another_digest.same = vec![Same {
+        root: ROOT,
+        digest: "other",
+        reason: "r",
+    }];
+    assert_eq!(another_digest.own(), none());
+    let mut another_root = control();
+    another_root.same = vec![Same {
+        root: "another root",
+        digest: "dig",
+        reason: "r",
+    }];
+    assert_eq!(another_root.own(), none());
+}
+
+#[test]
+fn three_accounts_for_one_item_give_one_text() {
+    let mut world = control();
+    world.edit_accounts(|accounts| {
+        accounts.push(accounts[1].clone());
+        accounts.push(accounts[1].clone());
+    });
+    assert_eq!(
+        world.own(),
+        vec![said("two accounts cover kr_cli::other_builder")]
+    );
+}
+
+#[test]
+fn a_daemon_account_that_is_absent_or_cannot_be_read_has_its_own_text() {
+    let mut absent = control();
+    absent.lookup_of("kr_controller", "Controller::other", Lookup::Absent);
+    assert_eq!(
+        absent.own(),
+        vec![said(
+            "the daemon account kr_controller::Controller::other is absent in this checkout"
+        )]
+    );
+    let mut failed = control();
+    failed.lookup_of(
+        "kr_controller",
+        "Controller::other",
+        Lookup::Failed("e".to_owned()),
+    );
+    assert_eq!(
+        failed.own(),
+        vec![said(
+            "the daemon account kr_controller::Controller::other cannot be read in this checkout: e"
+        )]
+    );
+}
+
+#[test]
+fn a_sighting_is_covered_by_the_crate_and_the_name_together() {
+    let world = with_sightings(vec![
+        sighting("kr_cli", "Link::target", &[SightKind::Target]),
+        sighting("kr_client", "other_builder", &[SightKind::Names]),
+    ]);
+    assert_eq!(
+        world.own(),
+        vec![
+            said(
+                "the sighting kr_cli::Link::target ({Target}) is no item of a row and no account covers it"
+            ),
+            said(
+                "the sighting kr_client::other_builder ({Names}) is no item of a row and no account covers it"
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_sightings_are_not_read_in_a_release_run() {
+    let mut world = control();
+    world.current.sightings = Ok(vec![sighting("kr_cli", "uncovered", &[SightKind::Names])]);
+    assert_eq!(world.release(), none());
+}
+
+#[test]
+fn every_class_of_peer_needs_a_row() {
+    let mut world = control();
+    world.entry.senders = &[];
+    world.peer_classes = super::narrower::PEER_CLASSES.to_vec();
+    let rows: Vec<String> = [
+        "the companion",
+        "a device's mutation relayed by the daemon",
+        "the daemon's local prompt route",
+        "the workflow and voice routes",
+        "kr",
+        "kr-hook",
+        "the plugin host, the plugin runtime and the automation engine",
+    ]
+    .iter()
+    .map(|class| said(&format!("the peer class {class} has no row")))
+    .collect();
+    assert_eq!(world.own(), rows);
+}
+
+#[test]
+fn a_change_of_another_root_or_digest_is_not_excused_by_an_entry_for_its_neighbour() {
+    let record = json!({
+        "T": { "digest": "d1", "followed": ["a"] },
+        "U": { "digest": "d3", "followed": [] }
+    });
+    let both = [("T", followed("d2", &["b"])), ("U", followed("d2", &[]))];
+    let only_u = "level 0.77: what U names changed (digest d2 now, d3 recorded); items only recorded: []; items only now: []";
+    let narrower = [the_entry_for("T", "d2")];
+    assert_eq!(
+        compare(record.clone(), &both, &[], &narrower, true, false),
+        vec![only_u.to_owned()]
+    );
+    let same = [Same {
+        root: "T",
+        digest: "d2",
+        reason: "r",
+    }];
+    assert_eq!(
+        compare(record.clone(), &both, &same, &[], true, false),
+        vec![only_u.to_owned()]
+    );
+    // A digest of the root that is not the one now excuses nothing, in a release tree too.
+    let text = "level 0.77: what T names changed (digest d2 now, d1 recorded); items only recorded: [\"a\"]; items only now: [\"b\"]";
+    let one = [("T", followed("d2", &["b"]))];
+    let record_t = json!({ "T": { "digest": "d1", "followed": ["a"] } });
+    let other_same = [Same {
+        root: "T",
+        digest: "d9",
+        reason: "r",
+    }];
+    assert_eq!(
+        compare(record_t.clone(), &one, &other_same, &[], false, false),
+        vec![text.to_owned()]
+    );
+    let other_narrower = [the_entry_for("T", "d9")];
+    assert_eq!(
+        compare(record_t, &one, &[], &other_narrower, false, false),
+        vec![text.to_owned()]
+    );
 }
