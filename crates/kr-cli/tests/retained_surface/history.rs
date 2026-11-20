@@ -536,6 +536,7 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
             });
         }
     };
+    let tree = tree.scoped(&|krate| is_client(krate));
     let krates = crates_read(entry)
         .into_iter()
         .map(|krate| (krate.to_owned(), tree.krate(krate)))

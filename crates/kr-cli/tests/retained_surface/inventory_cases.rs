@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::condition::Condition;
 use super::repository;
-use super::walker::{Lookup, SightKind, Tree};
+use super::walker::{Depth, Lookup, SightKind, Tree};
 use super::walker_cases::{small_tree, tree_at, write};
 
 /// Whether some configuration without `test` enables a function written with `attributes`.
@@ -379,6 +379,11 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         "use kr_protocol::Method as M;",
         "use kr_protocol::Method::{self as M};",
         "fn f() { use kr_protocol::Method::*; }",
+        // An alias of `Method`, and a variant named through `Self` in an impl for `Method`.
+        "type M = Method;",
+        "type M = kr_protocol::Method;",
+        "impl Local for Method { fn f() { let _ = Self::AgentTurnCancel; } }",
+        "impl Local for kr_protocol::Method { fn f() { match 1 { _ => Self::PluginActionInvoke }; } }",
     ] {
         let (scan, _) = scanned(&format!("{import}\n"), &[]);
         assert_eq!(
@@ -389,6 +394,22 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
             "{import}"
         );
     }
+    // `Self::<name>` in an impl for another type or for `Method` with a name that is no variant, and
+    // an alias of another type, are not those forms.
+    for lib in [
+        "impl Local for Method { fn f() { let _ = Self::Unrelated; } }",
+        "impl Local for Other { fn f() { let _ = Self::AgentTurnCancel; } }",
+        "type M = Other;",
+    ] {
+        assert_eq!(
+            read_names(&format!("{lib}\n"), &[]),
+            Ok(Vec::<String>::new()),
+            "{lib}"
+        );
+    }
+    // The crate that defines `Method` names its own variants and is not read as a sender.
+    let definition = "pub enum Method { AgentTurnCancel }\nuse Method::*;\ntype M = Method;\nimpl Method { fn f() -> Self { Self::AgentTurnCancel } }\n";
+    assert_eq!(read_names(definition, &[]), Ok(Vec::<String>::new()));
     // Targets and roots: Cargo's own report gives them, so a binary at any path is a root.
     let manifest = |extra: &str| {
         format!(
@@ -643,6 +664,94 @@ fn a_manifest_names_a_target_and_a_procedural_macro_crate_is_refused() {
         sender_names(&tree_at(folder.path()).expect("the tree")),
         Err("crates/kr-sender/Cargo.toml: a procedural-macro crate; the scan does not read what it generates".to_owned())
     );
+}
+
+#[test]
+fn a_refused_crate_gives_no_lookup_result_whatever_the_index_holds() {
+    let existing = "pub fn existing() {}\n";
+    // What the lookups of a crate give: an item the index holds, one it does not, as an item, as a
+    // source and as a root.
+    let lookups = |tree: &Tree| {
+        let item = |name: &str| tree.item("kr_sender", name);
+        let source = |name: &str| tree.source("kr_sender", name).map(|found| found.is_some());
+        let root = |name: &str| tree.lookup("kr_sender", &[name], Depth::Alone);
+        (
+            [item("existing"), item("missing")],
+            [source("existing"), source("missing")],
+            [root("existing"), root("missing")],
+        )
+    };
+    // No refusal: the index answers.
+    let folder = small_tree(existing);
+    let tree = tree_at(folder.path()).expect("the tree");
+    let (items, sources, roots) = lookups(&tree);
+    assert!(matches!(items[0], Lookup::Found(_)), "{items:?}");
+    assert_eq!(items[1], Lookup::Absent);
+    assert_eq!(sources, [Ok(true), Ok(false)]);
+    assert!(matches!(roots[0], Lookup::Found(_)), "{roots:?}");
+    assert_eq!(roots[1], Lookup::Absent);
+    // Each refusal of the scan and of the crate gives no `Found` and no `Absent`.
+    let meta = "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\nfn uses() { meta!(Method::AgentTurnCancel); }\n";
+    for (lib, text) in [
+        (
+            format!("use kr_protocol::Method::*;\n{existing}"),
+            "crates/kr-sender/src/lib.rs: a use of Method::* or of Method under another name; the scan reads Method::<Variant> only",
+        ),
+        (
+            format!("{meta}{existing}"),
+            "kr_sender: the macro meta calls a macro through a metavariable, which the scan cannot follow",
+        ),
+    ] {
+        let folder = small_tree(&lib);
+        let tree = tree_at(folder.path()).expect("the tree");
+        let (items, sources, roots) = lookups(&tree);
+        let failed = Lookup::Failed(text.to_owned());
+        assert_eq!(items, [failed.clone(), failed.clone()], "{text}");
+        assert_eq!(
+            sources,
+            [Err(text.to_owned()), Err(text.to_owned())],
+            "{text}"
+        );
+        assert_eq!(roots, [failed.clone(), failed], "{text}");
+    }
+    // A procedural-macro crate.
+    let folder = small_tree(existing);
+    write(
+        folder.path(),
+        "crates/kr-sender/Cargo.toml",
+        "[package]\nname = \"kr-sender\"\nversion = \"0.0.0\"\n[lib]\nproc-macro = true\n",
+    );
+    let tree = tree_at(folder.path()).expect("the tree");
+    let text = "crates/kr-sender/Cargo.toml: a procedural-macro crate; the scan does not read what it generates";
+    let (items, sources, roots) = lookups(&tree);
+    let failed = Lookup::Failed(text.to_owned());
+    assert_eq!(items, [failed.clone(), failed.clone()]);
+    assert_eq!(sources, [Err(text.to_owned()), Err(text.to_owned())]);
+    assert_eq!(roots, [failed.clone(), failed]);
+    // A call with a sighting to a macro that another crate exports: refused where that crate is in
+    // the tree's scope, read where it is not.
+    let folder = small_tree(&format!(
+        "fn f() {{ shared!(Method::AgentTurnCancel); }}\n{existing}"
+    ));
+    write(
+        folder.path(),
+        "crates/kr-worker/src/lib.rs",
+        "#[macro_export]\nmacro_rules! shared { ($m:expr) => { $m }; }\n",
+    );
+    let text = "kr_sender: shared! is called with a sighting and kr_worker exports it; the scan does not follow it across crates";
+    let tree = tree_at(folder.path()).expect("the tree");
+    let (items, sources, roots) = lookups(&tree);
+    let failed = Lookup::Failed(text.to_owned());
+    assert_eq!(items, [failed.clone(), failed.clone()]);
+    assert_eq!(sources, [Err(text.to_owned()), Err(text.to_owned())]);
+    assert_eq!(roots, [failed.clone(), failed]);
+    let tree = tree.scoped(&|krate| krate == "kr_sender");
+    let (items, sources, roots) = lookups(&tree);
+    assert!(matches!(items[0], Lookup::Found(_)), "{items:?}");
+    assert_eq!(items[1], Lookup::Absent);
+    assert_eq!(sources, [Ok(true), Ok(false)]);
+    assert!(matches!(roots[0], Lookup::Found(_)), "{roots:?}");
+    assert_eq!(roots[1], Lookup::Absent);
 }
 
 #[test]

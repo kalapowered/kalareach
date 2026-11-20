@@ -47,6 +47,9 @@ pub struct Tree {
     indexes: RefCell<BTreeMap<String, Rc<CrateIndex>>>,
     scans: RefCell<BTreeMap<String, Rc<CrateScan>>>,
     inventories: RefCell<BTreeMap<String, Rc<Inventory>>>,
+    /// The crates that a refusal across crates looks at (the exports a call is held to): every
+    /// crate where it is not set.
+    scope: Option<BTreeSet<String>>,
 }
 
 /// What Cargo says of a crate that the inventory needs.
@@ -323,7 +326,21 @@ impl Tree {
             indexes: RefCell::new(BTreeMap::new()),
             scans: RefCell::new(BTreeMap::new()),
             inventories: RefCell::new(BTreeMap::new()),
+            scope: None,
         })
+    }
+
+    /// The tree with the refusals across crates (X9) looking at the crates `include` accepts only,
+    /// as a scan of those crates does.
+    pub fn scoped(mut self, include: &dyn Fn(&str) -> bool) -> Self {
+        self.scope = Some(
+            self.crates
+                .keys()
+                .filter(|krate| include(krate))
+                .cloned()
+                .collect(),
+        );
+        self
     }
 
     /// The files product code of `krate` is made of: read once, for the index and the scan.
@@ -1552,7 +1569,7 @@ pub struct Sighting {
 }
 
 /// The six methods a worker's input rule may refuse more for: their variants and wire names.
-const VARIANTS: [&str; 6] = [
+pub(super) const VARIANTS: [&str; 6] = [
     "AgentPromptSubmit",
     "AgentPromptQueue",
     "AgentTurnSteer",
@@ -1595,6 +1612,9 @@ impl Tree {
             Lookup::Found(_) => {}
             other => return other,
         }
+        if let Err(error) = self.refusals(krate) {
+            return Lookup::Failed(error);
+        }
         let mut undefined: Vec<&str> = Vec::new();
         for name in names {
             match self.followed_set(krate, &[*name], Depth::Alone) {
@@ -1627,6 +1647,7 @@ impl Tree {
             Lookup::Absent => return Ok(None),
             Lookup::Failed(error) => return Err(error),
         }
+        self.refusals(krate)?;
         match self.followed_set(krate, &[name], Depth::Alone) {
             Err(WalkError::Undefined(_)) => {}
             Err(WalkError::Other(error)) => return Err(error),
@@ -1667,29 +1688,51 @@ impl Tree {
     pub fn sightings(&self, include: &dyn Fn(&str) -> bool) -> Result<Vec<Sighting>, String> {
         let mut all = Vec::new();
         for krate in self.crates.keys().filter(|krate| include(krate)) {
-            if self.manifests[krate].proc_macro {
-                return Err(format!(
-                    "{}: a procedural-macro crate; the scan does not read what it generates",
-                    self.manifests[krate].shown
-                ));
-            }
-            let scan = self.scan(krate)?;
-            all.extend(scan.sightings.iter().cloned());
-            for name in &scan.unresolved {
-                for other in self
-                    .crates
-                    .keys()
-                    .filter(|other| *other != krate && include(other))
-                {
-                    if self.inventory(other)?.exported.contains(name) {
-                        return Err(format!(
-                            "{krate}: {name}! is called with a sighting and {other} exports it; the scan does not follow it across crates"
-                        ));
-                    }
+            all.extend(self.refused(krate, include)?.sightings.iter().cloned());
+        }
+        Ok(all)
+    }
+
+    /// What stops a crate from being read: the forms the inventory refuses, and the refusals of the
+    /// scan (X8, X11), of a procedural-macro crate (X10) and of a call with a sighting to a macro
+    /// that a crate in scope exports (X9). A lookup in the crate gives none of its results while
+    /// one holds.
+    pub fn refusals(&self, krate: &str) -> Result<(), String> {
+        self.refused(krate, &|other| {
+            self.scope
+                .as_ref()
+                .is_none_or(|scope| scope.contains(other))
+        })
+        .map(|_| ())
+    }
+
+    /// The scan of `krate`, where no refusal holds, with X9 over the crates `include` accepts.
+    fn refused(
+        &self,
+        krate: &str,
+        include: &dyn Fn(&str) -> bool,
+    ) -> Result<Rc<CrateScan>, String> {
+        if self.manifests[krate].proc_macro {
+            return Err(format!(
+                "{}: a procedural-macro crate; the scan does not read what it generates",
+                self.manifests[krate].shown
+            ));
+        }
+        let scan = self.scan(krate)?;
+        for name in &scan.unresolved {
+            for other in self
+                .crates
+                .keys()
+                .filter(|other| *other != krate && include(other))
+            {
+                if self.inventory(other)?.exported.contains(name) {
+                    return Err(format!(
+                        "{krate}: {name}! is called with a sighting and {other} exports it; the scan does not follow it across crates"
+                    ));
                 }
             }
         }
-        Ok(all)
+        Ok(scan)
     }
 
     fn scan(&self, krate: &str) -> Result<Rc<CrateScan>, String> {
