@@ -66,8 +66,9 @@ fn copy_into(from: &Path, to: &Path, skip: &dyn Fn(&str) -> bool) {
 /// every file. No commit is made, so a case that reads the commit gets `unknown`.
 fn copy_without(name: &str, skip: &dyn Fn(&str) -> bool) -> (tempfile::TempDir, PathBuf) {
     let directory = tempfile::tempdir().expect("a directory");
-    // Where paths resolve through links (macOS's temporary directory is one) Cargo names files by
-    // the resolved path; on Windows a resolved path carries a `\\?\` prefix that Cargo does not.
+    // Unix resolves the copy's root, so that every case names the copy by one path (macOS's
+    // temporary directory is behind a link); Windows keeps the path as it is, because a resolved
+    // path there carries a `\\?\` prefix.
     let root = if cfg!(windows) {
         directory.path().to_path_buf()
     } else {
@@ -303,12 +304,9 @@ fn a_compiler_directory_that_is_not_a_directory_of_the_tested_root_is_refused() 
     assert!(Plan::parse(&planted("web"), &root).is_ok());
 }
 
-/// A package belongs to the workspace that Cargo says holds it, named relative to the tested root:
-/// the workspace of a manifest spelled with a `.` is the same as without it, and a manifest that is
-/// a member's, not the workspace's own, is refused naming the workspace's manifest.
-#[test]
-fn a_package_belongs_to_the_workspace_cargo_names_and_a_members_manifest_is_refused() {
-    let (_directory, root) = copy("no-root-manifest");
+/// Plants a member of the first workspace of a copy of `no-root-manifest`: the root manifest names
+/// it, and the copy's index holds it.
+fn plant_member(root: &Path) {
     let member = root.join("first").join("member");
     std::fs::create_dir_all(member.join("src")).expect("a directory");
     std::fs::write(
@@ -324,7 +322,16 @@ fn a_package_belongs_to_the_workspace_cargo_names_and_a_members_manifest_is_refu
         text.replace("[workspace]", "[workspace]\nmembers = [\"member\"]"),
     )
     .expect("the manifest is written");
-    git(&root, &["add", "-A"]);
+    git(root, &["add", "-A"]);
+}
+
+/// A package belongs to the workspace that Cargo says holds it, named relative to the tested root:
+/// the workspace of a manifest spelled with a `.` is the same as without it, and a manifest that is
+/// a member's, not the workspace's own, is refused naming the workspace's manifest.
+#[test]
+fn a_package_belongs_to_the_workspace_cargo_names_and_a_members_manifest_is_refused() {
+    let (_directory, root) = copy("no-root-manifest");
+    plant_member(&root);
     let base = plan_text(&root);
     let owners = |manifests: &str| -> (Vec<(String, String)>, Vec<String>) {
         let text = base.replace("'first/Cargo.toml', 'second/Cargo.toml'", manifests);
@@ -383,8 +390,100 @@ fn a_package_belongs_to_the_workspace_cargo_names_and_a_members_manifest_is_refu
     assert!(stdout.contains("`first/Cargo.toml`"), "{stdout}");
 }
 
-/// A workspace at the tested root is named `.`, and a root manifest that names a member of its own
-/// is one workspace.
+/// A link inside the repository that the plan's path goes through does not make a workspace's own
+/// manifest a member's: the workspace is the same file whichever way it is reached, from an
+/// absolute root and from a relative one, and a member's manifest through the same link is still
+/// refused, naming the workspace's own.
+#[cfg(unix)]
+#[test]
+fn a_workspace_reached_through_a_link_inside_the_repository_keeps_its_own_manifest() {
+    let (_directory, root) = copy("no-root-manifest");
+    plant_member(&root);
+    std::os::unix::fs::symlink("first", root.join("alias")).expect("a link");
+    git(&root, &["add", "-A"]);
+    let base = plan_text(&root);
+    let write = |manifests: &str| {
+        std::fs::write(
+            root.join("conformance").join("plan.toml"),
+            base.replace("'first/Cargo.toml', 'second/Cargo.toml'", manifests),
+        )
+        .expect("the plan is written");
+    };
+    let name = root
+        .file_name()
+        .expect("a name")
+        .to_string_lossy()
+        .into_owned();
+    let parent = root.parent().expect("a parent").to_path_buf();
+    let absolute = root.to_string_lossy().into_owned();
+    let roots = [
+        (root.clone(), absolute.as_str()),
+        (root.clone(), "."),
+        (parent, name.as_str()),
+    ];
+    // The workspace's own manifest, through the link.
+    write("'alias/Cargo.toml', 'second/Cargo.toml'");
+    let map = map_of(&root, load(&root), None, false);
+    assert!(map.problems.is_empty(), "{:?}", map.problems);
+    for package in &map.packages {
+        if package.name != "beta" {
+            assert!(
+                ["alias", "first"].contains(&package.workspace.as_str()),
+                "{}: {}",
+                package.name,
+                package.workspace
+            );
+        }
+    }
+    for (from, argument) in &roots {
+        let (code, stdout, stderr) = program_in(from, &["map", "--root", argument]);
+        assert_eq!(code, Some(0), "--root {argument}: {stdout}{stderr}");
+        assert!(
+            stdout.contains("; 0 refused; 0 problems"),
+            "{argument}: {stdout}"
+        );
+    }
+    // A member's manifest through the same link.
+    write("'alias/member/Cargo.toml', 'second/Cargo.toml'");
+    for (from, argument) in &roots {
+        let (code, stdout, stderr) = program_in(from, &["map", "--root", argument]);
+        assert_eq!(code, Some(2), "--root {argument}: {stdout}{stderr}");
+        assert!(
+            stdout.contains("a manifest inside the workspace")
+                && stdout.contains("Cargo.toml` in `[rust] manifests`"),
+            "--root {argument}: {stdout}"
+        );
+    }
+}
+
+/// A Rust workspace is mapped from a relative root, and from a root that holds `..` and so is not
+/// in the form Cargo writes its paths in: the files are named relative to the root and no problem
+/// is raised.
+#[test]
+fn a_rust_workspace_is_mapped_from_a_relative_root_and_from_a_root_that_holds_dots() {
+    let (directory, root) = copy("no-root-manifest");
+    let dotted = directory.path().join("first").join("..");
+    for (from, argument) in [
+        (root.clone(), ".".to_owned()),
+        (root.parent().expect("a parent").to_path_buf(), {
+            root.file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .into_owned()
+        }),
+        (root.clone(), dotted.to_string_lossy().into_owned()),
+    ] {
+        let (code, stdout, stderr) = program_in(&from, &["map", "--root", &argument]);
+        assert_eq!(code, Some(0), "--root {argument}: {stdout}{stderr}");
+        assert!(
+            stdout.starts_with("4 identifiers keyed to 4 tests;")
+                && stdout.contains("; 0 refused; 0 problems"),
+            "--root {argument}: {stdout}"
+        );
+    }
+}
+
+/// A workspace at the tested root is named `.`.
 #[test]
 fn the_workspace_of_a_root_manifest_is_the_tested_root() {
     let (_directory, root) = copy("ignored-tests");
@@ -497,7 +596,7 @@ fn a_mention_outside_the_grammar_is_refused_naming_the_row() {
     );
 }
 
-/// Each key of the plan's `[typescript]` table that names a directory is read where the map reads
+/// Each top-level key of the plan that names a directory is read where the map reads
 /// that directory: the scripts' directories for references in scripts, and the lanes' directories
 /// for the references in Kotlin, Swift and Java files. A planted edit of a key changes the map.
 #[test]
@@ -703,6 +802,28 @@ fn the_compiler_is_the_package_a_directory_holds_and_no_directory_above_it_is_se
     let map = mapped("'empty', 'first', 'second'", None);
     assert!(map.problems.is_empty(), "{:?}", map.problems);
     assert_eq!(map.typescript_version.as_deref(), Some("first"));
+    // The first directory that holds a package is the one used: a package that does not load is an
+    // error, and the next directory's compiler does not take its place.
+    let broken = root.join("broken").join("node_modules").join("typescript");
+    std::fs::create_dir_all(&broken).expect("a package directory");
+    std::fs::write(root.join("broken").join("package.json"), "{}").expect("a manifest");
+    std::fs::write(
+        broken.join("index.js"),
+        "throw new Error('broken on purpose')\n",
+    )
+    .expect("an entry");
+    git(&root, &["add", "-A"]);
+    let map = mapped("'empty', 'broken', 'first', 'second'", None);
+    assert!(
+        map.problems
+            .iter()
+            .any(|problem| problem.contains("could not be loaded")
+                && problem.contains("broken on purpose")
+                && problem.contains("broken")),
+        "{:?}",
+        map.problems
+    );
+    assert_eq!(map.typescript_version, None);
     // The command line's directory replaces the plan's.
     let map = mapped("'empty', 'first', 'second'", Some(&compiler()));
     assert!(map.problems.is_empty(), "{:?}", map.problems);
@@ -779,6 +900,11 @@ fn a_typescript_call_is_a_test_only_when_it_names_one() {
             false,
         ),
         ("a step", "a step inside a test", false),
+        (
+            "a helper that is not a suite",
+            "a helper with a title",
+            false,
+        ),
         ("a hook with a title", "a hook before all", false),
         ("a hook with a title", "a hook before each", false),
         ("a hook with a title", "a hook after all", false),

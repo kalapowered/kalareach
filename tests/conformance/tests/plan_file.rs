@@ -423,6 +423,14 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "`[rust] manifests` names `Cargo.toml` twice",
         ),
         (
+            "a manifest named twice by another spelling",
+            with("").replace(
+                "manifests = []",
+                "manifests = ['Cargo.toml', './Cargo.toml']",
+            ),
+            "`[rust] manifests` names `./Cargo.toml` twice",
+        ),
+        (
             "a directory left out that is a path",
             with("[typescript]\npackages = []\nskip_directories = ['web/generated']\n"),
             "`[typescript] skip_directories` names `web/generated`, which is not the name of one directory",
@@ -555,6 +563,7 @@ fn a_key_that_names_a_path_is_refused_with_its_reason_for_each_way_a_path_goes_w
     // path that is absent, and a path that is the other kind of place.
     let ways = |absent: (&str, &'static str), other_kind: (&str, &'static str)| {
         vec![
+            (String::new(), "is empty"),
             (absent.0.to_owned(), absent.1),
             (other_kind.0.to_owned(), other_kind.1),
             ("/dir".to_owned(), "is not a relative path"),

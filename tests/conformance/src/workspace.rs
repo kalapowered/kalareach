@@ -235,20 +235,17 @@ fn describe(root: &Path, manifest: &str, value: &Value) -> Result<Vec<Package>, 
         inside => inside.to_owned(),
     };
     // The plan names each workspace by its root manifest: a member's manifest describes the same
-    // workspace, and naming it would list the workspace under a name that is not its own.
-    let named = Path::new(manifest)
-        .parent()
-        .map(|parent| {
-            parent
-                .components()
-                .filter(|part| !matches!(part, std::path::Component::CurDir))
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/")
-        })
-        .filter(|directory| !directory.is_empty())
-        .unwrap_or_else(|| ".".to_owned());
-    if named != workspace {
+    // workspace, and naming it would list the workspace under a name that is not its own. The two
+    // manifests are compared as the file system resolves them, so a link on the way of the plan's
+    // path does not make a workspace's own manifest a member's; the name shown above is derived
+    // apart from that comparison.
+    let own = Path::new(workspace_root).join("Cargo.toml");
+    let named = root.join(manifest);
+    let same = match (named.canonicalize(), own.canonicalize()) {
+        (Ok(named), Ok(own)) => named == own,
+        _ => named == own,
+    };
+    if !same {
         let root_manifest = if workspace == "." {
             "Cargo.toml".to_owned()
         } else {
@@ -624,6 +621,24 @@ harness = false
         assert_eq!(
             describe(Path::new("/r"), "w/Cargo.toml", &value).expect_err("refused"),
             "cargo metadata gave no `workspace_default_members` for `w/Cargo.toml`"
+        );
+    }
+
+    #[test]
+    fn a_workspace_outside_the_tested_root_is_refused_naming_where_it_is() {
+        let outer = std::env::temp_dir().join("kr-conformance-outer-workspace");
+        let root = outer.join("inner");
+        let value = serde_json::json!({
+            "workspace_members": [],
+            "workspace_default_members": [],
+            "packages": [],
+            "workspace_root": outer.to_string_lossy(),
+        });
+        let problem = describe(&root, "Cargo.toml", &value).expect_err("refused");
+        assert!(
+            problem.contains(&format!("is at `{}`", outer.to_string_lossy()))
+                && problem.ends_with("which is not inside the tested root"),
+            "{problem}"
         );
     }
 

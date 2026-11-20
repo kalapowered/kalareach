@@ -489,11 +489,14 @@ fn script_operands(command: &[String]) -> Vec<&str> {
 }
 
 /// Why `operand` does not name a place inside the repository, or `None`: it is a relative path that
-/// holds no `..` and no pattern character (`*`, `?`, `[` or `]`). A pattern names several files and
-/// so is no path, and a Windows file system refuses the characters before it looks for the file, so
-/// a path that holds one is refused on every platform. This is a check of the text and looks at no
-/// file.
+/// is not empty, holds no `..` and no pattern character (`*`, `?`, `[` or `]`). A pattern names
+/// several files and so is no path. A Windows file system refuses `*` and `?` before it looks for
+/// the file, and `[` and `]` are patterns of Git's pathspecs, so a path that holds one is refused
+/// on every platform. This is a check of the text and looks at no file.
 fn outside_refused(operand: &str) -> Option<String> {
+    if operand.is_empty() {
+        return Some("is empty".to_owned());
+    }
     let path = Path::new(operand);
     if path.is_absolute() || operand.starts_with('/') || operand.contains('\\') {
         return Some("is not a relative path".to_owned());
@@ -758,7 +761,12 @@ impl Plan {
                     "`[rust] manifests` names `{manifest}`, which {why}"
                 ));
             }
-            if !manifests.insert(manifest.as_str()) {
+            // Two spellings of one path, with or without a `.`, are one manifest.
+            let spelled: PathBuf = Path::new(manifest)
+                .components()
+                .filter(|part| !matches!(part, std::path::Component::CurDir))
+                .collect();
+            if !manifests.insert(spelled) {
                 return refuse(format!("`[rust] manifests` names `{manifest}` twice"));
             }
         }

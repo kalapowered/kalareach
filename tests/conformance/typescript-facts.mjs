@@ -6,9 +6,10 @@
 //
 // The program embeds this script and gives it on standard input. A compiler directory is a directory
 // whose own `node_modules` holds `typescript`, and only that one: no parent directory is searched.
-// The first directory that holds it is used. A test call is a call of `it`, `test`, `describe` or
-// `suite`, including their modifiers (`it.skip`, `test.describe`, `describe.each(table)`), that names
-// a test: its first argument is a string or a template, or an arrow function or a function
+// The first directory that holds it is used, and a package that does not load stops the read. A test
+// call is a call of `it`, `test`, `describe` or `suite`, including their modifiers (`it.skip`,
+// `test.describe`, `describe.each(table)`), that names a test: its first argument is a string or a
+// template, or an arrow function or a function
 // expression follows its first argument. The conformance report decides which test each comment
 // keys; this script only says where things are. It uses the compiler's parser rather than a pattern
 // so that a comment marker inside a string, a template or JSX text is never read as a comment.
@@ -27,26 +28,25 @@ if (!repository || separator < 0) {
 }
 
 // The compiler is the package a directory holds in its own `node_modules`, loaded by its absolute
-// path: Node's search of the parent directories, and of NODE_PATH, never finds another.
+// path: Node's search of the parent directories, and of NODE_PATH, never finds another. The first
+// directory that holds the package is the one used: a package that does not load is an error, and
+// no later directory takes its place.
 let ts
-const failures = []
 for (const directory of directories) {
   const installed = resolve(directory, 'node_modules', 'typescript')
   if (!existsSync(installed)) continue
   try {
     ts = createRequire(join(installed, 'package.json'))(installed)
-    break
   } catch (error) {
-    failures.push(`${installed}: ${error.message}`)
+    process.stderr.write(
+      `typescript-facts: the TypeScript compiler at ${installed} could not be loaded: ${error.message}; reinstall it with \`pnpm install --frozen-lockfile\`, or pass \`--typescript-compiler <directory>\`\n`
+    )
+    process.exit(3)
   }
+  break
 }
 if (!ts) {
-  const where =
-    directories.length === 0
-      ? 'because no directory names one'
-      : failures.length > 0
-        ? `in ${directories.join(', ')} (it could not be loaded: ${failures.join('; ')})`
-        : `in ${directories.join(', ')}`
+  const where = directories.length > 0 ? `in ${directories.join(', ')}` : 'because no directory names one'
   process.stderr.write(
     `typescript-facts: the TypeScript compiler is not installed ${where}; run \`pnpm install --frozen-lockfile\`, name a directory of the tree in the plan's \`compiler_from\`, or pass \`--typescript-compiler <directory>\`\n`
   )
@@ -103,7 +103,8 @@ for (const file of files) {
       const root = names?.[0]
       // The calls of a test file that are not tests: a hook, a step, and the fixtures a test takes.
       const other = names?.some((name) => NOT_TESTS.has(name))
-      const isSuite = !other && names && (SUITES.has(root) || names.slice(1).some((name) => SUITES.has(name)))
+      const isSuite =
+        !other && names && (SUITES.has(root) || (TESTS.has(root) && names.slice(1).some((name) => SUITES.has(name))))
       const isTest = !other && names && !isSuite && TESTS.has(root)
       const first = node.arguments[0]
       // A call names a test when its first argument is a string or a template, or when a function

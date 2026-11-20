@@ -21,4 +21,5 @@ describe('every form of a call', () => {
   test.beforeEach('a hook before each', async () => {})
   test.afterAll('a hook after all', async () => {})
   test.afterEach('a hook after each', async () => {})
+  controls.describe('a helper with a title', () => {})
 })
