@@ -4236,7 +4236,9 @@ async fn a_refused_dial_beside_a_live_replacement_writes_nothing() {
     })
     .await;
     assert!(
-        Arc::ptr_eq(&state.session().expect("still connected"), &held.session()),
+        state
+            .session()
+            .is_ok_and(|now| Arc::ptr_eq(&now, &held.session())),
         "the connection installed meanwhile is still the one held"
     );
     rig.app.told_everything().await;
@@ -4310,18 +4312,26 @@ async fn a_replacement_that_ends_before_adoption_reaches_a_typed_end_and_a_new_d
     tokio::time::timeout(Duration::from_secs(30), second.closed())
         .await
         .expect("the replacement ends");
+    // What the page is told from here on: the end, and then the connection the keeper dials.
+    let told_before = rig.app.told_connection().len();
     hold.release();
     let told = told_until(&rig, |told| {
-        let ended = told.iter().position(|state| {
-            state["connected"] == false && state["contact"]["state"] == "out_of_contact"
-        });
-        ended.is_some_and(|at| {
-            told[at..].iter().any(|state| {
-                state["connected"] == true && state["contact"]["state"] == "in_contact"
-            })
-        })
+        let after = &told[told_before..];
+        after
+            .iter()
+            .position(|state| state["connected"] == false)
+            .is_some_and(|at| after[at..].iter().any(|state| state["connected"] == true))
     })
     .await;
+    let told = &told[told_before..];
+    let Some(ended) = told.iter().find(|state| state["connected"] == false) else {
+        panic!("the end is told: {told:?}");
+    };
+    assert_eq!(ended["contact"]["state"], "out_of_contact", "{ended}");
+    let Some(dialled) = told.iter().rev().find(|state| state["connected"] == true) else {
+        panic!("the dialled connection is told: {told:?}");
+    };
+    assert_eq!(dialled["contact"]["state"], "in_contact", "{dialled}");
     assert!(dials.made() >= 2, "a new dial: {told:?}");
 }
 
