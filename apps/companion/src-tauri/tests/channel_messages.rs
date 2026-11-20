@@ -471,9 +471,12 @@ fn an_entry_whose_flush_failed_is_finished_by_the_next_keep_and_names_the_draft_
 /// until the flush works.
 #[test]
 fn a_directory_whose_name_cannot_be_flushed_keeps_no_entry_and_fails_again() {
-    let data = data();
-    let window = Window::over(data.path());
-    let guard = kr_flush::testing::refuse_flushes_of(data.path());
+    let temporary = data();
+    // The walk that proves each name on a path durable flushes the directories as they resolve, so
+    // the refusal names the directory as it resolves.
+    let root = temporary.path().canonicalize().expect("a resolved path");
+    let window = Window::over(&root);
+    let guard = kr_flush::testing::refuse_flushes_of(&root);
     refused_with(
         &window.keep(message(1, "text", &[])),
         "RESOURCE_UNAVAILABLE",
@@ -483,7 +486,7 @@ fn a_directory_whose_name_cannot_be_flushed_keeps_no_entry_and_fails_again() {
         "RESOURCE_UNAVAILABLE",
     );
     assert!(
-        !names(&dir(data.path())).contains(&format!("{}.message", action(1))),
+        !names(&dir(&root)).contains(&format!("{}.message", action(1))),
         "nothing is kept while the folder's name is not durable"
     );
     drop(guard);
@@ -685,7 +688,7 @@ fn two_keeps_over_one_folder_with_one_place_left_never_pass_the_bound() {
         } else {
             Limits {
                 entries: 100,
-                bytes: 700,
+                bytes: 450,
                 holds: 1_000,
             }
         };

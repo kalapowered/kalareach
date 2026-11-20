@@ -1419,7 +1419,8 @@ async fn blocking<T: Send + 'static>(
 #[tauri::command]
 pub async fn device_drafts(state: State<'_, AppState>) -> Result<Value> {
     let drafts = state.drafts();
-    encode(&blocking(move || drafts.read()).await?)
+    let channels = state.channels();
+    encode(&blocking(move || channels.read_drafts(&drafts)).await?)
 }
 
 /// Keeps a draft: makes it, or replaces the version the page names.
