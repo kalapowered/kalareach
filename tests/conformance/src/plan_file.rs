@@ -569,14 +569,9 @@ impl Plan {
                     ));
                 }
             }
-            if expand(step, "", &[])
-                .iter()
-                .filter(|word| *word == "--show-output")
-                .count()
-                > 1
-            {
+            if step.command.iter().any(|word| word == "--show-output") {
                 return refuse(format!(
-                    "step `{id}` holds `--show-output`, which the loader adds"
+                    "step `{id}` holds `--show-output`, which the loader adds and a plan file does not write"
                 ));
             }
             for operand in script_operands(&step.command) {
