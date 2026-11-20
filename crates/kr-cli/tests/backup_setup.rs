@@ -2830,11 +2830,25 @@ async fn the_kit_is_shown_without_a_staircase_on_a_console_that_does_not_return_
     }
     window.type_bytes_exactly(&[0x03]);
     let shown = window.wait_for("kr ended");
+    // The case's condition, asserted: the output mode that the observer set was in force when `kr`
+    // started, so a kit shown at the left edge is the command's doing and not the console's.
+    let (before, _) = modes_of(&shown);
+    let output_before = u32::from_str_radix(before.rsplit(':').next().unwrap_or("0"), 16)
+        .expect("the output mode is hexadecimal");
+    assert_eq!(
+        output_before & 0x0008,
+        0x0008,
+        "this case could not make its condition: the console did not start without a return at a \
+         line end: {shown}"
+    );
     window.assert_the_terminal_is_as_found(&shown);
 }
 
-/// An answer longer than the bound is read to the end of its line and kept to the bound, and
-/// nothing of it is left in the console: the next line the person types is the shell's.
+/// An answer longer than the bound ends the dialogue and leaves nothing of it in the console: the
+/// next line the person types is the shell's. That the line is read to its end and kept to the
+/// bound is shown by `backup::kit::answer_tests::a_line_over_the_bound_keeps_the_bound_and_leaves_nothing_on_the_handle`:
+/// the handle's reader is closed when the command ends, so a console case cannot tell a reader that
+/// took the whole line from one that left some for its own handle.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_over_the_bound_is_read_to_the_end_of_its_line_and_leaves_nothing_behind() {
