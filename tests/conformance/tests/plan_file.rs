@@ -888,6 +888,11 @@ fn execution_faults() -> Vec<(&'static str, String, &'static str)> {
             "neither its command nor an `env` value holds `{output}`",
         ),
         (
+            "a variable that holds the output of a step that names none",
+            step_adding("env = { A = '{output}' }\n", cargo),
+            "step `one` holds `{output}` and names no `output`",
+        ),
+        (
             "a command that holds the output of a step that names none",
             step_adding("", "['cargo', 'test', '{output}']"),
             "step `one` holds `{output}` and names no `output`",
@@ -969,6 +974,100 @@ fn a_variable_the_report_sets_for_each_step_is_refused_in_the_plan_and_in_a_step
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A step's `directory` is refused with its own reason for each way a path goes wrong, as the keys
+/// that name a path are: it is absent, it is a file, it is absolute or holds `..` or a pattern
+/// character, it is a link, or a link on its way leads out of the repository. A directory that a
+/// link inside the repository reaches inside it is accepted.
+#[test]
+fn a_step_directory_is_refused_with_its_reason_for_each_way_a_path_goes_wrong() {
+    let (repository, _elsewhere) = tree_with_links();
+    let root = repository.path();
+    let step =
+        |operand: &str| step_adding(&format!("directory = '{operand}'\n"), "['pnpm', 'test']");
+    let not_a_directory = "is not a directory of the repository";
+    let mut refusals = vec![
+        ("missing", not_a_directory),
+        ("dir/file.txt", not_a_directory),
+        ("/dir", "is not a relative path"),
+        ("dir/../dir", "holds `..`"),
+        ("d*r", "holds a pattern character"),
+    ];
+    let mut accepted = vec!["dir", "dir/sub"];
+    if cfg!(unix) {
+        refusals.push(("dirlink", "is a link"));
+        refusals.push(("insidelink", "is a link"));
+        refusals.push(("dirlink/sub", "leads out of the repository through a link"));
+        accepted.push("insidelink/sub");
+    }
+    let mut wrong = Vec::new();
+    for operand in accepted {
+        if let Err(refusal) = Plan::parse(&step(operand), root) {
+            wrong.push(format!("{operand}: refused as `{refusal}`"));
+        }
+    }
+    for (operand, why) in refusals {
+        let wanted = format!("step `one` names the `directory` `{operand}`, which {why}");
+        match Plan::parse(&step(operand), root) {
+            Ok(_) => wrong.push(format!("{operand}: the loader refused nothing")),
+            Err(refusal) if refusal.0 == wanted => {}
+            Err(refusal) => wrong.push(format!("{operand}: refused as `{refusal}`")),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A script a step runs is read from the directory the step runs in: the file the step finds there
+/// is the one the loader holds to be tracked, and one at the repository's root is not.
+#[test]
+fn a_script_is_looked_for_in_the_directory_the_step_runs_in() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = directory.path();
+    std::fs::write(root.join("Cargo.toml"), "").expect("a manifest");
+    std::fs::create_dir(root.join("dir")).expect("a directory");
+    std::fs::write(root.join("dir").join("here.sh"), "").expect("a script");
+    std::fs::write(root.join("top.sh"), "").expect("a script");
+    git(root, &["init", "-q"]);
+    git(root, &["add", "dir/here.sh", "top.sh"]);
+    let step =
+        |directory: &str, script: &str| step_adding(directory, &format!("['bash', '{script}']"));
+    let in_dir = "directory = 'dir'\n";
+    for (before, script) in [(in_dir, "here.sh"), ("", "top.sh")] {
+        let loaded = Plan::parse(&step(before, script), root);
+        assert!(loaded.is_ok(), "{before} {script}: {loaded:?}");
+    }
+    for (before, script) in [(in_dir, "top.sh"), ("", "here.sh")] {
+        let refusal =
+            Plan::parse(&step(before, script), root).expect_err("the script is not there");
+        assert!(
+            refusal
+                .0
+                .contains(&format!("step `one` runs the script `{script}`, which")),
+            "{before} {script}: {refusal}"
+        );
+    }
+}
+
+/// `{output}` in a step's variable is the step's output, the one the step names, as it is in a word
+/// of its command.
+#[test]
+fn the_output_placeholder_in_a_step_variable_is_the_steps_output() {
+    let text = step_adding(
+        "output = '{evidence}/conformance/x.json'\nenv = { WHERE = '{output}' }\n",
+        "['cargo', 'test']",
+    );
+    let plan = Plan::parse(&text, &repository()).expect("a variable can hold the output");
+    let steps = plan.steps(
+        Platform::Linux,
+        &selection(&["rust"]),
+        &Values::evidence("/e"),
+        None,
+    );
+    assert_eq!(
+        steps[0].env,
+        [("WHERE".to_owned(), "/e/conformance/x.json".to_owned())]
+    );
 }
 
 /// A set-up step, `prep`, on `platforms`, and a step, `one`, that holds `after` and its own
