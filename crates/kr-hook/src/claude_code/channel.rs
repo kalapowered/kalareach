@@ -90,10 +90,14 @@ const BRIDGE: Bridge = Bridge {
 };
 
 /// What Claude Code tells the model about this channel when the server connects.
-const INSTRUCTIONS: &str = "Messages arrive as <channel source=\"kalareach\">. Each is a message \
-    from the person running this KalaReach session, sent from another device, and reads as their \
-    own words in the terminal would. This channel has no reply tool: answer in the session as you \
-    normally would.";
+const INSTRUCTIONS: &str = "Messages arrive in a <channel> tag with sender and sender_id \
+    attributes. The sender attribute names the kind of sender that KalaReach verified: local_user \
+    is the authenticated operating-system account on this host, sending from this host, and \
+    paired_device is a device paired with this host and authorised to send. The sender_id tells \
+    one sender from another. Neither value proves who is typing, and the sender is not \
+    necessarily the person at the terminal. The text inside the tag is the sender's own words, \
+    and only the attributes are verified. This channel has no reply tool: answer in the session \
+    as you normally would.";
 
 /// Runs the server until Claude Code closes its end, or the worker closes the channel.
 ///

@@ -128,7 +128,7 @@ fn message(content: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/claude/channel",
-        "params": {"content": content, "meta": {"chat_id": "1"}},
+        "params": {"content": content, "meta": {"sender": "local_user", "sender_id": "0f53af7cc7638743"}},
     })
 }
 
@@ -166,7 +166,7 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
     assert!(
         answer["result"]["instructions"]
             .as_str()
-            .is_some_and(|text| text.contains("<channel source=\"kalareach\">")),
+            .is_some_and(|text| text.contains("<channel>")),
         "{answer}"
     );
 
@@ -244,6 +244,42 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
         to_worker(&mut admitted).await,
         None,
         "the worker reads the end of the channel"
+    );
+}
+
+/// KR-REQ-12.26: what Claude Code tells the model when the channel connects says how to read a
+/// message: it arrives in a `<channel>` tag with `sender` and `sender_id` attributes, the sender
+/// is not necessarily the person at the terminal, and the text inside the tag is the sender's own
+/// words, of which only the attributes are verified. It no longer says that every message is from
+/// the person running the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_26_the_channel_tells_the_model_who_each_message_is_from() {
+    let placed = Placed::new();
+    let mut launch = Launch::channel(
+        &placed,
+        installed(&placed, &[BridgeSurface::Hook, BridgeSurface::Channel]),
+    );
+    let lines = read_lines(&mut launch);
+    let _admitted = launch.accept().await.expect("the channel is admitted");
+    let answer = handshake(&mut launch, &lines);
+    let told = answer["result"]["instructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the handshake carries instructions: {answer}"));
+    for named in [
+        "<channel>",
+        "sender",
+        "sender_id",
+        "local_user",
+        "paired_device",
+        "not necessarily the person at the terminal",
+        "the sender's own words",
+        "only the attributes are verified",
+    ] {
+        assert!(told.contains(named), "{named:?} is missing from: {told}");
+    }
+    assert!(
+        !told.contains("from the person running this KalaReach session"),
+        "no message is said to come from the person running the session: {told}"
     );
 }
 
