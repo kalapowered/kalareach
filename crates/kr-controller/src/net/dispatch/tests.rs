@@ -2769,10 +2769,22 @@ async fn a_receipt_is_written_whole_under_the_privacy_state_it_was_read_in() {
     world.serving.abort();
 }
 
+/// A receipt read answered `frame` as a refusal, or a panic naming what it was answered instead.
+fn a_receipt_refused_as_not_shown(frame: &kr_protocol::envelope::ControlFrame) {
+    let refusal = the_refusal_of(frame);
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::ResourceUnavailable
+    );
+    assert_eq!(refusal.message, "this retained output cannot be shown");
+}
+
 /// KR-REQ-24.28: a receipt's result that a worker answered while privacy mode was off is not
 /// published after privacy mode has started: the device is told it cannot be shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_receipt_is_refused_when_privacy_mode_starts_before_it_is_sent() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
     let world = worker_answering_a_receipt().await;
     let controller = &world.controller;
     let (connection, kept) = describing_connection(controller, 72);
@@ -2780,27 +2792,32 @@ async fn a_receipt_is_refused_when_privacy_mode_starts_before_it_is_sent() {
         privacy_mode_is_turned_on(controller)
     })
     .await;
-    let refusal = the_refusal_of(&frame);
-    assert_eq!(
-        refusal.code,
-        kr_protocol::error::ErrorCode::ResourceUnavailable
+    assert!(
+        matches!(
+            &frame,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(_),
+                ..
+            })
+        ),
+        "the answer was not refused: {frame:?}"
     );
-    assert_eq!(refusal.message, "this retained output cannot be shown");
+    a_receipt_refused_as_not_shown(&frame);
     world.serving.abort();
 }
 
-/// KR-REQ-24.28: a receipt read while privacy mode is on and its removal had reported complete when
-/// the read began is written, so no receipt is refused for as long as the mode is on.
+/// KR-REQ-24.28: a receipt read while privacy mode is on is written when its own session owed no
+/// removal when the read began.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_receipt_read_after_privacy_mode_reported_complete_is_written() {
+async fn a_receipt_read_after_its_session_removed_what_privacy_mode_takes_is_written() {
     use kr_protocol::envelope::{ControlFrame, Outcome};
 
     let world = worker_answering_a_receipt().await;
     let controller = &world.controller;
     privacy_mode_is_on_and_settled(controller, world.session_id).await;
     assert!(
-        privacy_mode_has_reported_complete(controller),
-        "the removal has reported complete before the read"
+        !controller.privacy.owes_cleanup(world.session_id),
+        "the session owes no removal before the read"
     );
     let (connection, kept) = describing_connection(controller, 73);
     let frame = a_receipt_read_then(&world, &connection, &kept, || async {}).await;
@@ -2817,11 +2834,56 @@ async fn a_receipt_read_after_privacy_mode_reported_complete_is_written() {
     world.serving.abort();
 }
 
-/// KR-REQ-24.28: a receipt read while privacy mode is on and its removal had not reported complete
-/// when the read began is refused, as a worker's answer made before it was told may still hold what
-/// the removal takes.
+/// KR-REQ-24.28: a receipt read while privacy mode is on is written when its own session owed no
+/// removal, though another session still owes its own: the receipt of one session is not refused
+/// for a debt of another.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_receipt_read_before_privacy_mode_reported_complete_is_refused() {
+async fn a_receipt_read_while_another_session_owes_its_removal_is_written() {
+    use kr_protocol::envelope::{ControlFrame, Outcome};
+
+    let world = worker_answering_a_receipt().await;
+    let controller = &world.controller;
+    privacy_mode_is_on_and_settled(controller, world.session_id).await;
+    // Another session's worker is running and has not said that its cleanup is complete.
+    let another = SessionId::new(kr_ipc::new_uuid());
+    controller
+        .privacy
+        .note_session_live(
+            another,
+            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+        )
+        .expect("the other session owes its removal");
+    assert!(
+        controller.privacy.owes_cleanup(another)
+            && !controller.privacy.owes_cleanup(world.session_id),
+        "only the other session owes its removal"
+    );
+    assert!(
+        !privacy_mode_has_reported_complete(controller),
+        "the environment as a whole has not reported complete"
+    );
+    let (connection, kept) = describing_connection(controller, 78);
+    let frame = a_receipt_read_then(&world, &connection, &kept, || async {}).await;
+    assert!(
+        matches!(
+            frame,
+            ControlFrame::Response(kr_protocol::envelope::Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "{frame:?}"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-24.28: a receipt read while privacy mode is on and its own session still owed its removal
+/// when the read began is refused, though the removal finishes while the answer waits: a worker's
+/// answer made before it was told may still hold what the removal takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_receipt_read_before_its_session_removed_what_privacy_mode_takes_is_refused() {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
     let world = worker_answering_a_receipt().await;
     let controller = &world.controller;
     privacy_mode_is_turned_on(controller).await;
@@ -2833,15 +2895,29 @@ async fn a_receipt_read_before_privacy_mode_reported_complete_is_refused() {
         )
         .expect("the session owes its removal");
     assert!(
-        !privacy_mode_has_reported_complete(controller),
-        "the removal has not reported complete before the read"
+        controller.privacy.owes_cleanup(world.session_id),
+        "the session owes its removal before the read"
     );
     let (connection, kept) = describing_connection(controller, 74);
-    let frame = a_receipt_read_then(&world, &connection, &kept, || async {}).await;
-    assert_eq!(
-        the_refusal_of(&frame).code,
-        kr_protocol::error::ErrorCode::ResourceUnavailable
+    let frame = a_receipt_read_then(&world, &connection, &kept, || async {
+        the_session_has_removed_what_privacy_mode_takes(controller, world.session_id);
+        assert!(
+            privacy_mode_has_reported_complete(controller),
+            "the removal has reported complete once the read is made"
+        );
+    })
+    .await;
+    assert!(
+        matches!(
+            &frame,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(_),
+                ..
+            })
+        ),
+        "the answer was not refused: {frame:?}"
     );
+    a_receipt_refused_as_not_shown(&frame);
     world.serving.abort();
 }
 
