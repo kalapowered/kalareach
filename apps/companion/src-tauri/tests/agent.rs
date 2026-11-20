@@ -369,7 +369,13 @@ async fn each_agent_mutation_names_the_workers_session_the_instance_and_the_revi
         params["target"] = target(&worker, own_instance, own_revision);
         let mut asked = page.call(command, json!({ "params": params }));
         if link.is_none() {
-            link = Some(worker.link().await);
+            let opened = worker.reached_by(&mut asked).await;
+            assert!(
+                opened.is_ok(),
+                "{command} opened the session's link: {:?}",
+                opened.as_ref().err()
+            );
+            link = opened.ok();
         }
         let link = link.as_mut().expect("the session's link");
         let reached = link.reached_by(&mut asked).await;
@@ -464,7 +470,15 @@ async fn a_package_action_is_invoked_on_the_sessions_worker_and_answered_in_the_
             "parameters": "e30",
         } }),
     );
-    let mut link = worker.link().await;
+    let opened = worker.reached_by(&mut asked).await;
+    assert!(
+        opened.is_ok(),
+        "plugin_action_invoke opened the session's link: {:?}",
+        opened.as_ref().err()
+    );
+    let Ok(mut link) = opened else {
+        unreachable!("asserted to be a link")
+    };
     let reached = link.reached_by(&mut asked).await;
     assert!(
         matches!(reached, Reached::Call(_)),
@@ -478,6 +492,10 @@ async fn a_package_action_is_invoked_on_the_sessions_worker_and_answered_in_the_
     let envelope = call.target.clone().expect("a mutation's envelope");
     assert_eq!(envelope.environment_id, worker.descriptor.environment_id);
     assert_eq!(envelope.session_id.as_ref(), Some(&worker.session_id));
+    assert_eq!(
+        envelope.session_epoch.as_ref(),
+        Some(&worker.descriptor.session_epoch)
+    );
     let sent: PluginActionInvokeParams = call.params();
     assert_eq!(
         envelope.application_instance_id.as_ref(),
@@ -1135,6 +1153,10 @@ async fn a_draft_submit_reaches_the_worker_in_envelopes_that_name_its_own_instan
         );
         assert_eq!(call.kind, CallKind::Mutation, "{which}");
         let envelope = call.target.clone().expect("a mutation's envelope");
+        assert_eq!(
+            envelope.environment_id, draft.worker.descriptor.environment_id,
+            "{which}"
+        );
         assert_eq!(envelope.session_id.as_ref(), Some(&draft.worker.session_id));
         assert_eq!(
             envelope.session_epoch.as_ref(),
@@ -1210,6 +1232,10 @@ async fn a_draft_queue_reaches_the_worker_in_envelopes_that_name_its_own_instanc
         assert_eq!(call.method, Method::AgentPromptQueue.to_string(), "{which}");
         assert_eq!(call.kind, CallKind::Mutation, "{which}");
         let envelope = call.target.clone().expect("a mutation's envelope");
+        assert_eq!(
+            envelope.environment_id, draft.worker.descriptor.environment_id,
+            "{which}"
+        );
         assert_eq!(envelope.session_id.as_ref(), Some(&draft.worker.session_id));
         assert_eq!(
             envelope.session_epoch.as_ref(),
