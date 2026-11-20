@@ -61,8 +61,9 @@ use kr_protocol::scalars::{AuthorisationKey, Nonce256};
 use kr_protocol::worker::ReservationId;
 
 use crate::protocol::{
-    self, HostDescriptor, HostProtocol, HostRendezvous, HostVerifyProof, RENDEZVOUS_DOMAIN,
-    RendezvousAccepted, VERIFY_DOMAIN,
+    self, HostDescriptor, HostProtocol, HostRendezvous, HostStartFailure, HostVerifyProof,
+    MAX_FAILURE_REASON_BYTES, RENDEZVOUS_DOMAIN, RendezvousAccepted, VERIFY_DOMAIN,
+    failure_reason_line,
 };
 
 /// The largest descriptor this host writes or reads.
@@ -215,6 +216,14 @@ pub enum LaunchError {
     Refused {
         /// Why.
         detail: String,
+    },
+    /// The host said it could not start, and why.
+    ///
+    /// The reason is the host's own sentence, cleaned to one line and held to its bound here.
+    #[error("{reason}")]
+    HostFailed {
+        /// What the host said.
+        reason: String,
     },
     /// A cryptographic operation failed, including a signature that did not verify.
     #[error("{0}")]
@@ -1045,10 +1054,16 @@ impl HostReservation {
                 }
             };
             let (connection, peer) = accepted;
+            // Who connected is settled before anything is read: a process that is not the one the
+            // service manager started cannot end this wait with a failure, and cannot hold the
+            // read of the next connection to the deadline by saying nothing.
+            if let Err(error) = verify_peer(&peer, launched) {
+                refused = Some(error);
+                continue;
+            }
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             let received =
-                tokio::time::timeout(left, self.receive(environment, launched, connection, peer))
-                    .await;
+                tokio::time::timeout(left, self.receive(environment, launched, connection)).await;
             match received {
                 Ok(Ok((descriptor, mut writer))) => {
                     // Publishing and acknowledging are inside the deadline too: a host waiting to
@@ -1114,6 +1129,9 @@ impl HostReservation {
                     // later claim on it is refused and counted.
                     return Ok((descriptor, fence(self.reservation_id, self.listener)));
                 }
+                // The host said why it could not start: that is the answer, and nothing better is
+                // on its way.
+                Ok(Err(error @ LaunchError::HostFailed { .. })) => return Err(error),
                 // One refused claim is not the end of the wait: the process the service manager
                 // started may still be on its way. The refusal is kept and reported if nothing
                 // better arrives.
@@ -1125,16 +1143,54 @@ impl HostReservation {
         }
     }
 
+    /// What a host's failure frame makes of the wait: its reason, when the frame is for this
+    /// launcher's reservation and environment and the reason is within its bound, and otherwise a
+    /// refusal that the wait keeps.
+    fn failure_from(&self, failure: HostStartFailure) -> LaunchError {
+        if failure.reservation_id != self.reservation_id {
+            return LaunchError::Refused {
+                detail: "the failure names a reservation this launcher did not make".to_owned(),
+            };
+        }
+        if failure.environment_id != self.environment_id {
+            return LaunchError::Refused {
+                detail: "the failure names a different environment".to_owned(),
+            };
+        }
+        if failure.reason.len() > MAX_FAILURE_REASON_BYTES {
+            return LaunchError::Refused {
+                detail: "the failure's reason is longer than the bound".to_owned(),
+            };
+        }
+        LaunchError::HostFailed {
+            reason: failure_reason_line(&failure.reason),
+        }
+    }
+
     async fn receive(
         &self,
         environment: &EnvironmentPaths,
         launched: &ProcessStartIdentity,
         connection: Connection,
-        peer: PeerIdentity,
     ) -> LaunchResult<(HostDescriptor, kr_ipc::framed::FrameWriter)> {
-        peer.authorise(kr_ipc::paths::current_uid())?;
         let (mut reader, writer) = split(connection, StreamKind::Control);
-        let claim: HostRendezvous = reader.read_message_without_schema().await?;
+        let payload = reader.read_payload().await?;
+        let limits = StreamKind::Control.cbor_limits();
+        let claim: HostRendezvous = match kr_cbor::from_canonical_slice(&payload, &limits) {
+            Ok(claim) => claim,
+            // Not a claim: the host may be saying it could not start. The connection is dropped
+            // on return, which is what the host waits for.
+            Err(error) => {
+                return Err(
+                    match kr_cbor::from_canonical_slice::<HostStartFailure>(&payload, &limits) {
+                        Ok(failure) => self.failure_from(failure),
+                        Err(_) => LaunchError::Endpoint(kr_ipc::IpcError::Frame(
+                            kr_protocol::frame::FrameError::Cbor(error),
+                        )),
+                    },
+                );
+            }
+        };
         check_rendezvous(&claim)?;
 
         if claim.reservation_id != self.reservation_id {
@@ -1152,30 +1208,6 @@ impl HostReservation {
                 detail: format!(
                     "the claim is from process {} and the service manager started {}",
                     claim.process_start_identity.pid.get(),
-                    launched.pid.get()
-                ),
-            });
-        }
-        // The kernel's own account of who connected, which the claim cannot choose. A peer the
-        // kernel will not name is a peer this launcher cannot check, and an unverifiable claim is
-        // refused rather than taken on the strength of a signature anyone holding the key could
-        // make.
-        let Some(pid) = peer.pid else {
-            return Err(LaunchError::Refused {
-                detail: "the connecting process has no kernel identity to check the claim against"
-                    .to_owned(),
-            });
-        };
-        let observed = kr_ipc::identity::process_start_identity(pid).map_err(|error| {
-            LaunchError::Refused {
-                detail: format!("the connecting process is unreadable: {error}"),
-            }
-        })?;
-        if !observed.matches(launched) {
-            return Err(LaunchError::Refused {
-                detail: format!(
-                    "the connecting process is {} and the service manager started {}",
-                    observed.pid.get(),
                     launched.pid.get()
                 ),
             });
@@ -1213,6 +1245,36 @@ impl HostReservation {
             writer,
         ))
     }
+}
+
+/// Checks the connecting process against the one the service manager started, from the kernel's
+/// own account of who connected, which nothing the process sends can choose.
+///
+/// A peer the kernel will not name, or one that is not this user's or not the process that was
+/// started, is refused: an unverifiable claim or failure is not taken on the strength of what it
+/// says of itself.
+fn verify_peer(peer: &PeerIdentity, launched: &ProcessStartIdentity) -> LaunchResult<()> {
+    peer.authorise(kr_ipc::paths::current_uid())?;
+    let Some(pid) = peer.pid else {
+        return Err(LaunchError::Refused {
+            detail: "the connecting process has no kernel identity to check the claim against"
+                .to_owned(),
+        });
+    };
+    let observed =
+        kr_ipc::identity::process_start_identity(pid).map_err(|error| LaunchError::Refused {
+            detail: format!("the connecting process is unreadable: {error}"),
+        })?;
+    if !observed.matches(launched) {
+        return Err(LaunchError::Refused {
+            detail: format!(
+                "the connecting process is {} and the service manager started {}",
+                observed.pid.get(),
+                launched.pid.get()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Starts a plugin host and takes its identity proof.
@@ -2076,5 +2138,178 @@ mod tests {
             );
             tokio::time::sleep(core::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// This process, as the launcher is told the process it started: a case that plays the host
+    /// from here connects as this process, so the launcher's check of who connected passes.
+    fn this_process() -> ProcessStartIdentity {
+        kr_ipc::identity::process_start_identity(std::process::id()).expect("this process")
+    }
+
+    /// The host's side of a rendezvous connection, made from this process.
+    async fn the_hosts_side(
+        reservation: &HostReservation,
+    ) -> (kr_ipc::framed::FrameReader, kr_ipc::framed::FrameWriter) {
+        let connection = Connection::connect(reservation.endpoint())
+            .await
+            .expect("the host connects");
+        split(connection, StreamKind::Control)
+    }
+
+    /// What the launcher makes of a failure frame sent from this process, with the reservation and
+    /// the environment the frame names.
+    async fn wait_after_failure(
+        environment: &EnvironmentPaths,
+        name: impl FnOnce(&HostReservation) -> (ReservationId, EnvironmentId),
+        reason: &str,
+    ) -> LaunchError {
+        let reservation =
+            HostReservation::open(environment, HostProtocol::THIS).expect("a reservation");
+        let (reservation_id, environment_id) = name(&reservation);
+        let (_reader, mut writer) = the_hosts_side(&reservation).await;
+        writer
+            .write_message(&HostStartFailure {
+                reservation_id,
+                environment_id,
+                reason: reason.to_owned(),
+            })
+            .await
+            .expect("the failure is written");
+        reservation
+            .accept(
+                environment,
+                &this_process(),
+                core::time::Duration::from_millis(500),
+            )
+            .await
+            .expect_err("no host started")
+    }
+
+    #[tokio::test]
+    async fn a_failure_for_this_reservation_ends_the_wait_with_its_reason() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let error = wait_after_failure(
+            &environment,
+            |reservation| (reservation.reservation_id(), environment.environment_id()),
+            "the plugin host could not listen on /x: a file stands there",
+        )
+        .await;
+        assert!(
+            matches!(&error, LaunchError::HostFailed { reason } if reason == "the plugin host could not listen on /x: a file stands there"),
+            "{error:?}"
+        );
+    }
+
+    /// A failure that does not belong to this launch is kept as a refusal and the wait goes on to
+    /// its deadline, as a claim that does not belong to it is, so a stray frame cannot end a start.
+    #[tokio::test]
+    async fn a_failure_that_is_not_this_launches_does_not_end_the_wait() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let other_reservation = ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        let other_environment = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([8; 16]));
+        let error = wait_after_failure(
+            &environment,
+            |_| (other_reservation, environment.environment_id()),
+            "another launch's failure",
+        )
+        .await;
+        assert!(matches!(error, LaunchError::Refused { .. }), "{error:?}");
+        let error = wait_after_failure(
+            &environment,
+            |reservation| (reservation.reservation_id(), other_environment),
+            "another environment's failure",
+        )
+        .await;
+        assert!(matches!(error, LaunchError::Refused { .. }), "{error:?}");
+    }
+
+    /// A peer the kernel will not name, and a peer that is not the process that was started, are
+    /// refused before anything they send is read.
+    #[test]
+    fn a_peer_that_is_not_the_launched_process_is_refused() {
+        let uid = kr_ipc::paths::current_uid();
+        let nameless = PeerIdentity {
+            uid,
+            gid: 0,
+            pid: None,
+        };
+        assert!(matches!(
+            verify_peer(&nameless, &this_process()),
+            Err(LaunchError::Refused { .. })
+        ));
+        let another = PeerIdentity {
+            uid,
+            gid: 0,
+            pid: Some(1),
+        };
+        assert!(matches!(
+            verify_peer(&another, &this_process()),
+            Err(LaunchError::Refused { .. })
+        ));
+        let itself = PeerIdentity {
+            uid,
+            gid: 0,
+            pid: Some(std::process::id()),
+        };
+        verify_peer(&itself, &this_process()).expect("the process that was started is accepted");
+    }
+
+    #[tokio::test]
+    async fn a_reason_over_the_bound_is_refused_and_control_characters_are_replaced() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let error = wait_after_failure(
+            &environment,
+            |reservation| (reservation.reservation_id(), environment.environment_id()),
+            &"x".repeat(MAX_FAILURE_REASON_BYTES + 1),
+        )
+        .await;
+        assert!(matches!(error, LaunchError::Refused { .. }), "{error:?}");
+        let error = wait_after_failure(
+            &environment,
+            |reservation| (reservation.reservation_id(), environment.environment_id()),
+            "line one\nline two\t\u{7}end",
+        )
+        .await;
+        assert!(
+            matches!(&error, LaunchError::HostFailed { reason } if reason == "line one line two  end"),
+            "{error:?}"
+        );
+        assert_eq!(failure_reason_line(&"é".repeat(300)).len(), 400);
+    }
+
+    /// A host of the release before sends the claim and nothing else, and the launcher takes it as
+    /// it always did.
+    #[tokio::test]
+    async fn a_host_of_the_earlier_release_that_sends_only_a_claim_is_accepted() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let reservation =
+            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+        let identity = HostIdentity::generate(environment.environment_id()).expect("an identity");
+        let endpoint = host_endpoint(&environment, &HostProtocol::THIS)
+            .expect("an endpoint")
+            .as_text();
+        let claim = identity
+            .rendezvous(reservation.reservation_id(), &endpoint)
+            .expect("a claim");
+        let (mut reader, mut writer) = the_hosts_side(&reservation).await;
+        writer.write_message(&claim).await.expect("the claim");
+        let (descriptor, _fence) = reservation
+            .accept(
+                &environment,
+                &this_process(),
+                core::time::Duration::from_secs(10),
+            )
+            .await
+            .expect("the claim is accepted");
+        assert_eq!(descriptor.endpoint, endpoint);
+        let accepted: RendezvousAccepted = reader
+            .read_message_without_schema()
+            .await
+            .expect("the acknowledgement");
+        assert_eq!(accepted.endpoint, endpoint);
     }
 }
