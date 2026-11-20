@@ -2146,16 +2146,55 @@ fn end_to_end_drift(plan: &Plan) -> Result<(), String> {
         .filter_map(|(target, _)| target.split_once(':'))
         .map(|(package, suite)| (package.to_owned(), suite.to_owned()))
         .collect();
-    let planned: Vec<(String, String)> = plan
+    let steps: Vec<(Step, (String, String))> = plan
         .steps(Platform::Linux, &["end-to-end".to_owned()], "/tmp/e", None)
-        .iter()
+        .into_iter()
         .filter(|step| step.reading == Reading::Cargo)
-        .filter_map(|step| Some((word_after(step, "-p")?, word_after(step, "--test")?)))
+        .filter_map(|step| {
+            let suite = (word_after(&step, "-p")?, word_after(&step, "--test")?);
+            Some((step, suite))
+        })
         .collect();
+    let planned: Vec<(String, String)> = steps.iter().map(|(_, suite)| suite.clone()).collect();
     if planned != listed {
         return Err(format!(
             "scripts/end-to-end.sh's suites, in its order: {listed:?} against the plan's {planned:?}"
         ));
+    }
+    // Each suite runs as the script runs it: one test at a time, the network suite with its ignored
+    // tests as well, and on the platforms the script is run on.
+    for (step, (package, suite)) in &steps {
+        let mut expected: Vec<String> = [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            package,
+            "--test",
+            suite,
+            "--",
+            "--test-threads=1",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        if suite == "network" {
+            expected.push("--include-ignored".to_owned());
+        }
+        expected.push("--show-output".to_owned());
+        if step.command != expected {
+            return Err(format!(
+                "the end-to-end step for {package} {suite} runs {:?}, not {expected:?}",
+                step.command
+            ));
+        }
+    }
+    for step in plan.steps.iter().filter(|step| step.group == "end-to-end") {
+        if step.platforms != [Platform::Linux, Platform::MacOs] {
+            return Err(format!(
+                "the end-to-end step {} runs on {:?}, not on Linux and macOS",
+                step.id, step.platforms
+            ));
+        }
     }
     if !script.contains("-- --test-threads=1 $ignored") {
         return Err("the script runs one test at a time".to_owned());
@@ -2244,10 +2283,9 @@ fn without_display(command: &str) -> String {
     words.join(" ")
 }
 
-/// KR-REQ-29.01, the part about reproducible commands: the test steps the plan holds for Windows
-/// are the tests the landing workflow's Windows job runs, its build steps are builds that job also
-/// runs, and the workspace step it holds for macOS leaves out, by name, the cases the macOS job's
-/// workspace run leaves out.
+/// The test steps the plan holds for Windows are the tests the landing workflow's Windows job runs,
+/// its build steps are builds that job also runs, and the workspace step it holds for macOS leaves
+/// out, by name, the cases the macOS job's workspace run leaves out.
 fn platform_drift(plan: &Plan) -> Result<(), String> {
     // Windows: every `cargo test` of the workflow's Windows job is a step, and every test step is
     // one; what the plan builds first, the Windows job builds too.
@@ -2308,6 +2346,8 @@ fn platform_drift(plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
+/// KR-REQ-29.01, the part about reproducible commands: the platform plans run what the landing
+/// workflow runs there.
 #[test]
 fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
     assert_eq!(platform_drift(&core_plan()), Ok(()));
@@ -2327,21 +2367,62 @@ fn performance_drift(plan: &Plan) -> Result<(), String> {
             Some((format!("{kind} {target}"), name.to_owned()))
         })
         .collect();
-    let planned: Vec<(String, String)> = plan
+    let measurements: Vec<(Step, (String, String))> = plan
         .steps(Platform::Linux, &["performance".to_owned()], "/tmp/e", None)
-        .iter()
+        .into_iter()
         .filter(|step| step.command.iter().any(|word| word == "--exact"))
         .filter_map(|step| {
-            let (kind, target) = word_after(step, "--test")
+            let (kind, target) = word_after(&step, "--test")
                 .map(|target| ("test", target))
-                .or_else(|| word_after(step, "--bench").map(|target| ("bench", target)))?;
-            Some((format!("{kind} {target}"), step.command.last()?.clone()))
+                .or_else(|| word_after(&step, "--bench").map(|target| ("bench", target)))?;
+            let measurement = (format!("{kind} {target}"), step.command.last()?.clone());
+            Some((step, measurement))
         })
+        .collect();
+    let planned: Vec<(String, String)> = measurements
+        .iter()
+        .map(|(_, measurement)| measurement.clone())
         .collect();
     if planned != listed {
         return Err(format!(
             "scripts/performance.sh's measurements, in its order: {listed:?} against the plan's {planned:?}"
         ));
+    }
+    // Each measurement runs as the script runs it: in release, by its exact name, ignored and
+    // uncaptured, and on the platforms the script is run on.
+    for (step, (target, name)) in &measurements {
+        let (kind, target) = target.split_once(' ').expect("a kind and a target");
+        let flag = format!("--{kind}");
+        let expected: Vec<&str> = [
+            "cargo",
+            "test",
+            "--locked",
+            "--release",
+            "-p",
+            "kr-worker",
+            flag.as_str(),
+            target,
+            "--",
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            name.as_str(),
+        ]
+        .to_vec();
+        if step.command != expected {
+            return Err(format!(
+                "the measurement {name} runs {:?}, not {expected:?}",
+                step.command
+            ));
+        }
+    }
+    for step in plan.steps.iter().filter(|step| step.group == "performance") {
+        if step.platforms != [Platform::Linux, Platform::MacOs] {
+            return Err(format!(
+                "the performance step {} runs on {:?}, not on Linux and macOS",
+                step.id, step.platforms
+            ));
+        }
     }
     if !script.contains("-- --ignored --exact --nocapture \"$name\"") {
         return Err("the script runs each measurement exactly, uncaptured".to_owned());
@@ -2430,6 +2511,51 @@ fn each_drift_case_fails_against_a_planted_edit_of_a_copy_of_the_file() {
         .expect("a measurement");
     measured.steps.remove(at);
     assert!(performance_drift(&measured).is_err());
+
+    // A flag removed from one step, and a platform changed on one step, for each of the guards of
+    // the end-to-end suites and the measurements.
+    let step_of = |plan: &Plan, group: &str, word: &str| {
+        plan.steps
+            .iter()
+            .position(|step| step.group == group && step.command.iter().any(|each| each == word))
+            .unwrap_or_else(|| panic!("a {group} step with {word}"))
+    };
+    let mut serial = plan.clone();
+    let at = step_of(&serial, "end-to-end", "--test-threads=1");
+    serial.steps[at]
+        .command
+        .retain(|word| word != "--test-threads=1");
+    let refused = end_to_end_drift(&serial).expect_err("a suite not run one test at a time");
+    assert!(refused.contains("the end-to-end step for"), "{refused}");
+
+    let mut network = plan.clone();
+    let at = step_of(&network, "end-to-end", "--include-ignored");
+    network.steps[at]
+        .command
+        .retain(|word| word != "--include-ignored");
+    let refused =
+        end_to_end_drift(&network).expect_err("a network suite without its ignored tests");
+    assert!(refused.contains("the end-to-end step for"), "{refused}");
+
+    let mut elsewhere = plan.clone();
+    let at = step_of(&elsewhere, "end-to-end", "--test-threads=1");
+    elsewhere.steps[at].platforms.push(Platform::Windows);
+    let refused =
+        end_to_end_drift(&elsewhere).expect_err("a suite on a platform the script is not run on");
+    assert!(refused.contains("runs on"), "{refused}");
+
+    let mut ignored = plan.clone();
+    let at = step_of(&ignored, "performance", "--ignored");
+    ignored.steps[at].command.retain(|word| word != "--ignored");
+    let refused = performance_drift(&ignored)
+        .expect_err("a measurement that runs its ignored tests no longer");
+    assert!(refused.contains("the measurement"), "{refused}");
+
+    let mut moved = plan.clone();
+    let at = step_of(&moved, "performance", "--ignored");
+    moved.steps[at].platforms = vec![Platform::Linux];
+    let refused = performance_drift(&moved).expect_err("a measurement on one platform only");
+    assert!(refused.contains("runs on"), "{refused}");
 
     let mut renamed = plan;
     renamed.groups[3] = "javascript".to_owned();
