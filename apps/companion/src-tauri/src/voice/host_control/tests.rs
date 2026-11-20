@@ -554,27 +554,104 @@ async fn a_look_ends_with_no_word_when_the_host_holds_no_such_call_or_refuses_or
     }
 }
 
+/// The answers of a host that is still closing the call, `count` times over.
+fn closing_for(count: usize) -> Vec<Step> {
+    (0..count).map(|_| closing_beat()).collect()
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_look_is_cut_at_its_bound_whatever_the_request_that_is_waiting_then_is_doing() {
     // The host is still closing the call at every look until the last, which begins at 39 seconds
     // and is never answered: it would be given 20 seconds more, and is cut at 40. A word that the
-    // news offers at 45 seconds comes after the look is over.
-    let mut steps: Vec<Step> = (0..39).map(|_| closing_beat()).collect();
+    // news offers a moment after 40 seconds comes after the look is over.
+    let mut steps = closing_for(39);
     steps.push(Step::Hang);
     let script = Script::new(steps);
     let evidence = CloseEvidence::default();
     let late = evidence.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(45)).await;
+        tokio::time::sleep(Duration::from_millis(40_001)).await;
         late.offer(VoiceProviderClose::Confirmed);
     });
+    let began = Instant::now();
     final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+    let spent = began.elapsed();
+    assert_eq!(
+        spent,
+        Duration::from_secs(40),
+        "the look ends at its bound, whatever the request in flight is doing"
+    );
     assert_eq!(
         evidence.get(),
         None,
-        "the look was over before the news at 45 seconds"
+        "the look was over before the news a moment after 40 seconds"
     );
     assert_eq!(script.seen().len(), 40);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_at_a_host_that_closes_the_call_for_ever_ends_at_its_bound_with_no_word() {
+    let script = Script::new(closing_for(100));
+    let evidence = CloseEvidence::default();
+    let began = Instant::now();
+    final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+    let spent = began.elapsed();
+    assert_eq!(
+        spent,
+        Duration::from_secs(40),
+        "a host that always answers Closing is asked until the bound and no longer"
+    );
+    assert_eq!(
+        evidence.get(),
+        None,
+        "a host that never closes says nothing"
+    );
+    assert!(
+        acknowledges_nothing(&script),
+        "the look acknowledges nothing however long it lasts"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_that_finds_the_call_closed_with_no_word_of_the_providers_close_offers_unconfirmed()
+{
+    let script = Script::new([Step::Answer(VoiceControlAnswer::Heartbeat {
+        state: VoiceHostCallState::Closed {
+            reason: VoiceEndReason::Stop,
+        },
+        remaining_seconds: 0,
+        news: Vec::new(),
+        dropped: false,
+        provider_close: Nullable::null(),
+    })]);
+    let evidence = CloseEvidence::default();
+    final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+    assert_eq!(
+        evidence.get(),
+        Some(VoiceProviderClose::Unconfirmed),
+        "a closed status with no word of the provider's close is no confirmation"
+    );
+    assert_eq!(script.seen().len(), 1, "a final status ends the look");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_made_again_after_the_status_was_read_asks_for_it_from_the_start_again() {
+    // The status stays at the host for later reads only because no look acknowledges it: every look
+    // asks from the start, whatever an earlier one read.
+    let script = Script::new([
+        closed_beat(VoiceProviderClose::Confirmed),
+        closed_beat(VoiceProviderClose::Confirmed),
+    ]);
+    for _ in 0..2 {
+        let evidence = CloseEvidence::default();
+        final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
+        assert_eq!(evidence.get(), Some(VoiceProviderClose::Confirmed));
+    }
+    assert_eq!(script.seen().len(), 2);
+    assert!(
+        acknowledges_nothing(&script),
+        "each look asks from the start"
+    );
 }
 
 #[tokio::test(start_paused = true)]
