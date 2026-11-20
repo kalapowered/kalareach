@@ -249,9 +249,11 @@ a step that holds `{output}` has to name an `output`. A Vitest step and a lane s
 and the report reads that file and no word of the command. The run makes the directory that holds
 the output before the step runs, and the tool makes the output. Two outputs may not be equal or
 nested, and an output may not be in `logs` or be `result.json`, which are the report's own. Each
-part of an output holds only ASCII letters, digits, `.`, `-` and `_`, is not empty, `.` or `..`, and
-does not end with a dot or a space, and the loader compares the parts without case, because the file
-systems of macOS and Windows take `Logs` and `logs`, and `x` and `x.`, for one file. A step whose
+part of an output holds only ASCII letters, digits, `.`, `-` and `_`, is not empty, `.` or `..`, does
+not end with a dot or a space, and is not a name Windows keeps for a device: `con`, `prn`, `aux`,
+`nul`, `com1` to `com9` and `lpt1` to `lpt9`, in any case, with or without an extension. The loader
+compares the parts without case, because the file systems of macOS and Windows take `Logs` and
+`logs`, and `x` and `x.`, for one file. A step whose
 output is there before it runs is not run: another step or command wrote it.
 
 A set-up step (`setup = true`) reads `exit`: the report records its exit status and nothing else. A

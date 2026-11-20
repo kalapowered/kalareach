@@ -674,14 +674,29 @@ fn differs_only_by_case<'a>(table: &'a BTreeMap<String, String>, name: &str) -> 
         .find(|held| held.as_str() < name && held.eq_ignore_ascii_case(name))
 }
 
+/// Whether `part` is a name Windows keeps for a device: `con`, `prn`, `aux`, `nul`, `com1` to `com9`
+/// or `lpt1` to `lpt9`, in any case, alone or followed by a dot and any extension.
+fn windows_device(part: &str) -> bool {
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match stem.as_bytes() {
+        b"con" | b"prn" | b"aux" | b"nul" => true,
+        [b'c', b'o', b'm', digit] | [b'l', b'p', b't', digit] => matches!(digit, b'1'..=b'9'),
+        _ => false,
+    }
+}
+
 /// The parts of `output` below `{evidence}/conformance/`, in lower case, or why it is not a place a
 /// step may write its output, in words that follow the output's name. Each part holds ASCII
 /// letters, digits, `.`, `-` and `_` and no more, is not empty, `.` or `..` and does not end with a
-/// dot or a space, and the first is not the report's own directory of logs or its result. The
-/// grammar is what every file system of the platforms agrees on, and so a name in ASCII lower case
-/// is the one name each takes it for: the file systems of macOS and Windows name one file by `Logs`
-/// and `logs`, and Windows by `x` and `x.` too, and a file system may take a letter outside ASCII
-/// for another.
+/// dot or a space, is not a name Windows keeps for a device, and the first is not the report's own
+/// directory of logs or its result. The grammar is what every file system of the platforms agrees
+/// on, and so a name in ASCII lower case is the one name each takes it for: the file systems of
+/// macOS and Windows name one file by `Logs` and `logs`, and Windows by `x` and `x.` too, and a
+/// file system may take a letter outside ASCII for another.
 fn output_parts(output: &str) -> Result<Vec<String>, String> {
     let Some(rest) = output.strip_prefix("{evidence}/conformance/") else {
         return Err("which is not below `{evidence}/conformance/`".to_owned());
@@ -704,6 +719,12 @@ fn output_parts(output: &str) -> Result<Vec<String>, String> {
         return Err(format!(
             "whose part `{part}` holds a character outside the portable set: letters, digits, `.`, \
              `-` and `_`"
+        ));
+    }
+    if let Some(part) = parts.iter().find(|part| windows_device(part)) {
+        return Err(format!(
+            "whose part `{part}` is a name that Windows keeps for a device: `con`, `prn`, `aux`, \
+             `nul`, `com1` to `com9` and `lpt1` to `lpt9`, with or without an extension"
         ));
     }
     let parts: Vec<String> = parts.into_iter().map(str::to_ascii_lowercase).collect();
