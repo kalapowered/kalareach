@@ -185,13 +185,14 @@ fn managed() -> GatewayOrigin {
     GatewayOrigin::new(ACCOUNT_ORIGIN).expect("the managed service's origin is one")
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     /// A phone started before its first unlock cannot read its files, and keeps the managed service
     /// in the meantime. The setting is read again at the next use, so that once the files can be read
     /// the service the person chose is the one used, and not the one that stood in for it.
+    #[cfg(unix)]
     #[test]
     fn a_setting_that_could_not_be_read_is_read_again_and_the_choice_stands() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -208,6 +209,39 @@ mod tests {
         );
 
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        assert_eq!(service.origin().as_str(), "https://sync.example");
+        assert!(!service.view().is_default);
+    }
+
+    /// The same on Windows, where who can reach a file is its access list and not its mode. A
+    /// setting whose list was widened to Everyone is not read and the managed service stands; when
+    /// the grant is taken away the setting is read again and the choice stands.
+    #[cfg(windows)]
+    #[test]
+    fn a_setting_that_could_not_be_read_is_read_again_and_the_choice_stands() {
+        let data = kr_ipc::testing::PrivateTempDir::create();
+        let file = data.path().join(FILE);
+        write_owner_only_file(&file, b"https://sync.example").expect("a setting");
+        let icacls = |arguments: [&str; 2]| {
+            let output = std::process::Command::new("icacls.exe")
+                .arg(&file)
+                .args(arguments)
+                .output()
+                .expect("icacls starts");
+            assert!(
+                output.status.success(),
+                "icacls {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        };
+        icacls(["/grant", "*S-1-1-0:(R)"]);
+        let service = SyncService::open(data.path());
+        assert!(
+            service.view().is_default,
+            "the managed service stands while the setting cannot be read"
+        );
+
+        icacls(["/remove:g", "*S-1-1-0"]);
         assert_eq!(service.origin().as_str(), "https://sync.example");
         assert!(!service.view().is_default);
     }
