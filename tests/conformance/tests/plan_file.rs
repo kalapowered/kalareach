@@ -1523,17 +1523,12 @@ fn a_cargo_test_step_whose_flags_the_report_cannot_read_is_refused_for_each_faul
         }
     }
     // A step that reads nothing of `cargo test` is not held to its flags.
-    for (reading, words) in [(
-        "build",
-        "'cargo', 'build', '-Z', 'unstable-options', '--manifest-path', 'x/Cargo.toml'",
-    )] {
-        let text = step_with(
-            "reading = 'cargo'\ncommand = ['cargo', 'test']",
-            &format!("reading = '{reading}'\ncommand = [{words}]"),
-        );
-        if let Err(refusal) = Plan::parse(&text, &root) {
-            wrong.push(format!("a {reading} step: refused as `{refusal}`"));
-        }
+    let text = step_with(
+        "reading = 'cargo'\ncommand = ['cargo', 'test']",
+        "reading = 'build'\ncommand = ['cargo', 'build', '-Z', 'unstable-options', '--manifest-path', 'x/Cargo.toml']",
+    );
+    if let Err(refusal) = Plan::parse(&text, &root) {
+        wrong.push(format!("a build step: refused as `{refusal}`"));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

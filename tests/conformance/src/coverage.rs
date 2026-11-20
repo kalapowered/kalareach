@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn a_target_the_manifest_tests_by_default_is_covered_by_a_command_that_names_none() {
         use TargetKind::{Bench, Example, Lib};
-        let packages = vec![package(
+        let packages = [package(
             "a",
             vec![
                 target("a", Lib, "a", true),
