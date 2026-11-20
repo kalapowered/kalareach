@@ -26,7 +26,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
@@ -1447,69 +1447,107 @@ fn test_only_files(files: &[PathBuf], source: &Path) -> Result<BTreeSet<PathBuf>
             .map(|path| (path.clone(), true))
             .collect()
     };
-    let every = reached(&present, roots(), true)?;
-    let product = reached(&present, roots(), false)?;
+    let mut declarations = BTreeMap::new();
+    let every = reached(&present, roots(), true, &mut declarations)?;
+    let product = reached(&present, roots(), false, &mut declarations)?;
     Ok(every.difference(&product).cloned().collect())
+}
+
+/// One module declaration of a file: the files its module may be at, whether it is declared
+/// test-only (by its own attribute or by a module around it), and whether a `#[path]` names it.
+struct Declared {
+    candidates: Vec<PathBuf>,
+    test: bool,
+    explicit: bool,
 }
 
 /// The files reachable from `roots` (each with whether it is a `mod.rs`-like file, whose modules
 /// sit beside it), through the module declarations of every file; those under `#[cfg(test)]` only
-/// when `with_tests`.
+/// when `with_tests`. A file is visited once for each place its modules are looked up in, and each
+/// is read and parsed once for both walks, whose results `declarations` keeps.
 fn reached(
     present: &BTreeSet<&PathBuf>,
     roots: Vec<(PathBuf, bool)>,
     with_tests: bool,
+    declarations: &mut BTreeMap<(PathBuf, bool), Vec<Declared>>,
 ) -> Result<BTreeSet<PathBuf>, String> {
-    let mut seen = BTreeSet::new();
+    let mut seen: BTreeSet<(PathBuf, bool)> = BTreeSet::new();
     let mut todo = roots;
-    while let Some((path, mod_rs)) = todo.pop() {
-        if !seen.insert(path.clone()) {
+    while let Some(visit) = todo.pop() {
+        if !seen.insert(visit.clone()) {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        if !may_declare_modules(&text) {
-            continue;
+        if !declarations.contains_key(&visit) {
+            let found = declarations_of(&visit.0, visit.1)?;
+            declarations.insert(visit.clone(), found);
         }
-        let file =
-            syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-        let directory = path.parent().unwrap_or(Path::new(""));
-        let stem = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or_default();
-        let modules = if mod_rs {
-            directory.to_owned()
-        } else {
-            directory.join(stem)
-        };
-        let mut declared = Vec::new();
-        declared_modules(&file.items, directory, &modules, false, &mut declared);
-        for (candidates, test, explicit) in declared {
-            if test && !with_tests {
+        for declared in &declarations[&visit] {
+            if declared.test && !with_tests {
                 continue;
             }
-            for candidate in candidates {
-                if present.contains(&candidate) {
+            for candidate in &declared.candidates {
+                if present.contains(candidate) {
                     // A file that a `#[path]` loads holds its modules beside it, as `mod.rs` does.
-                    let beside = explicit || candidate.file_name().is_some_and(|n| n == "mod.rs");
-                    todo.push((candidate, beside));
+                    let beside = declared.explicit
+                        || candidate.file_name().is_some_and(|name| name == "mod.rs");
+                    todo.push((candidate.clone(), beside));
                 }
             }
         }
     }
-    Ok(seen)
+    Ok(seen.into_iter().map(|(path, _)| path).collect())
 }
 
-/// The module files `items` declare: the paths each may be at, whether it is declared test-only,
-/// and whether a `#[path]` names it. `path_base` is what a `#[path]` is relative to, `modules`
-/// what a module's file is looked up under.
+/// The module declarations of the file at `path`; `mod_rs` is whether its modules sit beside it.
+fn declarations_of(path: &Path, mod_rs: bool) -> Result<Vec<Declared>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !may_declare_modules(&text) {
+        return Ok(Vec::new());
+    }
+    let file = syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let directory = path.parent().unwrap_or(Path::new(""));
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default();
+    let modules = if mod_rs {
+        directory.to_owned()
+    } else {
+        directory.join(stem)
+    };
+    let mut declared = Vec::new();
+    declared_modules(&file.items, directory, &modules, false, &mut declared);
+    Ok(declared)
+}
+
+/// `path` with its `.` components left out and each `..` taken with the component before it, as
+/// the file system resolves them where no link is in the way.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The module declarations `items` hold. `path_base` is what a `#[path]` is relative to, `modules`
+/// what a module's file is looked up under; an inline module with a `#[path]` moves both to that
+/// path, as rustc does.
 fn declared_modules(
     items: &[syn::Item],
     path_base: &Path,
     modules: &Path,
     under_test: bool,
-    out: &mut Vec<(Vec<PathBuf>, bool, bool)>,
+    out: &mut Vec<Declared>,
 ) {
     for item in items {
         let syn::Item::Mod(module) = item else {
@@ -1517,11 +1555,6 @@ fn declared_modules(
         };
         let test = under_test || attrs_are_cfg_test(&module.attrs);
         let name = module.ident.to_string();
-        if let Some((_, inner)) = &module.content {
-            let inside = modules.join(&name);
-            declared_modules(inner, &inside, &inside, test, out);
-            continue;
-        }
         let explicit = module.attrs.iter().find_map(|attribute| {
             if !attribute.path().is_ident("path") {
                 return None;
@@ -1537,16 +1570,28 @@ fn declared_modules(
                 _ => None,
             }
         });
+        if let Some((_, inner)) = &module.content {
+            let inside = match &explicit {
+                Some(directory) => lexical(&modules.join(directory)),
+                None => modules.join(&name),
+            };
+            declared_modules(inner, &inside, &inside, test, out);
+            continue;
+        }
         match explicit {
-            Some(explicit) => out.push((vec![path_base.join(explicit)], test, true)),
-            None => out.push((
-                vec![
+            Some(explicit) => out.push(Declared {
+                candidates: vec![lexical(&path_base.join(explicit))],
+                test,
+                explicit: true,
+            }),
+            None => out.push(Declared {
+                candidates: vec![
                     modules.join(format!("{name}.rs")),
                     modules.join(&name).join("mod.rs"),
                 ],
                 test,
-                false,
-            )),
+                explicit: false,
+            }),
         }
     }
 }
