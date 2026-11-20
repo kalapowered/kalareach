@@ -84,6 +84,7 @@ log="$artefacts/run.log"
 # message this run never sent must not be judged on an earlier run's.
 : >"${artefacts:?}/challenge-outcomes.txt"
 : >"${artefacts:?}/delivery-outcomes.txt"
+: >"$artefacts/doze.txt"
 # What the harness and the gateway hold lives on the internal disk, for this run.
 harness="$(mktemp -d "${TMPDIR:-/tmp}/kr-push-device.XXXXXX")"
 gateway_state="$harness/gateway"
@@ -423,6 +424,20 @@ say("a second question answered at the host while the person had chosen Yes and 
     and ("PUSH-CHOSEN" in late_chosen or "chosen" in late_chosen),
     late_seen[:300].replace("\n", " "))
 say("and the host's answer is the one the worker keeps (09.21)", report.get("host_answer_kept") is True)
+if platform == "android":
+    expired = report.get("expired_step") or ""
+    say("a question that expired while its notification was on the phone was ended as expired by the worker, and the person who tapped the notification is told so and is offered nothing to answer it with (KR-ACC-013)",
+        report.get("expiring_delivered") is True and report.get("expiring_shown") is True
+        and report.get("expiring_ended_as_expired") is True and "PUSH-EXPIRED" in expired and "Send answer" not in expired,
+        expired[:300].replace("\n", " "))
+    say("and the worker's ledger holds no answer to it (KR-ACC-013)", report.get("expired_question_holds_no_answer") is True)
+doze = read("doze.txt")
+if doze.strip():
+    first_outcome = (read("delivery-outcomes.txt").splitlines() or [""])[0]
+    say("the device was in deep Doze when the first delivery came to the application with no process, was still in it after the delivery was shown, and left it when it was taken out (KR-ACC-013)",
+        "before the delivery: deep=IDLE" in doze and "after the delivery: deep=IDLE" in doze and "after unforce: deep=" in doze
+        and "after unforce: deep=IDLE" not in doze and "shown" in first_outcome,
+        doze.replace("\n", "; ") + first_outcome)
 
 if report.get("later_phases_ran") is not True:
     say("the phases after the registration ran", False, "the host had no destination to go on with")
@@ -523,6 +538,8 @@ pump_android() { # <adb> <serial>
             "$adb" -s "$serial" shell input keyevent KEYCODE_HOME >/dev/null 2>&1
             "$adb" -s "$serial" shell am force-stop "$app_id" >/dev/null 2>&1
             echo "pid before the message: '$("$adb" -s "$serial" shell pidof "$app_id" | tr -d '\r')'" >"$artefacts/cold-start.txt"
+            # KR_PUSH_DOZE=1: the device is in deep Doze while this first delivery comes to the application with no process.
+            [ "${KR_PUSH_DOZE:-}" != 1 ] || doze_on "$adb" "$serial"
         fi
         "$adb" -s "$serial" shell "run-as $app_id sh" <"$harness/inject-$n.sh" >"$harness/inject-$n.out" 2>&1
         while :; do
@@ -539,6 +556,7 @@ pump_android() { # <adb> <serial>
         if python3 "$here/scripts/lib/push-inject.py" kind "$file" | grep -q '^delivery$'; then
             printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/delivery-outcomes.txt"
             check_android_notification "$adb" "$serial" "$n"
+            [ ! -e "$harness/doze-on" ] || [ -e "$harness/doze-done" ] || doze_off "$adb" "$serial"
         else
             printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/challenge-outcomes.txt"
         fi
@@ -607,6 +625,38 @@ action_android() { # <adb> <serial> <step> <words of the question> <choice> <sen
     mv "$out" "$harness/done-$step"
 }
 
+# Taps the notification of a question that has expired and reads what the page says of it: that it
+# expired, and nothing to answer it with.
+expired_android() { # <adb> <serial>
+    local adb="$1" serial="$2" alert out="$harness/done-expired.tmp"
+    alert="$(python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)")"
+    : >"$out"
+    python3 "$here/scripts/lib/push-android.py" tap "$adb" "$serial" "$shots" "$alert" >>"$out" 2>&1 \
+        && python3 "$here/scripts/lib/push-android.py" expired "$adb" "$serial" "$shots" >>"$out" 2>&1
+    mv "$out" "$harness/done-expired"
+}
+
+# Puts the device into deep Doze with the system's own shell commands and keeps the state it reports,
+# and takes it out again. The state read is the system's: `IDLE` is deep Doze.
+doze_on() { # <adb> <serial>
+    local adb="$1" serial="$2"
+    "$adb" -s "$serial" shell cmd deviceidle help >"$artefacts/deviceidle-help.txt" 2>&1
+    "$adb" -s "$serial" shell dumpsys battery unplug >/dev/null 2>&1
+    "$adb" -s "$serial" shell dumpsys deviceidle enable deep >/dev/null 2>&1
+    "$adb" -s "$serial" shell dumpsys deviceidle force-idle deep >/dev/null 2>&1
+    printf 'before the delivery: deep=%s\n' "$("$adb" -s "$serial" shell dumpsys deviceidle get deep | tr -d '\r')" >"$artefacts/doze.txt"
+    : >"$harness/doze-on"
+}
+
+doze_off() { # <adb> <serial>
+    local adb="$1" serial="$2"
+    printf 'after the delivery: deep=%s\n' "$("$adb" -s "$serial" shell dumpsys deviceidle get deep | tr -d '\r')" >>"$artefacts/doze.txt"
+    "$adb" -s "$serial" shell dumpsys deviceidle unforce >/dev/null 2>&1
+    "$adb" -s "$serial" shell dumpsys battery reset >/dev/null 2>&1
+    printf 'after unforce: deep=%s\n' "$("$adb" -s "$serial" shell dumpsys deviceidle get deep | tr -d '\r')" >>"$artefacts/doze.txt"
+    : >"$harness/doze-done"
+}
+
 # Does what the host asks of the phone besides what messages do: the gateway issues the phone's
 # authorisation again and the application ends, and the application registers again with a new
 # token. Each is done once, when its file appears.
@@ -627,6 +677,10 @@ steps_android() { # <adb> <serial>
         if [ -e "$harness/step-late.json" ] && [ ! -e "$harness/started-late" ]; then
             : >"$harness/started-late"
             action_android "$adb" "$serial" late "A question is waiting for an answer" "Yes" stop
+        fi
+        if [ -e "$harness/step-expired.json" ] && [ ! -e "$harness/started-expired" ]; then
+            : >"$harness/started-expired"
+            expired_android "$adb" "$serial"
         fi
         if [ -e "$harness/step-late-observe.json" ] && [ ! -e "$harness/started-late-observe" ]; then
             : >"$harness/started-late-observe"
@@ -709,7 +763,7 @@ run_android() {
     # signs for is the origin the gateway signs for.
     "$adb" -s "$serial" reverse "tcp:$gateway_port" "tcp:$gateway_port" >/dev/null \
         || { say "the emulator's loopback interface could not be tied to the gateway"; return 2; }
-    start_harness 10.0.2.2 || return 2
+    KR_PUSH_EXPIRED_STEP=1 start_harness 10.0.2.2 || return 2
     pump_android "$adb" "$serial" &
     pump_pid=$!
 

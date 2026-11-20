@@ -23,6 +23,10 @@ Commands, each given the adb program, the emulator's serial and a screenshot dir
       Waits until the page says that the question was answered by someone else, with what the person
       had chosen, and offers nothing to send. Prints `PUSH-ENDED <what the screen shows>`.
 
+  expired
+      After `tap` on the notification of a question that expired, waits until the page says that it
+      expired and offers nothing to answer it with. Prints `PUSH-EXPIRED <what the screen shows>`.
+
 `blind` is for a sheet the application opens over the Attention screen, which the web view does not
 always hand over to `uiautomator`: when the choice or the button is not on the screen, it is pressed
 where the form draws it (`SHEET_CHOICES`, `SHEET_SEND`) and the run's own checks, the worker's
@@ -177,15 +181,30 @@ def observe(phone: Phone) -> None:
     print(f"PUSH-ENDED {texts(phone)}", flush=True)
 
 
+def expired(phone: Phone) -> None:
+    """Waits for the page, opened from the notification of a question that has expired, to say that it
+    expired and to offer nothing to answer it with."""
+    def said(nodes: list[dict]) -> bool:
+        labels = [each["label"] for each in nodes]
+        return any("expired" in label.lower() for label in labels) and not any(label in {"Send answer", "Yes"} for label in labels)
+
+    phone.wait_screen(said, "the page to say the question expired and to offer nothing to answer it with", 60, nudging=True)
+    phone.shot("expired")
+    print(f"PUSH-EXPIRED {texts(phone)}", flush=True)
+
+
 def main() -> None:
     arguments = sys.argv[1:]
-    if len(arguments) >= 4 and arguments[0] in {"tap", "choose", "send", "observe"}:
+    if len(arguments) >= 4 and arguments[0] in {"tap", "choose", "send", "observe", "expired"}:
         phone = Phone(arguments[1], arguments[2], Path(arguments[3]))
         if arguments[0] == "tap" and len(arguments) == 5:
             tap_notification(phone, arguments[4])
             return
         if arguments[0] == "observe" and len(arguments) == 4:
             observe(phone)
+            return
+        if arguments[0] == "expired" and len(arguments) == 4:
+            expired(phone)
             return
         blind = arguments[-1] == "blind"
         if blind:

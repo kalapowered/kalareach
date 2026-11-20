@@ -539,13 +539,32 @@ impl Worker {
 
     /// As [`Self::ask`], for a question that comes with `context` to decide it by.
     pub fn ask_with_context(&self, request: &str, context: &str) -> Question {
-        self.ask_from(request, context, "/bin/agent", "an agent", None)
+        self.ask_from(request, context, "/bin/agent", "an agent", None, None)
+    }
+
+    /// As [`Self::ask`], for a question that asks to expire `expiry_ms` after it is made.
+    pub fn ask_expiring(&self, request: &str, expiry_ms: u64) -> Question {
+        self.ask_from(
+            request,
+            "the release is tagged",
+            "/bin/agent",
+            "an agent",
+            None,
+            Some(expiry_ms),
+        )
     }
 
     /// As [`Self::ask`], for a question asked by the program at `executable`, which gives itself
     /// the name `label`: the worker verifies the program, and nothing verifies the name.
     pub fn ask_as(&self, request: &str, executable: &str, label: &str) -> Question {
-        self.ask_from(request, "the release is tagged", executable, label, None)
+        self.ask_from(
+            request,
+            "the release is tagged",
+            executable,
+            label,
+            None,
+            None,
+        )
     }
 
     /// As [`Self::ask`], for a question the ledger records as created at `utc_ms`.
@@ -556,6 +575,7 @@ impl Worker {
             "/bin/agent",
             "an agent",
             Some(utc_ms),
+            None,
         )
     }
 
@@ -566,6 +586,7 @@ impl Worker {
         executable: &str,
         label: &str,
         utc_ms: Option<u64>,
+        expiry_ms: Option<u64>,
     ) -> Question {
         self.service
             .questions()
@@ -587,7 +608,9 @@ impl Worker {
                     question: format!("Publish the release ({request})?"),
                     kind: QuestionKind::Confirm,
                     choices: Vec::new(),
-                    requested_expiry_ms: Nullable::null(),
+                    requested_expiry_ms: expiry_ms.map_or_else(Nullable::null, |expiry| {
+                        Nullable::some(kr_protocol::scalars::DurationMs::new(expiry))
+                    }),
                     wait_ms: Nullable::null(),
                 },
                 kr_worker::questions::Now {

@@ -76,6 +76,13 @@ const DELIVERY_WAIT: Duration = Duration::from_secs(90);
 /// How long a delivery that has to be renewed first is given to reach the stand-in.
 const RENEWAL_WAIT: Duration = Duration::from_secs(150);
 
+/// How long a question that is asked to expire is given to live: long enough for its delivery to
+/// reach the phone, short enough that the run waits for its end.
+const EXPIRING_QUESTION_MS: u64 = 30_000;
+
+/// How long the worker is given to end a question at its deadline.
+const EXPIRY_WAIT: Duration = Duration::from_secs(90);
+
 /// A marker in the text of a question, which must never appear in what leaves the host.
 const MARKER: &str = "kr-marker-4f1c9a";
 
@@ -789,6 +796,59 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
                     })
             ),
         );
+    }
+
+    // ---- An action on a question that expired (KR-ACC-013) ----------------------------------
+    // A question whose deadline passes while its notification is still on the phone: the worker
+    // ends it as expired, and the person who then taps the notification is told that it expired,
+    // is offered nothing to answer, and the worker's ledger holds no answer. Only the script for a
+    // phone that has the step (`KR_PUSH_EXPIRED_STEP=1`) takes it.
+    if std::env::var("KR_PUSH_EXPIRED_STEP").is_ok_and(|value| value == "1") {
+        let before = fcm.sent().len();
+        let expiring = worker.ask_expiring("expiring-1", EXPIRING_QUESTION_MS);
+        asked_questions.push(expiring.clone());
+        let expiring_delivered = until(DELIVERY_WAIT.min(run.left()), || {
+            fcm.sent()
+                .iter()
+                .skip(before)
+                .any(|sent| is_delivery(sent, &token))
+        })
+        .await;
+        report.insert("expiring_delivered".to_owned(), json!(expiring_delivered));
+        if expiring_delivered {
+            let message = fcm
+                .sent()
+                .into_iter()
+                .skip(before)
+                .find(|sent| is_delivery(sent, &token))
+                .expect("the expiring question's delivery")
+                .body;
+            n += 1;
+            report.insert(
+                "expiring_shown".to_owned(),
+                json!(
+                    run.inject(n, "delivery", "a question that expires", &message)
+                        .await
+                        && run.appears(&format!("shown-{n}"), INJECTION_WAIT).await
+                ),
+            );
+            let ended = until(EXPIRY_WAIT.min(run.left()), || {
+                worker.held(&expiring).state == kr_protocol::question::QuestionState::Expired
+            })
+            .await;
+            report.insert("expiring_ended_as_expired".to_owned(), json!(ended));
+            run.ask_step("expired");
+            let told = run.step_done("expired", SCREEN_STEP_WAIT).await;
+            report.insert("expired_step".to_owned(), json!(told));
+            let held = worker.held(&expiring);
+            report.insert(
+                "expired_question_holds_no_answer".to_owned(),
+                json!(
+                    held.state == kr_protocol::question::QuestionState::Expired
+                        && held.answer.0.is_none()
+                ),
+            );
+        }
     }
 
     // ---- Renewal with the phone away (16.09) ------------------------------------------------
