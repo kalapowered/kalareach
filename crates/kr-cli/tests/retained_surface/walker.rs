@@ -160,9 +160,11 @@ impl Tree {
     /// Reads the crates of the workspace at `root`: the repository's checkout, or a release's. A
     /// crate is `crates/*` or an application's `apps/*/src-tauri`, named by its manifest's package.
     pub fn at(root: &Path) -> Result<Self, String> {
-        // A root with `..` in it (the repository's own is `crates/kr-cli/../..`) gets the form of
-        // the module paths the scan compares its files with.
-        let root = &lexical(root);
+        // The root as the file system names it: a relative root, one with `..` in it (the
+        // repository's own is `crates/kr-cli/../..`) and one through a link all give the one path
+        // that the files of the tree and the module paths between them are compared in.
+        let root =
+            &std::fs::canonicalize(root).map_err(|error| format!("{}: {error}", root.display()))?;
         let mut crates = BTreeMap::new();
         let mut unreadable = Vec::new();
         let directory = root.join("crates");
@@ -1517,22 +1519,26 @@ fn declarations_of(path: &Path, mod_rs: bool) -> Result<Vec<Declared>, String> {
     Ok(declared)
 }
 
-/// `path` with its `.` components left out and each `..` taken with the component before it, as
-/// the file system resolves them where no link is in the way.
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
+/// `path` with its `.` components left out and each `..` taken with the normal component before
+/// it. A `..` that nothing before it can take stays, and one after the root is the root, so a
+/// relative path keeps every step up that it makes. Links are not looked at: callers pass an
+/// absolute path under a canonical root and test the file they find (3.5).
+pub(super) fn normalised(path: &Path) -> PathBuf {
+    let mut parts: Vec<Component> = Vec::new();
     for part in path.components() {
         match part {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
+            Component::ParentDir => match parts.last() {
+                Some(Component::Normal(_)) => {
+                    parts.pop();
                 }
-            }
-            other => out.push(other),
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => parts.push(part),
+            },
+            other => parts.push(other),
         }
     }
-    out
+    parts.iter().collect()
 }
 
 /// The module declarations `items` hold. `path_base` is what a `#[path]` is relative to, `modules`
@@ -1568,7 +1574,7 @@ fn declared_modules(
         });
         if let Some((_, inner)) = &module.content {
             let inside = match &explicit {
-                Some(directory) => lexical(&path_base.join(directory)),
+                Some(directory) => normalised(&path_base.join(directory)),
                 None => modules.join(&name),
             };
             declared_modules(inner, &inside, &inside, test, out);
@@ -1576,7 +1582,7 @@ fn declared_modules(
         }
         match explicit {
             Some(explicit) => out.push(Declared {
-                candidates: vec![lexical(&path_base.join(explicit))],
+                candidates: vec![normalised(&path_base.join(explicit))],
                 test,
                 explicit: true,
             }),
