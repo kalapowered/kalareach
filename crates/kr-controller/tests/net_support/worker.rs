@@ -657,6 +657,25 @@ impl Worker {
         self.register_agent_on(upstream)
     }
 
+    /// Announces the agent registered under `number` as the package its binding names recognised it,
+    /// as a launch announces it. The phone's composer offers a prompt only to an agent that a
+    /// package is bound to, and the registration alone announces none.
+    pub fn announce_agent_package_numbered(&self, number: u8) {
+        let instance = ApplicationInstanceId::new(Uuid::from_bytes([number; 16]));
+        self._runtime
+            .session()
+            .announce_instance(kr_protocol::projection::AgentInstanceSummary {
+                application_instance_id: instance,
+                plugin_id: Nullable::some(PluginId::new("kalareach.codex").expect("valid")),
+                profile_id: Nullable::null(),
+                mode: IntegrationMode::Gateway,
+                bypass: Nullable::null(),
+                started_at: TimestampMs::new(1),
+                ended_at: Nullable::null(),
+                refusal: Nullable::null(),
+            });
+    }
+
     /// Ends the agent registered under `number`, as the session announces the end of a launch: the
     /// instance is no longer live, and a view of the session's agents finds the ones that remain.
     pub fn end_agent_numbered(&self, number: u8) {

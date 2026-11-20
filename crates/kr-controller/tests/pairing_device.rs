@@ -942,6 +942,7 @@ impl Run {
     async fn replace(&self) {
         self.workers[0].end_agent_numbered(2);
         self.workers[0].register_agent_numbered(3, self.replacement.clone());
+        self.workers[0].announce_agent_package_numbered(3);
         self.say("replace-result.txt", "replaced\n");
     }
 
@@ -1150,6 +1151,8 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
     // be written for and to be sent to.
     let upstream = Arc::new(Upstream::default());
     workers[0].register_agent(Arc::clone(&upstream));
+    // The phone offers a prompt only to an agent that a package recognised.
+    workers[0].announce_agent_package_numbered(2);
     // The daemon's address is where a phone that is paired with it dials it, so it is kept for a
     // daemon that starts again.
     let host_port = host
