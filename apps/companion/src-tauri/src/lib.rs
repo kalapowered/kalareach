@@ -29,6 +29,7 @@ mod access_list;
 pub mod account;
 pub mod agent;
 pub mod bound;
+pub mod channel_messages;
 pub mod commands;
 pub mod connection;
 pub mod contact;

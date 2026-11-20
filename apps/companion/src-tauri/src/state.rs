@@ -56,6 +56,7 @@ pub struct AppState {
     mailbox: OnceLock<Arc<crate::mailbox::MailboxDesk>>,
     settings: OnceLock<Arc<crate::settings::Settings>>,
     drafts: Arc<crate::drafts::DraftDesk>,
+    channels: Arc<crate::channel_messages::ChannelDesk>,
     questions: crate::questions::QuestionDesk,
     shares: Arc<crate::sharing::ShareDesk>,
     retained: crate::retained::Deletions,
@@ -97,6 +98,7 @@ impl AppState {
             mailbox: OnceLock::new(),
             settings: OnceLock::new(),
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
+            channels: Arc::new(crate::channel_messages::ChannelDesk::default()),
             questions: crate::questions::QuestionDesk::default(),
             shares: Arc::new(crate::sharing::ShareDesk::default()),
             retained: crate::retained::Deletions::default(),
@@ -702,6 +704,7 @@ impl AppState {
             .set(Arc::new(crate::settings::Settings::open(data)));
         self.questions.keep_at(crate::questions::kept_in(data));
         self.drafts.keep_at(data.to_path_buf());
+        self.channels.keep_at(data.to_path_buf());
         self.shares.keep_at(crate::sharing::kept_in(data));
     }
 
@@ -709,6 +712,12 @@ impl AppState {
     #[must_use]
     pub fn drafts(&self) -> Arc<crate::drafts::DraftDesk> {
         Arc::clone(&self.drafts)
+    }
+
+    /// The messages this device keeps that were sent over a channel that confirms nothing.
+    #[must_use]
+    pub fn channels(&self) -> Arc<crate::channel_messages::ChannelDesk> {
+        Arc::clone(&self.channels)
     }
 }
 
