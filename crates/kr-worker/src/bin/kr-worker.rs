@@ -316,8 +316,15 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     {
         Ok(bound) => bound,
         Err(error) => {
+            // One code for every way the address or its listener can fail: the create answers
+            // with the platform's words under its own code, and a code the IPC error carries for
+            // an unrelated refusal (a file that is not a socket is an untrusted file) would make
+            // it answer as a refusal of the create's authority.
             writer
-                .write_message(&ControlFrame::WorkerFailed(error.to_protocol_error()))
+                .write_message(&ControlFrame::WorkerFailed(ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    error.to_string(),
+                )))
                 .await?;
             return Err(Box::new(error));
         }

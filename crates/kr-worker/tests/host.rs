@@ -2587,6 +2587,10 @@ async fn a_worker_that_cannot_listen_says_why_to_the_create_that_waits_for_it() 
         refused.message.contains("not a socket"),
         "the worker's own words reach the caller: {refused}"
     );
+    // The create answers that the worker could not start, whatever code the listener's own error
+    // carries: a file that is not a socket is an untrusted file there, which would otherwise make
+    // the create answer as a refusal of the caller's authority.
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused}");
 }
 
 /// A managed create whose shell has no startup entry is refused by the worker as soon as it has
