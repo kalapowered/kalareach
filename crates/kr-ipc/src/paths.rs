@@ -2377,17 +2377,29 @@ mod windows {
     ) -> std::io::Result<()> {
         use std::os::windows::io::AsHandle as _;
 
+        #[cfg(test)]
+        let at_open = tests::at_open();
         let held = query_descriptor(file.as_handle(), OWNER_SECURITY_INFORMATION)
             .and_then(|descriptor| read_descriptor(&descriptor))
             .map_err(refusal_error)?;
-        if !could_have_created(held.owner.as_psid(), accounts) {
+        let owner = held.owner;
+        #[cfg(test)]
+        let owner = if at_open.owner_is_everyone {
+            tests::everyone()
+        } else {
+            owner
+        };
+        if !could_have_created(owner.as_psid(), accounts) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "the file belongs to another account, so it cannot be made readable by its owner \
                  alone",
             ));
         }
-        if !volume_keeps_lists(file)? {
+        let keeps = volume_keeps_lists(file)?;
+        #[cfg(test)]
+        let keeps = keeps && !at_open.keeps_no_lists;
+        if !keeps {
             return Err(no_lists_refusal());
         }
         // SAFETY: the handle is open for the call and holds the right to change the list, and the
@@ -2602,6 +2614,53 @@ mod windows {
             OtherOwner,
             /// The list cannot be read back.
             Unreadable,
+        }
+
+        /// What a case makes the opening of a file that already stands at the name see in place of
+        /// the file system's answer, as it is when the owner is read and the volume is asked.
+        #[derive(Clone, Copy)]
+        pub(super) struct AtOpen {
+            /// The volume reports that it keeps no access lists.
+            pub(super) keeps_no_lists: bool,
+            /// The file's owner reads as Everyone, as it does on a volume that keeps no access
+            /// lists, where every file has the world descriptor.
+            pub(super) owner_is_everyone: bool,
+        }
+
+        thread_local! {
+            static AT_OPEN: std::cell::Cell<AtOpen> = const {
+                std::cell::Cell::new(AtOpen {
+                    keeps_no_lists: false,
+                    owner_is_everyone: false,
+                })
+            };
+        }
+
+        /// What the case of this thread makes the opening of an existing file see.
+        pub(super) fn at_open() -> AtOpen {
+            AT_OPEN.with(std::cell::Cell::get)
+        }
+
+        /// What the opening of an existing file sees, put back to the file system's answer when this
+        /// is dropped however the case ends.
+        struct OpenedAs;
+
+        impl OpenedAs {
+            fn install(seen: AtOpen) -> Self {
+                AT_OPEN.with(|cell| cell.set(seen));
+                Self
+            }
+        }
+
+        impl Drop for OpenedAs {
+            fn drop(&mut self) {
+                AT_OPEN.with(|cell| {
+                    cell.set(AtOpen {
+                        keeps_no_lists: false,
+                        owner_is_everyone: false,
+                    });
+                });
+            }
         }
 
         /// Everyone, `S-1-1-0`.
@@ -3079,6 +3138,88 @@ mod windows {
                 std::io::ErrorKind::PermissionDenied,
                 "{error}"
             );
+            assert_eq!(std::fs::read(&path).expect("reads"), b"what was there");
+            assert_eq!(
+                FileAccess::of(&path).expect("reads who can reach the file"),
+                before,
+                "the file keeps its list"
+            );
+            assert_eq!(folder.names(), vec!["kit".to_owned()]);
+        }
+
+        /// The words of the refusal for an existing file that belongs to another account.
+        const ANOTHER_ACCOUNT: &str = "the file belongs to another account, so it cannot be made \
+                                       readable by its owner alone";
+
+        /// An existing file with a list that grants Authenticated Users and some content, which a
+        /// refusal has to leave as it is.
+        fn wide_file(folder: &Folder) -> std::path::PathBuf {
+            let path = folder.0.join("kit");
+            create_file_with_descriptor(
+                &path,
+                &format!("D:P(A;;GA;;;OW)(A;;GA;;;{})(A;;GR;;;AU)", user_text()),
+            )
+            .expect("a file that grants Authenticated Users");
+            std::fs::write(&path, b"what was there").expect("content");
+            path
+        }
+
+        /// A file that already stands at the name on a volume that keeps no access lists, such as
+        /// FAT or exFAT, is refused with the words for the volume, and not with the words for an
+        /// owner. Such a volume gives every file the world descriptor, whose owner is Everyone, so
+        /// both are replaced here as that volume gives them; no case makes a volume. The file
+        /// keeps its bytes and its list.
+        #[test]
+        fn an_existing_file_on_a_volume_that_keeps_no_access_lists_is_refused_as_the_volume_is() {
+            let folder = Folder::new("existing-fat");
+            let path = wide_file(&folder);
+            let before = FileAccess::of(&path).expect("reads who can reach the file");
+            let _opened = OpenedAs::install(AtOpen {
+                keeps_no_lists: true,
+                owner_is_everyone: true,
+            });
+
+            let error = crate::paths::open_owner_only_in_place(&path)
+                .expect_err("the volume keeps no lists, so the file is not opened");
+
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported,
+                "the volume's refusal, not an owner's: {error}"
+            );
+            assert!(error.to_string().contains(NO_LISTS), "{error}");
+            assert_eq!(std::fs::read(&path).expect("reads"), b"what was there");
+            assert_eq!(
+                FileAccess::of(&path).expect("reads who can reach the file"),
+                before,
+                "the file keeps its list"
+            );
+            assert_eq!(folder.names(), vec!["kit".to_owned()]);
+        }
+
+        /// A file that already stands at the name and whose owner reads back as an account this
+        /// process could not have created it as is refused with the words for another account's
+        /// file, and keeps its bytes and its list. The owner is replaced here by Everyone; no case
+        /// makes a file that another account owns.
+        #[test]
+        fn an_existing_file_owned_by_another_account_is_refused_and_keeps_its_bytes() {
+            let folder = Folder::new("existing-owner");
+            let path = wide_file(&folder);
+            let before = FileAccess::of(&path).expect("reads who can reach the file");
+            let _opened = OpenedAs::install(AtOpen {
+                keeps_no_lists: false,
+                owner_is_everyone: true,
+            });
+
+            let error = crate::paths::open_owner_only_in_place(&path)
+                .expect_err("the owner is another account, so the file is not opened");
+
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{error}"
+            );
+            assert!(error.to_string().contains(ANOTHER_ACCOUNT), "{error}");
             assert_eq!(std::fs::read(&path).expect("reads"), b"what was there");
             assert_eq!(
                 FileAccess::of(&path).expect("reads who can reach the file"),
