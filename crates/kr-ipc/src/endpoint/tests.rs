@@ -2,7 +2,7 @@
 
 use crate::endpoint::Listener;
 use crate::error::IpcError;
-use crate::listen::{ListenRefusal, ObjectKind};
+use crate::listen::ListenRefusal;
 use crate::paths::Endpoint;
 use crate::testing::PrivateTempDir;
 
@@ -15,14 +15,15 @@ fn refusal_of(result: crate::Result<Listener>) -> (String, ListenRefusal) {
     }
 }
 
-/// The folder's endpoint named `name`.
-fn endpoint_in(folder: &PrivateTempDir, name: &str) -> Endpoint {
-    Endpoint::from_path(folder.path().join(name)).expect("an endpoint that fits the platform")
-}
-
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use crate::listen::ObjectKind;
+
+    /// The folder's endpoint named `name`.
+    fn endpoint_in(folder: &PrivateTempDir, name: &str) -> Endpoint {
+        Endpoint::from_path(folder.path().join(name)).expect("an endpoint that fits the platform")
+    }
 
     use std::os::unix::fs::MetadataExt as _;
 
