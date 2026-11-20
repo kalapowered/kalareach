@@ -324,14 +324,15 @@ same step, before it checks the stores, for a journal that no daemon of this bui
 the release it goes to reads the journal below version 6. The step goes, with the version that the
 release lists as read through, once no supported upgrade can start from a journal at version 6.
 
-A rollback goes to a release that keeps no binding revision for a draft. That release records a
-prompt that names a draft written for an application under the binding revision in force at the
-prompt, not the one the draft was written under. No release carries the text of a draft to an
-agent on such a prompt, so what it makes is a record, not a delivery. The rollback ends no draft
-and says so. When the host is updated again, this build reads that record as a draft sent to that
-session: the draft is kept as the record of what the session was sent, a prompt that names it under
-any revision but its own is refused, and its attachments follow the session's retention. The
-record is not repaired.
+A rollback goes to a release that reads the transfers journal below version 6 and keeps no binding
+revision for a draft. That release records a prompt that names a draft written for an application
+under the binding revision in force at the prompt, not the one the draft was written under. No
+release carries the text of a draft to an agent on such a prompt, so what it makes is a record, not
+a delivery. The rollback ends no draft and says so. A release that reads the journal at version 6
+refuses a draft that holds no revision, so the rollback says nothing of this for it. When the host
+is updated again, this build reads that record as a draft sent to that session: the draft is kept
+as the record of what the session was sent, a prompt that names it under any revision but its own
+is refused, and its attachments follow the session's retention. The record is not repaired.
 
 The order the rows are written in is what makes a resume possible.
 

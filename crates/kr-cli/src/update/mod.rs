@@ -1468,6 +1468,18 @@ async fn carry_out(
     } else {
         collect(store, record, update_lock)
     };
+    // The release a rollback goes to keeps the binding revision of a draft in a store of its own
+    // only if its manifest lists that store; one that does not records a prompt for a draft without
+    // it. That holds of a release that reads the transfers journal below the version that keeps the
+    // revision in the journal, the releases the rollback brings a journal back for; a release that
+    // reads that version refuses a draft that holds no revision, so it is not one. The manifest
+    // says so, so no journal is read to decide it.
+    let draft_limit = rolled_back
+        && formats::reads_the_journal_below_the_column(&target).is_some()
+        && !target
+            .stores
+            .iter()
+            .any(|listed| listed.store == formats::DRAFT_REVISIONS_STORE);
     Ok(Updated {
         source,
         target: target.release,
@@ -1476,14 +1488,7 @@ async fn carry_out(
         not_removed,
         carried: report.carried,
         brought_back: report.brought_back,
-        // The release a rollback goes to keeps the binding revision of a draft in a store of its
-        // own only if its manifest lists that store; one that does not records a prompt for a draft
-        // without it. The manifest says so, so no journal is read to decide it.
-        draft_limit: rolled_back
-            && !target
-                .stores
-                .iter()
-                .any(|listed| listed.store == formats::DRAFT_REVISIONS_STORE),
+        draft_limit,
         unreached: report.unreached,
         checked_only: check,
         rolled_back,

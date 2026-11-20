@@ -5852,40 +5852,51 @@ async fn a_rollback_that_a_store_refuses_after_a_journal_was_brought_back_says_s
     );
 }
 
-/// KR-REQ-12.06: a rollback to a release that lists no store of binding revisions says, in the lines
-/// and in the JSON, that the release records a prompt that names a draft under the revision in force
-/// at the prompt and that no draft was ended; a rollback to one that lists the store says nothing of
-/// it.
+/// KR-REQ-12.06: a rollback to a release that lists no store of binding revisions and reads the
+/// transfers journal below version 6 says, in the lines and in the JSON, that the release records a
+/// prompt that names a draft under the revision in force at the prompt and that no draft was ended; a
+/// rollback to one that lists the store says nothing of it, and neither does one to a release that
+/// reads the journal at version 6, whether it writes that version or reads it through, since that
+/// release refuses a draft that holds no revision.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_to_a_release_without_the_store_of_binding_revisions_states_the_limit() {
-    let without = || {
+    // A release that lists no store of binding revisions, and reads the transfers journal as
+    // `(version, reads_through)` says; `None` keeps what this build lists.
+    let without = |journal: Option<(u32, Option<u32>)>| {
         Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(
             release_stores()
                 .into_iter()
                 .filter(|store| store.store != "draft-revisions")
+                .map(|store| match journal {
+                    Some((version, reads_through)) if store.store == "transfers" => ReleaseStore {
+                        migrates_from: 1,
+                        reads_through,
+                        version,
+                        ..store
+                    },
+                    _ => store,
+                })
                 .collect(),
         )
     };
+    let limit = "records a prompt that names a draft written for an application under the binding \
+                 revision in force at the prompt, not the one the draft was written under; this \
+                 rollback ended no draft";
     // One host at a time: a host holds one of the places the harness gives each case for its host,
     // and a case that holds more than the places there are waits for itself.
     {
-        let (host, _one, _two, archive) =
-            host_to_update_between(without(), Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2))
-                .await;
+        let (host, _one, _two, archive) = host_to_update_between(
+            without(Some((5, None))),
+            Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2),
+        )
+        .await;
         let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
         assert!(output.status.success(), "kr host update: {said}");
         let output = host.run(&host.store.stable(Program::Kr), &["host", "rollback"]);
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
         assert!(output.status.success(), "kr host rollback: {text}");
-        assert!(
-            text.contains(
-                "records a prompt that names a draft written for an application under the binding \
-                 revision in force at the prompt, not the one the draft was written under; this \
-                 rollback ended no draft"
-            ),
-            "{text}"
-        );
+        assert!(text.contains(limit), "{text}");
     }
 
     // The control: the release before lists the store, and the rollback says nothing of the limit.
@@ -5898,16 +5909,51 @@ async fn a_rollback_to_a_release_without_the_store_of_binding_revisions_states_t
         assert_eq!(said["draft_limit"], false, "{said}");
     }
 
-    // And the one that lacks it says so in the JSON too.
+    // The one that lacks it and reads the journal below version 6 says so in the JSON too.
     {
-        let (host, _one, _two, archive) =
-            host_to_update_between(without(), Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2))
-                .await;
+        let (host, _one, _two, archive) = host_to_update_between(
+            without(Some((5, None))),
+            Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2),
+        )
+        .await;
         let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
         assert!(output.status.success(), "kr host update: {said}");
         let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
         assert!(output.status.success(), "kr host rollback: {said}");
         assert_eq!(said["draft_limit"], true, "{said}");
+    }
+
+    // A release that lists no store of binding revisions and writes the journal at version 6 refuses
+    // a draft that holds no revision: it is not one the limit is stated for.
+    {
+        let (host, _one, _two, archive) = host_to_update_between(
+            without(Some((6, None))),
+            Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2),
+        )
+        .await;
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        assert!(output.status.success(), "kr host update: {said}");
+        let output = host.run(&host.store.stable(Program::Kr), &["host", "rollback"]);
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "kr host rollback: {text}");
+        assert!(
+            !text.contains(limit) && !text.contains("ended no draft"),
+            "{text}"
+        );
+    }
+
+    // And so does one that reads the journal at version 6 through, as this build does.
+    {
+        let (host, _one, _two, archive) = host_to_update_between(
+            without(None),
+            Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2),
+        )
+        .await;
+        let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+        assert!(output.status.success(), "kr host update: {said}");
+        let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+        assert!(output.status.success(), "kr host rollback: {said}");
+        assert_eq!(said["draft_limit"], false, "{said}");
     }
 }
 
