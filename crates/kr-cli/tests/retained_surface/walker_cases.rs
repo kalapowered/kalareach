@@ -537,6 +537,7 @@ mod product_commented;
 mod support_two;
 #[cfg(test)]
 mod r#loop;
+mod r#match;
 #[cfg(all(test, unix))]
 mod t_all;
 #[cfg(not(not(test)))]
@@ -584,8 +585,10 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
             "#[path = \"shared2.rs\"]\nmod/* a note */commented;\n".to_owned(),
         ),
         ("shared2.rs", sends("from_shared_two", "AgentTurnSteer")),
-        // A test module with a raw name is the file of the name without `r#`.
+        // A module with a raw name is the file of the name without `r#`, for a test module (left
+        // out) and for a product one.
         ("loop.rs", sends("from_loop", "AgentTurnCancel")),
+        ("match.rs", sends("from_match", "AgentTurnSteer")),
         // Conditions no configuration without `test` enables, and ones some configuration does.
         ("t_all.rs", sends("from_t_all", "AgentTurnCancel")),
         ("t_not.rs", sends("from_t_not", "AgentTurnCancel")),
@@ -602,6 +605,7 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
         "from_a",
         "from_beside",
         "from_inner_d",
+        "from_match",
         "from_p_any",
         "from_p_not",
         "from_shared",
@@ -613,16 +617,14 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
     .collect();
     let scan = |root: &Path| {
         let tree = Tree::at(root).expect("the tree");
-        let sightings = tree
-            .sightings(&|krate| krate == "kr_sender")
-            .expect("the scan");
-        names(&sightings, "kr_sender")
+        tree.sightings(&|krate| krate == "kr_sender")
+            .map(|sightings| names(&sightings, "kr_sender"))
     };
-    assert_eq!(scan(folder.path()), expected);
+    assert_eq!(scan(folder.path()), Ok(expected.clone()));
     // The same tree through a root with `..` in it, as the repository's own root is.
     assert_eq!(
         scan(&folder.path().join("crates/kr-sender/../..")),
-        expected
+        Ok(expected.clone())
     );
     // And through a relative root that steps up past every folder of the working directory, as a
     // release tree named by a relative path is.
@@ -639,7 +641,7 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
         "{} does not step up twice",
         relative.display()
     );
-    assert_eq!(scan(&relative), expected);
+    assert_eq!(scan(&relative), Ok(expected));
 }
 
 #[test]

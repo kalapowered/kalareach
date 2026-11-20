@@ -597,10 +597,10 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
     write(
         folder.path(),
         "crates/kr-sender/src/lib.rs",
-        "fn f() { shared!(1); }\n",
+        "fn f() { let _ = Method::AgentTurnSteer; shared!(1); }\n",
     );
     let tree = Tree::at(folder.path()).expect("the tree");
-    assert_eq!(tree.sightings(&|_| true), Ok(Vec::new()));
+    assert_eq!(tree.sightings(&|_| true).map(|found| found.len()), Ok(1));
 }
 
 #[test]
@@ -631,5 +631,27 @@ fn two_private_definitions_of_one_macro_in_different_files_are_merged_by_name() 
             ("macro:m".to_owned(), vec![SightKind::Expands]),
             ("user".to_owned(), vec![SightKind::Names]),
         ]))
+    );
+}
+
+#[test]
+fn a_file_that_two_declarations_reach_in_different_ways_is_read_for_each() {
+    // `x.rs` is a module of its own by `mod x;` (its modules are in `x/`) and the file of `y` by a
+    // `#[path]` (its modules are beside it): each reading finds a file of its own.
+    let lib = "mod x;\n#[path = \"x.rs\"]\nmod y;\n";
+    let files = [
+        ("src/x.rs", "mod inner;\n"),
+        (
+            "src/x/inner.rs",
+            "fn from_in_folder() { let _ = Method::AgentTurnCancel; }\n",
+        ),
+        (
+            "src/inner.rs",
+            "fn from_beside() { let _ = Method::AgentTurnSteer; }\n",
+        ),
+    ];
+    assert_eq!(
+        read_names(lib, &files),
+        Ok(vec!["from_beside".to_owned(), "from_in_folder".to_owned()])
     );
 }
