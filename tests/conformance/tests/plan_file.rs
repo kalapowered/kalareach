@@ -553,12 +553,20 @@ fn the_steps_are_the_plans_in_its_own_order_for_a_platform_and_a_selection() {
 
 /// Runs the program with `arguments` and returns its exit code and what it wrote to stderr.
 fn program(arguments: &[&str]) -> (Option<i32>, String) {
+    let (code, _, stderr) = program_output(arguments);
+    (code, stderr)
+}
+
+/// Runs the program with `arguments` and returns its exit code, what it wrote to stdout and what it
+/// wrote to stderr.
+fn program_output(arguments: &[&str]) -> (Option<i32>, String, String) {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_kr-conformance"))
         .args(arguments)
         .output()
         .expect("the program runs");
     (
         output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
@@ -640,12 +648,14 @@ fn a_group_the_plan_does_not_have_is_refused_with_exit_2() {
     );
 }
 
-/// A plan option with no path is a usage error with exit status 2 and its own reason, before the
-/// map is built or anything runs: the program does not take the repository's own plan instead.
+/// An option with no value is a usage error with exit status 2 and the option's own reason, for
+/// `map` and for `run`, before the plan is read, the map is built or anything runs: the option
+/// reads as given and without its value, never as absent, and never takes the next option as its
+/// value. The `run` selection is the group that needs no applications, so a missing value of
+/// `--applications` is not excused by the selection.
 #[test]
-fn a_plan_option_without_a_path_is_a_usage_error_for_map_and_run() {
+fn an_option_without_a_value_is_a_usage_error_for_map_and_run() {
     let repository = tempfile::tempdir().expect("a directory");
-    let evidence = tempfile::tempdir().expect("a directory");
     std::fs::create_dir(repository.path().join("conformance")).expect("a directory");
     let default_plan = with(
         "[[step]]\nid = 'version'\ngroup = 'rust'\nwhat = 'the version'\n\
@@ -657,39 +667,49 @@ fn a_plan_option_without_a_path_is_a_usage_error_for_map_and_run() {
     )
     .expect("the repository's own plan");
     let root = repository.path().to_string_lossy().into_owned();
-    let evidence_path = evidence.path().to_string_lossy().into_owned();
-    for arguments in [
-        vec!["map", "--root", root.as_str(), "--plan"],
-        vec![
-            "run",
-            "--root",
-            root.as_str(),
-            "--group",
-            "rust",
+    let options = [
+        ("--root", "--root takes the path of the repository"),
+        (
             "--evidence",
-            evidence_path.as_str(),
-            "--plan",
-        ],
-    ] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_kr-conformance"))
-            .args(&arguments)
-            .output()
-            .expect("the program runs");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(2), "{arguments:?}: {stderr}");
-        assert!(
-            stderr.starts_with("kr-conformance: --plan takes the path of a plan file\n"),
-            "{arguments:?}: {stderr}"
-        );
-        assert!(output.stdout.is_empty(), "{arguments:?}: something ran");
-        assert_eq!(
-            std::fs::read_dir(evidence.path())
-                .expect("the evidence")
-                .count(),
-            0,
-            "{arguments:?}: something was written"
-        );
+            "--evidence takes the path of the evidence directory",
+        ),
+        (
+            "--applications",
+            "--applications takes the path of the applications cache",
+        ),
+        ("--plan", "--plan takes the path of a plan file"),
+    ];
+    let mut failures = Vec::new();
+    // At the end of the arguments, and before another option.
+    for after in [None, Some("--all-terminals")] {
+        for (option, reason) in options {
+            for command in ["map", "run"] {
+                let evidence = tempfile::tempdir().expect("a directory");
+                let evidence_path = evidence.path().to_string_lossy().into_owned();
+                let mut arguments = vec![command, "--root", root.as_str()];
+                if command == "run" {
+                    arguments.extend(["--group", "rust", "--evidence", evidence_path.as_str()]);
+                }
+                arguments.push(option);
+                arguments.extend(after);
+                let (code, stdout, stderr) = program_output(&arguments);
+                let written = std::fs::read_dir(evidence.path())
+                    .expect("the evidence")
+                    .count();
+                if code != Some(2)
+                    || !stderr.starts_with(&format!("kr-conformance: {reason}\n"))
+                    || !stdout.is_empty()
+                    || written != 0
+                {
+                    failures.push(format!(
+                        "{arguments:?}: exit {code:?}, stdout {} bytes, {written} files of evidence: {stderr}",
+                        stdout.len()
+                    ));
+                }
+            }
+        }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// No constant or static of the harness's sources holds a step, a table row or a reason, no code

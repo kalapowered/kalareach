@@ -55,15 +55,24 @@ fn main() -> ExitCode {
     let mut rest = arguments[1..].iter();
     while let Some(argument) = rest.next() {
         match argument.as_str() {
-            "--root" => root = rest.next().map(PathBuf::from),
-            "--evidence" => evidence_directory = rest.next().map(PathBuf::from),
-            "--applications" => applications = rest.next().map(PathBuf::from),
-            "--plan" => match rest.next() {
+            "--root" => match value(&mut rest) {
+                Some(path) => root = Some(PathBuf::from(path)),
+                None => return usage("--root takes the path of the repository"),
+            },
+            "--evidence" => match value(&mut rest) {
+                Some(path) => evidence_directory = Some(PathBuf::from(path)),
+                None => return usage("--evidence takes the path of the evidence directory"),
+            },
+            "--applications" => match value(&mut rest) {
+                Some(path) => applications = Some(PathBuf::from(path)),
+                None => return usage("--applications takes the path of the applications cache"),
+            },
+            "--plan" => match value(&mut rest) {
                 Some(path) => plan_path = Some(PathBuf::from(path)),
                 None => return usage("--plan takes the path of a plan file"),
             },
-            "--group" => match rest.next() {
-                Some(group) => groups.push(group.clone()),
+            "--group" => match value(&mut rest) {
+                Some(group) => groups.push(group.to_owned()),
                 None => return usage("--group takes the name of a group of the plan"),
             },
             "--all-terminals" => all_terminals = true,
@@ -110,6 +119,13 @@ fn main() -> ExitCode {
         }
         other => usage(&format!("{other} is not a command")),
     }
+}
+
+/// The value of an option: the next word, unless there is none or it is an option itself.
+fn value<'a>(rest: &mut std::slice::Iter<'a, String>) -> Option<&'a str> {
+    rest.next()
+        .map(String::as_str)
+        .filter(|word| !word.starts_with("--"))
 }
 
 /// A part of a plan as `<number>/<parts>`: the number of the part from 1, and the number of parts.
