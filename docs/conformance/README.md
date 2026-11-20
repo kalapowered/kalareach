@@ -61,11 +61,15 @@ the run, and refuses a directory that already holds one, so no log, test report 
 earlier run can be read as this run's.
 
 The exit status is 0 when the run passed, 1 when it ran and did not, and 2 when it was refused
-before running anything. A run passes when no identifier failed, every step exited 0 and its output
+before running anything. A plan file that is missing or refused, and a `--plan` with no path, are
+refused with status 2 and their reason; the report never falls back to another plan. A run passes when no identifier failed, every step exited 0 and its output
 could be read, no test failed that names no identifier, and every record a test wrote for the report
 could be read.
 
 ### Groups
+
+Each repository keeps its plan at `conformance/plan.toml`, or names another file with `--plan`. The
+plan names the groups and the steps of each; the table is core's.
 
 | Group | Linux | macOS | Windows |
 | --- | --- | --- | --- |
@@ -560,7 +564,7 @@ identifier's `references` and `figures`.
 | `steps` | Every command the run ran, as run, with its exit status, how long it took and its log, relative to the evidence directory. `needs` names the variables a step reads from the environment |
 | `steps[].observation` | Present on a failed step whose log names a program the system would not start: each program's path, the log's lines about it and what its file looked like when the step ended, and whether a test also failed in the log; `log` is present, with no programs, when the step's log was not read, and says what its path held or why it could not be read |
 | `summary.failed_with_damage_seen`, `summary.failed_otherwise` | The numbers of the failed steps that carry an observation with damage seen and no failed test, and of the other failed steps |
-| `identifiers` | Every identifier a test or a reference names and, in a run of every group, every row of section 21's and section 27's tables whether named or not |
+| `identifiers` | Every identifier a test or a reference names and, in a run of every group of a plan that sets `list_table_rows`, every row of section 21's and section 27's tables whether named or not |
 | `tests[].test` | The package, target and test name, or the TypeScript file and its titles as the run gave them, joined by ` > ` |
 | `tests[].source` | Where the key is written |
 | `tests[].keyed_by` | `attached_comment`, `comment_inside`, `test_name`, `section_comment`, `called_function`, `module_comment`, `case_table`, `title` or `file_comment` |

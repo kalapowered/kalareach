@@ -904,20 +904,24 @@ impl Plan {
             .any(|step| step.skips_from == Some(SkipsFrom::Applications))
     }
 
-    /// Why an unrun Rust target is unrun beyond the platform's general reason: the first reason of
-    /// a selected group that runs nothing on `platform` and is marked as explaining it.
+    /// Why an unrun Rust target is unrun beyond the platform's general reason: the first reason, in
+    /// the plan's order of groups, of a selected group that runs nothing on `platform` and is
+    /// marked as explaining it.
     #[must_use]
     pub fn unrun_rust_reason(&self, platform: Platform, groups: &[String]) -> Option<&str> {
-        groups.iter().find_map(|group| {
-            self.group_absent
-                .iter()
-                .find(|absent| {
-                    absent.explains_unrun_rust
-                        && absent.platform == platform
-                        && absent.group == *group
-                })
-                .map(|absent| absent.reason.as_str())
-        })
+        self.groups
+            .iter()
+            .filter(|group| groups.contains(group))
+            .find_map(|group| {
+                self.group_absent
+                    .iter()
+                    .find(|absent| {
+                        absent.explains_unrun_rust
+                            && absent.platform == platform
+                            && absent.group == *group
+                    })
+                    .map(|absent| absent.reason.as_str())
+            })
     }
 
     /// Why a TypeScript test no step ran is not run: the reason of the first selected group that

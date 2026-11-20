@@ -910,6 +910,32 @@ command = ['cargo', 'build']
     assert!(!plan.uses_javascript_tools(Platform::Linux, &others));
 }
 
+/// Two selected groups that both explain an unrun Rust target on a platform: the plan's first
+/// group gives the reason, whatever the order of the selection.
+#[test]
+fn the_reason_of_an_unrun_target_is_the_plans_first_group_whatever_the_selection_order() {
+    let plan = Plan::parse(
+        &with(
+            "[[group_absent]]\ngroup = 'rust'\nplatform = 'windows'\nreason = 'first'\nexplains_unrun_rust = true\n\
+             [[group_absent]]\ngroup = 'other'\nplatform = 'windows'\nreason = 'second'\nexplains_unrun_rust = true\n",
+        )
+        .replace("groups = ['rust']", "groups = ['rust', 'other']"),
+        &repository(),
+    )
+    .expect("the planted plan loads");
+    for names in [&["rust", "other"][..], &["other", "rust"]] {
+        assert_eq!(
+            plan.unrun_rust_reason(Platform::Windows, &selection(names)),
+            Some("first"),
+            "{names:?}"
+        );
+    }
+    assert_eq!(
+        plan.unrun_rust_reason(Platform::Windows, &selection(&["other"])),
+        Some("second")
+    );
+}
+
 /// The words each way a command is expanded gives: a captured test output, an uncaptured one, a
 /// command that already shows its output, the skips of a step, the one raw skip of the Windows
 /// startup step, and a build.

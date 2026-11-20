@@ -9,9 +9,10 @@
 //!
 //! `scripts/run-conformance.sh` is the way in: it fetches the applications, builds this binary and
 //! runs it. The exit status is 0 when the run passed, 1 when it ran and did not, and 2 when it was
-//! refused before running anything: a malformed identifier, a row outside section 21's or section
-//! 27's table, an evidence directory outside the platform's temporary directory, or a map that
-//! cannot be trusted.
+//! refused before running anything: a plan file that is missing or refused, a malformed identifier,
+//! a row outside section 21's or section 27's table, an evidence directory outside the platform's
+//! temporary directory, a map that cannot be trusted, or a usage error such as an option with no
+//! value or a group the plan does not have.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
