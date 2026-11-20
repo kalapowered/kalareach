@@ -260,6 +260,28 @@ mod platform {
             }
         }
 
+        /// Makes a folder in this one that only its owner can enter, and opens it. It fails where
+        /// the name is taken, so the folder is one this call made.
+        pub(in crate::catalogue::native_bridge) fn make_private(
+            &self,
+            name: &str,
+        ) -> std::io::Result<Self> {
+            rustix::fs::mkdirat(self.handle.as_fd(), name, Mode::RWXU)?;
+            let opened = rustix::fs::openat(
+                self.handle.as_fd(),
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(std::io::Error::from)
+            .and_then(|handle| Self::held(handle, self.join(name)));
+            if opened.is_err() {
+                // Nothing was put in it yet, so the folder this call made goes again.
+                let _ = rustix::fs::unlinkat(self.handle.as_fd(), name, AtFlags::REMOVEDIR);
+            }
+            opened
+        }
+
         /// Says what is at one name, without following a link.
         pub(in crate::catalogue::native_bridge) fn entry(
             &self,
@@ -353,38 +375,41 @@ mod platform {
                 })
         }
 
-        /// Renames `from` to `to` only where nothing is at `to`.
+        /// Renames `from` in this directory to `to` in `into`, only where nothing is at `to`. A
+        /// file system that cannot refuse a name that is taken says `Unsupported`.
         pub(in crate::catalogue::native_bridge) fn rename_new(
             &self,
             from: &str,
+            into: &Self,
             to: &str,
         ) -> std::io::Result<()> {
             rustix::fs::renameat_with(
                 self.handle.as_fd(),
                 from,
-                self.handle.as_fd(),
+                into.handle.as_fd(),
                 to,
                 RenameFlags::NOREPLACE,
             )
-            .map_err(Into::into)
+            .map_err(rename_failure)
         }
 
-        /// Makes `from` and `to` trade places in one step: both names stay in use, and no instant
-        /// has either of them absent. It fails where `to` is not there, and where the file system
-        /// has no such exchange (`InvalidInput` on Linux, `Unsupported` on macOS).
+        /// Makes `from` in this directory and `to` in `with` trade places in one step: both names
+        /// stay in use, and no instant has either of them absent. It fails where `to` is not
+        /// there, and with `Unsupported` where the file system has no such exchange.
         pub(in crate::catalogue::native_bridge) fn exchange(
             &self,
             from: &str,
+            with: &Self,
             to: &str,
         ) -> std::io::Result<()> {
             rustix::fs::renameat_with(
                 self.handle.as_fd(),
                 from,
-                self.handle.as_fd(),
+                with.handle.as_fd(),
                 to,
                 RenameFlags::EXCHANGE,
             )
-            .map_err(Into::into)
+            .map_err(rename_failure)
         }
 
         /// Renames `from` over whatever is at `to`.
@@ -469,6 +494,17 @@ mod platform {
         rustix::process::geteuid().as_raw()
     }
 
+    /// The error of a rename that takes a flag. A file system that does not take the flag says so
+    /// with a different number on each system (`ENOTSUP` on macOS, `EINVAL` on Linux, `ENOSYS`
+    /// where the flags do not exist); each is `Unsupported`, and any other failure keeps its kind.
+    fn rename_failure(errno: Errno) -> std::io::Error {
+        if [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::NOSYS, Errno::INVAL].contains(&errno) {
+            std::io::Error::new(std::io::ErrorKind::Unsupported, std::io::Error::from(errno))
+        } else {
+            errno.into()
+        }
+    }
+
     /// True when `path`, followed as any program would follow it, leads to the file object
     /// `identity` names.
     fn leads_to(path: &Path, identity: &Identity) -> bool {
@@ -504,6 +540,33 @@ mod platform {
             size: metadata.size(),
             modified_seconds: metadata.mtime(),
             modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::ErrorKind;
+
+        use rustix::io::Errno;
+
+        use super::rename_failure;
+
+        /// A file system that does not take a rename flag is `Unsupported`, whichever number the
+        /// system answers with; every other failure keeps its kind.
+        #[test]
+        fn a_file_system_that_does_not_take_a_rename_flag_is_unsupported_by_every_number() {
+            for errno in [Errno::NOTSUP, Errno::OPNOTSUPP, Errno::NOSYS, Errno::INVAL] {
+                assert_eq!(
+                    rename_failure(errno).kind(),
+                    ErrorKind::Unsupported,
+                    "{errno}"
+                );
+            }
+            assert_eq!(
+                rename_failure(Errno::EXIST).kind(),
+                ErrorKind::AlreadyExists
+            );
+            assert_eq!(rename_failure(Errno::NOENT).kind(), ErrorKind::NotFound);
         }
     }
 }
@@ -589,6 +652,13 @@ mod platform {
             Err(unsupported())
         }
 
+        pub(in crate::catalogue::native_bridge) fn make_private(
+            &self,
+            _name: &str,
+        ) -> std::io::Result<Self> {
+            Err(unsupported())
+        }
+
         pub(in crate::catalogue::native_bridge) fn owners(
             &self,
             _name: &str,
@@ -626,6 +696,7 @@ mod platform {
         pub(in crate::catalogue::native_bridge) fn rename_new(
             &self,
             _from: &str,
+            _into: &Self,
             _to: &str,
         ) -> std::io::Result<()> {
             Err(unsupported())
@@ -634,6 +705,7 @@ mod platform {
         pub(in crate::catalogue::native_bridge) fn exchange(
             &self,
             _from: &str,
+            _with: &Self,
             _to: &str,
         ) -> std::io::Result<()> {
             Err(unsupported())

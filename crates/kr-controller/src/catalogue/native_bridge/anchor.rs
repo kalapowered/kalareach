@@ -7,7 +7,7 @@
 //! one component at a time, each opened without following a link. A link or a file at any
 //! component stops the walk by name before anything below it is touched, so a place a person
 //! replaced with a link between the check and the write is refused rather than followed. A file is
-//! published under a temporary name beside its destination and renamed into place; the folder is
+//! staged in a private folder beside its destination and published from there; the folder is
 //! flushed after.
 
 use std::io::ErrorKind;
@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 use kr_protocol::scalars::Digest256;
 
-use super::tree::{Child, Dir, Entry, Fetched, Identity};
+use super::tree::{Child, Dir, Entry, Fetched, Identity, temporary_name};
 use crate::catalogue::files::{digest_of, storage};
 use crate::error::{ControllerError, Result};
 
@@ -318,9 +318,10 @@ impl Anchor {
         Ok(made)
     }
 
-    /// Writes `bytes` to the file at `path`: under a temporary name beside it, flushed, and
-    /// published, the folder flushed after. A file that is there keeps its permission bits; a new
-    /// one gets `default_mode`. A folder, a link or a special file at the name is refused.
+    /// Writes `bytes` to the file at `path`: staged in a private folder beside it, flushed, and
+    /// published from there, the folder flushed after. A file that is there keeps its permission
+    /// bits; a new one gets `default_mode`. A folder, a link or a special file at the name is
+    /// refused.
     ///
     /// `replaces` is the digest of the file the caller checked at `path`, or `None` where it found
     /// nothing. Nothing is replaced that is not that file. Where nothing stood, the file is
@@ -329,9 +330,15 @@ impl Anchor {
     /// checked contents. Anything else, a file another process put there after the last read, a
     /// link or a folder, is traded back and the write is refused.
     ///
-    /// Between the two trades the place holds the new contents and the displaced file is under
-    /// the temporary name. It is removed only where it is the checked file. Where it cannot be put
-    /// back it is kept, and the refusal names where.
+    /// The private folder is made by this write, opened once, and closed to every user but this
+    /// one. Every step on the staged file goes through the handle this write holds on that folder,
+    /// never through a name another process can reach, so the staged file and the file a trade
+    /// displaces are removed from there and a file another process puts under the folder's own name
+    /// is never removed. The folder is removed by its name when the write ends. The kernel refuses
+    /// to remove a folder that holds anything, so a file kept in it stays. Between the two trades
+    /// the place holds the new contents and the displaced file is in the folder; it is removed only
+    /// where it is the checked file. Where it cannot be put back it is kept there, and the refusal
+    /// names where.
     pub(crate) fn write(
         &self,
         path: &Path,
@@ -346,11 +353,10 @@ impl Anchor {
                 path.display()
             )));
         };
-        let changed = || changed_since_checked(path);
         let mode = match parent.fetch(place.name, MAX_FILE_BYTES).map_err(storage)? {
             Fetched::Absent if replaces.is_none() => default_mode,
             Fetched::File(read) if replaces == Some(digest_of(&read.bytes)) => read.mode,
-            Fetched::Absent | Fetched::File(_) => return Err(changed()),
+            Fetched::Absent | Fetched::File(_) => return Err(changed_since_checked(path)),
             Fetched::NotRegular | Fetched::TooLarge => {
                 return Err(refused(format!(
                     "{} is not a regular file an installation can replace",
@@ -358,37 +364,13 @@ impl Anchor {
                 )));
             }
         };
-        let temporary = format!(
-            ".{}.{}.kalareach",
-            place.name,
-            crate::catalogue::files::hex(&kr_cbor::sha256(kr_ipc::new_uuid().as_bytes())[..6])
-        );
-        let staged = match parent.stage(&temporary, bytes, mode) {
-            Ok(staged) => staged,
-            Err(unstaged) => {
-                if unstaged.made.is_some() {
-                    let _ = parent.remove_file(&temporary);
-                }
-                return Err(storage(unstaged.error));
-            }
-        };
-        #[cfg(test)]
-        publish_pause::run(path);
-        match replaces {
-            None => {
-                if let Err(error) = parent.rename_new(&temporary, place.name) {
-                    let _ = parent.remove_file(&temporary);
-                    return Err(if error.kind() == ErrorKind::AlreadyExists {
-                        changed()
-                    } else {
-                        storage(error)
-                    });
-                }
-            }
-            Some(expected) => {
-                replace_checked(&parent, &temporary, place.name, &staged, expected, path)?;
-            }
-        }
+        let folder = temporary_name(place.name);
+        let staging = parent.make_private(&folder).map_err(storage)?;
+        let published = publish(&parent, &staging, place.name, path, bytes, mode, replaces);
+        // Removed by its name: a folder that holds anything stays, and so does a file another
+        // process put under that name.
+        let _ = parent.remove_directory(&folder);
+        published?;
         parent.flush().map_err(storage)
     }
 
@@ -438,8 +420,17 @@ fn no_exchange(path: &Path) -> ControllerError {
     ))
 }
 
+/// The refusal where the file system cannot add a name only where none is.
+fn no_add(path: &Path) -> ControllerError {
+    refused(format!(
+        "{} is on a file system that cannot add a file without the risk of replacing another one, \
+         so nothing is written there",
+        path.display()
+    ))
+}
+
 /// The refusal where a file another process put at the place could not be put back, so it is kept
-/// under the temporary name `kept`.
+/// under the name `kept`.
 fn kept_aside(path: &Path, kept: &Path) -> ControllerError {
     refused(format!(
         "{} was replaced by another process while this installation wrote it, and that file \
@@ -449,65 +440,126 @@ fn kept_aside(path: &Path, kept: &Path) -> ControllerError {
     ))
 }
 
-/// Replaces the file at `name` with the staged file at `temporary` when the file at `name` holds
-/// the `expected` contents. The two names trade places in one step, so the place is never absent
-/// and no check stands between a read and the replacement; the file that came out of the place is
-/// then read, and anything but the expected file is put back.
+/// Why a name that was free could not be given the staged file.
+fn new_name_refusal(error: std::io::Error, path: &Path) -> ControllerError {
+    match error.kind() {
+        ErrorKind::AlreadyExists => changed_since_checked(path),
+        ErrorKind::Unsupported => no_add(path),
+        _ => storage(error),
+    }
+}
+
+/// Why the staged file and the place could not trade names.
+fn trade_refusal(error: std::io::Error, path: &Path) -> ControllerError {
+    match error.kind() {
+        ErrorKind::NotFound => changed_since_checked(path),
+        ErrorKind::Unsupported => no_exchange(path),
+        _ => storage(error),
+    }
+}
+
+/// The name of the staged file in its private folder.
+const STAGED: &str = "staged";
+
+/// Stages `bytes` in `staging` and publishes the staged file at `name` in `parent`, over the file
+/// the caller checked, or only where the name is free.
+fn publish(
+    parent: &Dir,
+    staging: &Dir,
+    name: &str,
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    replaces: Option<Digest256>,
+) -> Result<()> {
+    let staged = match staging.stage(STAGED, bytes, mode) {
+        Ok(staged) => staged,
+        Err(unstaged) => {
+            if let Some(made) = unstaged.made {
+                remove_staged(staging, &made);
+            }
+            return Err(storage(unstaged.error));
+        }
+    };
+    #[cfg(test)]
+    publish_pause::run(path);
+    match replaces {
+        None => staging.rename_new(STAGED, parent, name).map_err(|error| {
+            remove_staged(staging, &staged);
+            new_name_refusal(error, path)
+        }),
+        Some(expected) => replace_checked(parent, staging, name, &staged, expected, path),
+    }
+}
+
+/// Removes the staged file from its private folder where it is the file this write made.
+fn remove_staged(staging: &Dir, staged: &Identity) {
+    let ours = matches!(
+        staging.fetch(STAGED, MAX_FILE_BYTES),
+        Ok(Fetched::File(read)) if read.identity.same_object(staged)
+    );
+    if ours {
+        let _ = staging.remove_file(STAGED);
+    }
+}
+
+/// Replaces the file at `name` with the staged file when the file at `name` holds the `expected`
+/// contents. The two names trade places in one step, so the place is never absent and no check
+/// stands between a read and the replacement; the file that came out of the place is then read in
+/// the private folder, and anything but the expected file is put back.
 fn replace_checked(
     parent: &Dir,
-    temporary: &str,
+    staging: &Dir,
     name: &str,
     staged: &Identity,
     expected: Digest256,
     path: &Path,
 ) -> Result<()> {
-    if let Err(error) = parent.exchange(temporary, name) {
-        // The names did not trade, so the staged file is still under its own name.
-        let _ = parent.remove_file(temporary);
-        return Err(match error.kind() {
-            ErrorKind::NotFound => changed_since_checked(path),
-            ErrorKind::InvalidInput | ErrorKind::Unsupported => no_exchange(path),
-            _ => storage(error),
-        });
+    if let Err(error) = staging.exchange(STAGED, parent, name) {
+        // The names did not trade, so the staged file is still in its folder.
+        remove_staged(staging, staged);
+        return Err(trade_refusal(error, path));
     }
-    match parent.fetch(temporary, MAX_FILE_BYTES) {
+    #[cfg(test)]
+    trade_pause::run(path);
+    match staging.fetch(STAGED, MAX_FILE_BYTES) {
         Ok(Fetched::File(read)) if digest_of(&read.bytes) == expected => {
             #[cfg(test)]
             cleanup_pause::run(path);
-            parent.remove_file(temporary).map_err(storage)
+            staging.remove_file(STAGED).map_err(storage)
         }
-        _ => Err(put_back(parent, temporary, name, staged, path)),
+        _ => Err(put_back(parent, staging, name, staged, path)),
     }
 }
 
 /// Undoes a trade that took a file other than the checked one out of the place. The staged file is
 /// removed only where it is the one this write made; a file that is not, and the file taken out of
-/// the place where it cannot go back, are kept.
+/// the place where it cannot go back, are kept in the private folder.
 fn put_back(
     parent: &Dir,
-    temporary: &str,
+    staging: &Dir,
     name: &str,
     staged: &Identity,
     path: &Path,
 ) -> ControllerError {
-    let back = match parent.exchange(temporary, name) {
+    let back = match staging.exchange(STAGED, parent, name) {
         Ok(()) => true,
         // Something took the staged file from the place: the file taken out of it goes back to
         // the free name.
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            parent.rename_new(temporary, name).is_ok()
+            staging.rename_new(STAGED, parent, name).is_ok()
         }
         Err(_) => false,
     };
-    match parent.fetch(temporary, MAX_FILE_BYTES) {
+    match staging.fetch(STAGED, MAX_FILE_BYTES) {
         Ok(Fetched::Absent) if back => changed_since_checked(path),
         Ok(Fetched::File(read)) if back && read.identity.same_object(staged) => {
             #[cfg(test)]
             cleanup_pause::run(path);
-            let _ = parent.remove_file(temporary);
+            let _ = staging.remove_file(STAGED);
             changed_since_checked(path)
         }
-        _ => kept_aside(path, &parent.join(temporary)),
+        _ => kept_aside(path, &staging.join(STAGED)),
     }
 }
 
@@ -532,6 +584,33 @@ pub(crate) mod publish_pause {
 
     pub(crate) fn run(path: &Path) {
         if let Some(then) = BEFORE_PUBLISH.with(|before| before.borrow_mut().take()) {
+            then(path);
+        }
+    }
+}
+
+/// What the unit tests run in a write after the staged file and the place have traded names and
+/// before the file that came out of the place is read, to make the change another process could
+/// make in between.
+#[cfg(test)]
+pub(crate) mod trade_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static AFTER_TRADE: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a write on this thread has traded the names.
+    #[cfg(unix)]
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        AFTER_TRADE.with(|after| *after.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(path: &Path) {
+        if let Some(then) = AFTER_TRADE.with(|after| after.borrow_mut().take()) {
             then(path);
         }
     }
@@ -585,6 +664,47 @@ pub(crate) mod make_pause {
     pub(crate) fn run(path: &Path) {
         if let Some(then) = BEFORE_MAKE.with(|before| before.borrow_mut().take()) {
             then(path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Error;
+
+    use super::*;
+
+    fn detail(refusal: ControllerError) -> String {
+        match refusal {
+            ControllerError::PermissionDenied { detail } => detail,
+            other => panic!("not a refusal: {other}"),
+        }
+    }
+
+    /// A file system that cannot add a file only where none is, or cannot trade two names, is
+    /// refused in the words a person is shown; a name that is taken, or a file that is gone, is the
+    /// refusal of a file that changed.
+    #[test]
+    fn a_file_system_without_the_two_renames_is_refused_in_the_words_a_person_is_shown() {
+        let path = Path::new("/home/p/.amp/mcp.json");
+        assert_eq!(
+            detail(new_name_refusal(Error::from(ErrorKind::Unsupported), path)),
+            "/home/p/.amp/mcp.json is on a file system that cannot add a file without the risk of \
+             replacing another one, so nothing is written there"
+        );
+        assert_eq!(
+            detail(trade_refusal(Error::from(ErrorKind::Unsupported), path)),
+            "/home/p/.amp/mcp.json is on a file system that cannot swap two names in one step, \
+             which an installation needs to replace a file safely, so nothing is written there"
+        );
+        for refusal in [
+            new_name_refusal(Error::from(ErrorKind::AlreadyExists), path),
+            trade_refusal(Error::from(ErrorKind::NotFound), path),
+        ] {
+            assert!(
+                detail(refusal).contains("replaces only the file it checked"),
+                "a name that is taken or a file that is gone is a changed file"
+            );
         }
     }
 }

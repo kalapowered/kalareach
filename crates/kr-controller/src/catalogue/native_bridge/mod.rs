@@ -1159,7 +1159,7 @@ impl NativeBridges {
         self.save(journal)?;
         self.step("rename", &base.join(name))?;
         self.about_to_publish_directory(&base.join(name));
-        match base.rename_new(&temporary, name) {
+        match base.rename_new(&temporary, base, name) {
             Ok(()) => {
                 self.flush(base)
                     .map_err(|error| refused(root, path, &error))?;
@@ -1244,7 +1244,7 @@ impl NativeBridges {
         self.about_to_publish(&directory.join(name));
         self.step("rename", &directory.join(name))?;
         directory
-            .rename_new(&temporary, name)
+            .rename_new(&temporary, directory, name)
             .map_err(|error| refused(root, path, &error))?;
         self.flush(directory)
             .map_err(|error| refused(root, path, &error))?;
@@ -1364,7 +1364,7 @@ impl NativeBridges {
             }
             self.step("rename", &directory.join(name))?;
             let renamed = if read.is_none() {
-                directory.rename_new(&temporary, name)
+                directory.rename_new(&temporary, directory, name)
             } else {
                 directory.rename_over(&temporary, name)
             };

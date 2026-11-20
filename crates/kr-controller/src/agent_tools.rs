@@ -6097,6 +6097,64 @@ mod tests {
         }
     }
 
+    /// KR-REQ-11.01: a file another process puts at the place while the names are traded is not
+    /// removed as if it were the staged file. It is kept, and the refusal names where.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_put_at_the_place_while_the_names_are_traded_is_kept_and_named() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        walk.write(&place, b"one", 0o600, None).expect("a new file");
+        let at = place.clone();
+        anchor::publish_pause::once(move |_| {
+            std::fs::write(&at, b"theirs").expect("another process writes the file");
+        });
+        let (at, home) = (place.clone(), tree.home());
+        anchor::trade_pause::once(move |_| {
+            std::fs::write(home.join("third.json"), b"third").expect("another process writes");
+            std::fs::rename(home.join("third.json"), &at).expect("it is put at the place");
+        });
+        let refused = walk
+            .write(&place, b"two", 0o600, Some(digest_of(b"one")))
+            .expect_err("the place does not hold the checked file");
+        let ControllerError::PermissionDenied { detail } = &refused else {
+            panic!("{refused}");
+        };
+        assert!(
+            detail.contains("could not be put back, so it is kept as "),
+            "{detail}"
+        );
+        assert_eq!(
+            std::fs::read(&place).expect("a file"),
+            b"theirs",
+            "the file that stood is back at the place"
+        );
+        let mut holding = Vec::new();
+        let mut folders = vec![tree.home()];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(&folder).expect("the folder") {
+                let path = entry.expect("an entry").path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else if std::fs::read(&path).ok().as_deref() == Some(&b"third"[..]) {
+                    holding.push(path);
+                }
+            }
+        }
+        assert_eq!(
+            holding.len(),
+            1,
+            "the file put at the place is kept: {holding:?}"
+        );
+        assert!(
+            detail.ends_with(&holding[0].display().to_string()),
+            "the refusal names it: {detail}"
+        );
+    }
+
     /// KR-REQ-11.01: a file where a folder is needed and a folder where a file is to be written
     /// stop the installation before anything is written, by the walk's approved words.
     #[cfg(unix)]
