@@ -151,23 +151,19 @@ impl BoundEndpoint {
                     BrokerError::invalid("a private socket lives inside a directory")
                 })?;
                 crate::broker::process::check_private_directory(parent)?;
-                let listener = tokio::net::UnixListener::bind(path).map_err(|error| {
-                    BrokerError::ledger(format!(
-                        "could not bind {} ({} bytes): {error}",
-                        path.display(),
-                        path.as_os_str().len()
-                    ))
-                })?;
+                let listener = tokio::net::UnixListener::bind(path)
+                    .map_err(|error| bind_refusal(path, &error))?;
                 // And the socket itself is owner-only, so the filesystem answers "who may
                 // connect" before any byte is read.
                 {
                     use std::os::unix::fs::PermissionsExt as _;
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                        .map_err(|error| {
-                            BrokerError::ledger(format!(
-                                "could not make {} owner-only: {error}",
-                                path.display()
-                            ))
+                        .map_err(|error| BrokerError::Listen {
+                            endpoint: path.to_string_lossy().into_owned(),
+                            refusal: kr_ipc::listen::ListenRefusal::Other {
+                                operation: kr_ipc::listen::ListenStep::Permissions,
+                                os: error.raw_os_error(),
+                            },
                         })?;
                 }
                 Ok(Self {
@@ -190,12 +186,16 @@ impl BoundEndpoint {
                     })?;
                 // The pipe's own list is its owner's, and the first instance is created
                 // exclusively, so a name another account made first is refused.
-                let listener = kr_ipc::endpoint::Listener::bind(&endpoint).map_err(|error| {
-                    BrokerError::ledger(format!(
-                        "could not bind {}: {error}",
-                        address.for_diagnostics()
-                    ))
-                })?;
+                let listener =
+                    kr_ipc::endpoint::Listener::bind(&endpoint).map_err(|error| match error {
+                        kr_ipc::IpcError::Listen { endpoint, refusal } => {
+                            BrokerError::Listen { endpoint, refusal }
+                        }
+                        other => BrokerError::ledger(format!(
+                            "could not bind {}: {other}",
+                            address.for_diagnostics()
+                        )),
+                    })?;
                 Ok(Self {
                     address,
                     listener: Bound::Pipe(listener),
@@ -411,5 +411,77 @@ mod tests {
             .expect("the directory is made readable by others");
         assert!(BoundEndpoint::bind(&directory).is_err());
         let _ = std::fs::remove_dir_all(&directory);
+    }
+}
+
+/// What a failed bind of a launch's socket says, read from what stands at the address at that
+/// moment: something that is not a socket is named for what it is, a socket is said to occupy the
+/// address (the launch's directory is new, so nothing there is the broker's to replace, and no
+/// claim about whether its listener runs is made), and any other failure is the bind step's own.
+#[cfg(unix)]
+fn bind_refusal(path: &std::path::Path, error: &std::io::Error) -> BrokerError {
+    use kr_ipc::listen::{ListenRefusal, ListenStep, ObjectKind};
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let refusal = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => ListenRefusal::Occupied,
+        Ok(metadata) => ListenRefusal::NotASocket {
+            object: ObjectKind::of(metadata.file_type()),
+        },
+        Err(_) => ListenRefusal::Other {
+            operation: ListenStep::Bind,
+            os: error.raw_os_error(),
+        },
+    };
+    BrokerError::Listen {
+        endpoint: path.to_string_lossy().into_owned(),
+        refusal,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bind_tests {
+    use super::*;
+    use kr_ipc::listen::{ListenRefusal, ObjectKind};
+
+    /// A launch's socket that cannot be bound is named for what stands at its address: a file, a
+    /// directory or a socket, each left alone.
+    #[tokio::test]
+    async fn a_broker_bind_names_what_stands_at_the_path() {
+        let folder = kr_ipc::testing::PrivateTempDir::create();
+        let file = folder.path().join("file.sock");
+        std::fs::write(&file, b"mine").expect("a file");
+        let directory = folder.path().join("directory.sock");
+        std::fs::create_dir(&directory).expect("a directory");
+        let socket = folder.path().join("socket.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("a socket");
+        for (name, expected) in [
+            (
+                "file.sock",
+                ListenRefusal::NotASocket {
+                    object: ObjectKind::File,
+                },
+            ),
+            (
+                "directory.sock",
+                ListenRefusal::NotASocket {
+                    object: ObjectKind::Directory,
+                },
+            ),
+            ("socket.sock", ListenRefusal::Occupied),
+        ] {
+            let error = BoundEndpoint::bind_named(folder.path(), name)
+                .map(|_| ())
+                .expect_err("the address is taken");
+            match error {
+                BrokerError::Listen { endpoint, refusal } => {
+                    assert_eq!(refusal, expected, "{name}");
+                    assert_eq!(endpoint, folder.path().join(name).to_string_lossy());
+                }
+                other => panic!("a listen refusal, not {other:?}"),
+            }
+        }
+        assert_eq!(std::fs::read(&file).expect("the file"), b"mine");
+        assert!(directory.is_dir() && socket.exists());
     }
 }

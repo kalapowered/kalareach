@@ -128,6 +128,17 @@ pub enum BrokerError {
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The socket the broker made for one launch could not be bound, and why.
+    ///
+    /// The refusal is read from what stands at the address when the bind failed, never from the
+    /// system's text; its words are the class's own.
+    #[error("{}", .refusal.said(.endpoint))]
+    Listen {
+        /// The address, as text.
+        endpoint: String,
+        /// Why the bind was refused.
+        refusal: kr_ipc::listen::ListenRefusal,
+    },
     /// The broker's durable records could not be read or written.
     #[error("the broker ledger is unavailable: {detail}")]
     LedgerUnavailable {
@@ -282,7 +293,9 @@ impl BrokerError {
             Self::LedgerUnavailable { .. } | Self::StoreFault { .. } => {
                 ErrorCode::StorageUnavailable
             }
-            Self::ResourceUnavailable { .. } => ErrorCode::ResourceUnavailable,
+            Self::ResourceUnavailable { .. } | Self::Listen { .. } => {
+                ErrorCode::ResourceUnavailable
+            }
             Self::Launch(refusal) => match refusal {
                 kr_protocol::broker::LaunchRefusal::ForegroundChanged
                 | kr_protocol::broker::LaunchRefusal::PromptMoved => ErrorCode::DraftConflict,
