@@ -28,6 +28,30 @@ pub enum TargetKind {
 }
 
 impl TargetKind {
+    /// The kind of a target whose `kind` Cargo gives as `kinds`, in its metadata and in its build
+    /// messages alike, or `None` for a build script and any other crate that no test selects.
+    #[must_use]
+    pub fn from_cargo(kinds: &[&str]) -> Option<Self> {
+        if kinds.contains(&"bin") {
+            Some(Self::Bin)
+        } else if kinds.contains(&"test") {
+            Some(Self::Test)
+        } else if kinds.contains(&"bench") {
+            Some(Self::Bench)
+        } else if kinds.contains(&"example") {
+            Some(Self::Example)
+        } else if kinds.iter().any(|kind| {
+            matches!(
+                *kind,
+                "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro"
+            )
+        }) {
+            Some(Self::Lib)
+        } else {
+            None
+        }
+    }
+
     /// The `cargo test` flag that selects a target of this kind by name, or `--lib`.
     #[must_use]
     pub fn selector(self, name: &str) -> String {
@@ -366,22 +390,7 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
                 .as_array()
                 .map(|kinds| kinds.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            let kind = if kinds.contains(&"bin") {
-                TargetKind::Bin
-            } else if kinds.contains(&"test") {
-                TargetKind::Test
-            } else if kinds.contains(&"bench") {
-                TargetKind::Bench
-            } else if kinds.contains(&"example") {
-                TargetKind::Example
-            } else if kinds.iter().any(|kind| {
-                matches!(
-                    *kind,
-                    "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro"
-                )
-            }) {
-                TargetKind::Lib
-            } else {
+            let Some(kind) = TargetKind::from_cargo(&kinds) else {
                 continue;
             };
             let target_name = target["name"].as_str().ok_or("a target without a name")?;

@@ -1,0 +1,6 @@
+# A tree the conformance report's own tests copy and run: two packages whose `tests/shared.rs` the
+# case makes links to the one file `common/shared.rs`. It is a workspace of its own, so the
+# repository's workspace never builds it.
+[workspace]
+members = ["alpha", "beta"]
+resolver = "3"

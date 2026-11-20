@@ -38,7 +38,7 @@ use crate::lane;
 use crate::libtest::{self, Binary, Recording};
 use crate::plan::{Reading, Step, Tests};
 use crate::vitest;
-use crate::workspace::{Package, TargetId};
+use crate::workspace::{Package, TargetId, TargetKind};
 
 /// What one step did.
 #[derive(Clone, Debug)]
@@ -1164,9 +1164,9 @@ fn build_first(
     let mut executables = BTreeMap::new();
     let mut outputs = Vec::new();
     let mut compiled = Vec::new();
-    // The targets of the map by the file they are built from, made when the first test program is
-    // met.
-    let mut sources: Option<BTreeMap<(PathBuf, String), TargetId>> = None;
+    // The targets of the map by the package, the kind, the name and the file, made when the first
+    // test program is met.
+    let mut index: Option<BTreeMap<ArtifactKey, TargetId>> = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -1195,14 +1195,12 @@ fn build_first(
         let Some(executable) = message["executable"].as_str() else {
             continue;
         };
-        let Some(source) = message["target"]["src_path"].as_str() else {
-            continue;
-        };
-        let name = message["target"]["name"].as_str().unwrap_or_default();
-        let target = sources
-            .get_or_insert_with(|| targets_by_source(packages))
-            .get(&(resolved(Path::new(source)), name.to_owned()))
-            .cloned();
+        let target = artifact_key(&message).and_then(|key| {
+            index
+                .get_or_insert_with(|| targets_by_artifact(packages))
+                .get(&key)
+                .cloned()
+        });
         if let Some(target) = target {
             executables.insert(file_name(executable), target.clone());
             if !built.contains(&target) {
@@ -1236,16 +1234,47 @@ fn resolved(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The targets of `packages` by the file each is built from, as [`resolved`] spells it, and its
-/// name. The first target of a file and a name is the one kept.
-fn targets_by_source(packages: &[Package]) -> BTreeMap<(PathBuf, String), TargetId> {
-    let mut by_source = BTreeMap::new();
-    for target in packages.iter().flat_map(|package| &package.targets) {
-        by_source
-            .entry((resolved(&target.src_path), target.id.name.clone()))
-            .or_insert_with(|| target.id.clone());
+/// How a test program of a build is matched to a target of the map: the manifest of its package,
+/// the kind and the name of the target, and the file it is built from. The manifest and the file
+/// are as [`resolved`] spells them, the file within the package: two packages whose test files are
+/// links to one file are two targets, and so are a program and a test of one package that share a
+/// name and a file.
+type ArtifactKey = (PathBuf, TargetKind, String, PathBuf);
+
+/// The key of the target that a `compiler-artifact` message of Cargo's describes, or `None` for a
+/// message with no package, no kind that a test selects, no name or no file.
+fn artifact_key(message: &serde_json::Value) -> Option<ArtifactKey> {
+    let kinds: Vec<&str> = message["target"]["kind"]
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    Some((
+        resolved(Path::new(message["manifest_path"].as_str()?)),
+        TargetKind::from_cargo(&kinds)?,
+        message["target"]["name"].as_str()?.to_owned(),
+        resolved(Path::new(message["target"]["src_path"].as_str()?)),
+    ))
+}
+
+/// The targets of `packages` by the key of the artifact that builds each.
+fn targets_by_artifact(packages: &[Package]) -> BTreeMap<ArtifactKey, TargetId> {
+    let mut index = BTreeMap::new();
+    for package in packages {
+        let manifest = resolved(&package.manifest);
+        for target in &package.targets {
+            index.insert(
+                (
+                    manifest.clone(),
+                    target.id.kind,
+                    target.id.name.clone(),
+                    resolved(&target.src_path),
+                ),
+                target.id.clone(),
+            );
+        }
     }
-    by_source
+    index
 }
 
 /// What a compile of a crate of this tree was, for deciding whether two of them could have run
@@ -1565,15 +1594,16 @@ fn run_logged(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     use super::{
-        Binary, Compiled, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, date_before,
+        Binary, Compiled, ERROR_BYTES, LISTING_BEGIN, LISTING_END, Unit, artifact_key, date_before,
         dependency_file, ends_of, ends_of_root_resolved, file_name, is_count, is_named_by_digest,
-        libtest, may_have_been_read_while_written, read_listing, reconcile, unrecorded,
+        libtest, may_have_been_read_while_written, read_listing, reconcile, targets_by_artifact,
+        unrecorded,
     };
-    use crate::workspace::{TargetId, TargetKind};
+    use crate::workspace::{Package, Target, TargetId, TargetKind};
 
     fn test_target(name: &str) -> TargetId {
         TargetId {
@@ -2176,5 +2206,98 @@ mod tests {
         // A file from before the build is not this build's.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         assert_eq!(dependency_file("kalareach_companion", &copied, later), None);
+    }
+
+    /// A package whose manifest is `manifest`, with targets that are a kind, a name and a file each.
+    fn package(name: &str, manifest: &str, targets: &[(TargetKind, &str, &str)]) -> Package {
+        Package {
+            name: name.to_owned(),
+            version: "0.1.0".to_owned(),
+            targets: targets
+                .iter()
+                .map(|(kind, target, source)| Target {
+                    id: TargetId {
+                        package: name.to_owned(),
+                        kind: *kind,
+                        name: (*target).to_owned(),
+                    },
+                    src_path: PathBuf::from(source),
+                    tested_by_default: true,
+                    harness: true,
+                    edition: "2024".to_owned(),
+                })
+                .collect(),
+            manifest: PathBuf::from(manifest),
+            registry_crates: BTreeSet::new(),
+            dependency_names: BTreeSet::new(),
+            workspace: ".".to_owned(),
+            workspace_members: Vec::new(),
+            workspace_default_members: Vec::new(),
+        }
+    }
+
+    /// The `compiler-artifact` message for a target of the package whose manifest is `manifest`.
+    fn artifact(manifest: &str, kind: &str, name: &str, source: &str) -> serde_json::Value {
+        serde_json::json!({
+            "reason": "compiler-artifact",
+            "manifest_path": manifest,
+            "target": { "kind": [kind], "name": name, "src_path": source },
+        })
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a test program of the build is matched
+    /// to the target of its own package, its own kind and its own name. Here two packages and two
+    /// kinds name one file and one name, and each message finds its own target.
+    #[test]
+    fn a_program_of_the_build_is_matched_by_its_package_its_kind_its_name_and_its_file() {
+        let file = "/nowhere/shared/t.rs";
+        let packages = [
+            package(
+                "p",
+                "/nowhere/p/Cargo.toml",
+                &[(TargetKind::Bin, "t", file), (TargetKind::Test, "t", file)],
+            ),
+            package(
+                "q",
+                "/nowhere/q/Cargo.toml",
+                &[(TargetKind::Test, "t", file)],
+            ),
+        ];
+        let index = targets_by_artifact(&packages);
+        let found = |manifest: &str, kind: &str, name: &str, source: &str| {
+            artifact_key(&artifact(manifest, kind, name, source))
+                .and_then(|key| index.get(&key).cloned())
+        };
+        let id = |package: &str, kind: TargetKind| TargetId {
+            package: package.to_owned(),
+            kind,
+            name: "t".to_owned(),
+        };
+        assert_eq!(
+            found("/nowhere/p/Cargo.toml", "test", "t", file),
+            Some(id("p", TargetKind::Test))
+        );
+        assert_eq!(
+            found("/nowhere/p/Cargo.toml", "bin", "t", file),
+            Some(id("p", TargetKind::Bin))
+        );
+        assert_eq!(
+            found("/nowhere/q/Cargo.toml", "test", "t", file),
+            Some(id("q", TargetKind::Test))
+        );
+        // A package, a kind or a file that the map does not hold finds nothing, and neither does a
+        // message with no package.
+        assert_eq!(found("/nowhere/r/Cargo.toml", "test", "t", file), None);
+        assert_eq!(found("/nowhere/q/Cargo.toml", "bin", "t", file), None);
+        assert_eq!(
+            found("/nowhere/q/Cargo.toml", "test", "t", "/nowhere/q/t.rs"),
+            None
+        );
+        let mut message = artifact("/nowhere/p/Cargo.toml", "test", "t", file);
+        message
+            .as_object_mut()
+            .expect("an object")
+            .remove("manifest_path");
+        assert_eq!(artifact_key(&message), None);
     }
 }
