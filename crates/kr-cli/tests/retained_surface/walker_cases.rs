@@ -467,6 +467,9 @@ fn the_scan_finds_each_way_a_sender_is_written_and_none_that_is_not() {
         ("Holder::in_method", vec![Names]),
         ("Holder", vec![Names]),
         ("outer_live", vec![Names]),
+        // A variant name stands in the arguments of a call, whatever it is joined to.
+        ("takes_two", vec![Names]),
+        ("macro:idle", vec![Expands]),
         // A stack that no configuration builds is read: the rule does not tell the names apart.
         ("never", vec![Names]),
         ("Sends", vec![Names]),
@@ -908,4 +911,188 @@ fn the_reader_of_a_tree_does_not_scan_the_receiver_crates() {
             .all(|sighting| sighting.krate == "kr_sender")
     );
     assert!(Reader::sightings(&tree).expect("the scan").len() == 1);
+}
+
+/// What the scan finds in the library `lib` of a sender crate: the kinds of each item it names.
+fn kinds_found(lib: &str, files: &[(&str, &str)]) -> BTreeMap<String, Vec<SightKind>> {
+    let folder = small_tree(lib);
+    for (path, text) in files {
+        write(folder.path(), &format!("crates/kr-sender/src/{path}"), text);
+    }
+    let tree = tree_at(folder.path()).expect("the tree");
+    let sightings = tree
+        .sightings(&|krate| krate == "kr_sender")
+        .expect("the scan");
+    names(&sightings, "kr_sender")
+}
+
+fn one(name: &str, kind: SightKind) -> BTreeMap<String, Vec<SightKind>> {
+    BTreeMap::from([(name.to_owned(), vec![kind])])
+}
+
+#[test]
+fn each_variant_name_is_a_sighting_wherever_it_stands_except_after_action_right() {
+    let none = BTreeMap::new();
+    for (lib, expected) in [
+        (
+            "fn f() { let _ = Method::AgentTurnCancel; }",
+            one("f", SightKind::Names),
+        ),
+        (
+            "fn f() { let _ = kr_protocol::Method::PluginActionInvoke; }",
+            one("f", SightKind::Names),
+        ),
+        (
+            "impl Local for Method { fn f() { let _ = Self::AgentTurnCancel; } }",
+            one("Method::f", SightKind::Names),
+        ),
+        (
+            "fn f() { let _ = <Method>::AgentPromptQueue; }",
+            one("f", SightKind::Names),
+        ),
+        (
+            "type M = Method;\nfn f() { let _ = M::AgentTurnSteer; }",
+            one("f", SightKind::Names),
+        ),
+        (
+            "use Method::*;\nfn f() { let _ = AgentApprovalRespond; }",
+            one("f", SightKind::Names),
+        ),
+        (
+            "use kr_protocol::Method::AgentPromptSubmit;\n",
+            one("use:lib.rs", SightKind::Names),
+        ),
+        (
+            "use kr_protocol::Method::{AgentPromptSubmit, Other};\n",
+            one("use:lib.rs", SightKind::Names),
+        ),
+        (
+            "fn f() { match x { Method => AgentTurnSteer } }",
+            one("f", SightKind::Names),
+        ),
+        (
+            "fn f() { thing!(Method::AgentTurnCancel); }",
+            one("f", SightKind::Names),
+        ),
+        (
+            "fn f() { let _ = Method::r#AgentTurnCancel; }",
+            one("f", SightKind::Names),
+        ),
+        // The one path `ActionRight::<Variant>` is a right of the same name.
+        (
+            "fn f() { let _ = ActionRight::AgentApprovalRespond; }",
+            none.clone(),
+        ),
+        (
+            "fn f() { let _ = ActionRight::AgentApprovalRespond; let _ = Method::AgentApprovalRespond; }",
+            one("f", SightKind::Names),
+        ),
+        // A name that is no variant, and one that only starts like one.
+        ("fn f() { let _ = Method::SessionOpen; }", none.clone()),
+        ("fn f() { let _ = AgentTurnCancelled; }", none.clone()),
+    ] {
+        assert_eq!(kinds_found(lib, &[]), expected, "{lib}");
+    }
+}
+
+#[test]
+fn a_wire_name_in_any_literal_is_a_sighting_once_it_is_decoded() {
+    let sends = |literal: &str| format!("fn f() {{ let _ = {literal}; }}");
+    for literal in [
+        "\"agent.turn.cancel\"",
+        "r\"agent.turn.cancel\"",
+        "r#\"agent.turn.cancel\"#",
+        "r##\"agent.turn.cancel\"##",
+        "b\"agent.turn.cancel\"",
+        "br#\"agent.turn.cancel\"#",
+        "c\"agent.turn.cancel\"",
+        "cr#\"agent.turn.cancel\"#",
+        "\"agent\\x2eturn.cancel\"",
+        "\"\\u{61}gent.turn.cancel\"",
+        "b\"agent\\x2eturn.cancel\"",
+        "\"agent.turn.\\\n            cancel\"",
+        "\"the method agent.turn.cancel is sent\"",
+        "\"agent.prompt.submit\"",
+        "\"agent.prompt.queue\"",
+        "\"agent.turn.steer\"",
+        "\"agent.approval.respond\"",
+        "\"plugin.action.invoke\"",
+    ] {
+        assert_eq!(
+            kinds_found(&sends(literal), &[]),
+            one("f", SightKind::Names),
+            "{literal}"
+        );
+    }
+    for literal in [
+        "\"agent.turn\"",
+        "\"agent turn cancel\"",
+        "\"agent.\"",
+        "'a'",
+        "1",
+    ] {
+        assert_eq!(
+            kinds_found(&sends(literal), &[]),
+            BTreeMap::new(),
+            "{literal}"
+        );
+    }
+    // A file that holds no word of a sighting but an escaped wire name is read.
+    let found = kinds_found(
+        "mod m;\n",
+        &[(
+            "m.rs",
+            "pub fn from_m() { let _ = \"agent\\x2eturn.cancel\"; }\n",
+        )],
+    );
+    assert_eq!(found, one("from_m", SightKind::Names));
+}
+
+#[test]
+fn a_request_or_a_target_is_a_sighting_where_a_brace_group_follows_its_name_or_self() {
+    for (lib, expected) in [
+        (
+            "fn f() { let _ = MutationRequest { a: 1 }; }",
+            one("f", SightKind::Request),
+        ),
+        (
+            "fn f() { let _ = kr_protocol::ActionTarget { a: 1 }; }",
+            one("f", SightKind::Target),
+        ),
+        (
+            "fn f() { thing!(MutationRequest { a: 1 }); }",
+            one("f", SightKind::Request),
+        ),
+        (
+            "fn f() { thing!(vec![ActionTarget { a: 1 }]); }",
+            one("f", SightKind::Target),
+        ),
+        (
+            "impl MutationRequest { fn new() -> Self { Self { a: 1 } } }",
+            one("MutationRequest::new", SightKind::Request),
+        ),
+        (
+            "impl Tr for ActionTarget { fn new() -> Self { Self { a: 1 } } }",
+            one("ActionTarget::new", SightKind::Target),
+        ),
+        (
+            "impl MutationRequest { const C: Self = Self { a: 1 }; }",
+            one("MutationRequest", SightKind::Request),
+        ),
+        // Another type's `Self { .. }`, and the type's name with no brace group, are not.
+        (
+            "impl Other { fn new() -> Self { Self { a: 1 } } }",
+            BTreeMap::new(),
+        ),
+        (
+            "fn f(_: MutationRequest, _: ActionTarget) { todo!() }",
+            BTreeMap::new(),
+        ),
+        (
+            "impl MutationRequest { fn id(&self) -> u8 { 1 } }",
+            BTreeMap::new(),
+        ),
+    ] {
+        assert_eq!(kinds_found(lib, &[]), expected, "{lib}");
+    }
 }

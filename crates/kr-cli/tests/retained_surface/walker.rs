@@ -1513,7 +1513,7 @@ pub struct Source {
 /// What a sighting of a way to build a mutation for a worker names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SightKind {
-    /// `Method::<V>` or a wire name as a string, for one of the six methods.
+    /// One of the six variant names, or a wire name in a string.
     Names,
     /// `MutationRequest` followed by a brace group.
     Request,
@@ -1657,8 +1657,8 @@ impl Tree {
     }
 
     /// What stops a crate from being read: the forms the inventory refuses, and the refusals of the
-    /// scan (X8, X11), of a procedural-macro crate (X10) and of a call with a sighting to a macro
-    /// that a crate in scope exports (X9). A lookup in the crate gives none of its results while
+    /// scan (X8 and the renames of R1), of a procedural-macro crate (X10) and of a call with a sighting
+    /// to a macro that a crate in scope exports (X9). A lookup in the crate gives none of its results while
     /// one holds.
     pub fn refusals(&self, krate: &str) -> Result<(), String> {
         self.refused(krate, &|other| {
@@ -1683,6 +1683,17 @@ impl Tree {
         }
         let scan = self.scan(krate)?;
         let imported = self.inventory(krate)?;
+        // A rename of the name of a macro that a crate in scope defines hides the macro from the scan.
+        for (file, old, new) in &imported.renames {
+            for other in self.crates.keys().filter(|other| include(other)) {
+                let defined = &self.inventory(other)?.defined;
+                if defined.contains(old) || defined.contains(new) {
+                    return Err(format!(
+                        "{file}: the scan does not read a use of {old} under another name (as {new})"
+                    ));
+                }
+            }
+        }
         for name in &scan.unresolved {
             // A call names a macro as written, or as a `use ... as` renamed it.
             let mut called = vec![(name.clone(), String::new())];
@@ -1727,25 +1738,6 @@ impl Tree {
     }
 }
 
-/// Whether the text holds a word a sighting is made of, so that the file is parsed.
-fn mentions_a_sighting(text: &str) -> bool {
-    // An escape or a line continuation can spell a wire name that the text does not hold: a file
-    // with one is parsed, and the literal's value decides.
-    [
-        "Method",
-        "MutationRequest",
-        "ActionTarget",
-        "macro_rules",
-        "\\x",
-        "\\u{",
-        "\\\n",
-        "\\\r\n",
-    ]
-    .iter()
-    .any(|word| text.contains(word))
-        || WIRE_NAMES.iter().any(|name| text.contains(name))
-}
-
 /// `path` with its `.` components left out and each `..` taken with the normal component before
 /// it. A `..` that nothing before it can take stays, and one after the root is the root, so a
 /// relative path keeps every step up that it makes. Links are not looked at: callers pass an
@@ -1769,6 +1761,9 @@ pub(super) fn normalised(path: &Path) -> PathBuf {
 }
 
 struct Scanner {
+    /// The kind of the type of the `impl` block the scan is in, when it is `MutationRequest` or
+    /// `ActionTarget`.
+    self_kind: Option<SightKind>,
     sightings: BTreeMap<String, BTreeSet<SightKind>>,
     /// The text of each scan-only name, in file order, with the file it is in.
     scan_only: BTreeMap<String, (String, Vec<String>)>,
@@ -1830,13 +1825,13 @@ impl Scanner {
     /// bodies then give the parameters' target.
     fn body(&mut self, name: String, tokens: TokenStream) {
         calls_in(&tokens, &mut self.calls);
-        self.sight(name, kinds_of(&tokens));
+        self.sight(name, kinds_in(&tokens, self.self_kind));
     }
 
     /// The tokens of an item that only the scan names: when they hold a sighting, their text
     /// joins the text and the digest of `name`.
     fn scan_only_body(&mut self, name: String, file: &str, tokens: TokenStream) {
-        let kinds = kinds_of(&tokens);
+        let kinds = kinds_in(&tokens, self.self_kind);
         if kinds.is_empty() {
             return;
         }
@@ -1887,6 +1882,15 @@ impl Scanner {
                 }
                 syn::Item::Impl(block) => {
                     let owner = type_name(&block.self_ty);
+                    // `Self { .. }` in an impl for one of the two types is a literal of it.
+                    let outer = std::mem::replace(
+                        &mut self.self_kind,
+                        match owner.as_str() {
+                            "MutationRequest" => Some(SightKind::Request),
+                            "ActionTarget" => Some(SightKind::Target),
+                            _ => None,
+                        },
+                    );
                     for inner in &block.items {
                         if !condition::enabled(impl_item_attrs(inner), file)? {
                             continue;
@@ -1915,6 +1919,7 @@ impl Scanner {
                             _ => {}
                         }
                     }
+                    self.self_kind = outer;
                 }
                 syn::Item::Trait(definition) => {
                     // `Strip` takes the members that no configuration builds out of the trait.
@@ -1997,12 +2002,8 @@ fn scan_crate(
     root: &Path,
     inventory: &Inventory,
 ) -> Result<CrateScan, String> {
-    if let Some(file) = inventory.method_uses.first() {
-        return Err(format!(
-            "{file}: a use of Method::* or of Method under another name; the scan reads Method::<Variant> only"
-        ));
-    }
     let mut scanner = Scanner {
+        self_kind: None,
         sightings: BTreeMap::new(),
         scan_only: BTreeMap::new(),
         macro_rules: BTreeSet::new(),
@@ -2011,9 +2012,6 @@ fn scan_crate(
     for path in &inventory.files {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        if !mentions_a_sighting(&text) {
-            continue;
-        }
         let parsed =
             syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
         let relative = path
@@ -2224,49 +2222,74 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
     }
 }
 
-/// The kinds of sighting the tokens hold: a `Method::<V>` path or wire name, a `MutationRequest`
-/// or an `ActionTarget` with a brace group after it.
+/// The kinds of sighting the tokens hold: a variant name or a wire name, a `MutationRequest` or an
+/// `ActionTarget` with a brace group after it.
 fn kinds_of(stream: &TokenStream) -> BTreeSet<SightKind> {
+    kinds_in(stream, None)
+}
+
+/// What the tokens of an item sight. `owner` is the kind of the type of an enclosing `impl` for
+/// `MutationRequest` or `ActionTarget`, whose `Self { .. }` is a literal of it.
+fn kinds_in(stream: &TokenStream, owner: Option<SightKind>) -> BTreeSet<SightKind> {
     let mut kinds = BTreeSet::new();
-    collect_kinds(stream, &mut kinds);
+    collect_kinds(stream, &mut kinds, owner);
     kinds
 }
 
-fn collect_kinds(stream: &TokenStream, kinds: &mut BTreeSet<SightKind>) {
+/// Whether a literal's value, once its escapes are decoded, holds a wire name: a string, a raw
+/// string, a byte string or a C string.
+fn holds_a_wire_name(literal: &proc_macro2::Literal) -> bool {
+    let holds = |value: &[u8]| {
+        WIRE_NAMES.iter().any(|wire| {
+            value
+                .windows(wire.len())
+                .any(|window| window == wire.as_bytes())
+        })
+    };
+    match syn::parse_str::<syn::Lit>(&literal.to_string()) {
+        Ok(syn::Lit::Str(text)) => holds(text.value().as_bytes()),
+        Ok(syn::Lit::ByteStr(bytes)) => holds(&bytes.value()),
+        Ok(syn::Lit::CStr(text)) => holds(text.value().to_bytes()),
+        _ => false,
+    }
+}
+
+/// Each of the six variant names, wherever it stands, is a sighting, but for the one path
+/// `ActionRight::<Variant>`, which is a right of the same name. A wire name in a literal, and the
+/// brace form of `MutationRequest` and `ActionTarget`, are sightings.
+fn collect_kinds(stream: &TokenStream, kinds: &mut BTreeSet<SightKind>, owner: Option<SightKind>) {
     let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
     let is_brace = |tree: Option<&TokenTree>| matches!(tree, Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace);
+    let is_colon = |tree: Option<&TokenTree>| matches!(tree, Some(TokenTree::Punct(punct)) if punct.as_char() == ':');
     for (at, tree) in flat.iter().enumerate() {
         match tree {
-            TokenTree::Group(group) => collect_kinds(&group.stream(), kinds),
+            TokenTree::Group(group) => collect_kinds(&group.stream(), kinds, owner),
             TokenTree::Literal(literal) => {
-                if let Ok(text) = syn::parse_str::<syn::LitStr>(&literal.to_string())
-                    && WIRE_NAMES.contains(&text.value().as_str())
-                {
+                if holds_a_wire_name(literal) {
                     kinds.insert(SightKind::Names);
                 }
             }
             TokenTree::Ident(ident) => {
                 let word = ident.to_string();
+                let word = word.trim_start_matches("r#");
                 if word == "MutationRequest" && is_brace(flat.get(at + 1)) {
                     kinds.insert(SightKind::Request);
                 }
                 if word == "ActionTarget" && is_brace(flat.get(at + 1)) {
                     kinds.insert(SightKind::Target);
                 }
-                let separated = matches!(flat.get(at + 1), Some(TokenTree::Punct(one)) if one.as_char() == ':')
-                    && matches!(flat.get(at + 2), Some(TokenTree::Punct(two)) if two.as_char() == ':');
-                if word == "Method" && separated {
-                    let names_one = |tree: &TokenTree| matches!(tree, TokenTree::Ident(variant) if VARIANTS.contains(&variant.to_string().as_str()));
-                    let hit = match flat.get(at + 3) {
-                        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => {
-                            group.stream().into_iter().any(|inner| names_one(&inner))
-                        }
-                        Some(other) => names_one(other),
-                        None => false,
-                    };
-                    if hit {
-                        kinds.insert(SightKind::Names);
-                    }
+                if word == "Self"
+                    && let Some(kind) = owner
+                    && is_brace(flat.get(at + 1))
+                {
+                    kinds.insert(kind);
+                }
+                let right = at >= 3
+                    && is_colon(flat.get(at - 1))
+                    && is_colon(flat.get(at - 2))
+                    && matches!(flat.get(at - 3), Some(TokenTree::Ident(before)) if before == "ActionRight");
+                if VARIANTS.contains(&word) && !right {
+                    kinds.insert(SightKind::Names);
                 }
             }
             TokenTree::Punct(_) => {}

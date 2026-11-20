@@ -320,38 +320,48 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
             "{at}: thing! is called at item position, is not defined in kr_sender and is not one the scan accepts"
         ),
     );
-    // A `use` of the variants by glob, or of `Method` under another name.
+    // A rename of a name the scan reads hides it: `Method`, the two types, `ActionRight`, a variant, a
+    // macro the scan accepts (R1), whether the name comes as the old or as the new one.
     for import in [
-        "use kr_protocol::Method::*;",
         "use kr_protocol::Method as M;",
         "use kr_protocol::Method::{self as M};",
-        "fn f() { use kr_protocol::Method::*; }",
-        // An alias of `Method`, and a variant named through `Self` in an impl for `Method`.
-        "type M = Method;",
-        "type M = kr_protocol::Method;",
-        "impl Local for Method { fn f() { let _ = Self::AgentTurnCancel; } }",
-        "impl Local for kr_protocol::Method { fn f() { match 1 { _ => Self::PluginActionInvoke }; } }",
-        // A variant named through the type in angle brackets.
-        "fn f() { let _ = <Method>::AgentTurnCancel; }",
-        "fn f() { match 1 { _ => <kr_protocol::Method>::PluginActionInvoke }; }",
+        "use kr_protocol::{Method as M, other};",
+        "fn f() { use kr_protocol::Method as M; }",
+        "use kr_protocol::MutationRequest as Request;",
+        "use kr_protocol::ActionTarget as Target;",
+        "use kr_protocol::ActionRight as Right;",
+        "use kr_protocol::Method::AgentTurnCancel as Cancel;",
+        "use kr_protocol::something as AgentTurnCancel;",
+        "use kr_protocol::something as Method;",
+        "use kr_client::debug_fields as shown;",
+        "extern crate kr_protocol as Method;",
+        "use kr_protocol::Method::AgentTurnCancel as _;",
     ] {
         let (scan, _) = scanned(&format!("{import}\n"), &[]);
-        assert_eq!(
-            scan,
-            Err(format!(
-                "{at}: a use of Method::* or of Method under another name; the scan reads Method::<Variant> only"
-            )),
-            "{import}"
+        assert!(
+            matches!(&scan, Err(text) if text.starts_with(&format!("{at}: the scan does not read a use of "))
+                && text.contains(" under another name (as ")),
+            "{import}: {scan:?}"
         );
     }
-    // `Self::<name>` in an impl for another type or for `Method` with a name that is no variant, and
-    // an alias of another type, are not those forms.
+    assert_eq!(
+        read_names("use kr_protocol::Method as M;\n", &[]),
+        Err(format!(
+            "{at}: the scan does not read a use of Method under another name (as M)"
+        ))
+    );
+    assert_eq!(
+        read_names("use kr_protocol::something as Method;\n", &[]),
+        Err(format!(
+            "{at}: the scan does not read a use of something under another name (as Method)"
+        ))
+    );
+    // A rename of any other name, and a `use` that renames nothing, are not refused.
     for lib in [
-        "impl Local for Method { fn f() { let _ = Self::Unrelated; } }",
-        "impl Local for Other { fn f() { let _ = Self::AgentTurnCancel; } }",
-        "type M = Other;",
-        "fn f() { let _ = <Other>::AgentTurnCancel; }",
-        "fn f() { let _ = <Method as std::str::FromStr>::from_str; }",
+        "use kr_protocol::Method::*;",
+        "use kr_protocol::Method;",
+        "use kr_protocol::other as renamed;",
+        "use std::fmt::Result as FmtResult;",
     ] {
         assert_eq!(
             read_names(&format!("{lib}\n"), &[]),
@@ -359,22 +369,45 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
             "{lib}"
         );
     }
-    // An enum named `Method` in a crate that is not the protocol's is no exemption, and the protocol
-    // crate, which defines `Method` and names its own variants, is not read as a sender.
+    // A `type` alias of `MutationRequest` or `ActionTarget` hides the literal it makes (R2), in any
+    // place a `type` can stand; an alias of any other type is not refused.
+    for alias in [
+        "type M = MutationRequest;",
+        "type T = kr_protocol::ActionTarget;",
+        "type G = kr_protocol::MutationRequest<u8>;",
+        "fn f() { type T = ActionTarget; }",
+        "trait Tr { type A; }\nimpl Tr for S { type A = ActionTarget; }",
+    ] {
+        let (scan, _) = scanned(&format!("{alias}\n"), &[]);
+        assert!(
+            matches!(&scan, Err(text) if text.starts_with(&format!("{at}: the scan does not read a type alias of "))),
+            "{alias}: {scan:?}"
+        );
+    }
+    assert_eq!(
+        read_names("type M = MutationRequest;\n", &[]),
+        Err(format!(
+            "{at}: the scan does not read a type alias of MutationRequest (M)"
+        ))
+    );
+    for lib in [
+        "type M = Other;",
+        "type M = Method;",
+        "type B = Box<ActionTarget>;",
+        "fn f() { let _ = <Other>::AgentTurnCancelled; }",
+    ] {
+        assert_eq!(
+            read_names(&format!("{lib}\n"), &[]),
+            Ok(Vec::<String>::new()),
+            "{lib}"
+        );
+    }
+    // A variant name is read wherever it stands (S1): there is no exemption for a crate that defines
+    // an enum named `Method`, and none for a form that spells the name by `Self`, a glob or an alias.
     let definition = "pub enum Method { AgentTurnCancel }\nuse Method::*;\ntype M = Method;\nimpl Method { fn f() -> Self { Self::AgentTurnCancel } }\n";
     assert_eq!(
         read_names(&format!("mod local {{ {definition} }}\n"), &[]),
-        Err(format!(
-            "{at}: a use of Method::* or of Method under another name; the scan reads Method::<Variant> only"
-        ))
-    );
-    let folder = small_tree("pub fn quiet() {}\n");
-    write(folder.path(), "crates/kr-protocol/src/lib.rs", definition);
-    let tree = tree_at(folder.path()).expect("the tree");
-    assert_eq!(
-        tree.sightings(&|krate| krate == "kr_protocol")
-            .map(|found| found.len()),
-        Ok(0)
+        Ok(vec!["Method".to_owned(), "Method::f".to_owned()])
     );
     // Targets and roots: Cargo's own report gives them, so a binary at any path is a root.
     let manifest = |extra: &str| {
@@ -703,8 +736,8 @@ fn a_refused_crate_gives_no_lookup_result_whatever_the_index_holds() {
     let meta = "macro_rules! meta { ($m:ident) => { $m!(Method::AgentTurnCancel) }; }\nfn uses() { meta!(Method::AgentTurnCancel); }\n";
     for (lib, text) in [
         (
-            format!("use kr_protocol::Method::*;\n{existing}"),
-            "crates/kr-sender/src/lib.rs: a use of Method::* or of Method under another name; the scan reads Method::<Variant> only",
+            format!("use kr_protocol::Method as M;\n{existing}"),
+            "crates/kr-sender/src/lib.rs: the scan does not read a use of Method under another name (as M)",
         ),
         (
             format!("{meta}{existing}"),
@@ -783,7 +816,6 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
         "use tokio::task_local;\ntask_local! { static X: u8; }",
         "use wasmtime::component::bindgen;\nbindgen!({ path: \"x.wit\" });",
         "use wasmtime::component;\ncomponent::bindgen!({ path: \"x.wit\" });",
-        "use kr_client::{debug_fields as shown};\nshown!(E { a });",
         "use schemars::json_schema;\nmacro_rules! schema { () => { json_schema!({}) }; }",
         "macro_rules! schema { () => { schemars::json_schema!({}) }; }",
     ] {
@@ -964,7 +996,7 @@ fn a_macro_called_through_a_metavariable_or_exported_to_a_crate_the_scan_reads_i
     assert_eq!(across(lib, "json_schema"), refused("json_schema"));
     // A call through the name a `use` gives the other crate's macro, in a call and in a transcriber.
     let renamed = Err(
-        "kr_sender: shared! is called with a sighting (imported as renamed) and kr_worker exports it; the scan does not follow it across crates"
+        "crates/kr-sender/src/lib.rs: the scan does not read a use of shared under another name (as renamed)"
             .to_owned(),
     );
     let lib = "use kr_worker::shared as renamed;\nfn f() { renamed!(Method::AgentTurnCancel); }\n";
