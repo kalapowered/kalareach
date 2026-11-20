@@ -123,6 +123,11 @@ pub struct Step {
     pub setup: bool,
     /// The set-up steps that run before it, by name.
     pub after: Vec<String>,
+    /// The most seconds the step may take, from its start to its end, counting the build and the
+    /// listing of its tests that come before its run: the report ends its processes at that time.
+    pub timeout: Option<u64>,
+    /// The time budget it spends from, by `id`, and the budget's seconds.
+    pub budget: Option<(String, u64)>,
 }
 
 impl Step {
@@ -147,6 +152,8 @@ impl Step {
             output: None,
             setup: false,
             after: Vec::new(),
+            timeout: None,
+            budget: None,
         }
     }
 
@@ -344,6 +351,8 @@ mod tests {
             output: None,
             setup: false,
             after: Vec::new(),
+            timeout: None,
+            budget: None,
         };
         let mut steps = vec![step("a", Reading::Build), step("b", Reading::Build)];
         steps.extend((0..7).map(|n| step(&format!("t{n}"), Reading::Cargo)));
@@ -363,6 +372,8 @@ mod tests {
             id: id.to_owned(),
             setup,
             after: after.iter().map(|name| (*name).to_owned()).collect(),
+            timeout: None,
+            budget: None,
             ..step_of(id, &["cargo"], reading)
         }
     }
@@ -423,6 +434,8 @@ mod tests {
             output: None,
             setup: false,
             after: Vec::new(),
+            timeout: None,
+            budget: None,
         }
     }
 
