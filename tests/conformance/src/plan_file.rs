@@ -1184,7 +1184,7 @@ impl Plan {
                 && step.platforms.contains(&Platform::Windows)
             {
                 return refuse(format!(
-                    "step `{id}` has a time limit and runs on windows, where the report cannot end \
+                    "step `{id}` has a time limit and runs on `windows`, where the report cannot end \
                      the processes of a step"
                 ));
             }
