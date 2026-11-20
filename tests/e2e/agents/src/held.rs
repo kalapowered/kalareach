@@ -1104,8 +1104,9 @@ fn person_home_of(
 }
 
 /// One row of the process listing: the process, its parent, its user, the name its parent gave it
-/// (`argv[0]`, which is what `ps` prints as `comm` on macOS) and the path of the file it runs as the
-/// system says it, where the system says one.
+/// (`argv[0]`: what `ps` prints as `comm` on macOS, and the first field of the process's command
+/// line on Linux, where `comm` is the name of the file it runs) and the path of the file it runs as
+/// the system says it, where the system says one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessRow {
     pid: u32,
@@ -1177,6 +1178,32 @@ fn outside_the_run(
     found
 }
 
+/// The first field of a command line as `/proc/<pid>/cmdline` holds it, its fields ended by a NUL:
+/// the name the process's parent gave it. None for a command line with no first field, which is
+/// what the system gives for a process that has ended and for a kernel thread.
+#[cfg(any(target_os = "linux", test))]
+fn first_argument(command_line: &[u8]) -> Option<String> {
+    let first = command_line.split(|byte| *byte == 0).next()?;
+    (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
+}
+
+/// The name the parent of the process `pid` gave it: `argv[0]`, which `ps` prints as `comm` on
+/// macOS and which Linux keeps in the process's command line, where `comm` is the name of the file
+/// it runs. The listing's `comm` stays the answer where the command line cannot be read.
+#[cfg(target_os = "linux")]
+fn name_given_by_parent(pid: u32, comm: String) -> String {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .and_then(|command_line| first_argument(&command_line))
+        .unwrap_or(comm)
+}
+
+/// The name the parent of the process `pid` gave it: what `ps` prints as `comm`.
+#[cfg(not(target_os = "linux"))]
+fn name_given_by_parent(_pid: u32, comm: String) -> String {
+    comm
+}
+
 /// The processes of this user that are the agent called `agent` (`codex`) outside the run whose
 /// directory is `run_root`, where there is a run, each as its process id and nothing else: found by
 /// a listing of the processes and, for each of this user's, the path of the file it runs as the
@@ -1219,8 +1246,13 @@ pub fn other_agent_processes(agent: &str, run_root: Option<&Path>) -> Result<Vec
             let pid: u32 = fields.next()?.parse().ok()?;
             let parent = fields.next()?.parse().ok()?;
             let user: u32 = fields.next()?.parse().ok()?;
-            let argv0 = fields.collect::<Vec<_>>().join(" ");
-            // The system's own answer, asked for the processes of this user only.
+            let comm = fields.collect::<Vec<_>>().join(" ");
+            // The system's own answers, asked for the processes of this user only.
+            let argv0 = if user == me {
+                name_given_by_parent(pid, comm)
+            } else {
+                comm
+            };
             let executable = (user == me)
                 .then(|| kr_e2e_m1b::run::executable_path(pid))
                 .flatten()
@@ -2549,6 +2581,23 @@ mod tests {
             !said.contains("secret-name") && !said.contains('/'),
             "{said}"
         );
+    }
+
+    /// The name a parent gave a process is the first field of the command line the system keeps,
+    /// whole, with its spaces; a command line with no first field gives none.
+    #[test]
+    fn the_name_a_parent_gave_is_the_first_field_of_the_command_line() {
+        assert_eq!(
+            first_argument(b"codex\0--flag\0value\0").as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            first_argument(b"/opt/the agent/codex\0a\0").as_deref(),
+            Some("/opt/the agent/codex")
+        );
+        assert_eq!(first_argument(b"codex").as_deref(), Some("codex"));
+        assert_eq!(first_argument(b""), None);
+        assert_eq!(first_argument(b"\0a\0"), None);
     }
 
     #[test]
