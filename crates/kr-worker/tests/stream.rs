@@ -3977,3 +3977,90 @@ async fn kr_req_11_17_a_gateway_record_names_only_causes_a_detector_raises() {
         );
     }
 }
+
+/// A hook the instance's application started, as the kernel recorded it starting at `kernel`.
+fn hook(kernel: u64) -> kr_worker::broker::bridge::BridgeProcess {
+    kr_worker::broker::bridge::BridgeProcess {
+        identity: ProcessStartIdentity::new(
+            4_000 + kernel,
+            ProcessStartSource::MacosProcBsdInfo,
+            kernel,
+        ),
+        starter: Some(process()),
+        started: Some(kernel),
+    }
+}
+
+impl World {
+    /// What a hook that the application started at `kernel` reports of `thread`, applied.
+    fn hook_reports(&self, kernel: u64, event: &str, thread: &str) {
+        let observation = kr_worker::broker::bridge::Observation::from_frame(
+            format!(r#"{{"kr_observation":{{"event":"{event}","thread":"{thread}"}}}}"#).as_bytes(),
+        )
+        .expect("an observation");
+        self.broker
+            .observe_bridge(
+                instance(),
+                &hook(kernel),
+                &observation,
+                NOW,
+                kr_worker::broker::observation::PrivacyMark::default(),
+            )
+            .expect("the observation is applied");
+    }
+}
+
+/// KR-REQ-18.01: a launch that has a hook bridge and a gateway has two ways to select a thread, and
+/// a selection the gateway proves does not settle a bridge that could not place its own reports.
+/// After two hooks of one tick leave the bridge unable to vouch for a thread, a reply of the
+/// server that names the thread the first hook selected binds it, the bridge still cannot vouch
+/// for it, and a turn's end a hook reports in it, from a hook that started after the report that
+/// began the binding, completes no turn. The same end before the two hooks collided did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gateway_selection_does_not_vouch_for_an_unsettled_hook_thread() {
+    let mut world = World::new(1 << 20);
+    let notices = Arc::new(kr_worker::notices::SessionNotices::default());
+    world.broker.set_session_notices(Arc::clone(&notices));
+
+    world.hook_reports(10, "thread_started", "t1");
+    assert_eq!(
+        world.thread().as_deref(),
+        Some("t1"),
+        "the first hook selects"
+    );
+    world.hook_reports(20, "turn_ended", "t1");
+    assert_eq!(
+        notices.front(),
+        Some(kr_protocol::attention::SessionEventNotice::TurnCompleted {
+            turn_id: kr_protocol::ids::AgentTurnId::new("t1").expect("valid"),
+        }),
+        "a bridge that vouches for the thread completes the turn"
+    );
+    notices.taken();
+
+    world.hook_reports(10, "thread_started", "t2");
+    assert_eq!(
+        world.thread(),
+        None,
+        "two hooks of one tick leave no thread"
+    );
+    assert!(world.broker.verified_selection(instance()).is_none());
+
+    world.terminal_selects("t1").await;
+    assert_eq!(
+        world.thread().as_deref(),
+        Some("t1"),
+        "the server's reply selects the thread"
+    );
+    assert!(
+        world.broker.verified_selection(instance()).is_none(),
+        "the bridge still cannot vouch for it"
+    );
+
+    world.hook_reports(30, "turn_ended", "t1");
+    assert_eq!(
+        notices.front(),
+        None,
+        "a turn's end in a thread the bridge cannot vouch for completes nothing"
+    );
+}
