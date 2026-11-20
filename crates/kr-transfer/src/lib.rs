@@ -20,6 +20,7 @@
 //! | [`filesystem`] | Which filesystem a recorded directory is on, and the one rule that settles a record against the directory found where it was recorded |
 //! | [`staging`] | The environment's private staging area and the names payloads are stored under |
 //! | [`store`] | `transfers.sqlite`: uploads, the per-chunk journal, snapshots, drafts, grants |
+//! | [`revisions`] | `draft-revisions.sqlite3`: the binding revision each draft that names an application was written under |
 //! | [`service`] | Uploads, attachment handles, drafts, read grants, recovery and expiry sweeps |
 //! | [`download`] | Immutable sources, bounded snapshots, and the client's verified publish |
 //! | [`preview`] | The bounded image decoder |
@@ -65,6 +66,7 @@ pub mod download;
 pub mod error;
 pub mod filesystem;
 pub mod preview;
+pub mod revisions;
 pub mod service;
 pub mod staging;
 pub mod store;

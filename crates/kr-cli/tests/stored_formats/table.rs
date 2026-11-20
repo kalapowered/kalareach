@@ -69,7 +69,7 @@ fn reading_through(entry: ReleaseStore, through: u32) -> ReleaseStore {
 pub fn known() -> Vec<Known> {
     use kr_protocol::{
         account, attention, automation, changeset, delivery, error, host_account, identity,
-        pairing, push, sharing, skill,
+        pairing, push, sharing, skill, transfer,
     };
 
     let source = |store, name, file, pinned| Known {
@@ -385,6 +385,13 @@ pub fn known() -> Vec<Known> {
             "ErrorCode",
             "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
         ),
+        // The answer of a draft a device ended, which the transfers store keeps in `actions.result`
+        // as the bytes the method answered, beside the answers its own declaration lists.
+        known_protocol::<transfer::DraftDiscardResult>(
+            "transfers",
+            "DraftDiscardResult",
+            "da7f26b9971c4e3450b20922b3573827c5bffd47956665dd06ab3d9ddb647e78",
+        ),
         // The code a refused workflow action keeps in `action_records.error_code`, read back as the
         // code it names.
         known_protocol::<error::ErrorCode>(
@@ -449,6 +456,7 @@ pub fn kept_without_a_holder() -> Vec<(&'static str, &'static str)> {
         ("changesets", "ChangesetMaterializeResult"),
         ("changesets", "DiffApplyResult"),
         ("changesets", "ErrorCode"),
+        ("transfers", "DraftDiscardResult"),
         ("workflows", "ErrorCode"),
         // The parameters of a stored workflow's node, which admission decodes at each admission.
         ("workflows", "ChangesetMaterializeParams"),
@@ -1159,21 +1167,49 @@ pub fn table() -> Vec<Store> {
             owned: Vec::new(),
             kept: Vec::new(),
         },
+        // The binding revision each draft that names an application was written under, which the
+        // daemon keeps beside the transfers journal in a store of its own. The transfers claim
+        // below covers the file.
         Store {
             levels: None,
             writers: Writers::Daemon,
             entry: entry(
-                "transfers",
+                "draft-revisions",
                 StoreScope::Environment,
-                "transfers/transfers.sqlite",
-                sqlite_table("schema_version"),
-                version(kr_transfer::store::SCHEMA_VERSION),
-                version(kr_transfer::store::OLDEST_SCHEMA_VERSION),
+                "transfers/draft-revisions.sqlite3",
+                sqlite_table("draft_revisions_schema"),
+                version(kr_transfer::revisions::SCHEMA_VERSION),
+                version(kr_transfer::revisions::SCHEMA_VERSION),
+            ),
+            owned: Vec::new(),
+            kept: Vec::new(),
+        },
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            // A journal at version 6, which a build that kept a draft's binding revision in a
+            // column of the journal wrote, is read through: the daemon of this release keeps the
+            // revisions in the store beside the journal and brings the journal to version 5 when
+            // it starts, and a rollback does the same before the release before is checked. The
+            // field goes with that step: remove both once no supported upgrade can start from a
+            // journal at version 6.
+            entry: reading_through(
+                entry(
+                    "transfers",
+                    StoreScope::Environment,
+                    "transfers/transfers.sqlite",
+                    sqlite_table("schema_version"),
+                    version(kr_transfer::store::SCHEMA_VERSION),
+                    version(kr_transfer::store::OLDEST_SCHEMA_VERSION),
+                ),
+                version(kr_controller::transfer::JOURNAL_VERSION_WITH_THE_COLUMN),
             ),
             owned: vec![Claim {
                 name: "transfers",
                 children: &["*"],
             }],
+            // `DraftDiscardResult`, which `actions.result` also keeps, is a known type of this store
+            // (`known`), to be declared here at the store's next raise.
             kept: vec![
                 protocol::<transfer::UploadBeginResult>("UploadBeginResult"),
                 protocol::<transfer::UploadChunkResult>("UploadChunkResult"),
@@ -1181,7 +1217,6 @@ pub fn table() -> Vec<Store> {
                 protocol::<transfer::UploadCancelResult>("UploadCancelResult"),
                 protocol::<transfer::DraftCreateResult>("DraftCreateResult"),
                 protocol::<transfer::DraftUpdateResult>("DraftUpdateResult"),
-                protocol::<transfer::DraftDiscardResult>("DraftDiscardResult"),
                 protocol::<transfer::AgentDraftAddAttachmentResult>(
                     "AgentDraftAddAttachmentResult",
                 ),

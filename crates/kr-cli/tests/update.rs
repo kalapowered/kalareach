@@ -5511,13 +5511,157 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
     );
 }
 
-/// KR-REQ-12.06: a rollback is refused, naming the transfer journal, when this build brought it
-/// forward from the version the release before wrote, the version that keeps the binding revision a
-/// draft was written under: a release that reads versions 1 to 5 would send a draft under another
-/// revision. Nothing is switched, and the journal and the draft in it are left as they were.
+/// A transfers journal as a build that kept each draft's binding revision in a column of the journal
+/// wrote it: at schema version 6, with a draft that names an application under revision 7, and with no
+/// store of binding revisions beside it.
+fn a_journal_at_version_six(
+    journal: &std::path::Path,
+    environment: kr_protocol::ids::EnvironmentId,
+) {
+    std::fs::create_dir_all(journal.parent().expect("a directory")).expect("transfers/");
+    drop(kr_transfer::store::Store::open(journal, environment).expect("makes the journal"));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(
+            journal.with_file_name(format!("{}{suffix}", kr_transfer::revisions::FILE_NAME)),
+        );
+    }
+    rusqlite::Connection::open(journal)
+        .expect("opens")
+        .execute_batch(&format!(
+            "ALTER TABLE drafts ADD COLUMN agent_binding_revision INTEGER;
+             UPDATE schema_version SET version = 6;
+             INSERT INTO drafts (draft_id, environment_id, actor_id, application_instance_id,
+                                 revision, state, text, created_at_ms, updated_at_ms,
+                                 agent_binding_revision)
+             VALUES (X'{}', X'{}', 'local:501', X'{}', 1, 'open', 'a draft', 1, 1, 7);",
+            "0B".repeat(16),
+            "0E".repeat(16),
+            "0A".repeat(16),
+        ))
+        .expect("writes the journal of the build before");
+}
+
+/// What a transfers journal reads as, by one query.
+fn journal_reads(journal: &std::path::Path, query: &str) -> String {
+    rusqlite::Connection::open(journal)
+        .expect("opens")
+        .query_row(query, [], |row| row.get::<_, String>(0))
+        .expect("reads")
+}
+
+/// The binding revision this build reads for the draft `a_journal_at_version_six` wrote, once a daemon
+/// of this build has opened the journal.
+fn revision_of_the_draft(
+    journal: &std::path::Path,
+    environment: kr_protocol::ids::EnvironmentId,
+) -> Option<u64> {
+    kr_transfer::store::Store::open(journal, environment)
+        .expect("opens as a daemon of this build does")
+        .draft(kr_protocol::ids::DraftId::new(
+            kr_protocol::scalars::Uuid::from_bytes([0x0B; 16]),
+        ))
+        .expect("reads the draft")
+        .expect("the draft is there")
+        .agent_binding_revision
+        .map(kr_protocol::ids::AgentBindingRevision::get)
+}
+
+/// KR-REQ-12.06, KR-REQ-26.10: an update reads a transfers journal at version 6 through, because the
+/// release lists the journal as read through that version; a daemon of the release then keeps the
+/// draft's binding revision in the store beside the journal and brings the journal to version 5. A
+/// release that does not read through it refuses the update, naming the journal. The daemon here is
+/// a stand-in program, so the open that a daemon of the release makes is the store's own.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rollback_is_refused_naming_a_transfer_journal_that_keeps_the_revision_of_its_drafts() {
+async fn an_update_reads_a_transfer_journal_at_version_six_through_and_the_daemon_brings_it_to_five()
+ {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
+    let refusing = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2).reading(reading_a_store_at(
+        "transfers",
+        1,
+        5,
+    ));
+    let two = Assembled::at_this_level("0.3.0+cccccccccccc", 3);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let idle = Idle::new(&host.store);
+    let journal = kr_transfer::staging::StagingArea::store_path(&idle.temp.environment());
+    a_journal_at_version_six(&journal, idle.temp.environment_id());
+    let version = || journal_reads(&journal, "SELECT CAST(version AS TEXT) FROM schema_version");
+
+    // A release that reads the journal at versions 1 to 5 only is refused, and nothing is changed.
+    let archive = host.scratch("archives").join("refusing.tar.gz");
+    refusing.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "transfers of environment {}",
+            idle.environment_id()
+        )) && message.contains("schema version 6")
+            && message.contains("reads versions 1 to 5"),
+        "{said}"
+    );
+    assert_eq!(version(), "6", "the journal was left as it was");
+
+    // This release reads it through.
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        version(),
+        "6",
+        "the update changes no journal of an environment no daemon served"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone())
+    );
+
+    // The daemon of the release opens the journal.
+    assert_eq!(
+        revision_of_the_draft(&journal, idle.temp.environment_id()),
+        Some(7)
+    );
+    assert_eq!(version(), "5");
+    assert_eq!(
+        journal_reads(&journal, "SELECT text FROM drafts"),
+        "a draft"
+    );
+}
+
+/// KR-REQ-12.06, KR-REQ-26.10: a rollback brings the transfers journal of an environment no daemon
+/// served back from version 6 to 5 before it checks the stores, keeping the draft's binding revision
+/// beside the journal, and says so; a release that reads version 6 through takes the journal as it is
+/// and the rollback says nothing of it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_brings_a_transfer_journal_at_version_six_back_before_it_checks_the_stores() {
     let mut host = Host::bare();
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
         "transfers",
@@ -5529,43 +5673,9 @@ async fn a_rollback_is_refused_naming_a_transfer_journal_that_keeps_the_revision
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
     let idle = Idle::new(&host.store);
-
-    // A journal as the release before wrote it: at version 5, with a draft that names an
-    // application and no column for the revision it was written under.
     let journal = kr_transfer::staging::StagingArea::store_path(&idle.temp.environment());
-    std::fs::create_dir_all(journal.parent().expect("a directory")).expect("transfers/");
-    rusqlite::Connection::open(&journal)
-        .expect("opens")
-        .execute_batch(&format!(
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version (version) VALUES (5);
-             CREATE TABLE ended_sessions (session_id BLOB PRIMARY KEY, ended_at_ms INTEGER NOT NULL);
-             CREATE TABLE drafts (
-                 draft_id BLOB PRIMARY KEY, environment_id BLOB NOT NULL, actor_id TEXT NOT NULL,
-                 device_id BLOB, session_id BLOB, application_instance_id BLOB,
-                 revision INTEGER NOT NULL, state TEXT NOT NULL, text TEXT NOT NULL,
-                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
-             INSERT INTO drafts (draft_id, environment_id, actor_id, application_instance_id,
-                                 revision, state, text, created_at_ms, updated_at_ms)
-             VALUES (X'{}', X'{}', 'local:501', X'{}', 1, 'open', 'an old draft', 1, 1);",
-            "0B".repeat(16),
-            "0E".repeat(16),
-            "0A".repeat(16),
-        ))
-        .expect("writes the journal of the release before");
-    drop(
-        kr_transfer::store::Store::open(&journal, idle.temp.environment_id())
-            .expect("this build brings the journal forward"),
-    );
-    let read = |query: &str| -> String {
-        rusqlite::Connection::open(&journal)
-            .expect("opens")
-            .query_row(query, [], |row| row.get::<_, String>(0))
-            .expect("reads")
-    };
-    let version = || read("SELECT CAST(version AS TEXT) FROM schema_version");
-    let draft = || read("SELECT text FROM drafts");
-    assert_eq!(version(), kr_transfer::store::SCHEMA_VERSION.to_string());
+    a_journal_at_version_six(&journal, idle.temp.environment_id());
+    let version = || journal_reads(&journal, "SELECT CAST(version AS TEXT) FROM schema_version");
 
     let archive = host.scratch("archives").join("two.tar.gz");
     two.archive(&archive);
@@ -5581,6 +5691,134 @@ async fn a_rollback_is_refused_naming_a_transfer_journal_that_keeps_the_revision
         "kr host update: {said} {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(version(), "6");
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        said["brought_back"],
+        serde_json::json!([{
+            "environment": idle.environment_id().to_string(),
+            "from": 6,
+            "to": 5,
+        }]),
+        "{said}"
+    );
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(one.name().clone()),
+        "the switch was made"
+    );
+    assert_eq!(version(), "5");
+    assert_eq!(
+        journal_reads(&journal, "SELECT text FROM drafts"),
+        "a draft"
+    );
+    assert_eq!(
+        revision_of_the_draft(&journal, idle.temp.environment_id()),
+        Some(7),
+        "the revision the draft was written under is kept beside the journal"
+    );
+}
+
+/// KR-REQ-12.06: a rollback to a release that reads the journal at version 6 as it is leaves it at
+/// version 6 and says nothing of bringing one back.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_to_a_release_that_reads_version_six_leaves_the_journal_as_it_is() {
+    let (host, one, _two, archive) = host_to_update().await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let idle = Idle::new(&host.store);
+    let journal = kr_transfer::staging::StagingArea::store_path(&idle.temp.environment());
+    a_journal_at_version_six(&journal, idle.temp.environment_id());
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["target"], one.name().as_str(), "{said}");
+    assert_eq!(said["brought_back"], serde_json::json!([]), "{said}");
+    assert_eq!(
+        journal_reads(&journal, "SELECT CAST(version AS TEXT) FROM schema_version"),
+        "6"
+    );
+}
+
+/// KR-REQ-12.06, KR-REQ-26.10: a rollback that another store refuses, after it brought a journal back,
+/// says what it brought back, and the journal stays at version 5, the version the release before
+/// reads.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_that_a_store_refuses_after_a_journal_was_brought_back_says_so() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(
+        release_stores()
+            .into_iter()
+            .map(|store| match store.store.as_str() {
+                "transfers" => ReleaseStore {
+                    migrates_from: 1,
+                    reads_through: None,
+                    version: 5,
+                    ..store
+                },
+                "configuration" => ReleaseStore {
+                    migrates_from: 1,
+                    reads_through: None,
+                    version: 2,
+                    ..store
+                },
+                _ => store,
+            })
+            .collect(),
+    );
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let idle = Idle::new(&host.store);
+    let journal = kr_transfer::staging::StagingArea::store_path(&idle.temp.environment());
+    a_journal_at_version_six(&journal, idle.temp.environment_id());
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The owner's choice, which this build writes at version 3: the release before reads 1 to 2.
+    let environment = host.tree.environment();
+    let writers = kr_cli::barrier::hold_for_configuration(&environment)
+        .expect("a test outside a store holds nothing");
+    let permit = kr_cli::barrier::permit(&writers, &kr_cli::doctor::configuration::WRITTEN)
+        .expect("permitted");
+    kr_cli::doctor::configuration::apply(
+        &environment,
+        &kr_protocol::hostinfo::configuration::Change::SleepInhibition(
+            kr_protocol::desktop::SleepInhibitionSetting::MainsOnly,
+        ),
+        &permit,
+    )
+    .expect("the owner's choice");
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
@@ -5591,13 +5829,12 @@ async fn a_rollback_is_refused_naming_a_transfer_journal_that_keeps_the_revision
     );
     let message = said["message"].as_str().unwrap_or_default().to_owned();
     assert!(
-        message.contains(&format!(
-            "transfers of environment {}",
-            idle.environment_id()
-        )) && message.contains(&format!(
-            "schema version {}",
-            kr_transfer::store::SCHEMA_VERSION
-        )) && message.contains("versions 1 to 5"),
+        message.contains("reads versions 1 to 2")
+            && message.contains(&format!(
+                "The rollback had already brought back the transfers journal of environment {} \
+                 from schema version 6 to 5; this release reads those journals as they are now",
+                idle.environment_id()
+            )),
         "{said}"
     );
     assert_eq!(
@@ -5606,12 +5843,62 @@ async fn a_rollback_is_refused_naming_a_transfer_journal_that_keeps_the_revision
         "nothing was switched"
     );
     assert_eq!(
-        host.daemon_build().await,
-        format!("kr-controller/{}", two.name()),
-        "the daemon the rollback stopped serves again, from the release still current"
+        journal_reads(&journal, "SELECT CAST(version AS TEXT) FROM schema_version"),
+        "5"
     );
-    assert_eq!(version(), kr_transfer::store::SCHEMA_VERSION.to_string());
-    assert_eq!(draft(), "an old draft", "the draft was left as it was");
+    assert_eq!(
+        revision_of_the_draft(&journal, idle.temp.environment_id()),
+        Some(7)
+    );
+}
+
+/// KR-REQ-12.06: a rollback to a release that lists no store of binding revisions says, in the lines
+/// and in the JSON, that the release records a prompt that names a draft under the revision in force
+/// at the prompt and that no draft was ended; a rollback to one that lists the store says nothing of
+/// it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_to_a_release_without_the_store_of_binding_revisions_states_the_limit() {
+    let without = || {
+        Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(
+            release_stores()
+                .into_iter()
+                .filter(|store| store.store != "draft-revisions")
+                .collect(),
+        )
+    };
+    let (host, one, _two, archive) =
+        host_to_update_between(without(), Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)).await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(output.status.success(), "kr host update: {said}");
+    let output = host.run(&host.store.stable(Program::Kr), &["host", "rollback"]);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(output.status.success(), "kr host rollback: {text}");
+    assert!(
+        text.contains(
+            "records a prompt that names a draft written for an application under the binding \
+             revision in force at the prompt, not the one the draft was written under; this \
+             rollback ended no draft"
+        ),
+        "{text}"
+    );
+    let _ = one;
+
+    // The control: the release before lists the store, and the rollback says nothing of the limit.
+    let (host, _one, _two, archive) = host_to_update().await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(output.status.success(), "kr host update: {said}");
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(output.status.success(), "kr host rollback: {said}");
+    assert_eq!(said["draft_limit"], false, "{said}");
+    // And the one that lacks it says so in the JSON too.
+    let (host, _one, _two, archive) =
+        host_to_update_between(without(), Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2)).await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(output.status.success(), "kr host update: {said}");
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert!(output.status.success(), "kr host rollback: {said}");
+    assert_eq!(said["draft_limit"], true, "{said}");
 }
 
 /// KR-REQ-26.10: a rollback is refused, naming the document, when the configuration document is at a
@@ -10523,18 +10810,25 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
     );
 }
 
-/// KR-REQ-26.10, KR-REQ-26.13: the release lists the registry at schema version 17 and the
-/// configuration document at version 4 as read through, and no other store. The release after this
-/// one writes them, so a rollback to this one is not refused for a store at those versions.
+/// KR-REQ-26.10, KR-REQ-26.13, KR-REQ-12.06: the release lists the registry at schema version 17, the
+/// configuration document at version 4 and the transfers journal at version 6 as read through, and no
+/// other store. The release after this one writes the registry and the document, so a rollback to
+/// this one is not refused for a store at those versions; the journal at version 6 is what a build
+/// before this one wrote, and a daemon of this release brings it to version 5.
 #[test]
-fn the_release_reads_through_the_registry_and_the_configuration_document_and_no_other_store() {
+fn the_release_reads_through_the_registry_the_configuration_document_and_the_transfers_journal_and_no_other_store()
+ {
     let through: Vec<(String, u32)> = stored_formats::table::table()
         .into_iter()
         .filter_map(|store| Some((store.entry.store.clone(), store.entry.reads_through?)))
         .collect();
     assert_eq!(
         through,
-        vec![("configuration".to_owned(), 4), ("registry".to_owned(), 17)]
+        vec![
+            ("configuration".to_owned(), 4),
+            ("registry".to_owned(), 17),
+            ("transfers".to_owned(), 6),
+        ]
     );
 }
 

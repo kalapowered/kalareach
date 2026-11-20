@@ -791,10 +791,13 @@ pub struct ReleaseStore {
     /// The oldest version of the store this release brings forward when it opens it.
     pub migrates_from: u32,
     /// The newest version above `version` that this release reads without writing it: it opens a
-    /// store at any version up to this one as it finds it and migrates nothing. A release reads no
-    /// store above the version it writes unless it says so here, and says so only for the next
-    /// version of a store that a change already defines, so that the release after it, which
-    /// writes that version, can be rolled back to this one. Absent for a store that has none.
+    /// store at any version up to this one as it finds it and migrates nothing, with one
+    /// exception below. A release reads no store above the version it writes unless it says so
+    /// here, and says so only for the next version of a store that a change already defines, so
+    /// that the release after it, which writes that version, can be rolled back to this one. The
+    /// exception is the transfers journal: it is read through the version a build before this
+    /// release wrote, which a daemon of this release brings down to the version it writes when it
+    /// starts, so that a host at that version can be updated. Absent for a store that has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads_through: Option<u32>,
 }
