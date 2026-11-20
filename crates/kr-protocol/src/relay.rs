@@ -681,6 +681,12 @@ impl RelayConsumptionReceipt {
         )))
     }
 
+    /// Returns true when this receipt could be the first one of its reservation.
+    #[must_use]
+    pub fn is_first(&self) -> bool {
+        self.sequence.get() == FIRST_RECEIPT_SEQUENCE
+    }
+
     /// Returns true when this receipt is the one that follows `previous`.
     ///
     /// The next receipt of a reservation comes from the same instance, sits one position later,
@@ -1414,6 +1420,7 @@ mod tests {
         let shrunk = receipt(2, 512);
         let skipped = receipt(3, 4096);
 
+        assert!(first.is_first());
         assert!(second.follows(&first));
         assert!(flat.follows(&first));
         assert!(!shrunk.follows(&first));
@@ -1427,6 +1434,7 @@ mod tests {
         let wrapped = receipt(0, 8192);
 
         assert!(!wrapped.follows(&last));
+        assert!(!last.is_first());
     }
 
     #[test]
