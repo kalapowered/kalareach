@@ -1412,18 +1412,18 @@ fn mentions_a_sighting(text: &str) -> bool {
         || WIRE_NAMES.iter().any(|name| text.contains(name))
 }
 
-/// Whether the text may declare a module file: a `#[path]` attribute, or a module with no body.
+/// Whether the text may declare a module file: a module with no body. A `#[path]` is read on such
+/// a module, so a file that none holds is not read for declarations.
 fn may_declare_modules(text: &str) -> bool {
     let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-    compact.contains("path=\"")
-        || compact.match_indices("mod").any(|(at, _)| {
-            let rest = &compact[at + 3..];
-            let name: String = rest
-                .chars()
-                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
-                .collect();
-            !name.is_empty() && rest[name.len()..].starts_with(';')
-        })
+    compact.match_indices("mod").any(|(at, _)| {
+        let rest = &compact[at + 3..];
+        let name: String = rest
+            .chars()
+            .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+            .collect();
+        !name.is_empty() && rest[name.len()..].starts_with(';')
+    })
 }
 
 /// The files of a crate that only a `#[cfg(test)]` module declaration reaches, as rustc finds
