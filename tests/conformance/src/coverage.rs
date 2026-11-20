@@ -8,38 +8,45 @@
 //!
 //! The words are read against `cargo test --help` of Cargo 1.97: a flag that is not one of its own is
 //! refused, so a flag that could change what Cargo selects is never passed over unread. A feature
-//! flag and `--target` change which targets build; a target whose `required-features` they leave
-//! off is covered here and shown by the listing as not built.
+//! flag and `--target` change which targets build; a target that Cargo leaves out for one of them is
+//! covered here and reads as not run, because no listing returned it.
 
 use std::collections::BTreeSet;
 
 use crate::workspace::{Package, Target, TargetId, TargetKind};
 
-/// A package spec of `-p` or `--exclude`: a package's name, or a pattern of `*`, `?` and `[...]`
-/// that matches names.
+/// A name, or a pattern of `*`, `?` and `[...]` that matches names, as Cargo reads one in `-p`,
+/// `--exclude`, `--bin`, `--example`, `--test` and `--bench`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Spec(String);
+struct Pattern(String);
 
-impl Spec {
+impl Pattern {
     fn new(text: &str) -> Result<Self, String> {
-        if text.contains(['@', ':', '/', '\\', '#']) {
-            return Err(format!(
-                "names the package `{text}`: give a package by its name, or by a pattern of `*`, `?` and \
-                 `[...]` that matches names"
-            ));
-        }
         let pattern: Vec<char> = text.chars().collect();
         let mut at = 0;
         while at < pattern.len() {
-            if pattern[at] == '[' {
-                match class_end(&pattern, at) {
+            match pattern[at] {
+                '[' => match class_end(&pattern, at) {
                     Some(end) => at = end,
                     None => {
                         return Err(format!(
                             "names the pattern `{text}`, which has a `[` that no `]` closes"
                         ));
                     }
+                },
+                '*' => {
+                    // Cargo reads `**` as a pattern only where it is a whole path component, and a
+                    // name has one component.
+                    let run = pattern[at..].iter().take_while(|one| **one == '*').count();
+                    if run > 2 || (run == 2 && pattern.len() != 2) {
+                        return Err(format!(
+                            "names the pattern `{text}`, which Cargo refuses: a run of `*` is one \
+                             `*`, or the whole pattern `**`"
+                        ));
+                    }
+                    at += run - 1;
                 }
+                _ => {}
             }
             at += 1;
         }
@@ -51,6 +58,17 @@ impl Spec {
         let name: Vec<char> = name.chars().collect();
         glob(&pattern, &name)
     }
+}
+
+/// A package spec of `-p` or `--exclude`: a package's name, or a pattern that matches names.
+fn package_spec(text: &str) -> Result<Pattern, String> {
+    if text.contains(['@', ':', '/', '\\', '#']) {
+        return Err(format!(
+            "names the package `{text}`: give a package by its name, or by a pattern of `*`, `?` and \
+             `[...]` that matches names"
+        ));
+    }
+    Pattern::new(text)
 }
 
 /// The index of the `]` that closes the class that opens at `open`, if one does.
@@ -103,17 +121,16 @@ fn glob(pattern: &[char], name: &[char]) -> bool {
     }
 }
 
-/// Whether a flag takes a value, and in which spellings.
+/// Whether a flag takes a value.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Takes {
     No,
     Value,
-    /// Only in the form `--flag=value`.
-    Optional,
 }
 
 /// Every flag of `cargo test`, with each of its spellings; the first is the one the words below name.
 const FLAGS: &[(&[&str], Takes)] = &[
+    (&["--help", "-h"], Takes::No),
     (&["--no-run"], Takes::No),
     (&["--no-fail-fast"], Takes::No),
     (&["--future-incompat-report"], Takes::No),
@@ -146,7 +163,7 @@ const FLAGS: &[(&[&str], Takes)] = &[
     (&["--target"], Takes::Value),
     (&["--target-dir"], Takes::Value),
     (&["--unit-graph"], Takes::No),
-    (&["--timings"], Takes::Optional),
+    (&["--timings"], Takes::No),
     (&["--manifest-path", "-m"], Takes::Value),
     (&["--ignore-rust-version"], Takes::No),
     (&["--locked"], Takes::No),
@@ -154,26 +171,51 @@ const FLAGS: &[(&[&str], Takes)] = &[
     (&["--frozen"], Takes::No),
 ];
 
-/// The flag a word spells and the value the word holds for it, as `--flag=value`, `-Fvalue` or
-/// `-F=value`.
-fn lookup(word: &str) -> Option<(&'static [&'static str], Takes, Option<String>)> {
-    let (spelling, held) = if word.starts_with("--") {
-        match word.split_once('=') {
-            Some((name, value)) => (name, Some(value)),
-            None => (word, None),
-        }
-    } else {
-        let split = word.char_indices().nth(2).map_or(word.len(), |(at, _)| at);
-        let (name, rest) = word.split_at(split);
-        (
-            name,
-            Some(rest.strip_prefix('=').unwrap_or(rest)).filter(|rest| !rest.is_empty()),
-        )
-    };
+/// The flag that `spelling`, as `--flag` or `-f`, names.
+fn flag(spelling: &str) -> Option<(&'static [&'static str], Takes)> {
     FLAGS
         .iter()
         .find(|(spellings, _)| spellings.contains(&spelling))
-        .map(|(spellings, takes)| (*spellings, *takes, held.map(str::to_owned)))
+        .map(|(spellings, takes)| (*spellings, *takes))
+}
+
+fn not_a_flag(word: &str) -> String {
+    format!(
+        "gives `{word}`, which is not a flag of `cargo test`: the report reads only the flags it knows"
+    )
+}
+
+fn without_value(flag: &str) -> String {
+    format!("gives `{flag}` without a value")
+}
+
+/// A flag that selects nothing the report can read: `written` is how the command spells it.
+fn refused(flag: &str, written: &str) -> Result<(), String> {
+    match flag {
+        "--help" => Err(format!("gives `{written}`, which prints help and builds nothing")),
+        "--doc" => Err(
+            "gives `--doc`: the report reads no doc test, and the run adds `--no-run`, which Cargo \
+             refuses with `--doc`"
+                .to_owned(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The value of `flag` in the word at `at`, which no `-` begins: `--jobs` also takes a negative number.
+fn next_value(words: &[&str], at: &mut usize, flag: &str) -> Result<String, String> {
+    match words.get(*at) {
+        Some(next)
+            if !next.starts_with('-')
+                || (flag == "--jobs"
+                    && next.len() > 1
+                    && next[1..].bytes().all(|byte| byte.is_ascii_digit())) =>
+        {
+            *at += 1;
+            Ok((*next).to_owned())
+        }
+        _ => Err(without_value(flag)),
+    }
 }
 
 /// What a command's package flags select.
@@ -182,9 +224,9 @@ enum Packages {
     /// No package flag: the workspace's default members.
     Default,
     /// `-p`, once or more.
-    Named(Vec<Spec>),
+    Named(Vec<Pattern>),
     /// `--workspace`, less each `--exclude`.
-    Workspace(Vec<Spec>),
+    Workspace(Vec<Pattern>),
 }
 
 /// The targets of one kind that a command asks for.
@@ -194,8 +236,8 @@ enum Rule {
     Off,
     /// The plural flag: every one.
     All,
-    /// The singular flag, once or more: those by name.
-    Named(Vec<String>),
+    /// The singular flag, once or more: those whose name matches.
+    Named(Vec<Pattern>),
 }
 
 impl Rule {
@@ -203,20 +245,23 @@ impl Rule {
         *self != Self::Off
     }
 
-    fn holds(&self, name: &str) -> bool {
-        match self {
-            Self::Off => false,
-            Self::All => true,
-            Self::Named(names) => names.iter().any(|held| held == name),
-        }
+    /// Whether a singular flag names the target.
+    fn names(&self, name: &str) -> bool {
+        matches!(self, Self::Named(patterns) if patterns.iter().any(|pattern| pattern.matches(name)))
     }
 
-    fn name(&mut self, name: String) {
+    fn holds(&self, name: &str) -> bool {
+        *self == Self::All || self.names(name)
+    }
+
+    fn name(&mut self, text: &str) -> Result<(), String> {
+        let pattern = Pattern::new(text)?;
         match self {
             Self::All => {}
-            Self::Named(names) => names.push(name),
-            Self::Off => *self = Self::Named(vec![name]),
+            Self::Named(patterns) => patterns.push(pattern),
+            Self::Off => *self = Self::Named(vec![pattern]),
         }
+        Ok(())
     }
 }
 
@@ -230,85 +275,21 @@ pub struct Selection {
     tests: Rule,
     benches: Rule,
     all_targets: bool,
-    doc: bool,
     carried: Vec<String>,
 }
 
-/// Reads what the command `cargo test ...` selects.
-///
-/// # Errors
-///
-/// Returns why the command is refused, in words that follow the step's name: a flag that is not one
-/// of `cargo test`'s own, a flag without its value, `--manifest-path`, `-Z`, `--exclude` without
-/// `--workspace`, `--doc` beside another flag that selects targets, or a package spec that is
-/// neither a name nor a pattern.
-pub fn parse(command: &[String]) -> Result<Selection, String> {
-    if command.first().map(String::as_str) != Some("cargo")
-        || command.get(1).map(String::as_str) != Some("test")
-    {
-        return Err(
-            "reads the output of `cargo test` and its command is not `cargo test`".to_owned(),
-        );
-    }
-    let words: Vec<&str> = command[2..]
-        .iter()
-        .map(String::as_str)
-        .take_while(|word| *word != "--")
-        .collect();
-    let mut selection = Selection {
-        packages: Packages::Default,
-        lib: false,
-        bins: Rule::Off,
-        examples: Rule::Off,
-        tests: Rule::Off,
-        benches: Rule::Off,
-        all_targets: false,
-        doc: false,
-        carried: Vec::new(),
-    };
-    let mut named: Vec<Spec> = Vec::new();
-    let mut excluded: Vec<Spec> = Vec::new();
-    let mut workspace = false;
-    let mut at = 0;
-    while at < words.len() {
-        let word = words[at];
-        at += 1;
-        // A word that is no flag is the name that filters the tests.
-        if !word.starts_with('-') {
-            continue;
-        }
-        // Boolean short flags may be written together: `-qr`, `-vv`.
-        if !word.starts_with("--") && word.len() > 1 && word[1..].chars().all(|c| "rqv".contains(c))
-        {
-            if word.contains('r') {
-                selection.carried.push("--release".to_owned());
-            }
-            continue;
-        }
-        let Some((spellings, takes, held)) = lookup(word) else {
-            return Err(format!(
-                "gives `{word}`, which is not a flag of `cargo test`: the report reads only the flags \
-                 it knows"
-            ));
-        };
-        let flag = spellings[0];
-        let value = match (takes, held) {
-            (Takes::No, None) => None,
-            (Takes::No, Some(_)) => {
-                return Err(format!("gives `{word}`, but `{flag}` takes no value"));
-            }
-            (Takes::Optional, value) => value,
-            (Takes::Value, Some(value)) if !value.is_empty() => Some(value),
-            (Takes::Value, Some(_)) => return Err(format!("gives `{flag}` without a value")),
-            (Takes::Value, None) => match words.get(at) {
-                Some(next) if !next.starts_with('-') => {
-                    at += 1;
-                    Some((*next).to_owned())
-                }
-                _ => return Err(format!("gives `{flag}` without a value")),
-            },
-        };
-        let value = value.unwrap_or_default();
+/// The words read so far.
+struct Parsed {
+    selection: Selection,
+    named: Vec<Pattern>,
+    excluded: Vec<Pattern>,
+    workspace: bool,
+}
+
+impl Parsed {
+    /// Takes `flag`, the first of its spellings, with its value: empty for a flag that takes none.
+    fn give(&mut self, flag: &str, value: String) -> Result<(), String> {
+        let selection = &mut self.selection;
         match flag {
             "--manifest-path" => {
                 return Err(
@@ -324,20 +305,19 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
                         .to_owned(),
                 );
             }
-            "--package" => named.push(Spec::new(&value)?),
-            "--exclude" => excluded.push(Spec::new(&value)?),
-            "--workspace" => workspace = true,
+            "--package" => self.named.push(package_spec(&value)?),
+            "--exclude" => self.excluded.push(package_spec(&value)?),
+            "--workspace" => self.workspace = true,
             "--lib" => selection.lib = true,
             "--bins" => selection.bins = Rule::All,
-            "--bin" => selection.bins.name(value),
+            "--bin" => selection.bins.name(&value)?,
             "--examples" => selection.examples = Rule::All,
-            "--example" => selection.examples.name(value),
+            "--example" => selection.examples.name(&value)?,
             "--tests" => selection.tests = Rule::All,
-            "--test" => selection.tests.name(value),
+            "--test" => selection.tests.name(&value)?,
             "--benches" => selection.benches = Rule::All,
-            "--bench" => selection.benches.name(value),
+            "--bench" => selection.benches.name(&value)?,
             "--all-targets" => selection.all_targets = true,
-            "--doc" => selection.doc = true,
             "--release" | "--all-features" | "--no-default-features" => {
                 selection.carried.push(flag.to_owned());
             }
@@ -347,28 +327,118 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
             }
             _ => {}
         }
+        Ok(())
     }
-    if !excluded.is_empty() && !workspace {
-        return Err("gives `--exclude` without `--workspace`, which Cargo refuses".to_owned());
-    }
-    if selection.doc
-        && (selection.lib
-            || selection.all_targets
-            || selection.bins.asked()
-            || selection.examples.asked()
-            || selection.tests.asked()
-            || selection.benches.asked())
+}
+
+/// Reads what the command `cargo test ...` selects.
+///
+/// # Errors
+///
+/// Returns why the command is refused, in words that follow the step's name: a flag that is not one
+/// of `cargo test`'s own, a flag without its value, `--manifest-path`, `-Z`, `--doc`, `-h` or
+/// `--help`, `--exclude` without `--workspace`, or a package spec or a target pattern that is not a
+/// name or a pattern that Cargo reads.
+pub fn parse(command: &[String]) -> Result<Selection, String> {
+    if command.first().map(String::as_str) != Some("cargo")
+        || command.get(1).map(String::as_str) != Some("test")
     {
         return Err(
-            "gives `--doc` with another flag that selects targets, which Cargo refuses".to_owned(),
+            "reads the output of `cargo test` and its command is not `cargo test`".to_owned(),
         );
     }
-    selection.packages = if workspace {
-        Packages::Workspace(excluded)
-    } else if named.is_empty() {
+    let words: Vec<&str> = command[2..]
+        .iter()
+        .map(String::as_str)
+        .take_while(|word| *word != "--")
+        .collect();
+    let mut read = Parsed {
+        selection: Selection {
+            packages: Packages::Default,
+            lib: false,
+            bins: Rule::Off,
+            examples: Rule::Off,
+            tests: Rule::Off,
+            benches: Rule::Off,
+            all_targets: false,
+            carried: Vec::new(),
+        },
+        named: Vec::new(),
+        excluded: Vec::new(),
+        workspace: false,
+    };
+    let mut test_name = false;
+    let mut at = 0;
+    while at < words.len() {
+        let word = words[at];
+        at += 1;
+        if !word.starts_with('-') || word == "-" {
+            // A word that is no flag is the name that filters the tests.
+            test_name = true;
+        } else if let Some(long) = word.strip_prefix("--") {
+            let (name, held) = match long.split_once('=') {
+                Some((name, held)) => (name, Some(held)),
+                None => (long, None),
+            };
+            let spelling = format!("--{name}");
+            let Some((spellings, takes)) = flag(&spelling) else {
+                return Err(not_a_flag(word));
+            };
+            let flag = spellings[0];
+            refused(flag, &spelling)?;
+            let value = match (takes, held) {
+                (Takes::No, None) => String::new(),
+                (Takes::No, Some(_)) => {
+                    return Err(format!("gives `{word}`, but `{flag}` takes no value"));
+                }
+                (Takes::Value, Some("")) => return Err(without_value(flag)),
+                (Takes::Value, Some(held)) => held.to_owned(),
+                (Takes::Value, None) => next_value(&words, &mut at, flag)?,
+            };
+            read.give(flag, value)?;
+        } else {
+            // Short flags may be written together, as `-qp a`: each takes the next letter, until one
+            // takes a value, which is the rest of the word or, with none, the next word.
+            let mut rest = &word[1..];
+            while let Some(letter) = rest.chars().next() {
+                let spelling = format!("-{letter}");
+                let Some((spellings, takes)) = flag(&spelling) else {
+                    return Err(not_a_flag(&spelling));
+                };
+                let flag = spellings[0];
+                refused(flag, &spelling)?;
+                rest = &rest[letter.len_utf8()..];
+                if takes == Takes::No {
+                    read.give(flag, String::new())?;
+                    continue;
+                }
+                let held = rest.strip_prefix('=').unwrap_or(rest);
+                let value = if held.is_empty() {
+                    next_value(&words, &mut at, flag)?
+                } else {
+                    held.to_owned()
+                };
+                read.give(flag, value)?;
+                break;
+            }
+        }
+    }
+    if !read.excluded.is_empty() && !read.workspace {
+        return Err("gives `--exclude` without `--workspace`, which Cargo refuses".to_owned());
+    }
+    let mut selection = read.selection;
+    // A test name and no flag that names targets: Cargo builds the library, whatever its `test` key
+    // says, and each target that is tested.
+    if test_name && !selection.asks_for_targets() {
+        selection.lib = true;
+        selection.tests = Rule::All;
+    }
+    selection.packages = if read.workspace {
+        Packages::Workspace(read.excluded)
+    } else if read.named.is_empty() {
         Packages::Default
     } else {
-        Packages::Named(named)
+        Packages::Named(read.named)
     };
     Ok(selection)
 }
@@ -415,13 +485,9 @@ impl Selection {
     /// Whether Cargo builds the target to test it. With no flag that names targets, it builds each
     /// target that its manifest says is tested. With one, a plural flag takes every target of its
     /// kind, and `--tests` and `--benches` take every target of any kind that is tested or
-    /// benchmarked, a library and the binaries among them; a singular flag takes the target it
-    /// names, and any of them builds the target to test it whatever its manifest says.
+    /// benchmarked, a library and the binaries among them; a singular flag takes the targets whose
+    /// name it matches, and any of them builds the target to test it whatever its manifest says.
     fn selects_target(&self, target: &Target) -> bool {
-        if self.doc {
-            // A doc test is no target: its tests are built and run by `rustdoc`.
-            return false;
-        }
         if !self.asks_for_targets() {
             return target.tested_by_default;
         }
@@ -438,10 +504,8 @@ impl Selection {
             TargetKind::Lib => self.lib || all,
             TargetKind::Bin => all || self.bins.holds(name),
             TargetKind::Example => all || self.examples.holds(name),
-            TargetKind::Test => matches!(&self.tests, Rule::Named(names) if names.contains(name)),
-            TargetKind::Bench => {
-                matches!(&self.benches, Rule::Named(names) if names.contains(name))
-            }
+            TargetKind::Test => self.tests.names(name),
+            TargetKind::Bench => self.benches.names(name),
         };
         by_kind
             || ((all || self.tests == Rule::All) && target.tested_by_default)
@@ -528,6 +592,8 @@ mod tests {
             ("a*", "ba", false),
             ("*b", "ab", true),
             ("*", "anything", true),
+            ("**", "anything", true),
+            ("a?c", "abc", true),
             ("a?", "ab", true),
             ("a?", "a", false),
             ("a?", "abc", false),
@@ -544,7 +610,7 @@ mod tests {
         ];
         let mut wrong = Vec::new();
         for (pattern, name, expected) in rows {
-            let spec = Spec::new(pattern).expect("a pattern");
+            let spec = Pattern::new(pattern).expect("a pattern");
             if spec.matches(name) != *expected {
                 wrong.push(format!("`{pattern}` against `{name}` is not {expected}"));
             }
@@ -566,6 +632,34 @@ mod tests {
         }
         assert_eq!(covered("cargo test --bin=x"), ["a --bin x"]);
         assert_eq!(covered("cargo test --test t"), ["a --test t"]);
+    }
+
+    #[test]
+    fn short_flags_written_together_take_the_value_of_the_one_that_takes_one() {
+        let one = covered("cargo test -p b");
+        for spelling in [
+            "cargo test -qp b",
+            "cargo test -rp b",
+            "cargo test -vvp b",
+            "cargo test -qpb",
+            "cargo test -qp=b",
+            "cargo test -rqpb",
+        ] {
+            assert_eq!(covered(spelling), one, "{spelling}");
+        }
+        let plain = covered("cargo test");
+        for spelling in [
+            "cargo test -j 4",
+            "cargo test -j4",
+            "cargo test -j=4",
+            "cargo test -j -1",
+            "cargo test -j=-1",
+            "cargo test --jobs -1",
+            "cargo test --jobs=-1",
+            "cargo test --jobs -1 -qr",
+        ] {
+            assert_eq!(covered(spelling), plain, "{spelling}");
+        }
     }
 
     #[test]
@@ -636,9 +730,20 @@ mod tests {
                     "a --bench m",
                 ],
             ),
-            ("cargo test --doc", &[]),
             ("cargo test -p nowhere", &[]),
             ("cargo test --bin nowhere", &[]),
+            ("cargo test --bin [xz]", &["a --bin x", "a --bin z"]),
+            ("cargo test --bin ?", &["a --bin x", "a --bin z"]),
+            ("cargo test --bin x*", &["a --bin x"]),
+            ("cargo test --bin x --bin z*", &["a --bin x", "a --bin z"]),
+            ("cargo test --test t*", &["a --test t"]),
+            ("cargo test --test ?", &["a --test t"]),
+            ("cargo test --test [!t]", &[]),
+            ("cargo test --example *", &["a --example e"]),
+            ("cargo test --bench m*", &["a --bench m"]),
+            ("cargo test --bench **", &["a --bench m"]),
+            ("cargo test smoke", &["a --lib", "a --bin x", "a --test t"]),
+            ("cargo test smoke --bin x", &["a --bin x"]),
         ];
         let mut wrong = Vec::new();
         for (line, expected) in rows {
@@ -675,6 +780,44 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         assert_eq!(found, ["a --lib", "a --bench timed", "a --example checked"]);
+    }
+
+    #[test]
+    fn a_test_name_with_no_flag_that_names_targets_builds_the_library_whatever_its_test_key_says() {
+        use TargetKind::{Bin, Lib, Test};
+        let packages = [package(
+            "a",
+            vec![
+                target("a", Lib, "a", false),
+                target("a", Bin, "x", true),
+                target("a", Test, "t", true),
+                target("a", Test, "off", false),
+            ],
+            &["a"],
+        )];
+        let members: Vec<&Package> = packages.iter().collect();
+        let found = |line: &str| -> Vec<String> {
+            parse(&words(line))
+                .expect("a command")
+                .covers(&members)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert_eq!(found("cargo test"), ["a --bin x", "a --test t"]);
+        assert_eq!(
+            found("cargo test smoke"),
+            ["a --lib", "a --bin x", "a --test t"]
+        );
+        assert_eq!(
+            found("cargo test -q smoke -- --nocapture"),
+            found("cargo test smoke")
+        );
+        assert_eq!(
+            found("cargo test --tests smoke"),
+            ["a --bin x", "a --test t"]
+        );
+        assert_eq!(found("cargo test smoke --lib"), ["a --lib"]);
     }
 
     #[test]
@@ -758,16 +901,55 @@ mod tests {
                 "names the pattern `a[b`, which has a `[` that no `]` closes",
             ),
             (
-                "cargo test --doc --lib",
-                "gives `--doc` with another flag that selects targets, which Cargo refuses",
+                "cargo test --doc",
+                "gives `--doc`: the report reads no doc test, and the run adds `--no-run`, which Cargo refuses with `--doc`",
             ),
             (
-                "cargo test --doc --all-targets",
-                "gives `--doc` with another flag",
+                "cargo test --lib --doc",
+                "gives `--doc`: the report reads no doc test",
             ),
             (
-                "cargo test --bin x --doc",
-                "gives `--doc` with another flag",
+                "cargo test -h",
+                "gives `-h`, which prints help and builds nothing",
+            ),
+            (
+                "cargo test --help",
+                "gives `--help`, which prints help and builds nothing",
+            ),
+            (
+                "cargo test -qh",
+                "gives `-h`, which prints help and builds nothing",
+            ),
+            (
+                "cargo test --timings=html",
+                "gives `--timings=html`, but `--timings` takes no value",
+            ),
+            ("cargo test -qp", "gives `--package` without a value"),
+            ("cargo test -j", "gives `--jobs` without a value"),
+            ("cargo test -j -x", "gives `--jobs` without a value"),
+            (
+                "cargo test -qx",
+                "gives `-x`, which is not a flag of `cargo test`",
+            ),
+            (
+                "cargo test -p a**",
+                "names the pattern `a**`, which Cargo refuses: a run of `*` is one `*`, or the whole pattern `**`",
+            ),
+            (
+                "cargo test --workspace --exclude **a",
+                "names the pattern `**a`, which Cargo refuses",
+            ),
+            (
+                "cargo test --test ***",
+                "names the pattern `***`, which Cargo refuses",
+            ),
+            (
+                "cargo test --bin a*b**",
+                "names the pattern `a*b**`, which Cargo refuses",
+            ),
+            (
+                "cargo test --example x[y",
+                "names the pattern `x[y`, which has a `[` that no `]` closes",
             ),
         ];
         let mut wrong = Vec::new();

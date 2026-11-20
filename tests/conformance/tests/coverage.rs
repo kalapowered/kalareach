@@ -71,9 +71,32 @@ fn small(root: &Path, directory: &str, name: &str, binary: bool, test: bool) {
     }
 }
 
-/// The three workspaces: a virtual one with `default-members`, a virtual one without, and one whose
-/// root is a package with two members.
-fn fixtures(root: &Path) -> Vec<&'static str> {
+/// The package `n`: its library is never tested, and it has the binary `x`, the integration tests
+/// `t1`, `t2` and `off` (`off` is never tested), the example `e` and the bench `m` that has no harness.
+fn names(root: &Path, directory: &str) {
+    write(
+        root,
+        &format!("{directory}/Cargo.toml"),
+        &manifest(
+            "n",
+            "\n[lib]\ntest = false\n\n\
+             [[test]]\nname = \"off\"\npath = \"tests/off.rs\"\ntest = false\n\n\
+             [[bench]]\nname = \"m\"\npath = \"benches/m.rs\"\nharness = false\n",
+        ),
+    );
+    write(root, &format!("{directory}/src/lib.rs"), LIB);
+    write(root, &format!("{directory}/src/bin/x.rs"), MAIN);
+    for test in ["t1", "t2", "off"] {
+        write(root, &format!("{directory}/tests/{test}.rs"), TEST);
+    }
+    write(root, &format!("{directory}/examples/e.rs"), MAIN);
+    write(root, &format!("{directory}/benches/m.rs"), MAIN);
+}
+
+/// The workspaces with the commands each is asked about: a virtual one with `default-members`, a
+/// virtual one without, one whose root is a package with two members, and one whose only package has
+/// a library that is never tested.
+fn fixtures(root: &Path) -> Vec<(&'static str, Vec<Vec<&'static str>>)> {
     for (name, defaults) in [
         (
             "virtual-with-defaults",
@@ -100,10 +123,17 @@ fn fixtures(root: &Path) -> Vec<&'static str> {
     write(root, "package-root/tests/t.rs", TEST);
     rich(root, "package-root/a", "a");
     small(root, "package-root/ab", "ab", false, true);
+    write(
+        root,
+        "names/Cargo.toml",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"n\"]\n",
+    );
+    names(root, "names/n");
     vec![
-        "virtual-with-defaults",
-        "virtual-without-defaults",
-        "package-root",
+        ("virtual-with-defaults", table()),
+        ("virtual-without-defaults", table()),
+        ("package-root", table()),
+        ("names", names_table()),
     ]
 }
 
@@ -153,6 +183,55 @@ fn table() -> Vec<Vec<&'static str>> {
         "-p a --benches",
         "-p a --bins --test u",
         "-p a --lib --example e --bench m",
+        "-qp a",
+        "-rp a",
+        "-qpa -r",
+        "-p ab -j -1",
+        "--jobs=-1 -p a",
+        "-p a --test t*",
+        "-p a --test [tu]",
+        "-p a --test ?",
+        "-p a --bin [xy]",
+        "-p a --bin ?",
+        "-p a --example ?",
+        "-p a --example [!e]",
+        "-p a --bench *",
+        "-p a --bench **",
+        "-p a --bin x --bin [yz]",
+        "somename",
+        "-p a somename",
+    ]
+    .iter()
+    .map(|line| line.split(' ').filter(|word| !word.is_empty()).collect())
+    .collect()
+}
+
+/// The commands of the table for the workspace `names`.
+fn names_table() -> Vec<Vec<&'static str>> {
+    [
+        "",
+        "-p n",
+        "somename",
+        "-p n somename",
+        "-qp n somename",
+        "--lib",
+        "--lib somename",
+        "--tests",
+        "--tests somename",
+        "--bins somename",
+        "--test t*",
+        "--test t?",
+        "--test t[12]",
+        "--test off",
+        "--test [!t]*",
+        "--bin ?",
+        "--bin [x]",
+        "--example e*",
+        "--bench *",
+        "--bench m",
+        "--benches",
+        "--all-targets",
+        "--all-targets somename",
     ]
     .iter()
     .map(|line| line.split(' ').filter(|word| !word.is_empty()).collect())
@@ -232,7 +311,8 @@ fn the_targets_a_command_covers_are_the_targets_cargo_builds_for_it() {
     let root = directory.path();
     let mut wrong = Vec::new();
     let mut commands = 0;
-    for name in fixtures(root) {
+    let mut asked = 0;
+    for (name, rows) in fixtures(root) {
         let workspace = root.join(name);
         let target = root.join(format!("target-{name}"));
         let lock = cargo(&workspace, &target, &["generate-lockfile", "--offline"]);
@@ -244,7 +324,8 @@ fn the_targets_a_command_covers_are_the_targets_cargo_builds_for_it() {
         let read = workspace::read(root, &[format!("{name}/Cargo.toml")]);
         assert!(read.problems.is_empty(), "{name}: {:?}", read.problems);
         let members: Vec<&kr_conformance::workspace::Package> = read.packages.iter().collect();
-        for words in table() {
+        asked += rows.len();
+        for words in rows {
             let built = built(&workspace, &target, &read.packages, &words);
             let mut command = vec!["cargo".to_owned(), "test".to_owned()];
             command.extend(words.iter().map(|word| (*word).to_owned()));
@@ -273,7 +354,8 @@ fn the_targets_a_command_covers_are_the_targets_cargo_builds_for_it() {
             }
         }
     }
-    assert_eq!(commands, 3 * table().len());
+    assert_eq!(commands, asked);
+    assert!(asked > 80, "{asked} commands");
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
@@ -286,7 +368,7 @@ fn the_workspaces_of_the_table_select_different_targets_for_one_command() {
     let directory = tempfile::tempdir().expect("a directory");
     let root = directory.path();
     let mut plain = Vec::new();
-    for name in fixtures(root) {
+    for (name, _) in fixtures(root).into_iter().take(3) {
         let workspace = root.join(name);
         let target = root.join(format!("target-{name}"));
         let lock = cargo(&workspace, &target, &["generate-lockfile", "--offline"]);
@@ -314,4 +396,70 @@ fn the_workspaces_of_the_table_select_different_targets_for_one_command() {
     assert_eq!(plain[0], names(&["a", "ab"]), "default-members");
     assert_eq!(plain[1], names(&["a", "ab", "b"]), "every member");
     assert_eq!(plain[2], names(&["r"]), "the root package");
+}
+
+/// A flag or a pattern the loader refuses is one Cargo refuses too, with `--no-run` as the run adds it,
+/// and `-h` and `--help` are the two flags Cargo answers with its help text and no build.
+#[test]
+fn a_command_the_loader_refuses_for_its_flags_is_one_cargo_refuses_or_answers_with_help() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = directory.path();
+    fixtures(root);
+    let workspace = root.join("virtual-with-defaults");
+    let target = root.join("target-refused");
+    let lock = cargo(&workspace, &target, &["generate-lockfile", "--offline"]);
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let run = |line: &str| {
+        let mut arguments = vec!["test", "--locked", "--offline"];
+        arguments.extend(line.split(' '));
+        arguments.extend(["--no-run", "--message-format=json"]);
+        cargo(&workspace, &target, &arguments)
+    };
+    let loader = |line: &str| {
+        let mut command = vec!["cargo".to_owned(), "test".to_owned()];
+        command.extend(line.split(' ').map(str::to_owned));
+        coverage::parse(&command)
+    };
+    let mut wrong = Vec::new();
+    for line in [
+        "-p a**",
+        "--workspace --exclude a**",
+        "--test a**",
+        "--test ***",
+        "--bin a**b",
+        "--example a[b",
+        "--timings=html",
+        "--doc",
+        "--nope",
+        "--exclude a",
+        "-p a --exclude b",
+    ] {
+        let output = run(line);
+        if output.status.success() {
+            wrong.push(format!("`{line}`: Cargo accepts it"));
+        }
+        if loader(line).is_ok() {
+            wrong.push(format!("`{line}`: the loader accepts it"));
+        }
+    }
+    for line in ["-h", "--help"] {
+        let output = run(line);
+        let shown = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success()
+            || !shown.contains("Usage:")
+            || shown.contains("compiler-artifact")
+        {
+            wrong.push(format!(
+                "`{line}`: Cargo does not answer with its help text"
+            ));
+        }
+        if loader(line).is_ok() {
+            wrong.push(format!("`{line}`: the loader accepts it"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
