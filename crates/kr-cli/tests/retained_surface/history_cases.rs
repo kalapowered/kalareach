@@ -88,6 +88,8 @@ fn app_lib(step: usize) -> Option<String> {
 struct Repo {
     work: tempfile::TempDir,
     origin: tempfile::TempDir,
+    /// The tag of each release, in the order of `RELEASES`.
+    tags: Vec<String>,
 }
 
 /// The releases: version, commit date, and the step whose content the commit holds. The three
@@ -99,7 +101,7 @@ const RELEASES: [(&str, i64, usize); 8] = [
     ("0.4.0", 450, 3),
     ("0.4.0", 400, 4),
     ("0.4.0", 400, 5),
-    ("0.10.0", 500, 6),
+    ("0.10.0", 350, 6),
     ("0.11.0", 600, 7),
 ];
 
@@ -121,6 +123,7 @@ fn repo(unreadable_at: Option<usize>, broken_at: Option<usize>) -> Repo {
         None,
     );
     let root = work.path();
+    let mut tags = Vec::new();
     for (at, (version, date, step)) in RELEASES.iter().enumerate() {
         write(
             root,
@@ -185,14 +188,12 @@ fn repo(unreadable_at: Option<usize>, broken_at: Option<usize>) -> Repo {
             Some(*date),
         );
         let commit = git(root, &["rev-parse", "HEAD"], None).trim().to_owned();
-        git(
-            root,
-            &["tag", &format!("packages/v{version}+{}", &commit[..12])],
-            None,
-        );
+        let tag = format!("packages/v{version}+{}", &commit[..12]);
+        git(root, &["tag", &tag], None);
+        tags.push(tag);
     }
     git(work.path(), &["push", "origin", "main", "--tags"], None);
-    Repo { work, origin }
+    Repo { work, origin, tags }
 }
 
 fn leaked(text: String) -> &'static str {
@@ -329,32 +330,79 @@ fn app_source(label: &str, file: &str, text: &str) -> Source {
     source_of("companion_tauri", &format!("{APP}/src/{file}"), label, text)
 }
 
-/// Reads the repository once with an entry that lists no text, takes the digests the snapshots
-/// show, and returns the entry that lists them.
+/// Reads the repository with the entry that lists the digests of the fixture's items, made here
+/// from their texts, and the repository's oldest tag.
 fn read(repo: &Repo) -> Read {
-    let probe = entry(&Default::default(), 7, leaked(String::new()));
-    let (_, snapshots) = read_history(repo.work.path(), &probe).expect("the history");
-    let digest = |name: &str, tag_at: usize| match snapshots[tag_at]
-        .items
-        .get(&("companion_tauri".to_owned(), name.to_owned()))
-    {
-        Some(Lookup::Found(digest)) => digest.clone(),
-        other => panic!("{name} at {tag_at}: {other:?}"),
-    };
+    let lib = "lib.rs";
     let digests = [
-        digest("Link::target", 1),
-        digest("Link::target", 2),
-        digest("old_builder", 1),
-        digest("relay", 1),
+        app_source("Link::target", lib, &target_text(1)).digest,
+        app_source("Link::target", lib, &target_text(2)).digest,
+        app_source("old_builder", lib, OLD_BUILDER).digest,
+        app_source("relay", lib, RELAY).digest,
     ];
-    let oldest = snapshots[0].at.tag.clone();
-    let entry = entry(&digests, 7, leaked(oldest));
+    let entry = entry(&digests, 7, leaked(repo.tags[0].clone()));
     let (expected, snapshots) = read_history(repo.work.path(), &entry).expect("the history");
     Read {
         expected,
         snapshots,
         entry,
     }
+}
+
+/// The distinct texts of the fixture's items and accounts, each with the tags that have it, in the
+/// order of crate, item and digest. `all` is the tags of the snapshots in order: the relay has no
+/// sighting, and the account that moved between files has two digests and one text.
+fn fixture_texts(all: &[String]) -> Vec<Shown> {
+    let lib = "lib.rs";
+    let other = source_of(
+        "kr_other",
+        "crates/kr-other/src/lib.rs",
+        "other_one",
+        OTHER_ONE,
+    );
+    let mut texts = vec![
+        shown(
+            "companion_tauri",
+            "Link::target",
+            app_source("Link::target", lib, &target_text(1)),
+            &all[1..2],
+        ),
+        shown(
+            "companion_tauri",
+            "Link::target",
+            app_source("Link::target", lib, &target_text(2)),
+            &all[2..],
+        ),
+        shown(
+            "companion_tauri",
+            "names_one",
+            app_source("names_one", lib, NAMES_ONE),
+            &all[3..6],
+        ),
+        shown(
+            "companion_tauri",
+            "names_one",
+            app_source("names_one", "more.rs", NAMES_ONE),
+            &all[6..],
+        ),
+        shown(
+            "companion_tauri",
+            "old_builder",
+            app_source("old_builder", lib, OLD_BUILDER),
+            &all[1..3],
+        ),
+        shown(
+            "companion_tauri",
+            "relay",
+            app_source("relay", lib, RELAY),
+            &all[1..],
+        ),
+        shown("kr_other", "other_one", other, &all[1..]),
+    ];
+    texts.sort_by(|a, b| {
+        (&a.krate, &a.name, &a.source.digest).cmp(&(&b.krate, &b.name, &b.source.digest))
+    });
+    texts
 }
 
 fn said(text: &str) -> String {
@@ -420,14 +468,6 @@ fn the_history_of_a_repository_that_fits_its_entry_has_no_problem_and_is_reporte
     let target_2 = app_source("Link::target", lib, &target_text(2));
     let old = app_source("old_builder", lib, OLD_BUILDER);
     let relay = app_source("relay", lib, RELAY);
-    let names_here = app_source("names_one", lib, NAMES_ONE);
-    let names_moved = app_source("names_one", "more.rs", NAMES_ONE);
-    let other = source_of(
-        "kr_other",
-        "crates/kr-other/src/lib.rs",
-        "other_one",
-        OTHER_ONE,
-    );
     // The groups of each client item, in the order of its first tag.
     let mut absent_old = vec![all[0].clone()];
     absent_old.extend(all[3..].iter().cloned());
@@ -441,23 +481,13 @@ fn the_history_of_a_repository_that_fits_its_entry_has_no_problem_and_is_reporte
         group("relay", &relay.digest, &all[1..]),
     ];
     assert_eq!(report.groups, groups);
-    // Each distinct text once with its tags, in the order of crate, item and digest: the relay has
-    // no sighting, and the account that moved between files has two digests and one text.
+    let names_here = app_source("names_one", lib, NAMES_ONE);
+    let names_moved = app_source("names_one", "more.rs", NAMES_ONE);
     assert_eq!(names_here.text, names_moved.text);
     assert_ne!(names_here.digest, names_moved.digest);
-    let mut texts = vec![
-        shown("companion_tauri", "Link::target", target_1, &all[1..2]),
-        shown("companion_tauri", "Link::target", target_2, &all[2..]),
-        shown("companion_tauri", "names_one", names_here, &all[3..6]),
-        shown("companion_tauri", "names_one", names_moved, &all[6..]),
-        shown("companion_tauri", "old_builder", old, &all[1..3]),
-        shown("companion_tauri", "relay", relay, &all[1..]),
-        shown("kr_other", "other_one", other, &all[1..]),
-    ];
-    texts.sort_by(|a, b| {
-        (&a.krate, &a.name, &a.source.digest).cmp(&(&b.krate, &b.name, &b.source.digest))
-    });
-    assert_eq!(report.texts, texts);
+    // Each distinct text once with its tags: the relay has no sighting, and the account that moved
+    // between files has two digests and one text.
+    assert_eq!(report.texts, fixture_texts(&all));
     // The account's span is the first and last tag that have it, over both files.
     let span = |krate: &str, name: &str, first: &str, last: &str| Span {
         krate: krate.to_owned(),
@@ -623,10 +653,12 @@ fn a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_t
     let odd = repo(Some(2), None);
     let (expected, snapshots) = read_history(odd.work.path(), &read.entry).expect("history");
     let report = audit_tags(&read.entry, &expected, &snapshots);
-    let unreadable = snapshots
+    let failed: Vec<&Snapshot> = snapshots
         .iter()
-        .find(|snapshot| snapshot.sightings.is_err())
-        .expect("a snapshot whose scan failed");
+        .filter(|snapshot| snapshot.sightings.is_err())
+        .collect();
+    assert_eq!(failed.len(), 1, "one snapshot whose scan failed");
+    let unreadable = failed[0];
     let (Some(Lookup::Failed(crate_error)), Err(scan_error)) =
         (unreadable.krates.get("kr_hook"), &unreadable.sightings)
     else {
@@ -657,10 +689,13 @@ fn a_source_that_cannot_be_read_at_a_tag_is_a_text_of_its_own() {
     let (expected, snapshots) = read_history(broken.work.path(), &read.entry).expect("history");
     let report = audit_tags(&read.entry, &expected, &snapshots);
     let at = &snapshots[2];
-    let error = at
-        .source_errors
-        .get(&("kr_other".to_owned(), "other_one".to_owned()))
-        .expect("the account's source failed");
+    let key = ("kr_other".to_owned(), "other_one".to_owned());
+    assert_eq!(
+        at.source_errors.keys().cloned().collect::<Vec<_>>(),
+        vec![key.clone()],
+        "the account's source failed"
+    );
+    let error = &at.source_errors[&key];
     assert!(error.contains("broken.rs"), "{error}");
     assert!(at.sightings.is_ok());
     assert_eq!(
@@ -708,6 +743,9 @@ fn a_sighting_is_held_to_its_row_its_account_or_its_crate() {
         )));
     }
     assert_eq!(report.problems, texts);
+    // The texts of the sightings that nothing covers are shown as those of an account are.
+    let all: Vec<String> = (0..7).map(|at| tag_at(&read, at)).collect();
+    assert_eq!(report.texts, fixture_texts(&all));
     // A4: a sighting in a daemon crate or a receiver crate at a tag is not read; an account that
     // lacks a kind of its sighting is.
     let report = report_with(&read, |_, snapshots| {
@@ -825,7 +863,7 @@ fn a_daemon_item_and_a_daemon_account_cause_no_reading_and_no_text() {
         krate: "kr_controller",
         name: "other",
         kinds: &[SightKind::Names],
-        now: "n",
+        now: "absent",
         why: "x",
     });
     entry.accounts = leak(accounts);
