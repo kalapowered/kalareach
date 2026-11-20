@@ -229,6 +229,16 @@ exactly what the installation recorded, through `agent_tools.remove`.
 
 The agents are `codex`, `claude-code`, `opencode`, `gemini-cli`, `kimi-code-cli` and `qoder-cli`.
 A package that this host admits, and whose grant holds `skill_target.install`, can name another agent. The host accepts that word while that package is the only one that names it, at the places the owner confirmed, and adds a tool-server entry only where the package names a configuration file; on Windows it refuses such a word. A word that no admitted package names and no record of this host holds is refused, with the list of the words this host knows.
+
+To install a word that a package declares, the host writes to a folder and replaces a file. It refuses to do those things if another user can change the folder or the file, that is, if another user owns it, if its group or every user can write to it, or (on macOS) if its access list has any allow entry. The host does not map an entry to its account, so it counts every allow entry as another user's. On Linux, the host does not count the write bit of the account's own private group as letting another user change the place. A group is the account's own private group if it is the account's primary group, if `/etc/group` names it after the account and lists no other member of it, and if no other account has it as its primary group. A group that only another name service knows, such as LDAP, does not get this exception, so its write bit is counted. If the folder or the file fails the check, the host leaves the place as it was, and the refusal names the place and says why. The check has these limits:
+
+- A process of this user, or of root, can change the place at any time. A file such a process puts under a write's temporary name between the host's check of that name and its removal is removed.
+- On a volume that ignores ownership (on macOS, this is the default for external disks), every account acts as the owner. The limit above then covers every account there, and the host does not refuse the place.
+- A share that enforces another permission model (for example, NFSv4 or SMB) is outside the check.
+- The path in a refusal is the path the host walked. It goes stale when a folder above it moves.
+- During a replacement the place can show the new contents before the host has checked the file it displaced, and if that file is not the checked one, before the host recovers it.
+- The documents of the six compiled agents are replaced as before, outside this check. On Windows the host refuses a declared word.
+
 `manifest.json` in the skill package lists, for each of the six compiled agents, where the skill goes at each scope, which
 configuration document the server entry is added to, and whether that layout was verified against an
 installed executable or taken from published documentation.
