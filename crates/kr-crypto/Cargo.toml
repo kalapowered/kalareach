@@ -34,6 +34,12 @@ subtle.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 
+# The Windows Credential Manager's item takes a persistence class at its creation, and `keyring`'s
+# entry type does not offer one, so the recovery seed's item is built through the store's own entry
+# type, at the version `keyring` already uses.
+[target.'cfg(windows)'.dependencies]
+keyring-core.workspace = true
+
 # The Apple mobile systems. `keyring`'s default backend set turns on the Apple keychain store
 # without its protected-data mode, and that store refuses to build for iOS without it: an item
 # there is readable only after the device has been unlocked once, which is the only accessibility

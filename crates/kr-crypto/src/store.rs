@@ -236,12 +236,29 @@ impl PlatformStore {
     }
 
     fn entry(&self, name: &SecretName) -> Result<keyring::Entry> {
-        keyring::Entry::new(&self.service, name.as_str()).map_err(|error| {
-            CryptoError::SecretStore {
-                message: error.to_string(),
-            }
+        #[cfg(windows)]
+        let entry = windows_entry(&self.service, name.as_str());
+        #[cfg(not(windows))]
+        let entry = keyring::Entry::new(&self.service, name.as_str());
+        entry.map_err(|error| CryptoError::SecretStore {
+            message: error.to_string(),
         })
     }
+}
+
+/// Builds the item of `user` under `service` in the Windows Credential Manager with the Local
+/// persistence class.
+///
+/// `keyring::Entry::new` builds the item with the store's default class, Enterprise, which can
+/// travel to another computer with a roaming profile, and the keys this store holds belong to this
+/// computer. The class is applied when the item is written, so an item that an earlier build wrote
+/// as Enterprise stays so until it is written again, and is read as before. The store the entry is
+/// built in is the one `keyring` set up when [`PlatformStore::open`] asked for its status.
+#[cfg(windows)]
+fn windows_entry(service: &str, user: &str) -> keyring::Result<keyring::Entry> {
+    let modifiers = std::collections::HashMap::from([("persistence", "Local")]);
+    keyring_core::Entry::new_with_modifiers(service, user, &modifiers)
+        .map(|inner| keyring::Entry { inner })
 }
 
 impl SecretStore for PlatformStore {

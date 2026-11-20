@@ -129,6 +129,9 @@ iroh-relay = { version = "=1.4.1", default-features = false }
 # The calendar and instant types `tough` states metadata expiry in.
 jiff = { version = "=0.2.37", features = ["serde"] }
 keyring = "=4.2.0"
+# The credential store's own entry type, which says how long an item persists in the Windows
+# Credential Manager; `keyring`'s entry type has no way to say it.
+keyring-core = "=1.0.0"
 kr-attention = { path = "crates/kr-attention", version = "=0.1.0" }
 kr-automation = { path = "crates/kr-automation", version = "=0.1.0" }
 kr-cbor = { path = "crates/kr-cbor", version = "=0.1.0" }
