@@ -253,6 +253,57 @@ command = ['cargo', 'test', '--locked', '--test', 'plan_env']
     );
 }
 
+/// KR-REQ-29.01, the part about reproducible commands: `{root}` is the absolute root, with forward
+/// slashes, so that a step that runs in a directory of the repository reaches the repository
+/// through it whatever `--root` the program was started with. Here the program is started in the
+/// directory that holds the repository, with the repository's name as its root, and the step's
+/// script fails unless the root it is given holds a file of the repository.
+#[cfg(unix)]
+#[test]
+fn the_root_placeholder_is_the_absolute_root_when_the_root_is_given_relative() {
+    let (case, root) = copy_beside("no-root-manifest");
+    std::fs::write(
+        root.join("first").join("check-root.sh"),
+        "test -f \"$1/first/check-root.sh\"\n",
+    )
+    .expect("a script");
+    let text = plan_of(
+        &["first/Cargo.toml", "second/Cargo.toml"],
+        "[[step]]
+id = 'check'
+group = 'rust'
+what = 'the root'
+platforms = ['linux', 'macos', 'windows']
+reading = 'build'
+directory = 'first'
+command = ['bash', 'check-root.sh', '{root}']
+",
+    );
+    std::fs::create_dir_all(root.join("conformance")).expect("a directory");
+    let plan = root.join("conformance").join("plan.toml");
+    std::fs::write(&plan, text).expect("the plan");
+    git(&root, &["add", "-A"]);
+    let evidence = tempfile::Builder::new()
+        .prefix("kr-conformance-evidence.")
+        .tempdir()
+        .expect("an evidence directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_kr-conformance"))
+        .current_dir(case.path())
+        .args(["run", "--root", "tree", "--plan"])
+        .arg(&plan)
+        .arg("--evidence")
+        .arg(evidence.path())
+        .output()
+        .expect("the program runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A plan of one `bash` script step that reads nothing, whose command is `words`.
 #[cfg(unix)]
 fn script_plan(words: &str, more: &str) -> String {
