@@ -1943,20 +1943,8 @@ impl Scanner {
                     }
                 }
                 syn::Item::Trait(definition) => {
-                    let mut kept = definition.clone();
-                    let mut keep = Vec::new();
-                    for member in &definition.items {
-                        keep.push(within.within(trait_item_attrs(member), file)?.is_some());
-                    }
-                    let mut keep = keep.into_iter();
-                    kept.items.retain(|_| keep.next().unwrap_or(true));
-                    let kept = stripped(&kept, &within, file, |strip, node| {
-                        strip.visit_item_trait_mut(node);
-                    })?;
-                    self.body(
-                        definition.ident.to_string(),
-                        without_docs(kept.to_token_stream()),
-                    );
+                    // `Strip` takes the members that no configuration builds out of the trait.
+                    self.body(definition.ident.to_string(), text()?);
                 }
                 syn::Item::Macro(call) => {
                     let kinds = kinds_of(&plain());
