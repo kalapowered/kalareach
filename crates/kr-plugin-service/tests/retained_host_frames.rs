@@ -14,8 +14,8 @@
 
 use kr_plugin_service::launcher::{self, HostReservation};
 use kr_plugin_service::protocol::{
-    Frame, HostDescriptor, HostProtocol, HostRendezvous, RendezvousAccepted, Request, RequestBody,
-    ResponseBody,
+    Frame, HostDescriptor, HostProtocol, HostRendezvous, HostStartFailure, RendezvousAccepted,
+    Request, RequestBody, ResponseBody,
 };
 use kr_protocol::frame::StreamKind;
 use kr_protocol::scalars::Nonce256;
@@ -170,4 +170,36 @@ async fn the_arguments_a_launcher_starts_the_host_of_the_release_before_with_are
         .map(|flag| flag.as_str().expect("a flag"))
         .collect();
     assert_eq!(flags, recorded);
+}
+
+/// The frame a host that could not start sends and the claim a host that started sends are closed
+/// shapes that each refuse the other's bytes, so a launcher that tries the claim first and the
+/// failure second cannot take one for the other, and a launcher of the release before, which reads
+/// only the claim, refuses the failure frame.
+#[test]
+fn the_start_failure_frame_and_the_claim_refuse_each_other() {
+    let record: Value = serde_json::from_str(RECORD).expect("the record");
+    let limits = StreamKind::Control.cbor_limits();
+    let claim_bytes = recorded(&record, "claim");
+    assert!(
+        kr_cbor::from_canonical_slice::<HostStartFailure>(&claim_bytes, &limits).is_err(),
+        "a recorded claim does not read as a start failure"
+    );
+    let failure = HostStartFailure {
+        reservation_id: kr_protocol::worker::ReservationId::new(
+            kr_protocol::scalars::Uuid::from_bytes([1; 16]),
+        ),
+        environment_id: kr_protocol::ids::EnvironmentId::new(
+            kr_protocol::scalars::Uuid::from_bytes([2; 16]),
+        ),
+        reason: "the plugin host could not start: paths".to_owned(),
+    };
+    let bytes = kr_cbor::to_canonical_vec(&failure).expect("encodes");
+    assert!(
+        kr_cbor::from_canonical_slice::<HostRendezvous>(&bytes, &limits).is_err(),
+        "a start failure does not read as a claim"
+    );
+    let read: HostStartFailure =
+        kr_cbor::from_canonical_slice(&bytes, &limits).expect("the failure reads back");
+    assert_eq!(read, failure);
 }
