@@ -48,6 +48,11 @@ const NAMED_NOT_RUN: [(&str, &[Entry]); 5] = [
         &[
             ("", 1, "the list of tools a recording stand-in answers for"),
             (
+                "a_launchctl_stand_in_records_into_a_folder_whose_name_holds_a_quote_and_a_space",
+                1,
+                "a recording program placed under the name `launchctl` in a folder of the case's own and run by its path; the account's launchctl is never started",
+            ),
+            (
                 "allowed",
                 1,
                 "the table of calls the standalone start may make, which it compares and never runs",
