@@ -164,25 +164,56 @@ fn racing_repository(work: &Path, name: &str) -> PathBuf {
     path
 }
 
+/// Writes one filtered file with content whose size is neither the size the index holds for it nor
+/// the size it has now, so the index cannot show the file unchanged.
+fn rewrite_at_a_new_size(repository: &Path, name: &str) {
+    let in_the_index: usize = git_raw(repository, ["cat-file", "-s", &format!(":{name}")])
+        .trim()
+        .parse()
+        .expect("the size of the content the index holds");
+    let held = usize::try_from(
+        std::fs::metadata(repository.join(name))
+            .expect("the filtered file")
+            .len(),
+    )
+    .expect("a size that fits in memory");
+    let size = in_the_index.max(held) + 1;
+    write(repository, name, &format!("{}\n", "x".repeat(size - 1)));
+}
+
 /// Runs installed Git over one repository and requires the planting to have had an effect.
 ///
 /// Without this the assertions above it would pass for a repository where nothing was planted at
 /// all, or where the recorder could not record. Installed Git reads the same configuration the seam
-/// wrote, runs the driver, and the driver leaves the sentinel this requires.
+/// wrote, runs the drivers, and each driver leaves the sentinel this requires.
+///
+/// The control writes the two filtered files first because Git re-reads a file through its clean
+/// filter only when the index cannot show the file unchanged. A file that still matches its index
+/// entry (a fresh clone's, once the clock has moved on from the checkout) runs no filter at all, so
+/// without the writes the control would pass or fail with the time it was run at. A file of a size
+/// the index never held is changed on any clock, in every repository that calls this.
 fn require_the_planting_would_have_run(repository: &Path) {
     assert_eq!(
         escaped(repository),
         Vec::<String>::new(),
         "the control starts from nothing"
     );
+    rewrite_at_a_new_size(repository, "one.inside");
+    rewrite_at_a_new_size(repository, "two.temporary");
     git_raw(repository, ["add", "-A"]);
     let left = escaped(repository);
-    assert!(
-        left.contains(&"driver-inside-the-repository".to_owned()),
-        "installed Git runs the driver the seam defined and the driver records where the boundary \
-         would have let it, so an empty sentinel directory above is evidence that the boundary \
-         stopped it rather than that nothing was planted or nothing could be written: {left:?}"
-    );
+    for driver in [
+        "driver-inside-the-repository",
+        "driver-in-the-temporary-directory",
+    ] {
+        assert!(
+            left.contains(&driver.to_owned()),
+            "installed Git runs the drivers the seam defined and each driver records where the \
+             boundary would have let it, so an empty sentinel directory above is evidence that the \
+             boundary stopped them rather than that nothing was planted or nothing could be \
+             written; {driver} left no sentinel: {left:?}"
+        );
+    }
     clear(repository);
 }
 
