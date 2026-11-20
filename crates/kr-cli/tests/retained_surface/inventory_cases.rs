@@ -509,6 +509,57 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
 }
 
 #[test]
+fn a_step_up_after_a_link_in_a_path_is_the_links_parent_and_is_refused() {
+    let written = |path: &str| format!("#[path = \"{path}\"]\nmod chosen;\n");
+    let prepare = |path: &str| {
+        let folder = small_tree(&written(path));
+        // Two files of the one name: the one the cancelled path names, and the one the file
+        // system finds when `link/..` is the parent of the link's target.
+        write(
+            folder.path(),
+            "crates/kr-sender/src/chosen.rs",
+            "pub fn lexical() { let _ = Method::AgentTurnCancel; }\n",
+        );
+        write(
+            folder.path(),
+            "crates/kr-sender/src/deep/chosen.rs",
+            "pub fn by_the_file_system() { let _ = Method::AgentTurnSteer; }\n",
+        );
+        let source = folder.path().join("crates/kr-sender/src");
+        std::fs::create_dir_all(source.join("deep/inner")).expect("a folder");
+        std::os::unix::fs::symlink(source.join("deep/inner"), source.join("link")).expect("a link");
+        folder
+    };
+    let folder = prepare("link/../chosen.rs");
+    let root = std::fs::canonicalize(folder.path()).expect("a path");
+    let tree = tree_at(folder.path()).expect("the tree");
+    let text = format!(
+        "crates/kr-sender/src/lib.rs: the scan does not read a path through a link or outside the checkout (it is {})",
+        root.join("crates/kr-sender/src/deep/chosen.rs").display()
+    );
+    assert_eq!(sender_names(&tree), Err(text.clone()));
+    assert_eq!(tree.item("kr_sender", "lexical"), Lookup::Failed(text));
+    // The same step up after a folder that is no link is read as the cancelled path.
+    let folder = prepare("deep/../chosen.rs");
+    assert_eq!(
+        sender_names(&tree_at(folder.path()).expect("the tree")),
+        Ok(vec!["lexical".to_owned()])
+    );
+    // After a folder that is not there it finds no file, as rustc finds none.
+    let folder = prepare("gone/../chosen.rs");
+    let root = std::fs::canonicalize(folder.path()).expect("a path");
+    assert_eq!(
+        sender_names(&tree_at(folder.path()).expect("the tree")),
+        Err(
+            "crates/kr-sender/src/lib.rs: mod chosen is at no file the scan can find (tried crates/kr-sender/src/gone/../chosen.rs)"
+                .to_owned()
+        ),
+        "{}",
+        root.display()
+    );
+}
+
+#[test]
 fn a_manifest_names_a_target_and_a_procedural_macro_crate_is_refused() {
     let manifest =
         |extra: &str| format!("[package]\nname = \"kr-sender\"\nversion = \"0.0.0\"\n{extra}");

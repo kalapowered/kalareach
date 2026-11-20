@@ -359,6 +359,37 @@ impl Reader<'_> {
         }
     }
 
+    /// The path a `#[path]` names, as the file system reads it: the path written, joined to the
+    /// folder it is relative to, is resolved as a whole before its `.` and `..` are cancelled, so
+    /// that a step up after a link is the link's parent. A path that resolves elsewhere than the
+    /// cancelled one is refused; one that is not there is left as written, and finds no file.
+    fn explicit_path(&mut self, written: PathBuf) -> PathBuf {
+        let cancelled = normalised(&written);
+        match std::fs::canonicalize(&written) {
+            Ok(real) if real != cancelled => {
+                self.error = Some(format!(
+                    "{}: the scan does not read a path through a link or outside the checkout (it is {})",
+                    self.at,
+                    real.display()
+                ));
+                cancelled
+            }
+            Ok(_) => cancelled,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                written
+            }
+            Err(error) => {
+                self.error = Some(format!("{}: {error}", written.display()));
+                cancelled
+            }
+        }
+    }
+
     fn call(&mut self, path: &syn::Path) {
         if let Some(last) = path.segments.last() {
             self.calls.push(last.ident.to_string());
@@ -423,7 +454,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                     // The folder of an inline module with a `#[path]` is that path, taken from the
                     // file's folder, and holds the modules inside it.
                     let inside = match &explicit {
-                        Some(path) => normalised(&self.path_base.join(path)),
+                        Some(path) => self.explicit_path(self.path_base.join(path)),
                         None => self.modules.join(&name),
                     };
                     let outer_base = std::mem::replace(&mut self.path_base, inside.clone());
@@ -443,7 +474,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                 }
                 None => {
                     let (candidates, explicit) = match explicit {
-                        Some(path) => (vec![normalised(&self.path_base.join(path))], true),
+                        Some(path) => (vec![self.explicit_path(self.path_base.join(path))], true),
                         None => (
                             vec![
                                 self.modules.join(format!("{name}.rs")),
