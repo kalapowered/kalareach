@@ -940,7 +940,7 @@ impl Installer {
         let Fs::Walk(walk) = &self.fs else {
             return Ok(());
         };
-        walk.missing_folders(&layout.skills)?;
+        let skills_to_make = walk.missing_folders(&layout.skills)?;
         walk.refuse_links(&layout.skills, anchor::Expect::Folder)?;
         for place in files
             .iter()
@@ -958,12 +958,18 @@ impl Installer {
         {
             walk.refuse_shared_folder(place, anchor::Act::Write)?;
         }
+        // The folder that holds the first folder this host has still to make, in each chain, is one
+        // that only this user can change: the host writes that folder's name in it.
+        if let Some(first) = skills_to_make.first() {
+            walk.refuse_shared_folder(first, anchor::Act::Write)?;
+        }
         if let Some(parent) = layout
             .configuration
             .as_ref()
             .and_then(|document| document.path.parent())
+            && let Some(first) = walk.missing_folders(parent)?.first()
         {
-            walk.missing_folders(parent)?;
+            walk.refuse_shared_folder(first, anchor::Act::Write)?;
         }
         Ok(())
     }
@@ -6875,6 +6881,204 @@ mod tests {
                 .all(|operation| !operation.path().ends_with("SKILL.md")),
             "it is not counted as removed"
         );
+    }
+
+    /// True when the installation has written a record: it has passed the marker.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn record_written(tree: &Tree) -> bool {
+        std::fs::read_dir(tree.root.join("state").join("agent-tools"))
+            .is_ok_and(|mut records| records.next().is_some())
+    }
+
+    /// KR-REQ-11.01: a skills folder that every user can change, which holds the folder the
+    /// installation would make, is refused before the marker.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_every_user_can_change_is_refused_when_the_installation_would_make_a_folder_in_it() {
+        let tree = Tree::create();
+        let (installer, made) = amp_installer_with_folder(&tree);
+        std::fs::remove_dir(&made).expect("the folder the installation makes is not there");
+        set_mode(made.parent().expect("the skills folder"), 0o757);
+        let refused = installer
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a folder another user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(&format!(
+                        "{} cannot be written safely",
+                        made.file_name().expect("a name").to_string_lossy()
+                    ))
+                    && detail.contains(FOLDER_WRITE_BIT)
+                    && detail.ends_with("so nothing is written there")),
+            "{refused}"
+        );
+        assert!(!made.exists(), "the folder is not made");
+        assert!(
+            !record_written(&tree),
+            "the refusal comes before any record is written"
+        );
+    }
+
+    /// KR-REQ-11.01: on macOS a skills folder with an allow entry that new folders inherit is
+    /// refused before the marker, as a folder with one that applies to it is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_folder_with_an_allow_entry_new_folders_inherit_is_refused_when_the_installation_would_make_a_folder_in_it()
+     {
+        let tree = Tree::create();
+        let (installer, made) = amp_installer_with_folder(&tree);
+        std::fs::remove_dir(&made).expect("the folder the installation makes is not there");
+        let skills = made.parent().expect("the skills folder").to_owned();
+        let _entry = Restriction(skills.clone());
+        exacl::setfacl(
+            &[&skills],
+            &[exacl::AclEntry::allow_group(
+                "everyone",
+                exacl::Perm::READ,
+                Some(exacl::Flag::FILE_INHERIT | exacl::Flag::DIRECTORY_INHERIT),
+            )],
+            None,
+        )
+        .expect("an allow entry that new folders inherit");
+        let refused = installer
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a folder another user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(&format!(
+                        "{} cannot be written safely",
+                        made.file_name().expect("a name").to_string_lossy()
+                    ))
+                    && detail.contains("because the folder it is in has an allow entry for an account not known to be yours")
+                    && detail.ends_with("so nothing is written there")),
+            "{refused}"
+        );
+        assert!(!made.exists(), "the folder is not made");
+        assert!(
+            !record_written(&tree),
+            "the refusal comes before any record is written"
+        );
+    }
+
+    /// KR-REQ-11.01: a project folder that every user can change, where the installation would make
+    /// `.amp`, is refused before the marker.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_project_folder_every_user_can_change_is_refused_when_the_installation_would_make_a_folder_in_it()
+     {
+        let tree = Tree::create();
+        let project = tree.root.join("project");
+        std::fs::create_dir_all(&project).expect("a project");
+        set_mode(&project, 0o757);
+        let target: kr_plugin_sdk::skill_target::SkillTarget = serde_json::from_value(json!({
+            "word": "amp",
+            "project": { "skills": [".amp", "skills"] }
+        }))
+        .expect("a target");
+        let installer = tree.installer().with_declaration(Some(target), Vec::new());
+        let made = project.join(".amp");
+        let refused = installer
+            .install(&project_params(amp(), &project))
+            .expect_err("a folder another user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(&format!(
+                        "{} cannot be written safely",
+                        made.file_name().expect("a name").to_string_lossy()
+                    ))
+                    && detail.contains(FOLDER_WRITE_BIT)
+                    && detail.ends_with("so nothing is written there")),
+            "{refused}"
+        );
+        assert!(!made.exists(), "the folder is not made");
+        assert!(
+            !record_written(&tree),
+            "the refusal comes before any record is written"
+        );
+    }
+
+    /// KR-REQ-11.01: the folder that holds the folder the document is to be in is judged as well,
+    /// where the skills folder is already there.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_every_user_can_change_is_refused_when_the_installation_would_make_the_documents_folder_in_it()
+     {
+        let tree = Tree::create();
+        std::fs::create_dir_all(tree.home().join(".amp/skills")).expect("the skills folder");
+        let shared = tree.home().join(".cfg");
+        std::fs::create_dir_all(&shared).expect("a folder");
+        set_mode(&shared, 0o757);
+        let target = declared(
+            Some(
+                json!({ "path": [".cfg", "amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+            ),
+            &[".amp", "skills"],
+        );
+        let installer = tree.installer().with_declaration(Some(target), Vec::new());
+        let made = shared.join("amp");
+        let refused = installer
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a folder another user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(&format!(
+                        "{} cannot be written safely",
+                        made.file_name().expect("a name").to_string_lossy()
+                    ))
+                    && detail.contains(FOLDER_WRITE_BIT)
+                    && detail.ends_with("so nothing is written there")),
+            "{refused}"
+        );
+        assert!(!made.exists(), "the folder is not made");
+        assert!(
+            !record_written(&tree),
+            "the refusal comes before any record is written"
+        );
+    }
+
+    /// KR-REQ-11.01: a folder that another process makes changeable by every user after the check is
+    /// judged where the installation makes a folder in it, through the handle it holds, and the
+    /// folder is not made.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_made_changeable_after_the_check_is_refused_where_a_folder_is_made_in_it() {
+        let tree = Tree::create();
+        let (installer, made) = amp_installer_with_folder(&tree);
+        std::fs::remove_dir(&made).expect("the folder the installation makes is not there");
+        let skills = made.parent().expect("the skills folder").to_owned();
+        anchor::make_pause::once(move |_| set_mode(&skills, 0o757));
+        let refused = installer
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a folder every user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(FOLDER_WRITE_BIT) && detail.ends_with("so nothing is written there")),
+            "{refused}"
+        );
+        assert!(!made.exists(), "the folder is not made");
+    }
+
+    /// KR-REQ-11.01: a write into a folder that is not there yet judges the folder that will hold
+    /// the one it makes, through the handle it holds, and makes nothing.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_write_into_a_folder_to_be_made_in_a_folder_every_user_can_change_is_refused() {
+        let tree = Tree::create();
+        let (_, made) = amp_installer_with_folder(&tree);
+        let skills = made.parent().expect("the skills folder").to_owned();
+        set_mode(&skills, 0o757);
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let refused = walk
+            .write(&skills.join("new/SKILL.md"), b"one", 0o644, None)
+            .expect_err("a folder every user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(FOLDER_WRITE_BIT) && detail.ends_with("so nothing is written there")),
+            "{refused}"
+        );
+        assert!(!skills.join("new").exists(), "the folder is not made");
     }
 
     /// KR-REQ-11.01: a write judges the folder it walked to, read through the handle it holds. A

@@ -172,6 +172,12 @@ impl Anchor {
             let from = held.as_ref().unwrap_or(&self.root);
             let mut child = from.child(component).map_err(storage)?;
             if matches!(child, Child::Absent) && make {
+                // The folder that is to hold the one made here is judged through the handle this
+                // walk holds on it, as a folder that holds a written file is.
+                let made = self
+                    .path
+                    .join(place.folders[..=index].iter().collect::<PathBuf>());
+                check_folder(from, &made, Act::Write)?;
                 from.make_child(component).map_err(storage)?;
                 from.flush().map_err(storage)?;
                 child = from.child(component).map_err(storage)?;
@@ -338,13 +344,18 @@ impl Anchor {
         names.push(place.name);
         let mut held: Option<Dir> = None;
         let mut made = false;
+        let mut so_far = self.path.clone();
         for name in names {
+            so_far.push(name);
             let from = held.as_ref().unwrap_or(&self.root);
             let mut child = from.child(name).map_err(storage)?;
             made = false;
             if matches!(child, Child::Absent) {
                 #[cfg(test)]
                 make_pause::run(folder);
+                // The folder that is to hold the one made here is judged through the handle this
+                // walk holds on it, as a folder that holds a written file is.
+                check_folder(from, &so_far, Act::Write)?;
                 made = from.make_child(name).map_err(storage)?;
                 from.flush().map_err(storage)?;
                 child = from.child(name).map_err(storage)?;
@@ -363,7 +374,8 @@ impl Anchor {
     }
 
     /// Refuses the folder that holds `path`, a place below the selected root, where another user can
-    /// change it. A folder that is not there yet is made by this host, and is judged at the write.
+    /// change it. Where that folder is not there yet nothing is judged: to judge the folder that
+    /// will hold the first one this host makes, ask about that first one.
     pub(crate) fn refuse_shared_folder(&self, path: &Path, act: Act) -> Result<()> {
         if self.is_root(path) {
             return Ok(());
