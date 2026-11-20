@@ -331,9 +331,8 @@ fn environment_additions_resolve_on_the_ladder() {
     }
 }
 
-/// KR-REQ-07.64: the resolver answers the ownership the document records for a package, read when
-/// it is opened, and full ownership for every other package and for a host with no document or no
-/// usable one.
+/// KR-REQ-07.64: the resolver lists the package whose usable configuration records reduced
+/// ownership. A missing or unusable document produces an empty list.
 #[test]
 fn an_agents_entry_records_reduced_ownership_for_its_package_only() {
     use kr_protocol::broker::AgentOwnership;
