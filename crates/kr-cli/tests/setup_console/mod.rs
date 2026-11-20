@@ -836,9 +836,63 @@ pub fn drop_the_debug_privilege() -> String {
             std::ptr::null_mut(),
         )
     };
+    assert!(
+        changed != 0,
+        "this case could not make its condition: the call that removes the debug privilege failed"
+    );
+    // The call also succeeds for a token that never held the privilege, and for one whose removal
+    // did not take: the privileges the token holds now are read, and the debug privilege must not
+    // be among them. A token that never held it passes.
+    let held = privileges_of(&token);
+    assert!(
+        !held.contains(&(luid.LowPart, luid.HighPart)),
+        "this case could not make its condition: the token still holds the debug privilege, so \
+         every open of a case would be granted whatever the lists say"
+    );
     format!(
-        "the case's token is {}elevated; removing its debug privilege {}",
+        "the case's token is {}elevated; it holds no debug privilege",
         if elevation == 0 { "not " } else { "" },
-        if changed == 0 { "failed" } else { "was asked" }
     )
+}
+
+/// The privileges a token holds, each as the low and high part of its identifier.
+fn privileges_of(token: &OwnedHandle) -> Vec<(u32, i32)> {
+    const TOKEN_PRIVILEGES_CLASS: i32 = 3;
+    let mut length = 0_u32;
+    // SAFETY: the call is asked only how much room it needs; the handle is open.
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle().cast(),
+            TOKEN_PRIVILEGES_CLASS,
+            std::ptr::null_mut(),
+            0,
+            &raw mut length,
+        )
+    };
+    let mut buffer = vec![
+        0_u32;
+        usize::try_from(length)
+            .expect("a small size")
+            .div_ceil(4)
+            .max(1)
+    ];
+    // SAFETY: the buffer has at least the room the system asked for.
+    let read = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle().cast(),
+            TOKEN_PRIVILEGES_CLASS,
+            buffer.as_mut_ptr().cast(),
+            length,
+            &raw mut length,
+        )
+    };
+    assert!(read != 0, "the case reads the privileges of its token");
+    // The count, then for each privilege its low part, its high part and its attributes.
+    let count = usize::try_from(buffer[0]).expect("a small count");
+    (0..count)
+        .map(|at| {
+            let entry = &buffer[1 + at * 3..4 + at * 3];
+            (entry[0], i32::from_ne_bytes(entry[1].to_ne_bytes()))
+        })
+        .collect()
 }
