@@ -86,7 +86,8 @@ impl ChannelRoot {
     /// # Errors
     ///
     /// Returns a refusal when the root cannot be read, is not root metadata, gives one key to two
-    /// roles, or is not signed by its own root keys.
+    /// roles, names one key twice in a role or a key that is not an Ed25519 key of 32 bytes, or is
+    /// not signed by its own root keys.
     pub fn read(release: &Path) -> Result<Option<Self>> {
         let path = release.join(CHANNEL_ROOT);
         let bytes = match read_bounded(&path, MAX_ROOT_LEN) {
@@ -111,9 +112,19 @@ impl ChannelRoot {
         kr_release::verify_root_itself(&signed).map_err(|error| {
             CliError::Other(match error {
                 kr_release::VerifyError::SharedKey { .. } => shown!(
-                    "the update channel's root at {} gives one key to two roles: an older \
-                     `kr-release dev-keys` made such a root, and a host that holds one is \
-                     installed again in a new store, from a release made again",
+                    "the update channel's root at {} gives one key to two roles: a root made by \
+                     an older `kr-release dev-keys` does, and a host that holds one is installed \
+                     again in a new store, from a release made again",
+                    Shown::root(&path)
+                ),
+                kr_release::VerifyError::ReusedKey { .. } => shown!(
+                    "the update channel's root at {} names one key under two identifiers for one \
+                     role, which counts it twice toward the role's threshold",
+                    Shown::root(&path)
+                ),
+                kr_release::VerifyError::UnsupportedKey { .. } => shown!(
+                    "the update channel's root at {} names a key that is not an Ed25519 key of 32 \
+                     bytes",
                     Shown::root(&path)
                 ),
                 _ => shown!(
@@ -129,14 +140,23 @@ impl ChannelRoot {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when it gives one key to two roles or is not signed by its own root keys.
+    /// Returns a refusal when it gives one key to two roles, names one key twice in a role or a key
+    /// that is not an Ed25519 key of 32 bytes, or is not signed by its own root keys.
     pub fn kept(signed: tough::schema::Signed<tough::schema::Root>) -> Result<Self> {
         kr_release::verify_root_itself(&signed).map_err(|error| {
             CliError::Other(Shown::said(match error {
                 kr_release::VerifyError::SharedKey { .. } => {
-                    "the update channel's root this host kept gives one key to two roles: an older \
-                     `kr-release dev-keys` made such a root, so this host is installed again in a \
-                     new store, from a release made again"
+                    "the update channel's root this host kept gives one key to two roles: a root \
+                     made by an older `kr-release dev-keys` does, so a host that holds one is \
+                     installed again in a new store, from a release made again"
+                }
+                kr_release::VerifyError::ReusedKey { .. } => {
+                    "the update channel's root this host kept names one key under two identifiers \
+                     for one role"
+                }
+                kr_release::VerifyError::UnsupportedKey { .. } => {
+                    "the update channel's root this host kept names a key that is not an Ed25519 \
+                     key of 32 bytes"
                 }
                 _ => {
                     "the update channel's root this host kept is not signed by the root keys it \
@@ -189,8 +209,8 @@ impl ChannelRoot {
             CliError::Other(Shown::said(match error {
                 kr_release::VerifyError::SharedKey { .. } => {
                     "the release's update channel root, or the one this host trusts, gives one key \
-                     to two roles: an older `kr-release dev-keys` made such a root, and a host that \
-                     holds one is installed again in a new store, from a release made again"
+                     to two roles: a root made by an older `kr-release dev-keys` does, and a host \
+                     that holds one is installed again in a new store, from a release made again"
                 }
                 _ => {
                     "the release's update channel root is not signed by the root keys this host \
