@@ -413,7 +413,9 @@ pub enum HostEnd {
     Revoked {
         /// The status of its fence, as the page reads it.
         fence: VoiceFence,
-        /// Whether the host also told the voice service the call ended.
+        /// Whether the host confirmed the close at the provider: that it told the voice service the
+        /// call ended, for a call the voice service controls, or that OpenAI confirmed the close,
+        /// for a call on the host's own key.
         broker_notified: bool,
     },
     /// The host answered the stop with a refusal that says it holds no call of this device by that

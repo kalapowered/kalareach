@@ -3335,11 +3335,13 @@ pub(super) struct Stopped {
 /// controls whose close the stop did not confirm, looks for the host's final status of the call on
 /// the same connection, offering the provider's close it holds to `evidence`. A host that held no
 /// such call after the call ended, or revoked the grant without the provider's confirmation, may
-/// have the word. A stop that was refused or not sent asks no more, and a call the voice service
-/// controls is never asked about: the host has no final status for it.
+/// have the word. A stop that was refused, not sent, or whose answer was lost asks no more, so the
+/// close can stay unknown, and a call the voice service controls is never asked about: the host has
+/// no final status for it.
 ///
 /// The longest this takes is the connection's reconnection, the stop, and the look, each within its
-/// own bound: about 80 seconds with the bounds the device keeps.
+/// own bound: about 80 seconds with the bounds the device keeps. The collection of the host's news
+/// that follows, within `host_within` again, makes the longest end about 100 seconds.
 pub(super) async fn stop_and_read(
     reach: &Arc<dyn HostReach>,
     host: &CallHost,

@@ -296,7 +296,9 @@ pub(super) async fn revoke_over(
     }
 }
 
-/// Whether the host's answer to a stop says it told the voice service the call ended.
+/// Whether the host's answer to a stop says it confirmed the close at the provider: that it told the
+/// voice service the call ended, for a call the voice service controls, or that OpenAI confirmed
+/// the close, for a call on the host's own key.
 fn told_the_service(answer: &kr_client::Settled) -> bool {
     let kr_client::Settled::Result(value) = answer else {
         return false;

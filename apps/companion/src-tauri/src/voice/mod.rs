@@ -113,7 +113,8 @@ pub struct Timings {
     pub final_status_beat: Duration,
     /// How long, from its start, the look for the host's final status of a call may take, whatever
     /// a request is doing then. With the reconnection and the stop, each within `host_within`, the
-    /// longest a call takes to end at the host is about 80 seconds.
+    /// longest a call takes to end at the host is about 80 seconds, and about 100 with the
+    /// collection of the host's news that follows, within `host_within` again.
     pub final_status_within: Duration,
 }
 

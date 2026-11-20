@@ -7903,10 +7903,8 @@ const MANAGER: [ActionRight; 3] = [
     ActionRight::HostManage,
 ];
 
-/// What a person is told when a call on the host's key has ended on this phone and the host has not
-/// confirmed that it closed the call.
-/// What a person is told when the host lost its connection to OpenAI, could not restore it and did
-/// not confirm that it closed the call.
+/// What a person is told when a call on the host's key has ended on this phone and the host did not
+/// confirm that OpenAI closed the call: it said so, or it revoked the grant and confirmed nothing.
 const HOST_UNCONFIRMED_WORDS: &str = "The call has ended on this phone. The host could not confirm that OpenAI closed the call, so the call may keep running on your OpenAI account until OpenAI ends it.";
 /// What a person is told when the host was asked and never told the phone that OpenAI closed the
 /// call: a stop that may have reached it, or a host that holds no such call.
@@ -8413,8 +8411,8 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
 
 /// A grant the host revoked while the provider's hangup failed does not close the call: the phone
 /// does not show it closed by the host, however it ended. The call is left to the host with the
-/// notice of the host's own rule, the grant's revocation is not owed, and nothing reaches the voice
-/// service.
+/// notice that the host could not confirm the close, the grant's revocation is not owed, and
+/// nothing reaches the voice service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leaves_an_own_key_call_to_the_host()
  {
@@ -8488,7 +8486,7 @@ async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leav
             .unwrap_or_default();
         assert!(
             owed_kinds.contains(&"host_close") && !owed_kinds.contains(&"service_close"),
-            "the host's own rule is owed ({cause}): {owed_kinds:?}"
+            "the notice that the host could not confirm the close is owed ({cause}): {owed_kinds:?}"
         );
         assert!(
             !owed_kinds.contains(&"revocation"),
@@ -9021,8 +9019,8 @@ async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_throu
 }
 
 /// A call the host swept out of its list before the person's stop reached it, when the phone had not
-/// heard the host's news of it, ends as the person ended it: a host that holds no such call at the end
-/// of a call has ended it itself, and nothing is left to the host.
+/// heard the host's news of it, ends as the person ended it: the stop finds no call, the look for the
+/// host's final status finds the close confirmed, and nothing is left to the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_person_who_ends_a_call_the_host_swept_unheard_is_not_told_it_is_left_to_the_host() {
     // The host's beats are far apart: its news of the sweep does not reach the phone before the stop.

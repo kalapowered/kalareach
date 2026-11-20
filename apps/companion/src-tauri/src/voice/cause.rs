@@ -6,9 +6,9 @@ use kr_protocol::voice_host::{HOST_CLIENT_ABSENT_SECONDS, VoiceEndReason, VoiceP
 use super::host_control::{CloseWord, HostEnding};
 use super::view::HostEnd;
 
-/// What a person is told when a call on the host's own key has ended on this phone and the host has
-/// not confirmed that it closed the call at the provider: the host's own absence rule decides
-/// when, and the call may be charged until then.
+/// What a person is told when a call on the host's own key has ended on this phone and the stop was
+/// not sent to the host, so the host was not asked: the host's own absence rule decides when it
+/// closes the call, and the call may be charged until then.
 pub(super) const LEFT_TO_HOST: &str = "The call has ended on this phone. This host starts closing \
     the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm \
     that, the call may keep running on your OpenAI account until OpenAI ends it.";
@@ -33,8 +33,8 @@ pub(super) const HOST_FOUND_CLOSED: &str = "This phone could not find the call a
     call ended on this phone. The host has since said that OpenAI closed the call.";
 
 /// What a person is told when this phone heard nothing from the host for as long as the host waits
-/// before it closes a call, and the host has since said, in its answer to the stop, that the call is
-/// over.
+/// before it closes a call, and the host has since said that the call is over: in its answer to the
+/// stop, in the news this phone read while the call closed, or in its final status.
 pub(super) const HOST_SILENT_SETTLED: &str = "This phone heard nothing from the host for two \
     minutes, so the call ended on this phone. The host has since said that the call is over.";
 
