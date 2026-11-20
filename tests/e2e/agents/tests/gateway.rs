@@ -7498,12 +7498,32 @@ fn a_sleeper_the_cases_that_leave_a_child_start() {
     }
 }
 
+/// How long a child that left its process group may take to end after the host has stopped, where
+/// the host's own closure ends it.
+const ENDED_WITH_THE_HOST: Duration = Duration::from_secs(10);
+
+/// Whether the process `pid` runs, as `kill -0` says.
+fn is_running(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// A stand-in agent that, once it has started, starts a child that leaves its process group, is
 /// adopted by the system's first process, and names nothing of the run on its command line, in the
 /// run's working directory, with the environment the agent has or with none. The host is then
 /// stopped and the run's closing check made: the child that kept its environment, which carries the
 /// run's marker, is found and fails the check, and ended by its number the check then passes; the
 /// child that cleared its environment is the limit the check names, and passes.
+///
+/// On Linux the worker is the child subreaper, so the system hands the child to the worker and not
+/// to the first process, and where the host delegates a control group the worker's closure ends
+/// every process in it, one that left its process group included, when the host stops. The check
+/// then has nothing to find, and passes. That is accepted only for a child that is no longer
+/// running within [`ENDED_WITH_THE_HOST`] of the stop, by `kill -0`, with the check Ok; any other
+/// result meets the assertion above.
 fn an_agent_leaves_a_child_outside_its_group(keeps_environment: bool) {
     if std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty()) {
         // The stand-in is the agent here; a real agent is never asked to leave a child behind.
@@ -7564,13 +7584,22 @@ fn an_agent_leaves_a_child_outside_its_group(keeps_environment: bool) {
         .parse()
         .expect("a number");
     session.host.stop().expect("the host stops");
+    let ended_with_the_host = cfg!(target_os = "linux") && {
+        let waited = Instant::now();
+        while is_running(child) && waited.elapsed() < ENDED_WITH_THE_HOST {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        !is_running(child)
+    };
     let closing = ctx.run.closing_check();
     if keeps_environment {
-        let said = closing.expect_err("the child that kept its environment is found");
-        assert!(
-            said.contains(&format!("process {child} holds the run's marker")),
-            "{said}"
-        );
+        if !(ended_with_the_host && closing.is_ok()) {
+            let said = closing.expect_err("the child that kept its environment is found");
+            assert!(
+                said.contains(&format!("process {child} holds the run's marker")),
+                "{said}"
+            );
+        }
     } else {
         let passed = closing.expect("the child that cleared its environment is the named limit");
         assert!(
@@ -7582,13 +7611,7 @@ fn an_agent_leaves_a_child_outside_its_group(keeps_environment: bool) {
         .arg(child.to_string())
         .status();
     let waited = Instant::now();
-    while std::process::Command::new("/bin/kill")
-        .args(["-0", &child.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-        && waited.elapsed() < LIVENESS
-    {
+    while is_running(child) && waited.elapsed() < LIVENESS {
         std::thread::sleep(Duration::from_millis(50));
     }
     ctx.run
