@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::compiler::{SightKind, Sighting};
 use super::narrower::{
     Account, Evidence, Helper, Input, Item, LevelRecord, Narrower, Range, Reader, Sender,
-    check_narrower,
+    check_held, check_narrower,
 };
 use super::walker::{Depth, Followed, Lookup};
 use super::{REMOVED, Root, Same, compare_with_records};
@@ -1501,5 +1501,135 @@ fn a_change_of_another_root_or_digest_is_not_excused_by_an_entry_for_its_neighbo
     assert_eq!(
         compare(record_t, &one, &[], &other_narrower, false, false),
         vec![text.to_owned()]
+    );
+}
+
+/// What a release holds of the rule: the root and the helper.
+fn a_release_with(root: Lookup, helper: Lookup) -> Fixed {
+    Fixed {
+        krates: BTreeMap::new(),
+        roots: BTreeMap::from([(ROOT.to_owned(), root)]),
+        items: BTreeMap::from([(at("kr_worker", "helper_fn"), helper)]),
+        sightings: Ok(Vec::new()),
+    }
+}
+
+fn the_entry_holds_in(world: &World, releases: &[(&str, &Fixed)]) -> Vec<String> {
+    let roots: Vec<Root> = world
+        .roots
+        .iter()
+        .map(|(label, krate, depth)| the_root(label, krate, *depth))
+        .collect();
+    let releases: Vec<(&str, &dyn Reader)> = releases
+        .iter()
+        .map(|(tag, release)| (*tag, *release as &dyn Reader))
+        .collect();
+    check_held(std::slice::from_ref(&world.entry), &roots, &releases)
+}
+
+const EARLY: &str = "packages/v0.78.0+aaaaaaaaaaaa";
+const LATE: &str = "packages/v0.78.1+bbbbbbbbbbbb";
+
+#[test]
+fn the_root_and_the_helper_are_held_to_every_release_of_the_level() {
+    let world = control();
+    let same = a_release_with(found("dig"), found("h-now"));
+    assert_eq!(
+        the_entry_holds_in(&world, &[(EARLY, &same), (LATE, &same)]),
+        none()
+    );
+
+    // The root: another digest, no root, a root that cannot be read; the tag is named, and the
+    // release that holds it is not.
+    let root = |lookup: Lookup| {
+        the_entry_holds_in(
+            &world,
+            &[
+                (EARLY, &same),
+                (LATE, &a_release_with(lookup, found("h-now"))),
+            ],
+        )
+    };
+    assert_eq!(
+        root(found("other")),
+        vec![said(&format!(
+            "{LATE} has the digest other for the root, the entry names dig"
+        ))]
+    );
+    assert_eq!(
+        root(Lookup::Absent),
+        vec![said(&format!("the root is absent in {LATE}"))]
+    );
+    assert_eq!(
+        root(Lookup::Failed("e".to_owned())),
+        vec![said(&format!("the root cannot be read in {LATE}: e"))]
+    );
+
+    // The helper, the same three ways, apart from the root.
+    let helper = |lookup: Lookup| {
+        the_entry_holds_in(
+            &world,
+            &[
+                (EARLY, &a_release_with(found("dig"), lookup)),
+                (LATE, &same),
+            ],
+        )
+    };
+    assert_eq!(
+        helper(found("other")),
+        vec![said(&format!(
+            "{EARLY} has the digest other for the helper kr_worker::helper_fn, the entry names h-now"
+        ))]
+    );
+    assert_eq!(
+        helper(Lookup::Absent),
+        vec![said(&format!(
+            "the helper kr_worker::helper_fn is absent in {EARLY}"
+        ))]
+    );
+    assert_eq!(
+        helper(Lookup::Failed("e".to_owned())),
+        vec![said(&format!(
+            "the helper kr_worker::helper_fn cannot be read in {EARLY}: e"
+        ))]
+    );
+
+    // Both at once, in the order root then helper.
+    assert_eq!(
+        the_entry_holds_in(
+            &world,
+            &[(EARLY, &a_release_with(Lookup::Absent, Lookup::Absent))]
+        ),
+        vec![
+            said(&format!("the root is absent in {EARLY}")),
+            said(&format!(
+                "the helper kr_worker::helper_fn is absent in {EARLY}"
+            )),
+        ]
+    );
+}
+
+#[test]
+fn an_entry_whose_root_no_root_has_is_told_once_and_nothing_else_is_read() {
+    let mut world = control();
+    world.roots.clear();
+    let same = a_release_with(found("dig"), found("h-now"));
+    assert_eq!(
+        the_entry_holds_in(&world, &[(EARLY, &same), (LATE, &same)]),
+        vec![said(
+            "no root has this label, so no release can be held to it"
+        )]
+    );
+}
+
+#[test]
+fn no_entry_and_no_release_are_no_problem() {
+    let world = control();
+    assert_eq!(the_entry_holds_in(&world, &[]), none());
+    let roots = [the_root(ROOT, "kr_worker", Depth::Alone)];
+    let wrong = a_release_with(found("other"), Lookup::Absent);
+    assert_eq!(
+        check_held(&[], &roots, &[(EARLY, &wrong as &dyn Reader)]),
+        none()
     );
 }
