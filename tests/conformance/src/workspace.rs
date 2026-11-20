@@ -733,6 +733,84 @@ bench = false
         );
     }
 
+    /// A package `a` with one target of each kind, as `cargo metadata` lists them, in the folder
+    /// `root` that holds its manifest.
+    fn a_target_of_each_kind(root: &Path) -> Value {
+        let manifest = root.join("Cargo.toml");
+        let target = |kind: &str, name: &str, test: bool| {
+            let src = root.join(format!("{kind}-{name}.rs"));
+            serde_json::json!({ "kind": [kind], "name": name, "src_path": src, "test": test })
+        };
+        serde_json::json!({
+            "workspace_root": root,
+            "workspace_members": ["path+file:///w/a#0.1.0"],
+            "workspace_default_members": ["path+file:///w/a#0.1.0"],
+            "packages": [{
+                "id": "path+file:///w/a#0.1.0",
+                "name": "a",
+                "version": "0.1.0",
+                "manifest_path": manifest,
+                "targets": [
+                    target("lib", "a", true),
+                    target("bin", "a", true),
+                    target("test", "flow", true),
+                    target("bench", "speed", false),
+                    target("example", "plain", false)
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn a_target_is_benchmarked_by_its_kind_where_its_manifest_says_nothing() {
+        let packages = parse(&a_target_of_each_kind(Path::new("/w/a"))).expect("parses");
+        let benchmarked: Vec<(TargetKind, bool)> = packages[0]
+            .targets
+            .iter()
+            .map(|target| (target.id.kind, target.benchmarked))
+            .collect();
+        assert_eq!(
+            benchmarked,
+            [
+                (TargetKind::Lib, true),
+                (TargetKind::Bin, true),
+                (TargetKind::Test, false),
+                (TargetKind::Bench, true),
+                (TargetKind::Example, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_manifests_bench_key_decides_whether_its_target_is_benchmarked_over_the_kind() {
+        let root = tempfile::tempdir().expect("a directory");
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"a\"\n\n[lib]\nbench = false\n\n[[bin]]\nname = \"a\"\n\n[[test]]\nname = \"flow\"\nbench = true\n\n[[bench]]\nname = \"speed\"\nbench = false\n",
+        )
+        .expect("writes");
+        std::fs::write(root.path().join("Cargo.lock"), "version = 4\n").expect("writes");
+        let value = a_target_of_each_kind(root.path());
+        let packages = describe(root.path(), "Cargo.toml", &value).expect("described");
+        let benchmarked: Vec<(TargetKind, bool)> = packages[0]
+            .targets
+            .iter()
+            .map(|target| (target.id.kind, target.benchmarked))
+            .collect();
+        // The library and the benchmark say `bench = false` against their kinds' default, the test
+        // says `bench = true` against its own, and the binary and the example say nothing.
+        assert_eq!(
+            benchmarked,
+            [
+                (TargetKind::Lib, false),
+                (TargetKind::Bin, true),
+                (TargetKind::Test, true),
+                (TargetKind::Bench, false),
+                (TargetKind::Example, false)
+            ]
+        );
+    }
+
     #[test]
     fn a_target_carries_its_required_features_and_a_package_its_features_and_its_dev_dependency_on_itself()
      {
