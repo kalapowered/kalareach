@@ -486,6 +486,20 @@ mod b;
 #[cfg(test)]
 #[path = "folder"]
 mod holder { mod nested; }
+mod plain;
+#[cfg(test)]
+#[path = "d/inner.rs"]
+mod inner_test;
+mod product_raw;
+#[cfg(test)]
+#[path = "shared.rs"]
+mod support;
+mod product_commented;
+#[cfg(test)]
+#[path = "shared2.rs"]
+mod support_two;
+#[cfg(test)]
+mod r#loop;
 "##;
 
 #[test]
@@ -507,6 +521,26 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
         ("child.rs", sends("from_beside", "AgentTurnSteer")),
         // Under an inline module whose `#[path]` is a folder, which a test attribute marks.
         ("folder/nested.rs", sends("from_nested", "AgentTurnCancel")),
+        // An inline `#[path]` in a file that is no `mod.rs`: relative to the file's folder.
+        (
+            "plain.rs",
+            "#[path = \"d\"]\nmod p { mod inner; }\n".to_owned(),
+        ),
+        ("d/inner.rs", sends("from_inner_d", "AgentTurnSteer")),
+        // A file a test module reaches by path and a product module reaches by path from a module
+        // with a raw name, and from one with a comment before its name.
+        (
+            "product_raw.rs",
+            "#[path = \"shared.rs\"]\nmod r#type;\n".to_owned(),
+        ),
+        ("shared.rs", sends("from_shared", "AgentTurnSteer")),
+        (
+            "product_commented.rs",
+            "#[path = \"shared2.rs\"]\nmod/* a note */commented;\n".to_owned(),
+        ),
+        ("shared2.rs", sends("from_shared_two", "AgentTurnSteer")),
+        // A test module with a raw name is the file of the name without `r#`.
+        ("loop.rs", sends("from_loop", "AgentTurnCancel")),
     ] {
         write(
             folder.path(),
@@ -514,10 +548,17 @@ fn a_module_file_is_product_where_a_product_declaration_reaches_it_however_the_p
             &text,
         );
     }
-    let expected: BTreeMap<String, Vec<SightKind>> = ["from_a", "from_beside", "from_wide"]
-        .into_iter()
-        .map(|name| (name.to_owned(), vec![SightKind::Names]))
-        .collect();
+    let expected: BTreeMap<String, Vec<SightKind>> = [
+        "from_a",
+        "from_beside",
+        "from_inner_d",
+        "from_shared",
+        "from_shared_two",
+        "from_wide",
+    ]
+    .into_iter()
+    .map(|name| (name.to_owned(), vec![SightKind::Names]))
+    .collect();
     let scan = |root: &Path| {
         let tree = Tree::at(root).expect("the tree");
         let sightings = tree
