@@ -2365,9 +2365,10 @@ mod windows {
     /// Gives a file that already stood at the name the list [`create_owner_only_file`] sets,
     /// through the handle that opened it, before anything is written through the handle.
     ///
-    /// The owner is checked by the rule that decides who may own a file this process creates, the
-    /// volume is asked whether it keeps access lists before the list is set, and the list is read
-    /// back as it is for a new file.
+    /// The volume is asked whether it keeps access lists first, because a volume that keeps none
+    /// gives every file the world descriptor, whose owner is Everyone, and its refusal has to be
+    /// the one for the volume. Then the owner is checked by the rule that decides who may own a
+    /// file this process creates, the list is set, and it is read back as it is for a new file.
     fn narrow_existing_file(
         path: &Path,
         file: &std::fs::File,
@@ -2379,6 +2380,12 @@ mod windows {
 
         #[cfg(test)]
         let at_open = tests::at_open();
+        let keeps = volume_keeps_lists(file)?;
+        #[cfg(test)]
+        let keeps = keeps && !at_open.keeps_no_lists;
+        if !keeps {
+            return Err(no_lists_refusal());
+        }
         let held = query_descriptor(file.as_handle(), OWNER_SECURITY_INFORMATION)
             .and_then(|descriptor| read_descriptor(&descriptor))
             .map_err(refusal_error)?;
@@ -2395,12 +2402,6 @@ mod windows {
                 "the file belongs to another account, so it cannot be made readable by its owner \
                  alone",
             ));
-        }
-        let keeps = volume_keeps_lists(file)?;
-        #[cfg(test)]
-        let keeps = keeps && !at_open.keeps_no_lists;
-        if !keeps {
-            return Err(no_lists_refusal());
         }
         // SAFETY: the handle is open for the call and holds the right to change the list, and the
         // descriptor lives as long as `built`, which the caller holds past the call.
