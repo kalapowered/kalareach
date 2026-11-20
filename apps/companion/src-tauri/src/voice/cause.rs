@@ -6,8 +6,8 @@ use kr_protocol::voice_host::{HOST_CLIENT_ABSENT_SECONDS, VoiceEndReason, VoiceP
 use super::host_control::{CloseWord, HostEnding};
 use super::view::HostEnd;
 
-/// What a person is told when a call on the host's own key has ended on this phone and the stop was
-/// not sent to the host, so the host was not asked: the host's own absence rule decides when it
+/// What a person is told when a call on the host's own key has ended on this phone and the stop did
+/// not reach the host, so the host was not asked: the host's own absence rule decides when it
 /// closes the call, and the call may be charged until then.
 pub(super) const LEFT_TO_HOST: &str = "The call has ended on this phone. This host starts closing \
     the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm \
@@ -217,7 +217,7 @@ impl Cause {
                      was ended."
                         .to_owned()
                 }
-                HostEnding::NotKnown(_) | HostEnding::Silent => LEFT_TO_HOST.to_owned(),
+                HostEnding::NotKnown(_) | HostEnding::Silent => HOST_UNHEARD.to_owned(),
             },
             Self::Deadline => "The call reached its time limit.".to_owned(),
             Self::AccountChanged => {

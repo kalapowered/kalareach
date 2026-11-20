@@ -4242,6 +4242,11 @@ mod tests {
         );
         for cause in [&lost, &silent] {
             assert_eq!(
+                cause.words(),
+                crate::voice::cause::HOST_UNHEARD,
+                "the cause's own words are the host's that this phone did not hear from"
+            );
+            assert_eq!(
                 ended_words(cause, Some(crate::voice::cause::HOST_UNHEARD), false, false),
                 crate::voice::cause::HOST_UNHEARD,
                 "the sentence that leaves the call to the host stands alone"
