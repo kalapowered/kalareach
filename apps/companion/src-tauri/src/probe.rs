@@ -480,7 +480,9 @@ fn is_a_run_name(run: &str) -> bool {
 pub fn take<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<Request> {
     use tauri::Manager as _;
 
-    let directory = app.path().app_data_dir().ok()?.join("kr-probe");
+    let directory = companion_platform::companion_data_dir(app)
+        .ok()?
+        .join("kr-probe");
     let text = std::fs::read_to_string(directory.join("request.json")).ok()?;
     let _ = std::fs::remove_file(directory.join("request.json"));
     let request = serde_json::from_str::<Request>(&text).ok()?;
@@ -492,7 +494,7 @@ pub fn take<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<Request> {
 pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>, request: Request) {
     use tauri::Manager as _;
 
-    let Ok(data) = app.path().app_data_dir() else {
+    let Ok(data) = companion_platform::companion_data_dir(app) else {
         return;
     };
     let directory = data.join("kr-probe");

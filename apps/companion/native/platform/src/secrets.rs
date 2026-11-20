@@ -93,10 +93,7 @@ pub fn keychain_item(access_group: &str, name: &SecretName) -> KeychainItem {
 pub fn open<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<dyn SecretStore>, PlatformError> {
     #[cfg(desktop)]
     {
-        use tauri::Manager as _;
-        let directory = app
-            .path()
-            .app_data_dir()
+        let directory = crate::companion_data_dir(app)
             .map_err(|error| PlatformError::new(format!("no application data directory: {error}")))?
             .join("secrets");
         let opened = kr_crypto::store::open_store(

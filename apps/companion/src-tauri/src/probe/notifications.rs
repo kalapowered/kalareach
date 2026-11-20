@@ -81,7 +81,9 @@ pub struct Request {
 /// Reads the request a script left, when there is one that has not been run.
 #[must_use]
 pub fn take<R: Runtime>(app: &AppHandle<R>) -> Option<Request> {
-    let directory = app.path().app_data_dir().ok()?.join("kr-probe");
+    let directory = companion_platform::companion_data_dir(app)
+        .ok()?
+        .join("kr-probe");
     let text = std::fs::read_to_string(directory.join("push-request.json")).ok()?;
     let request = serde_json::from_str::<Request>(&text).ok()?;
     if !super::is_a_run_name(&request.run) {
@@ -98,7 +100,7 @@ pub fn take<R: Runtime>(app: &AppHandle<R>) -> Option<Request> {
 
 /// Runs what a request asks for, writing each check as it is made.
 pub fn start<R: Runtime>(app: &AppHandle<R>, request: Request) {
-    let Ok(data) = app.path().app_data_dir() else {
+    let Ok(data) = companion_platform::companion_data_dir(app) else {
         return;
     };
     let file = data
