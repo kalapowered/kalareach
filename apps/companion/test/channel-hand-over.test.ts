@@ -140,52 +140,53 @@ describe('a message handed over to the channel store', () => {
     expect(of.drafts.all()).toEqual([])
   })
 
-  const failingKeeps: readonly [
-    string,
-    (of: World) => void,
-    ((held: HeldPrompt) => Promise<boolean>) | null
-  ][] = [
-    [
-      'a refusal that is a local failure',
-      (of) => {
-        of.messages.refuseKeeps({ code: 'RESOURCE_UNAVAILABLE', message: 'refused' })
-      },
-      null
-    ],
-    ['a keep that rejects', () => undefined, () => Promise.reject(new Error('the keep rejected'))]
-  ]
-  it.each(failingKeeps)(
-    'ends as an unknown send for %s and leaves the press record stored',
-    async (_name, arrange, rejecting) => {
-      const of = world()
-      arrange(of)
-      const { book, token } = await pressed(of)
-      const record = token.pressed()[0]
-      const told: (string | null)[] = []
-      const seen: HeldPrompt[] = []
-      const attempt = rejecting ?? keeping(of)
-      book.endSend(
-        token,
-        'handed_over',
-        LOCAL,
-        (id) => told.push(id),
-        async (held) => {
-          seen.push(held)
-          return attempt(held)
-        }
-      )
-      await book.settled()
-      expect(book.handedOver(LOCAL)).toBeNull()
-      expect(book.draft(MAIN).text).toBe('the message')
-      expect(told).toHaveLength(1)
-      // The press record is the one that stays, with the text: the composer takes it back under the same identity.
-      expect(of.drafts.all().map((draft) => [draft.id, draft.text])).toEqual([[record?.id, 'the message']])
-      // The keep was asked with the press record's exact version, and the record took the text back after it.
-      expect(seen.map((held) => held.drafts.map((ref) => [ref.id, ref.revision]))).toEqual([
-        [[record?.id, record?.revision]]
-      ])
-    }
-  )
+  it('ends as an unknown send for a refusal that is a local failure and leaves the press record stored', async () => {
+    const of = world()
+    of.messages.refuseKeeps({ code: 'RESOURCE_UNAVAILABLE', message: 'refused' })
+    const { book, token } = await pressed(of)
+    const record = token.pressed()[0]
+    const told: (string | null)[] = []
+    const seen: HeldPrompt[] = []
+    const attempt = keeping(of)
+    book.endSend(token, 'handed_over', LOCAL, (id) => told.push(id), async (held) => {
+      seen.push(held)
+      return attempt(held)
+    })
+    await book.settled()
+    expect(book.handedOver(LOCAL)).toBeNull()
+    expect(book.draft(MAIN).text).toBe('the message')
+    expect(told).toHaveLength(1)
+    // The press record is the one that stays, with the text: the composer takes it back under the same identity.
+    expect(of.drafts.all().map((draft) => [draft.id, draft.text])).toEqual([[record?.id, 'the message']])
+    // The keep was asked with the press record's exact version, and the record took the text back after it.
+    expect(seen.map((held) => held.drafts.map((ref) => [ref.id, ref.revision]))).toEqual([
+      [[record?.id, record?.revision]]
+    ])
+  })
+
+  it('ends as an unknown send for a keep that rejects and leaves the press record stored', async () => {
+    const of = world()
+    const { book, token } = await pressed(of)
+    const record = token.pressed()[0]
+    const told: (string | null)[] = []
+    const seen: HeldPrompt[] = []
+    const attempt = (held: HeldPrompt): Promise<boolean> =>
+      Promise.reject(new Error(`the keep of ${held.text.length} characters rejected`))
+    book.endSend(token, 'handed_over', LOCAL, (id) => told.push(id), async (held) => {
+      seen.push(held)
+      return attempt(held)
+    })
+    await book.settled()
+    expect(book.handedOver(LOCAL)).toBeNull()
+    expect(book.draft(MAIN).text).toBe('the message')
+    expect(told).toHaveLength(1)
+    // The press record is the one that stays, with the text: the composer takes it back under the same identity.
+    expect(of.drafts.all().map((draft) => [draft.id, draft.text])).toEqual([[record?.id, 'the message']])
+    // The keep was asked with the press record's exact version, and the record took the text back after it.
+    expect(seen.map((held) => held.drafts.map((ref) => [ref.id, ref.revision]))).toEqual([
+      [[record?.id, record?.revision]]
+    ])
+  })
 
   it('owes the removal of the draft when the discard fails after the keep, and makes it at the next start', async () => {
     const of = world()
@@ -219,34 +220,57 @@ describe('a message handed over to the channel store', () => {
     expect(repaired.draft(MAIN).text).toBe('')
   })
 
-  it.each(['applied', 'refused'] as const)(
-    'changes nothing when a %s receipt arrives during the keep, even with the same text typed again',
-    async (state) => {
-      const of = world()
-      const { book, token } = await pressed(of)
-      let release: () => void = () => undefined
-      const gate = new Promise<void>((resolve) => {
-        release = resolve
-      })
-      const inner = keeping(of)
-      book.endSend(token, 'handed_over', LOCAL, undefined, async (held) => {
-        await gate
-        return inner(held)
-      })
-      expect(book.handedOver(LOCAL)).toBe('pending')
-      type(book, MAIN, 'the message')
-      book.sendSettled(LOCAL, state)
-      const before = of.drafts.calls.length
-      release()
-      await book.settled()
-      // The store saw the keep's own removal of the press record and the typed words, and nothing
-      // else: no receipt cleared a composer and none returned text to it.
-      expect(of.drafts.calls.slice(before)).toEqual([{ kind: 'discard' }, { kind: 'save', text: 'the message' }])
-      expect(book.draft(MAIN).text).toBe('the message')
-      expect(of.messages.all()).toHaveLength(1)
-      expect(book.handedOver(LOCAL)).toBe('kept')
-    }
-  )
+  it('changes nothing when a applied receipt arrives during the keep, even with the same text typed again', async () => {
+    const of = world()
+    const { book, token } = await pressed(of)
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const inner = keeping(of)
+    book.endSend(token, 'handed_over', LOCAL, undefined, async (held) => {
+      await gate
+      return inner(held)
+    })
+    expect(book.handedOver(LOCAL)).toBe('pending')
+    type(book, MAIN, 'the message')
+    book.sendSettled(LOCAL, 'applied')
+    const before = of.drafts.calls.length
+    release()
+    await book.settled()
+    // The store saw the keep's own removal of the press record and the typed words, and nothing
+    // else: no receipt cleared a composer and none returned text to it.
+    expect(of.drafts.calls.slice(before)).toEqual([{ kind: 'discard' }, { kind: 'save', text: 'the message' }])
+    expect(book.draft(MAIN).text).toBe('the message')
+    expect(of.messages.all()).toHaveLength(1)
+    expect(book.handedOver(LOCAL)).toBe('kept')
+  })
+
+  it('changes nothing when a refused receipt arrives during the keep, even with the same text typed again', async () => {
+    const of = world()
+    const { book, token } = await pressed(of)
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const inner = keeping(of)
+    book.endSend(token, 'handed_over', LOCAL, undefined, async (held) => {
+      await gate
+      return inner(held)
+    })
+    expect(book.handedOver(LOCAL)).toBe('pending')
+    type(book, MAIN, 'the message')
+    book.sendSettled(LOCAL, 'refused')
+    const before = of.drafts.calls.length
+    release()
+    await book.settled()
+    // The store saw the keep's own removal of the press record and the typed words, and nothing
+    // else: no receipt cleared a composer and none returned text to it.
+    expect(of.drafts.calls.slice(before)).toEqual([{ kind: 'discard' }, { kind: 'save', text: 'the message' }])
+    expect(book.draft(MAIN).text).toBe('the message')
+    expect(of.messages.all()).toHaveLength(1)
+    expect(book.handedOver(LOCAL)).toBe('kept')
+  })
 
   it('names the one reference the press left when the press write failed', async () => {
     const of = world()
