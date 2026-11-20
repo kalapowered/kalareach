@@ -603,6 +603,7 @@ fn the_check_lets_through_the_groups_own_calls_and_no_other() {
     let all = format!("{start} {term} {kill}");
     assert!(allowed("tree.rs", &group_with(&all)));
     assert!(allowed("tree.rs", &group_with(term)));
+    let mut let_through = Vec::new();
     for (what, path, source) in [
         (
             "the same text in another file",
@@ -715,8 +716,11 @@ fn the_check_lets_through_the_groups_own_calls_and_no_other() {
             ),
         ),
     ] {
-        assert!(!allowed(path, &source), "{what}: let through");
+        if allowed(path, &source) {
+            let_through.push(what);
+        }
     }
+    assert!(let_through.is_empty(), "let through: {let_through:#?}");
 }
 
 #[test]
