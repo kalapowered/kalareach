@@ -641,29 +641,40 @@ fn set_by_the_report(name: &str) -> Option<&'static str> {
 }
 
 /// The parts of `output` below `{evidence}/conformance/`, in lower case, or why it is not a place a
-/// step may write its output: it is below that directory, in no part empty, `.` or `..` or ending
-/// with a dot or a space, and not in the report's own directory of logs or its result. The parts
-/// are in lower case because the file systems of macOS and Windows name one file by `Logs` and
-/// `logs`, and Windows by `x` and `x.` too.
+/// step may write its output, in words that follow the output's name. Each part holds ASCII
+/// letters, digits, `.`, `-` and `_` and no more, is not empty, `.` or `..` and does not end with a
+/// dot or a space, and the first is not the report's own directory of logs or its result. The
+/// grammar is what every file system of the platforms agrees on, and so a name in ASCII lower case
+/// is the one name each takes it for: the file systems of macOS and Windows name one file by `Logs`
+/// and `logs`, and Windows by `x` and `x.` too, and a file system may take a letter outside ASCII
+/// for another.
 fn output_parts(output: &str) -> Result<Vec<String>, String> {
     let Some(rest) = output.strip_prefix("{evidence}/conformance/") else {
-        return Err("is not below `{evidence}/conformance/`".to_owned());
+        return Err("which is not below `{evidence}/conformance/`".to_owned());
     };
     if rest.contains(['{', '}', '\\']) {
-        return Err("holds a placeholder or a backslash".to_owned());
+        return Err("which holds a placeholder or a backslash".to_owned());
     }
-    let parts: Vec<String> = rest.split('/').map(str::to_ascii_lowercase).collect();
-    if parts
-        .iter()
-        .any(|part| matches!(part.as_str(), "" | "." | ".."))
-    {
-        return Err("holds `..`, `.` or an empty part".to_owned());
+    let parts: Vec<&str> = rest.split('/').collect();
+    if parts.iter().any(|part| matches!(*part, "" | "." | "..")) {
+        return Err("which holds `..`, `.` or an empty part".to_owned());
     }
     if parts.iter().any(|part| part.ends_with(['.', ' '])) {
-        return Err("holds a part that ends with a dot or a space".to_owned());
+        return Err("which holds a part that ends with a dot or a space".to_owned());
     }
+    if let Some(part) = parts.iter().find(|part| {
+        !part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    }) {
+        return Err(format!(
+            "whose part `{part}` holds a character outside the portable set: letters, digits, `.`, \
+             `-` and `_`"
+        ));
+    }
+    let parts: Vec<String> = parts.into_iter().map(str::to_ascii_lowercase).collect();
     if matches!(parts[0].as_str(), "logs" | "result.json") {
-        return Err("is the report's own: its logs and its result are there".to_owned());
+        return Err("which is the report's own: its logs and its result are there".to_owned());
     }
     Ok(parts)
 }
@@ -963,7 +974,7 @@ impl Plan {
                         Ok(parts) => parts,
                         Err(why) => {
                             return refuse(format!(
-                                "step `{id}` names the `output` `{output}`, which {why}"
+                                "step `{id}` names the `output` `{output}`, {why}"
                             ));
                         }
                     };
