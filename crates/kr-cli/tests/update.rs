@@ -3470,7 +3470,7 @@ fn a_channel_root_that_gives_one_key_to_two_roles_is_not_trusted() {
 /// The three channel roots a host refuses for their keys: one that gives a key to two roles, one
 /// that names a key twice in a role under two identifiers, and one that names a key that is not an
 /// Ed25519 key of 32 bytes, the targets key in its 44-byte wrapper. Each is the harness's own root
-/// with that one change.
+/// with that one change, signed again by its root key, so that the keys are its only defect.
 struct RootsRefusedForTheirKeys {
     shared: String,
     twice: String,
@@ -3500,9 +3500,14 @@ fn roots_refused_for_their_keys() -> RootsRefusedForTheirKeys {
             .expect("an identifier")
             .to_owned();
         change(&mut document, &targets);
+        let edited: tough::schema::Root =
+            serde_json::from_value(document["signed"].clone()).expect("root metadata");
+        let canonical = tough::schema::Role::canonical_form(&edited).expect("canonical");
+        document["signatures"] =
+            serde_json::to_value([signature(&k.root, &canonical)]).expect("a signature");
         document.to_string()
     };
-    RootsRefusedForTheirKeys {
+    let roots = RootsRefusedForTheirKeys {
         shared: channel_root_over(1, [&k.root, &k.targets, &k.root, &k.timestamp], &[&k.root]),
         // The targets key named a second time under another identifier: a member added to its
         // description gives it another name and leaves the key as it was.
@@ -3534,7 +3539,22 @@ fn roots_refused_for_their_keys() -> RootsRefusedForTheirKeys {
             document["signed"]["keys"][&name] = key;
             document["signed"]["roles"]["targets"]["keyids"] = serde_json::json!([name]);
         }),
+    };
+    // Each is signed by the keys its own root role names, so the key sentence is what a root shows
+    // whose only defect is its keys.
+    for (what, text) in [
+        ("shared", &roots.shared),
+        ("twice", &roots.twice),
+        ("wrapped", &roots.wrapped),
+    ] {
+        let signed: tough::schema::Signed<tough::schema::Root> =
+            serde_json::from_str(text).expect("root metadata");
+        assert!(
+            signed.signed.verify_role(&signed).is_ok(),
+            "the {what} root is signed by its own root key"
+        );
     }
+    roots
 }
 
 /// What a host says of a root a release carries, when it refuses it.
