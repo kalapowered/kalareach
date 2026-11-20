@@ -34,8 +34,8 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_protocol::voice::VoiceDelegationId;
 use kr_protocol::voice_host::{
-    VoiceContextSendParams, VoiceContextSendResult, VoiceContextState, VoiceControlArm,
-    VoiceControlParams, VoiceControlResult, VoiceEndReason, VoiceHostCallState, VoiceHostRefusal,
+    VoiceContextSendParams, VoiceContextSendResult, VoiceContextState, VoiceControlAnswer,
+    VoiceControlArm, VoiceControlParams, VoiceEndReason, VoiceHostCallState, VoiceHostRefusal,
     VoiceNewsItem, VoiceNote,
 };
 use tokio::sync::{Notify, mpsc};
@@ -82,7 +82,7 @@ pub(super) trait HostLink: Send + Sync + 'static {
         &'a self,
         action_id: ActionId,
         params: &'a VoiceControlParams,
-    ) -> LinkFuture<'a, VoiceControlResult>;
+    ) -> LinkFuture<'a, VoiceControlAnswer>;
 
     /// Writes a `voice.context.send` under `action_id` and returns the host's answer.
     fn send_context<'a>(
@@ -208,7 +208,7 @@ impl HostLink for SessionLink {
         &'a self,
         action_id: ActionId,
         params: &'a VoiceControlParams,
-    ) -> LinkFuture<'a, VoiceControlResult> {
+    ) -> LinkFuture<'a, VoiceControlAnswer> {
         Box::pin(self.write(Method::VoiceControl, action_id, params))
     }
 
@@ -354,7 +354,7 @@ impl HostControl {
     async fn ask(
         &self,
         arm: VoiceControlArm,
-    ) -> std::result::Result<VoiceControlResult, HostSendError> {
+    ) -> std::result::Result<VoiceControlAnswer, HostSendError> {
         let params = VoiceControlParams {
             voice_session_id: self.voice_session_id,
             arm,
@@ -388,8 +388,8 @@ impl HostControl {
             })
             .await?
         {
-            VoiceControlResult::Admitted { .. } => Ok(()),
-            VoiceControlResult::Refused { reason } => Err(HostSendError::Refused(Some(reason))),
+            VoiceControlAnswer::Admitted { .. } => Ok(()),
+            VoiceControlAnswer::Refused { reason } => Err(HostSendError::Refused(Some(reason))),
             _ => Err(HostSendError::Unanswered),
         }
     }
@@ -397,8 +397,8 @@ impl HostControl {
     /// Tells the host the person's microphone state, which it writes to the provider as advice.
     pub(super) async fn mute(&self, muted: bool) -> std::result::Result<(), HostSendError> {
         match self.ask(VoiceControlArm::Mute { muted }).await? {
-            VoiceControlResult::Admitted { .. } => Ok(()),
-            VoiceControlResult::Refused { reason } => Err(HostSendError::Refused(Some(reason))),
+            VoiceControlAnswer::Admitted { .. } => Ok(()),
+            VoiceControlAnswer::Refused { reason } => Err(HostSendError::Refused(Some(reason))),
             _ => Err(HostSendError::Unanswered),
         }
     }
@@ -412,9 +412,9 @@ impl HostControl {
         let delegation_id =
             VoiceDelegationId::new(delegation).map_err(|_| HostSendError::NotSent)?;
         match self.ask(VoiceControlArm::Heard { delegation_id }).await? {
-            VoiceControlResult::Heard { offset_ms } => Ok(Some(offset_ms.get())),
-            VoiceControlResult::NotHeard => Ok(None),
-            VoiceControlResult::Refused { reason } => Err(HostSendError::Refused(Some(reason))),
+            VoiceControlAnswer::Heard { offset_ms } => Ok(Some(offset_ms.get())),
+            VoiceControlAnswer::NotHeard => Ok(None),
+            VoiceControlAnswer::Refused { reason } => Err(HostSendError::Refused(Some(reason))),
             _ => Err(HostSendError::Unanswered),
         }
     }
@@ -487,7 +487,7 @@ async fn heartbeats(
             answer = tokio::time::timeout(limits.miss_after, link.control(action_id, &params)) => answer,
         };
         match answer {
-            Ok(Ok(VoiceControlResult::Heartbeat {
+            Ok(Ok(VoiceControlAnswer::Heartbeat {
                 state,
                 news,
                 dropped,
@@ -558,7 +558,7 @@ async fn heartbeats(
                 }
             }
             // The host does not know the call for this device: nothing more will be answered.
-            Ok(Ok(VoiceControlResult::Refused { reason })) => {
+            Ok(Ok(VoiceControlAnswer::Refused { reason })) => {
                 let _ = told
                     .send(HostNews::Ended(HostEnding::NotKnown(reason)))
                     .await;

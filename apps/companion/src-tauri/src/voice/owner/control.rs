@@ -157,8 +157,8 @@ mod tests {
 
     use kr_protocol::ids::{ActionId, VoiceSessionId};
     use kr_protocol::voice_host::{
-        VoiceContextSendParams, VoiceContextSendResult, VoiceControlArm, VoiceControlParams,
-        VoiceControlResult, VoiceHostCallState,
+        VoiceContextSendParams, VoiceContextSendResult, VoiceControlAnswer, VoiceControlArm,
+        VoiceControlParams, VoiceHostCallState,
     };
 
     use super::*;
@@ -176,21 +176,22 @@ mod tests {
             &'a self,
             _action_id: ActionId,
             params: &'a VoiceControlParams,
-        ) -> LinkFuture<'a, VoiceControlResult> {
+        ) -> LinkFuture<'a, VoiceControlAnswer> {
             self.arms
                 .lock()
                 .expect("the record")
                 .push(params.arm.clone());
             let refuse = self.refuse_writes;
             let answer = match &params.arm {
-                VoiceControlArm::Heartbeat { .. } => Ok(VoiceControlResult::Heartbeat {
+                VoiceControlArm::Heartbeat { .. } => Ok(VoiceControlAnswer::Heartbeat {
                     state: VoiceHostCallState::Open,
                     remaining_seconds: 100,
                     news: Vec::new(),
                     dropped: false,
+                    provider_close: kr_protocol::scalars::Nullable::null(),
                 }),
                 _ if refuse => Err(LinkError::NotSent),
-                _ => Ok(VoiceControlResult::Admitted {
+                _ => Ok(VoiceControlAnswer::Admitted {
                     note: kr_protocol::scalars::Nullable::null(),
                 }),
             };

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use kr_protocol::scalars::U64;
 use kr_protocol::voice::VoiceDelegationId;
-use kr_protocol::voice_host::{VoiceNews, VoiceNewsItem};
+use kr_protocol::voice_host::{VoiceNews, VoiceNewsItem, VoiceProviderClose};
 
 use super::*;
 
@@ -36,7 +36,7 @@ fn quiet() -> HostLimits {
 
 /// What the host does with one write.
 enum Step {
-    Answer(VoiceControlResult),
+    Answer(VoiceControlAnswer),
     Hang,
     Fail(LinkError),
 }
@@ -67,7 +67,7 @@ impl HostLink for Script {
         &'a self,
         action_id: ActionId,
         params: &'a VoiceControlParams,
-    ) -> LinkFuture<'a, VoiceControlResult> {
+    ) -> LinkFuture<'a, VoiceControlAnswer> {
         self.seen
             .lock()
             .expect("the record")
@@ -102,11 +102,12 @@ fn voice_session() -> VoiceSessionId {
 }
 
 fn open_beat(news: Vec<VoiceNews>) -> Step {
-    Step::Answer(VoiceControlResult::Heartbeat {
+    Step::Answer(VoiceControlAnswer::Heartbeat {
         state: VoiceHostCallState::Open,
         remaining_seconds: 1_700,
         news,
         dropped: false,
+        provider_close: Nullable::null(),
     })
 }
 
@@ -248,7 +249,7 @@ async fn a_host_not_heard_for_two_minutes_ends_the_control_at_that_moment_and_no
 
 #[tokio::test(start_paused = true)]
 async fn a_heartbeat_the_host_refuses_and_a_closed_call_end_the_control_with_their_reason() {
-    let refused = Script::new([Step::Answer(VoiceControlResult::Refused {
+    let refused = Script::new([Step::Answer(VoiceControlAnswer::Refused {
         reason: VoiceHostRefusal::UnknownCall,
     })]);
     let (_control, mut events) = HostControl::open(refused, voice_session(), limits());
@@ -258,13 +259,14 @@ async fn a_heartbeat_the_host_refuses_and_a_closed_call_end_the_control_with_the
     );
     assert!(events.next().await.is_none());
 
-    let closed = Script::new([Step::Answer(VoiceControlResult::Heartbeat {
+    let closed = Script::new([Step::Answer(VoiceControlAnswer::Heartbeat {
         state: VoiceHostCallState::Closed {
             reason: VoiceEndReason::ProviderClosed,
         },
         remaining_seconds: 0,
         news: Vec::new(),
         dropped: true,
+        provider_close: Nullable::some(VoiceProviderClose::Confirmed),
     })]);
     let (_control, mut events) = HostControl::open(closed, voice_session(), limits());
     assert_eq!(
@@ -283,17 +285,17 @@ async fn a_heartbeat_the_host_refuses_and_a_closed_call_end_the_control_with_the
 async fn a_note_a_mute_and_a_question_about_a_delegation_are_written_as_the_arms_the_host_reads() {
     let script = Script::new([
         Step::Hang,
-        Step::Answer(VoiceControlResult::Admitted {
+        Step::Answer(VoiceControlAnswer::Admitted {
             note: Nullable::some(VoiceNote::DelegationAdmitted),
         }),
-        Step::Answer(VoiceControlResult::Admitted {
+        Step::Answer(VoiceControlAnswer::Admitted {
             note: Nullable::null(),
         }),
-        Step::Answer(VoiceControlResult::Heard {
+        Step::Answer(VoiceControlAnswer::Heard {
             offset_ms: U64::new(1_250),
         }),
-        Step::Answer(VoiceControlResult::NotHeard),
-        Step::Answer(VoiceControlResult::Refused {
+        Step::Answer(VoiceControlAnswer::NotHeard),
+        Step::Answer(VoiceControlAnswer::Refused {
             reason: VoiceHostRefusal::AlreadyTold,
         }),
     ]);
