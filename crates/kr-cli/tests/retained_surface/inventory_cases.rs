@@ -285,44 +285,6 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         &[],
         format!("{at}: mod m is at no file the scan can find (tried crates/kr-sender/src/gone.rs)"),
     );
-    // A macro defined twice where one definition can hide the other: in one file, with an export
-    // among them, or with a module under `#[macro_use]` among them.
-    let twice = |files: &str| {
-        format!(
-            "kr_sender: the macro m is defined twice where one definition can hide the other ({files}); the scan reads one definition of a name"
-        )
-    };
-    refuse(
-        "macro_rules! m { () => {}; }\nmacro_rules! m { () => {}; }\n",
-        &[],
-        twice("crates/kr-sender/src/lib.rs, crates/kr-sender/src/lib.rs"),
-    );
-    refuse(
-        "mod other;\n#[macro_export]\nmacro_rules! m { () => {}; }\n",
-        &[("src/other.rs", "macro_rules! m { () => {}; }\n")],
-        twice("crates/kr-sender/src/lib.rs, crates/kr-sender/src/other.rs"),
-    );
-    refuse(
-        "#[macro_use]\nmod other;\nmacro_rules! m { () => {}; }\n",
-        &[("src/other.rs", "macro_rules! m { () => {}; }\n")],
-        twice("crates/kr-sender/src/lib.rs, crates/kr-sender/src/other.rs"),
-    );
-    // A definition in a file whose module declaration is reached from the file of another: the
-    // parent's definition before `mod child;` stays in scope in the child, and the child's can hide
-    // it, whether the child is declared in the parent or further down.
-    refuse(
-        "macro_rules! m { () => {}; }\nmod child;\n",
-        &[("src/child.rs", "macro_rules! m { () => {}; }\n")],
-        twice("crates/kr-sender/src/lib.rs, crates/kr-sender/src/child.rs"),
-    );
-    refuse(
-        "macro_rules! m { () => {}; }\nmod a;\n",
-        &[
-            ("src/a.rs", "mod b;\n"),
-            ("src/a/b.rs", "macro_rules! m { () => {}; }\n"),
-        ],
-        twice("crates/kr-sender/src/lib.rs, crates/kr-sender/src/a/b.rs"),
-    );
     // An item-position macro that nothing defines.
     refuse(
         "thing! { pub struct S; }\n",
@@ -985,24 +947,23 @@ fn a_macro_defined_in_a_function_body_is_a_macro_of_its_own() {
 }
 
 #[test]
-fn a_cfg_attr_that_adds_macro_export_or_macro_use_counts_where_some_configuration_enables_it() {
-    // Two sibling modules define `m`: they are accepted while each is private, and refused when
-    // one definition's scope reaches beyond its module.
-    let define = "macro_rules! m { () => {}; }\n";
-    let hides = |result: Result<Vec<String>, String>| {
-        result.is_err_and(|error| {
-            error.starts_with(
-                "kr_sender: the macro m is defined twice where one definition can hide the other (",
-            )
-        })
+fn a_cfg_attr_that_adds_macro_export_counts_where_the_predicate_is_not_false() {
+    // The other crate exports `shared` where the attribute is written, or a `cfg_attr` that is not
+    // false adds it, and a call with a sighting to a macro it exports is refused.
+    let call = |attribute: &str| {
+        let folder = small_tree("fn f() { shared!(Method::AgentTurnCancel); }\n");
+        write(
+            folder.path(),
+            "crates/kr-worker/src/lib.rs",
+            &format!("{attribute}\nmacro_rules! shared {{ ($m:expr) => {{ $m }}; }}\n"),
+        );
+        let tree = tree_at(folder.path()).expect("the tree");
+        tree.sightings(&|_| true).map(|found| found.len())
     };
-    let siblings = |lib: &str, a: &str| {
-        read_names(
-            lib,
-            &[("src/a.rs", &format!("{a}{define}")), ("src/b.rs", define)],
-        )
-    };
-    let none = Ok(Vec::<String>::new());
+    let refused = Err(
+        "kr_sender: shared! is called with a sighting and kr_worker exports it; the scan does not follow it across crates"
+            .to_owned(),
+    );
     for attribute in [
         "#[macro_export]",
         "#[cfg_attr(unix, macro_export)]",
@@ -1011,59 +972,72 @@ fn a_cfg_attr_that_adds_macro_export_or_macro_use_counts_where_some_configuratio
         "#[cfg_attr(windows, cfg_attr(unix, macro_export))]",
         "#[cfg_attr(some_atom, macro_export)]",
     ] {
-        let found = siblings("mod a;\nmod b;\n", &format!("{attribute}\n"));
-        assert!(hides(found), "{attribute}");
+        assert_eq!(call(attribute), refused, "{attribute}");
     }
     for attribute in [
+        "",
         "#[cfg_attr(test, macro_export)]",
         "#[cfg_attr(all(unix, test), macro_export)]",
         "#[cfg_attr(unix, cfg_attr(test, macro_export))]",
         "#[cfg_attr(unix, allow(unused))]",
     ] {
-        assert_eq!(
-            siblings("mod a;\nmod b;\n", &format!("{attribute}\n")),
-            none,
-            "{attribute}"
-        );
+        assert_eq!(call(attribute), Ok(1), "{attribute}");
     }
-    // `macro_use` on the declaration of a module whose file defines it.
-    let files = [("src/a.rs", define), ("src/b.rs", define)];
-    for attribute in [
-        "#[macro_use]",
-        "#[cfg_attr(unix, macro_use)]",
-        "#[cfg_attr(not(test), macro_use)]",
-    ] {
-        let found = read_names(&format!("{attribute}\nmod a;\nmod b;\n"), &files);
-        assert!(hides(found), "{attribute}");
-    }
-    assert_eq!(
-        read_names("#[cfg_attr(test, macro_use)]\nmod a;\nmod b;\n", &files),
-        none
-    );
-    // `macro_use` on an inline module reaches beyond the module, whether the module is in a file
-    // or in another inline module, and one without it does not.
-    let inline = |attributes: &str| {
-        read_names(
-            "mod a;\nmod b;\n",
-            &[
-                (
-                    "src/a.rs",
-                    &format!("{attributes}\nmod inside {{ {define} }}\n"),
-                ),
-                ("src/b.rs", define),
-            ],
-        )
-    };
-    assert!(hides(inline("#[macro_use]")));
-    assert_eq!(inline(""), none);
-    assert_eq!(inline("#[cfg_attr(test, macro_use)]"), none);
     // A predicate the rule cannot read is its error.
     assert_eq!(
-        siblings("mod a;\nmod b;\n", "#[cfg_attr(not(unix, windows), macro_export)]\n"),
-        Err(
-            "crates/kr-sender/src/a.rs: the scan cannot read the condition not (unix , windows)"
-                .to_owned()
-        )
+        call("#[cfg_attr(not(unix, windows), macro_export)]"),
+        Err("crates/kr-worker/src/lib.rs: the scan cannot read the condition not (unix , windows)".to_owned())
+    );
+}
+
+#[test]
+fn definitions_of_one_macro_name_are_one_under_it_and_add_marks_and_take_none() {
+    use SightKind::{Expands, Names};
+    let marks = |lib: &str, files: &[(&str, &str)]| {
+        let folder = small_tree(lib);
+        for (path, text) in files {
+            write(folder.path(), &format!("crates/kr-sender/{path}"), text);
+        }
+        let tree = tree_at(folder.path()).expect("the tree");
+        tree.sightings(&|krate| krate == "kr_sender")
+            .map(|found| super::walker_cases::names(&found, "kr_sender"))
+    };
+    let both = Ok(BTreeMap::from([
+        ("macro:callee_a".to_owned(), vec![Expands]),
+        ("macro:callee_b".to_owned(), vec![Expands]),
+        ("macro:m".to_owned(), vec![Expands]),
+        ("user".to_owned(), vec![Names]),
+    ]));
+    let callees = "macro_rules! callee_a { () => {}; }\nmacro_rules! callee_b { () => {}; }\n";
+    let user = "pub fn user() { m!(Method::AgentTurnCancel); }\n";
+    // In one file twice, with an export among them.
+    let lib = format!(
+        "{callees}#[macro_export]\nmacro_rules! m {{ () => {{ callee_a!() }}; }}\nmacro_rules! m {{ () => {{ callee_b!() }}; }}\n{user}"
+    );
+    assert_eq!(marks(&lib, &[]), both);
+    // In a parent before `mod child;` and in the child, and in a module under `#[macro_use]`.
+    let lib = format!(
+        "{callees}macro_rules! m {{ () => {{ callee_a!() }}; }}\nmod child;\n{user}"
+    );
+    let child = [("src/child.rs", "macro_rules! m { () => { callee_b!() }; }\n")];
+    assert_eq!(marks(&lib, &child), both);
+    let lib = format!(
+        "{callees}macro_rules! m {{ () => {{ callee_a!() }}; }}\n#[macro_use]\nmod child;\n{user}"
+    );
+    assert_eq!(marks(&lib, &child), both);
+    // One file that two declarations reach holds one definition.
+    let lib = "#[cfg(unix)]\n#[path = \"shared.rs\"]\nmod as_unix;\n\
+               #[cfg(windows)]\n#[path = \"shared.rs\"]\nmod as_windows;\n";
+    let shared = [(
+        "src/shared.rs",
+        "macro_rules! m { () => {}; }\npub fn shared() { m!(Method::AgentTurnCancel); }\n",
+    )];
+    assert_eq!(
+        marks(lib, &shared),
+        Ok(BTreeMap::from([
+            ("macro:m".to_owned(), vec![Expands]),
+            ("shared".to_owned(), vec![Names]),
+        ]))
     );
 }
 

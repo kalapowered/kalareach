@@ -197,9 +197,6 @@ struct Declared {
     name: String,
     candidates: Vec<PathBuf>,
     explicit: bool,
-    /// Whether `#[macro_use]` is on the declaration, so that the macros of its file stay in scope
-    /// after it.
-    macro_use: bool,
 }
 
 /// Whether `path` is a file: a path that is not there, or has a file where a folder should be, is
@@ -231,29 +228,24 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             .display()
             .to_string()
     };
-    let mut todo: Vec<(PathBuf, bool, bool)> = roots
-        .iter()
-        .map(|target| (target.clone(), true, false))
-        .collect();
-    let mut seen: BTreeSet<(PathBuf, bool, bool)> = BTreeSet::new();
+    let mut todo: Vec<(PathBuf, bool)> = roots.iter().map(|target| (target.clone(), true)).collect();
+    let mut seen: BTreeSet<(PathBuf, bool)> = BTreeSet::new();
     let mut reached: BTreeSet<PathBuf> = BTreeSet::new();
-    // For each macro name: where it is defined, and whether the definition's scope reaches
-    // beyond its module (`#[macro_export]`, or a module under `#[macro_use]`).
-    let mut defined: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+    // The names the crate defines a `macro_rules!` for. Definitions of one name, in any place, are one
+    // under it: what either calls is called, so a name defined twice adds marks and takes none away.
+    let mut defined: BTreeSet<String> = BTreeSet::new();
     let mut exported = BTreeSet::new();
     let mut calls: Vec<(String, Vec<String>)> = Vec::new();
     let mut imports: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
     let mut module_set: BTreeSet<String> = BTreeSet::new();
     let mut token_defined: BTreeSet<String> = BTreeSet::new();
-    // For each file the files whose module declarations reach it.
-    let mut parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut method_uses = Vec::new();
     let mut defines_method = false;
     while let Some(visit) = todo.pop() {
         if !seen.insert(visit.clone()) {
             continue;
         }
-        let (path, beside, macro_use) = visit;
+        let (path, beside) = visit;
         let at = shown(&path);
         let real = std::fs::canonicalize(&path).map_err(|error| format!("{at}: {error}"))?;
         if real != path || !path.starts_with(root) {
@@ -286,7 +278,6 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             at: &at,
             path_base: directory.to_owned(),
             modules,
-            macro_use: usize::from(macro_use),
             block: 0,
             declared: Vec::new(),
             defined: Vec::new(),
@@ -303,14 +294,11 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
         if let Some(error) = reader.error {
             return Err(error);
         }
-        for (name, export, leaks) in reader.defined {
+        for (name, export) in reader.defined {
             if export {
                 exported.insert(name.clone());
             }
-            defined
-                .entry(name)
-                .or_default()
-                .push((at.clone(), export || leaks));
+            defined.insert(name);
         }
         calls.extend(reader.calls.into_iter().map(|path| (at.clone(), path)));
         for (local, full) in reader.imports {
@@ -338,11 +326,10 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             };
             match found.as_slice() {
                 [one] => {
-                    parents.entry(shown(one)).or_default().insert(at.clone());
                     // A file that a `#[path]` loads keeps its modules beside it, as `mod.rs` does.
                     let beside =
                         declared.explicit || one.file_name().is_some_and(|name| name == "mod.rs");
-                    todo.push(((*one).clone(), beside, declared.macro_use));
+                    todo.push(((*one).clone(), beside));
                 }
                 [] => {
                     let tried: Vec<&PathBuf> = declared.candidates.iter().collect();
@@ -362,47 +349,8 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             }
         }
     }
-    // Private definitions of a name in files that neither reaches from the other are in scopes that
-    // do not overlap (two sibling modules): the scan takes the calls of both under the name. A
-    // definition in a parent's file before `mod child;` stays in scope in the child, and the child's
-    // can hide it, so the two are one definition of the name that the scan cannot tell apart. One
-    // file twice shadows, and a definition whose scope reaches beyond its module can hide, or be
-    // hidden by, any other.
-    let reaches = |from: &str, to: &str| {
-        let mut seen: BTreeSet<&String> = BTreeSet::new();
-        let mut todo: Vec<&String> = parents.get(to).into_iter().flatten().collect();
-        while let Some(next) = todo.pop() {
-            if next == from {
-                return true;
-            }
-            if seen.insert(next) {
-                todo.extend(parents.get(next.as_str()).into_iter().flatten());
-            }
-        }
-        false
-    };
-    for (name, places) in &defined {
-        let files: BTreeSet<&String> = places.iter().map(|(file, _)| file).collect();
-        let nested = files.iter().any(|outer| {
-            files
-                .iter()
-                .any(|inner| outer != inner && reaches(outer, inner))
-        });
-        if places.len() > 1
-            && (files.len() < places.len() || nested || places.iter().any(|(_, leaks)| *leaks))
-        {
-            return Err(format!(
-                "{krate}: the macro {name} is defined twice where one definition can hide the other ({}); the scan reads one definition of a name",
-                places
-                    .iter()
-                    .map(|(file, _)| file.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-    }
     let scope = Scope {
-        defined: defined.keys().cloned().chain(token_defined).collect(),
+        defined: defined.iter().cloned().chain(token_defined).collect(),
         modules: module_set,
         imports,
     };
@@ -416,7 +364,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
     }
     Ok(Inventory {
         files: reached.into_iter().collect(),
-        defined: defined.into_keys().collect(),
+        defined,
         exported,
         // The crate that defines `Method` names its own variants (`Self::Variant`, a glob of them,
         // an alias) and matches them: it is the definition and is not read as a sender.
@@ -441,11 +389,8 @@ struct Reader<'a> {
     /// How many blocks the visit is inside.
     block: usize,
     declared: Vec<Declared>,
-    /// `macro_rules!` definitions: the name, whether it is exported, and whether a module under
-    /// `#[macro_use]` holds it.
-    defined: Vec<(String, bool, bool)>,
-    /// How many `#[macro_use]` modules the visit is inside (the file itself counts).
-    macro_use: usize,
+    /// `macro_rules!` definitions: the name, and whether it is exported.
+    defined: Vec<(String, bool)>,
     /// The macros called at item position and in the transcribers of a definition, as written.
     calls: Vec<Vec<String>>,
     /// The `macro_rules!` names written in those transcribers.
@@ -618,7 +563,6 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         }
         let name = node.ident.unraw().to_string();
         self.module_names.push(name.clone());
-        let macro_use = self.carries(&node.attrs, "macro_use");
         match path_attribute(&node.attrs) {
             Err(()) => {
                 self.error = Some(format!(
@@ -636,10 +580,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                     };
                     let outer_base = std::mem::replace(&mut self.path_base, inside.clone());
                     let outer_modules = std::mem::replace(&mut self.modules, inside);
-                    let uses = usize::from(macro_use);
-                    self.macro_use += uses;
                     syn::visit::visit_item_mod(self, node);
-                    self.macro_use -= uses;
                     self.path_base = outer_base;
                     self.modules = outer_modules;
                 }
@@ -664,7 +605,6 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                         name,
                         candidates,
                         explicit,
-                        macro_use,
                     });
                 }
             },
@@ -678,8 +618,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         match &node.ident {
             Some(name) if node.mac.path.is_ident("macro_rules") => {
                 let exported = self.carries(&node.attrs, "macro_export");
-                self.defined
-                    .push((name.to_string(), exported, self.macro_use > 0));
+                self.defined.push((name.to_string(), exported));
                 for expansion in transcribers(&node.mac.tokens) {
                     token_calls(&expansion, &mut self.calls, &mut self.token_defined);
                 }
