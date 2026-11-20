@@ -8,6 +8,11 @@ let told = Promise.resolve()
 const tell = (title) => {
   told = told.then(() => shown.setTitle(title))
 }
+// The state that announces a connection, in the order it arrived among the events.
+listen('kr://connection', (published) => {
+  heard.push({ connection: published.payload })
+  tell(JSON.stringify(heard))
+})
 listen('kr://event', (published) => {
   heard.push(published.payload)
   tell(JSON.stringify(heard))

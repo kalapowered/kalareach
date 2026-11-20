@@ -398,6 +398,124 @@ mod window {
                 "the page heard {received:?}, not the events as they were published"
             ));
         }
+        a_hosts_first_events_follow_its_state(app, runtime, &window)
+    }
+
+    /// KR-REQ-10.01: what a host sends first on a connection reaches the page after the state that
+    /// announces the connection, and names that state's revision. The connection is reached by the
+    /// keeper, as the application reaches a host, with the publisher held before it tells the
+    /// announcing state; the host's events are sent meanwhile and are not forwarded until that
+    /// state has been told.
+    fn a_hosts_first_events_follow_its_state(
+        app: &AppHandle,
+        runtime: &tokio::runtime::Runtime,
+        window: &WebviewWindow,
+    ) -> Result<(), String> {
+        use companion_tauri::connection::{Attempt, Connection, Standing};
+
+        // The events the page heard before this leg began.
+        let before = heard(window).len();
+        let mut worker = runtime.block_on(async { ScriptedWorker::start(Challenge::Answered) });
+        let paths = worker.paths();
+        let session_id = worker.session_id;
+        let (session, mut link) = runtime.block_on(async {
+            let reached = companion_tauri::worker::reach(&paths, session_id)
+                .await
+                .map_err(companion_tauri::worker::Unreached::words)?;
+            let transport = kr_client::ipc::IpcTransport::over(reached.client);
+            let session =
+                kr_client::Session::start(transport.shared()).map_err(|error| error.to_string())?;
+            let link = worker.link().await;
+            Ok::<_, String>((session, link))
+        })?;
+        let host = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        let connection = Connection::assembled(session, host, Standing::Owner, None, None);
+        let session = connection.session();
+        // A second subscription, which says when the session has received an event.
+        let mut witness = session.events();
+        let owner =
+            Arc::clone(tauri::Manager::state::<companion_tauri::AppState>(app).contact_owner());
+        let started_at = owner.revision();
+        let mut hold = owner.hold_the_publisher();
+        let mut offered = Some(connection);
+        companion_tauri::connection::reach_host_on_this_machine(app, move || {
+            let next = offered.take();
+            async move { next.map_or(Attempt::Nothing, Attempt::Reached) }
+        })
+        .map_err(|error| error.message)?;
+        runtime.block_on(async {
+            tokio::time::timeout(LIVENESS, hold.reached())
+                .await
+                .map_err(|_| "the publisher did not take the choice's publication".to_owned())
+        })?;
+        // The choice and the connection are each a revision, and the keeper subscribed to the
+        // connection's events before the owner held it.
+        wait_for("the connection being held", || {
+            owner.revision() >= started_at + 2
+        })?;
+        runtime.block_on(async {
+            link.push(
+                "session.state",
+                &json!({ "state": "live", "cursor": 7, "changed": [] }),
+            )
+            .await;
+            link.push_raw(
+                "session.output",
+                ParamsValue::new(kr_cbor::CanonicalValue::Bytes(vec![4, 5, 6])),
+            )
+            .await;
+            for _ in 0..2 {
+                tokio::time::timeout(LIVENESS, witness.recv())
+                    .await
+                    .map_err(|_| "the session did not receive both events".to_owned())?
+                    .map_err(|error| format!("the session's events ended: {error}"))?;
+            }
+            Ok::<_, String>(())
+        })?;
+        // The state that announces the connection is held, so the host's events wait for it.
+        std::thread::sleep(Duration::from_secs(1));
+        let early = heard(window)[before..].to_vec();
+        assert!(
+            early.is_empty(),
+            "the page heard {early:?} before the state that announces the connection was told"
+        );
+
+        hold.release();
+        let heard_now = || heard(window)[before..].to_vec();
+        wait_for("the page hearing the state and both events", || {
+            heard_now()
+                .iter()
+                .filter(|each| each.get("connection").is_none())
+                .count()
+                >= 2
+        })?;
+        let told = heard_now();
+        let first_event = told
+            .iter()
+            .position(|each| each.get("connection").is_none());
+        let last_state = told
+            .iter()
+            .rposition(|each| each.get("connection").is_some());
+        let (Some(first_event), Some(last_state)) = (first_event, last_state) else {
+            panic!("the page heard no state beside the events: {told:?}");
+        };
+        assert!(
+            last_state < first_event,
+            "the page heard the host's first events before the state that announces the connection: {told:?}"
+        );
+        let announced = &told[last_state]["connection"];
+        assert_eq!(announced["connected"], json!(true), "{announced}");
+        assert!(
+            announced["revision"].as_u64().unwrap_or(0) > started_at,
+            "the state names a revision after the choice: {announced}"
+        );
+        for event in &told[first_event..] {
+            assert_eq!(
+                event["revision"], announced["revision"],
+                "each event names the revision of the state it follows: {told:?}"
+            );
+        }
+        session.close();
         Ok(())
     }
 }
