@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Runs the Android push receiver and the scheduler behind it in the application's own process on
-# the emulator, with no screen of the application started (`PushReceiverInstrumentedTest`).
+# the emulator, with no screen of the application started (`PushReceiverInstrumentedTest`), and the
+# voice call's negotiation with a peer in the same process (`VoiceNegotiationTest`).
 #
 # The instrumentation runs as the application, and hands the application's Firebase receiver the
 # data of a message the way the provider does. One case shows a delivery shown by the receiver alone.
@@ -111,9 +112,11 @@ emulator_checked=1
 "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the application did not install"; exit 2; }
 "$adb" -s "$serial" install -r "$tests" >/dev/null || { say "the tests did not install"; exit 2; }
 
-say "running the receiver's cases in the application's process"
+say "running the receiver's cases and the voice call's negotiation cases in the application's process"
+# Both classes are in the one test package; the runner takes a comma-separated list.
+classes=to.kala.reach.companion.push.PushReceiverInstrumentedTest,to.kala.reach.companion.voice.VoiceNegotiationTest
 "$adb" -s "$serial" shell am instrument -w -r \
-    -e class to.kala.reach.companion.push.PushReceiverInstrumentedTest \
+    -e class "$classes" \
     "$app_id.test/androidx.test.runner.AndroidJUnitRunner" >"$artefacts/instrument.txt" 2>&1
 sed 's/^/    /' "$artefacts/instrument.txt" | grep -E "INSTRUMENTATION_STATUS: (test|class|stack|numtests)|INSTRUMENTATION_RESULT|OK \(|FAILURES" | tee -a "$log" >/dev/null
 "$adb" -s "$serial" logcat -d -s KalaReachPush:I >"$artefacts/receiver.log" 2>&1
