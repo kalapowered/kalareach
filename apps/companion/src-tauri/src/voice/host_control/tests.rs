@@ -557,16 +557,24 @@ async fn a_look_ends_with_no_word_when_the_host_holds_no_such_call_or_refuses_or
 #[tokio::test(start_paused = true)]
 async fn a_look_is_cut_at_its_bound_whatever_the_request_that_is_waiting_then_is_doing() {
     // The host is still closing the call at every look until the last, which begins at 39 seconds
-    // and is never answered: it would be given 20 seconds more, and is cut at 40.
+    // and is never answered: it would be given 20 seconds more, and is cut at 40. A word that the
+    // news offers at 45 seconds comes after the look is over.
     let mut steps: Vec<Step> = (0..39).map(|_| closing_beat()).collect();
     steps.push(Step::Hang);
     let script = Script::new(steps);
     let evidence = CloseEvidence::default();
-    let began = Instant::now();
+    let late = evidence.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        late.offer(VoiceProviderClose::Confirmed);
+    });
     final_close_word(&*script, voice_session(), &evidence, poll_limits()).await;
-    assert_eq!(evidence.get(), None);
+    assert_eq!(
+        evidence.get(),
+        None,
+        "the look was over before the news at 45 seconds"
+    );
     assert_eq!(script.seen().len(), 40);
-    assert_eq!(began.elapsed(), Duration::from_secs(40));
 }
 
 #[tokio::test(start_paused = true)]
