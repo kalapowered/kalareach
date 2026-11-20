@@ -393,6 +393,26 @@ fn faults() -> Vec<(&'static str, String, &'static str)> {
             "unknown variant `solaris`",
         ),
         (
+            "a plan with no `[rust]` table",
+            with("").replace("[rust]\nmanifests = []\n", ""),
+            "missing field `rust`",
+        ),
+        (
+            "a `[rust]` table with no manifests",
+            with("").replace("manifests = []\n", ""),
+            "missing field `manifests`",
+        ),
+        (
+            "a plan with no `[ignored_runs]` table",
+            with("").replace("[ignored_runs]\nheld = false\n", ""),
+            "missing field `ignored_runs`",
+        ),
+        (
+            "an `[ignored_runs]` table with no `held`",
+            with("").replace("held = false\n", ""),
+            "missing field `held`",
+        ),
+        (
             "an unrun reason that lacks a platform",
             with("").replace("windows = 'w'\n", ""),
             "missing field `windows`",

@@ -573,6 +573,29 @@ harness = false
     }
 
     #[test]
+    fn the_members_and_the_default_members_of_a_workspace_are_named_by_their_packages() {
+        let package = |id: &str, name: &str| serde_json::json!({ "id": id, "name": name, "version": "0.1.0", "targets": [] });
+        let mut value = serde_json::json!({
+            "workspace_members": ["path+file:///w/a#0.1.0", "path+file:///w/b#0.1.0"],
+            "workspace_default_members": ["path+file:///w/b#0.1.0"],
+            "packages": [package("path+file:///w/b#0.1.0", "b"), package("path+file:///w/a#0.1.0", "a")]
+        });
+        let packages = parse(&value).expect("parses");
+        for package in &packages {
+            assert_eq!(package.workspace_members, ["a", "b"]);
+            assert_eq!(package.workspace_default_members, ["b"]);
+        }
+        // A Cargo that names no default members runs every member.
+        value
+            .as_object_mut()
+            .expect("an object")
+            .remove("workspace_default_members");
+        for package in parse(&value).expect("parses") {
+            assert_eq!(package.workspace_default_members, ["a", "b"]);
+        }
+    }
+
+    #[test]
     fn the_selector_is_the_flag_cargo_test_takes() {
         assert_eq!(TargetKind::Lib.selector("x"), "--lib");
         assert_eq!(
