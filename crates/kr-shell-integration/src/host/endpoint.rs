@@ -19,7 +19,7 @@ use kr_protocol::scalars::Bytes;
 
 #[cfg(not(unix))]
 use crate::contract::transport::WINDOWS_PIPE_PREFIX;
-use crate::contract::transport::{Bootstrap, BridgeEndpoint, ENDPOINT_BASENAME, EndpointKind};
+use crate::contract::transport::{Bootstrap, BridgeEndpoint, ENDPOINT_BASENAME};
 use crate::host::error::{HostError, Result};
 
 /// How many characters of an identifier a bridge endpoint's name carries.
@@ -241,16 +241,6 @@ fn occupied(error: &kr_ipc::IpcError) -> bool {
     )
 }
 
-/// Returns the kind of endpoint this platform listens on.
-#[must_use]
-pub const fn native_kind() -> EndpointKind {
-    if cfg!(windows) {
-        EndpointKind::WindowsNamedPipe
-    } else {
-        EndpointKind::UnixSocket
-    }
-}
-
 /// Checks that a directory admits the owning user alone.
 ///
 /// The check is of the directory this path resolves to: its type, its owner and its mode bits. It
@@ -311,9 +301,18 @@ const fn owner_only_mode(
 mod tests {
     use kr_protocol::scalars::Uuid;
 
-    use crate::contract::transport::BOOTSTRAP_SECRET_LEN;
+    use crate::contract::transport::{BOOTSTRAP_SECRET_LEN, EndpointKind};
 
     use super::*;
+
+    /// The kind of endpoint this platform listens on.
+    const fn native_kind() -> EndpointKind {
+        if cfg!(windows) {
+            EndpointKind::WindowsNamedPipe
+        } else {
+            EndpointKind::UnixSocket
+        }
+    }
 
     fn session() -> SessionId {
         SessionId::new(Uuid::from_bytes([0x5a; 16]))
