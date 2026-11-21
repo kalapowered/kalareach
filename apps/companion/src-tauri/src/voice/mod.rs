@@ -3075,10 +3075,10 @@ mod tests {
         );
     }
 
-    /// The starts a launch kept, by the kinds of D-3731's table, are what the launch that follows
-    /// finds and names: a fresh `Calls` over the file the first one wrote finds the older kept
-    /// start and the start the host never answered as candidates, shows only the notices, and
-    /// offers no hidden start to the page.
+    /// The starts a launch kept, by the `START_*` entry kinds of the view module, are what the
+    /// launch that follows finds and names: a fresh `Calls` over the file the first one wrote
+    /// finds the older kept start and the start the host never answered as candidates, shows only
+    /// the notices, and offers no hidden start to the page.
     #[test]
     fn a_fresh_calls_over_the_file_finds_the_kept_starts_the_refusal_names() {
         let directory = tempfile::tempdir().expect("a folder");
