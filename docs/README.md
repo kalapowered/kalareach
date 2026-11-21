@@ -130,13 +130,17 @@ stops, so a limit that a part has is written in that part's own document.
   the evidence for what it can do, and the approvals. Typed requests to submit or queue a prompt,
   steer or cancel a turn and answer an approval act only where a binding has evidence for them, so
   what an agent offers depends on its package and its build. A bundled agent always runs in its own
-  terminal, as the agent draws it. Unless its package declares a command integration and its owner
-  has turned that on with `kr plugin integration enable`, the command starts as typed. The Codex,
-  Claude Code, Gemini CLI and Qoder CLI packages declare a command integration, the OpenCode and
-  Kimi packages do not. On macOS and Linux, if a program is started another way, it will be adopted
-  as a native terminal and will not be given a gateway afterwards. Where two packages recognise a
+  terminal, as the agent draws it. Its command starts as typed unless its package declares a
+  command integration and the session's list of integrations names the package. The host keeps
+  that list. `kr plugin integration enable` adds a package to it, and so can a hand edit of the
+  configuration document. A profile that names a list of its own replaces the host's. Of the
+  bundled packages, Claude Code, Gemini CLI and Qoder CLI declare a command integration. Codex,
+  OpenCode and Kimi do not. On macOS and Linux, a program started another way is adopted as a
+  native terminal, with no gateway afterwards, only where the session's own shell started it, it
+  holds the terminal and a package recognises the file it runs. Where two packages recognise a
   program equally well, as the two OpenCode packages do for `opencode`, the worker adopts it bound
-  to neither, and its announcement names both. The Claude Code and Gemini CLI
+  to neither, and its announcement names both.
+  The Claude Code and Gemini CLI
   bridges are applied only where a signed index names a qualified build of the agent's executable,
   and no index names one yet. The host applies no bridge to an executable that is a script, and the
   `gemini` that npm installs is one, so a signed index cannot make the Gemini CLI bridge apply to that
