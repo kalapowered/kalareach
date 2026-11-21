@@ -233,8 +233,7 @@ pub(crate) fn check_role_keys(root: &tough::schema::Root, met: Met) -> Catalogue
         if material.len() != identifiers.len() {
             return Err(CatalogueError::Untrusted {
                 detail: format!(
-                    "the root names one key under two identifiers for its {} role, which counts \
-                     it twice toward the role's threshold; {}",
+                    "the root names one key under two identifiers for its {} role; {}",
                     role_name(*role),
                     met.remedy()
                 ),
