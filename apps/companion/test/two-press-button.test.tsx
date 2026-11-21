@@ -85,4 +85,25 @@ describe('a control that commits on its second press', () => {
     expect(screen.getByTestId('control')).not.toHaveAttribute('data-armed')
     expect(commits).not.toHaveBeenCalled()
   })
+
+  it('disarms at a press elsewhere and at Escape though the control never took focus, as in Safari, and not at a press on itself', () => {
+    const commits = vi.fn()
+    shown(commits)
+    const control = screen.getByTestId('control')
+    const arm = () => {
+      fireEvent.keyDown(control, { key: 'Enter' })
+      fireEvent.keyUp(control, { key: 'Enter' })
+      expect(control).toHaveAttribute('data-armed', 'true')
+    }
+    arm()
+    expect(document.activeElement).not.toBe(control)
+    fireEvent.pointerDown(control)
+    expect(control).toHaveAttribute('data-armed', 'true')
+    fireEvent.pointerDown(screen.getByTestId('elsewhere'))
+    expect(control).not.toHaveAttribute('data-armed')
+    arm()
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    expect(control).not.toHaveAttribute('data-armed')
+    expect(commits).not.toHaveBeenCalled()
+  })
 })

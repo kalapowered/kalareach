@@ -1115,6 +1115,14 @@ textarea::placeholder {
     color: var(--text);
   }
 
+  /* A control that waits for its second press keeps the danger colours while a pointer rests on it,
+     which is where the pointer is right after the first press. */
+  .btn[data-armed='true']:hover:not(:disabled) {
+    background: var(--danger-soft);
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+
   .nav-item:not([aria-current='page']):hover,
   .filter:not([aria-pressed='true']):hover {
     background: var(--subtle);
