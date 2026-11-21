@@ -424,6 +424,34 @@ describe('what the host in use shows is stored and shown under the owner’s key
     expect(held.count).toBe(first + 3)
   })
 
+  // The numbers of an epoch are not the numbers of the next: a replacement moves it, the inbox is
+  // read again, and the numbers' read has not answered, so the rows say "A session".
+  it('a_replacement_leaves_the_old_numbers_unshown_while_the_new_numbers_are_unread', async () => {
+    const { controls } = start(null)
+    await waitFor(() => {
+      expect(rowsOf('studio')[0]).toHaveTextContent(/Session \d/)
+    })
+    controls.hold('sessionNumbers')
+    act(() => {
+      controls.setInboxEpoch(2)
+      controls.replaceConnection()
+    })
+    await shown('studio')
+    expect(rowsOf('studio')[0]).toHaveTextContent('A session')
+  })
+
+  it('a_change_of_host_starts_a_read_at_once', async () => {
+    const { controls } = start(null)
+    await shown('studio')
+    const held = controls.hold('attentionRead')
+    const first = held.count
+    act(() => {
+      controls.setPairing({ hosts: [{ ...STUDIO, in_use: false }, { ...LAPTOP, in_use: true }] })
+    })
+    await settle()
+    expect(held.count).toBe(first + 1)
+  })
+
   it('a_reconnection_keeps_the_items_and_a_replacement_hides_them', async () => {
     const { controls } = start(null)
     await shown('studio')
@@ -507,10 +535,11 @@ describe('what another host shows is cached by epoch and serial', () => {
     })
     act(() => {
       controls.setPairing({ hosts: [STUDIO, LAPTOP] })
-      controls.setOtherHosts([laptopOther(5)])
+      controls.setOtherHosts([laptopOther(3)])
     })
     await settle()
-    // The host is paired again and no pass has read it: nothing of the earlier pairing is shown.
+    // The host is paired again, at the epoch the old cache was read under, and no pass has read it:
+    // nothing of the earlier pairing is shown.
     expect(rowsOf('laptop')).toHaveLength(0)
     release()
   })
