@@ -14,12 +14,16 @@
 use super::*;
 
 use kr_e2e_agents::account::conversation_id;
+use kr_e2e_agents::build::Action;
+use kr_e2e_agents::conversation::turn_between;
 use kr_e2e_agents::detect::{
-    Detection, Held, Launched, Shown, announced_now, capabilities_of, check_detected,
-    check_unchanged, wait_for_detection,
+    Detection, Held, Launched, Shown, Surface, announced_now, backend_files, capabilities_of,
+    check_detected, check_observation_only, check_unchanged, wait_for_detection,
 };
-use kr_e2e_agents::observe::live_bindings;
-use kr_e2e_agents::stage::Keyboard;
+use kr_e2e_agents::observe::{
+    AGENT_READS, Answer as Reply, capability_states, live_bindings, typed_actions,
+};
+use kr_e2e_agents::stage::{Keyboard, events_snapshot};
 use kr_e2e_m1b::run::running;
 
 /// What the stand-in started by hand says on its first row.
@@ -64,6 +68,19 @@ fn by_hand_login_case(
         body,
     );
 }
+
+/// The package's actions, as its manifest declares them.
+fn package_actions() -> Vec<Action> {
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(codex_package().join("plugin.json")).expect("the package's manifest"),
+    )
+    .expect("a manifest");
+    serde_json::from_value(manifest["actions"].clone()).expect("the package's actions")
+}
+
+// ---------------------------------------------------------------------------------------------
+// The sessions, the agents and what the host shows of them.
+// ---------------------------------------------------------------------------------------------
 
 /// One of a case's sessions.
 #[derive(Clone, Copy)]
@@ -247,6 +264,48 @@ fn detected(agent: &HandAgent, shown: &Shown, what: &str) {
     }
 }
 
+/// The typed surface a device reaches for the agent in `at`: each typed mutation and each of the
+/// package's upstream actions, the capability records, the resources and every command backend in
+/// the host's runtime directory. The agent reads come back apart.
+fn surface(
+    ctx: &Context,
+    session: &Session<'_>,
+    at: &Seated<'_>,
+    shown: &Shown,
+) -> (Surface, Vec<Reply>) {
+    let upstream: Vec<Action> = package_actions()
+        .into_iter()
+        .filter(Action::upstream)
+        .collect();
+    let answers = typed_actions(
+        at.remote,
+        &ctx.runtime,
+        at.session_id,
+        &codex(),
+        &upstream,
+        Held::of(shown).map(|held| (held.instance, held.revision)),
+    );
+    let (reads, mutations): (Vec<Reply>, Vec<Reply>) = answers
+        .into_iter()
+        .partition(|answer| AGENT_READS.contains(&answer.call.as_str()));
+    let snapshot = events_snapshot(at.remote, &ctx.runtime, at.session_id);
+    let resources = snapshot.agent_resources.resources.len()
+        + usize::from(snapshot.agent_resources.continue_after.0.is_some());
+    (
+        Surface {
+            records: Surface::records_of(shown.binding.as_ref()),
+            answers: mutations,
+            resources,
+            backend_files: backend_files(session.host.roots().runtime_root()),
+        },
+        reads,
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the device types, and what a turn costs.
+// ---------------------------------------------------------------------------------------------
+
 /// The turns a case charged to the budget and the ones it submitted.
 struct Turns<'a> {
     ctx: &'a Context,
@@ -400,6 +459,21 @@ fn first_line_with(text: &str, after: Option<usize>, needles: &[&str]) -> Option
         .map(|(index, _)| index)
 }
 
+/// Waits until a line of the record holds every one of `needles`, and returns its number.
+fn waits_for_a_line(ctx: &Context, real: &Real, needles: &[&str], why: &str) -> usize {
+    let started = Instant::now();
+    loop {
+        if let Some(line) = first_line_with(&record_text(ctx, real), None, needles) {
+            return line;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "{why}: no line of the agent's record holds {needles:?} after {LIVENESS:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Waits, a while at most, until a line of the record holds every one of `needles`: the agent
 /// writes its record of a reply shortly after the screen shows it.
 fn settles(ctx: &Context, real: &Real, needles: &[&str]) {
@@ -410,6 +484,700 @@ fn settles(ctx: &Context, real: &Real, needles: &[&str]) {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+/// The lines of the record from `from`, each by its number, the kind its `type` member names, and
+/// which of `needles` it holds, by their labels: what a failed order check says of where each thing
+/// landed, with none of the lines' text.
+fn outline(text: &str, from: Option<usize>, needles: &[(&str, &str)]) -> String {
+    text.lines()
+        .enumerate()
+        .skip(from.unwrap_or(0))
+        .map(|(index, line)| {
+            let kind = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| value["type"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "?".to_owned());
+            let held: Vec<&str> = needles
+                .iter()
+                .filter(|(_, needle)| line.contains(needle))
+                .map(|(label, _)| *label)
+                .collect();
+            format!("{index}:{kind}:{}", held.join("+"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Part 2a: each of the agent's own terminal controls, from a paired device, on its own.
+// ---------------------------------------------------------------------------------------------
+
+/// Whether a turn still runs, as the view and the record show it.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct Running {
+    busy: bool,
+    unfinished: bool,
+}
+
+impl Running {
+    const fn holds(self) -> bool {
+        self.busy && self.unfinished
+    }
+}
+
+/// Where a prompt entered during a running turn landed in the record, as the queue and steering
+/// checks read it: the line of the running turn's last reply, of the second prompt, and of that
+/// prompt's answer.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+struct Order {
+    /// Whether the running turn still ran across the second prompt's submission: just before, the
+    /// view showed it busy and the record held no closing reply; just after, the record still held
+    /// none.
+    busy_at_submission: bool,
+    /// The reading just before.
+    before: Running,
+    /// The reading just after.
+    after: Running,
+    /// Whether the agent writes a record of a prompt it queued behind a running turn.
+    records_queue: bool,
+    /// Its record of the second prompt, queued, where it wrote one.
+    queued_record: Option<usize>,
+    /// The running turn's reply that finished its work.
+    first_finished: Option<usize>,
+    /// The second prompt.
+    second_prompt: Option<usize>,
+    /// The second prompt's answer.
+    second_answered: Option<usize>,
+    /// Whether a turn started between the running turn's prompt and the second prompt, where the
+    /// agent writes a line at each turn's start.
+    new_turn: Option<bool>,
+}
+
+/// A prompt entered during a turn waited for it: it was entered while the turn ran, the turn's work
+/// finished before the prompt joined the record, the prompt was answered after that, and, where the
+/// agent writes a line at each turn's start, it started a turn of its own.
+///
+/// # Errors
+///
+/// Returns what the order lacks.
+fn check_queued(order: &Order) -> Result<(), String> {
+    match (
+        order.first_finished,
+        order.second_prompt,
+        order.second_answered,
+    ) {
+        _ if !order.busy_at_submission => Err(format!(
+            "the second prompt was not entered while a turn ran: just before {:?}, just after {:?}",
+            order.before, order.after
+        )),
+        _ if order.new_turn == Some(false) => Err(format!(
+            "the second prompt joined the running turn rather than starting one of its own: \
+             {order:?}"
+        )),
+        (finished, _, _)
+            if order.records_queue
+                && !matches!((order.queued_record, finished), (Some(queued), Some(done)) if queued < done) =>
+        {
+            Err(format!(
+                "the agent's record does not hold the second prompt as queued before the turn \
+                 finished: {order:?}"
+            ))
+        }
+        (Some(finished), Some(prompt), Some(answered))
+            if finished < prompt && prompt < answered =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "the record does not hold the turn's finished work, then the prompt, then its answer: \
+             {order:?}"
+        )),
+    }
+}
+
+/// A prompt entered during a turn steered it: it was entered while the turn ran, it joined that
+/// turn, and it was answered. Where the agent writes a line at each turn's start, joining means no
+/// turn started between the running turn's prompt and this one. Where it writes none, the prompt
+/// must have joined the record before the turn's work finished, which it then never did.
+///
+/// # Errors
+///
+/// Returns what the order lacks.
+fn check_steered(order: &Order) -> Result<(), String> {
+    match (
+        order.first_finished,
+        order.second_prompt,
+        order.second_answered,
+        order.new_turn,
+    ) {
+        _ if !order.busy_at_submission => {
+            Err("the steering prompt was not entered while a turn ran".to_owned())
+        }
+        (_, _, _, Some(true)) => Err(format!(
+            "the steering prompt started a turn of its own rather than joining the running one: \
+             {order:?}"
+        )),
+        (_, Some(prompt), Some(answered), Some(false))
+        | (None, Some(prompt), Some(answered), None)
+            if prompt < answered =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "the running turn did not take the prompt: {order:?}"
+        )),
+    }
+}
+
+/// Whether the package leaves the typed queue off (12.08): no record of `agent.prompt.queue` is
+/// advertised as qualified and available, though the agent queues a prompt entered during a turn
+/// on its own terminal.
+///
+/// # Errors
+///
+/// Returns that the queue is advertised.
+fn queue_declared_off(states: &[(String, String)]) -> Result<(), String> {
+    match states
+        .iter()
+        .find(|(capability, _)| capability == "agent.prompt.queue")
+    {
+        Some((_, state)) if state == "qualified_available" => {
+            Err("agent.prompt.queue is advertised as qualified and available".to_owned())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The turn that begins the reply: a long count, and what the screen shows once the reply began.
+/// Interrupted before its reply begins, a turn can be withdrawn whole rather than stopped.
+fn long_turn(mark: &str, reply_mark: Option<&str>) -> (String, String) {
+    match reply_mark {
+        Some(reply_mark) => (
+            format!(
+                "({mark}-i) Without using any tool or file, count from 1 to 400 in your reply, \
+                 one number per line, and write nothing else."
+            ),
+            reply_mark.to_owned(),
+        ),
+        None => (
+            format!(
+                "({mark}-i) Without using any tool or file, write the code {mark} in upper case \
+                 at the start of every line of your reply, then a space and the number, count \
+                 from 1 to 400, one number per line, and write nothing else."
+            ),
+            mark.to_uppercase(),
+        ),
+    }
+}
+
+/// Whether the turn whose prompt is after line `prompt` of the record, and whose reply closes with
+/// `done`, still runs now: the screen is read again for up to `within` while it does not yet show
+/// the agent busy, since an agent drawing its reply redraws its whole screen.
+fn turn_runs(
+    ctx: &Context,
+    real: &Real,
+    person: &Person,
+    prompt: Option<usize>,
+    done: &str,
+    within: Duration,
+) -> Running {
+    let until = Instant::now() + within;
+    loop {
+        let busy = person
+            .window
+            .screen()
+            .iter()
+            .any(|row| row.contains(&real.account.busy));
+        if busy || Instant::now() >= until {
+            return Running {
+                busy,
+                unfinished: first_line_with(
+                    &record_text(ctx, real),
+                    prompt,
+                    &[done, &real.account.reply_line],
+                )
+                .is_none(),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The turn that the real route runs for the queue and for the steering: a count with a closing
+/// line of its own, which only the model writes.
+fn counting_turn(mark: &str, tag: &str, done: &str) -> String {
+    format!(
+        "({mark}-{tag}) Without using any tool or file, count from 1 to 300 in your reply, one \
+         number per line, then write {done} on a line of its own, and nothing else."
+    )
+}
+
+/// KR-REQ-12.32, case 2, part 2a: with the person's login, each of the agent's own terminal
+/// controls from a paired device, on its own. A slash command that calls no model shows its screen.
+/// A long turn stops at the agent's interrupt key, and the agent says so. A prompt entered while a
+/// turn runs, which the view shows busy and whose finishing reply the record does not yet hold
+/// both just before and just after the entry, waits for it: the agent's record holds the turn's
+/// finished work, then the prompt, then its answer. Where the agent steers a running turn with a
+/// prompt entered during it, the turn takes the prompt before its work finishes, which then never
+/// does. The typed steer, queue and commands stay refused, since the launch has only observation
+/// and the terminal. The queue and steering checks are also handed orders made wrong on purpose,
+/// which they must reject (the guard cases below). On the stand-in route, which has no model, the
+/// case shows the device's keys reaching the agent's composer, and the result says so.
+#[test]
+fn gateway_slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device_at_the_agents_terminal()
+ {
+    const TEST: &str = "gateway_slash_commands_interrupts_queued_prompts_and_steering_each_work_from_a_device_at_the_agents_terminal";
+    by_hand_login_case("2a", TEST, Setup::default(), "by-hand", |ctx, session| {
+        let at = seated(session, Seat::First);
+        let agent = starts_by_hand(ctx, session, Seat::First, &[], true);
+        let shown = detects(ctx, &at);
+        detected(&agent, &shown, "the agent's launch");
+        let mut typing = Typing::attach(ctx, session, Seat::First);
+        let driven = match &ctx.route {
+            Route::StandIn => {
+                // The stand-in takes a typed line and says what it came to: the device's keys,
+                // a slash command and the key that submits it, reach the composer.
+                typing.types("/status");
+                let _ = at
+                    .person
+                    .sees("/status", "the composer shows the slash command");
+                std::thread::sleep(Duration::from_millis(300));
+                typing.types("\r");
+                let _ = at
+                    .person
+                    .sees("by hand: took", "the stand-in says what it took");
+                serde_json::json!({
+                    "arm": arm(ctx),
+                    "slash": "typed and submitted from the device, and taken by the stand-in",
+                    "models_turns": 0,
+                    "why_not": "the stand-in has no model, so it has no turn to interrupt, queue behind or steer",
+                })
+            }
+            Route::Real(real) => drives_the_controls(ctx, real, session, &mut typing),
+        };
+        // The typed forms stay refused, and the agent goes on.
+        let after = shown_now(ctx, &at);
+        check_unchanged(Held::of(&shown), &after)
+            .unwrap_or_else(|why| panic!("the controls change nothing the host shows: {why}"));
+        let (offered, reads) = surface(ctx, session, &at, &after);
+        check_observation_only(&offered).unwrap_or_else(|why| {
+            panic!("the typed steer, queue and commands stay refused: {why}")
+        });
+        // The package leaves the typed queue off, though the agent queues a prompt on its own
+        // terminal.
+        let states = capability_states(at.remote, &ctx.runtime, &codex());
+        queue_declared_off(&states).unwrap_or_else(|why| panic!("{why}"));
+        agent
+            .runs()
+            .unwrap_or_else(|why| panic!("the agent goes on: {why}"));
+        serde_json::json!({
+            "arm": arm(ctx),
+            "detection": shown.detection.evidence(),
+            "driven": driven,
+            "capability_states": states,
+            "surface": offered.evidence(),
+            "agent_reads": reads.iter().map(Reply::evidence).collect::<Vec<_>>(),
+        })
+    });
+}
+
+/// The slash command, the interrupt, the queued prompt and, where the agent steers, the steering
+/// prompt, each typed from the device with the person's login: the real arm of part 2a.
+fn drives_the_controls(
+    ctx: &Context,
+    real: &Real,
+    session: &Session<'_>,
+    typing: &mut Typing<'_>,
+) -> serde_json::Value {
+    let account = &real.account;
+    let person = &session.person;
+    let mut turns = Turns::new(ctx, real, "2a");
+    // A slash command that calls no model.
+    typing.types(&account.slash.input);
+    std::thread::sleep(Duration::from_millis(300));
+    typing.types(&account.submit);
+    let slash = person.sees(&account.slash.shows, "the slash command shows its screen");
+    if !account.dismiss.is_empty() {
+        typing.types(&account.dismiss);
+        // Keys typed while the slash command's screen is still closing would go to it.
+        person.stops_seeing(&account.slash.shows, "the slash command's screen closes");
+    }
+    person.waits_for_the_composer(
+        &account.composer,
+        &account.busy,
+        "the composer is back after the slash command",
+    );
+    // An interrupt of a long turn, once its reply is on the screen.
+    let mark = mark();
+    let upper = mark.to_uppercase();
+    let (long, reply_begins) = long_turn(&mark, account.reply_mark.as_deref());
+    typing.submits(
+        &mut turns,
+        "a long turn to interrupt",
+        &long,
+        &format!("({mark}-i)"),
+        &account.submit,
+    );
+    let _ = person.sees(&account.busy, "the turn runs");
+    let _ = person.sees(&reply_begins, "the turn's reply begins");
+    // An agent whose first press only arms the interrupt wants the key again, as a separate press.
+    for press in 0..account.interrupt_presses.max(1) {
+        if press > 0 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        typing.types(&account.interrupt.input);
+    }
+    let interrupted = person.sees(&account.interrupt.shows, "the agent says the turn stopped");
+    person.waits_for_the_composer(
+        &account.composer,
+        &account.busy,
+        "the composer is back after the interrupt",
+    );
+    // The record exists once the interrupted prompt is in it; a prompt entered into a running turn
+    // goes in as soon as the agent shows the turn running.
+    let _ = waits_for_a_line(
+        ctx,
+        real,
+        &[&format!("{mark}-i"), &account.prompt_line],
+        "the interrupted prompt is recorded",
+    );
+    // A prompt entered while a turn runs, which waits for it.
+    let (queued_question, queued_sum) = fresh_question(&[&mark]);
+    let queued_done = format!("DONE-{upper}-Q");
+    typing.submits(
+        &mut turns,
+        "a turn to queue behind",
+        &counting_turn(&mark, "q", &queued_done),
+        &format!("({mark}-q)"),
+        &account.submit,
+    );
+    let _ = person.sees(&account.busy, "the first turn runs");
+    let none = Duration::ZERO;
+    let before_queue = turn_runs(ctx, real, person, None, &queued_done, none);
+    let queue_key = account
+        .queue_key
+        .clone()
+        .unwrap_or_else(|| account.submit.clone());
+    typing.submits(
+        &mut turns,
+        "a prompt entered during the turn",
+        &format!("({mark}-r) {queued_question}"),
+        &format!("({mark}-r)"),
+        &queue_key,
+    );
+    let after_queue = turn_runs(
+        ctx,
+        real,
+        person,
+        None,
+        &queued_done,
+        Duration::from_secs(2),
+    );
+    let _ = person.sees(&queued_sum, "the queued prompt is answered");
+    person.waits_for_the_composer(
+        &account.composer,
+        &account.busy,
+        "the composer is back after the queue",
+    );
+    settles(ctx, real, &[&queued_sum, &account.reply_line]);
+    let text = record_text(ctx, real);
+    let first_prompt = first_line_with(&text, None, &[&format!("{mark}-q"), &account.prompt_line]);
+    let second_prompt = first_line_with(&text, None, &[&format!("{mark}-r"), &account.prompt_line]);
+    let queued_record = account
+        .queued_line
+        .as_ref()
+        .and_then(|marker| first_line_with(&text, first_prompt, &[&format!("{mark}-r"), marker]));
+    let queue = Order {
+        busy_at_submission: before_queue.holds()
+            && if account.queued_line.is_some() {
+                after_queue.unfinished
+            } else {
+                after_queue.holds()
+            },
+        before: before_queue,
+        after: after_queue,
+        records_queue: account.queued_line.is_some(),
+        queued_record,
+        first_finished: first_line_with(&text, first_prompt, &[&queued_done, &account.reply_line]),
+        second_prompt,
+        second_answered: first_line_with(&text, second_prompt, &[&queued_sum, &account.reply_line]),
+        new_turn: first_prompt.and_then(|from| {
+            turn_between(&text, from, second_prompt?, account.turn_line.as_deref()?)
+        }),
+    };
+    let labels = [
+        ("q", format!("{mark}-q")),
+        ("r", format!("{mark}-r")),
+        ("done", queued_done.clone()),
+        ("sum", queued_sum.clone()),
+        (
+            "queued",
+            account
+                .queued_line
+                .clone()
+                .unwrap_or_else(|| "\u{0}".to_owned()),
+        ),
+        (
+            "turn",
+            account
+                .turn_line
+                .clone()
+                .unwrap_or_else(|| "\u{0}".to_owned()),
+        ),
+    ];
+    let outlined = |from: Option<usize>, text: &str| {
+        let needles: Vec<(&str, &str)> = labels
+            .iter()
+            .map(|(label, needle)| (*label, needle.as_str()))
+            .collect();
+        outline(text, from, &needles)
+    };
+    // A fast model can finish the turn before the second prompt is entered, and a screen can fail
+    // to show a turn that goes on: either way the turn was not shown to be running when the prompt
+    // was entered, which is a cause of its own.
+    assert!(
+        queue.busy_at_submission,
+        "the agent was not shown to be running its turn when the second prompt was entered: {}; \
+         the record from the first prompt: {}",
+        check_queued(&queue).err().unwrap_or_default(),
+        outlined(first_prompt, &text)
+    );
+    check_queued(&queue).unwrap_or_else(|why| {
+        panic!(
+            "the prompt waited for the turn: {why}; the record from the first prompt: {}",
+            outlined(first_prompt, &text)
+        )
+    });
+    // Steering, where the agent's terminal route steers a running turn.
+    let steering = if account.steers {
+        let (steer_question, steer_sum) = fresh_question(&[&mark, &queued_sum]);
+        let steered_done = format!("DONE-{upper}-S");
+        typing.submits(
+            &mut turns,
+            "a turn to steer",
+            &counting_turn(&mark, "s", &steered_done),
+            &format!("({mark}-s)"),
+            &account.submit,
+        );
+        let _ = person.sees(&account.busy, "the turn to steer runs");
+        let before_steer = turn_runs(ctx, real, person, None, &steered_done, none);
+        typing.submits(
+            &mut turns,
+            "a steering prompt",
+            &format!("({mark}-t) Stop counting. {steer_question}"),
+            &format!("({mark}-t)"),
+            &account.submit,
+        );
+        // Where steering is a second step, the prompt waits, and its key goes once the screen says
+        // it would steer.
+        if let (Some(key), Some(ready)) = (&account.steer_key, &account.steer_ready) {
+            let _ = person.sees(ready, "the prompt waits and can be steered");
+            typing.types(key);
+        }
+        let after_steer = turn_runs(ctx, real, person, None, &steered_done, none);
+        let _ = person.sees(&steer_sum, "the steered turn answers");
+        person.waits_for_the_composer(
+            &account.composer,
+            &account.busy,
+            "the composer is back after steering",
+        );
+        settles(ctx, real, &[&steer_sum, &account.reply_line]);
+        let text = record_text(ctx, real);
+        let steered_prompt =
+            first_line_with(&text, None, &[&format!("{mark}-s"), &account.prompt_line]);
+        // A steering prompt is a line of its own kind where the agent writes one.
+        let steering_prompt = first_line_with(
+            &text,
+            None,
+            &[
+                &format!("{mark}-t"),
+                account
+                    .steer_line
+                    .as_deref()
+                    .unwrap_or(&account.prompt_line),
+            ],
+        );
+        let steer = Order {
+            busy_at_submission: before_steer.holds() && after_steer.unfinished,
+            before: before_steer,
+            after: after_steer,
+            records_queue: false,
+            queued_record: None,
+            first_finished: first_line_with(
+                &text,
+                steered_prompt,
+                &[&steered_done, &account.reply_line],
+            ),
+            second_prompt: steering_prompt,
+            second_answered: first_line_with(
+                &text,
+                steering_prompt,
+                &[&steer_sum, &account.reply_line],
+            ),
+            new_turn: steered_prompt.and_then(|from| {
+                turn_between(&text, from, steering_prompt?, account.turn_line.as_deref()?)
+            }),
+        };
+        check_steered(&steer).unwrap_or_else(|why| {
+            panic!(
+                "the running turn took the prompt: {why}; the record from its prompt: {}",
+                outlined(steered_prompt, &text)
+            )
+        });
+        serde_json::json!({ "steered": true, "order": steer })
+    } else {
+        serde_json::json!({ "steered": false, "why": "a prompt entered during a turn waits for it, as the queued step shows" })
+    };
+    let planned = if account.steers { 5 } else { 3 };
+    turns_as_planned(turns.charged, turns.submitted, planned)
+        .unwrap_or_else(|why| panic!("the turns of the part: {why}"));
+    serde_json::json!({
+        "arm": "pinned build",
+        "login": account.login,
+        "turns_charged": turns.charged,
+        "slash": { "typed": account.slash.input, "shows": account.slash.shows, "seen": !slash.is_empty() },
+        "interrupt": { "key": account.interrupt.input, "shows": account.interrupt.shows, "seen": !interrupted.is_empty() },
+        "queued": { "answer": queued_sum, "order": queue },
+        "steering": steering,
+        "control": { "what": "orders made wrong on purpose, which the queue and steering checks reject", "breaks_property": false, "why_not": "the controls are the agent's own terminal keys, which only the agent could refuse, so the checks are shown wrong orders instead (the guard cases)" },
+    })
+}
+
+/// A queued order that is right.
+#[cfg(test)]
+fn a_queued_order() -> Order {
+    Order {
+        busy_at_submission: true,
+        before: Running {
+            busy: true,
+            unfinished: true,
+        },
+        after: Running {
+            busy: true,
+            unfinished: true,
+        },
+        records_queue: true,
+        queued_record: Some(4),
+        first_finished: Some(6),
+        second_prompt: Some(8),
+        second_answered: Some(10),
+        new_turn: Some(true),
+    }
+}
+
+/// A prompt that is not shown to be entered during a running turn, one that joined the record
+/// before the turn finished, one the agent kept no record of as queued and one that joined the
+/// running turn all fail the queue check.
+#[test]
+fn an_order_the_agent_could_not_have_queued_fails_the_queue_check_of_2a() {
+    let right = a_queued_order();
+    assert!(check_queued(&right).is_ok());
+    assert!(
+        check_queued(&Order {
+            busy_at_submission: false,
+            ..right
+        })
+        .is_err(),
+        "entered with no turn running"
+    );
+    assert!(
+        check_queued(&Order {
+            second_prompt: right.first_finished.map(|line| line - 1),
+            ..right
+        })
+        .is_err(),
+        "the prompt joined before the turn finished"
+    );
+    assert!(
+        check_queued(&Order {
+            queued_record: None,
+            ..right
+        })
+        .is_err(),
+        "the agent kept no record of the prompt as queued"
+    );
+    assert!(
+        check_queued(&Order {
+            new_turn: Some(false),
+            ..right
+        })
+        .is_err(),
+        "the prompt joined the running turn"
+    );
+}
+
+/// A steering prompt that started a turn of its own, one entered with no turn running and one that
+/// came after the turn's work finished fail the steering check.
+#[test]
+fn an_order_the_agent_could_not_have_steered_fails_the_steer_check_of_2a() {
+    let right = Order {
+        records_queue: false,
+        queued_record: None,
+        first_finished: None,
+        second_prompt: Some(8),
+        second_answered: Some(10),
+        new_turn: Some(false),
+        ..a_queued_order()
+    };
+    assert!(check_steered(&right).is_ok());
+    assert!(
+        check_steered(&Order {
+            new_turn: Some(true),
+            ..right
+        })
+        .is_err(),
+        "a turn started between the prompts"
+    );
+    assert!(
+        check_steered(&Order {
+            busy_at_submission: false,
+            ..right
+        })
+        .is_err(),
+        "entered with no turn running"
+    );
+    assert!(
+        check_steered(&Order {
+            new_turn: None,
+            first_finished: Some(0),
+            ..right
+        })
+        .is_err(),
+        "the turn finished its work"
+    );
+}
+
+/// A typed queue the package advertises as qualified and available fails the check of 2a, which
+/// keeps it declared off.
+#[test]
+fn a_typed_queue_advertised_as_available_fails_the_check_of_2a() {
+    let record = |capability: &str, state: &str| (capability.to_owned(), state.to_owned());
+    assert!(queue_declared_off(&[record("agent.prompt.queue", "declared_off")]).is_ok());
+    assert!(queue_declared_off(&[record("agent.prompt", "qualified_available")]).is_ok());
+    assert!(queue_declared_off(&[]).is_ok());
+    assert!(
+        queue_declared_off(&[record("agent.prompt.queue", "qualified_available")]).is_err(),
+        "the queue is advertised as qualified and available"
+    );
+}
+
+/// A turn submitted with no charge before it, and a case whose charges are not its submissions or
+/// not the planned number, fail the check of 2a.
+#[test]
+fn a_turn_submitted_without_its_charge_fails_the_check_of_2a() {
+    assert!(charged_first(1, 1).is_ok());
+    assert!(charged_first(2, 2).is_ok());
+    assert!(charged_first(1, 2).is_err());
+    assert!(charged_first(0, 1).is_err());
+    assert!(turns_as_planned(5, 5, 5).is_ok());
+    assert!(turns_as_planned(4, 5, 5).is_err());
+    assert!(turns_as_planned(5, 4, 5).is_err());
+    assert!(turns_as_planned(3, 3, 5).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Parts 7 and 7f: a second process on a saved conversation another process holds.
+// ---------------------------------------------------------------------------------------------
 
 /// How the agent's second start went.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
