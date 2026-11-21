@@ -38,9 +38,9 @@ pub const LOOKS_LIKE_AN_ANSWER: &str = "This looks like an answer to an approval
      sent. To answer an approval, use Allow or Deny on the request. To send this as a message, \
      change its words.";
 
-/// What a sender is told when the text holds the opening or the closing of a channel's tag.
-pub const TAG_SHAPED: &str = "This message contains text shaped like a channel tag, such as \
-     <channel> or </channel>. It was not sent. Change that text.";
+/// What a sender is told when the text matches the filter for a channel's own tag.
+pub const TAG_SHAPED: &str = "This message matches the channel tag filter. KalaReach did not send \
+     it. Write the tag, code, or comparison in words.";
 
 /// The kind of sender the host verified, as the application is told it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

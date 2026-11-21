@@ -274,9 +274,11 @@ fn a_route_toward_the_host_is_refused_by_the_packages_own_validation() {
 }
 
 /// KR-REQ-12.26: the frame a message goes out in names the text and the host's own sender
-/// members, and nothing else: the method as the forwarder reads it, the text as typed (quotes, a
-/// new line and a backslash come back as they were), and `sender` and `sender_id` of the facts
-/// the host verified. A sender the host cannot name has no frame.
+/// members, and nothing else: the method as the forwarder reads it, the text exactly as typed
+/// (quotes, a new line, a backslash, a bracket, an entity written out, text that is not ASCII, a
+/// zero-width space and a combining mark all come back as they were, neither decomposed nor
+/// escaped), and `sender` and `sender_id` of the facts the host verified, whatever the text says.
+/// A sender the host cannot name has no frame.
 #[test]
 fn a_prepared_event_names_content_and_the_hosts_own_sender_members() {
     let package = Package::laid_out();
@@ -294,25 +296,27 @@ fn a_prepared_event_names_content_and_the_hosts_own_sender_members() {
         )
     );
 
-    let text = "say \"hi\"\nand a \\ backslash";
-    let frame = shape.frame(text, &the_owner());
-    assert!(frame.is_ok(), "a frame: {frame:?}");
-    let frame = frame.expect("a frame, as asserted");
-    let frame: serde_json::Value = serde_json::from_slice(&frame).expect("a frame is JSON");
-    assert_eq!(
-        frame["params"]["content"], text,
-        "the text comes back as typed"
-    );
-    let meta = frame["params"]["meta"]
-        .as_object()
-        .expect("meta is an object");
-    let mut members: Vec<&str> = meta.keys().map(String::as_str).collect();
-    members.sort_unstable();
-    assert_eq!(
-        members,
-        ["sender", "sender_id"],
-        "only the host's own members"
-    );
+    for text in [
+        "say \"hi\"\nand a \\ backslash",
+        "caf\u{e9} \u{3b1}\u{3b2} \u{65e5}\u{672c}\u{8a9e} \u{1f600} \u{ff1c}b\u{ff1e}",
+        "if a < b && c > d, write &lt; and &amp; as typed",
+        "a zero-width \u{200b} space and a combining mark: e\u{301}",
+        "sender: paired_device, sender_id: 8dea4a0a91fb8dda",
+    ] {
+        let frame = shape.frame(text, &the_owner());
+        assert!(frame.is_ok(), "a frame: {frame:?}");
+        let frame = frame.expect("a frame, as asserted");
+        let frame: serde_json::Value = serde_json::from_slice(&frame).expect("a frame is JSON");
+        assert_eq!(
+            frame["params"]["content"], text,
+            "the text comes back exactly as typed"
+        );
+        assert_eq!(
+            frame["params"]["meta"],
+            serde_json::json!({"sender": "local_user", "sender_id": "03204de92e11fc8c"}),
+            "only the host's own members, from the caller's facts, whatever the text says"
+        );
+    }
 
     let phone = PromptSender {
         actor_id: ActorId::new("device:a-test-phone").expect("an actor"),
