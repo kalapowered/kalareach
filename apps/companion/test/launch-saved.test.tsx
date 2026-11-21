@@ -550,6 +550,49 @@ describe('the Settings form for the saved commands', () => {
     expect(controls.launchCommands.writes).toEqual([])
   })
 
+  it.each([
+    ['powershell', 'a ~ at the start of an argument', 'A program that begins with ~ is looked for under the home folder.'],
+    ['zsh', 'a leading ~', null]
+  ] as const)(
+    'tells the passed-as-written sentence in the form of the session\'s shell: %s',
+    async (shell, said, home) => {
+      const person = userEvent.setup()
+      const { port } = fakeHost({ stockShell: shell })
+      const created = await port.sessionCreate(
+        {
+          environment_id: ENVIRONMENT,
+          presentation: 'invisible',
+          shell: null,
+          shell_mode: 'native_compat',
+          cwd: '/Users/rs/work/notes',
+          dimensions: null,
+          worker_profile: 'desktop_bound',
+          environment_snapshot: [],
+          palette: null,
+          launch_profile: { startup: 'host_default', fenced_launch: false, command_integrations: [] },
+          terminal: null
+        },
+        {}
+      )
+      open(port, 'semantic', created.value?.session.session_id ?? '')
+      await person.click(await screen.findByRole('button', { name: 'Settings' }))
+      await person.click(await screen.findByRole('button', { name: 'Launch commands' }))
+      const passed = await screen.findByTestId('launch-commands-passed')
+      await waitFor(() => {
+        expect(passed).toHaveTextContent(said)
+      })
+      if (home === null) {
+        expect(passed).toHaveTextContent(
+          "The program and each argument are passed as written: a leading ~ or a $VARIABLE is not expanded, and there are no pipes or redirections. Use a full path, or a program on the shell's path."
+        )
+      } else {
+        expect(passed).toHaveTextContent(
+          "The program and each argument are passed as written: a $VARIABLE, or a ~ at the start of an argument, is not expanded, and there are no pipes or redirections. A program that begins with ~ is looked for under the home folder. Use a full path, or a program on the shell's path."
+        )
+      }
+    }
+  )
+
   it('opens with the words that say whose the list is, and tells the host does not serve it, or this device may not see it', async () => {
     const first = fakeHost()
     first.controls.launchCommands.scenario = 'not_served'
