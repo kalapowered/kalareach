@@ -101,6 +101,10 @@ const CLAIMED_DIFFERENTLY: &str = "another installation this host made claims a 
      contents; remove that installation before installing this one";
 
 /// What a person does where this host will not rewrite an agent's configuration document.
+/// What a removal tells of an entry it keeps, the host's own and unchanged, because its document
+/// changed after the plan: the record is kept too.
+const ENTRY_HELD: &str = "the document changed while the removal ran, so the entry stays and its record is kept; run the removal again to remove the entry";
+
 const CONFIGURATION_BY_HAND: &str = "add or remove the server with the agent's own command instead";
 
 /// Where one agent keeps its skills and its tool-server configuration.
@@ -1142,6 +1146,8 @@ impl Installer {
                     plan,
                 } => match self.remove_entry(
                     Path::new(path),
+                    entry_key(&entry),
+                    digest,
                     self.confirmed(
                         Path::new(path),
                         &entry,
@@ -1904,26 +1910,37 @@ impl Installer {
             (EntryPlan::Delete { .. }, now @ EntryPlan::Delete { .. })
             | (EntryPlan::Edit { .. }, now @ EntryPlan::Edit { .. })
             | (_, now @ EntryPlan::Keep(_)) => now,
-            _ => EntryPlan::Held(
-                "the document changed while the removal ran, so the entry stays and its record is \
-                 kept; run the removal again to remove the entry"
-                    .to_owned(),
-            ),
+            _ => EntryPlan::Held(ENTRY_HELD.to_owned()),
+        })
+    }
+
+    /// What a removal says of an entry whose document changed under the act: the entry is read again
+    /// by its key, and the host acts on nothing from that read. The entry as it was written stays,
+    /// with its record; another entry, or none, is somebody else's matter.
+    fn held_or_kept(&self, path: &Path, key: &str, digest: Digest256) -> Result<Removal> {
+        Ok(match self.entry_digest_under(path, key)? {
+            Some(found) if found == digest => Removal::Held(ENTRY_HELD.to_owned()),
+            Some(_) => Removal::Kept("it has changed since it was installed".to_owned()),
+            None => Removal::Kept("it is already gone".to_owned()),
         })
     }
 
     /// Carries out what the plan says of the server entry the removal recorded: nothing for an
     /// entry it keeps, the document's deletion, or its rewrite without the entry.
-    fn remove_entry(&self, path: &Path, plan: EntryPlan) -> Result<Removal> {
+    fn remove_entry(
+        &self,
+        path: &Path,
+        key: &str,
+        digest: Digest256,
+        plan: EntryPlan,
+    ) -> Result<Removal> {
         Ok(match plan {
             EntryPlan::Keep(reason) => Removal::Kept(reason),
             EntryPlan::Held(reason) => Removal::Held(reason),
             EntryPlan::Delete { checked } => match self.fs.remove_file(path, checked)? {
                 anchor::Taken::Removed => Removal::Removed,
                 anchor::Taken::Gone => Removal::Kept("it is already gone".to_owned()),
-                anchor::Taken::Changed => {
-                    Removal::Kept("it has changed since it was installed".to_owned())
-                }
+                anchor::Taken::Changed => self.held_or_kept(path, key, digest)?,
                 anchor::Taken::Kept { name, at } => {
                     Removal::Told(anchor::kept_while_removing(path, &name, &at))
                 }
@@ -6918,10 +6935,10 @@ mod tests {
             "the document another process put there is kept"
         );
         assert!(
-            result.retained.iter().any(|line| line.ends_with(&format!(
-                "{}: it has changed since it was installed",
-                document.display()
-            ))),
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with(&format!("{}: it is already gone", document.display()))),
             "{:?}",
             result.retained
         );
@@ -7840,6 +7857,88 @@ mod tests {
         assert!(
             text.contains("/usr/local/bin/kr"),
             "the entry another process changed is not removed: {text}"
+        );
+    }
+
+    /// What a removal that kept an unchanged entry, because its document changed under the act, must
+    /// have left: the words, the record, and a later removal that finishes without a repair.
+    #[cfg(unix)]
+    fn assert_held_and_finished(
+        installer: &Installer,
+        params: &AgentToolsParams,
+        document: &Path,
+        removed: &AgentToolsRemoveResult,
+    ) {
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("its record is kept")),
+            "the removal says that the entry and its record stay: {:?}",
+            removed.retained
+        );
+        assert!(
+            installer.record_path(params).exists(),
+            "the record of the entry that stays is kept"
+        );
+        installer.remove(params).expect("a later removal finishes");
+        let text = std::fs::read_to_string(document).expect("the document stays");
+        assert!(
+            text.contains("\"theme\"") && !text.contains("agent-tools"),
+            "the later removal takes the entry and keeps the setting: {text}"
+        );
+        assert!(
+            !installer.record_path(params).exists(),
+            "and the record goes with the entry"
+        );
+    }
+
+    /// KR-REQ-11.01: a document the host made that gets a setting after the removal's last read of
+    /// it and before the act's own read keeps the entry, which is the host's and unchanged, with its
+    /// record: the removal says so, and a later removal finishes.
+    #[cfg(unix)]
+    #[test]
+    fn a_setting_written_before_the_act_reads_a_made_document_keeps_the_entry_and_its_record() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let project = tree.root.join("project");
+        std::fs::create_dir_all(&project).expect("a project folder");
+        let params = project_params(AgentTarget::CLAUDE_CODE, &project);
+        installer.install(&params).expect("installs");
+        let document = project.join(".mcp.json");
+        let at = document.clone();
+        when_walked_to(".mcp.json", move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, text.replacen('{', "{\n  \"theme\": \"dark\",", 1))
+                .expect("another process writes a setting");
+        });
+        let removed = installer
+            .remove(&params)
+            .expect("a removal keeps what it did not write");
+        assert_held_and_finished(&installer, &params, &document, &removed);
+    }
+
+    /// KR-REQ-11.01: the same under the walk, for a document the host made.
+    #[cfg(unix)]
+    #[test]
+    fn a_setting_written_before_the_walk_reads_a_made_document_keeps_the_entry_and_its_record() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let document = tree.home().join(".amp/mcp.json");
+        let at = document.clone();
+        when_walked_to(".amp/mcp.json", move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, text.replacen('{', "{\n  \"theme\": \"dark\",", 1))
+                .expect("another process writes a setting");
+        });
+        let removed = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("a removal keeps what it did not write");
+        assert_held_and_finished(
+            &installer,
+            &params(amp(), InstallScope::User),
+            &document,
+            &removed,
         );
     }
 
