@@ -48,7 +48,7 @@ describe("the application's sentences are the ones the page recognises and shows
 
   it('changes only the first letter of a sentence', () => {
     expect(words.sentence(words.TOO_MANY_OPEN)).toBe(
-      'Two files are being sent to this host already: wait for one to finish, or cancel one'
+      'Two files are open on this host already: wait for one to finish, or cancel one'
     )
     expect(words.sentence('')).toBe('')
   })
