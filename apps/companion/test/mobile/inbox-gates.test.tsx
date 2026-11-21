@@ -680,7 +680,9 @@ describe('what another host shows is cached by epoch and serial', () => {
     })
   })
 
-  // The serial is the owner's, so a new pairing's first read is below an old cache's serial.
+  // The serial is the owner's and counts up across pairings, so a real new pairing's first read is above
+  // an old cache's. The case gives it a lower one all the same, so that only the epoch rule (another
+  // epoch replaces the cache whatever its serial) can put it in place.
   it('a_new_pairings_first_read_replaces_an_old_cache_of_another_epoch', async () => {
     const { controls } = start({ row: laptopRow(3, 90, 'old pairing'), other: laptopOther(3) })
     await waitFor(() => {
