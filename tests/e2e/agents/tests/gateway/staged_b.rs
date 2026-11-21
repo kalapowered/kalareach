@@ -946,13 +946,15 @@ fn the_two_approval_markers_are_as_long_as_each_other_and_differ() {
 /// Why the moment the device went is not shown to lie between the prompt and its reply, where it
 /// is not: a screen the device was sent showed the reply begin, the output bytes it was sent after
 /// the submission hold the code's start or the reply mark, its view was told to resynchronise or
-/// asked for a fresh screen in that time (which may have skipped some), or its reader was not seen
+/// asked for a fresh screen in that time (which may have skipped some), an event it was sent could
+/// not be applied (which is not a screen that showed the reply begin), or its reader was not seen
 /// to stop once it disconnected.
 fn cut_unknown(
     on_a_screen: bool,
     in_the_output: bool,
     resynchronised: bool,
     fresh_screen: bool,
+    event_not_applied: bool,
     reader_stopped: bool,
 ) -> Option<&'static str> {
     if on_a_screen {
@@ -961,6 +963,8 @@ fn cut_unknown(
         Some("the output the device was sent held the start of the reply before it went")
     } else if resynchronised || fresh_screen {
         Some("the device was told to resynchronise or asked for a fresh screen before it went")
+    } else if event_not_applied {
+        Some("an event sent to the device could not be applied before the device disconnected")
     } else if !reader_stopped {
         Some("the device's reader was not seen to stop once it disconnected")
     } else {
@@ -968,16 +972,20 @@ fn cut_unknown(
     }
 }
 
-/// The cut is shown only where none of the five conditions holds: each one alone leaves the
-/// boundary unknown.
+/// The cut is shown only where none of the six conditions holds: each one alone leaves the
+/// boundary unknown, and an event that could not be applied says so, in words of its own.
 #[test]
 fn a_cut_after_which_the_reply_may_have_reached_the_device_is_not_a_shown_boundary() {
-    assert_eq!(cut_unknown(false, false, false, false, true), None);
-    assert!(cut_unknown(true, false, false, false, true).is_some());
-    assert!(cut_unknown(false, true, false, false, true).is_some());
-    assert!(cut_unknown(false, false, true, false, true).is_some());
-    assert!(cut_unknown(false, false, false, true, true).is_some());
-    assert!(cut_unknown(false, false, false, false, false).is_some());
+    assert_eq!(cut_unknown(false, false, false, false, false, true), None);
+    assert!(cut_unknown(true, false, false, false, false, true).is_some());
+    assert!(cut_unknown(false, true, false, false, false, true).is_some());
+    assert!(cut_unknown(false, false, true, false, false, true).is_some());
+    assert!(cut_unknown(false, false, false, true, false, true).is_some());
+    assert_eq!(
+        cut_unknown(false, false, false, false, true, true),
+        Some("an event sent to the device could not be applied before the device disconnected")
+    );
+    assert!(cut_unknown(false, false, false, false, false, false).is_some());
 }
 
 /// Whether the old attachment's input, tried on the device's new connection, was refused by the
@@ -1285,6 +1293,7 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 };
                 let marks_before = reply_marks(&watch.view.rows());
                 let mut reached = false;
+                let mut event_not_applied = false;
                 // What the view was sent before the submission: a resynchronisation or a fresh
                 // screen asked for after it may have skipped some of the reply, and the output
                 // bytes sent after it are searched for the reply's start.
@@ -1368,7 +1377,7 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                         }
                         Ok(false) => break,
                         Err(_) => {
-                            reached = true;
+                            event_not_applied = true;
                             break;
                         }
                     }
@@ -1389,6 +1398,7 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                     in_the_output,
                     resyncs > 0,
                     fresh_screens > 0,
+                    event_not_applied,
                     reader_stopped,
                 );
                 let cutoff = serde_json::json!({
@@ -1397,6 +1407,7 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                     "resyncs": resyncs,
                     "code_or_reply_mark_in_the_output": in_the_output,
                     "code_on_a_screen": reached,
+                    "event_not_applied": event_not_applied,
                 });
                 if let Some(why) = unknown {
                     // Something of the reply reached the device before it went, or whether it had
