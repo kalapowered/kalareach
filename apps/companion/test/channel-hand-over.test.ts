@@ -272,12 +272,23 @@ describe('a message handed over to the channel store', () => {
     expect(book.handedOver(LOCAL)).toBe('kept')
   })
 
-  it('names the one reference the press left when the press write failed', async () => {
+  it('names the one reference the press left when the press write failed, and leaves an unrelated draft as it is', async () => {
     const of = world()
+    // A draft of another session that nothing here touches: its stored revision is compared at the end.
+    const unrelated = of.drafts.save({
+      id: null,
+      expectedRevision: null,
+      sessionId: '8a7b6c50-22bb-4c3d-8e4f-000000000102',
+      applicationInstanceId: null,
+      agentBindingRevision: null,
+      state: 'open',
+      text: 'an unrelated draft',
+      attachments: []
+    }).draft
     const book = await opened(of)
     type(book, MAIN, 'the message')
     await book.settled()
-    const before = of.drafts.all()
+    const before = of.drafts.all().filter((draft) => draft.id !== unrelated.id)
     of.drafts.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
     const token = book.beginSend(MAIN)
     type(book, MAIN, '')
@@ -290,7 +301,9 @@ describe('a message handed over to the channel store', () => {
     await book.settled()
     expect(seen[0]?.drafts.map((ref) => ref.id)).toEqual(before.map((draft) => draft.id))
     expect(seen[0]?.drafts.map((ref) => ref.revision)).toEqual(before.map((draft) => draft.revision))
-    expect(of.drafts.all()).toEqual([])
+    expect(seen[0]?.drafts.map((ref) => ref.id)).not.toContain(unrelated.id)
+    // The press's draft is gone; the unrelated one stands at the revision it had.
+    expect(of.drafts.all().map((draft) => [draft.id, draft.revision])).toEqual([[unrelated.id, unrelated.revision]])
   })
 
   it('applies a final receipt once when the keep then fails', async () => {
