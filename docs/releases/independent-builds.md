@@ -43,7 +43,8 @@ configured for.
   in to and its other services stay where they are. Each request is bound to the exact origin it
   was addressed to, so a signature made for one deployment cannot be replayed against another, and
   a gateway refuses a request authorised for somebody else's origin. The gateway compares the
-  origin as exact text, so its setting `PUSH_GATEWAY_ORIGIN` is the same text as the build input.
+  origin as exact text, so the origin that the gateway is configured with is the same text as the
+  build input.
 
 The official build takes no gateway of its own. The store scripts start it with
 `KR_OFFICIAL_BUILD=1` and without `KR_PUSH_GATEWAY_ORIGIN`, and a build marked that way stops when
