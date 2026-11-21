@@ -3504,6 +3504,10 @@ fn reproduced(disk: &OnDisk, words: &[&str], target: &TargetId, test: &str) -> R
         .arg(format!("( {command} ) 2>&1"))
         .current_dir(root)
         .env("CARGO_TARGET_DIR", &disk.target)
+        // The output is read below by the word each Cargo line starts with. A runner that sets
+        // `CARGO_TERM_COLOR=always` would put colour codes before that word, so this command, like
+        // the report's own runs, sets `never`.
+        .env("CARGO_TERM_COLOR", "never")
         .output()
         .expect("a shell runs");
     let shown = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -3603,6 +3607,32 @@ fn a_command_for_a_step_with_a_feature_in_each_package_runs_in_the_steps_build()
     assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
     assert_eq!(ran.ran, ran.programs_of(&[&a, &b]), "{}", ran.command);
     assert!(ran.command.contains(" --lib "), "{}", ran.command);
+}
+
+/// The cases that read the lines Cargo prints for the report's command hold where the environment
+/// asks Cargo for colour, as the hosted runners' workflows do with `CARGO_TERM_COLOR=always`: the
+/// test program is started again with that variable set and runs two of those cases: one over a
+/// single workspace and one over several.
+#[cfg(unix)]
+#[test]
+fn a_command_is_read_by_the_lines_cargo_prints_whatever_colour_the_environment_asks_for() {
+    let output = std::process::Command::new(std::env::current_exe().expect("this test program"))
+        .args([
+            "--test-threads",
+            "1",
+            "--exact",
+            "a_command_for_a_step_with_a_feature_in_each_package_runs_in_the_steps_build",
+            "a_command_runs_in_the_steps_build_where_another_package_turns_a_feature_on",
+        ])
+        .env("CARGO_TERM_COLOR", "always")
+        .output()
+        .expect("this test program starts");
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && said.contains("2 passed"),
+        "{said}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Another package of the step turns a feature on in the test's package or in a dependency of it, or
