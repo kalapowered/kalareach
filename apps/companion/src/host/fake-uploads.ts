@@ -284,7 +284,7 @@ export class FakeUploads {
   #start(sessionId: string, text: string): HostDraft {
     this.#draftCounter += 1
     const draft: HostDraft = {
-      draftId: `draft-${String(this.#draftCounter)}`,
+      draftId: `00000000-0000-4000-8000-${String(this.#draftCounter).padStart(12, '0')}`,
       revision: 1,
       text,
       attachments: []
