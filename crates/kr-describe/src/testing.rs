@@ -2491,7 +2491,7 @@ pub fn tick(
                     other => (produced(&other.output()), 0),
                 };
                 if behaviour == Behaviour::CancelBeforePublish {
-                    service.cancel_running(&session_id);
+                    service.handles().running.cancel(&session_id);
                 }
                 return Ok(Tick::from(service.finished(
                     id,

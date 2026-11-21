@@ -904,22 +904,6 @@ impl DescriptionService {
         self.in_flight.total()
     }
 
-    /// Returns the handle that cancels the job the process is running.
-    #[cfg(any(test, feature = "testing"))]
-    #[must_use]
-    pub const fn running_job(&self) -> &RunningJob {
-        &self.running
-    }
-
-    /// Cancels the running job for this session if one is running, and returns whether it stopped
-    /// one. The next [`Self::next`] tells the host to cancel it in the process.
-    ///
-    /// A job whose description had already reached the store is past cancelling, and this returns
-    /// false for it rather than reporting work it did not take back.
-    pub fn cancel_running(&self, session_id: &SessionId) -> bool {
-        self.running.cancel(session_id)
-    }
-
     /// Notes that the job with this identifier, when it is the one in the process, was asked to stop
     /// because its deadline passed.
     pub fn job_asked_to_stop_at_its_deadline(&mut self, id: u64) {

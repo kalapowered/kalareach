@@ -509,7 +509,7 @@ fn a_cancelled_job_publishes_nothing_and_keeps_the_title_it_had() {
         at(0),
     );
     let (id, _, request) = dispatch_one(&mut service, at(3_000));
-    assert!(service.cancel_running(&session(1)));
+    assert!(service.handles().running.cancel(&session(1)));
     assert_eq!(
         service.next(&roomy(), at(3_100)).expect("an instruction"),
         Instruction::Cancel {
@@ -794,7 +794,7 @@ fn a_running_job_can_be_cancelled_through_the_shared_handle() {
         at(0),
     );
     let (id, _, request) = dispatch_one(&mut service, at(3_000));
-    let running = service.running_job().clone();
+    let running = service.handles().running;
     assert!(running.is_running(&session(1)));
     assert!(!running.is_running(&session(2)));
     assert!(

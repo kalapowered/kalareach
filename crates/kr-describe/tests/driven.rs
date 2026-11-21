@@ -548,7 +548,7 @@ fn a_job_cancelled_before_its_process_ends_is_not_retried() {
         loaded(&mut cancelled, at(3_000)),
         Instruction::Generate { .. }
     ));
-    assert!(cancelled.cancel_running(&session(1)));
+    assert!(cancelled.handles().running.cancel(&session(1)));
     assert_eq!(
         cancelled
             .process_ended(ProcessEnd::Exited, at(3_100))
@@ -678,7 +678,7 @@ fn a_job_that_was_being_stopped_when_its_process_passed_the_ceiling_ends_as_the_
             panic!("the job is sent");
         };
         match form {
-            OnTheJob::CallerCancelled => assert!(service.cancel_running(&session(1))),
+            OnTheJob::CallerCancelled => assert!(service.handles().running.cancel(&session(1))),
             OnTheJob::Paused => assert_eq!(
                 service.next(&hot, at(3_050)).expect("an instruction"),
                 Instruction::Cancel {
@@ -782,7 +782,7 @@ fn every_attempt_is_measured_however_it_ends() {
     else {
         panic!("the job is sent");
     };
-    assert!(service.cancel_running(&session(1)));
+    assert!(service.handles().running.cancel(&session(1)));
     assert_eq!(
         service
             .finished(
@@ -858,7 +858,7 @@ fn a_job_stays_running_until_its_description_is_in_the_store() {
         panic!("the job is sent");
     };
     let other = write_lock(&path);
-    let running = service.running_job().clone();
+    let running = service.handles().running;
     let watching = {
         let path = path.clone();
         std::thread::spawn(move || {
@@ -898,7 +898,7 @@ fn a_job_stays_running_until_its_description_is_in_the_store() {
         assert!(stored, "too late only once the description is in the store");
     }
     // The control: with the outcome complete, nothing is running or in flight.
-    assert!(!service.running_job().is_running(&session(1)));
+    assert!(!service.handles().running.is_running(&session(1)));
     assert_eq!(service.in_flight(), 0);
 
     // A publication the store refuses: the job runs until the store gives up, and then ends.
@@ -914,7 +914,7 @@ fn a_job_stays_running_until_its_description_is_in_the_store() {
         panic!("the job is sent");
     };
     let other = write_lock(&path);
-    let running = service.running_job().clone();
+    let running = service.handles().running;
     let watching = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
         running.is_running(&session(1))
@@ -928,7 +928,7 @@ fn a_job_stays_running_until_its_description_is_in_the_store() {
         watching.join().expect("the watching thread"),
         "the job runs while the store is waited for"
     );
-    assert!(!service.running_job().is_running(&session(1)));
+    assert!(!service.handles().running.is_running(&session(1)));
     assert_eq!(service.in_flight(), 0);
 }
 
@@ -1045,7 +1045,7 @@ fn a_cancellation_is_honoured_or_refused_at_the_moment_a_job_is_decided() {
     let told = std::rc::Rc::new(std::cell::Cell::new(None));
     {
         let told = std::rc::Rc::clone(&told);
-        let running = service.running_job().clone();
+        let running = service.handles().running;
         at_next_decision(move || told.set(Some(running.cancel(&session(1)))));
     }
     let ended = service
@@ -1071,7 +1071,7 @@ fn a_cancellation_is_honoured_or_refused_at_the_moment_a_job_is_decided() {
         loaded(&mut service, at(3_000)),
         Instruction::Generate { .. }
     ));
-    assert!(service.cancel_running(&session(1)));
+    assert!(service.handles().running.cancel(&session(1)));
     assert_eq!(
         service
             .process_ended(ProcessEnd::Exited, at(3_100))
@@ -1109,7 +1109,7 @@ fn a_caller_cancellation_outlasts_a_pause() {
             }
         );
         assert!(
-            service.cancel_running(&session(1)),
+            service.handles().running.cancel(&session(1)),
             "the caller is told it stopped the job"
         );
         let outcome = if crash {
@@ -1376,7 +1376,7 @@ fn a_job_made_stale_whose_answer_is_read_before_the_service_stops_it_is_supersed
             );
         }
         if caller_cancelled {
-            assert!(service.cancel_running(&session(1)), "{form}");
+            assert!(service.handles().running.cancel(&session(1)), "{form}");
         }
         let outcome = service
             .finished(id, Answered::Ended { why, detail: None }, at(5_200))
@@ -2615,7 +2615,7 @@ fn a_job_stopped_at_its_deadline_ends_past_it_unless_something_else_stopped_it()
     let mut service = self::service();
     let id = sent(&mut service);
     service.job_asked_to_stop_at_its_deadline(id);
-    assert!(service.cancel_running(&session(1)));
+    assert!(service.handles().running.cancel(&session(1)));
     assert_eq!(
         service
             .finished(id, stopped.clone(), after)
@@ -2796,7 +2796,7 @@ fn a_cancellation_accepted_before_the_handle_closes_is_never_a_missed_deadline()
                 service.job_asked_to_stop_at_its_deadline(id);
             }
             let told = std::rc::Rc::new(std::cell::Cell::new(None));
-            let running = service.running_job().clone();
+            let running = service.handles().running;
             let cancel = {
                 let told = std::rc::Rc::clone(&told);
                 move || told.set(Some(running.cancel(&session(1))))

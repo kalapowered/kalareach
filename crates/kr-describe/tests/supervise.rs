@@ -471,7 +471,7 @@ fn each_change_while_a_job_is_in_the_process_refuses_its_result() {
                 service.set_privacy_generation(session(1), PrivacyGeneration::new(1));
             }
             Change::Disabled => service.set_enabled(false),
-            Change::Cancelled => assert!(service.cancel_running(&session(1))),
+            Change::Cancelled => assert!(service.handles().running.cancel(&session(1))),
         }
         let reports = rig.until(&roomy(), at(5_200), "the answer", |reports, _| {
             a_job_ended(reports)
@@ -726,7 +726,7 @@ fn a_process_whose_control_thread_is_wedged_is_ended_when_a_cancel_goes_unanswer
     });
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
     rig.job_sent(at(3_000));
-    assert!(rig.driver.service().cancel_running(&session(1)));
+    assert!(rig.driver.service().handles().running.cancel(&session(1)));
     let reports = rig.driver.turn(&roomy(), at(4_000)).expect("a turn");
     assert!(reports.is_empty(), "{reports:?}");
     std::thread::sleep(Duration::from_millis(300));
@@ -763,7 +763,7 @@ fn a_process_whose_control_thread_is_wedged_is_ended_when_a_cancel_goes_unanswer
     queue(rig.service(), &session(1), Priority::Ordinary, at(0));
     rig.job_sent(at(3_000));
     let pid = rig.driver.pid();
-    assert!(rig.driver.service().cancel_running(&session(1)));
+    assert!(rig.driver.service().handles().running.cancel(&session(1)));
     let reports = rig.until(&roomy(), at(4_000), "the cancellation", |reports, _| {
         a_job_ended(reports)
     });
@@ -1070,7 +1070,7 @@ fn an_acknowledged_cancellation_is_held_to_the_jobs_deadline_and_not_the_cancel_
     rig.job_sent(at(3_000));
     stub::wait_until_began(&rig.placed.directory("runtime"), "job");
     let pid = rig.driver.pid();
-    assert!(rig.driver.service().cancel_running(&session(1)));
+    assert!(rig.driver.service().handles().running.cancel(&session(1)));
     rig.until(&roomy(), at(4_000), "the acknowledgement", |_, driver| {
         matches!(driver.cancelling(), Some((_, true)))
     });
@@ -1166,7 +1166,7 @@ fn a_cancellation_after_an_acknowledged_stop_is_held_to_the_stop_bound() {
         |_, driver| driver.stopping_at_its_deadline() == Some(true),
     );
     // The caller cancels the job. Nothing reads it, so it is never acknowledged.
-    assert!(rig.driver.service().cancel_running(&session(1)));
+    assert!(rig.driver.service().handles().running.cancel(&session(1)));
     let reports = rig.driver.turn(&roomy(), at(deadline + 1)).expect("a turn");
     assert!(!the_process_ended(&reports), "{reports:?}");
     assert!(matches!(rig.driver.cancelling(), Some((_, false))));
@@ -1902,7 +1902,7 @@ fn a_cancellation_reaches_the_process_during_a_load_and_a_decode() {
         stub::began(&runtime, "job")
     });
     let pid = rig.driver.pid();
-    assert!(rig.driver.service().cancel_running(&session(1)));
+    assert!(rig.driver.service().handles().running.cancel(&session(1)));
     let reports = rig.until(&roomy(), at(3_100), "the cancelled job", |reports, _| {
         a_job_ended(reports)
     });
@@ -2282,7 +2282,7 @@ fn the_cadence_holds_under_mixed_demand_through_the_process() {
     let running = |driver: &Driver| {
         std::iter::once(ordinary)
             .chain(foreground.iter().copied())
-            .find(|session_id| driver.service().running_job().is_running(session_id))
+            .find(|session_id| driver.service().handles().running.is_running(session_id))
     };
     // What the queue stood at just before each dispatch: the next job is sent in the same turn
     // that takes the answer before it, so this is read at that turn's reading, before it.
@@ -3155,7 +3155,7 @@ fn a_cancelled_job_whose_process_crashes_is_not_retried() {
         // The process has ended; the driver has not heard it yet.
         rig.answer_arrives();
         if cancel {
-            assert!(rig.driver.service().cancel_running(&session(1)));
+            assert!(rig.driver.service().handles().running.cancel(&session(1)));
         }
         let reports = rig.driver.turn(&roomy(), at(3_100)).expect("a turn");
         let ended = outcomes(&reports);
