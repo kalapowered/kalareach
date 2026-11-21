@@ -672,7 +672,13 @@ fn a_token_that_names_a_stamped_item_is_found_in_a_group_a_raw_name_and_a_litera
          fn h(&self) -> ActionTarget { self.t() }\n\
          fn i(&self) -> &MutationRequest { &self.r }\n\
          fn j<'a>(&'a self) -> &'a mut ActionTarget { &mut self.t }\n\
-         fn k() -> ActionTarget { ActionTarget { a: 1 } }\n",
+         fn k() -> ActionTarget { ActionTarget { a: 1 } }\n\
+         //! agent.turn.cancel in an inner doc comment\n\
+         /// agent.turn.steer in an outer doc comment\n\
+         fn l() {}\n\
+         #[doc = \"agent.prompt.submit\"]\n\
+         fn m() {}\n\
+         fn n() { f(doc = \"agent.turn.cancel\"); }\n",
     );
     assert_eq!(
         found,
@@ -686,6 +692,9 @@ fn a_token_that_names_a_stamped_item_is_found_in_a_group_a_raw_name_and_a_litera
             ("ActionTarget {".to_owned(), 6),
             // A return type before a function's body is no struct value; a value in the body is.
             ("ActionTarget {".to_owned(), 13),
+            // The text of a doc comment or a `doc` attribute is documentation; the same words as an
+            // argument are a literal.
+            ("\"agent.turn.cancel\"".to_owned(), 19),
         ]
     );
 }

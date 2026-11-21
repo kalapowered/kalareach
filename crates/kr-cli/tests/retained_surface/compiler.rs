@@ -22,7 +22,7 @@ use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use serde_json::Value;
 use syn::ext::IdentExt as _;
 use syn::visit::Visit;
@@ -1516,6 +1516,25 @@ fn is_return_type(trees: &[TokenTree], at: usize) -> bool {
     back >= 2 && punct(back - 1, '>') && punct(back - 2, '-')
 }
 
+/// Whether the group at `at` is the brackets of `#[doc = "..."]` or `#![doc = "..."]`, which is what a
+/// `///` or `//!` comment is read as: its text is documentation, not a use.
+fn is_doc_attribute(trees: &[TokenTree], at: usize, group: &Group) -> bool {
+    let punct = |index: Option<usize>, wanted: char| {
+        index.is_some_and(
+            |index| matches!(trees.get(index), Some(TokenTree::Punct(found)) if found.as_char() == wanted),
+        )
+    };
+    let inner = group.stream().into_iter().collect::<Vec<_>>();
+    group.delimiter() == Delimiter::Bracket
+        && (punct(at.checked_sub(1), '#')
+            || (punct(at.checked_sub(1), '!') && punct(at.checked_sub(2), '#')))
+        && matches!(
+            inner.as_slice(),
+            [TokenTree::Ident(name), TokenTree::Punct(equals), TokenTree::Literal(_)]
+                if name == "doc" && equals.as_char() == '='
+        )
+}
+
 fn walk_tokens(stream: TokenStream, found: &mut Vec<Candidate>) {
     let trees: Vec<TokenTree> = stream.into_iter().collect();
     let punct = |at: usize| match trees.get(at) {
@@ -1533,7 +1552,11 @@ fn walk_tokens(stream: TokenStream, found: &mut Vec<Candidate>) {
             what,
         };
         match tree {
-            TokenTree::Group(group) => walk_tokens(group.stream(), found),
+            TokenTree::Group(group) => {
+                if !is_doc_attribute(&trees, at, group) {
+                    walk_tokens(group.stream(), found);
+                }
+            }
             TokenTree::Ident(ident) => {
                 let name = ident.unraw().to_string();
                 if VARIANTS.contains(&name.as_str()) {
