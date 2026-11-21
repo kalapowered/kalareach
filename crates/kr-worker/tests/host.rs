@@ -2648,7 +2648,9 @@ async fn a_worker_that_cannot_listen_says_why_to_the_create_that_waits_for_it() 
         .expect("the call reaches the daemon")
         .expect_err("a worker that cannot listen serves no session");
     assert!(
-        refused.message.contains("not a socket"),
+        refused
+            .message
+            .contains("w1.sock: it holds a file; kr does not remove what it did not make"),
         "the worker's own words reach the caller: {refused}"
     );
     // The create answers that the worker could not start, whatever code the listener's own error
