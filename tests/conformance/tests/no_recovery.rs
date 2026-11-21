@@ -8,6 +8,10 @@
 //! the case that counts the runs of a failed step
 //! (`a_step_that_could_not_run_a_program_fails_once_and_keeps_the_file_as_it_was_seen` in
 //! `observation.rs`), and what the steps themselves run is the plan's.
+//!
+//! The files of the cases that run processes under a time limit are read too: `tests/tree.rs`,
+//! `tests/execution.rs` and the fixture `time-limits`. No case sends a signal, and no case reaps a
+//! process by its number but the one that proves what the report does when another waiter has.
 
 use std::path::{Path, PathBuf};
 
@@ -863,4 +867,266 @@ fn the_sources_of_every_directory_below_the_source_directory_are_read() {
     assert_eq!(names.len(), 2, "{names:?}");
     assert!(names.iter().any(|name| name.ends_with("c.rs")), "{names:?}");
     assert!(names.iter().any(|name| name == "e.rs"), "{names:?}");
+}
+
+/// The programs that send a signal to a process, by the name a command is given or the path's last
+/// part.
+const SIGNALLERS: [&str; 4] = ["kill", "pkill", "killall", "taskkill"];
+
+/// The names of the calls that reap a process by its number.
+const REAPS: [&str; 3] = ["waitpid", "waitid", "wait4"];
+
+/// The one case that reaps a process by its number: it proves what the report does when another
+/// waiter has reaped the leader, and holds the pipe open until it has.
+const THE_REAPING_CASE: &str =
+    "a_leader_reaped_by_another_waiter_gives_the_error_and_no_signal_is_sent";
+
+/// Whether `text`, taken as shell text, sends a signal: a part that starts one of the programs of
+/// [`SIGNALLERS`], but for `kill -0`, which asks whether a process exists and sends nothing. The
+/// parts are cut as in [`runs_one`].
+fn signals_by_text(text: &str) -> bool {
+    text.replace("$(", ";")
+        .split([';', '|', '&', '\n', '`'])
+        .any(|part| {
+            let mut words = part.split_whitespace();
+            let Some(first) = words.next() else {
+                return false;
+            };
+            let program = first.rsplit(['/', '\\']).next().unwrap_or(first);
+            if !SIGNALLERS.contains(&program) {
+                return false;
+            }
+            let only_looks = program == "kill"
+                && words.next() == Some("-0")
+                && !words.any(|word| word.starts_with('-'));
+            !only_looks
+        })
+}
+
+/// The tokens, from the `fn` of the item named `name` to its closing brace, as a range of positions.
+fn body_of(tokens: &[Token], name: &str) -> Option<std::ops::Range<usize>> {
+    let opens = (0..tokens.len()).find(|&at| {
+        tokens[at].ident() == Some("fn") && tokens.get(at + 1).and_then(Token::ident) == Some(name)
+    })?;
+    let mut depth = 0_usize;
+    for (at, token) in tokens.iter().enumerate().skip(opens) {
+        match token.tok {
+            Tok::Punct('{') => depth += 1,
+            Tok::Punct('}') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(opens..at + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What in the Rust source of a case file sends a signal or reaps a process by its number, each with
+/// its line: a text that runs a program of [`SIGNALLERS`] (but for `kill -0`), the type `Signal`,
+/// every name of a signal and every name that begins `kill` (which covers `Child::kill` and
+/// `kill_process_group`), and a call of [`REAPS`] but inside the body of the case `reaps_in`.
+fn case_refused(source: &str, reaps_in: Option<&str>) -> Result<Vec<String>, String> {
+    let tokens: Vec<Token> = lex(source)
+        .map_err(|error| format!("line {}: {}", error.line, error.what))?
+        .into_iter()
+        .filter(|token| !token.is_comment())
+        .collect();
+    let allowed = reaps_in.and_then(|name| body_of(&tokens, name));
+    let mut found = Vec::new();
+    for (at, token) in tokens.iter().enumerate() {
+        let what = match &token.tok {
+            Tok::Str(text, _) if signals_by_text(text) => format!("the text {text:?}"),
+            Tok::Ident(name)
+                if name == SIGNAL_TYPE
+                    || name.starts_with("kill")
+                    || (name.starts_with("SIG")
+                        && name.chars().nth(3).is_some_and(char::is_uppercase))
+                    || (REAPS.contains(&name.as_str())
+                        && !allowed.as_ref().is_some_and(|range| range.contains(&at))) =>
+            {
+                format!("`{name}`")
+            }
+            _ => continue,
+        };
+        found.push(format!("line {}: {what}", token.line));
+    }
+    Ok(found)
+}
+
+/// What in the text of a shell script sends a signal, each with its line.
+fn script_refused(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| signals_by_text(line))
+        .map(|(at, line)| format!("line {}: the text {line:?}", at + 1))
+        .collect()
+}
+
+/// The files of the fixture `time-limits` that run: its Rust sources and its scripts.
+fn fixture_files(directory: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(directory).expect("a directory") {
+        let path = entry.expect("an entry").path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|name| name != "target") {
+                files.extend(fixture_files(&path));
+            }
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "rs" || extension == "sh")
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+/// What in the file at `path` the check of the case files refuses: only `tests/tree.rs` holds the
+/// case that may reap by number.
+fn case_file_refused(path: &Path, source: &str) -> Result<Vec<String>, String> {
+    if path.extension().is_some_and(|extension| extension == "sh") {
+        return Ok(script_refused(source));
+    }
+    let reaps = (path.file_name().is_some_and(|name| name == "tree.rs")
+        && path
+            .parent()
+            .is_some_and(|folder| folder.ends_with("tests")))
+    .then_some(THE_REAPING_CASE);
+    case_refused(source, reaps)
+}
+
+#[test]
+fn the_case_files_send_no_signal_and_reap_by_number_in_one_case_only() {
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut files = vec![tests.join("tree.rs"), tests.join("execution.rs")];
+    let fixture = fixture_files(&tests.join("fixtures").join("time-limits"));
+    assert!(
+        fixture.len() >= 5,
+        "the fixture's files were not found: {fixture:?}"
+    );
+    files.extend(fixture);
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("a case file");
+        match case_file_refused(&path, &source) {
+            Ok(hits) => assert!(hits.is_empty(), "{}: {hits:#?}", path.display()),
+            Err(problem) => panic!("{}: {problem}", path.display()),
+        }
+    }
+}
+
+/// The check of the case files refuses each way a case can send a signal and each call that reaps by
+/// number outside the one case, and lets through a look (`kill -0`) and that case's call.
+#[test]
+fn the_check_of_the_case_files_refuses_each_signal_and_lets_through_a_look_and_one_reap() {
+    let refused_rust = [
+        (
+            "a signal to a group",
+            "fn f() { rustix::process::kill_process_group(group, rustix::process::Signal::KILL); }",
+        ),
+        ("the type that names a signal", "fn f(signal: Signal) {}"),
+        (
+            "a kill of a child",
+            "fn f(child: &mut Child) { child.kill(); }",
+        ),
+        ("the system's call", "fn f() { libc::killpg(1, 9); }"),
+        ("a name of a signal", "fn f() { let s = SIGHUP; }"),
+        (
+            "a kill of a recorded pid",
+            "fn f(pid: &str) { run(&format!(\"kill -9 {pid} 2>/dev/null\")); }",
+        ),
+        ("a kill by name", "fn f() { run(\"kill -KILL 123\"); }"),
+        (
+            "a kill with a signal named",
+            "fn f() { run(\"kill -s KILL 123\"); }",
+        ),
+        ("a kill with TERM", "fn f() { run(\"kill -TERM 123\"); }"),
+        (
+            "a kill after another command",
+            "fn f() { run(\"true; kill -9 123\"); }",
+        ),
+        (
+            "a kill by its path",
+            "fn f() { run(\"/bin/kill -9 123\"); }",
+        ),
+        (
+            "a look that is also a kill",
+            "fn f() { run(\"kill -0 -s KILL 123\"); }",
+        ),
+        (
+            "a kill of every process of a name",
+            "fn f() { run(\"pkill sleep\"); }",
+        ),
+        (
+            "a kill of a name, all",
+            "fn f() { run(\"killall sleep\"); }",
+        ),
+        (
+            "a reap in another case",
+            "fn another() { waitpid(None, WaitOptions::empty()); }\nfn the_one() {}",
+        ),
+        (
+            "an import of the reap",
+            "use rustix::process::waitpid;\nfn the_one() {}",
+        ),
+        (
+            "a reap by `waitid`",
+            "fn the_one() {}\nfn other() { waitid(P::Pid(x), W::EXITED); }",
+        ),
+    ];
+    let let_through_rust = [
+        (
+            "a look",
+            "fn f(pid: &str) { run(&format!(\"kill -0 {pid} 2>/dev/null\")); }",
+        ),
+        ("a look, written alone", "fn f() { run(\"kill -0 123\"); }"),
+        (
+            "the reap of the one case",
+            "fn the_one() { let a = waitpid(Some(x), WaitOptions::empty()); }",
+        ),
+        (
+            "an ignored signal",
+            "fn f() { run(\"trap '' TERM; sleep 61\"); }",
+        ),
+    ];
+    let refused_script = [
+        ("a script that kills a pid", "sleep 61 &\nkill -9 $!\n"),
+        ("a script that kills after a pipe", "ps | kill -9 1\n"),
+    ];
+    let let_through_script = [
+        ("a script that waits", "trap '' TERM\nsleep 61 &\nwait\n"),
+        ("a script that looks", "kill -0 $! 2>/dev/null\n"),
+    ];
+    let mut wrong = Vec::new();
+    for (what, code) in refused_rust {
+        if case_refused(code, Some("the_one"))
+            .expect("a source")
+            .is_empty()
+        {
+            wrong.push(format!("{what}: let through"));
+        }
+    }
+    for (what, code) in let_through_rust {
+        if !case_refused(code, Some("the_one"))
+            .expect("a source")
+            .is_empty()
+        {
+            wrong.push(format!("{what}: refused"));
+        }
+    }
+    for (what, text) in refused_script {
+        if script_refused(text).is_empty() {
+            wrong.push(format!("{what}: let through"));
+        }
+    }
+    for (what, text) in let_through_script {
+        if !script_refused(text).is_empty() {
+            wrong.push(format!("{what}: refused"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
