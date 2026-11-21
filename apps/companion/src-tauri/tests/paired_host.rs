@@ -3292,8 +3292,15 @@ async fn a_pass_answers_with_the_records_not_its_own_results() {
     let v = visiting().await;
     let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
     let older = v.pass();
-    until_told(v.companion(), &v.a_ref, "in_contact").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // A is read by the older pass, which C holds: wait for the read, and for the visit to end.
+    tokio::time::timeout(WATCHDOG, async {
+        while v.control.sent(Method::AttentionRead) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A is read by the older pass");
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let newer = v.pass();
     // A is read twice: by the older pass, and by the newer one, which does not wait for C to read A.
     tokio::time::timeout(WATCHDOG, async {
@@ -3315,6 +3322,8 @@ async fn a_pass_answers_with_the_records_not_its_own_results() {
         old_row["read_at_ms"], new_row["read_at_ms"],
         "the older pass shows the newer read"
     );
+    // The schema step: the rows carry the order the reads were made in, and it is the same.
+    assert!(new_row["read_serial"].is_u64(), "{new_row}");
     assert_eq!(old_row["read_serial"], new_row["read_serial"]);
     v.stop().await;
 }
@@ -3755,9 +3764,9 @@ async fn a_stale_listing_leaves_the_current_record_alone() {
         .expect("a hold")
         .release();
     let fresh = fresh.await.expect("ran").expect("answered");
-    let serial = row_of(&fresh, &v.a_ref).expect("A's row")["read_serial"].clone();
+    let read_at = row_of(&fresh, &v.a_ref).expect("A's row")["read_at_ms"].clone();
     assert!(
-        serial.is_u64(),
+        read_at.is_u64(),
         "A was read under the current pairing: {fresh}"
     );
     let revision = v
@@ -3768,12 +3777,13 @@ async fn a_stale_listing_leaves_the_current_record_alone() {
     let endpoint = v.a.network().endpoint_id();
     let asked = v.control.asked_of(&endpoint);
 
+    tokio::time::sleep(Duration::from_millis(50)).await;
     hold.release();
     drop(passes);
     let answered = old.await.expect("ran").expect("answered");
     assert_eq!(
-        row_of(&answered, &v.a_ref).map(|row| row["read_serial"].clone()),
-        Some(serial),
+        row_of(&answered, &v.a_ref).map(|row| row["read_at_ms"].clone()),
+        Some(read_at),
         "the stale listing did not read A again: {answered}"
     );
     assert_eq!(

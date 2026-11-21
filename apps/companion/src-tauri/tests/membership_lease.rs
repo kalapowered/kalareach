@@ -3100,7 +3100,7 @@ async fn an_account_that_left_invalidates_the_hosts_earlier_cache() {
         seeded["result"].is_object(),
         "a cache to invalidate: {seeded}"
     );
-    let epoch = seeded["inbox_epoch"].as_u64().expect("an epoch");
+    let epoch = seeded["inbox_epoch"].as_u64();
 
     // A second plain host is visited too and held; the member host's kept connection answers at
     // once, and the account leaves after that and before the slow host answers.
@@ -3124,12 +3124,8 @@ async fn an_account_that_left_invalidates_the_hosts_earlier_cache() {
         .find(|row| row["reference"] == member.as_str())
         .expect("the member host is listed");
     assert!(
-        listed["result"].is_null() && listed["read_serial"].is_null(),
+        listed["result"].is_null() && listed["read_at_ms"].is_null(),
         "nothing read for the account that left is published: {listed}"
-    );
-    assert!(
-        listed["inbox_epoch"].as_u64().expect("an epoch") > epoch,
-        "the epoch moved: {listed}"
     );
     let said = support::contact_of(rig.companion(), &member);
     assert_eq!(said["state"], "refused", "{said}");
@@ -3138,6 +3134,11 @@ async fn an_account_that_left_invalidates_the_hosts_earlier_cache() {
             .as_str()
             .is_some_and(|words| words.contains("sign in")),
         "{said}"
+    );
+    // The schema step: the row's epoch is a member of the answer, and it moved.
+    assert!(
+        listed["inbox_epoch"].as_u64().expect("an epoch") > epoch.expect("an epoch"),
+        "the epoch moved: {listed}"
     );
 }
 
