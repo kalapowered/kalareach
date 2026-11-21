@@ -301,6 +301,30 @@ fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated() {
     shellpkg::a_launch_is_quoted_for_its_own_shell_and_never_evaluated(PWSH);
 }
 
+/// KR-REQ-13.11
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_named_command_runs_in_the_shells_directory_and_is_found_on_the_shells_path() {
+    shellpkg::a_named_command_runs_in_the_shells_directory_and_is_found_on_the_shells_path(PWSH);
+}
+
+/// KR-REQ-13.11
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn powershell_bypasses_a_shadowing_alias_or_function_and_types_the_full_path() {
+    shellpkg::powershell_bypasses_a_shadowing_alias_or_function_and_types_the_full_path(PWSH);
+}
+
+/// KR-REQ-13.11
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_program_that_names_no_application_has_no_line_in_powershell_and_the_press_is_a_draft_conflict()
+{
+    shellpkg::a_program_that_names_no_application_has_no_line_in_powershell_and_the_press_is_a_draft_conflict(
+        PWSH,
+    );
+}
+
 /// KR-REQ-07.37
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
