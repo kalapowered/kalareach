@@ -1622,7 +1622,8 @@ impl<'a> Resolver<'a> {
     /// `cargo test` and the step's own words, with the test's own flag in place of the step's target
     /// flags where the step's build holds every target that flag names (see
     /// [`coverage::Selection::test_words`]), the options the step passes the test binary, and the
-    /// test's name. A test that no step selects gets `--locked`, `-p <package>` and its target's flag.
+    /// test's name. A test that no step selects gets `--locked`, `-p <package>`, `--features` with
+    /// its target's `required-features` where it has some, and its target's flag.
     fn rust_command(&self, target: &TargetId, name: &str, runs: &[RunRecord]) -> String {
         let done = self.reproducing_step(target, runs);
         let package = self
@@ -1670,6 +1671,14 @@ impl<'a> Resolver<'a> {
                 "-p".to_owned(),
                 target.package.clone(),
             ];
+            let required = package
+                .and_then(|package| package.targets.iter().find(|found| found.id == *target))
+                .map(|found| found.required_features.join(","))
+                .unwrap_or_default();
+            if !required.is_empty() {
+                own.push("--features".to_owned());
+                own.push(required);
+            }
             own.extend(
                 target
                     .kind

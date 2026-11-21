@@ -3018,19 +3018,24 @@ fn a_command_leaves_out_a_cargo_flag_whose_value_holds_a_placeholder() {
     );
 }
 
-/// A test that no step covers gets `--locked`, `-p <package>` and its target's flag, and none of the
-/// options or variables of a step.
+/// A test that no step covers gets `--locked`, `-p <package>`, its target's flag and `--features`
+/// with the target's required features, and none of the options or variables of a step.
 #[test]
 fn a_command_for_a_test_no_step_covers_names_its_package_and_its_targets_flag() {
     let lib = target_of("p", TargetKind::Lib, "p");
+    let needs = target_of("p", TargetKind::Test, "u");
+    let mut owner = package_of(
+        "p",
+        ".",
+        &[(TargetKind::Lib, "p", true), (TargetKind::Test, "u", true)],
+    );
+    owner.targets[1].required_features = vec!["f".to_owned(), "g".to_owned()];
     let mut map = Map {
-        packages: vec![
-            package_of("p", ".", &[(TargetKind::Lib, "p", true)]),
-            package_of("q", ".", &[(TargetKind::Lib, "q", true)]),
-        ],
+        packages: vec![owner, package_of("q", ".", &[(TargetKind::Lib, "q", true)])],
         ..Map::default()
     };
     key_in(&mut map, "KR-REQ-03.01", &lib, "a");
+    key_in(&mut map, "KR-REQ-03.02", &needs, "b");
     // The one step selects `q`, so no step covers `p`'s library.
     let step = Step {
         env: vec![("A".to_owned(), "on".to_owned())],
@@ -3047,6 +3052,12 @@ fn a_command_for_a_test_no_step_covers_names_its_package_and_its_targets_flag() 
             .command
             .as_deref(),
         Some("cargo test --locked -p p --lib -- --exact a")
+    );
+    assert_eq!(
+        document.identifiers["KR-REQ-03.02"].tests[0]
+            .command
+            .as_deref(),
+        Some("cargo test --locked -p p --features f,g --test u -- --exact b")
     );
 }
 
@@ -3989,6 +4000,43 @@ fn a_program_with_a_harness_of_its_own_that_the_command_starts_runs_everything_i
     assert!(
         ran.shown
             .contains("b ta ran everything, given [\"--exact\", \"works\"]"),
+        "{}\n{}",
+        ran.command,
+        ran.shown
+    );
+}
+
+/// A test that no step covers, in a target that needs a feature, gets `--features` with it, and
+/// Cargo accepts the command.
+#[cfg(unix)]
+#[test]
+fn a_command_for_a_test_no_step_covers_gives_the_features_its_target_needs() {
+    let files = [
+        file(
+            "m/Cargo.toml",
+            &manifest(
+                "m",
+                "[features]\nsuite = []\n\n[[test]]\nname = \"u\"\nrequired-features = [\"suite\"]\n",
+            ),
+        ),
+        file("m/src/lib.rs", ""),
+        file("m/tests/u.rs", WORKS),
+        file("q/Cargo.toml", &manifest("q", "")),
+        file("q/src/lib.rs", ""),
+    ];
+    let disk = on_disk(&["m", "q"], &files);
+    let u = target_of("m", TargetKind::Test, "u");
+    let ran = reproduced(&disk, &["test", "--locked", "-p", "q"], &u, "works");
+    assert_eq!(ran.step_failed, None);
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(
+        ran.command,
+        "cargo test --locked -p m --features suite --test u -- --exact works"
+    );
+    assert!(
+        ran.shown
+            .lines()
+            .any(|line| line.trim() == "test works ... ok"),
         "{}\n{}",
         ran.command,
         ran.shown

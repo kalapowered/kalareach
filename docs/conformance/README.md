@@ -438,8 +438,8 @@ another package, and when the step's build made every target the flag names in t
 packages. Otherwise it keeps the step's target flags and test names, and Cargo runs every program
 the step ran. After `--` come the options the step passes the test programs, with their values,
 except the filters, `--skip`, `--exact`, `--list`, `--show-output` and `--logfile`, then `--exact`
-and the test's name. A test that no step covers gets `--locked`, `-p <package>` and its target's
-flag.
+and the test's name. A test that no step covers gets `--locked`, `-p <package>`, its target's flag
+and, for a target whose manifest gives `required-features`, `--features` with them.
 
 The name does not always select one test. A program of the standard test harness runs the tests
 whose name is exactly the test's, so a test of the same name in another program that the command
