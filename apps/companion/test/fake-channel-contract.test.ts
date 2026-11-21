@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest'
 
 import { FakeChannelMessageStore } from '../src/host/fake-channel-messages'
 import { FakeDraftStore } from '../src/host/fake-drafts'
-import { failureCode, type ChannelMessageKeep } from '../src/host/port'
+import { failureCode, failureMessage, type ChannelMessageKeep } from '../src/host/port'
 
 const request = (over: Partial<ChannelMessageKeep> = {}): ChannelMessageKeep => ({
   actionId: '6a7b6c50-22bb-4c3d-8e4f-000000000401',
@@ -87,15 +87,60 @@ describe('the scripted store of channel messages keeps the native rules', () => 
   it('refuses the next keeps asked for and no more', () => {
     const drafts = new FakeDraftStore()
     const store = new FakeChannelMessageStore()
-    store.refuseKeeps({ code: 'RESOURCE_UNAVAILABLE', message: 'refused' }, 1)
+    store.refuseKeeps({ code: 'RESOURCE_UNAVAILABLE', message: 'refused' }, 2)
+    expect(refusal(() => store.keep(request(), drafts))).toBe('RESOURCE_UNAVAILABLE')
     expect(refusal(() => store.keep(request(), drafts))).toBe('RESOURCE_UNAVAILABLE')
     expect(refusal(() => store.keep(request(), drafts))).toBeNull()
+  })
+
+  it('refuses the next keep only, by default, and every keep when it is asked to', () => {
+    const drafts = new FakeDraftStore()
+    const store = new FakeChannelMessageStore()
     store.refuseKeeps({ code: 'RESOURCE_UNAVAILABLE', message: 'refused' })
-    expect(refusal(() => store.keep(request({ actionId: '6a7b6c50-22bb-4c3d-8e4f-000000000403' }), drafts))).toBe(
+    expect(refusal(() => store.keep(request(), drafts))).toBe('RESOURCE_UNAVAILABLE')
+    expect(refusal(() => store.keep(request(), drafts))).toBeNull()
+    store.refuseKeeps({ code: 'RESOURCE_UNAVAILABLE', message: 'refused' }, Infinity)
+    expect(refusal(() => store.keep(request({ actionId: '6a7b6c50-22bb-4c3d-8e4f-000000000405' }), drafts))).toBe(
       'RESOURCE_UNAVAILABLE'
     )
-    expect(refusal(() => store.keep(request({ actionId: '6a7b6c50-22bb-4c3d-8e4f-000000000404' }), drafts))).toBe(
+    expect(refusal(() => store.keep(request({ actionId: '6a7b6c50-22bb-4c3d-8e4f-000000000406' }), drafts))).toBe(
       'RESOURCE_UNAVAILABLE'
     )
+  })
+
+  it('fails a keep over a list of removals that cannot be read, keeps the entry, and marks nothing for removal', () => {
+    for (const state of ['damaged', 'unreadable'] as const) {
+      const drafts = new FakeDraftStore()
+      const store = new FakeChannelMessageStore()
+      store.damageLedger(state)
+      const named = { id: 'a', expectedRevision: '1' }
+      expect(refusal(() => store.keep(request({ drafts: [named] }), drafts))).toBe('LOCAL_FAILURE')
+      expect(store.all()).toHaveLength(1)
+      expect(drafts.pendingRemovals()).toEqual([])
+      // Readable again, the same keep is a resume that finishes the step.
+      store.damageLedger('ok')
+      expect(refusal(() => store.keep(request({ drafts: [named] }), drafts))).toBeNull()
+      expect(drafts.pendingRemovals()).toHaveLength(1)
+    }
+  })
+
+  it('says a full store and a store that cannot be read in the approved words', () => {
+    const drafts = new FakeDraftStore()
+    const store = new FakeChannelMessageStore()
+    store.lowerLimits({ entries: 1 })
+    expect(refusal(() => store.keep(request(), drafts))).toBeNull()
+    const messageOf = (call: () => unknown): string => {
+      try {
+        call()
+        return ''
+      } catch (failure) {
+        return failureMessage(failure)
+      }
+    }
+    expect(messageOf(() => store.keep(request({ actionId: '6a7b6c50-22bb-4c3d-8e4f-000000000407' }), drafts))).toBe(
+      'Channel messages is full. Remove some on the Kept drafts page.'
+    )
+    store.makeUnavailable()
+    expect(messageOf(() => store.list(false))).toBe('This device could not read or write its channel messages.')
   })
 })
