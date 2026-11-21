@@ -150,7 +150,15 @@ pub(super) fn lock_is_enforced(
     second: &File,
     try_lock: impl FnOnce(&File) -> Result<(), Errno>,
 ) -> bool {
-    matches!(try_lock(second), Err(error) if is_contention(error))
+    match try_lock(second) {
+        Err(error) => is_contention(error),
+        Ok(()) => {
+            // A lock taken by the test is let go of here, not at the close: a program started in
+            // this moment by another thread would keep it with its copy of the file.
+            let _ = flock(second, FlockOperation::Unlock);
+            false
+        }
+    }
 }
 
 /// The one error of an advisory lock that says another holder has it.
@@ -257,6 +265,10 @@ fn read_open(
         }
         _ => false,
     };
+    // The probe's lock is let go of here, not at the close: a program started in this moment by
+    // another thread would keep it with its copy of the file, and the lock the bind takes next
+    // would be refused.
+    let _ = flock(file, FlockOperation::Unlock);
     Evidence {
         lock: Lock::Free,
         record_matches,
@@ -276,10 +288,11 @@ const RECORD_LIMIT: u64 = 256;
 
 /// A listener's hold on its lock file, from before its bind until it ends.
 ///
-/// The lock is released by closing the descriptor and by nothing else: a holder that forked keeps
-/// its own copy until it exits, and no code unlocks. The file is opened through the standard
-/// library, which marks it close-on-exec, so a program the listener's process starts never holds
-/// it.
+/// The lock ends with the hold: the hold unlocks before its descriptor closes. A lock belongs to
+/// the open file, not to a descriptor, so closing alone would leave it held by the copy that a
+/// program started by another thread keeps from its start until its own program takes over. The
+/// file is opened through the standard library, which marks it close-on-exec, so a program the
+/// listener's process starts never holds it once that program runs.
 #[derive(Debug)]
 pub(super) struct Hold {
     file: Arc<File>,
@@ -347,6 +360,8 @@ impl Drop for Hold {
         if let Some(task) = self.refresh.take() {
             task.abort();
         }
+        // An unlock that fails leaves the lock to the close, as it was before.
+        let _ = flock(&*self.file, FlockOperation::Unlock);
     }
 }
 

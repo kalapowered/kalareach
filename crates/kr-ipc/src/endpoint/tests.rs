@@ -165,26 +165,16 @@ mod unix {
     fn lock_is_held(path: &Path) -> bool {
         let file = File::open(live_of(path)).expect("the lock file");
         match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => false,
+            Ok(()) => {
+                // Let go of it here, not at the close: a program that another case starts in this
+                // moment would keep the lock with its copy of the file, and the next bind of the
+                // endpoint would meet it.
+                flock(&file, FlockOperation::Unlock).expect("the probe lets go of its lock");
+                false
+            }
             Err(Errno::WOULDBLOCK) => true,
             Err(other) => panic!("a try-lock gives contention or the lock, not {other:?}"),
         }
-    }
-
-    /// Whether the lock is free once it has had up to `limit` to be.
-    ///
-    /// A program that another case starts while the lock file is open holds a copy of the open
-    /// file until that program executes its own, so a lock that has ended can read as held for
-    /// that short span.
-    fn lock_is_free_within(path: &Path, limit: std::time::Duration) -> bool {
-        let begun = std::time::Instant::now();
-        while lock_is_held(path) {
-            if begun.elapsed() >= limit {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        true
     }
 
     /// A socket that listens with a queue of one and does not accept.
@@ -497,25 +487,19 @@ mod unix {
         let live = Listener::bind(&endpoint).expect("a listener");
         assert!(lock_is_held(path), "a live listener holds the lock");
         drop(live);
-        // A process another case starts in the same moment holds a copy of every descriptor this
-        // program has open until it executes its program, so the lock is free once that has
-        // happened, within a bound, and not at the instant of the drop.
-        let begun = std::time::Instant::now();
-        while lock_is_held(path) && begun.elapsed() < std::time::Duration::from_secs(10) {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
         assert!(
             !lock_is_held(path),
             "the lock is free after the listener ends"
         );
     }
 
-    /// A listener that is killed leaves a socket and a free lock, and the next bind replaces it.
-    #[test]
-    fn a_listener_killed_without_cleanup_leaves_a_socket_the_next_bind_replaces() {
-        let folder = PrivateTempDir::create();
-        let endpoint = endpoint_in(&folder, "killed.sock");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("this program"))
+    /// Starts this test program as a listener of its own on `endpoint` and returns it once it
+    /// reports its bind. With `with_a_program` the listener has also started a program that waits
+    /// until the returned handle's input closes.
+    fn start_a_listener_program(endpoint: &Endpoint, with_a_program: bool) -> std::process::Child {
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("this program"));
+        command
             .args([
                 "--ignored",
                 "--exact",
@@ -523,9 +507,13 @@ mod unix {
                 "endpoint::tests::unix::a_listener_that_binds_and_waits",
             ])
             .env("KR_IPC_ENDPOINT_CASE", endpoint.as_path())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("the program starts itself");
+            .stdout(std::process::Stdio::piped());
+        if with_a_program {
+            command
+                .env("KR_IPC_ENDPOINT_CASE_PROGRAM", "1")
+                .stdin(std::process::Stdio::piped());
+        }
+        let mut child = command.spawn().expect("the program starts itself");
         let stdout = child.stdout.take().expect("its output");
         let mut bound = false;
         for line in std::io::BufReader::new(stdout).lines() {
@@ -535,6 +523,15 @@ mod unix {
             }
         }
         assert!(bound, "the child reports its bind");
+        child
+    }
+
+    /// A listener that is killed leaves a socket and a free lock, and the next bind replaces it.
+    #[test]
+    fn a_listener_killed_without_cleanup_leaves_a_socket_the_next_bind_replaces() {
+        let folder = PrivateTempDir::create();
+        let endpoint = endpoint_in(&folder, "killed.sock");
+        let mut child = start_a_listener_program(&endpoint, false);
         child.kill().expect("SIGKILL");
         child.wait().expect("the child is gone");
         assert!(
@@ -560,30 +557,34 @@ mod unix {
         let path = std::env::var_os("KR_IPC_ENDPOINT_CASE").expect("an endpoint named by the case");
         let endpoint = Endpoint::from_path(path).expect("an endpoint");
         let _live = Listener::bind(&endpoint).expect("a listener");
+        // For the case that shows a program the listener starts keeps no lock: it waits for the
+        // end of the input that the case holds, and has run its own program when it is started.
+        let _program = std::env::var_os("KR_IPC_ENDPOINT_CASE_PROGRAM").map(|_| {
+            std::process::Command::new("/bin/cat")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("a program that waits")
+        });
         println!("bound");
         std::io::stdout().flush().expect("a flush");
         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
     }
 
-    /// A program the listener's process starts after the bind does not keep the lock. The wait
-    /// is for a program that another case starts in the same moment, which holds the lock until
-    /// its exec. The case's own program has executed when its start returns, so a lock it kept
-    /// would still be held when the wait ends.
-    #[tokio::test]
-    async fn a_child_started_after_the_bind_does_not_keep_the_lock() {
+    /// A program the listener's process starts after the bind does not keep the lock: when the
+    /// listener is killed, with no chance to unlock, the lock is free while that program runs.
+    #[test]
+    fn a_child_started_after_the_bind_does_not_keep_the_lock() {
         let folder = PrivateTempDir::create();
         let endpoint = endpoint_in(&folder, "child.sock");
         let path = endpoint.as_path();
-        let live = Listener::bind(&endpoint).expect("a listener");
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("a program that waits");
-        drop(live);
-        let free = lock_is_free_within(path, std::time::Duration::from_secs(2));
-        child.kill().expect("the child ends");
-        child.wait().expect("the child is gone");
-        assert!(free, "the child inherited the lock");
+        let mut listener = start_a_listener_program(&endpoint, true);
+        assert!(lock_is_held(path), "a live listener holds the lock");
+        listener.kill().expect("SIGKILL");
+        listener.wait().expect("the listener is gone");
+        let held = lock_is_held(path);
+        // The program the listener started ends with the input it waits on.
+        drop(listener.stdin.take());
+        assert!(!held, "the child inherited the lock");
     }
 
     /// What the volume says decides a removal on macOS, where a refused connect cannot show that
