@@ -7128,6 +7128,10 @@ fn session_with_a_probe_on_the_path(
     std::fs::create_dir_all(&work).expect("a working directory");
     let add = match kind {
         ShellKind::Fish => format!("set -gx PATH '{}' $PATH", told(&bin)),
+        ShellKind::PowerShell => format!(
+            "$env:PATH = '{}' + [System.IO.Path]::PathSeparator + $env:PATH",
+            told(&bin)
+        ),
         _ => format!("export PATH='{}':\"$PATH\"", told(&bin)),
     };
     let line = format!(
@@ -7282,6 +7286,205 @@ pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and
             assert!(
                 session.answered("kr-still-here"),
                 "{}",
+                session.terminal_output()
+            );
+        },
+    );
+}
+
+/// Says that the shell's own history holds `line` whole, by a command that prints a word only when
+/// it does. The command puts the word together as it runs, so the line that asks cannot print it.
+fn history_holds(session: &mut Session, line: &str, marker: &str) -> bool {
+    assert!(
+        !line.contains(['"', '`', '$']),
+        "{line:?} cannot be put in a double-quoted PowerShell string as it is"
+    );
+    let split = marker.rfind('-').map_or(marker.len() / 2, |at| at + 1);
+    let (head, tail) = marker.split_at(split);
+    let check = format!(
+        "if (@(Get-History | ForEach-Object {{ $_.CommandLine }}) -ccontains \"{line}\") \
+         {{ Write-Output ('{head}' + '{tail}') }}"
+    );
+    session.run(&check, marker)
+}
+
+/// Presses `vector` at a fenced empty prompt and says what the reader answered.
+fn launch_vector(
+    session: &mut Session,
+    vector: Vec<String>,
+    prompt_seed: u8,
+    transaction_seed: u8,
+) -> LaunchDecision {
+    let (enter, fence) = session.fenced_prompt(prompt_seed);
+    session.launched(LaunchMailboxRequest {
+        session_id: session.session_id,
+        transaction: LaunchTransactionId::new(Uuid::from_bytes([transaction_seed; 16])),
+        fence_id: fence.fence_id,
+        command: LaunchCommand::Arguments(vector),
+        expected_prompt_generation: enter.prompt_generation,
+        expected_buffer_revision: enter.editor.buffer_revision,
+        expected_cwd_revision: enter.cwd_revision,
+        deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
+    })
+}
+
+/// KR-REQ-13.11: PowerShell types the program's full path where an alias or a function of the
+/// program's name would be found first, so the program runs and not the alias or the function; and
+/// it types the name as it was given where nothing is in front of the program.
+///
+/// The probe is on a directory the shell's path holds. A launch of its bare name is typed as that
+/// name. Then a function of the same name is defined, and the launch runs the probe and the line
+/// the shell accepted holds the probe's full path; then an alias of the same name, which the shell
+/// finds before a function, does the same. The accepted line is read back from the shell's own
+/// history, so the case does not depend on how a long line is drawn.
+pub fn powershell_bypasses_a_shadowing_alias_or_function_and_types_the_full_path(kind: ShellKind) {
+    in_each_locale(
+        kind,
+        "powershell_bypasses_a_shadowing_alias_or_function_and_types_the_full_path",
+        || {
+            let package = Package::built(kind);
+            let (mut session, work) = session_with_a_probe_on_the_path(kind, &package);
+            let probe = told(&session.home().join("kr-saved-bin").join("kr-probe"));
+            let printed = |word: &str| format!("kr-probe-dir=<{}> first=<{word}>", told(&work));
+            let held = "kr-history-held";
+
+            assert!(
+                launch_vector_drew(
+                    &mut session,
+                    vec!["kr-probe".to_owned(), "a".to_owned()],
+                    &printed("a"),
+                    28,
+                    0x7b,
+                ),
+                "the probe did not run when nothing stood in front of it:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                history_holds(&mut session, "& 'kr-probe' 'a'", held),
+                "nothing stood in front of the program, so its name was not typed as it was given:\n{}",
+                session.terminal_output()
+            );
+
+            let function = format!(
+                "function kr-probe {{ Write-Output ('function-' + 'ran') }}; {}",
+                print_assembled(kind, "kr-defined")
+            );
+            assert!(
+                session.run(&function, "kr-defined"),
+                "{}",
+                session.terminal_output()
+            );
+            assert!(
+                launch_vector_drew(
+                    &mut session,
+                    vec!["kr-probe".to_owned(), "b".to_owned()],
+                    &printed("b"),
+                    29,
+                    0x7c,
+                ),
+                "the probe did not run in place of a function of its name:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                history_holds(&mut session, &format!("& '{probe}' 'b'"), held),
+                "a function of the program's name was in front of it, and the full path was not \
+                 typed:\n{}",
+                session.terminal_output()
+            );
+
+            let alias = format!(
+                "function kr-alias-target {{ Write-Output ('alias-' + 'ran') }}; \
+                 Set-Alias -Name kr-probe -Value kr-alias-target; {}",
+                print_assembled(kind, "kr-aliased")
+            );
+            assert!(
+                session.run(&alias, "kr-aliased"),
+                "{}",
+                session.terminal_output()
+            );
+            assert!(
+                launch_vector_drew(
+                    &mut session,
+                    vec!["kr-probe".to_owned(), "c".to_owned()],
+                    &printed("c"),
+                    30,
+                    0x7d,
+                ),
+                "the probe did not run in place of an alias of its name:\n{}",
+                session.terminal_output()
+            );
+            assert!(
+                history_holds(&mut session, &format!("& '{probe}' 'c'"), held),
+                "an alias of the program's name was in front of it, and the full path was not \
+                 typed:\n{}",
+                session.terminal_output()
+            );
+
+            let output = session.terminal_output();
+            for stood_in in ["function-ran", "alias-ran"] {
+                assert!(
+                    !output.contains(stood_in),
+                    "{stood_in} ran in place of the program:\n{output}"
+                );
+            }
+        },
+    );
+}
+
+/// KR-REQ-13.11: a program that names no application or script has no line in PowerShell, so the
+/// press is refused as a draft conflict and nothing is typed. A function of that name is not the
+/// program either.
+///
+/// The refusal's reason is the one the reader has for a buffer it cannot take a command into, and
+/// its code is `DRAFT_CONFLICT`, which the page reads with the surface's shell to say that
+/// PowerShell cannot run the command. The shell is at an empty prompt after each refusal.
+pub fn a_program_that_names_no_application_has_no_line_in_powershell_and_the_press_is_a_draft_conflict(
+    kind: ShellKind,
+) {
+    in_each_locale(
+        kind,
+        "a_program_that_names_no_application_has_no_line_in_powershell_and_the_press_is_a_draft_conflict",
+        || {
+            let package = Package::built(kind);
+            let (mut session, _) = session_with_a_probe_on_the_path(kind, &package);
+            let define = format!(
+                "function kr-only-function {{ }}; {}",
+                print_assembled(kind, "kr-defined")
+            );
+            assert!(
+                session.run(&define, "kr-defined"),
+                "{}",
+                session.terminal_output()
+            );
+            for (seed, program) in [(31_u8, "kr-no-such-program"), (32, "kr-only-function")] {
+                let decision = launch_vector(
+                    &mut session,
+                    vec![program.to_owned(), "x".to_owned()],
+                    seed,
+                    0x70 + seed,
+                );
+                let LaunchDecision::Rejected(rejected) = decision else {
+                    panic!("{program} names no application, and a line was installed for it");
+                };
+                assert_eq!(
+                    rejected.reason,
+                    LaunchRejectionReason::BufferNotEmpty,
+                    "{program}"
+                );
+                assert_eq!(
+                    rejected.reason.code(),
+                    kr_protocol::error::ErrorCode::DraftConflict,
+                    "{program}"
+                );
+                assert!(
+                    session.answered("kr-still-here"),
+                    "the shell was not at an empty prompt after the refusal of {program}:\n{}",
+                    session.terminal_output()
+                );
+            }
+            assert!(
+                !session.terminal_output().contains("kr-no-such-program"),
+                "the refused program was typed:\n{}",
                 session.terminal_output()
             );
         },
