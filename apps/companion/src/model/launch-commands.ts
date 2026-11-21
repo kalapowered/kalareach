@@ -58,6 +58,12 @@ export const WORDS = {
   /** How the words are passed. */
   passed:
     "The program and each argument are passed as written: a leading ~ or a $VARIABLE is not expanded, and there are no pipes or redirections. Use a full path, or a program on the shell's path.",
+  /**
+   * How the words are passed to PowerShell, which looks for a program that begins with ~ under the
+   * home folder while an argument that begins with ~ stays as written.
+   */
+  passedInPowerShell:
+    "The program and each argument are passed as written: a $VARIABLE, or a ~ at the start of an argument, is not expanded, and there are no pipes or redirections. A program that begins with ~ is looked for under the home folder. Use a full path, or a program on the shell's path.",
   /** What Windows does with a batch program. */
   batch:
     'On Windows, a .cmd or .bat program is not started when an argument is empty, holds white space and ends in a backslash, or holds one of " % ! ^ & | < > ( ), or when the program\'s path holds % or !.',

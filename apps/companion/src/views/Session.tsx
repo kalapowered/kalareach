@@ -9,7 +9,7 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
-import type { SessionReadResult } from '@kalareach/protocol'
+import type { LaunchShell, SessionReadResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
 import { useApp, useSession } from '../app/state'
@@ -376,6 +376,22 @@ function SessionSettings({
     'appearance'
   )
   const [followOutput, setFollowOutput] = useState(true)
+  // The shell this session runs, as its launch surface says, for the words of the launch commands
+  // section: PowerShell finds a program that begins with ~ where the other shells do not.
+  const [shell, setShell] = useState<LaunchShell | null>(null)
+  useEffect(() => {
+    if (tab !== 'launch') return
+    let current = true
+    ask(() => port.launchSurface({ session_id: sessionId })).then(
+      (reading) => {
+        if (current && reading.state === 'served') setShell(reading.surface.shell)
+      },
+      () => undefined
+    )
+    return () => {
+      current = false
+    }
+  }, [port, sessionId, tab])
 
   return (
     <Sheet
@@ -466,7 +482,7 @@ function SessionSettings({
             </>
           ) : null}
 
-          {tab === 'launch' ? <LaunchCommands place="desktop" /> : null}
+          {tab === 'launch' ? <LaunchCommands place="desktop" shell={shell} /> : null}
 
           {tab === 'sharing' ? <Sharing sessionId={sessionId} subject={subject} /> : null}
 
