@@ -1002,7 +1002,10 @@ jobs:
       # filter. The crate's `testing` feature, which the guest's builds set, is off here, so the
       # programs that hold only guest cases build empty; every case that installs the boundary or
       # reads the platform's answers for a removal or a rename is ignored and says it needs a
-      # disposable guest as SYSTEM; and the cases that `cfg(unix)` holds do not build here.
+      # disposable guest as SYSTEM; and the cases that `cfg(unix)` holds do not build here. Eight of
+      # the library's cases, four of `fresh` and four of `install`, make files and directories that
+      # only SYSTEM and the Administrators group may open, so they need an elevated administrator
+      # token, which this runner's account has.
       - name: Test the Windows boundary's cases that need no guest
         if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-boundary-windows
