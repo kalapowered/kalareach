@@ -3752,6 +3752,117 @@ fn a_real_route_outcome_with_a_stop_stops_the_agent_under_the_stops_class() {
     assert!(stand_in.evidence.get("failure_codes").is_none());
 }
 
+/// The outcome the end of a case records, from what the case showed or the text it failed with
+/// (`said`), the stops the end found, and the route. A case that showed what it was to and found
+/// no stop is passed, not run where it says so, or a probe-only run; one that stopped, or failed,
+/// is failed, and its outcome on a real route stops the agent under each stop's class
+/// ([`with_agent_stops`]).
+fn outcome_of(
+    case: &str,
+    test: &str,
+    said: &Result<serde_json::Value, String>,
+    stops: &[Stop],
+    probe_only: bool,
+    real_route: bool,
+    mut evidence: serde_json::Value,
+) -> Outcome {
+    let stopped: Vec<String> = stops
+        .iter()
+        .map(|(class, why)| format!("{class}: {why}"))
+        .collect();
+    match said {
+        Ok(shows) => match recorded_as(shows, stops, probe_only) {
+            Filed::ProbeOnly => {
+                // A probe-only run starts no agent, so it says nothing of the case itself: it is a
+                // run that was not made, with what it recorded.
+                evidence["shows"] = shows.clone();
+                Outcome::not_run(
+                    case,
+                    test,
+                    "a probe-only run: the newer build's probes were recorded and no agent was \
+                     started",
+                    evidence,
+                )
+            }
+            Filed::NotRun(why) => {
+                evidence["shows"] = shows.clone();
+                Outcome::not_run(case, test, &why, evidence)
+            }
+            Filed::Passed => {
+                evidence["shows"] = shows.clone();
+                Outcome::passed(case, test, evidence)
+            }
+            Filed::Failed => {
+                evidence["shows"] = shows.clone();
+                with_agent_stops(
+                    Outcome::failed(case, test, &stopped.join("; "), evidence),
+                    real_route,
+                    stops,
+                )
+            }
+        },
+        Err(said) => {
+            let reason = if stopped.is_empty() {
+                said.clone()
+            } else {
+                format!("{said}; {}", stopped.join("; "))
+            };
+            with_agent_stops(
+                Outcome::failed(case, test, &reason, evidence),
+                real_route,
+                stops,
+            )
+        }
+    }
+}
+
+/// A case's end records a real route's failure or stop under the stops' classes, each of two
+/// classes in order, whether the case showed what it was to or panicked; the stand-in route's
+/// outcome, and one with no stop, does not stop the agent.
+#[test]
+fn the_outcome_a_case_ends_with_stops_the_agent_under_each_stops_class_on_a_real_route() {
+    let stops = [
+        (
+            "provider_key_found",
+            "a key was found in the run's directory".to_owned(),
+        ),
+        ("uncharged_turns", "a turn went uncharged".to_owned()),
+    ];
+    let codes = serde_json::json!([
+        { "code": "agent_stops", "class": "provider_key_found" },
+        { "code": "agent_stops", "class": "uncharged_turns" },
+    ]);
+    let shown: Result<serde_json::Value, String> = Ok(serde_json::json!({ "arm": "pinned build" }));
+    let panicked: Result<serde_json::Value, String> = Err("the case panicked".to_owned());
+    let end = |said: &Result<serde_json::Value, String>, stops: &[Stop], real_route: bool| {
+        outcome_of(
+            "7",
+            "a test",
+            said,
+            stops,
+            false,
+            real_route,
+            serde_json::json!({ "turns": 0 }),
+        )
+    };
+    for said in [&shown, &panicked] {
+        let stopped = end(said, &stops, true);
+        assert_eq!(stopped.outcome, "failed");
+        assert_eq!(stopped.evidence["stop_agent"], true);
+        assert_eq!(stopped.evidence["failure_codes"], codes);
+        let stand_in = end(said, &stops, false);
+        assert_eq!(stand_in.outcome, "failed");
+        assert!(stand_in.evidence.get("stop_agent").is_none());
+        assert!(stand_in.evidence.get("failure_codes").is_none());
+    }
+    let passed = end(&shown, &[], true);
+    assert_eq!(passed.outcome, "passed");
+    assert!(passed.evidence.get("stop_agent").is_none());
+    let failed = end(&panicked, &[], true);
+    assert_eq!(failed.outcome, "failed");
+    assert!(failed.evidence.get("stop_agent").is_none());
+}
+
 fn ends(
     route: Route,
     run: Option<Run>,
@@ -3960,53 +4071,22 @@ fn ends(
         .collect();
     let probe_only = matches!(&route, Route::Real(real) if real.probe_only);
     let real_route = matches!(&route, Route::Real(_));
+    let said: Result<serde_json::Value, String> = match &result {
+        Ok(shows) => Ok(shows.clone()),
+        Err(panic) => Err(kept_panic_text(&panic_text(&**panic))),
+    };
+    let failed_after_showing =
+        matches!(&said, Ok(shows) if recorded_as(shows, &stops, probe_only) == Filed::Failed);
+    record(outcome_of(
+        case, test, &said, &stops, probe_only, real_route, evidence,
+    ));
     match result {
-        Ok(shows) => match recorded_as(&shows, &stops, probe_only) {
-            Filed::ProbeOnly => {
-                // A probe-only run starts no agent, so it says nothing of the case itself: it is a
-                // run that was not made, with what it recorded.
-                evidence["shows"] = shows;
-                record(Outcome::not_run(
-                    case,
-                    test,
-                    "a probe-only run: the newer build's probes were recorded and no agent was \
-                     started",
-                    evidence,
-                ));
-            }
-            Filed::NotRun(why) => {
-                evidence["shows"] = shows;
-                record(Outcome::not_run(case, test, &why, evidence));
-            }
-            Filed::Passed => {
-                evidence["shows"] = shows;
-                record(Outcome::passed(case, test, evidence));
-            }
-            Filed::Failed => {
-                evidence["shows"] = shows;
-                record(with_agent_stops(
-                    Outcome::failed(case, test, &stopped.join("; "), evidence),
-                    real_route,
-                    &stops,
-                ));
-                panic!(
-                    "the case showed what it was to, and then: {}",
-                    stopped.join("; ")
-                );
-            }
-        },
+        Ok(_) => assert!(
+            !failed_after_showing,
+            "the case showed what it was to, and then: {}",
+            stopped.join("; ")
+        ),
         Err(panic) => {
-            let said = kept_panic_text(&panic_text(&*panic));
-            let reason = if stopped.is_empty() {
-                said
-            } else {
-                format!("{said}; {}", stopped.join("; "))
-            };
-            record(with_agent_stops(
-                Outcome::failed(case, test, &reason, evidence),
-                real_route,
-                &stops,
-            ));
             for line in &stopped {
                 eprintln!("{line}");
             }
