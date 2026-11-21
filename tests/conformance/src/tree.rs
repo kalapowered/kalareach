@@ -102,6 +102,41 @@ pub fn status(command: &mut Command, deadline: Option<Deadline>) -> io::Result<W
     }
 }
 
+/// Whether this process can wait for a command it starts, which the time limits rely on. A process
+/// that ignores `SIGCHLD` cannot, on Linux: the system reaps its children as they end, so a wait
+/// fails, and the signals at a deadline could go to a group whose leader the system has already
+/// reaped. The question is asked of a command that does nothing.
+///
+/// # Errors
+///
+/// Says why a command could not be started, or could not be waited for.
+#[cfg(unix)]
+pub fn waits_for_its_commands() -> io::Result<()> {
+    waited_for(Child::wait)
+}
+
+/// [`waits_for_its_commands`] with `wait` as the wait.
+#[cfg(unix)]
+fn waited_for(wait: impl FnOnce(&mut Child) -> io::Result<ExitStatus>) -> io::Result<()> {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", ":"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    wait(&mut child).map(drop)
+}
+
+/// Where no step with a limit runs, no trial is needed.
+///
+/// # Errors
+///
+/// Never.
+#[cfg(not(unix))]
+pub fn waits_for_its_commands() -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn supervised(_: &mut Command, _: Deadline, _: bool) -> io::Result<Waited<Output>> {
     Err(io::Error::new(
@@ -386,6 +421,24 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    /// KR-REQ-29.01, the part about reproducible commands: the report finds a host that cannot wait
+    /// for a command it started before it runs a step with a limit. A wait that fails, as it does
+    /// under a parent that ignores `SIGCHLD`, is the trial's error, and a wait that works passes.
+    /// The stand-in waits for the command first, so that it leaves none.
+    #[test]
+    fn a_host_that_cannot_wait_for_a_command_it_started_is_found_by_the_trial() {
+        let failed = waited_for(|child| {
+            child.wait()?;
+            Err(io::Error::from(rustix::io::Errno::CHILD))
+        })
+        .expect_err("the trial passed");
+        assert_eq!(
+            failed.raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error())
+        );
+        assert!(waited_for(Child::wait).is_ok(), "the trial failed here");
+    }
 
     /// KR-REQ-29.01, the part about reproducible commands: the bytes queued in a pipe when the
     /// processes that wrote them were ended are all read, however many pieces of the buffer's length
