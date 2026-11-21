@@ -16,48 +16,187 @@ use std::collections::BTreeSet;
 
 use crate::workspace::{Package, Target, TargetId, TargetKind};
 
-/// A name, or a pattern of `*`, `?` and `[...]` that matches names, as Cargo reads one in `-p`,
-/// `--exclude`, `--bin`, `--example`, `--test` and `--bench`.
+/// A name, or a pattern of `*`, `?`, `[...]` and `**` that matches names, as Cargo reads one in `-p`,
+/// `--exclude`, `--bin`, `--example`, `--test` and `--bench`. Cargo matches a name with the pattern
+/// of the `glob` crate; this follows that crate's rules for a pattern and for a name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Pattern(String);
+struct Pattern {
+    tokens: Vec<Token>,
+}
+
+/// One part of a pattern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Token {
+    One(char),
+    /// `?`.
+    Any,
+    /// `*`.
+    Run,
+    /// `**` as a whole path component: it matches any number of components, none among them.
+    Components,
+    /// `[abc]` or `[a-c]`.
+    Within(Vec<Member>),
+    /// `[!abc]`.
+    Except(Vec<Member>),
+}
+
+/// A character of a class, or a range of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Member {
+    One(char),
+    Range(char, char),
+}
 
 impl Pattern {
     fn new(text: &str) -> Result<Self, String> {
-        let pattern: Vec<char> = text.chars().collect();
+        let chars: Vec<char> = text.chars().collect();
+        let mut tokens = Vec::new();
         let mut at = 0;
-        while at < pattern.len() {
-            match pattern[at] {
-                '[' => match class_end(&pattern, at) {
-                    Some(end) => at = end,
-                    None => {
+        while at < chars.len() {
+            match chars[at] {
+                '?' => {
+                    tokens.push(Token::Any);
+                    at += 1;
+                }
+                '*' => {
+                    let start = at;
+                    while chars.get(at) == Some(&'*') {
+                        at += 1;
+                    }
+                    match at - start {
+                        1 => tokens.push(Token::Run),
+                        2 => {
+                            // `**` is a whole path component: the pattern starts with it or a
+                            // separator comes before it, and the pattern ends with it or a
+                            // separator follows it.
+                            let begins = start == 0 || std::path::is_separator(chars[start - 1]);
+                            let ends = at == chars.len() || std::path::is_separator(chars[at]);
+                            if !begins || !ends {
+                                return Err(refused_run(text));
+                            }
+                            if at < chars.len() {
+                                at += 1;
+                            }
+                            if tokens.last() != Some(&Token::Components) {
+                                tokens.push(Token::Components);
+                            }
+                        }
+                        _ => return Err(refused_run(text)),
+                    }
+                }
+                '[' => {
+                    // A class holds at least one member, and its first character is a member,
+                    // a `]` included, after a `!`.
+                    let (negated, first) = if chars.get(at + 1) == Some(&'!') {
+                        (true, at + 3)
+                    } else {
+                        (false, at + 2)
+                    };
+                    let long_enough = if negated {
+                        at + 4 <= chars.len()
+                    } else {
+                        at + 3 <= chars.len()
+                    };
+                    let close = long_enough
+                        .then(|| chars[first..].iter().position(|one| *one == ']'))
+                        .flatten();
+                    let Some(close) = close else {
                         return Err(format!(
                             "names the pattern `{text}`, which has a `[` that no `]` closes"
                         ));
-                    }
-                },
-                '*' => {
-                    // Cargo reads `**` as a pattern only where it is a whole path component, and a
-                    // name has one component.
-                    let run = pattern[at..].iter().take_while(|one| **one == '*').count();
-                    if run > 2 || (run == 2 && pattern.len() != 2) {
-                        return Err(format!(
-                            "names the pattern `{text}`, which Cargo refuses: a run of `*` is one \
-                             `*`, or the whole pattern `**`"
-                        ));
-                    }
-                    at += run - 1;
+                    };
+                    let members = members(&chars[first - 1..first + close]);
+                    tokens.push(if negated {
+                        Token::Except(members)
+                    } else {
+                        Token::Within(members)
+                    });
+                    at = first + close + 1;
                 }
-                _ => {}
+                one => {
+                    tokens.push(Token::One(one));
+                    at += 1;
+                }
             }
-            at += 1;
         }
-        Ok(Self(text.to_owned()))
+        Ok(Self { tokens })
     }
 
     fn matches(&self, name: &str) -> bool {
-        let pattern: Vec<char> = self.0.chars().collect();
         let name: Vec<char> = name.chars().collect();
-        glob(&pattern, &name)
+        matches_from(&self.tokens, &name)
+    }
+}
+
+fn refused_run(text: &str) -> String {
+    format!(
+        "names the pattern `{text}`, which Cargo refuses: a run of `*` is one `*`, or `**` as a \
+         whole path component"
+    )
+}
+
+/// The members of the class whose characters are `chars`: `a-c` is a range when three characters
+/// remain, and any other character is one member.
+fn members(chars: &[char]) -> Vec<Member> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        if at + 3 <= chars.len() && chars[at + 1] == '-' {
+            found.push(Member::Range(chars[at], chars[at + 2]));
+            at += 3;
+        } else {
+            found.push(Member::One(chars[at]));
+            at += 1;
+        }
+    }
+    found
+}
+
+impl Token {
+    /// Whether a token that matches one character matches `one`.
+    fn accepts(&self, one: char) -> bool {
+        let among = |members: &[Member]| {
+            members.iter().any(|member| match member {
+                Member::One(held) => *held == one,
+                Member::Range(first, last) => (*first..=*last).contains(&one),
+            })
+        };
+        match self {
+            Self::One(held) => *held == one,
+            Self::Any => true,
+            Self::Within(members) => among(members),
+            Self::Except(members) => !among(members),
+            Self::Run | Self::Components => false,
+        }
+    }
+}
+
+/// Whether the tokens match the whole of `name`, as the `glob` crate matches them: `*` takes any run
+/// of characters, and `**` takes whole path components, none included. A name holds no separator, so
+/// `**` takes the name's whole text or nothing.
+fn matches_from(tokens: &[Token], name: &[char]) -> bool {
+    let Some((token, rest)) = tokens.split_first() else {
+        return name.is_empty();
+    };
+    match token {
+        Token::Run | Token::Components => {
+            if matches_from(rest, name) {
+                return true;
+            }
+            for (at, &one) in name.iter().enumerate() {
+                if *token == Token::Components && !std::path::is_separator(one) {
+                    continue;
+                }
+                if matches_from(rest, &name[at + 1..]) {
+                    return true;
+                }
+            }
+            // The crate goes on with the next token after a `**` has taken every character.
+            *token == Token::Components && matches_from(rest, &[])
+        }
+        one => name
+            .split_first()
+            .is_some_and(|(&first, after)| one.accepts(first) && matches_from(rest, after)),
     }
 }
 
@@ -70,56 +209,6 @@ fn package_spec(text: &str) -> Result<Pattern, String> {
         ));
     }
     Pattern::new(text)
-}
-
-/// The index of the `]` that closes the class that opens at `open`, if one does.
-fn class_end(pattern: &[char], open: usize) -> Option<usize> {
-    let mut at = open + 1;
-    if pattern.get(at) == Some(&'!') {
-        at += 1;
-    }
-    // The first character of a class is a member, a `]` included.
-    at += 1;
-    while at < pattern.len() {
-        if pattern[at] == ']' {
-            return Some(at);
-        }
-        at += 1;
-    }
-    None
-}
-
-/// Whether `name` matches `pattern`, where `*` is any run of characters, `?` is one, and a class
-/// `[abc]`, `[a-c]` or `[!abc]` is one character in it or, with the `!`, not in it.
-fn glob(pattern: &[char], name: &[char]) -> bool {
-    match pattern.first() {
-        None => name.is_empty(),
-        Some('*') => (0..=name.len()).any(|skip| glob(&pattern[1..], &name[skip..])),
-        Some('?') => !name.is_empty() && glob(&pattern[1..], &name[1..]),
-        Some('[') => {
-            let Some(end) = class_end(pattern, 0) else {
-                return false;
-            };
-            let Some(&have) = name.first() else {
-                return false;
-            };
-            let negated = pattern.get(1) == Some(&'!');
-            let members = &pattern[if negated { 2 } else { 1 }..end];
-            let mut found = false;
-            let mut at = 0;
-            while at < members.len() {
-                if members.get(at + 1) == Some(&'-') && at + 2 < members.len() {
-                    found |= (members[at]..=members[at + 2]).contains(&have);
-                    at += 3;
-                } else {
-                    found |= members[at] == have;
-                    at += 1;
-                }
-            }
-            found != negated && glob(&pattern[end + 1..], &name[1..])
-        }
-        Some(&one) => name.first() == Some(&one) && glob(&pattern[1..], &name[1..]),
-    }
 }
 
 /// Whether a flag takes a value.
@@ -254,16 +343,6 @@ impl Rule {
     fn holds(&self, name: &str) -> bool {
         *self == Self::All || self.names(name)
     }
-
-    fn name(&mut self, text: &str) -> Result<(), String> {
-        let pattern = Pattern::new(text)?;
-        match self {
-            Self::All => {}
-            Self::Named(patterns) => patterns.push(pattern),
-            Self::Off => *self = Self::Named(vec![pattern]),
-        }
-        Ok(())
-    }
 }
 
 /// What a `cargo test` command selects, read from its words.
@@ -292,6 +371,12 @@ struct Parsed {
     named: Vec<Pattern>,
     excluded: Vec<Pattern>,
     workspace: bool,
+    /// What `--bin`, `--example`, `--test` and `--bench` name, as written: a plural flag beside them
+    /// takes every target of its kind, so a name is read only when the whole command is.
+    bin_names: Vec<String>,
+    example_names: Vec<String>,
+    test_names: Vec<String>,
+    bench_names: Vec<String>,
 }
 
 impl Parsed {
@@ -318,13 +403,13 @@ impl Parsed {
             "--workspace" => self.workspace = true,
             "--lib" => selection.lib = true,
             "--bins" => selection.bins = Rule::All,
-            "--bin" => selection.bins.name(&value)?,
+            "--bin" => self.bin_names.push(value),
             "--examples" => selection.examples = Rule::All,
-            "--example" => selection.examples.name(&value)?,
+            "--example" => self.example_names.push(value),
             "--tests" => selection.tests = Rule::All,
-            "--test" => selection.tests.name(&value)?,
+            "--test" => self.test_names.push(value),
             "--benches" => selection.benches = Rule::All,
-            "--bench" => selection.benches.name(&value)?,
+            "--bench" => self.bench_names.push(value),
             "--all-targets" => selection.all_targets = true,
             "--release" => selection.release = true,
             "--all-features" => selection.all_features = true,
@@ -385,6 +470,10 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
         named: Vec::new(),
         excluded: Vec::new(),
         workspace: false,
+        bin_names: Vec::new(),
+        example_names: Vec::new(),
+        test_names: Vec::new(),
+        bench_names: Vec::new(),
     };
     let mut test_name = false;
     let mut at = 0;
@@ -446,6 +535,23 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
         return Err("gives `--exclude` without `--workspace`, which Cargo refuses".to_owned());
     }
     let mut selection = read.selection;
+    // A plural flag takes every target of its kind and Cargo reads no name beside it, so only the
+    // names of a kind that no plural flag takes are read as patterns.
+    for (rule, names) in [
+        (&mut selection.bins, read.bin_names),
+        (&mut selection.examples, read.example_names),
+        (&mut selection.tests, read.test_names),
+        (&mut selection.benches, read.bench_names),
+    ] {
+        if *rule == Rule::Off && !names.is_empty() {
+            *rule = Rule::Named(
+                names
+                    .iter()
+                    .map(|name| Pattern::new(name))
+                    .collect::<Result<_, _>>()?,
+            );
+        }
+    }
     // A test name and no flag that names targets: Cargo builds the library, whatever its `test` key
     // says, and each target that is tested.
     if test_name && !selection.asks_for_targets() {
@@ -724,6 +830,20 @@ mod tests {
             ("a*c*", "abx", false),
             ("kr-*", "kr-worker", true),
             ("kr-*", "other-kr-worker", false),
+            ("**/single", "single", true),
+            ("**/single", "xsingle", false),
+            ("**/s*", "single", true),
+            ("**/s*", "other", false),
+            ("**/**/single", "single", true),
+            ("**/**/s?ngle", "single", true),
+            ("**/[sx]ingle", "single", true),
+            ("a/**", "a", false),
+            ("a/b", "a", false),
+            ("[!]]x", "ax", true),
+            ("[!]]x", "]x", false),
+            ("[]a]x", "]x", true),
+            ("[a-]x", "-x", true),
+            ("[a-]x", "bx", false),
         ];
         let mut wrong = Vec::new();
         for (pattern, name, expected) in rows {
@@ -733,6 +853,37 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    #[test]
+    fn a_target_pattern_may_hold_a_recursive_component_and_a_pattern_a_plural_flag_supersedes_is_not_read()
+     {
+        // `**` as a whole component matches the name with no component before it.
+        assert_eq!(covered("cargo test --test **/t"), ["a --test t"]);
+        assert_eq!(covered("cargo test --test **/**/t"), ["a --test t"]);
+        assert_eq!(covered("cargo test --bin **/x*"), ["a --bin x"]);
+        assert_eq!(
+            covered("cargo test --test **/nothing"),
+            Vec::<String>::new()
+        );
+        // A plural flag takes every target of its kind and Cargo reads no pattern beside it, in
+        // either order, so a pattern it refuses is not refused.
+        let tests = covered("cargo test --tests");
+        for line in [
+            "cargo test --tests --test ***",
+            "cargo test --test *** --tests",
+            "cargo test --test a** --tests --test x**",
+        ] {
+            assert_eq!(covered(line), tests, "{line}");
+        }
+        assert_eq!(
+            covered("cargo test --bins --bin ***"),
+            covered("cargo test --bins")
+        );
+        // A pattern that no plural flag supersedes is read, and refused when Cargo refuses it.
+        for line in ["cargo test --test ***", "cargo test --bins --test ***"] {
+            assert!(parse(&words(line)).is_err(), "{line}");
+        }
     }
 
     #[test]
@@ -1245,11 +1396,19 @@ mod tests {
             ),
             (
                 "cargo test -p a**",
-                "names the pattern `a**`, which Cargo refuses: a run of `*` is one `*`, or the whole pattern `**`",
+                "names the pattern `a**`, which Cargo refuses: a run of `*` is one `*`, or `**` as a whole path component",
             ),
             (
                 "cargo test --workspace --exclude **a",
                 "names the pattern `**a`, which Cargo refuses",
+            ),
+            (
+                "cargo test --test **x",
+                "names the pattern `**x`, which Cargo refuses",
+            ),
+            (
+                "cargo test --test x/**y",
+                "names the pattern `x/**y`, which Cargo refuses",
             ),
             (
                 "cargo test --test ***",
