@@ -604,6 +604,34 @@ mod tests {
     }
 
     #[test]
+    fn a_dependency_the_manifest_renames_is_known_by_its_rename() {
+        let value = serde_json::json!({
+            "workspace_members": ["path+file:///w/a#0.1.0"],
+            "workspace_default_members": ["path+file:///w/a#0.1.0"],
+            "packages": [{
+                "id": "path+file:///w/a#0.1.0",
+                "name": "a",
+                "version": "0.1.0",
+                "manifest_path": "/w/a/Cargo.toml",
+                "targets": [],
+                "dependencies": [
+                    { "name": "b", "rename": "dep", "source": null },
+                    { "name": "c", "rename": null, "source": null }
+                ]
+            }]
+        });
+        let packages = parse(&value).expect("parses");
+        assert_eq!(
+            packages[0].dependency_aliases,
+            BTreeMap::from([("b".to_owned(), "dep".to_owned())])
+        );
+        assert_eq!(
+            packages[0].dependency_names,
+            BTreeSet::from(["c".to_owned(), "dep".to_owned()])
+        );
+    }
+
+    #[test]
     fn a_crate_the_lockfile_takes_from_elsewhere_is_not_the_registrys() {
         let lock = "version = 4\n\n[[package]]\nname = \"tokio\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"patched\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"mirrored\"\nversion = \"1.0.0\"\nsource = \"registry+https://example.test/index\"\n";
         assert!(locked_from_crates_io(lock, "tokio"));
