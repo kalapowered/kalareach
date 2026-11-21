@@ -3828,6 +3828,53 @@ fn a_command_gives_no_package_flag_where_the_step_gave_none_in_a_workspace_with_
     assert!(!ran.command.contains("--workspace"), "{}", ran.command);
 }
 
+/// A `-p` name that no member has selects a package of the dependency graph, which the report does
+/// not read. Here `ext` is outside the workspace and has a target `t` that needs a feature the step
+/// leaves off, so the step does not build it, and Cargo refuses `--test t` for it. The command keeps
+/// the step's own flags, and every program of the step's build runs.
+#[cfg(unix)]
+#[test]
+fn a_command_keeps_the_steps_flags_where_the_step_names_a_package_that_no_member_has() {
+    let files = [
+        file(
+            "Cargo.toml",
+            &manifest(
+                "a",
+                "[dependencies]\next = { path = \"ext\" }\n\n[workspace]\nexclude = [\"ext\"]\n",
+            ),
+        ),
+        file("src/lib.rs", UNIT),
+        file("tests/t.rs", WORKS),
+        file(
+            "ext/Cargo.toml",
+            &manifest(
+                "ext",
+                "[features]\nslow = []\n\n[lib]\ntest = false\ndoctest = false\n\n[[test]]\nname = \"t\"\nrequired-features = [\"slow\"]\n",
+            ),
+        ),
+        file("ext/src/lib.rs", ""),
+        file("ext/tests/t.rs", WORKS),
+    ];
+    let disk = on_disk(&[], &files);
+    let (a_t, ext_t) = (
+        target_of("a", TargetKind::Test, "t"),
+        target_of("ext", TargetKind::Test, "t"),
+    );
+    let ran = reproduced(
+        &disk,
+        &["test", "--locked", "-p", "a", "-p", "ext"],
+        &a_t,
+        "works",
+    );
+    assert_eq!(ran.step_failed, None);
+    assert!(!ran.programs.contains_key(&ext_t), "the step built ext's t");
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.ran, ran.all_programs(), "{}", ran.command);
+    assert!(!ran.command.contains(" --test "), "{}", ran.command);
+}
+
 /// Two packages each have the target `ta`, and the step built both: the test's own flag names both,
 /// both run, and no other program of the step does.
 #[cfg(unix)]

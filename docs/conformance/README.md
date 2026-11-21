@@ -322,7 +322,9 @@ A command that gives neither `-p` nor `--workspace` takes the workspace's defaul
 package, the manifest's `default-members`, or, in a virtual workspace without them, every member.
 `-p` or `--package` takes the members whose names match. It may be repeated, written with `=`, and
 given a pattern of `*`, `?` and `[...]`. `--workspace` or `--all` takes every member, and `--exclude`
-removes the members that match. Cargo ignores `-p` beside `--workspace`, and so does the report.
+removes the members that match. Cargo ignores `-p` beside `--workspace`, and so does the report. A
+plain `-p` name that no member has selects a package of the dependency graph, whose targets the
+report does not read.
 
 With no target flag, a step covers each selected package's targets that the manifest says `cargo
 test` builds: the library, the binaries and the integration tests, and an example or a benchmark that
@@ -392,13 +394,14 @@ package and its dependencies with other features.
 
 In place of the step's target flags the command gives the test's own: `--lib`, or `--bin`,
 `--example`, `--test` or `--bench` with the target's name. Cargo applies that flag to every package
-the step selects, and refuses it for a target whose features are off, so the command gives it only
-when the step's build made every target the flag names in those packages. Otherwise it keeps the
-step's target flags and test names, and Cargo runs every program the step ran. After `--` come the
-options the step passes the test programs, with their values, except the filters, `--skip`,
-`--exact`, `--list`, `--show-output` and `--logfile`, then `--exact` and the test's name. Every
-program the command starts runs the tests of that exact name, so a test of the same name in another
-of them runs too. A test that no step covers gets `--locked`, `-p <package>` and its target's flag.
+the step selects, and refuses it for a target whose features are off. The command gives it only
+when every `-p` name is a member of the workspace, because the report does not read the targets of
+another package, and when the step's build made every target the flag names in the selected
+packages. Otherwise it keeps the step's target flags and test names, and Cargo runs every program
+the step ran. After `--` come the options the step passes the test programs, with their values,
+except the filters, `--skip`, `--exact`, `--list`, `--show-output` and `--logfile`, then `--exact`
+and the test's name. Every program the command starts runs the tests of that exact name, so a test
+of the same name in another of them runs too. A test that no step covers gets `--locked`, `-p <package>` and its target's flag.
 
 The command does not give what the report gives the step: `KR_TEST_ARTIFACTS_DIR`, the runner, and
 the option that makes each test program write its record. A word whose value holds a placeholder is
