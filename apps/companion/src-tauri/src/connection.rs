@@ -722,6 +722,13 @@ pub struct ConnectionState {
     /// A file this application uploads goes to the host on this machine. A host this device is
     /// paired with takes no file from it, so the page offers no attachment over one.
     pub paired: bool,
+    /// True while the live connection is to a host this device is paired with under a grant that
+    /// answers to an organisation, and false for every other host, the one on this machine included,
+    /// and when there is no connection.
+    ///
+    /// The account signed in decides who a device's uploads and drafts belong to on such a host and
+    /// on no other, so the page that follows the account's changes reads this.
+    pub organisation: bool,
     /// How many times, since this application started, a connection the host withdrew has been
     /// replaced by one it admits. A request refused on the withdrawn connection was answered with a
     /// failure just before the replacement, so the page says so whenever this grows.
@@ -738,6 +745,7 @@ impl ConnectionState {
             reason: Some(reason.into()),
             rights: None,
             paired: false,
+            organisation: false,
             replaced: 0,
         }
     }
@@ -751,16 +759,18 @@ impl ConnectionState {
             reason: None,
             rights: Some(kr_protocol::rights::ActionRight::ALL.to_vec()),
             paired: false,
+            organisation: false,
             replaced: 0,
         }
     }
 
     /// The state of a live connection to a host this device is paired with, in `environment_id`,
-    /// with the rights its grant carries.
+    /// with the rights its grant carries, and whether the grant answers to an organisation.
     #[must_use]
     pub fn paired(
         environment_id: EnvironmentId,
         rights: Vec<kr_protocol::rights::ActionRight>,
+        organisation: bool,
     ) -> Self {
         Self {
             connected: true,
@@ -768,6 +778,7 @@ impl ConnectionState {
             reason: None,
             rights: Some(rights),
             paired: true,
+            organisation,
             replaced: 0,
         }
     }
@@ -777,9 +788,11 @@ impl ConnectionState {
     pub fn of(connection: &Connection) -> Self {
         match &connection.standing {
             Standing::Owner => Self::owner(connection.environment_id),
-            Standing::Paired { rights, .. } => {
-                Self::paired(connection.environment_id, rights.clone())
-            }
+            Standing::Paired { rights, host, .. } => Self::paired(
+                connection.environment_id,
+                rights.clone(),
+                host.proposed_grant.organisation.as_ref().is_some(),
+            ),
         }
     }
 }
@@ -1430,13 +1443,17 @@ mod tests {
         let there = serde_json::to_value(ConnectionState::paired(
             environment,
             vec![kr_protocol::rights::ActionRight::AgentPrompt],
+            false,
         ))
         .expect("encodes");
         assert_eq!(there["paired"], serde_json::Value::Bool(true));
         assert_eq!(there["rights"], serde_json::json!(["agent.prompt"]));
+        assert_eq!(there["organisation"], serde_json::Value::Bool(false));
 
         let lost = serde_json::to_value(ConnectionState::unreachable("no host")).expect("encodes");
         assert_eq!(lost["paired"], serde_json::Value::Bool(false));
+        assert_eq!(lost["organisation"], serde_json::Value::Bool(false));
+        assert_eq!(here["organisation"], serde_json::Value::Bool(false));
     }
 
     /// KR-REQ-10.01: what crosses to the WebView is a host event's payload as the native client

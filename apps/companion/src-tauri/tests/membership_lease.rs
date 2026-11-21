@@ -1678,6 +1678,17 @@ async fn a_sign_out_ends_the_member_connection_at_once() {
     rig.served.web().release_held();
 }
 
+/// KR-REQ-13.12: the connection state the page reads says that the host it is connected to is one
+/// whose grant answers to an organisation. The account signed in decides whose uploads and drafts the
+/// device shows on such a host and on no other, so the page follows the account's changes there only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_to_a_member_host_tells_the_page_so() {
+    let rig = Rig::start().await;
+    let state = rig.connection(true).await;
+    assert_eq!(state["paired"], true, "{state}");
+    assert_eq!(state["organisation"], true, "{state}");
+}
+
 /// KR-REQ-17.53: the inbox keeps its connection to a host that is not in use between passes, and
 /// nothing keeps the lease of that host fresh. When the lease the host holds has ended, the next
 /// pass presents the device's lease again over the connection it kept, asks the organisation's
