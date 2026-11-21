@@ -197,6 +197,82 @@ describe('the feed that orders the connection’s states', () => {
     feed.stop()
   })
 
+  it('a resync that answers after later events advanced the feed is dropped', async () => {
+    const script = scripted()
+    const feed = createConnectionFeed(script.source)
+    const shown: { revision: number; resynced: boolean }[] = []
+    feed.watch((each, resynced) => shown.push({ revision: each.revision, resynced }), () => undefined)
+    await settle()
+    script.tell(state(1))
+    // 3 is ahead of the page, so the replay is asked for from 1; 2 and then 4 are heard while it is out.
+    script.tell(state(3))
+    await settle()
+    expect(script.asked.map((each) => each.after)).toEqual([1])
+    script.tell(state(2))
+    script.tell(state(4, { connected: false, reason: 'the newest state' }))
+    await settle()
+    expect(shown.map((each) => each.revision)).toEqual([1, 2, 3, 4])
+    // Native code answers that the page is too far behind, with the whole state it held when it was
+    // asked: that is older than 4, and the page was never behind.
+    script.asked[0]?.resolve(since(3, [state(3)], true))
+    await settle()
+    expect(shown).toEqual([
+      { revision: 1, resynced: false },
+      { revision: 2, resynced: false },
+      { revision: 3, resynced: false },
+      { revision: 4, resynced: false }
+    ])
+    expect(feed.latest()?.revision).toBe(4)
+    expect(feed.latest()?.connected).toBe(false)
+    expect(feed.appliedThrough()).toBe(4)
+    // The next change follows 4, not the older snapshot.
+    script.tell(state(5))
+    await settle()
+    expect(shown.at(-1)).toEqual({ revision: 5, resynced: false })
+    feed.stop()
+  })
+
+  it('a resync above the events heard meanwhile is applied and flagged', async () => {
+    const script = scripted()
+    const feed = createConnectionFeed(script.source)
+    const shown: { revision: number; resynced: boolean }[] = []
+    feed.watch((each, resynced) => shown.push({ revision: each.revision, resynced }), () => undefined)
+    await settle()
+    script.tell(state(1))
+    script.tell(state(3))
+    await settle()
+    script.tell(state(2))
+    await settle()
+    // The page is at 3 when native code answers that it was further behind: the whole state is newer.
+    script.asked[0]?.resolve(since(900, [state(900)], true))
+    await settle()
+    expect(shown.at(-1)).toEqual({ revision: 900, resynced: true })
+    expect(feed.appliedThrough()).toBe(900)
+    feed.stop()
+  })
+
+  it('a resync below the cursor is native code starting again when nothing was heard meanwhile', async () => {
+    const script = scripted()
+    const feed = createConnectionFeed(script.source)
+    const shown: { revision: number; resynced: boolean }[] = []
+    feed.watch((each, resynced) => shown.push({ revision: each.revision, resynced }), () => undefined)
+    await settle()
+    script.tell(state(500))
+    await settle()
+    // The tail asks again; native code has restarted and its revisions begin over.
+    feed.catchUp()
+    await settle()
+    expect(script.asked.map((each) => each.after)).toEqual([500])
+    script.asked[0]?.resolve(since(3, [state(3, { reason: 'after the restart' })], true))
+    await settle()
+    expect(shown.at(-1)).toEqual({ revision: 3, resynced: true })
+    expect(feed.appliedThrough()).toBe(3)
+    script.tell(state(4))
+    await settle()
+    expect(shown.at(-1)).toEqual({ revision: 4, resynced: false })
+    feed.stop()
+  })
+
   it('a failed fill goes to failed and is retried', async () => {
     vi.useFakeTimers()
     const script = scripted()

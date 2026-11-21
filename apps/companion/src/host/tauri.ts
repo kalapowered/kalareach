@@ -293,14 +293,18 @@ export function tauriPort(): HostPort {
       .then(receivedPublication)
       .then(learned(at))
   }
-  const readSince = (after: number): Promise<ConnectionSince> =>
-    invoking<NativeSince>('connection_since', { after }).then((since) => {
+  const readSince = (after: number): Promise<ConnectionSince> => {
+    const was = seen
+    return invoking<NativeSince>('connection_since', { after }).then((since) => {
       const states = since.states.map(receivedPublication)
       // The page was ahead of native code, or far behind it: what it held before says nothing now.
-      if (since.resync) seen = 0
+      // Unless a state was taken in while the request was out: the whole state is then older than
+      // the page, and takes nothing back.
+      if (since.resync && seen === was) seen = 0
       for (const state of states) observe(state)
       return { revision: since.revision, states, resync: since.resync }
     })
+  }
   // The one feed of the connection's state: every view follows it, and a raw event is told to it only
   // after the filter of the host in use has taken it in.
   const feed = createConnectionFeed({

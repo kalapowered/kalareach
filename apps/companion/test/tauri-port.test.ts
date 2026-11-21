@@ -758,6 +758,42 @@ describe('the desktop port and a host that changed', () => {
     expect(heard).toEqual(['2', '4'])
   })
 
+  it('does not move the host back on a resync that answers after later states', async () => {
+    const { heard } = await following(published('env-a', 1))
+    let answer: (since: unknown) => void = () => undefined
+    shell.answers.set(
+      'connection_since',
+      new Promise((resolve) => {
+        answer = resolve
+      })
+    )
+    // 3 is ahead of the page, so the replay is asked for; 2 and then 4 are heard while it is out, and
+    // 4 names the next host.
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 3) })
+    await settle()
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 2) })
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-b', 4) })
+    // Native code says the page is too far behind, with the state it held when it was asked.
+    answer({ revision: 3, resync: true, states: [published('env-a', 3)] })
+    await settle()
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 4))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '2', 4))
+    expect(heard).toEqual(['2'])
+  })
+
+  it('takes the host of a resync that restarts native code when nothing was heard meanwhile', async () => {
+    const { port, heard } = await following(published('env-a', 500))
+    shell.answers.set('connection_since', {
+      revision: 3,
+      resync: true,
+      states: [published('env-b', 3)]
+    })
+    await port.connectionSince(500)
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 3))
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '2', 3))
+    expect(heard).toEqual(['2'])
+  })
+
   it('holds the host events that are ahead of the feed and asks it to catch up', async () => {
     const { heard } = await following()
     shell.answers.set('connection_since', { revision: 3, resync: false, states: [] })

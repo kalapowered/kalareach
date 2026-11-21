@@ -14,7 +14,8 @@
  * or below the last applied is dropped, and one above the next is a gap: the missed states are asked
  * for, one request at a time, applied in order, and the late duplicates are dropped. When the page
  * is further behind than native code keeps, the answer is the whole current state, taken as a new
- * base and flagged, so a view reads again from the start.
+ * base and flagged, so a view reads again from the start; one that is not above what was heard while
+ * it was out is older than the page, and is dropped.
  *
  * Nothing waits on a view to look: while the document is visible the feed asks for what it missed
  * every few seconds, and when the document becomes visible, so a lost last event is found wherever
@@ -183,8 +184,14 @@ export function createConnectionFeed(source: FeedSource): ConnectionFeed {
         if (answer.resync) {
           const whole = answer.states[answer.states.length - 1]
           if (whole === undefined) return
-          for (const revision of [...buffer.keys()]) if (revision <= whole.revision) buffer.delete(revision)
-          apply(whole, true)
+          // States heard while the request was out moved the feed on from where it asked, so a whole
+          // state that is not above them is older than what the feed holds: the page was never
+          // behind, and taking it would show an older state over a newer one. With nothing heard
+          // meanwhile, a whole state below the cursor is native code starting its revisions over.
+          if (cursor === from || whole.revision > cursor) {
+            for (const revision of [...buffer.keys()]) if (revision <= whole.revision) buffer.delete(revision)
+            apply(whole, true)
+          }
         } else {
           for (const state of answer.states) if (state.revision > cursor) apply(state, false)
         }
