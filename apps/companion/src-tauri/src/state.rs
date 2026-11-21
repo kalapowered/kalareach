@@ -379,30 +379,44 @@ impl AppState {
     ///
     /// The sign-in refusal of [`Self::paired_for`].
     pub async fn check_stamp(&self, mark: Option<&str>) -> Result<()> {
-        let organisation = match self.paired_parts() {
-            Ok((_, _, _, organisation)) => organisation,
-            Err(_) => match self.paired_context() {
-                Some(context) => context.host.proposed_grant.organisation.as_ref().is_some(),
-                None => return Ok(()),
-            },
-        };
+        let organisation = self.organisation_host();
         let account = self.account_of(organisation).await.unwrap_or(None);
         stamp_matches(organisation, account, mark)
+    }
+
+    /// Whether the host this application is paired with answers to an organisation: read from the
+    /// connection when there is one and from the record of the host when there is none, so the
+    /// answer holds while the connection is down.
+    fn organisation_host(&self) -> bool {
+        match self.paired_parts() {
+            Ok((_, _, _, organisation)) => organisation,
+            Err(_) => self
+                .paired_context()
+                .is_some_and(|context| context.host.proposed_grant.organisation.as_ref().is_some()),
+        }
     }
 
     /// As [`Self::paired`], for a command the page made under the account that `mark` names. On a host
     /// whose grant answers to an organisation a mark that is not the account signed in now, and a
     /// missing mark, are refused with the sign-in words, at the command's entry; on another host
     /// nothing is compared. The account is read once, so the command goes on under the account it
-    /// was checked against.
+    /// was checked against. The mark is checked before the connection is asked for: a change of the
+    /// account ends the connection to a host that answers to an organisation at once, so a command
+    /// made under the earlier account finds none and is told to sign in, not that the host is out
+    /// of reach.
     ///
     /// # Errors
     ///
     /// As [`Self::paired`], and the refusal above.
     pub async fn paired_for(&self, mark: Option<&str>) -> Result<crate::open_transfers::Paired> {
-        let (device_id, environment_id, session, organisation) = self.paired_parts()?;
+        let parts = self.paired_parts();
+        let organisation = match &parts {
+            Ok((_, _, _, organisation)) => *organisation,
+            Err(_) => self.organisation_host(),
+        };
         let account = self.account_of(organisation).await?;
         stamp_matches(organisation, account, mark)?;
+        let (device_id, environment_id, session, _) = parts?;
         Ok(crate::open_transfers::Paired {
             device_id,
             environment_id,
@@ -419,13 +433,7 @@ impl AppState {
     /// As [`Self::paired_who`], and the refusal of [`Self::paired_for`].
     pub async fn paired_who_for(&self, mark: Option<&str>) -> Result<crate::open_transfers::Who> {
         let who = self.paired_who().await?;
-        let organisation = match self.paired_parts() {
-            Ok((_, _, _, organisation)) => organisation,
-            Err(_) => self
-                .paired_context()
-                .is_some_and(|context| context.host.proposed_grant.organisation.as_ref().is_some()),
-        };
-        stamp_matches(organisation, who.account, mark)?;
+        stamp_matches(self.organisation_host(), who.account, mark)?;
         Ok(who)
     }
 
