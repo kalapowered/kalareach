@@ -168,7 +168,7 @@ export function LaunchCommands({
             say(changed('absent', label), 'success')
             adopt(after)
           } else {
-            setOutcome({ kind: 'conflict', words: WORDS.conflict })
+            setOutcome({ kind: 'conflict', words: WORDS.removeConflict })
             adopt(after)
           }
         },
