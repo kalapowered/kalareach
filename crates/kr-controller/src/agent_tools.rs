@@ -229,10 +229,18 @@ impl Fs {
     }
 
     /// Removes the file at `path`. `expected` is the digest of the file the caller checked there:
-    /// a declared word's walk removes nothing else.
+    /// nothing else is removed, by the walk or by a path, and a file that is not that one is told
+    /// as changed.
     fn remove_file(&self, path: &Path, expected: Digest256) -> Result<anchor::Taken> {
         match self {
             Self::Paths => {
+                #[cfg(test)]
+                anchor::walked_pause::run(path);
+                match read_digest(path)? {
+                    None => return Ok(anchor::Taken::Gone),
+                    Some(found) if found != expected => return Ok(anchor::Taken::Changed),
+                    Some(_) => {}
+                }
                 std::fs::remove_file(path).map_err(storage)?;
                 if let Some(parent) = path.parent() {
                     sync_directory(parent, NameKind::File)?;
@@ -1102,7 +1110,9 @@ impl Installer {
         // The plan was made before the marker, from the tree as it was then, and the daemon
         // carries out that plan, not one made after the marker: a name that was kept is never
         // turned into one that is deleted or rewritten by a change made while the removal waits
-        // or runs.
+        // or runs. A name the plan deletes or rewrites is read again at its turn, and acted on
+        // only while it is still what the plan decided: the file the plan deleted, the document
+        // as it then stands, and no other kind of act.
         for Step { operation, what } in steps {
             let path = operation.path();
             match what {
@@ -1124,7 +1134,22 @@ impl Installer {
                         }
                     },
                 },
-                Planned::Entry { entry, plan } => match self.remove_entry(Path::new(path), plan)? {
+                Planned::Entry {
+                    entry,
+                    digest,
+                    created_document,
+                    plan,
+                } => match self.remove_entry(
+                    Path::new(path),
+                    self.confirmed(
+                        Path::new(path),
+                        &entry,
+                        digest,
+                        created_document,
+                        plan,
+                        params,
+                    )?,
+                )? {
                     Removal::Removed => removed.push(operation.clone()),
                     Removal::Kept(reason) => {
                         retained.push(format!("{entry} in {path}: {reason}"));
@@ -1379,6 +1404,8 @@ impl Installer {
                     created_document,
                 } => Planned::Entry {
                     entry: entry.clone(),
+                    digest: *digest,
+                    created_document: *created_document,
                     plan: self.plan_entry(
                         Path::new(path),
                         entry_key(entry),
@@ -1832,6 +1859,31 @@ impl Installer {
             None => FilePlan::Gone,
             Some(found) if found != digest => FilePlan::Changed,
             Some(_) => FilePlan::Delete,
+        })
+    }
+
+    /// The plan for a server entry as the document stands where the removal reaches it: an entry
+    /// the removal decided to keep it keeps, and one it decided to delete or to rewrite it reads
+    /// again and acts on only while the document still calls for that kind of act. A document that
+    /// no longer does is kept, with the reason, and never turned into another kind of act.
+    fn confirmed(
+        &self,
+        path: &Path,
+        entry: &str,
+        digest: Digest256,
+        created_document: bool,
+        decided: EntryPlan,
+        params: &AgentToolsParams,
+    ) -> Result<EntryPlan> {
+        if matches!(decided, EntryPlan::Keep(_)) {
+            return Ok(decided);
+        }
+        let now = self.plan_entry(path, entry_key(entry), digest, created_document, params)?;
+        Ok(match (&decided, now) {
+            (EntryPlan::Delete { .. }, now @ EntryPlan::Delete { .. })
+            | (EntryPlan::Edit { .. }, now @ EntryPlan::Edit { .. })
+            | (_, now @ EntryPlan::Keep(_)) => now,
+            _ => EntryPlan::Keep("it has changed since it was installed".to_owned()),
         })
     }
 
@@ -2911,8 +2963,13 @@ struct Step {
 enum Planned {
     /// A file, which was written with the digest `digest`.
     File { digest: Digest256, plan: FilePlan },
-    /// A server entry, named `entry`, in a document.
-    Entry { entry: String, plan: EntryPlan },
+    /// A server entry, named `entry`, in a document, written with the digest `digest`.
+    Entry {
+        entry: String,
+        digest: Digest256,
+        created_document: bool,
+        plan: EntryPlan,
+    },
     /// A folder the installation made.
     Folder(FolderPlan),
 }
@@ -7558,6 +7615,144 @@ mod tests {
             recorded_files_gone(&tree),
             Vec::<&str>::new(),
             "nothing was removed before the refusal"
+        );
+    }
+
+    /// The one file named `name` that an installation put under `tree`.
+    #[cfg(unix)]
+    fn installed_file(tree: &Tree, name: &str) -> PathBuf {
+        files_under(&tree.home())
+            .into_keys()
+            .find(|path| path.file_name().is_some_and(|found| found == name))
+            .expect("the installation wrote it")
+    }
+
+    /// KR-REQ-11.01: a removal of a compiled agent deletes a skill file only while it is the file
+    /// the removal planned to delete: one the person edits after the plan, before the removal
+    /// reaches it, is kept and named.
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_file_edited_after_the_plan_is_kept_by_the_removal_of_a_compiled_agent() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::CODEX, InstallScope::User);
+        installer.install(&params).expect("installs");
+        let tools = installed_file(&tree, "TOOLS.md");
+        let at = tools.clone();
+        when_walked_to("SKILL.md", move || {
+            std::fs::write(&at, "the person's own edit\n").expect("the person edits the file");
+        });
+        let removed = installer
+            .remove(&params)
+            .expect("a removal keeps what it did not write");
+        assert_eq!(
+            std::fs::read(&tools).ok().as_deref(),
+            Some(&b"the person's own edit\n"[..]),
+            "the edit made after the plan is kept"
+        );
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| { note.ends_with("TOOLS.md has changed since it was installed") }),
+            "{:?}",
+            removed.retained
+        );
+    }
+
+    /// KR-REQ-11.01: a removal of a compiled agent rewrites a document as it stands when the
+    /// removal reaches it: a setting written after the plan, before that turn, is not lost.
+    #[cfg(unix)]
+    #[test]
+    fn a_setting_written_after_the_plan_is_kept_by_the_removal_of_a_compiled_agent() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::CODEX, InstallScope::User);
+        installer.install(&params).expect("installs");
+        let config = tree.home().join(".codex/config.toml");
+        let at = config.clone();
+        when_walked_to("SKILL.md", move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, format!("model = \"another\"\n{text}"))
+                .expect("another process writes a setting");
+        });
+        installer.remove(&params).expect("removes");
+        let text = std::fs::read_to_string(&config).expect("the document stays");
+        assert!(
+            text.contains("model = \"another\""),
+            "the setting written after the plan is kept: {text}"
+        );
+        assert!(
+            !text.contains("agent-tools"),
+            "and the entry is taken: {text}"
+        );
+    }
+
+    /// KR-REQ-11.01: a document the host made is deleted only while it is nothing but what the
+    /// host wrote: one that gets a setting after the plan, before the removal reaches it, is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_the_host_made_that_gets_a_setting_after_the_plan_is_kept() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let project = tree.root.join("project");
+        std::fs::create_dir_all(&project).expect("a project folder");
+        let params = project_params(AgentTarget::CLAUDE_CODE, &project);
+        installer.install(&params).expect("installs");
+        let document = project.join(".mcp.json");
+        let at = document.clone();
+        when_walked_to("SKILL.md", move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, text.replacen('{', "{\n  \"theme\": \"dark\",", 1))
+                .expect("another process writes a setting");
+        });
+        let removed = installer
+            .remove(&params)
+            .expect("a removal keeps what it did not write");
+        let text = std::fs::read_to_string(&document).expect("the document is not deleted");
+        assert!(text.contains("\"theme\""), "the setting is kept: {text}");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("it has changed since it was installed")),
+            "{:?}",
+            removed.retained
+        );
+    }
+
+    /// KR-REQ-11.01: a removal under the walk rewrites a document as it stands when the removal
+    /// reaches it: a setting written after the plan, while the skill files go, is not a reason to
+    /// stop after they have gone, and is kept.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_changed_while_the_skill_files_go_is_rewritten_as_it_then_stands() {
+        let tree = Tree::create();
+        let amp_folder = tree.home().join(".amp");
+        std::fs::create_dir_all(amp_folder.join("skills")).expect("the folders are there before");
+        let document = amp_folder.join("mcp.json");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        let at = document.clone();
+        when_read(SKILL_FILE, move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, text.replacen('{', "{\n  \"other\": 1,", 1))
+                .expect("another process writes a setting");
+        });
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "a document that changed is rewritten as it then stands: {removed:?}"
+        );
+        let text = std::fs::read_to_string(&document).expect("the document stays");
+        assert!(
+            text.contains("\"other\"") && text.contains("\"theme\""),
+            "both settings are kept: {text}"
+        );
+        assert!(
+            !text.contains("agent-tools"),
+            "and the entry is taken: {text}"
         );
     }
 
