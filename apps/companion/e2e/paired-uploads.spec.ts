@@ -146,12 +146,12 @@ for (const surface of ['ios', 'android'] as const) {
         await page.evaluate(() => {
           window.krTestHost?.pairedUploads.refuseNext({
             code: 'PERMISSION_DENIED',
-            message: 'two files are being sent to this host already: wait for one to finish, or cancel one'
+            message: 'two files are open on this host already: wait for one to finish, or cancel one'
           })
         })
         await pickFile(page).catch(() => undefined)
         await expect(page.getByTestId('upload-line')).toHaveText(
-          'Two files are being sent to this host already: wait for one to finish, or cancel one'
+          'Two files are open on this host already: wait for one to finish, or cancel one'
         )
         await fits(page, surface)
         await page.screenshot({ path: screenshotPath(`kr-paired-upload-refused-${surface}-${String(ratio)}-${test.info().project.name}`) })

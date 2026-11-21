@@ -11,15 +11,15 @@ import { failureCode, failureWords, isHostError } from '../host/port'
 
 /** A third open upload is refused. */
 export const TOO_MANY_OPEN =
-  'two files are being sent to this host already: wait for one to finish, or cancel one'
+  'two files are open on this host already: wait for one to finish, or cancel one'
 
 /** An upload kept from before whose content is gone or changed. */
 export const CANNOT_RESUME =
   'this file cannot be resumed from where it stopped, because the copy this device kept is gone or has changed: cancel it and send the file again'
 
-/** An upload whose reservation was asked for and never answered before the application stopped. */
+/** An upload whose reservation was asked for and whose answer never came. */
 export const UNRECOVERABLE =
-  'the host was asked to take this file and did not answer before this application stopped: it keeps the place for up to 24 hours and then releases it'
+  'this device asked the host to take this file and did not get its answer: if the host agreed, it keeps the place for up to 24 hours and then releases it'
 
 /** What the command that waited for an upload is told when the person cancelled it. */
 export const CANCELLED_BEFORE_SENT = 'this file was cancelled before it was sent in full'

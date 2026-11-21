@@ -181,6 +181,7 @@ function phaseOf(view: OpenUpload): Phase {
       return { kind: 'kept', words: null }
     case 'cannotResume':
     case 'unrecoverable':
+    case 'failed':
       return { kind: 'stuck', words: sentence(view.said ?? '') }
   }
 }

@@ -1845,7 +1845,7 @@ export interface OpenUpload {
    * `waiting` for one kept from before that the host has not been asked about, `published` for one
    * sent in full and not yet bound to a draft, and the last two for one that cannot go on.
    */
-  readonly state: 'sending' | 'paused' | 'waiting' | 'published' | 'cannotResume' | 'unrecoverable'
+  readonly state: 'sending' | 'paused' | 'waiting' | 'published' | 'cannotResume' | 'unrecoverable' | 'failed'
   /** The session the file is for, when it is for one. */
   readonly sessionId: string | null
   readonly fileName: string
