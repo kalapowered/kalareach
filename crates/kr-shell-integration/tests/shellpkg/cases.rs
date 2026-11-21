@@ -7352,7 +7352,7 @@ pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and
                     "{}",
                     session.terminal_output()
                 );
-                let drawn = drawn_while_the_line_ran(&session.terminal_output(), before_line);
+                let drawn = drawn_while_the_line_ran(&session, before_line);
                 assert!(
                     drawn.contains(PROGRAM),
                     "the shell drew no message that names the program after the line ran; \
@@ -7377,12 +7377,14 @@ pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and
 /// title that Fish sets and the `cmdline_url` of its mark are operating system commands, and they
 /// name the program whether or not the shell says anything about it, so a reading that kept them
 /// would find the program in a shell that printed nothing.
-fn drawn_while_the_line_ran(output: &str, from: usize) -> String {
+///
+/// `from` is an offset into the terminal's bytes, as [`Session::written`] gives it, and only the
+/// bytes after it are decoded, so an offset inside a character the shell was still drawing cannot
+/// stop the reading.
+fn drawn_while_the_line_ran(session: &Session, from: usize) -> String {
     const MARK: &str = "\x1b]133;C";
     const PASTE_OFF: &str = "\x1b[?2004l";
-    let after = output
-        .get(from..)
-        .expect("the output before the line was installed is text up to a character boundary");
+    let after = shown_since(session, from);
     let mark = after.find(MARK);
     let paste_off = after.find(PASTE_OFF).map(|at| at + PASTE_OFF.len());
     let Some(started) = mark.max(paste_off) else {
