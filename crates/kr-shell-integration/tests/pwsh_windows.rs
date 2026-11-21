@@ -1236,3 +1236,61 @@ fn a_bat_file_is_held_to_the_same_rule_as_a_cmd_file() {
         launched[1].describe()
     );
 }
+
+/// KR-REQ-13.11: a function or an alias of a batch program's name is not run in its place: the
+/// line the module builds holds the program's full path, and nothing stands in front of it where
+/// the name is typed as it was given.
+#[test]
+fn powershell_bypasses_a_shadowing_alias_or_function_and_types_the_full_path() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_programs(directory.path());
+    batch_launch::assert_a_shadowing_function_or_alias_is_bypassed_and_the_full_path_is_typed(
+        directory.path(),
+        &programs,
+        false,
+    );
+}
+
+/// KR-REQ-13.11: a batch program runs with plain arguments, and is refused an empty argument, an
+/// argument with white space and a final backslash, an argument that holds a character `cmd.exe`
+/// reads as syntax, and a path with a percent sign or an exclamation mark.
+#[test]
+fn a_batch_program_runs_with_plain_arguments_and_is_refused_an_empty_or_batch_character_argument_or_a_path_with_percent_or_bang()
+ {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_programs(directory.path());
+    batch_launch::assert_a_batch_program_runs_with_plain_arguments_and_is_refused_what_cmd_exe_would_change(
+        directory.path(),
+        &programs,
+        false,
+    );
+}
+
+/// KR-REQ-13.11: a Windows path is typed as it was written; a program word with a leading `~` is
+/// found under the provider's home in both spellings of the separator, as PowerShell does; an
+/// argument that begins with `~` reaches the program as written. Both results are printed (read
+/// them with `--nocapture`).
+#[test]
+fn a_windows_path_is_typed_as_written_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_is_not_expanded()
+ {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_programs(directory.path());
+    batch_launch::assert_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_is_not_expanded(
+        directory.path(),
+        &programs,
+        false,
+    );
+}
+
+/// KR-REQ-13.11: a program that names no application or script has no line, and the refusal the
+/// reader gives for a command it has no line for is a draft conflict, which the page reads with
+/// the surface's shell to say that PowerShell cannot run the command.
+#[test]
+fn a_program_that_names_no_application_has_no_line_in_powershell_and_the_press_is_a_draft_conflict()
+{
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    batch_launch::assert_a_program_that_names_no_application_has_no_line_and_the_refusal_is_a_draft_conflict(
+        directory.path(),
+        false,
+    );
+}
