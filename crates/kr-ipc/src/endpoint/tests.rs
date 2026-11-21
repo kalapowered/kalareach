@@ -5,15 +5,6 @@ use crate::error::IpcError;
 use crate::listen::ListenRefusal;
 use crate::paths::Endpoint;
 
-/// The refusal a bind returned, which the case expects to be a listen refusal.
-fn refusal_of(result: crate::Result<Listener>) -> (String, ListenRefusal) {
-    match result {
-        Err(IpcError::Listen { endpoint, refusal }) => (endpoint, refusal),
-        Err(other) => panic!("a listen refusal, not {other:?}"),
-        Ok(_) => panic!("the bind was refused"),
-    }
-}
-
 #[cfg(unix)]
 mod unix {
     use super::*;
@@ -52,7 +43,11 @@ mod unix {
                 _ => std::os::unix::fs::symlink(&target, &path).expect("a link"),
             }
             let before = identity(&path);
-            let (endpoint, refusal) = refusal_of(Listener::bind(&endpoint_in(&folder, name)));
+            let error =
+                Listener::bind(&endpoint_in(&folder, name)).expect_err("the bind is refused");
+            let IpcError::Listen { endpoint, refusal } = error else {
+                panic!("a listen refusal, not {error:?}");
+            };
             assert_eq!(refusal, ListenRefusal::NotASocket { object }, "{name}");
             assert_eq!(endpoint, path.to_str().expect("text"), "{name}");
             assert_eq!(identity(&path), before, "{name} is left where it was");
@@ -76,7 +71,10 @@ mod unix {
         let folder = PrivateTempDir::create();
         let endpoint = endpoint_in(&folder, "held.sock");
         let _live = Listener::bind(&endpoint).expect("a live listener");
-        let (_, refusal) = refusal_of(Listener::bind(&endpoint));
+        let error = Listener::bind(&endpoint).expect_err("the bind is refused");
+        let IpcError::Listen { refusal, .. } = error else {
+            panic!("a listen refusal, not {error:?}");
+        };
         assert_eq!(
             refusal,
             ListenRefusal::Held {
@@ -212,7 +210,10 @@ mod unix {
         leave_a_refusing_socket(path);
         let before = identity(path);
         let _held = hold_the_lock_of(path);
-        let (_, refusal) = refusal_of(Listener::bind(&endpoint));
+        let error = Listener::bind(&endpoint).expect_err("the bind is refused");
+        let IpcError::Listen { refusal, .. } = error else {
+            panic!("a listen refusal, not {error:?}");
+        };
         assert_eq!(refusal, ListenRefusal::LockHeld);
         assert_eq!(identity(path), before, "the socket is left where it was");
     }
@@ -229,7 +230,10 @@ mod unix {
         let before = identity(path);
         let _held = hold_the_lock_of(path);
         leave_the_record_of(path);
-        let (_, refusal) = refusal_of(Listener::bind(&endpoint));
+        let error = Listener::bind(&endpoint).expect_err("the bind is refused");
+        let IpcError::Listen { refusal, .. } = error else {
+            panic!("a listen refusal, not {error:?}");
+        };
         assert_eq!(refusal, refusal_where_the_lock_names_the_listener());
         assert_eq!(identity(path), before, "the socket is left where it was");
         // The original still has its queue, and accepts one of the connections made to it.
@@ -247,7 +251,10 @@ mod unix {
         let listener = listen_with_a_queue_of_one(path);
         let queued = fill_the_queue_of(path);
         let before = identity(path);
-        let (_, refusal) = refusal_of(Listener::bind(&endpoint));
+        let error = Listener::bind(&endpoint).expect_err("the bind is refused");
+        let IpcError::Listen { refusal, .. } = error else {
+            panic!("a listen refusal, not {error:?}");
+        };
         let expected = if FULL_QUEUE_IS_REFUSED {
             ListenRefusal::Unanswered
         } else {
@@ -269,7 +276,10 @@ mod unix {
         leave_a_refusing_socket(path);
         let before = identity(path);
         std::fs::create_dir(live_of(path)).expect("a directory where the lock file goes");
-        let (_, refusal) = refusal_of(Listener::bind(&endpoint));
+        let error = Listener::bind(&endpoint).expect_err("the bind is refused");
+        let IpcError::Listen { refusal, .. } = error else {
+            panic!("a listen refusal, not {error:?}");
+        };
         if FULL_QUEUE_IS_REFUSED {
             assert_eq!(refusal, ListenRefusal::Unanswered);
             assert_eq!(identity(path), before, "the socket is left where it was");
@@ -307,7 +317,10 @@ mod unix {
             std::fs::write(live_of(path), text).expect("a lock file");
             let result = Listener::bind(&endpoint);
             if FULL_QUEUE_IS_REFUSED {
-                let (_, refusal) = refusal_of(result);
+                let error = result.expect_err("the bind is refused");
+                let IpcError::Listen { refusal, .. } = error else {
+                    panic!("a listen refusal, not {error:?}");
+                };
                 assert_eq!(refusal, ListenRefusal::Unanswered, "{name}");
                 assert_eq!(identity(path), before, "{name}");
             } else {
@@ -332,7 +345,10 @@ mod unix {
         std::fs::rename(&copy, live_of(path)).expect("a replacement");
         let result = Listener::bind(&endpoint);
         if FULL_QUEUE_IS_REFUSED {
-            let (_, refusal) = refusal_of(result);
+            let error = result.expect_err("the bind is refused");
+            let IpcError::Listen { refusal, .. } = error else {
+                panic!("a listen refusal, not {error:?}");
+            };
             assert_eq!(refusal, ListenRefusal::Unanswered);
             assert_eq!(identity(path), before);
         } else {
@@ -356,7 +372,10 @@ mod unix {
         let earlier = listen_with_a_queue_of_one(path);
         let queued = fill_the_queue_of(path);
         let before = identity(path);
-        let (_, refusal) = refusal_of(Listener::bind(&endpoint));
+        let error = Listener::bind(&endpoint).expect_err("the bind is refused");
+        let IpcError::Listen { refusal, .. } = error else {
+            panic!("a listen refusal, not {error:?}");
+        };
         let expected = if FULL_QUEUE_IS_REFUSED {
             ListenRefusal::Unanswered
         } else {
@@ -378,7 +397,10 @@ mod unix {
         let before = identity(path);
         let result = Listener::bind(&endpoint);
         if FULL_QUEUE_IS_REFUSED {
-            let (_, refusal) = refusal_of(result);
+            let error = result.expect_err("the bind is refused");
+            let IpcError::Listen { refusal, .. } = error else {
+                panic!("a listen refusal, not {error:?}");
+            };
             assert_eq!(refusal, ListenRefusal::Unanswered);
             assert_eq!(identity(path), before, "the socket is left where it was");
         } else {
@@ -416,7 +438,10 @@ mod unix {
         let _restore = Restore(folder.path().to_path_buf());
         std::fs::set_permissions(folder.path(), std::fs::Permissions::from_mode(0o500))
             .expect("a folder that cannot be written");
-        let (_, refusal) = refusal_of(Listener::bind(&endpoint));
+        let error = Listener::bind(&endpoint).expect_err("the bind is refused");
+        let IpcError::Listen { refusal, .. } = error else {
+            panic!("a listen refusal, not {error:?}");
+        };
         assert_eq!(
             refusal,
             ListenRefusal::NotRemoved {
@@ -605,7 +630,10 @@ mod windows {
         let name = format!("kr-ipc-taken-{}", crate::new_uuid());
         let endpoint = Endpoint::from_name(name).expect("a pipe name");
         let _first = Listener::bind(&endpoint).expect("the first instance");
-        let (_, refusal) = refusal_of(Listener::bind(&endpoint));
+        let error = Listener::bind(&endpoint).expect_err("the bind is refused");
+        let IpcError::Listen { refusal, .. } = error else {
+            panic!("a listen refusal, not {error:?}");
+        };
         assert_eq!(refusal, ListenRefusal::NameTaken);
         let said = refusal.said(&endpoint.as_text());
         assert!(
