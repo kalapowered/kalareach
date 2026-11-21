@@ -234,6 +234,7 @@ export function TwoPressButton({
 }): ReactNode {
   const [armed, setArmed] = useState(false)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const wrapper = useRef<HTMLSpanElement>(null)
 
   const disarm = useCallback(() => {
     if (timer.current !== null) clearTimeout(timer.current)
@@ -248,6 +249,26 @@ export function TwoPressButton({
     []
   )
 
+  // While armed, a press anywhere else and Escape end it. Focus alone cannot say so: Safari gives a
+  // button no focus when a pointer presses it, so a press elsewhere moves nothing out of focus.
+  useEffect(() => {
+    if (!armed) return undefined
+    const away = (event: PointerEvent): void => {
+      if (!(event.target instanceof Node) || wrapper.current?.contains(event.target) !== true) disarm()
+    }
+    const escape = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      event.stopPropagation()
+      disarm()
+    }
+    document.addEventListener('pointerdown', away, true)
+    document.addEventListener('keydown', escape, true)
+    return () => {
+      document.removeEventListener('pointerdown', away, true)
+      document.removeEventListener('keydown', escape, true)
+    }
+  }, [armed, disarm])
+
   // A control that is disabled is not armed when it is enabled again.
   const [wasDisabled, setWasDisabled] = useState(disabled === true)
   if ((disabled === true) !== wasDisabled) {
@@ -258,15 +279,10 @@ export function TwoPressButton({
 
   return (
     <span
+      ref={wrapper}
       className="two-press"
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) disarm()
-      }}
-      onKeyDown={(event) => {
-        if (event.key === 'Escape' && armed) {
-          event.stopPropagation()
-          disarm()
-        }
       }}
     >
       <CommitButton
