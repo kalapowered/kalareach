@@ -2191,7 +2191,7 @@ pub mod testing {
     }
 
     impl Hold {
-        fn arrive(&self, wait: bool) {
+        pub(crate) fn arrive(&self, wait: bool) {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.0 += 1;
             self.changed.notify_all();
