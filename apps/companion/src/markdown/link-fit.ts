@@ -108,24 +108,26 @@ export function packRooms(items: readonly Item[], least: number, slack: number =
   const links = items.flatMap((_, at) => (drawnLink(at) ? [at] : []))
   const controls = items.flatMap((item, at) => (!item.link && width(item) > 0 ? [at] : []))
   /** The walls of the link `at`: its column, the controls beside it, and the links of `others` that are not of its row. */
-  const wallsOf = (at: number, others: readonly number[]): { left: number; right: number } => {
+  const wallsOf = (at: number, others: readonly number[], current: boolean): { left: number; right: number } => {
     const item = items[at]
     let left = Math.min(item.column.left, item.box.left)
     let right = Math.max(item.column.right, item.box.right)
     for (const index of [...others, ...controls]) {
       const other = items[index]
       if (index === at || !reach(other.box, item.box)) continue
-      const middle = other.link && short(index)
-      if (other.box.right <= item.box.left) left = Math.max(left, middle ? (other.box.right + item.box.left) / 2 : other.box.right)
-      else if (other.box.left >= item.box.right) right = Math.min(right, middle ? (item.box.right + other.box.left) / 2 : other.box.left)
+      // The box of a link of another line as it is now, or the middle of the gap to its words where it is short and not yet packed.
+      const middle = !current && other.link && short(index)
+      const grown = current && other.link ? rooms[index] : NONE
+      if (other.box.right <= item.box.left) left = Math.max(left, middle ? (other.box.right + item.box.left) / 2 : other.box.right + grown.right)
+      else if (other.box.left >= item.box.right) right = Math.min(right, middle ? (item.box.right + other.box.left) / 2 : other.box.left - grown.left)
     }
     return { left, right }
   }
-  const slotsOf = (row: readonly number[], others: (at: number) => readonly number[]): Slot[] =>
+  const slotsOf = (row: readonly number[], others: (at: number) => readonly number[], current = false): Slot[] =>
     row
       .map((at) => {
         const item = items[at]
-        const wall = short(at) ? wallsOf(at, others(at)) : undefined
+        const wall = short(at) ? wallsOf(at, others(at), current) : undefined
         return {
           at,
           left: item.box.left,
@@ -164,6 +166,7 @@ export function packRooms(items: readonly Item[], least: number, slack: number =
     }
     // Otherwise each line, once: the connected groups of `sameLine`.
     const lineOf = new Map<number, number>()
+    const lines: number[][] = []
     for (const at of group) {
       if (lineOf.has(at)) continue
       lineOf.set(at, at)
@@ -174,8 +177,13 @@ export function packRooms(items: readonly Item[], least: number, slack: number =
           line.push(other)
         }
       }
+      lines.push(line)
       pack(slotsOf(line, (index) => group.filter((other) => lineOf.get(other) !== lineOf.get(index))))
     }
+    // Then each line again, from the top, against the boxes that the other lines have now: a line that the middle of a gap kept short
+    // has what a neighbour on another line did not need, and each line's rooms are written before the next line is packed.
+    lines.sort((a, b) => Math.min(...a.map((at) => items[at].box.top)) - Math.min(...b.map((at) => items[at].box.top)))
+    for (const line of lines) pack(slotsOf(line, (index) => group.filter((other) => lineOf.get(other) !== lineOf.get(index)), true))
   }
   return rooms
 }

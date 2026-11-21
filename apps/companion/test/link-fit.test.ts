@@ -325,6 +325,51 @@ describe('the room that the page gives the links of a message', () => {
     }
   })
 
+  it('completes `[2]` under `[1]` where a third link makes the group more than a row, at 44 and at 48', () => {
+    // Each layout is the one of the neighbouring lines (`[1]` 70 to 79 above `[2]` 0 to 9) with one more link: over `[2]`, on a third line, or wide.
+    const layouts: readonly (readonly (readonly [number, number, number])[])[] = [
+      [[70, 79, 20], [0, 9, 42], [0, 30, 20]],
+      [[70, 79, 20], [0, 9, 42], [200, 209, 64]],
+      [[70, 79, 20], [0, 9, 42], [0, 60, 20]]
+    ]
+    for (const least of [44, 48]) {
+      for (const layout of layouts) {
+        const { pane: root, messages } = pane(1, (message) => {
+          for (const [left, right, top] of layout) link(message, left, right, top)
+        })
+        computed.set(root, { '--target': `${String(least)}px` })
+        fitLinks(root, messages)
+        const boxes = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
+        const label = `${String(least)}: ${JSON.stringify(layout)}`
+        const [one, two] = [boxes[0], boxes[1]]
+        if (!one || !two) throw new Error('the made page has no links')
+        expect(one.right - one.left, `${label}, the box of [1]`).toBeGreaterThanOrEqual(least)
+        expect(two.right - two.left, `${label}, the box of [2]`).toBeGreaterThanOrEqual(least)
+        expect(one.right <= two.left || two.right <= one.left, `${label}, the boxes keep apart`).toBe(true)
+        document.body.replaceChildren()
+      }
+    }
+  })
+
+  it('completes all three links of three lines that reach one line at a time (A 0 to 9, B 70 to 79, C 200 to 209), at 44 and at 48', () => {
+    for (const [least, tops] of [
+      [44, [20, 44, 68]],
+      [48, [20, 46, 72]]
+    ] as const) {
+      const { pane: root, messages } = pane(1, (message) => {
+        link(message, 0, 9, tops[0])
+        link(message, 70, 79, tops[1])
+        link(message, 200, 209, tops[2])
+      })
+      computed.set(root, { '--target': `${String(least)}px` })
+      fitLinks(root, messages)
+      const boxes = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
+      boxes.forEach((box, at) => expect(box.right - box.left, `${String(least)}: the box of link ${String(at)}`).toBeGreaterThanOrEqual(least))
+      for (let at = 0; at + 1 < boxes.length; at += 1) expect((boxes[at] as { right: number }).right, `the end of box ${String(at)}`).toBeLessThanOrEqual((boxes[at + 1] as { left: number }).left)
+      document.body.replaceChildren()
+    }
+  })
+
   it('leaves a short link that cannot be completed the gap that a completed neighbour does not need of it', () => {
     // [8] has a wide link touching its left and 4 px to [9], which is completed and has the rest of the line on its right.
     const { pane: root, messages } = pane(1, (message) => {
