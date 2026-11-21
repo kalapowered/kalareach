@@ -2412,6 +2412,14 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
             why: "it needs the real description process and weights that KR_DESCRIBE_INFERENCE names, which no step of this repository has",
         },
     },
+    IgnoredRun {
+        package: "kr-cli",
+        target: "--test release_candidate",
+        cases: &[],
+        runs: Runs::ByHand {
+            why: "each builds the matrix reader of an earlier release on the build box, from a clean checkout of main and one case at a time with --test-threads=1, and no step of this repository does",
+        },
+    },
 ];
 
 /// A set of files whose tests another toolchain builds. The report reads their keys. It runs and
