@@ -4545,8 +4545,12 @@ async fn a_read_refused_on_a_withdrawn_connection_is_cleared_by_the_replacement(
     let told = told_until(&rig, |told| told.iter().any(|state| state["replaced"] == 1)).await;
     let refused = told
         .iter()
-        .position(|state| state["contact"]["state"] == "refused")
-        .expect("the refusal of the inbox is told");
+        .position(|state| state["contact"]["state"] == "refused");
+    assert!(
+        refused.is_some(),
+        "the refusal of the inbox is told: {told:?}"
+    );
+    let refused = refused.expect("a position");
     let replaced = told
         .iter()
         .position(|state| state["replaced"] == 1)
