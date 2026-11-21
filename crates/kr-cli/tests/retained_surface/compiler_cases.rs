@@ -118,6 +118,9 @@ include!("included.rs");
 #[path = "elsewhere/other.rs"]
 pub mod elsewhere;
 
+#[path = "../extra/more.rs"]
+pub mod more;
+
 pub fn direct() -> Method {
     Method::AgentTurnCancel
 }
@@ -261,6 +264,12 @@ fn forms(root: &Path) {
         root,
         "crates/kr-forms/src/orphan.rs",
         "use kr_protocol::method::Method;\n\npub fn orphan() -> Method {\n    Method::AgentTurnCancel\n}\n",
+    );
+    // A file the compiler reads through `#[path]` from outside `src`: only the dep-info lists it.
+    write(
+        root,
+        "crates/kr-forms/extra/more.rs",
+        "pub fn more() -> &'static str {\n    \"agent.prompt.queue\"\n}\n",
     );
     // The build script of the crate: no report covers a wire name in it, and no dep-info file lists it.
     write(
@@ -459,6 +468,7 @@ fn each_way_a_client_names_a_stamped_item_is_read_by_the_compiler_and_the_rest_i
             "kr_forms macro:cancel Expands",
             "kr_forms main Unread",
             "kr_forms mobile_only Unread",
+            "kr_forms more Unread",
             "kr_forms orphan Unread",
             "kr_forms pattern Names",
             "kr_forms qualified Names",
