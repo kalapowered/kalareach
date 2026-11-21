@@ -875,31 +875,42 @@ fn the_sources_of_every_directory_below_the_source_directory_are_read() {
     assert!(names.iter().any(|name| name == "e.rs"), "{names:?}");
 }
 
-/// The programs that send a signal to a process, by the name a command is given or the path's last
-/// part.
+/// The names of the programs that send a signal to a process: a word of shell text that holds one,
+/// in any case, is read as the program.
 const SIGNALLERS: [&str; 4] = ["kill", "pkill", "killall", "taskkill"];
 
 /// The names of the calls that reap a process by its number.
 const REAPS: [&str; 3] = ["waitpid", "waitid", "wait4"];
 
-/// Whether `text`, taken as shell text, sends a signal: a part of it has a word that is one of the
-/// programs of [`SIGNALLERS`], whatever comes before that word (a wrapper and its options, an
-/// assignment, a keyword), but for `kill -0`, which asks whether a process exists and sends
-/// nothing, and only when no later word of the part is an option. The quotes are removed first, as
-/// the shell removes them: a quoted option is an option (`kill -0 "-s" KILL "$p"`), and a quoted
-/// command is read with the rest (`trap 'kill -9 $c' TERM`). The text is cut at `;`, `|`, `&`, a new
-/// line, a back tick, `$(`, a bracket and a brace, and each word of a part is read with the
-/// complete list of the words after it.
+/// Whether `text`, taken as shell text, sends a signal: a part of it has a word that holds one of
+/// the names of [`SIGNALLERS`], in any case and anywhere in the word (`pkill`, `taskkill.exe`,
+/// `{kill,}`, `k=kill`), whatever comes before that word (a wrapper and its options, an assignment,
+/// a keyword), unless the word is `kill`, with or without a path, and the next word is `-0`, which
+/// asks whether a process exists and sends nothing, and no later word of the part is an option. The
+/// text is decoded first, as far as the shell decodes it without running anything: a line
+/// continuation is joined, the `$` that opens a `$'...'` or a `$"..."` quote and each quote and each
+/// backslash are removed, so that a quoted or an escaped option is an option (`kill -0 "-s" KILL`,
+/// `kill -0 \-s KILL`) and a quoted command, as in `trap 'kill -9 $c' TERM`, is read with the words
+/// around it, which can only add refusals to what it says on its own. A `<` and a `>` end a word, so
+/// that a redirection on a name hides nothing. The text is cut at `;`, `|`, `&`, a new line, a back
+/// tick, `$(`, a bracket and a brace, and each word of a part is read with the complete list of the
+/// words after it. The scan cannot see a name or an option that the shell makes when it runs, from
+/// text that holds neither: `/bin/k?ll -9 1`, `$(printf ki)ll -9 1` and `kill -0 $'\x2ds' 9 "$p"`
+/// pass.
 fn signals_by_text(text: &str) -> bool {
-    text.replace(['\'', '"'], "")
+    text.replace("\\\n", "")
+        .replace("$'", "'")
+        .replace("$\"", "\"")
+        .replace(['\'', '"', '\\'], "")
         .replace("$(", ";")
+        .replace(['<', '>'], " ")
         .split([';', '|', '&', '\n', '`', '(', ')', '{', '}'])
         .any(|part| {
             let words: Vec<&str> = part.split_whitespace().collect();
             words.iter().enumerate().any(|(at, word)| {
-                let program = word.rsplit(['/', '\\']).next().unwrap_or(word);
-                SIGNALLERS.contains(&program)
-                    && !(program == "kill"
+                let lower = word.to_ascii_lowercase();
+                SIGNALLERS.iter().any(|name| lower.contains(name))
+                    && !(word.rsplit('/').next() == Some("kill")
                         && words.get(at + 1) == Some(&"-0")
                         && !words[at + 2..].iter().any(|later| later.starts_with('-')))
             })
@@ -949,14 +960,19 @@ fn case_refused(source: &str) -> Result<Vec<String>, String> {
     Ok(found)
 }
 
-/// What in the text of a shell script sends a signal, each with its line.
+/// What in the text of a shell script sends a signal, each with its line; and, when no line does,
+/// the text as a whole, in which a command can run across a line continuation.
 fn script_refused(source: &str) -> Vec<String> {
-    source
+    let mut found: Vec<String> = source
         .lines()
         .enumerate()
         .filter(|(_, line)| signals_by_text(line))
         .map(|(at, line)| format!("line {}: the text {line:?}", at + 1))
-        .collect()
+        .collect();
+    if found.is_empty() && signals_by_text(source) {
+        found.push("the text across a line continuation".to_owned());
+    }
+    found
 }
 
 /// The files of the fixture `time-limits` that run: its Rust sources and its scripts.
@@ -1143,6 +1159,82 @@ fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_l
             "a kill after setsid",
             r#"fn f() { run("setsid kill -9 1"); }"#,
         ),
+        (
+            "a look with escaped quotes in a double-quoted trap",
+            r#"fn f() { run("trap \"kill -0 \\\"-s\\\" KILL \\\"$p\\\"\" TERM"); }"#,
+        ),
+        (
+            "a look with an escaped option",
+            r#"fn f() { run("kill -0 \\-s KILL \"$p\""); }"#,
+        ),
+        (
+            "a look with an escaped option in a trap",
+            r#"fn f() { run("trap 'kill -0 \\-s KILL \"$p\"' TERM"); }"#,
+        ),
+        (
+            "a look with an option in ANSI-C quotes",
+            r#"fn f() { run("kill -0 $'-s' KILL \"$p\""); }"#,
+        ),
+        (
+            "a look with an option in locale quotes",
+            r#"fn f() { run("kill -0 $\"-s\" KILL \"$p\""); }"#,
+        ),
+        (
+            "a look with an option after a line continuation",
+            r#"fn f() { run("kill -0 \\\n-s KILL \"$p\""); }"#,
+        ),
+        (
+            "a kill with an escaped letter",
+            r#"fn f() { run("ki\\ll -9 \"$p\""); }"#,
+        ),
+        (
+            "a kill with an escaped letter, short",
+            r#"fn f() { run("k\\ill -9 1"); }"#,
+        ),
+        (
+            "a kill with its name in ANSI-C quotes",
+            r#"fn f() { run("$'kill' -9 1"); }"#,
+        ),
+        (
+            "a kill with a line continuation in its name",
+            r#"fn f() { run("ki\\\nll -9 1"); }"#,
+        ),
+        (
+            "a kill with a redirection on its name",
+            r#"fn f() { run("kill>/dev/null -9 \"$p\""); }"#,
+        ),
+        (
+            "a kill with an input redirection on its name",
+            r#"fn f() { run("kill</dev/null -9 1"); }"#,
+        ),
+        (
+            "a kill with a descriptor redirection on its name",
+            r#"fn f() { run("kill>&2 -9 1"); }"#,
+        ),
+        (
+            "a kill with a capital letter",
+            r#"fn f() { run("Kill -9 1"); }"#,
+        ),
+        (
+            "a kill by a variable that holds its name",
+            r#"fn f() { run("k=kill; $k -9 1"); }"#,
+        ),
+        (
+            "a kill by a default for its name",
+            r#"fn f() { run("${K:-kill} -9 1"); }"#,
+        ),
+        (
+            "a kill by a brace expansion",
+            r#"fn f() { run("{kill,} -9 1"); }"#,
+        ),
+        (
+            "a kill with the field separator between its words",
+            r#"fn f() { run("kill${IFS}-9${IFS}1"); }"#,
+        ),
+        (
+            "a kill by a Windows name",
+            r#"fn f() { run("taskkill.exe /F /PID 1"); }"#,
+        ),
     ];
     let let_through_rust = [
         (
@@ -1185,6 +1277,30 @@ fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_l
         ),
         ("a script that kills after env", "env -i kill -9 1\n"),
         ("a script that kills after setsid", "setsid kill -9 1\n"),
+        (
+            "a script that looks with escaped quotes in a trap",
+            "trap \"kill -0 \\\"-s\\\" KILL \\\"$p\\\"\" TERM\n",
+        ),
+        (
+            "a script that looks with an escaped option",
+            "kill -0 \\-s KILL \"$p\" 2>/dev/null\n",
+        ),
+        (
+            "a script that looks across a line continuation",
+            "kill -0 \\\n-s KILL \"$p\"\n",
+        ),
+        (
+            "a script that kills across a line continuation in its name",
+            "ki\\\nll -9 1\n",
+        ),
+        (
+            "a script that kills with an escaped letter",
+            "k\\ill -9 1\n",
+        ),
+        (
+            "a script that kills with a redirection on its name",
+            "kill</dev/null -9 1\n",
+        ),
     ];
     let let_through_script = [
         ("a script that waits", "trap '' TERM\nsleep 61 &\nwait\n"),
