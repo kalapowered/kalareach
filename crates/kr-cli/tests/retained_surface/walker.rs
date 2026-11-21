@@ -33,10 +33,9 @@ use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens as _;
 use syn::ext::IdentExt as _;
 use syn::visit::Visit;
-use syn::visit_mut::VisitMut;
 
 use super::condition;
-use super::inventory::{self, Inventory, Rules, rename_refusal};
+use super::crate_files;
 
 /// A source tree: the repository, or a checkout of a release.
 pub struct Tree {
@@ -46,21 +45,14 @@ pub struct Tree {
     /// What Cargo says about each crate's targets, by crate name.
     manifests: BTreeMap<String, Manifest>,
     indexes: RefCell<BTreeMap<String, Rc<CrateIndex>>>,
-    scans: RefCell<BTreeMap<String, Rc<CrateScan>>>,
-    inventories: RefCell<BTreeMap<String, Rc<Inventory>>>,
-    /// The crates that the marks of a name and the renames of a macro's name look at: every crate
-    /// where it is not set.
-    scope: Option<BTreeSet<String>>,
+    /// The product files of each crate, read once.
+    files: RefCell<BTreeMap<String, Rc<Vec<PathBuf>>>>,
 }
 
-/// What Cargo says of a crate that the inventory needs.
+/// What Cargo says of a crate that the file list needs.
 struct Manifest {
-    /// The manifest, as a path under the tree.
-    shown: String,
     /// The source file of each library and binary target.
     roots: Vec<PathBuf>,
-    /// Whether the library is a procedural-macro crate.
-    proc_macro: bool,
 }
 
 /// The kinds of target that are product code: a library of any crate type, and a binary.
@@ -156,7 +148,6 @@ fn workspace(root: &Path) -> Result<BTreeMap<String, (PathBuf, Manifest)>, Strin
             continue;
         }
         let mut roots = Vec::new();
-        let mut proc_macro = false;
         for target in package["targets"].as_array().into_iter().flatten() {
             let kinds: Vec<&str> = target["kind"]
                 .as_array()
@@ -167,23 +158,12 @@ fn workspace(root: &Path) -> Result<BTreeMap<String, (PathBuf, Manifest)>, Strin
             if !kinds.iter().any(|kind| PRODUCT_KINDS.contains(kind)) {
                 continue;
             }
-            proc_macro |= kinds.contains(&"proc-macro");
             let source = target["src_path"]
                 .as_str()
                 .ok_or_else(|| cannot("a target with no source path"))?;
             roots.push(normalised(Path::new(source)));
         }
-        found.insert(
-            name,
-            (
-                directory,
-                Manifest {
-                    shown: shown.display().to_string(),
-                    roots,
-                    proc_macro,
-                },
-            ),
-        );
+        found.insert(name, (directory, Manifest { roots }));
     }
     Ok(found)
 }
@@ -318,60 +298,31 @@ impl Tree {
             crates,
             manifests: described,
             indexes: RefCell::new(BTreeMap::new()),
-            scans: RefCell::new(BTreeMap::new()),
-            inventories: RefCell::new(BTreeMap::new()),
-            scope: None,
+            files: RefCell::new(BTreeMap::new()),
         })
     }
 
-    /// The tree with the macro names that a sighting marks (S4) and the renames of a macro's name
-    /// (R1) looking at the crates `include` accepts only, as a scan of those crates does.
-    pub fn scoped(mut self, include: &dyn Fn(&str) -> bool) -> Self {
-        self.scope = Some(
-            self.crates
-                .keys()
-                .filter(|krate| include(krate))
-                .cloned()
-                .collect(),
-        );
-        self
+    /// The folder of the tree.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
-    /// The folder of each crate of the workspace and the product files its inventory reaches, by
-    /// canonical path, for the crates that `include` accepts. A crate the inventory refuses is an
-    /// error.
-    pub fn product_files(
-        &self,
-        include: &dyn Fn(&str) -> bool,
-    ) -> Result<BTreeMap<String, (PathBuf, BTreeSet<PathBuf>)>, String> {
-        let mut all = BTreeMap::new();
-        for (krate, folder) in self
-            .crates
-            .iter()
-            .filter(|(krate, _)| include(krate) && !self.manifests[*krate].proc_macro)
-        {
-            let files = self.inventory(krate)?.files.iter().cloned().collect();
-            all.insert(krate.clone(), (folder.clone(), files));
-        }
-        Ok(all)
+    /// The product files of `krate` that the digests' index reads, by canonical path.
+    pub fn product_files(&self, krate: &str) -> Result<Vec<PathBuf>, String> {
+        self.files(krate).map(|found| (*found).clone())
     }
 
-    /// The files product code of `krate` is made of: read once, for the index and the scan.
-    fn inventory(&self, krate: &str) -> Result<Rc<Inventory>, String> {
-        if let Some(found) = self.inventories.borrow().get(krate) {
+    /// The product files of `krate`, read once.
+    fn files(&self, krate: &str) -> Result<Rc<Vec<PathBuf>>, String> {
+        if let Some(found) = self.files.borrow().get(krate) {
             return Ok(Rc::clone(found));
         }
         let manifest = self
             .manifests
             .get(krate)
             .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-        let found = Rc::new(inventory::read(
-            krate,
-            &manifest.roots,
-            &self.root,
-            Rules::All,
-        )?);
-        self.inventories
+        let found = Rc::new(crate_files::read(krate, &manifest.roots, &self.root)?);
+        self.files
             .borrow_mut()
             .insert(krate.to_owned(), Rc::clone(&found));
         Ok(found)
@@ -385,10 +336,10 @@ impl Tree {
             .crates
             .get(krate)
             .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-        let inventory = self.inventory(krate)?;
+        let files = self.files(krate)?;
         let index = Rc::new(CrateIndex::read(
             krate,
-            &inventory,
+            &files,
             source,
             &self.root,
             &self.crates,
@@ -699,7 +650,7 @@ impl CrateIndex {
 
     fn read(
         name: &str,
-        inventory: &Inventory,
+        files: &[PathBuf],
         source: &Path,
         root: &Path,
         crates: &BTreeMap<String, PathBuf>,
@@ -717,7 +668,7 @@ impl CrateIndex {
             imports: BTreeMap::new(),
         };
         let workspace: BTreeSet<String> = crates.keys().cloned().collect();
-        for path in &inventory.files {
+        for path in files {
             let text = std::fs::read_to_string(path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             let file =
@@ -943,123 +894,6 @@ impl CrateIndex {
 
 /// The module a file is: `scalars` for `src/scalars.rs` and `src/scalars/mod.rs`, `crate` for the
 /// root.
-fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
-    match item {
-        syn::ImplItem::Const(member) => &member.attrs,
-        syn::ImplItem::Fn(member) => &member.attrs,
-        syn::ImplItem::Type(member) => &member.attrs,
-        syn::ImplItem::Macro(member) => &member.attrs,
-        _ => &[],
-    }
-}
-
-fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
-    match item {
-        syn::TraitItem::Const(member) => &member.attrs,
-        syn::TraitItem::Fn(member) => &member.attrs,
-        syn::TraitItem::Type(member) => &member.attrs,
-        syn::TraitItem::Macro(member) => &member.attrs,
-        _ => &[],
-    }
-}
-
-/// Takes the items that no configuration without `test` builds out of a copy of a node: the items
-/// nested in its blocks and modules, and the members of the impl blocks and traits among them. The
-/// condition rule decides each.
-struct Strip<'a> {
-    at: &'a str,
-    error: Option<String>,
-}
-
-impl Strip<'_> {
-    fn keeps(&mut self, attrs: &[syn::Attribute]) -> bool {
-        if self.error.is_some() {
-            return false;
-        }
-        match condition::enabled(attrs, self.at) {
-            Ok(enabled) => enabled,
-            Err(error) => {
-                self.error = Some(error);
-                false
-            }
-        }
-    }
-}
-
-impl VisitMut for Strip<'_> {
-    fn visit_block_mut(&mut self, block: &mut syn::Block) {
-        let mut kept = Vec::new();
-        for mut statement in std::mem::take(&mut block.stmts) {
-            if let syn::Stmt::Item(item) = &mut statement {
-                if !self.keeps(item_attrs(item)) {
-                    continue;
-                }
-                self.visit_item_mut(item);
-            } else {
-                self.visit_stmt_mut(&mut statement);
-            }
-            kept.push(statement);
-        }
-        block.stmts = kept;
-    }
-
-    fn visit_item_mod_mut(&mut self, module: &mut syn::ItemMod) {
-        if let Some((_, items)) = &mut module.content {
-            let mut kept = Vec::new();
-            for mut item in std::mem::take(items) {
-                if !self.keeps(item_attrs(&item)) {
-                    continue;
-                }
-                self.visit_item_mut(&mut item);
-                kept.push(item);
-            }
-            *items = kept;
-        }
-    }
-
-    fn visit_item_impl_mut(&mut self, block: &mut syn::ItemImpl) {
-        let mut kept = Vec::new();
-        for mut member in std::mem::take(&mut block.items) {
-            if !self.keeps(impl_item_attrs(&member)) {
-                continue;
-            }
-            self.visit_impl_item_mut(&mut member);
-            kept.push(member);
-        }
-        block.items = kept;
-    }
-
-    fn visit_item_trait_mut(&mut self, block: &mut syn::ItemTrait) {
-        let mut kept = Vec::new();
-        for mut member in std::mem::take(&mut block.items) {
-            if !self.keeps(trait_item_attrs(&member)) {
-                continue;
-            }
-            self.visit_trait_item_mut(&mut member);
-            kept.push(member);
-        }
-        block.items = kept;
-    }
-}
-
-/// A copy of `node` without its nested items that no configuration without `test` builds.
-fn stripped<T: Clone>(
-    node: &T,
-    file: &str,
-    visit: impl FnOnce(&mut Strip<'_>, &mut T),
-) -> Result<T, String> {
-    let mut strip = Strip {
-        at: file,
-        error: None,
-    };
-    let mut copy = node.clone();
-    visit(&mut strip, &mut copy);
-    match strip.error {
-        Some(error) => Err(error),
-        None => Ok(copy),
-    }
-}
-
 fn module_of(source: &Path, file: &Path) -> String {
     let relative = file.strip_prefix(source).unwrap_or(file);
     let stem = relative
@@ -1500,66 +1334,6 @@ pub struct Source {
     pub files: Vec<String>,
 }
 
-/// What a sighting of a way to build a mutation for a worker names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SightKind {
-    /// One of the six variant names, or a wire name in a string.
-    Names,
-    /// `MutationRequest` followed by a brace group.
-    Request,
-    /// `ActionTarget` followed by a brace group.
-    Target,
-    /// A `macro_rules!` body that an invocation which is a sighting expands.
-    Expands,
-}
-
-/// The lines of a product file that the item of a sighting covers: the file, the first and the last
-/// line (the first line of a file is 1).
-pub type Extent = (String, usize, usize);
-
-/// An item that builds, names or sets what a mutation for a worker carries.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Sighting {
-    pub krate: String,
-    pub name: String,
-    pub kinds: BTreeSet<SightKind>,
-}
-
-/// The six methods a worker's input rule may refuse more for: their variants and wire names.
-pub(super) const VARIANTS: [&str; 6] = [
-    "AgentPromptSubmit",
-    "AgentPromptQueue",
-    "AgentTurnSteer",
-    "AgentTurnCancel",
-    "AgentApprovalRespond",
-    "PluginActionInvoke",
-];
-pub const WIRE_NAMES: [&str; 6] = [
-    "agent.prompt.submit",
-    "agent.prompt.queue",
-    "agent.turn.steer",
-    "agent.turn.cancel",
-    "agent.approval.respond",
-    "plugin.action.invoke",
-];
-
-/// What the scan found in one crate.
-struct CrateScan {
-    /// The sightings of the crate's items, without the `Expands` of a `macro_rules!` that a call
-    /// marks: the names a call with a sighting marks are taken over every crate in scope.
-    sightings: Vec<Sighting>,
-    /// The names only a scan gives (`use:<file>`, `<macro>! invocation @<file>`), with their text.
-    scan_names: BTreeMap<String, Source>,
-    /// The names of the macros called with a sighting in their own arguments.
-    sighted: BTreeSet<String>,
-    /// What the transcribers of each `macro_rules!` definition call, at any depth.
-    callees: BTreeMap<String, Callees>,
-    /// The names of the `macro_rules!` items the crate defines.
-    rules: BTreeSet<String>,
-    /// The lines each sighted name's items cover.
-    extents: BTreeMap<String, BTreeSet<Extent>>,
-}
-
 impl Tree {
     /// Whether the workspace has a crate `krate` outside `tests/`.
     pub fn krate(&self, krate: &str) -> Lookup {
@@ -1577,17 +1351,12 @@ impl Tree {
             Lookup::Found(_) => {}
             other => return other,
         }
-        if let Err(error) = self.refusals(krate) {
-            return Lookup::Failed(error);
-        }
         let mut undefined: Vec<&str> = Vec::new();
         for name in names {
             match self.followed_set(krate, &[*name], Depth::Alone) {
                 Ok(_) => {}
                 Err(WalkError::Undefined(_)) => undefined.push(name),
-                // Not reached with a file that fails to parse or to read: `refusals` above scans
-                // every file of the crate's inventory first and stops on it. A lookup in a second
-                // crate is not made at `Depth::Alone`. The arm stays for a fault that scan lacks.
+                // A file that fails to parse or to read, in this crate or in one it names.
                 Err(WalkError::Other(error)) => return Lookup::Failed(error),
             }
         }
@@ -1607,15 +1376,13 @@ impl Tree {
         }
     }
 
-    /// The item `name` in `krate`, alone: a name the walker knows, else a name the scan gives.
-    /// `None` where the crate or the name is absent.
+    /// The item `name` in `krate`, alone. `None` where the crate or the name is absent.
     pub fn source(&self, krate: &str, name: &str) -> Result<Option<Source>, String> {
         match self.krate(krate) {
             Lookup::Found(_) => {}
             Lookup::Absent => return Ok(None),
             Lookup::Failed(error) => return Err(error),
         }
-        self.refusals(krate)?;
         match self.followed_set(krate, &[name], Depth::Alone) {
             Err(WalkError::Undefined(_)) => {}
             Err(WalkError::Other(error)) => return Err(error),
@@ -1641,7 +1408,7 @@ impl Tree {
                 }));
             }
         }
-        Ok(self.scan(krate)?.scan_names.get(name).cloned())
+        Ok(None)
     }
 
     pub fn item(&self, krate: &str, name: &str) -> Lookup {
@@ -1650,166 +1417,6 @@ impl Tree {
             Ok(None) => Lookup::Absent,
             Err(error) => Lookup::Failed(error),
         }
-    }
-
-    /// The sightings of the crates `include` accepts, outside `#[cfg(test)]` and outside `tests/`. A
-    /// crate that `include` leaves out is read for the renames and aliases that hide a name the scan
-    /// reads (R1 and R2): a crate it accepts may reach a type through a `pub use` or a `pub type` of
-    /// that crate.
-    pub fn sightings(&self, include: &dyn Fn(&str) -> bool) -> Result<Vec<Sighting>, String> {
-        for (krate, manifest) in &self.manifests {
-            if !include(krate) && !manifest.proc_macro {
-                let found = inventory::read(krate, &manifest.roots, &self.root, Rules::Renames)?;
-                self.hidden_macro_rename(&found, include)?;
-            }
-        }
-        let marked = self.marked(include);
-        let mut all = Vec::new();
-        for krate in self.crates.keys().filter(|krate| include(krate)) {
-            let scan = self.refused(krate, include)?;
-            let mut found: BTreeMap<String, BTreeSet<SightKind>> = scan
-                .sightings
-                .iter()
-                .map(|sighting| (sighting.name.clone(), sighting.kinds.clone()))
-                .collect();
-            // A `macro_rules!` whose name is marked is expanded (S4), wherever the call is.
-            for rules in scan.rules.iter().filter(|rules| marked.contains(*rules)) {
-                found
-                    .entry(format!("macro:{rules}"))
-                    .or_default()
-                    .insert(SightKind::Expands);
-            }
-            all.extend(found.into_iter().map(|(name, kinds)| Sighting {
-                krate: krate.clone(),
-                name,
-                kinds,
-            }));
-        }
-        Ok(all)
-    }
-
-    /// The lines that the items of each sighting of the crates `include` accepts cover, by crate and
-    /// name: a sighting that only a mark gives (`Expands`) covers none.
-    pub fn sighting_extents(
-        &self,
-        include: &dyn Fn(&str) -> bool,
-    ) -> Result<BTreeMap<(String, String), BTreeSet<Extent>>, String> {
-        let mut all = BTreeMap::new();
-        for krate in self.crates.keys().filter(|krate| include(krate)) {
-            for (name, extents) in &self.refused(krate, include)?.extents {
-                all.insert((krate.clone(), name.clone()), extents.clone());
-            }
-        }
-        Ok(all)
-    }
-
-    /// The macro names a sighting marks over the crates `include` accepts (S4): the name that ends a
-    /// call with a sighting in its own arguments, and each name that the transcribers of a
-    /// definition of a marked name call, wherever the definition is. The closure only adds marks. A
-    /// crate the scan cannot read marks nothing: its own results are its refusals.
-    fn marked(&self, include: &dyn Fn(&str) -> bool) -> BTreeSet<String> {
-        let scans: Vec<Rc<CrateScan>> = self
-            .crates
-            .keys()
-            .filter(|krate| include(krate) && !self.manifests[*krate].proc_macro)
-            .filter_map(|krate| self.scan(krate).ok())
-            .collect();
-        let mut marked: BTreeSet<String> = scans
-            .iter()
-            .flat_map(|scan| scan.sighted.iter().cloned())
-            .collect();
-        let mut todo: Vec<String> = marked.iter().cloned().collect();
-        while let Some(name) = todo.pop() {
-            for callees in scans.iter().filter_map(|scan| scan.callees.get(&name)) {
-                for callee in &callees.names {
-                    if marked.insert(callee.clone()) {
-                        todo.push(callee.clone());
-                    }
-                }
-            }
-        }
-        marked
-    }
-
-    /// What stops a crate from being read: the forms the inventory refuses, and the refusals of the
-    /// scan (X8 and the renames of R1) and of a procedural-macro crate (X10). A lookup in the crate
-    /// gives none of its results while one holds.
-    pub fn refusals(&self, krate: &str) -> Result<(), String> {
-        self.refused(krate, &|other| {
-            self.scope
-                .as_ref()
-                .is_none_or(|scope| scope.contains(other))
-        })
-        .map(|_| ())
-    }
-
-    /// The scan of `krate`, where no refusal holds, with the names marked over the crates `include`
-    /// accepts.
-    fn refused(
-        &self,
-        krate: &str,
-        include: &dyn Fn(&str) -> bool,
-    ) -> Result<Rc<CrateScan>, String> {
-        if self.manifests[krate].proc_macro {
-            return Err(format!(
-                "{}: a procedural-macro crate; the scan does not read what it generates",
-                self.manifests[krate].shown
-            ));
-        }
-        let scan = self.scan(krate)?;
-        let imported = self.inventory(krate)?;
-        self.hidden_macro_rename(&imported, include)?;
-        // A marked macro that calls another through a metavariable (R4) cannot be followed.
-        let marked = self.marked(include);
-        if let Some(name) = scan
-            .callees
-            .iter()
-            .find(|(name, callees)| callees.through_metavariable && marked.contains(*name))
-            .map(|(name, _)| name)
-        {
-            return Err(format!(
-                "{krate}: the macro {name} calls a macro through a metavariable, which the scan cannot follow"
-            ));
-        }
-        Ok(scan)
-    }
-
-    /// A rename of the name of a macro that a crate `include` accepts defines hides the macro from the
-    /// scan.
-    fn hidden_macro_rename(
-        &self,
-        imported: &Inventory,
-        include: &dyn Fn(&str) -> bool,
-    ) -> Result<(), String> {
-        for (file, old, new) in &imported.renames {
-            for other in self.crates.keys().filter(|other| include(other)) {
-                let defined = &self.inventory(other)?.defined;
-                if defined.contains(old) || defined.contains(new) {
-                    return Err(rename_refusal(file, old, new));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn scan(&self, krate: &str) -> Result<Rc<CrateScan>, String> {
-        if let Some(found) = self.scans.borrow().get(krate) {
-            return Ok(Rc::clone(found));
-        }
-        let source = self
-            .crates
-            .get(krate)
-            .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-        let scan = Rc::new(scan_crate(
-            krate,
-            source,
-            &self.root,
-            &*self.inventory(krate)?,
-        )?);
-        self.scans
-            .borrow_mut()
-            .insert(krate.to_owned(), Rc::clone(&scan));
-        Ok(scan)
     }
 }
 
@@ -1835,573 +1442,7 @@ pub(super) fn normalised(path: &Path) -> PathBuf {
     parts.iter().collect()
 }
 
-struct Scanner {
-    /// The file being scanned, relative to the root.
-    file: String,
-    /// The lines of the items that gave each sighted name its sightings.
-    extents: BTreeMap<String, BTreeSet<Extent>>,
-    /// The kind of the type of the `impl` block the scan is in, when it is `MutationRequest` or
-    /// `ActionTarget`.
-    self_kind: Option<SightKind>,
-    sightings: BTreeMap<String, BTreeSet<SightKind>>,
-    /// The text of each scan-only name, in file order, with the file it is in.
-    scan_only: BTreeMap<String, (String, Vec<String>)>,
-    macro_rules: BTreeSet<String>,
-    /// The macros called in what the scan read.
-    calls: Calls,
-}
-
-/// What the transcribers of one `macro_rules!` definition call, at any depth.
-#[derive(Default)]
-struct Callees {
-    /// The names called.
-    names: BTreeSet<String>,
-    /// Whether one is called through a metavariable (`$m!(..)`).
-    through_metavariable: bool,
-}
-
-/// The macros called in some tokens.
-#[derive(Default)]
-struct Calls {
-    /// The macros called with a sighting in their own arguments.
-    sighted: BTreeSet<String>,
-    /// Every macro called.
-    all: Callees,
-    /// What the transcribers of each `macro_rules!` definition call, at any depth, a definition
-    /// written in a function's body included: that definition is part of the function.
-    defined: BTreeMap<String, Callees>,
-}
-
-impl Calls {
-    /// Takes in what the transcribers of the definition `name` call.
-    fn absorb(&mut self, name: String, inner: Self) {
-        self.sighted.extend(inner.sighted);
-        for (nested, callees) in inner.defined {
-            let entry = self.defined.entry(nested).or_default();
-            entry.names.extend(callees.names);
-            entry.through_metavariable |= callees.through_metavariable;
-        }
-        // Definitions of one name, which the inventory let through, are one under it: what either
-        // calls is called.
-        let entry = self.defined.entry(name).or_default();
-        entry.names.extend(inner.all.names);
-        entry.through_metavariable |= inner.all.through_metavariable;
-    }
-}
-
-impl Scanner {
-    /// The tokens of an item: its kinds, and the macros it calls when it is a sighting, whose
-    /// bodies then give the parameters' target.
-    fn body(&mut self, name: String, tokens: TokenStream) {
-        calls_in(&tokens, &mut self.calls, self.self_kind);
-        let kinds = kinds_in(&tokens, self.self_kind);
-        self.sight(name, kinds, &tokens);
-    }
-
-    /// The tokens of an item that only the scan names: when `tokens` (the item without the nested
-    /// places that no configuration builds) hold a sighting, the item's `written` tokens join the
-    /// text and the digest of `name`.
-    fn scan_only_body(
-        &mut self,
-        name: String,
-        file: &str,
-        tokens: TokenStream,
-        written: &TokenStream,
-    ) {
-        let kinds = kinds_in(&tokens, self.self_kind);
-        if kinds.is_empty() {
-            return;
-        }
-        calls_in(&tokens, &mut self.calls, self.self_kind);
-        self.scan_only
-            .entry(name.clone())
-            .or_insert_with(|| (file.to_owned(), Vec::new()))
-            .1
-            .push(written.to_string());
-        self.sight(name, kinds, written);
-    }
-
-    /// A constant or a macro call of an `impl` block: named by the block's type, and by the file
-    /// where the type has no path (`impl T for [u8]`), as a `use` is.
-    fn impl_item(
-        &mut self,
-        owner: &str,
-        file: &str,
-        under_src: &str,
-        tokens: TokenStream,
-        written: &TokenStream,
-    ) {
-        if owner.is_empty() {
-            self.scan_only_body(format!("impl:{under_src}"), file, tokens, written);
-        } else {
-            self.body(owner.to_owned(), tokens);
-        }
-    }
-
-    /// A sighting of `name` by an item whose tokens are `tokens`: the lines they cover are kept.
-    fn sight(&mut self, name: String, kinds: BTreeSet<SightKind>, tokens: &TokenStream) {
-        if !kinds.is_empty() && !name.is_empty() {
-            if let Some((first, last)) = lines_of(tokens) {
-                self.extents.entry(name.clone()).or_default().insert((
-                    self.file.clone(),
-                    first,
-                    last,
-                ));
-            }
-            self.sightings.entry(name).or_default().extend(kinds);
-        }
-    }
-
-    fn items(&mut self, items: &[syn::Item], file: &str, under_src: &str) -> Result<(), String> {
-        for item in items {
-            if !condition::enabled(item_attrs(item), file)? {
-                continue;
-            }
-            // The item's tokens, without the nested items that no configuration builds.
-            let text = || -> Result<TokenStream, String> {
-                let kept = stripped(item, file, |strip, node| strip.visit_item_mut(node))?;
-                Ok(without_docs(kept.to_token_stream()))
-            };
-            let plain = || without_docs(item.to_token_stream());
-            match item {
-                syn::Item::Mod(module) => {
-                    // The attributes of the module are its own tokens; its items are read below.
-                    let attributes: TokenStream = module
-                        .attrs
-                        .iter()
-                        .map(|attribute| attribute.to_token_stream())
-                        .collect();
-                    self.body(module.ident.unraw().to_string(), without_docs(attributes));
-                    if let Some((_, inner)) = &module.content {
-                        self.items(inner, file, under_src)?;
-                    }
-                }
-                syn::Item::Use(_) => {
-                    self.scan_only_body(format!("use:{under_src}"), file, plain(), &plain());
-                }
-                syn::Item::Impl(block) => {
-                    let owner = type_name(&block.self_ty);
-                    // `Self { .. }` in an impl for one of the two types is a literal of it.
-                    let outer = std::mem::replace(
-                        &mut self.self_kind,
-                        match owner.as_str() {
-                            "MutationRequest" => Some(SightKind::Request),
-                            "ActionTarget" => Some(SightKind::Target),
-                            _ => None,
-                        },
-                    );
-                    // The header: the attributes, the generics, the trait and the type, with no body.
-                    let mut header = TokenStream::new();
-                    for attribute in &block.attrs {
-                        attribute.to_tokens(&mut header);
-                    }
-                    block.generics.to_tokens(&mut header);
-                    block.generics.where_clause.to_tokens(&mut header);
-                    if let Some((bang, path, for_token)) = &block.trait_ {
-                        bang.to_tokens(&mut header);
-                        path.to_tokens(&mut header);
-                        for_token.to_tokens(&mut header);
-                    }
-                    block.self_ty.to_tokens(&mut header);
-                    let header = without_docs(header);
-                    self.impl_item(&owner, file, under_src, header.clone(), &header);
-                    for inner in &block.items {
-                        if !condition::enabled(impl_item_attrs(inner), file)? {
-                            continue;
-                        }
-                        match inner {
-                            syn::ImplItem::Fn(method) => {
-                                let kept = stripped(method, file, |strip, node| {
-                                    strip.visit_impl_item_fn_mut(node);
-                                })?;
-                                self.body(
-                                    format!("{owner}::{}", method.sig.ident.unraw()),
-                                    without_docs(kept.to_token_stream()),
-                                );
-                            }
-                            syn::ImplItem::Const(constant) => {
-                                let kept = stripped(constant, file, |strip, node| {
-                                    strip.visit_impl_item_const_mut(node);
-                                })?;
-                                let tokens = without_docs(kept.to_token_stream());
-                                let written = without_docs(constant.to_token_stream());
-                                self.impl_item(&owner, file, under_src, tokens, &written);
-                            }
-                            // A macro call, an associated type, and what syn does not parse.
-                            other => {
-                                let tokens = without_docs(other.to_token_stream());
-                                self.impl_item(&owner, file, under_src, tokens.clone(), &tokens);
-                            }
-                        }
-                    }
-                    self.self_kind = outer;
-                }
-                syn::Item::Trait(definition) => {
-                    // `Strip` takes the members that no configuration builds out of the trait.
-                    self.body(definition.ident.unraw().to_string(), text()?);
-                }
-                syn::Item::Macro(call) => {
-                    let kinds = kinds_of(&plain());
-                    if let (Some(name), true) = (&call.ident, is_macro_rules(&call.mac.path)) {
-                        let name = name.unraw();
-                        self.macro_rules.insert(name.to_string());
-                        let mut inner = Calls::default();
-                        for expansion in transcribers(&call.mac.tokens) {
-                            calls_in(&expansion, &mut inner, self.self_kind);
-                        }
-                        self.calls.absorb(name.to_string(), inner);
-                        self.sight(format!("macro:{name}"), kinds, &plain());
-                        continue;
-                    }
-                    if kinds.is_empty() {
-                        continue;
-                    }
-                    if let Some(last) = call.mac.path.segments.last() {
-                        self.calls.sighted.insert(last.ident.unraw().to_string());
-                    }
-                    calls_in(&call.mac.tokens, &mut self.calls, self.self_kind);
-                    match defined_name(&call.mac.tokens) {
-                        Some(name) => self.sight(name, kinds, &plain()),
-                        None => {
-                            let macro_name = call
-                                .mac
-                                .path
-                                .segments
-                                .last()
-                                .map_or_else(String::new, |segment| {
-                                    segment.ident.unraw().to_string()
-                                });
-                            self.scan_only_body(
-                                format!("{macro_name}! invocation @{under_src}"),
-                                file,
-                                plain(),
-                                &plain(),
-                            );
-                        }
-                    }
-                }
-                syn::Item::Fn(definition) => {
-                    self.body(definition.sig.ident.unraw().to_string(), text()?);
-                }
-                syn::Item::Struct(definition) => {
-                    self.body(definition.ident.unraw().to_string(), text()?);
-                }
-                syn::Item::Enum(definition) => {
-                    self.body(definition.ident.unraw().to_string(), text()?);
-                }
-                syn::Item::Union(definition) => {
-                    self.body(definition.ident.unraw().to_string(), text()?);
-                }
-                syn::Item::Type(definition) => {
-                    self.body(definition.ident.unraw().to_string(), text()?);
-                }
-                syn::Item::Const(definition) => {
-                    self.body(definition.ident.unraw().to_string(), text()?);
-                }
-                syn::Item::Static(definition) => {
-                    self.body(definition.ident.unraw().to_string(), text()?);
-                }
-                // Items with no name of their own: the file names the sighting, as for a `use`.
-                syn::Item::ForeignMod(_) | syn::Item::TraitAlias(_) | syn::Item::Verbatim(_) => {
-                    self.scan_only_body(format!("item:{under_src}"), file, text()?, &plain());
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-}
-
-fn scan_crate(
-    krate: &str,
-    source: &Path,
-    root: &Path,
-    inventory: &Inventory,
-) -> Result<CrateScan, String> {
-    let mut scanner = Scanner {
-        file: String::new(),
-        extents: BTreeMap::new(),
-        self_kind: None,
-        sightings: BTreeMap::new(),
-        scan_only: BTreeMap::new(),
-        macro_rules: BTreeSet::new(),
-        calls: Calls::default(),
-    };
-    for path in &inventory.files {
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        let parsed =
-            syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-        let relative = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        let under_src = path
-            .strip_prefix(source)
-            .unwrap_or(path)
-            .display()
-            .to_string();
-        scanner.file.clone_from(&relative);
-        scanner.items(&parsed.items, &relative, &under_src)?;
-    }
-    let scan_names = scanner
-        .scan_only
-        .iter()
-        .map(|(name, (file, texts))| {
-            let mut digest = Vec::new();
-            for text in texts {
-                digest.extend_from_slice(format!("{krate} {file} {name}\n{text}\n").as_bytes());
-            }
-            (
-                name.clone(),
-                Source {
-                    digest: hex(&kr_cbor::sha256(&digest)),
-                    text: texts.join("\n"),
-                    files: vec![file.clone()],
-                },
-            )
-        })
-        .collect();
-    let sightings = scanner
-        .sightings
-        .into_iter()
-        .map(|(name, kinds)| Sighting {
-            krate: krate.to_owned(),
-            name,
-            kinds,
-        })
-        .collect();
-    Ok(CrateScan {
-        sightings,
-        scan_names,
-        sighted: scanner.calls.sighted,
-        callees: scanner.calls.defined,
-        rules: scanner.macro_rules,
-        extents: scanner.extents,
-    })
-}
-
-/// The first and the last line of the tokens, from the line of their first token to the line where
-/// their last one ends (the span's lines need proc-macro2's `span-locations`).
-fn lines_of(tokens: &TokenStream) -> Option<(usize, usize)> {
-    let all: Vec<TokenTree> = tokens.clone().into_iter().collect();
-    let first = all.first()?.span().start().line;
-    let last = all.last()?.span().end().line;
-    Some((first, last))
-}
-
-/// The expansions of the arms of a `macro_rules!` body: what follows each `=>` outside the
-/// matchers, where a call is only syntax to match.
-pub(super) fn transcribers(arms: &TokenStream) -> Vec<TokenStream> {
-    let flat: Vec<TokenTree> = arms.clone().into_iter().collect();
-    flat.iter()
-        .enumerate()
-        .filter_map(
-            |(at, tree)| match (tree, flat.get(at + 1), flat.get(at + 2)) {
-                (
-                    TokenTree::Punct(equals),
-                    Some(TokenTree::Punct(greater)),
-                    Some(TokenTree::Group(expansion)),
-                ) if equals.as_char() == '=' && greater.as_char() == '>' => {
-                    Some(expansion.stream())
-                }
-                _ => None,
-            },
-        )
-        .collect()
-}
-
 /// Whether `path` is `macro_rules`, as written or raw.
 pub(super) fn is_macro_rules(path: &syn::Path) -> bool {
     path.segments.len() == 1 && path.segments[0].ident.unraw() == "macro_rules"
-}
-
-/// The words that stand before a `!` and are no macro name: `if !(..)` negates what follows.
-const NOT_MACROS: [&str; 9] = [
-    "if", "while", "match", "return", "break", "in", "else", "yield", "let",
-];
-
-/// Whether `word`, before a `!` and a group, names a macro and is no keyword that negates.
-pub(super) fn names_a_macro(word: &proc_macro2::Ident) -> bool {
-    !NOT_MACROS.contains(&word.to_string().as_str())
-}
-
-/// The path that the macro name at `flat[at]` is written with: the segments before it that `::`
-/// joins to it, `$crate` as one segment.
-pub(super) fn path_before(flat: &[TokenTree], at: usize) -> Vec<String> {
-    let colon = |tree: &TokenTree| matches!(tree, TokenTree::Punct(one) if one.as_char() == ':');
-    let word = |tree: &TokenTree| match tree {
-        TokenTree::Ident(ident) => ident.unraw().to_string(),
-        other => other.to_string(),
-    };
-    let mut path = vec![word(&flat[at])];
-    let mut index = at;
-    while index >= 3
-        && colon(&flat[index - 1])
-        && colon(&flat[index - 2])
-        && let TokenTree::Ident(segment) = &flat[index - 3]
-    {
-        let mut text = segment.unraw().to_string();
-        index -= 3;
-        if text == "crate"
-            && index >= 1
-            && matches!(&flat[index - 1], TokenTree::Punct(dollar) if dollar.as_char() == '$')
-        {
-            text = "$crate".to_owned();
-            index -= 1;
-        }
-        path.push(text);
-    }
-    path.reverse();
-    path
-}
-
-/// The macros the tokens call, at any depth. A `macro_rules!` definition is read by its
-/// transcribers, never by its matchers, where a call is only syntax to match: what they call is
-/// kept under the definition's name, and a call with a sighting in its arguments is marked.
-fn calls_in(stream: &TokenStream, calls: &mut Calls, owner: Option<SightKind>) {
-    let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
-    let mut at = 0;
-    while at < flat.len() {
-        match &flat[at] {
-            TokenTree::Ident(word) if word.unraw() == "macro_rules" => {
-                if let (
-                    Some(TokenTree::Punct(bang)),
-                    Some(TokenTree::Ident(name)),
-                    Some(TokenTree::Group(arms)),
-                ) = (flat.get(at + 1), flat.get(at + 2), flat.get(at + 3))
-                    && bang.as_char() == '!'
-                {
-                    let mut inner = Calls::default();
-                    for expansion in transcribers(&arms.stream()) {
-                        calls_in(&expansion, &mut inner, owner);
-                    }
-                    calls.absorb(name.unraw().to_string(), inner);
-                    at += 4;
-                    continue;
-                }
-            }
-            TokenTree::Group(group) => calls_in(&group.stream(), calls, owner),
-            TokenTree::Ident(ident)
-                if names_a_macro(ident)
-                    && matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
-                    && matches!(flat.get(at + 2), Some(TokenTree::Group(_))) =>
-            {
-                let name = ident.unraw().to_string();
-                calls.all.names.insert(name.clone());
-                if at > 0
-                    && matches!(&flat[at - 1], TokenTree::Punct(dollar) if dollar.as_char() == '$')
-                {
-                    calls.all.through_metavariable = true;
-                }
-                if matches!(flat.get(at + 2), Some(TokenTree::Group(arguments))
-                    if !kinds_in_arguments(&arguments.stream(), owner).is_empty())
-                {
-                    calls.sighted.insert(name);
-                }
-            }
-            _ => {}
-        }
-        at += 1;
-    }
-}
-
-/// The kinds of sighting the tokens hold: a variant name or a wire name, a `MutationRequest` or an
-/// `ActionTarget` with a brace group after it.
-fn kinds_of(stream: &TokenStream) -> BTreeSet<SightKind> {
-    kinds_in(stream, None)
-}
-
-/// What the tokens of an item sight. `owner` is the kind of the type of an enclosing `impl` for
-/// `MutationRequest` or `ActionTarget`, whose `Self { .. }` is a literal of it.
-fn kinds_in(stream: &TokenStream, owner: Option<SightKind>) -> BTreeSet<SightKind> {
-    let mut kinds = BTreeSet::new();
-    collect_kinds(stream, &mut kinds, owner, false);
-    kinds
-}
-
-/// What the arguments of a macro call sight: as [`kinds_in`], and where a macro may build the literal
-/// from a name its argument gives, either type name and `Self` count with no brace group after them.
-fn kinds_in_arguments(stream: &TokenStream, owner: Option<SightKind>) -> BTreeSet<SightKind> {
-    let mut kinds = BTreeSet::new();
-    collect_kinds(stream, &mut kinds, owner, true);
-    kinds
-}
-
-/// Whether a literal's value, once its escapes are decoded, holds a wire name: a string, a raw
-/// string, a byte string or a C string.
-fn holds_a_wire_name(literal: &proc_macro2::Literal) -> bool {
-    let holds = |value: &[u8]| {
-        WIRE_NAMES.iter().any(|wire| {
-            value
-                .windows(wire.len())
-                .any(|window| window == wire.as_bytes())
-        })
-    };
-    match syn::parse_str::<syn::Lit>(&literal.to_string()) {
-        Ok(syn::Lit::Str(text)) => holds(text.value().as_bytes()),
-        Ok(syn::Lit::ByteStr(bytes)) => holds(&bytes.value()),
-        Ok(syn::Lit::CStr(text)) => holds(text.value().to_bytes()),
-        _ => false,
-    }
-}
-
-/// Each of the six variant names, wherever it stands, is a sighting, but for the one path
-/// `ActionRight::<Variant>`, which is a right of the same name. A wire name in a literal, and the
-/// brace form of `MutationRequest` and `ActionTarget`, are sightings.
-///
-/// In `arguments` (the arguments of a macro call, at any depth) the two type names are sightings of
-/// their kind wherever they stand, and `Self` of the enclosing impl's kind: the macro's transcriber
-/// may write the brace group.
-fn collect_kinds(
-    stream: &TokenStream,
-    kinds: &mut BTreeSet<SightKind>,
-    owner: Option<SightKind>,
-    arguments: bool,
-) {
-    let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
-    let is_bang = |tree: Option<&TokenTree>| matches!(tree, Some(TokenTree::Punct(punct)) if punct.as_char() == '!');
-    let is_brace = |tree: Option<&TokenTree>| matches!(tree, Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace);
-    let is_colon = |tree: Option<&TokenTree>| matches!(tree, Some(TokenTree::Punct(punct)) if punct.as_char() == ':');
-    for (at, tree) in flat.iter().enumerate() {
-        match tree {
-            TokenTree::Group(group) => {
-                // The group after `name !` holds a macro call's arguments.
-                let call = at >= 2
-                    && is_bang(flat.get(at - 1))
-                    && matches!(flat.get(at - 2), Some(TokenTree::Ident(name)) if names_a_macro(name));
-                collect_kinds(&group.stream(), kinds, owner, arguments || call);
-            }
-            TokenTree::Literal(literal) => {
-                if holds_a_wire_name(literal) {
-                    kinds.insert(SightKind::Names);
-                }
-            }
-            TokenTree::Ident(ident) => {
-                let word = ident.to_string();
-                let word = word.trim_start_matches("r#");
-                if word == "MutationRequest" && (arguments || is_brace(flat.get(at + 1))) {
-                    kinds.insert(SightKind::Request);
-                }
-                if word == "ActionTarget" && (arguments || is_brace(flat.get(at + 1))) {
-                    kinds.insert(SightKind::Target);
-                }
-                if word == "Self"
-                    && let Some(kind) = owner
-                    && (arguments || is_brace(flat.get(at + 1)))
-                {
-                    kinds.insert(kind);
-                }
-                let right = at >= 3
-                    && is_colon(flat.get(at - 1))
-                    && is_colon(flat.get(at - 2))
-                    && matches!(flat.get(at - 3), Some(TokenTree::Ident(before)) if before.unraw() == "ActionRight");
-                if VARIANTS.contains(&word) && !right {
-                    kinds.insert(SightKind::Names);
-                }
-            }
-            TokenTree::Punct(_) => {}
-        }
-    }
 }

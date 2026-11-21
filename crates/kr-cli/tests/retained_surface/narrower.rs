@@ -17,7 +17,8 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 use super::Root;
-use super::walker::{Depth, Lookup, SightKind, Sighting, Tree};
+use super::compiler::{self, SightKind, Sighting};
+use super::walker::{Depth, Lookup, Tree};
 
 /// The crates that receive: nothing in them is scanned and no row names them.
 pub const RECEIVER_CRATES: &[&str] = &["kr_protocol", "kr_worker"];
@@ -154,8 +155,10 @@ impl Reader for Tree {
         Tree::item(self, krate, name)
     }
 
+    /// The compiler's reading of the checkout the tree is: a stamped copy is built here, which takes
+    /// minutes, and a reading it cannot complete is the text that refuses it.
     fn sightings(&self) -> Result<Vec<Sighting>, String> {
-        Tree::sightings(self, &|krate| !RECEIVER_CRATES.contains(&krate))
+        compiler::read_checkout(self.root()).map_err(|problems| problems.join("\n"))
     }
 }
 

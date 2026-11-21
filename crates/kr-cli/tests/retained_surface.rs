@@ -38,20 +38,18 @@ use std::path::{Path, PathBuf};
 use kr_protocol::retained::{RETAINED, RetainedLevel};
 use serde_json::{Value, json};
 
+#[path = "retained_surface/compiler.rs"]
+mod compiler;
+#[path = "retained_surface/compiler_cases.rs"]
+mod compiler_cases;
 #[path = "retained_surface/condition.rs"]
 mod condition;
+#[path = "retained_surface/crate_files.rs"]
+mod crate_files;
 #[path = "retained_surface/history.rs"]
 mod history;
 #[path = "retained_surface/history_cases.rs"]
 mod history_cases;
-#[path = "retained_surface/history_gate.rs"]
-mod history_gate;
-#[path = "retained_surface/inventory.rs"]
-mod inventory;
-#[path = "retained_surface/inventory_cases.rs"]
-mod inventory_cases;
-#[path = "retained_surface/mechanisms.rs"]
-mod mechanisms;
 #[path = "retained_surface/narrower.rs"]
 mod narrower;
 #[path = "retained_surface/narrower_cases.rs"]
@@ -74,6 +72,9 @@ mod walker_cases;
 
 use narrower::{DAEMON_CRATES, Input, LevelRecord, Narrower, RECEIVER_CRATES, check_narrower};
 use walker::{Depth, Followed, Tree};
+
+/// The sightings of each release tag that the compiler's readings gave, with a line for each tag read.
+const RECORD: &str = include_str!("retained_history_record.txt");
 
 /// A rule of the surface: where it is rooted, and the names it is followed from.
 struct Root {
@@ -444,11 +445,17 @@ fn the_entries_of_the_narrower_table_hold() {
 #[test]
 #[ignore = "reads every release tag below the level of each entry"]
 fn the_senders_of_each_entry_at_each_release() {
+    let record = compiler::Record::parse(RECORD).expect("the record of the compiler's readings");
     for entry in narrower_table::NARROWER {
         print_this_checkouts_sightings();
         let started = std::time::Instant::now();
-        let (expected, snapshots) = history::read_history(&repository(), entry, &|_| {})
-            .unwrap_or_else(|error| panic!("{}: {error}", entry.root));
+        let (expected, snapshots) = history::read_history(
+            &repository(),
+            entry,
+            &|tagged| record.sightings(&tagged.tag),
+            &|_| {},
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", entry.root));
         println!(
             "read {} releases for {} in {:?}",
             snapshots.len(),
@@ -461,11 +468,11 @@ fn the_senders_of_each_entry_at_each_release() {
     }
 }
 
-/// What the scan finds in this checkout, by class of crate, and how long it takes.
+/// What the compiler finds in this checkout, by class of crate, and how long it takes.
 fn print_this_checkouts_sightings() {
-    let tree = Tree::at(&repository()).expect("this checkout");
     let started = std::time::Instant::now();
-    let sightings = tree.sightings(&|_| true).expect("the scan");
+    let sightings = compiler::read_checkout(&repository())
+        .unwrap_or_else(|problems| panic!("the reading is refused:\n{}", problems.join("\n")));
     println!(
         "this checkout: {} sightings in {:?}",
         sightings.len(),

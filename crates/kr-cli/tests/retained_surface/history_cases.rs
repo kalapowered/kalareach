@@ -1,22 +1,20 @@
 //! The cases of the historical audit, on a repository a case makes with `git init`: its tags, an
 //! origin that is a bare repository, and the production reader of snapshots.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
 use quote::ToTokens as _;
 
+use super::compiler::{SightKind, Sighting};
 use super::history::{
     Group, Report, Shown, Snapshot, Span, Tagged, audit_tags, expected_below,
     in_threads_of_their_own, read_history,
 };
-use super::history_gate::{
-    audit_differences, expected_audit_problems, level_above, listed_releases, release_problems,
-    snapshot_problems,
-};
 use super::narrower::{Account, Evidence, Item, Narrower, Range, Sender};
 use super::narrower_cases::leak;
-use super::walker::{Lookup, SightKind, Sighting, Source};
+use super::walker::{Lookup, Source};
 
 fn git(dir: &Path, args: &[&str], date: Option<i64>) -> String {
     let mut command = Command::new("git");
@@ -95,6 +93,43 @@ struct Repo {
     origin: tempfile::TempDir,
     /// The tag of each release, in the order of `RELEASES`.
     tags: Vec<String>,
+    /// The release whose tree holds a file that does not parse, and so gives no reading.
+    broken_at: Option<usize>,
+}
+
+/// The sightings of the fixture's code at each release, as a reading gives them: the builder's
+/// target from the first release, the old builder in the steps that have it, the later builder that
+/// names a method, and the account-only crate's. A release with a file that does not parse is a
+/// reading that failed.
+fn sightings_of(repo: &Repo) -> impl Fn(&Tagged) -> Result<Vec<Sighting>, String> + Sync + '_ {
+    move |tagged| {
+        let at = repo
+            .tags
+            .iter()
+            .position(|tag| *tag == tagged.tag)
+            .expect("a tag of the fixture");
+        if repo.broken_at == Some(at) {
+            return Err("crates/kr-other/src/broken.rs does not parse".to_owned());
+        }
+        let step = RELEASES[at].2;
+        let sight = |krate: &str, name: &str, kind| Sighting {
+            krate: krate.to_owned(),
+            name: name.to_owned(),
+            kinds: BTreeSet::from([kind]),
+        };
+        let mut list = Vec::new();
+        if step >= 1 {
+            list.push(sight("companion_tauri", "Link::target", SightKind::Target));
+            list.push(sight("kr_other", "other_one", SightKind::Names));
+        }
+        match step {
+            0 => {}
+            1 | 2 => list.push(sight("companion_tauri", "old_builder", SightKind::Names)),
+            _ => list.push(sight("companion_tauri", "names_one", SightKind::Names)),
+        }
+        list.sort_by(|left, right| (&left.krate, &left.name).cmp(&(&right.krate, &right.name)));
+        Ok(list)
+    }
 }
 
 /// The releases: version, commit date, and the step whose content the commit holds. The three
@@ -215,7 +250,12 @@ fn repo(unreadable_at: Option<usize>, broken_at: Option<usize>) -> Repo {
         tags.push(tag);
     }
     git(work.path(), &["push", "origin", "main", "--tags"], None);
-    Repo { work, origin, tags }
+    Repo {
+        work,
+        origin,
+        tags,
+        broken_at,
+    }
 }
 
 fn leaked(text: String) -> &'static str {
@@ -369,7 +409,7 @@ fn entry_of(repo: &Repo) -> Narrower {
 fn read(repo: &Repo) -> Read {
     let entry = entry_of(repo);
     let (expected, snapshots) =
-        read_history(repo.work.path(), &entry, &|_| {}).expect("the history");
+        read_history(repo.work.path(), &entry, &sightings_of(repo), &|_| {}).expect("the history");
     Read {
         expected,
         snapshots,
@@ -448,7 +488,6 @@ fn clone_snapshot(snapshot: &Snapshot) -> Snapshot {
         krates: snapshot.krates.clone(),
         items: snapshot.items.clone(),
         sightings: snapshot.sightings.clone(),
-        extents: snapshot.extents.clone(),
         records: snapshot.records.clone(),
         source_errors: snapshot.source_errors.clone(),
     }
@@ -681,7 +720,7 @@ fn a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_t
     // A tree with a manifest that names no package, read by the production reader and audited.
     let odd = repo(Some(2), None);
     let (expected, snapshots) =
-        read_history(odd.work.path(), &read.entry, &|_| {}).expect("history");
+        read_history(odd.work.path(), &read.entry, &sightings_of(&odd), &|_| {}).expect("history");
     let report = audit_tags(&read.entry, &expected, &snapshots);
     let failed: Vec<&Snapshot> = snapshots
         .iter()
@@ -724,8 +763,13 @@ fn a_source_that_cannot_be_read_at_a_tag_is_a_text_of_its_own() {
     // scan and the account's text both stop on it, each with a text of its own.
     let broken = repo(None, Some(2));
     let read = read(&repo(None, None));
-    let (expected, snapshots) =
-        read_history(broken.work.path(), &read.entry, &|_| {}).expect("history");
+    let (expected, snapshots) = read_history(
+        broken.work.path(),
+        &read.entry,
+        &sightings_of(&broken),
+        &|_| {},
+    )
+    .expect("history");
     let report = audit_tags(&read.entry, &expected, &snapshots);
     let at = &snapshots[2];
     let key = ("kr_other".to_owned(), "other_one".to_owned());
@@ -913,7 +957,8 @@ fn a_daemon_item_and_a_daemon_account_cause_no_reading_and_no_text() {
         why: "x",
     });
     entry.accounts = leak(accounts);
-    let (expected, snapshots) = read_history(repo.work.path(), &entry, &|_| {}).expect("history");
+    let (expected, snapshots) =
+        read_history(repo.work.path(), &entry, &sightings_of(&repo), &|_| {}).expect("history");
     assert!(snapshots.iter().all(|snapshot| {
         snapshot.items.keys().all(|key| key.0 != "kr_controller")
             && snapshot.records.keys().all(|key| key.0 != "kr_controller")
@@ -966,7 +1011,7 @@ fn an_origin_with_a_tag_the_checkout_lacks_is_refused_before_any_snapshot() {
         ],
         None,
     );
-    let error = read_history(repo.work.path(), &read.entry, &|_| {})
+    let error = read_history(repo.work.path(), &read.entry, &sightings_of(&repo), &|_| {})
         .err()
         .expect("an error before any snapshot");
     assert!(error.contains("packages/v0.3.5"), "{error}");
@@ -1029,7 +1074,8 @@ fn each_tag_is_read_in_a_thread_of_its_own_so_the_source_map_that_the_files_fill
     let repo = repo(None, None);
     let entry = entry_of(&repo);
     let (_, entry_end) = offsets_of_a_parse_in_this_thread();
-    let (_, snapshots) = read_history(repo.work.path(), &entry, &|_| {}).expect("the history");
+    let (_, snapshots) =
+        read_history(repo.work.path(), &entry, &sightings_of(&repo), &|_| {}).expect("the history");
     assert!(snapshots.len() > 1, "the fixture has several tags");
     let (third_start, _) = offsets_of_a_parse_in_this_thread();
     assert_eq!(
@@ -1100,9 +1146,14 @@ fn each_snapshot_is_given_to_the_caller_as_its_tag_finishes_and_the_result_stays
     let repo = repo(None, None);
     let entry = entry_of(&repo);
     let given = std::sync::Mutex::new(Vec::new());
-    let (_, snapshots) = read_history(repo.work.path(), &entry, &|snapshot| {
-        given.lock().expect("a lock").push(snapshot.at.tag.clone());
-    })
+    let (_, snapshots) = read_history(
+        repo.work.path(),
+        &entry,
+        &sightings_of(&repo),
+        &|snapshot| {
+            given.lock().expect("a lock").push(snapshot.at.tag.clone());
+        },
+    )
     .expect("the history");
     // One call for each tag, with that tag's own snapshot, in the order the tags finish.
     let mut given = given.into_inner().expect("a lock");
@@ -1119,394 +1170,5 @@ fn each_snapshot_is_given_to_the_caller_as_its_tag_finishes_and_the_result_stays
         snapshots
             .windows(2)
             .all(|pair| pair[0].at.order() < pair[1].at.order())
-    );
-}
-
-/// The tags `git` lists below level 0.11, which the fixture's entry is made for.
-fn listed_below_the_level(repo: &Repo) -> Vec<Tagged> {
-    listed_releases(repo.work.path())
-        .expect("the tags")
-        .into_iter()
-        .filter(|tagged| tagged.version.minor < 11)
-        .collect()
-}
-
-#[test]
-fn the_gate_lists_the_tags_apart_from_the_reader_and_holds_the_snapshots_to_them() {
-    let repo = repo(None, None);
-    let read = read(&repo);
-    let listed = listed_below_the_level(&repo);
-    assert_eq!(listed.len(), 7);
-    // The list is the reader's own, made by `git for-each-ref`: its order, its commits, its dates.
-    assert_eq!(listed, read.expected);
-    assert_eq!(
-        release_problems(&listed, &read.snapshots),
-        Vec::<String>::new()
-    );
-    let with = |change: &dyn Fn(&mut Vec<Snapshot>)| {
-        let mut snapshots: Vec<Snapshot> = read.snapshots.iter().map(clone_snapshot).collect();
-        change(&mut snapshots);
-        release_problems(&listed, &snapshots)
-    };
-    // A snapshot repeated in place of another keeps the count.
-    let problems = with(&|snapshots| snapshots[3] = clone_snapshot(&snapshots[2]));
-    assert!(
-        problems
-            .iter()
-            .any(|problem| problem.starts_with("snapshot 3 is ")),
-        "{problems:?}"
-    );
-    assert!(
-        problems
-            .iter()
-            .any(|problem| problem == "a release is read twice"),
-        "{problems:?}"
-    );
-    assert!(
-        !problems
-            .iter()
-            .any(|problem| problem.contains("snapshots for")),
-        "{problems:?}"
-    );
-    // A snapshot left out, one added, one swapped with another, and one at another commit.
-    let problems = with(&|snapshots| {
-        snapshots.remove(1);
-    });
-    assert!(
-        problems
-            .iter()
-            .any(|problem| problem == "6 snapshots for 7 release tags"),
-        "{problems:?}"
-    );
-    let problems = with(&|snapshots| {
-        let extra = clone_snapshot(&snapshots[0]);
-        snapshots.push(extra);
-    });
-    assert!(
-        problems
-            .iter()
-            .any(|problem| problem == "8 snapshots for 7 release tags"),
-        "{problems:?}"
-    );
-    let problems = with(&|snapshots| snapshots.swap(4, 5));
-    assert!(
-        problems
-            .iter()
-            .any(|problem| problem.starts_with("snapshot 4 is ")),
-        "{problems:?}"
-    );
-    let problems = with(&|snapshots| snapshots[2].at.commit = "0".repeat(40));
-    assert!(
-        problems
-            .iter()
-            .any(|problem| problem.starts_with("snapshot 2 is ")),
-        "{problems:?}"
-    );
-    // An annotated tag is listed at the commit it names, and with that commit's date.
-    let work = repo.work.path();
-    let commit = git(work, &["rev-parse", "HEAD~2"], None).trim().to_owned();
-    let tag = format!("packages/v0.5.0+{}", &commit[..12]);
-    git(
-        work,
-        &["tag", "-a", "-m", "an annotated release", &tag, &commit],
-        None,
-    );
-    let object = git(work, &["rev-parse", &tag], None).trim().to_owned();
-    assert_ne!(object, commit, "the tag is an object of its own");
-    let date: i64 = git(work, &["log", "-1", "--format=%ct", &commit], None)
-        .trim()
-        .parse()
-        .expect("a date");
-    let listed = listed_releases(work);
-    let annotated = listed
-        .as_ref()
-        .ok()
-        .and_then(|all| all.iter().find(|tagged| tagged.tag == tag))
-        .map(|tagged| (tagged.commit.clone(), tagged.committed));
-    assert_eq!(annotated, Some((commit, date)), "{listed:?}");
-}
-
-#[test]
-fn the_gate_holds_each_lookup_each_absence_and_the_level_to_what_the_entry_needs() {
-    let repo = repo(None, None);
-    let read = read(&repo);
-    assert_eq!(
-        snapshot_problems(&read.entry, &read.snapshots),
-        Vec::<String>::new()
-    );
-    let tag = tag_at(&read, 2);
-    let with = |entry: &Narrower, change: &dyn Fn(&mut Snapshot)| {
-        let mut snapshots: Vec<Snapshot> = read.snapshots.iter().map(clone_snapshot).collect();
-        change(snapshot_of(&mut snapshots, &tag));
-        snapshot_problems(entry, &snapshots)
-    };
-    let has = |problems: &[String], text: String| {
-        assert!(problems.contains(&text), "{text} is not in {problems:?}");
-    };
-    let target = || ("companion_tauri".to_owned(), "Link::target".to_owned());
-    // A lookup the entry needs and the snapshot lacks, and one that no row names.
-    let problems = with(&read.entry, &|snapshot| {
-        snapshot.krates.remove("companion_tauri");
-        snapshot.items.remove(&target());
-    });
-    has(
-        &problems,
-        format!("{tag}: no reading of the crate companion_tauri"),
-    );
-    has(
-        &problems,
-        format!("{tag}: no reading of the item companion_tauri::Link::target"),
-    );
-    let problems = with(&read.entry, &|snapshot| {
-        snapshot
-            .krates
-            .insert("kr_stray".to_owned(), Lookup::Absent);
-        snapshot
-            .items
-            .insert(("kr_stray".to_owned(), "x".to_owned()), Lookup::Absent);
-    });
-    has(
-        &problems,
-        format!("{tag}: a reading of the crate kr_stray, which no row names"),
-    );
-    has(
-        &problems,
-        format!("{tag}: a reading of the item kr_stray::x, which no row names"),
-    );
-    // A failed lookup, a failed scan, an unreadable source and a sighting with no source.
-    let problems = with(&read.entry, &|snapshot| {
-        snapshot
-            .items
-            .insert(target(), Lookup::Failed("it failed".to_owned()));
-        snapshot.sightings = Err("no scan".to_owned());
-    });
-    has(
-        &problems,
-        format!("{tag}: the item companion_tauri::Link::target: it failed"),
-    );
-    has(&problems, format!("{tag}: the scan failed: no scan"));
-    let problems = with(&read.entry, &|snapshot| {
-        snapshot.krates.insert(
-            "companion_tauri".to_owned(),
-            Lookup::Failed("no crate".to_owned()),
-        );
-        snapshot.names_a_method = Err("no method.rs".to_owned());
-        snapshot
-            .source_errors
-            .insert(target(), "no text".to_owned());
-    });
-    has(
-        &problems,
-        format!("{tag}: the crate companion_tauri: no crate"),
-    );
-    has(
-        &problems,
-        format!("{tag}: method.rs cannot be read: no method.rs"),
-    );
-    has(
-        &problems,
-        format!(
-            "{tag}: the source of {:?} cannot be read: no text",
-            target()
-        ),
-    );
-    let problems = with(&read.entry, &|snapshot| {
-        snapshot.records.clear();
-    });
-    assert!(
-        problems
-            .iter()
-            .any(|problem| problem.starts_with(&format!("{tag}: no source for "))),
-        "{problems:?}"
-    );
-    // `Absent` is read where the entry lists an absent text, and nowhere else: an entry whose item
-    // lists none refuses the tag that lacks the item, and its crate.
-    let mut strict = read.entry.clone();
-    strict.senders = leak(vec![Sender {
-        class: "the companion",
-        sends: "x",
-        evidence: Evidence::Builds {
-            items: leak(vec![Item {
-                krate: "companion_tauri",
-                name: "Link::target",
-                now: "n",
-                across: leak(vec![("a-digest", "x")]),
-            }]),
-        },
-    }]);
-    strict.accounts = &[];
-    let first = tag_at(&read, 0);
-    let mut snapshots: Vec<Snapshot> = read.snapshots.iter().map(clone_snapshot).collect();
-    for snapshot in &mut snapshots {
-        snapshot
-            .krates
-            .retain(|krate, _| krate == "companion_tauri");
-        snapshot.items.retain(|(_, name), _| name == "Link::target");
-        snapshot.records.clear();
-        snapshot.sightings = Ok(Vec::new());
-    }
-    let problems = snapshot_problems(&strict, &snapshots);
-    has(
-        &problems,
-        format!("{first}: the crate companion_tauri is absent"),
-    );
-    has(
-        &problems,
-        format!(
-            "{first}: the item companion_tauri::Link::target is absent and the entry lists no absent text for it"
-        ),
-    );
-    assert!(
-        snapshot_problems(&read.entry, &read.snapshots).is_empty(),
-        "the entry that lists an absent text permits it"
-    );
-    // The level is above the newest release, whatever it is.
-    let listed = listed_below_the_level(&repo);
-    assert_eq!(level_above(&listed), "0.11");
-    let mut later = listed.clone();
-    later.push(Tagged {
-        version: kr_protocol::hello::PackageVersion::new(1, 2, 3),
-        ..listed[0].clone()
-    });
-    assert_eq!(level_above(&later), "2");
-    for list in [&listed, &later] {
-        let level: kr_protocol::update::CompatibilityLevel =
-            level_above(list).parse().expect("a level");
-        assert!(
-            list.iter()
-                .all(|tagged| kr_protocol::update::CompatibilityLevel::of(tagged.version) < level)
-        );
-    }
-}
-
-#[test]
-fn the_gate_holds_the_audit_to_the_problems_it_expects_and_to_no_others() {
-    let read = read(&repo(None, None));
-    let clean = audit_tags(&read.entry, &read.expected, &read.snapshots);
-    assert_eq!(audit_differences(&clean, &[]), Vec::<String>::new());
-    // A problem the audit gives and the list lacks, and one the list has that the audit lacks.
-    let report = report_with(&read, |entry, _| entry.range.tags = 5);
-    assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
-    assert_eq!(
-        audit_differences(&report, &[]),
-        vec![format!("reported and not expected: {}", report.problems[0])]
-    );
-    assert_eq!(
-        audit_differences(&report, &report.problems),
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        audit_differences(&clean, &report.problems),
-        vec![format!("expected and not reported: {}", report.problems[0])]
-    );
-    // A problem told twice.
-    let twice = Report {
-        problems: vec![report.problems[0].clone(), report.problems[0].clone()],
-        ..Report::default()
-    };
-    assert_eq!(
-        audit_differences(&twice, &report.problems),
-        vec!["a problem is reported twice".to_owned()]
-    );
-}
-
-#[test]
-fn the_gate_expects_what_the_audit_reports_for_an_entry_that_is_wrong_without_calling_the_audit() {
-    let repo = repo(None, None);
-    let read = read(&repo);
-    let listed = listed_below_the_level(&repo);
-    let said = |text: &str| format!("history {}: {text}", read.entry.root);
-    // The entry that fits has no problem, and the gate expects none.
-    assert_eq!(
-        expected_audit_problems(&read.entry, &listed, &read.snapshots),
-        Vec::<String>::new()
-    );
-    // The audit's report for an entry made wrong and what the gate expects of it are the same set,
-    // and the expectation holds the line of the kind the change brings.
-    let wrong = |change: &dyn Fn(&mut Narrower)| {
-        let mut entry = read.entry.clone();
-        change(&mut entry);
-        let report = audit_tags(&entry, &read.expected, &read.snapshots);
-        let expected = expected_audit_problems(&entry, &listed, &read.snapshots);
-        assert_eq!(
-            audit_differences(&report, &expected),
-            Vec::<String>::new(),
-            "{expected:?}"
-        );
-        expected
-    };
-    // The range says a number of tags that origin does not list.
-    let expected = wrong(&|entry| entry.range.tags = 5);
-    assert_eq!(
-        expected,
-        vec![said(
-            "the entry says 5 tags and origin lists 7 below the level"
-        )]
-    );
-    // The range starts at a tag that is neither the oldest release nor the oldest that names a method.
-    let expected = wrong(&|entry| entry.range.first_tag = "scratch");
-    let oldest = &listed[0].tag;
-    assert!(
-        expected.contains(&said(&format!(
-            "the oldest release is {oldest}, the entry names scratch"
-        ))),
-        "{expected:?}"
-    );
-    assert!(
-        expected.iter().any(|problem| problem
-            .contains("the oldest release whose method.rs names one of the six is ")
-            && problem.ends_with(", the entry names scratch")),
-        "{expected:?}"
-    );
-    // An item's row lists none of its texts.
-    let expected = wrong(&|entry| {
-        let mut senders = entry.senders.to_vec();
-        senders[0].evidence = Evidence::Builds {
-            items: leak(vec![Item {
-                krate: "companion_tauri",
-                name: "Link::target",
-                now: "n",
-                across: &[],
-            }]),
-        };
-        entry.senders = leak(senders);
-    });
-    assert!(
-        expected.iter().any(|problem| problem
-            .contains("the item companion_tauri::Link::target has a text (")
-            && problem.ends_with(") that the entry does not list")),
-        "{expected:?}"
-    );
-    // No account covers a sighting that no row names.
-    let expected = wrong(&|entry| entry.accounts = &[]);
-    assert!(
-        expected.iter().any(|problem| problem.contains(
-            "the sighting companion_tauri::names_one ({Names}) is no item of a row and no account covers it"
-        )),
-        "{expected:?}"
-    );
-    assert!(
-        expected.iter().any(|problem| problem.contains(
-            "the sighting kr_other::other_one ({Names}) is no item of a row and no account covers it"
-        )),
-        "{expected:?}"
-    );
-    // A row names an item that no snapshot holds a reading of.
-    let expected = wrong(&|entry| {
-        let mut senders = entry.senders.to_vec();
-        senders[0].evidence = Evidence::Builds {
-            items: leak(vec![Item {
-                krate: "companion_tauri",
-                name: "Link::unread",
-                now: "n",
-                across: &[],
-            }]),
-        };
-        entry.senders = leak(senders);
-    });
-    assert!(
-        expected.iter().any(|problem| problem
-            .ends_with(": the snapshot has no reading of the item companion_tauri::Link::unread")),
-        "{expected:?}"
     );
 }

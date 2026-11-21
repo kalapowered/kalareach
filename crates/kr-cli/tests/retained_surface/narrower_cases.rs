@@ -5,11 +5,12 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
+use super::compiler::{SightKind, Sighting};
 use super::narrower::{
     Account, Evidence, Helper, Input, Item, LevelRecord, Narrower, Range, Reader, Sender,
     check_narrower,
 };
-use super::walker::{Depth, Followed, Lookup, SightKind, Sighting};
+use super::walker::{Depth, Followed, Lookup};
 use super::{REMOVED, Root, Same, compare_with_records};
 
 pub const ROOT: &str = "the envelope a worker checks";
