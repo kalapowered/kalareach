@@ -1,11 +1,11 @@
-//! The condition rule: which code a configuration without `test` can compile.
+//! The condition rule: which code a configuration without `test` can compile, for the digests' index.
 //!
 //! `cfg` is read by structure (`all`, `any`, `not`, `true`, `false`, a name, a name with a string)
 //! with three values. `test` is false, and every other name or name with a string is unknown. A
 //! place is skipped when one `cfg` around it is false, and read otherwise, so `all(test, unix)` and
 //! `not(not(test))` are skipped, and `any(test, feature = "testing")`, `not(test)` and `windows` are
-//! read. An unknown predicate reads as product code: the rule adds a sighting where a configuration
-//! may not build it, and never drops one. A predicate that does not parse is an error, whatever
+//! read. An unknown predicate reads as product code: the file list and the digests keep a place that
+//! a configuration may not build, and never drop one that some configuration builds. A predicate that does not parse is an error, whatever
 //! else is written on the place (`#[cfg(test)] #[cfg(not())]` is one). A `cfg_attr` that would add a
 //! `path` is an error too, unless a `cfg` on the same place is false: that place is skipped.
 
@@ -39,7 +39,7 @@ pub fn enabled(attrs: &[Attribute], at: &str) -> Result<bool, String> {
                 .map_err(|_| unreadable(at, &attribute.to_token_stream().to_string()))?;
             if sets.is_none() && sets_path(&listed) {
                 sets = Some(format!(
-                    "{at}: the scan does not read a cfg_attr that sets a path ({})",
+                    "{at}: the file list does not read a cfg_attr that sets a path ({})",
                     attribute.to_token_stream()
                 ));
             }
@@ -51,58 +51,6 @@ pub fn enabled(attrs: &[Attribute], at: &str) -> Result<bool, String> {
         (true, Some(error)) => Err(error),
         (true, None) => Ok(true),
     }
-}
-
-/// Whether `attrs` carry `#[name]`: written as it is, or added by a `cfg_attr` whose predicate is
-/// not false. A predicate the rule cannot read is its error.
-pub fn carries(attrs: &[Attribute], name: &str, at: &str) -> Result<bool, String> {
-    for attribute in attrs {
-        if attribute.path().is_ident(name) {
-            return Ok(true);
-        }
-        if attribute.path().is_ident("cfg_attr") {
-            let listed = attribute
-                .parse_args_with(parse_metas)
-                .map_err(|_| unreadable(at, &attribute.to_token_stream().to_string()))?;
-            if added_by(&listed, name, &mut Vec::new(), at)? {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-/// Whether the `cfg_attr` whose arguments are `listed`, under the predicates `guards` of the
-/// `cfg_attr`s around it, adds `#[name]` where none of them is false.
-fn added_by(
-    listed: &Punctuated<Meta, Token![,]>,
-    name: &str,
-    guards: &mut Vec<Value>,
-    at: &str,
-) -> Result<bool, String> {
-    let mut parts = listed.iter();
-    let Some(guard) = parts.next() else {
-        return Ok(false);
-    };
-    guards.push(value(guard, at)?);
-    let mut found = false;
-    for meta in parts {
-        if meta.path().is_ident(name) {
-            found = guards.iter().all(|guard| *guard != Value::False);
-        } else if let Meta::List(list) = meta
-            && list.path.is_ident("cfg_attr")
-        {
-            let inner = list
-                .parse_args_with(parse_metas)
-                .map_err(|_| unreadable(at, &meta.to_token_stream().to_string()))?;
-            found = added_by(&inner, name, guards, at)?;
-        }
-        if found {
-            break;
-        }
-    }
-    guards.pop();
-    Ok(found)
 }
 
 /// Whether the attributes a `cfg_attr` adds (after its predicate) set a path, looking into a
@@ -117,7 +65,7 @@ fn sets_path(listed: &Punctuated<Meta, Token![,]>) -> bool {
 }
 
 fn unreadable(at: &str, text: &str) -> String {
-    format!("{at}: the scan cannot read the condition {text}")
+    format!("{at}: the condition {text} cannot be read")
 }
 
 /// One meta item as a `cfg` writes it. `syn` takes no `true` or `false` as the outermost path of a

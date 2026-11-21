@@ -129,8 +129,8 @@ tempfile.workspace = true
 # The restore tests put a backup in the storage service and read it back through a real daemon.
 kr-service-stand-in = { path = "../../tests/support/service-stand-in" }
 # The stored-format checks read the types a store keeps from their definitions in the source, and the
-# retained surface's scan takes the nested items that only test code builds out of a copy of an item.
-syn = { workspace = true, features = ["visit-mut"] }
+# retained surface's reader of the compiler's reports finds the item that holds a call site.
+syn.workspace = true
 # The retained surface's cases write a fixture's root manifest from the repository's.
 toml.workspace = true
 # The upgrade suite's device pairs with an installed host's daemon over the network on the loopback

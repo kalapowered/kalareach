@@ -14,9 +14,10 @@ use std::process::Command;
 use kr_protocol::hello::PackageVersion;
 use kr_protocol::update::CompatibilityLevel;
 
+use super::compiler::{SightKind, Sighting, WIRE_NAMES};
 use super::narrower::{ABSENT, DAEMON_CRATES, Evidence, Item, Narrower, RECEIVER_CRATES};
 use super::releases;
-use super::walker::{Extent, Lookup, SightKind, Sighting, Source, Tree, WIRE_NAMES};
+use super::walker::{Lookup, Source, Tree};
 
 /// A release as its tag names it, with the date of its commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,10 +46,8 @@ pub struct Snapshot {
     pub krates: BTreeMap<String, Lookup>,
     /// Every client-crate item of the entry.
     pub items: BTreeMap<(String, String), Lookup>,
-    /// The sightings of the client crates.
+    /// The sightings of the client crates, from the record of the compiler's readings.
     pub sightings: Result<Vec<Sighting>, String>,
-    /// The lines that the items of each sighting cover (none for a failed scan).
-    pub extents: BTreeMap<(String, String), BTreeSet<Extent>>,
     /// Every client row item, every client-crate account and every sighted item.
     pub records: BTreeMap<(String, String), Source>,
     /// The sources that could not be read, by item: a crate whose files do not all parse reads
@@ -446,9 +445,13 @@ pub fn expected_below(repository: &Path, level: CompatibilityLevel) -> Result<Ve
     Ok(expected)
 }
 
+/// What gives the sightings of a release: the record of the compiler's readings, or a fixture's.
+pub type SightingsOf<'a> = &'a (dyn Fn(&Tagged) -> Result<Vec<Sighting>, String> + Sync);
+
 /// Reads the history of an entry: origin's agreement with the local tags first, then the
-/// expectation, then one snapshot per local release below the level. `on_read` is given each snapshot
-/// as its tag finishes, in the order the tags finish (the snapshots come back in release order).
+/// expectation, then one snapshot per local release below the level. `sightings_of` gives the
+/// sightings of a release. `on_read` is given each snapshot as its tag finishes, in the order the
+/// tags finish (the snapshots come back in release order).
 ///
 /// # Errors
 ///
@@ -456,6 +459,7 @@ pub fn expected_below(repository: &Path, level: CompatibilityLevel) -> Result<Ve
 pub fn read_history(
     repository: &Path,
     entry: &Narrower,
+    sightings_of: SightingsOf<'_>,
     on_read: &(dyn Fn(&Snapshot) + Sync),
 ) -> Result<(Vec<Tagged>, Vec<Snapshot>), String> {
     let level: CompatibilityLevel = entry
@@ -480,7 +484,7 @@ pub fn read_history(
     let results = in_threads_of_their_own(tagged, READ_WIDTH, |tagged| {
         let tag = tagged.tag.clone();
         let started = std::time::Instant::now();
-        let snapshot = snapshot_at(repository, entry, tagged);
+        let snapshot = snapshot_at(repository, entry, tagged, sightings_of);
         println!("read {tag} in {:?}", started.elapsed());
         if let Ok(done) = &snapshot {
             on_read(done);
@@ -548,16 +552,15 @@ pub(super) fn in_threads_of_their_own<T: Send, R: Send>(
         .collect()
 }
 
-/// Whether the crate is read at the head by the reader's check of this checkout: every crate but the
-/// two that receive a mutation (the daemon is read there, and not at a tag).
-pub(super) fn reads_at_head(krate: &str) -> bool {
-    !RECEIVER_CRATES.contains(&krate)
-}
-
 /// Extracts a release's tree into a folder of this function's own, reads the entry's crates,
 /// items and sightings, and lets the folder go. The whole tree is extracted: Cargo reads the
 /// workspace from the root manifest and the manifests of its members.
-fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapshot, String> {
+fn snapshot_at(
+    repository: &Path,
+    entry: &Narrower,
+    at: Tagged,
+    sightings_of: SightingsOf<'_>,
+) -> Result<Snapshot, String> {
     let folder = tempfile::tempdir().map_err(|error| error.to_string())?;
     let mut command = Command::new("git");
     command
@@ -607,13 +610,11 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
                     })
                     .collect(),
                 sightings: Err(error),
-                extents: BTreeMap::new(),
                 records: BTreeMap::new(),
                 source_errors: BTreeMap::new(),
             });
         }
     };
-    let tree = tree.scoped(&|krate| is_client(krate));
     let krates = crates_read(entry)
         .into_iter()
         .map(|krate| (krate.to_owned(), tree.krate(krate)))
@@ -627,12 +628,7 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
             )
         })
         .collect();
-    let scan_started = std::time::Instant::now();
-    let sightings = tree.sightings(&|krate| is_client(krate));
-    let scan_took = scan_started.elapsed();
-    let extents = tree
-        .sighting_extents(&|krate| is_client(krate))
-        .unwrap_or_default();
+    let sightings = sightings_of(&at);
     let mut records: BTreeMap<(String, String), Source> = BTreeMap::new();
     let mut source_errors: BTreeMap<(String, String), String> = BTreeMap::new();
     let mut wanted: BTreeSet<(String, String)> = client_items(entry)
@@ -674,13 +670,12 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
         })
         .collect();
     println!(
-        "snapshot {}: sightings {} in {:?}; {} items failed{}",
+        "snapshot {}: sightings {}; {} items failed{}",
         at.tag,
         sightings.as_ref().map_or_else(
             |error| format!("failed ({error})"),
             |list| list.len().to_string()
         ),
-        scan_took,
         failed_items.len(),
         failed_items
             .first()
@@ -692,7 +687,6 @@ fn snapshot_at(repository: &Path, entry: &Narrower, at: Tagged) -> Result<Snapsh
         krates,
         items,
         sightings,
-        extents,
         records,
         source_errors,
     })
