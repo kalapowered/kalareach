@@ -23,8 +23,8 @@ use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use serde_json::json;
 use support::{
-    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, inbox_read, next_read_hold, pair,
-    phone_paired_with, unpaired_phone_controlled,
+    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, hosts_of, inbox_read,
+    next_read_hold, pair, phone_paired_with, reference_for, unpaired_phone_controlled,
 };
 use tauri::Manager as _;
 
@@ -738,47 +738,60 @@ async fn a_host_chosen_or_forgotten_while_it_is_visited_is_not_reported() {
     pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
     connection(companion, true).await;
     let device = companion.device();
-    let id_of = |name_of: &Host| {
-        device
+    let (second_ref, third_ref) = (
+        reference_for(companion, &second),
+        reference_for(companion, &third),
+    );
+
+    // Both visits are under way, held at their connections.
+    control.hold();
+    let visiting = companion.start_call("inbox_hosts", json!({}));
+    until_held(&control, 2).await;
+
+    // The person begins to use the second host and forgets the third. The choice starts the task
+    // that keeps the second host's connection, and its dial is held too: the third held connection.
+    let using = companion.start_call("hosts_use", json!({ "reference": second_ref }));
+    companion.told_host(&second_ref).await;
+    until_held(&control, 3).await;
+    let forgetting = companion.start_call("hosts_forget", json!({ "reference": third_ref }));
+    until_unlisted(&device, &third).await;
+    control.stop_holding();
+    control.release_all();
+
+    let found = visiting
+        .await
+        .expect("the visit ran")
+        .expect("the pass answered");
+    assert!(hosts_of(&found).is_empty(), "{found}");
+    using
+        .await
+        .expect("the choice ran")
+        .expect("the second is chosen");
+    forgetting
+        .await
+        .expect("the forget ran")
+        .expect("the third is forgotten");
+    first.stop().await;
+    second.stop().await;
+    third.stop().await;
+}
+
+/// Waits until the device no longer lists `host`.
+async fn until_unlisted(device: &companion_tauri::device::Device, host: &Host) {
+    tokio::time::timeout(WATCHDOG, async {
+        while device
             .pairing()
             .hosts
             .list()
             .expect("the records")
-            .into_iter()
-            .find(|each| each.host_endpoint_id == name_of.network().endpoint_id())
-            .expect("the host is recorded")
-            .host_device_id
-    };
-    let (second_id, third_id) = (id_of(&second), id_of(&third));
-
-    // Both visits are under way, held at their connections.
-    control.hold();
-    let desk = Arc::new(companion_tauri::inbox::InboxDesk::default());
-    let visiting = tokio::spawn({
-        let (desk, device) = (Arc::clone(&desk), Arc::clone(&device));
-        async move { desk.visit(&device).await }
-    });
-    tokio::time::timeout(WATCHDOG, async {
-        while control.held() < 2 {
+            .iter()
+            .any(|each| each.host_endpoint_id == host.network().endpoint_id())
+        {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("both visits are held");
-
-    // The person begins to use the second host and forgets the third.
-    device.use_host(second_id).expect("the second is chosen");
-    device
-        .forget_host(third_id)
-        .expect("the third is forgotten");
-    control.stop_holding();
-    control.release_all();
-
-    let found = visiting.await.expect("the visit ran");
-    assert!(found.is_empty(), "{found:?}");
-    first.stop().await;
-    second.stop().await;
-    third.stop().await;
+    .expect("the host is forgotten");
 }
 
 /// Waits until `count` connections are held by `control`.
@@ -817,57 +830,142 @@ async fn a_pass_leaves_out_a_host_that_is_no_longer_one_of_the_others_when_it_en
     pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
     connection(companion, true).await;
     let device = companion.device();
-    let id_of = |name_of: &Host| {
-        device
-            .pairing()
-            .hosts
-            .list()
-            .expect("the records")
-            .into_iter()
-            .find(|each| each.host_endpoint_id == name_of.network().endpoint_id())
-            .expect("the host is recorded")
-            .host_device_id
-    };
-    let (second_id, third_id) = (id_of(&second), id_of(&third));
-    let desk = Arc::new(companion_tauri::inbox::InboxDesk::default());
+    let (second_ref, third_ref) = (
+        reference_for(companion, &second),
+        reference_for(companion, &third),
+    );
 
     // Both visits are at their connections. One is let go and fails to reach its host.
     control.hold();
-    let pass = tokio::spawn({
-        let (desk, device) = (Arc::clone(&desk), Arc::clone(&device));
-        async move { desk.visit(&device).await }
-    });
+    let pass = companion.start_call("inbox_hosts", json!({}));
     until_held(&control, 2).await;
     control.unreachable(true);
     control.release(0);
 
     // The witness: it holds a connection once the let-go visit has ended, and not before.
-    let witness = tokio::spawn({
-        let (desk, device) = (Arc::clone(&desk), Arc::clone(&device));
-        async move { desk.visit(&device).await }
-    });
+    let witness = companion.start_call("inbox_hosts", json!({}));
     until_held(&control, 2).await;
 
-    // The phone begins to use one of the other hosts and forgets the other, and the slow visit goes on.
-    device.use_host(second_id).expect("the second is chosen");
-    device
-        .forget_host(third_id)
-        .expect("the third is forgotten");
+    // The phone begins to use one of the other hosts and forgets the other, and the slow visit goes
+    // on. The choice starts the task that keeps its host's connection, which is held too.
+    let using = companion.start_call("hosts_use", json!({ "reference": second_ref }));
+    companion.told_host(&second_ref).await;
+    until_held(&control, 3).await;
+    let forgetting = companion.start_call("hosts_forget", json!({ "reference": third_ref }));
+    until_unlisted(&device, &third).await;
     control.stop_holding();
     control.release_all();
 
     let found = tokio::time::timeout(WATCHDOG, pass)
         .await
         .expect("the pass ended")
-        .expect("the pass ran");
-    assert!(found.is_empty(), "{found:?}");
+        .expect("the pass ran")
+        .expect("the pass answered");
+    assert!(hosts_of(&found).is_empty(), "{found}");
     tokio::time::timeout(WATCHDOG, witness)
         .await
         .expect("the witness pass ended")
-        .expect("the witness pass ran");
+        .expect("the witness pass ran")
+        .expect("the witness pass answered");
+    using
+        .await
+        .expect("the choice ran")
+        .expect("the second is chosen");
+    forgetting
+        .await
+        .expect("the forget ran")
+        .expect("the third is forgotten");
     first.stop().await;
     second.stop().await;
     third.stop().await;
+}
+
+/// The seam's hold in a pass releases after the pass has listed the hosts and before it spawns a
+/// visit: while it is held no host has been asked, and a host paired meanwhile is not on the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pass_hold_releases_after_listing_and_before_the_spawn() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let second = Host::start(&owner).await;
+    let third = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    let mut passes = companion.inbox().watch_passes();
+
+    let pass = companion.start_call("inbox_hosts", json!({}));
+    let hold = tokio::time::timeout(WATCHDOG, passes.recv())
+        .await
+        .expect("the pass reaches the hold")
+        .expect("a hold");
+    let second_asked = control.asked_of(&second.network().endpoint_id());
+    pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
+    let third_asked = control.asked_of(&third.network().endpoint_id());
+    hold.release();
+    let found = tokio::time::timeout(WATCHDOG, pass)
+        .await
+        .expect("the pass ended")
+        .expect("the pass ran")
+        .expect("the pass answered");
+
+    assert_eq!(hosts_of(&found).len(), 1, "{found}");
+    assert!(
+        control.asked_of(&second.network().endpoint_id()) > second_asked,
+        "the visit began once the hold was released"
+    );
+    assert_eq!(
+        control.asked_of(&third.network().endpoint_id()),
+        third_asked,
+        "a host paired after the pass listed its hosts is not visited by it"
+    );
+    first.stop().await;
+    second.stop().await;
+    third.stop().await;
+}
+
+/// The seam's hold in a visit releases after the read has ended and before the visit is checked: the
+/// host has answered, a host forgotten while the visit is held is left out of the pass's answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_visit_hold_releases_after_the_read_and_before_the_checks() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    let device = companion.device();
+    let mut visits = companion.inbox().watch_visits();
+
+    let pass = companion.start_call("inbox_hosts", json!({}));
+    let hold = tokio::time::timeout(WATCHDOG, visits.recv())
+        .await
+        .expect("the visit reaches the hold")
+        .expect("a hold");
+    let second = reference_for(companion, &two.second);
+    assert_eq!(
+        Some(hold.host),
+        device
+            .host_by_reference(&second)
+            .map(|host| host.host_device_id)
+    );
+    assert!(
+        two.control.sent(Method::AttentionRead) >= 1,
+        "the host was asked for its inbox before the hold"
+    );
+    let forgetting = companion.start_call("hosts_forget", json!({ "reference": second }));
+    until_unlisted(&device, &two.second).await;
+    hold.release();
+    let found = tokio::time::timeout(WATCHDOG, pass)
+        .await
+        .expect("the pass ended")
+        .expect("the pass ran")
+        .expect("the pass answered");
+
+    assert!(hosts_of(&found).is_empty(), "{found}");
+    forgetting
+        .await
+        .expect("the forget ran")
+        .expect("the host is forgotten");
+    two.stop().await;
 }
 
 /// KR-REQ-13.01: a host this computer owns is watched for what it wants confirmed, and the watcher

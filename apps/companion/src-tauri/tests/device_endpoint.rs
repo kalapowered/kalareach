@@ -38,7 +38,7 @@ use net_support::worker::{Adopted, Worker};
 use net_support::{Device, Host};
 use serde_json::{Value, json};
 use support::{
-    Companion, LinkControl, Phone, StubIntake, WATCHDOG, govern, on_relay, pair,
+    Companion, LinkControl, Phone, StubIntake, WATCHDOG, govern, on_relay, pair, reference_for,
     unpaired_phone_controlled,
 };
 use tauri::Manager as _;
@@ -418,26 +418,6 @@ fn relays(urls: &[&str]) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// What the page names `host` by, from the pairing screen, without choosing it.
-fn reference_for(companion: &Companion, host: &Host) -> String {
-    let device = companion.device();
-    let view = companion
-        .call("pairing_view", json!({}))
-        .expect("the pairing screen");
-    view["hosts"]
-        .as_array()
-        .expect("hosts")
-        .iter()
-        .filter_map(|row| row["reference"].as_str())
-        .find(|reference| {
-            device
-                .host_by_reference(reference)
-                .is_some_and(|paired| paired.host_endpoint_id == host.network().endpoint_id())
-        })
-        .expect("the host is listed")
-        .to_owned()
-}
-
 /// A host of `owner` that names `relays` and resolves through `resolver`.
 async fn host_on(owner: &DeviceKeys, relays: &[&str], resolver: &str) -> Host {
     let mut endpoint = on_relay(relays[0], resolver);
@@ -655,7 +635,7 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
         )
         .expect("the kept host is chosen");
     assert_eq!(used["connected"], true, "{used}");
-    let desk = Arc::new(InboxDesk::default());
+    let desk = companion.inbox();
     let forget = |host: &Host| {
         companion
             .call(

@@ -2905,3 +2905,51 @@ impl Companion {
         .expect("the publisher tells the last change");
     }
 }
+
+/// What the page names `host` by, from the pairing screen, without choosing it.
+pub fn reference_for(companion: &Companion, host: &Host) -> String {
+    let device = companion.device();
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    view["hosts"]
+        .as_array()
+        .expect("hosts")
+        .iter()
+        .filter_map(|row| row["reference"].as_str())
+        .find(|reference| {
+            device
+                .host_by_reference(reference)
+                .is_some_and(|paired| paired.host_endpoint_id == host.network().endpoint_id())
+        })
+        .expect("the host is listed")
+        .to_owned()
+}
+
+/// The hosts a pass of the inbox answered with.
+pub fn hosts_of(reply: &serde_json::Value) -> &Vec<serde_json::Value> {
+    reply.as_array().expect("a pass answers with its hosts")
+}
+
+impl Companion {
+    /// The attention desk the application visits the other hosts with.
+    pub fn inbox(&self) -> Arc<companion_tauri::inbox::InboxDesk> {
+        use tauri::Manager as _;
+        self.app.state::<companion_tauri::AppState>().inbox()
+    }
+
+    /// Waits until the page was told a state whose host in use is the one `reference` names.
+    pub async fn told_host(&self, reference: &str) {
+        tokio::time::timeout(WATCHDOG, async {
+            while !self
+                .told_connection()
+                .iter()
+                .any(|state| state["host"]["reference"] == reference)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the page is told of the host chosen");
+    }
+}

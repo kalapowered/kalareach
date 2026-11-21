@@ -102,6 +102,9 @@ pub struct HostInbox {
 #[derive(Debug, Default)]
 pub struct InboxDesk {
     kept: Mutex<BTreeMap<DeviceId, Kept>>,
+    /// Where a suite has paused the desk's passes and visits.
+    #[cfg(feature = "testing")]
+    pauses: testing::Pauses,
 }
 
 /// What is kept of one host between visits.
@@ -199,6 +202,8 @@ impl InboxDesk {
                 connection.session().close();
             }
         }
+        #[cfg(feature = "testing")]
+        self.at_the_pass().await;
         let visits: Vec<_> = hosts
             .into_iter()
             .map(|host| {
@@ -270,6 +275,8 @@ impl InboxDesk {
         let outcome = tokio::time::timeout(VISIT_WITHIN, read_host(device, host, held))
             .await
             .unwrap_or(Visited::Unreached);
+        #[cfg(feature = "testing")]
+        self.at_the_visit(host.host_device_id).await;
         let mut found = HostInbox {
             reference: reference_of(host),
             name: host.name.clone().unwrap_or_else(|| UNNAMED_HOST.to_owned()),
@@ -523,4 +530,111 @@ async fn pages(session: &kr_client::Session) -> Result<Option<AttentionReadResul
         page.items = items;
         page
     }))
+}
+
+/// Seams the application's own suites act through.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use std::sync::{Mutex, PoisonError};
+
+    use kr_protocol::ids::DeviceId;
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::InboxDesk;
+
+    /// A pass held after it listed the hosts and before it began a visit to any of them, until it is
+    /// released.
+    #[derive(Debug)]
+    pub struct PassHold {
+        release: oneshot::Sender<()>,
+    }
+
+    impl PassHold {
+        /// Lets the pass go on.
+        pub fn release(self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    /// A visit held after its read ended and before the visit is checked and its outcome applied,
+    /// until it is released.
+    #[derive(Debug)]
+    pub struct VisitHold {
+        /// The host the visit is to.
+        pub host: DeviceId,
+        release: oneshot::Sender<()>,
+    }
+
+    impl VisitHold {
+        /// Lets the visit go on.
+        pub fn release(self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    /// Every place a task of the desk can be paused at.
+    #[derive(Debug, Default)]
+    pub(super) struct Pauses {
+        passes: Mutex<Option<mpsc::UnboundedSender<PassHold>>>,
+        visits: Mutex<Option<mpsc::UnboundedSender<VisitHold>>>,
+    }
+
+    impl InboxDesk {
+        /// Hands every pass that has listed its hosts to the returned receiver, held before it
+        /// begins any visit, until it is released.
+        #[must_use]
+        pub fn watch_passes(&self) -> mpsc::UnboundedReceiver<PassHold> {
+            let (watching, passes) = mpsc::unbounded_channel();
+            *self
+                .pauses
+                .passes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(watching);
+            passes
+        }
+
+        /// Hands every visit whose read has ended to the returned receiver, held before the visit is
+        /// checked and its outcome applied, until it is released. Visits are held in the order they
+        /// reach the place and may be released in any order.
+        #[must_use]
+        pub fn watch_visits(&self) -> mpsc::UnboundedReceiver<VisitHold> {
+            let (watching, visits) = mpsc::unbounded_channel();
+            *self
+                .pauses
+                .visits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(watching);
+            visits
+        }
+
+        pub(super) async fn at_the_pass(&self) {
+            let watching = self
+                .pauses
+                .passes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(watching) = watching {
+                let (release, released) = oneshot::channel();
+                if watching.send(PassHold { release }).is_ok() {
+                    let _ = released.await;
+                }
+            }
+        }
+
+        pub(super) async fn at_the_visit(&self, host: DeviceId) {
+            let watching = self
+                .pauses
+                .visits
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(watching) = watching {
+                let (release, released) = oneshot::channel();
+                if watching.send(VisitHold { host, release }).is_ok() {
+                    let _ = released.await;
+                }
+            }
+        }
+    }
 }
