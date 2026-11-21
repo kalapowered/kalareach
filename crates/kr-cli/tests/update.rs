@@ -3804,8 +3804,7 @@ fn a_host_refuses_a_manifest_that_lists_a_signature_twice_or_has_no_canonical_fo
     let (_, _, document) = small_release(&keys().targets);
     let said = |document: &Value| {
         root.verify(document.to_string().as_bytes())
-            .err()
-            .expect("a host refuses the manifest")
+            .expect_err("a host refuses the manifest")
             .to_string()
     };
     let signed: Value = serde_json::from_str(&document).expect("JSON");
@@ -3852,8 +3851,7 @@ fn a_host_refuses_a_manifest_when_its_root_has_no_targets_role_as_that() {
     let (_, _, document) = small_release(&keys().targets);
     let said = root
         .verify(document.as_bytes())
-        .err()
-        .expect("a host refuses the manifest")
+        .expect_err("a host refuses the manifest")
         .to_string();
     assert!(
         said.contains(
