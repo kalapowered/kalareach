@@ -1097,6 +1097,16 @@ impl ContactOwner {
             .is_ok()
     }
 
+    /// How long a connection's first events wait for the state that announces them.
+    #[cfg(not(feature = "testing"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the one form of the call; a suite sets its own under `testing`"
+    )]
+    pub(crate) const fn state_first_within(&self) -> Duration {
+        STATE_FIRST_WITHIN
+    }
+
     /// The seam of a suite: the owner's fence.
     #[cfg(feature = "testing")]
     #[must_use]
@@ -1132,7 +1142,13 @@ pub fn serve<R: Runtime>(app: &AppHandle<R>) {
             while let Some(published) = owner.next_unemitted() {
                 #[cfg(feature = "testing")]
                 owner.before_telling().await;
-                tell(&app, &published);
+                #[cfg(feature = "testing")]
+                let lost = owner.loses_the_emit();
+                #[cfg(not(feature = "testing"))]
+                let lost = false;
+                if !lost {
+                    tell(&app, &published);
+                }
                 owner.told(published.revision);
             }
         }
@@ -1142,7 +1158,9 @@ pub fn serve<R: Runtime>(app: &AppHandle<R>) {
 /// Seams the application's own suites act through.
 #[cfg(feature = "testing")]
 pub mod testing {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
 
     use kr_client::Session;
     use tokio::sync::{mpsc, oneshot};
@@ -1224,6 +1242,8 @@ pub mod testing {
         publisher: Place,
         adoption: Place,
         stops: Mutex<Option<mpsc::UnboundedSender<Stop>>>,
+        state_wait: Mutex<Option<Duration>>,
+        lose_emits: AtomicUsize,
     }
 
     impl ContactOwner {
@@ -1285,6 +1305,39 @@ pub mod testing {
                     let _ = released.await;
                 }
             }
+        }
+
+        /// Sets how long a connection's first events wait for the state that announces them, from
+        /// now on: a bound on a wait that exists for order.
+        pub fn wait_for_the_state_at_most(&self, within: Duration) {
+            *self
+                .pauses
+                .state_wait
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(within);
+        }
+
+        pub(crate) fn state_first_within(&self) -> Duration {
+            self.pauses
+                .state_wait
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .unwrap_or(super::STATE_FIRST_WITHIN)
+        }
+
+        /// Makes the publisher's next emit fail: the page is told nothing of the publication it was
+        /// to tell, and the publisher goes on with the next as it does after an emit that failed.
+        pub fn lose_the_next_emit(&self) {
+            self.pauses.lose_emits.fetch_add(1, Ordering::SeqCst);
+        }
+
+        pub(super) fn loses_the_emit(&self) -> bool {
+            self.pauses
+                .lose_emits
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
         }
 
         /// Plants a stored read and a retained visit connection in the record of the paired host

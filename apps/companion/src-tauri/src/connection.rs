@@ -23,7 +23,7 @@ use kr_protocol::rights::ActionRight;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter as _, Manager as _, Runtime};
 
-use crate::contact::{Adopt, Outcome, Reach, STATE_FIRST_WITHIN, Target, Wrote};
+use crate::contact::{Adopt, Outcome, Reach, Target, Wrote};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::state::{AppState, Started};
@@ -1022,7 +1022,9 @@ async fn supervise<R: Runtime>(
     // The state that announces the connection comes before what the host sends on it. The wait is a
     // bound on a delay, not an authority: every event carries the revision it follows, and the
     // page holds an event until it has applied that revision.
-    let _ = owner.emitted_through(revision, STATE_FIRST_WITHIN).await;
+    let _ = owner
+        .emitted_through(revision, owner.state_first_within())
+        .await;
     // A host that is reached again is asked once more for what a call left owed it.
     if let (Some(host), Some(calls)) = (paired_host, app.try_state::<crate::voice::Calls>()) {
         calls.host_reached(host, environment_id, Arc::clone(&session));

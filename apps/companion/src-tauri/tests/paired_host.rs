@@ -2050,3 +2050,72 @@ async fn connection_since_replays_what_the_page_missed() {
     assert_eq!(none["states"], json!([]), "{none}");
     host.stop().await;
 }
+
+/// The owner of this application's contact with its hosts.
+fn contact_owner(companion: &Companion) -> Arc<companion_tauri::contact::ContactOwner> {
+    Arc::clone(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .contact_owner(),
+    )
+}
+
+/// KR-REQ-18.01: an emit that fails is not retried and its state is not told again, and the state
+/// is still held by the replay, so that a page that asks for what it missed above the last revision
+/// it heard is given it with no further change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_final_emit_is_found_by_the_tail() {
+    let (host, phone) = a_host_that_comes_back_and_its_phone().await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let owner = contact_owner(companion);
+    let heard_last = told_states(companion).last().expect("a state").2;
+
+    owner.lose_the_next_emit();
+    let stopped = host.shut_down().await;
+    connection(companion, false).await;
+    let lost = owner.revision();
+    assert!(lost > heard_last, "the loss of the host is a change");
+    assert!(
+        owner.emitted_through(lost, WATCHDOG).await,
+        "the publisher attempted the emit"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        told_states(companion).last().map(|told| told.2),
+        Some(heard_last),
+        "the page was told nothing of the change whose emit failed"
+    );
+
+    let replay = companion
+        .call("connection_since", json!({ "after": heard_last }))
+        .expect("the replay");
+    assert_eq!(replay["resync"], false, "{replay}");
+    let revisions: Vec<u64> = replay["states"]
+        .as_array()
+        .expect("states")
+        .iter()
+        .map(|state| state["revision"].as_u64().expect("a revision"))
+        .collect();
+    assert_eq!(
+        revisions,
+        vec![lost],
+        "the missed state is replayed: {replay}"
+    );
+    assert_eq!(replay["states"][0]["connected"], false, "{replay}");
+
+    // The next change is told as usual, and the lost one is not told after it.
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let state = connection(companion, true).await;
+    companion.told_everything().await;
+    let told: Vec<u64> = told_states(companion).iter().map(|each| each.2).collect();
+    assert!(told.contains(&state["revision"].as_u64().expect("a revision")));
+    assert!(
+        !told.contains(&lost),
+        "the lost emit is not retried: {told:?}"
+    );
+    host.stop().await;
+}

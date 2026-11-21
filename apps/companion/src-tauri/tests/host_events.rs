@@ -571,6 +571,356 @@ mod window {
             );
         }
         session.close();
+        a_replacement_event_sent_before_adoption_reaches_the_page(app, runtime, window)?;
+        a_replacement_event_waits_for_the_replacements_own_revision(app, runtime, window)?;
+        a_publisher_delayed_past_the_bound_still_precedes_host_events(app, runtime, window)?;
+        a_failed_state_emit_holds_host_events_until_replay(app, runtime, window)
+    }
+
+    /// A scripted worker, the link it answers on, and the connection the application would hold to
+    /// it, reached as the application reaches a real worker.
+    fn scripted_connection(
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<
+        (
+            ScriptedWorker,
+            super::scripted_worker::Link,
+            companion_tauri::connection::Connection,
+        ),
+        String,
+    > {
+        use companion_tauri::connection::{Connection, Standing};
+
+        let mut worker = runtime.block_on(async { ScriptedWorker::start(Challenge::Answered) });
+        let paths = worker.paths();
+        let session_id = worker.session_id;
+        let (session, link) = runtime.block_on(async {
+            let reached = companion_tauri::worker::reach(&paths, session_id)
+                .await
+                .map_err(companion_tauri::worker::Unreached::words)?;
+            let transport = kr_client::ipc::IpcTransport::over(reached.client);
+            let session =
+                kr_client::Session::start(transport.shared()).map_err(|error| error.to_string())?;
+            let link = worker.link().await;
+            Ok::<_, String>((session, link))
+        })?;
+        let host = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        Ok((
+            worker,
+            link,
+            Connection::assembled(session, host, Standing::Owner, None, None),
+        ))
+    }
+
+    /// What a replacement leg starts from: the keeper supervising a first connection whose state
+    /// the page has heard.
+    struct First {
+        _worker: ScriptedWorker,
+        _link: super::scripted_worker::Link,
+        session: Arc<kr_client::Session>,
+        owner: Arc<companion_tauri::contact::ContactOwner>,
+    }
+
+    fn reached_first(
+        app: &AppHandle,
+        runtime: &tokio::runtime::Runtime,
+        window: &WebviewWindow,
+    ) -> Result<First, String> {
+        use companion_tauri::connection::Attempt;
+
+        let (worker, link, connection) = scripted_connection(runtime)?;
+        let session = connection.session();
+        let owner =
+            Arc::clone(tauri::Manager::state::<companion_tauri::AppState>(app).contact_owner());
+        let mut offered = Some(connection);
+        companion_tauri::connection::reach_host_on_this_machine(app, move || {
+            let next = offered.take();
+            async move { next.map_or(Attempt::Nothing, Attempt::Reached) }
+        })
+        .map_err(|error| error.message)?;
+        wait_for("the connection being held", || owner.held().is_some())?;
+        let revision = owner.revision();
+        if !runtime.block_on(owner.emitted_through(revision, LIVENESS)) {
+            return Err("the publisher did not tell the first connection's state".to_owned());
+        }
+        wait_for("the page hearing the first connection's state", || {
+            heard(window).iter().any(|each| {
+                each.get("connection")
+                    .is_some_and(|state| state["revision"].as_u64() == Some(revision))
+            })
+        })?;
+        Ok(First {
+            _worker: worker,
+            _link: link,
+            session,
+            owner,
+        })
+    }
+
+    /// The worker of a replacement, and the link it pushes events on.
+    struct Second {
+        _worker: ScriptedWorker,
+        link: super::scripted_worker::Link,
+    }
+
+    /// A replacement of the first connection, as the replacer makes one: the second connection and
+    /// the receiver of its events, taken before the owner holds it. The answer is the revision the
+    /// replacement was published as.
+    fn replaced(runtime: &tokio::runtime::Runtime, first: &First) -> Result<(u64, Second), String> {
+        let (worker, link, connection) = scripted_connection(runtime)?;
+        let events = connection.session().events();
+        let applied = first.owner.replaced(&first.session, connection, events);
+        if !applied.value {
+            return Err("the owner did not take the replacement".to_owned());
+        }
+        let revision = applied.revision;
+        drop(applied);
+        Ok((
+            revision,
+            Second {
+                _worker: worker,
+                link,
+            },
+        ))
+    }
+
+    /// The host events the page heard after `before`, and the states beside them.
+    fn heard_since(window: &WebviewWindow, before: usize) -> (Vec<Value>, Vec<Value>) {
+        let all = heard(window)[before..].to_vec();
+        let states = all
+            .iter()
+            .filter_map(|each| each.get("connection").cloned())
+            .collect();
+        let events = all
+            .into_iter()
+            .filter(|each| each.get("connection").is_none())
+            .collect();
+        (events, states)
+    }
+
+    /// KR-REQ-10.01: an event the replacement sends while the keeper has not yet taken it up is not
+    /// lost: it is sent on once the keeper has, and names the revision the replacement was
+    /// published as.
+    fn a_replacement_event_sent_before_adoption_reaches_the_page(
+        app: &AppHandle,
+        runtime: &tokio::runtime::Runtime,
+        window: &WebviewWindow,
+    ) -> Result<(), String> {
+        let first = reached_first(app, runtime, window)?;
+        let before = heard(window).len();
+        let mut hold = first.owner.hold_adoption();
+        let (revision, mut second) = replaced(runtime, &first)?;
+        runtime.block_on(async {
+            tokio::time::timeout(LIVENESS, hold.reached())
+                .await
+                .map_err(|_| "the keeper did not reach the hold before adoption".to_owned())
+        })?;
+        assert!(
+            first.owner.adoption_pending(),
+            "the replacement is not taken up while the keeper is held"
+        );
+        runtime.block_on(async {
+            second
+                .link
+                .push(
+                    "session.state",
+                    &json!({ "state": "live", "cursor": 21, "changed": [] }),
+                )
+                .await;
+        });
+        hold.release();
+        wait_for("the page hearing the replacement's event", || {
+            heard_since(window, before)
+                .0
+                .iter()
+                .any(|event| event["payload"]["cursor"] == json!(21))
+        })?;
+        let (events, _) = heard_since(window, before);
+        let event = events
+            .iter()
+            .find(|event| event["payload"]["cursor"] == json!(21))
+            .expect("the event");
+        assert_eq!(
+            event["revision"],
+            json!(revision),
+            "the event names the revision the replacement was published as: {events:?}"
+        );
+        Ok(())
+    }
+
+    /// Replaces the first connection while the publisher is held before it tells the replacement's
+    /// state, with the keeper's wait for that state set to `within`, and has the replacement send one
+    /// event. Returns the revision of the held state, the host events the page heard and the states
+    /// it heard, while the state is still held, and a function that releases it.
+    fn an_event_beside_a_held_state(
+        app: &AppHandle,
+        runtime: &tokio::runtime::Runtime,
+        window: &WebviewWindow,
+        within: Duration,
+        stay: Duration,
+    ) -> Result<
+        (
+            First,
+            Second,
+            u64,
+            usize,
+            companion_tauri::contact::testing::Hold,
+        ),
+        String,
+    > {
+        let first = reached_first(app, runtime, window)?;
+        first.owner.wait_for_the_state_at_most(within);
+        let before = heard(window).len();
+        let mut hold = first.owner.hold_the_publisher();
+        let (revision, mut second) = replaced(runtime, &first)?;
+        runtime.block_on(async {
+            tokio::time::timeout(LIVENESS, hold.reached())
+                .await
+                .map_err(|_| "the publisher did not take the replacement's publication".to_owned())
+        })?;
+        let mut witness = first
+            .owner
+            .held()
+            .expect("the replacement is held")
+            .session()
+            .events();
+        runtime.block_on(async {
+            second
+                .link
+                .push(
+                    "session.state",
+                    &json!({ "state": "live", "cursor": 33, "changed": [] }),
+                )
+                .await;
+            tokio::time::timeout(LIVENESS, witness.recv())
+                .await
+                .map_err(|_| "the replacement's session did not receive the event".to_owned())?
+                .map_err(|error| format!("the replacement's events ended: {error}"))?;
+            Ok::<_, String>(())
+        })?;
+        std::thread::sleep(stay);
+        Ok((first, second, revision, before, hold))
+    }
+
+    /// KR-REQ-10.01: while the replacement's state is held, the replacement's event waits for it,
+    /// and then follows it, naming the replacement's own revision and not the first connection's.
+    fn a_replacement_event_waits_for_the_replacements_own_revision(
+        app: &AppHandle,
+        runtime: &tokio::runtime::Runtime,
+        window: &WebviewWindow,
+    ) -> Result<(), String> {
+        let (first, second, revision, before, hold) =
+            an_event_beside_a_held_state(app, runtime, window, LIVENESS, Duration::from_secs(1))?;
+        let (events, states) = heard_since(window, before);
+        assert!(
+            events.is_empty(),
+            "the page heard {events:?} before the replacement's state was told ({states:?})"
+        );
+        hold.release();
+        wait_for("the page hearing the replacement's state and event", || {
+            let (events, states) = heard_since(window, before);
+            !events.is_empty()
+                && states
+                    .iter()
+                    .any(|state| state["revision"].as_u64() == Some(revision))
+        })?;
+        let told = heard(window)[before..].to_vec();
+        let at_state = told
+            .iter()
+            .position(|each| {
+                each.get("connection")
+                    .is_some_and(|state| state["revision"].as_u64() == Some(revision))
+            })
+            .expect("the state");
+        let at_event = told
+            .iter()
+            .position(|each| each.get("connection").is_none())
+            .expect("the event");
+        assert!(at_state < at_event, "the state comes first: {told:?}");
+        assert_eq!(told[at_event]["revision"], json!(revision), "{told:?}");
+        drop((first, second));
+        Ok(())
+    }
+
+    /// KR-REQ-10.01: a publisher that is later than the keeper's bound does not make the page hear
+    /// the event as though it followed its state: the event names a revision the page has not
+    /// heard, which the page holds it for, and the state is told when the publisher goes on.
+    fn a_publisher_delayed_past_the_bound_still_precedes_host_events(
+        app: &AppHandle,
+        runtime: &tokio::runtime::Runtime,
+        window: &WebviewWindow,
+    ) -> Result<(), String> {
+        let (first, second, revision, before, hold) = an_event_beside_a_held_state(
+            app,
+            runtime,
+            window,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        )?;
+        wait_for("the page hearing the event the bound let go", || {
+            !heard_since(window, before).0.is_empty()
+        })?;
+        let (events, states) = heard_since(window, before);
+        assert!(
+            states
+                .iter()
+                .all(|state| state["revision"].as_u64().unwrap_or(0) < revision),
+            "the replacement's state was heard while it was held: {states:?}"
+        );
+        assert_eq!(events[0]["revision"], json!(revision), "{events:?}");
+        hold.release();
+        wait_for("the page hearing the delayed state", || {
+            heard_since(window, before)
+                .1
+                .iter()
+                .any(|state| state["revision"].as_u64() == Some(revision))
+        })?;
+        drop((first, second));
+        Ok(())
+    }
+
+    /// KR-REQ-10.01: when the emit of the replacement's state fails, the host's events name a
+    /// revision the page never hears told, and the owner's replay holds it.
+    fn a_failed_state_emit_holds_host_events_until_replay(
+        app: &AppHandle,
+        runtime: &tokio::runtime::Runtime,
+        window: &WebviewWindow,
+    ) -> Result<(), String> {
+        let first = reached_first(app, runtime, window)?;
+        let before_revision = first.owner.revision();
+        let before = heard(window).len();
+        first.owner.lose_the_next_emit();
+        let (revision, mut second) = replaced(runtime, &first)?;
+        runtime.block_on(async {
+            second
+                .link
+                .push(
+                    "session.state",
+                    &json!({ "state": "live", "cursor": 44, "changed": [] }),
+                )
+                .await;
+        });
+        wait_for("the page hearing the event of the replacement", || {
+            !heard_since(window, before).0.is_empty()
+        })?;
+        std::thread::sleep(Duration::from_secs(1));
+        let (events, states) = heard_since(window, before);
+        assert_eq!(events[0]["revision"], json!(revision), "{events:?}");
+        assert!(
+            states
+                .iter()
+                .all(|state| state["revision"].as_u64() != Some(revision)),
+            "the state whose emit failed was heard: {states:?}"
+        );
+        let replay = first.owner.since(before_revision);
+        assert!(!replay.resync, "the replay is not a resync");
+        assert!(
+            replay
+                .states
+                .iter()
+                .any(|state| state.revision == revision && state.replaced > 0),
+            "the replay holds the state the page missed"
+        );
         Ok(())
     }
 }
