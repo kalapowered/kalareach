@@ -1610,3 +1610,41 @@ fn a_place_no_configuration_without_test_builds_is_not_read_by_the_inventory_at_
         );
     }
 }
+
+#[test]
+fn a_definition_named_action_right_is_refused_in_a_crate_the_scan_reads_where_a_build_without_test_has_it()
+ {
+    let at = "crates/kr-sender/src/lib.rs";
+    for (lib, kind) in [
+        (
+            "type ActionRight = kr_protocol::method::Method;",
+            "type alias",
+        ),
+        (
+            "mod ActionRight { pub use kr_protocol::method::Method::*; }",
+            "module",
+        ),
+        ("enum ActionRight { A }", "enum"),
+        ("struct ActionRight;", "struct"),
+        ("union ActionRight { a: u8 }", "union"),
+        ("trait ActionRight {}", "trait"),
+        ("type r#ActionRight = u8;", "type alias"),
+    ] {
+        assert_eq!(
+            read_names(&format!("{lib}\n"), &[]),
+            Err(format!(
+                "{at}: the scan does not read a {kind} named ActionRight"
+            )),
+            "{lib}"
+        );
+    }
+    for lib in [
+        "#[cfg(test)]\nenum ActionRight { A }",
+        "use kr_protocol::rights::ActionRight;",
+        "fn f() { let _ = ActionRight::AgentTurnCancel; }",
+        "enum Other { ActionRight }",
+        "struct S { ActionRight: u8 }",
+    ] {
+        assert!(read_names(&format!("{lib}\n"), &[]).is_ok(), "{lib}");
+    }
+}
