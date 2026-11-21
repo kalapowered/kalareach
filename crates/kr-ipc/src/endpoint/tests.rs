@@ -480,7 +480,7 @@ mod unix {
         }
 
         if rustix::process::geteuid().is_root() {
-            eprintln!("stands down: a process of the superuser writes any folder");
+            eprintln!("not exercised: a process of the superuser writes any folder");
             return;
         }
         let folder = PrivateTempDir::create();
