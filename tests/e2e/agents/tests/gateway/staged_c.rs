@@ -1270,7 +1270,8 @@ enum Started {
     /// Codex does, went on running with the conversation open read-only and a notice in place of
     /// the composer.
     Refused,
-    /// Its start ended with the shell's prompt back and none of those texts.
+    /// Its start ended, with the shell's prompt back below the typed line or with the agent's
+    /// process gone, and none of those texts.
     Ended,
 }
 
@@ -1355,8 +1356,8 @@ fn check_taken(forks: bool, what: Taken) -> Result<(), String> {
             what.word()
         )),
         (_, Taken::Ended) => Err(
-            "the second start ended with the shell's prompt back and none of the texts the entry \
-             names for a refusal, so what the agent did with the saved conversation was not shown"
+            "the second start ended with none of the entry's refusal texts on the screen, so the \
+             screen did not show what the agent did with the saved conversation"
                 .to_owned(),
         ),
     }
@@ -1430,18 +1431,25 @@ const RESUMING: &str = "Resuming session…";
 /// shows a card, "This conversation is open in another app", in place of the composer and keeps
 /// the conversation read-only). The composer with the resume done is a running continuation; the
 /// composer beside [`RESUMING`] is the startup draft and says nothing yet. The shell's prompt
-/// below the typed line's echo is an end.
+/// below the typed line's echo is an end, and so is the end of the agent's own process, which
+/// needs no echo of the typed line: the echo wraps, scrolls off or is cleared, and the start is
+/// still over. The process's end comes after the card's words, which an agent that printed them
+/// and ended leaves on the screen, and before the composer, which an ended agent leaves too.
 fn second_screen(
     rows: &[String],
     typed: &str,
     composer: &str,
     refusals: &[String],
+    agent_ended: bool,
 ) -> Option<(Started, Option<String>)> {
     if let Some(text) = refusals
         .iter()
         .find(|text| rows.iter().any(|row| row.contains(text.as_str())))
     {
         return Some((Started::Refused, Some(text.clone())));
+    }
+    if agent_ended {
+        return Some((Started::Ended, None));
     }
     if rows.iter().any(|row| row.contains(composer)) {
         return if rows.iter().any(|row| row.contains(RESUMING)) {
@@ -1473,7 +1481,7 @@ fn a_card_is_a_refusal_the_startup_composer_is_no_answer_and_a_resumed_composer_
         "  Close it there and press R to continue here.",
     ]);
     assert_eq!(
-        second_screen(&card, typed, composer, &refusals),
+        second_screen(&card, typed, composer, &refusals, false),
         Some((
             Started::Refused,
             Some("This conversation is open in another app".to_owned())
@@ -1484,38 +1492,109 @@ fn a_card_is_a_refusal_the_startup_composer_is_no_answer_and_a_resumed_composer_
         "  Resuming session…",
         "> Ask Codex to do anything",
     ]);
-    assert_eq!(second_screen(&draft, typed, composer, &refusals), None);
+    assert_eq!(
+        second_screen(&draft, typed, composer, &refusals, false),
+        None
+    );
     let resumed = screen(&[
         "kr-session$ codex resume 0123-4567",
         "> (kr1) Remember the code kr1.",
         "> Ask Codex to do anything",
     ]);
     assert_eq!(
-        second_screen(&resumed, typed, composer, &refusals),
+        second_screen(&resumed, typed, composer, &refusals, false),
         Some((Started::Running, None))
     );
 }
 
-/// Waits for the second start to end one way or the other, and says how, by [`second_screen`].
+/// A start whose process has ended is an end whatever the screen shows of the typed line: the echo
+/// wrapped over two rows, scrolled off, or cleared by the agent leaves no prompt below it to find,
+/// and the start is still over. A card's words that stand on the screen of an agent that has ended
+/// are still a refusal, and a start whose process runs and shows nothing yet is no end.
+#[test]
+fn a_start_whose_process_ended_is_an_end_whatever_the_screen_shows_of_the_typed_line() {
+    let screen = |rows: &[&str]| rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
+    let typed = "codex resume 0123-4567";
+    let composer = "Ask Codex to do anything";
+    let refusals = ["This conversation is open in another app".to_owned()];
+    let read =
+        |rows: &[String], ended: bool| second_screen(rows, typed, composer, &refusals, ended);
+    let wrapped = screen(&[
+        "kr-session$ codex resume 0123-",
+        "4567",
+        "no such conversation",
+    ]);
+    assert_eq!(
+        read(&wrapped, true),
+        Some((Started::Ended, None)),
+        "an echo wrapped over two rows leaves no prompt below it, and the process has ended"
+    );
+    let cleared = screen(&["", ""]);
+    assert_eq!(
+        read(&cleared, true),
+        Some((Started::Ended, None)),
+        "a screen the agent cleared shows no echo, and the process has ended"
+    );
+    assert_eq!(
+        read(&cleared, false),
+        None,
+        "a start whose process runs and shows nothing yet is no end"
+    );
+    let card = screen(&["  This conversation is open in another app"]);
+    assert_eq!(
+        read(&card, true),
+        Some((
+            Started::Refused,
+            Some("This conversation is open in another app".to_owned())
+        )),
+        "a card on the screen of an agent that has ended is still a refusal"
+    );
+    let stale = screen(&["> Ask Codex to do anything"]);
+    assert_eq!(
+        read(&stale, true),
+        Some((Started::Ended, None)),
+        "a composer on the screen of an agent that has ended is no running agent"
+    );
+}
+
+/// Waits for the second start of the agent in `at` to end one way or the other, and says how, by
+/// [`second_screen`], with the agent's process: the process below the session's worker that maps
+/// the agent's file is looked for until it is seen, and its end is read before each read of the
+/// screen, so that the screen it is judged with is the last the agent drew.
 fn second_start(
-    person: &Person,
+    ctx: &Context,
+    at: &Seated<'_>,
     typed: &str,
     composer: &str,
     refusals: &[String],
 ) -> (Started, Option<String>) {
+    let worker =
+        u32::try_from(ctx.run.worker_of(&at.session_id.to_string()).pid.get()).expect("a pid");
+    let inode = inode_of(&ctx.executable);
+    let mut agent: Option<ProcessStartIdentity> = None;
     let started = Instant::now();
     loop {
-        let rows = person.window.screen();
-        if let Some(answer) = second_screen(&rows, typed, composer, refusals) {
+        if agent.is_none() {
+            agent = process_mapping_once(worker, inode, None)
+                .unwrap_or_else(|why| panic!("the agent's process was not looked for: {why}"));
+        }
+        let ended = agent.as_ref().is_some_and(|identity| !running(identity));
+        let rows = at.person.window.screen();
+        if let Some(answer) = second_screen(&rows, typed, composer, refusals, ended) {
             return answer;
         }
         assert!(
             started.elapsed() < LIVENESS,
-            "the second start neither reached the composer nor ended after {LIVENESS:?}; the \
-             screen is:\n{}",
+            "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
+             agent's process was {}; the screen is:\n{}",
+            if agent.is_some() {
+                "seen and still running"
+            } else {
+                "not seen"
+            },
             rows.join("\n")
         );
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1703,7 +1782,7 @@ fn second_process(
     let line = real.typed(&extra);
     b.person.types(&line);
     let (started, refusal) =
-        second_start(b.person, &line, &account.composer, &account.resume_refused);
+        second_start(ctx, &b, &line, &account.composer, &account.resume_refused);
     let first_after = shown_now(ctx, &a);
     check_unchanged(Held::of(&shown_a), &first_after)
         .unwrap_or_else(|why| panic!("session A's instance and revision are as they were: {why}"));
