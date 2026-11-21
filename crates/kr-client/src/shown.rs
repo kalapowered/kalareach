@@ -361,9 +361,7 @@ impl Shown {
             IpcError::IdentityUnavailable { what, .. } => {
                 crate::shown!("{} is not available", *what)
             }
-            IpcError::HostRefused { .. } => {
-                Self::said("the host refused the connection is not available")
-            }
+            IpcError::HostRefused { .. } => Self::said("the host refused the connection"),
             // The connection stands: the request is in a form the peer's release cannot read, and
             // it was not written.
             IpcError::NotInLevel(_) => {
@@ -2109,6 +2107,16 @@ mod tests {
             !said.as_str().contains("a method the level lacks"),
             "{said}"
         );
+    }
+
+    /// A hello the host refused is said in this side's own words, which name the refusal and show
+    /// nothing of the detail the host wrote, as one sentence that reads on its own.
+    #[test]
+    fn a_hello_the_host_refused_is_said_as_that_refusal() {
+        let said = Shown::ipc(&IpcError::HostRefused {
+            detail: "a detail the host wrote".to_owned(),
+        });
+        assert_eq!(said.as_str(), "the host refused the connection");
     }
 
     /// A path prefix outside a configured root says a drive's letter, and never a server's, a
