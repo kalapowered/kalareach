@@ -2971,7 +2971,6 @@ struct Visiting {
     c: Host,
     phone: Phone,
     control: Arc<LinkControl>,
-    owner: DeviceKeys,
     a_ref: String,
     c_ref: String,
 }
@@ -2998,7 +2997,6 @@ async fn visiting() -> Visiting {
         c,
         phone,
         control,
-        owner,
         a_ref,
         c_ref,
     }

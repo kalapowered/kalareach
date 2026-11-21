@@ -3369,11 +3369,7 @@ pub(crate) mod tests {
         let committed = owner.commit_visit(&new, Found::Lost);
         assert!(matches!(committed.value, Committed::Rejected(None)));
         drop(committed);
-        assert_eq!(
-            rows(&owner, 5)[0].read.is_none(),
-            true,
-            "nothing was written"
-        );
+        assert!(rows(&owner, 5)[0].read.is_none(), "nothing was written");
         let fresh = begun(&owner, &a);
         assert!(matches!(
             owner.commit_visit(&fresh, Found::Lost).value,
@@ -3440,7 +3436,7 @@ pub(crate) mod tests {
         // The generation: the host was forgotten and paired again.
         let ticket = mismatch(&owner);
         drop(owner.forget(host(5), "forgotten"));
-        drop(begun(&owner, &a));
+        let _ = begun(&owner, &a);
         assert!(matches!(
             owner.replace(&ticket, &again, owner.fence()).value,
             Admit::Stale
