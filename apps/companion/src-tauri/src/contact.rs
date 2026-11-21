@@ -522,6 +522,7 @@ impl State {
                 reason: self.reason.clone(),
                 rights: None,
                 paired: false,
+                organisation: false,
                 replaced: self.replaced,
             },
         };

@@ -1214,6 +1214,23 @@ async fn kr_req_23_41_a_text_with_no_kept_draft_is_refused_in_words() {
 
 // ---- the fix round: what a read of the first build found ------------------------------------------
 
+/// KR-REQ-13.12: the connection state the page reads says that a host this device is paired with
+/// under a grant that answers to no organisation is not one that does, so the page leaves the
+/// device's uploads and drafts alone when the account changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_connection_to_a_host_with_no_organisation_says_so_to_the_page() {
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    connected(&phone.companion).await;
+    let state = phone
+        .companion
+        .call("connection_state", json!({}))
+        .expect("the connection's state");
+    assert_eq!(state["paired"], true, "{state}");
+    assert_eq!(state["organisation"], false, "{state}");
+    adopted.stop().await;
+}
+
 /// Waits for the phone to be connected.
 async fn connected(companion: &Companion) {
     tokio::time::timeout(WATCHDOG, async {
