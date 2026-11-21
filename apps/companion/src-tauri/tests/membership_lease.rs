@@ -1940,7 +1940,7 @@ struct Found {
     row: HostInbox,
     state: HostInboxState,
     refusal: Option<companion_tauri::error::CommandError>,
-    lost_since_ms: Option<u64>,
+    since_ms: Option<u64>,
 }
 
 impl Found {
@@ -1950,7 +1950,7 @@ impl Found {
             row,
             state: seen.state,
             refusal: seen.refusal,
-            lost_since_ms: seen.lost_since_ms,
+            since_ms: seen.since_ms,
         }
     }
 }
@@ -2165,7 +2165,7 @@ async fn a_visit_that_cannot_get_a_lease_says_why_and_is_not_out_of_contact() {
 
     let row = rig.inbox_of(&Arc::new(InboxDesk::default())).await;
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
-    assert_eq!(row.lost_since_ms, None);
+    assert_eq!(row.since_ms, None);
     let said = row.refusal.expect("the reason").message;
     assert!(said.contains("sign in"), "{said}");
 }

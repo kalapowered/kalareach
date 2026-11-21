@@ -100,19 +100,19 @@ pub(crate) fn target_of(host: &PairedHost) -> Target {
 /// leaves the connection.
 ///
 /// A local action. It reaches no host, so it works for one that no longer answers, among them one
-/// that revoked this computer. When `host` is the one in use its connection ends and none is in
-/// use until the person chooses another; any other host's connection is left as it is. What the
-/// push desk keeps of the host goes with it, and the owner has let go of what it held of the host. The device's one endpoint then forgets
-/// the host: its address lookups and the relays that no other host names. That is the last step,
-/// and it runs to its end in a task of its own, so a command that stops waiting for it, or an
-/// application that ends in it, leaves nothing else of the forgetting undone, and the host is not
-/// left in the endpoint. The only thing that waits for the endpoint is the command's return. The
-/// endpoint's forget waits for the introduction of its own host, if a visit or a look is making
-/// one, and for the device lock and the transport's turn at the relay map, which all hosts share.
-/// It then takes the host out, so a visit or a look that began before the forget does not put
-/// the host back, and one that reaches the endpoint after it is refused. When that takes long the
-/// host is already gone from the list and the connection event has been sent: only the command's
-/// answer is late.
+/// that revoked this computer. When `host` is the one in use its connection ends and none is in use
+/// until the person chooses another; any other host's connection is left as it is. What the push
+/// desk keeps of the host goes with it, and the owner has let go of what it held of the host. The
+/// device's one endpoint then forgets the host: its address lookups and the relays that no other
+/// host names. That is the last step, and it runs to its end in a task of its own, so a command
+/// that stops waiting for it, or an application that ends in it, leaves nothing else of the
+/// forgetting undone, and the host is not left in the endpoint. The only thing that waits for the
+/// endpoint is the command's return. The endpoint's forget waits for the introduction of its own
+/// host, if a visit or a look is making one, and for the device lock and the transport's turn at
+/// the relay map, which all hosts share. It then takes the host out, so a visit or a look that
+/// began before the forget does not put the host back, and one that reaches the endpoint after it
+/// is refused. When that takes long the host is already gone from the list and the connection event
+/// has been sent: only the command's answer is late.
 ///
 /// # Errors
 ///

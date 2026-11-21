@@ -649,7 +649,7 @@ pub mod testing {
         /// What the visit asked when the host refused, when it did.
         pub refused_request: Option<Asked>,
         /// Since when this device has not been in contact with the host, when it has not.
-        pub lost_since_ms: Option<u64>,
+        pub since_ms: Option<u64>,
     }
 
     /// A pass held after it listed the hosts and before it began a visit to any of them, until it is
@@ -854,19 +854,19 @@ pub mod testing {
                     state: HostInboxState::Read,
                     refusal: None,
                     refused_request: None,
-                    lost_since_ms: None,
+                    since_ms: None,
                 },
                 Some(HostContact::Refused { refusal, request }) => Seen {
                     state: HostInboxState::Refused,
                     refusal: Some(refusal),
                     refused_request: Some(request),
-                    lost_since_ms: None,
+                    since_ms: None,
                 },
                 Some(HostContact::OutOfContact { since_ms, .. }) => Seen {
                     state: HostInboxState::OutOfContact,
                     refusal: None,
                     refused_request: None,
-                    lost_since_ms: Some(since_ms),
+                    since_ms: Some(since_ms),
                 },
                 other => {
                     panic!("a host a pass answered for holds an outcome a case knows: {other:?}")
