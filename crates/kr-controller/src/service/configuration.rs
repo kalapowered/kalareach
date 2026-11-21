@@ -548,7 +548,24 @@ impl Controller {
         Ok(())
     }
 
-    /// Applies one validated configuration edit and does what the change owes.
+    /// Applies one validated configuration edit made under no admission, as a test makes it: the
+    /// write of [`Self::apply_configuration_standing`] always stands.
+    ///
+    /// # Errors
+    ///
+    /// As `apply_configuration_standing`, without an admission's refusal.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn apply_configuration(
+        self: &Arc<Self>,
+        change: &kr_protocol::hostinfo::configuration::Change,
+    ) -> Result<crate::config::Applied> {
+        self.apply_configuration_standing(change, &|write| write())
+            .await
+    }
+
+    /// Applies one validated configuration edit made under an admission and does what the change
+    /// owes: `standing` runs the write once everything the change waited for is behind it, and
+    /// refuses it when the admission no longer stands ([`crate::config::apply_standing`]).
     ///
     /// A change that affects authority fences dispatch *before* this returns, which is section
     /// 26's "changes affecting authority fence dispatch before acknowledgement": the caller is
@@ -559,23 +576,8 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the edit is refused, when an effect could not be applied, or when a
-    /// worker has not yet acknowledged the fence the change raised.
-    pub async fn apply_configuration(
-        self: &Arc<Self>,
-        change: &kr_protocol::hostinfo::configuration::Change,
-    ) -> Result<crate::config::Applied> {
-        self.apply_configuration_standing(change, &|write| write())
-            .await
-    }
-
-    /// [`Self::apply_configuration`] for a change made under an admission: `standing` runs the
-    /// write once everything the change waited for is behind it, and refuses it when the
-    /// admission no longer stands ([`crate::config::apply_standing`]).
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::apply_configuration`], and the admission's refusal, in which case nothing was
-    /// written.
+    /// worker has not yet acknowledged the fence the change raised, and the admission's refusal,
+    /// in which case nothing was written.
     pub(crate) async fn apply_configuration_standing(
         self: &Arc<Self>,
         change: &kr_protocol::hostinfo::configuration::Change,

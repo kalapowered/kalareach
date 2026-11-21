@@ -80,6 +80,7 @@ struct Daemon {
 
 impl Daemon {
     /// A handle bound to `daemon` from the start.
+    #[cfg(any(test, feature = "testing"))]
     fn bound_to(daemon: &Arc<Controller>) -> Self {
         let handle = Self::default();
         let _ = handle.bound.set(Arc::downgrade(daemon));
@@ -224,6 +225,7 @@ pub struct HostGrants {
 
 impl HostGrants {
     /// Reads grants from `daemon`'s own stores and decides them under its own model.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn for_daemon(daemon: &Arc<Controller>) -> Self {
         Self {

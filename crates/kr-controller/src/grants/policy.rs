@@ -941,6 +941,7 @@ impl HostPolicy {
     }
 
     /// The highest authority revision this host has ever accepted.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub const fn accepted_floor(&self) -> AuthorityRevision {
         self.accepted_floor
