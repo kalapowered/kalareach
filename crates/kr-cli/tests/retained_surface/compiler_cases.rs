@@ -570,9 +570,9 @@ fn the_canary_and_the_count_of_stamped_items_show_that_the_stamp_took() {
             .map(|config| (config.name, 0, true))
             .collect::<Vec<_>>()
     );
-    // A protocol crate whose `methods!` text holds a wire name that its transcriber does not use (the
-    // variant is not in the list, the name is in a constant): nothing reports the name, so the canary
-    // says so.
+    // A protocol crate whose `methods!` list lacks a variant that a constant in the same file still
+    // quotes by its wire name: the canary reads the whole file that holds `macro_rules! methods`, and
+    // nothing reports the name, so it says so.
     let root = tempfile::tempdir().expect("a folder");
     write(
         root.path(),

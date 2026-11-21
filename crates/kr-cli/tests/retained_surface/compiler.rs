@@ -1052,9 +1052,10 @@ fn mark_test_only(reports: &mut Vec<Report>) {
     reports.dedup_by(|later, earlier| key(later) == key(earlier));
 }
 
-/// The wire names the tree's `methods!` holds that `kr_protocol` reports: its own transcriber uses
-/// each variant, and the compiler must say so. A name it does not report is a stamp that did not
-/// take, and nothing a client reports is then to be trusted.
+/// The wire names that the file holding `macro_rules! methods` quotes and `kr_protocol` must report:
+/// its own transcriber uses each variant, and the compiler must say so. The whole file is read, so a
+/// name quoted anywhere in it counts. A name it does not report is a stamp that did not take, and
+/// nothing a client reports is then to be trusted.
 fn canary(root: &Path, reports: &[Report]) -> Result<usize, String> {
     let source = root.join("crates/kr-protocol/src");
     let method = file_holding(&source, "macro_rules! methods")?;
