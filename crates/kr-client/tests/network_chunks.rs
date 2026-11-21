@@ -1065,8 +1065,7 @@ async fn the_journal_is_told_before_each_call_that_needs_it_and_a_refusal_stops_
             &journal,
         ))
         .await
-        .err()
-        .expect("the send stops");
+        .expect_err("the send stops");
         assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{step}");
         fresh.script.seen(|seen| {
             assert_eq!((seen.begins, seen.finishes), (begins, finishes), "{step}");
