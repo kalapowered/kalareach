@@ -11062,8 +11062,7 @@ fn enrolment_over(root: Vec<u8>, generation: &Generation) -> CatalogueResult<Enr
 
 /// A root that gives two roles one key lets whoever holds it act for both, so the host does not
 /// adopt it, and says which roles and what to do. A root that gives each role a key of its own is
-/// adopted. The same holds for a role that names one key under two identifiers, which counts it
-/// twice toward its threshold.
+/// adopted. The same holds for a role that names one key under two identifiers.
 #[tokio::test]
 async fn kr_req_26_40_a_root_that_gives_two_roles_one_key_is_not_adopted() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -11117,6 +11116,8 @@ async fn kr_req_26_40_a_root_that_gives_two_roles_one_key_is_not_adopted() {
         text.contains("two identifiers") && text.contains("targets"),
         "{text}"
     );
+    // Two identifiers are not two signatures, and the root is refused before one is counted.
+    assert!(!text.contains("counts it twice"), "{text}");
 }
 
 /// A rotation to a root that gives two roles one key is refused before the root is kept: the
