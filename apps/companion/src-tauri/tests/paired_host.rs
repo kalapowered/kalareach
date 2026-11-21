@@ -3098,6 +3098,21 @@ async fn until_told(companion: &Companion, reference: &str, state: &str) -> serd
     })
 }
 
+/// Waits until the last state the page was told has the host `reference` names in use.
+async fn until_last_told_host(companion: &Companion, reference: &str) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while companion
+            .told_connection()
+            .last()
+            .is_none_or(|state| state["host"]["reference"] != reference)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the page is told of the host chosen last");
+}
+
 /// Waits for the visit to `host` to reach its hold, and lets every other visit that reaches it go on.
 async fn visit_held(
     visits: &mut tokio::sync::mpsc::UnboundedReceiver<companion_tauri::inbox::testing::VisitHold>,
@@ -3189,7 +3204,10 @@ async fn a_refusal_then_a_recovery_of_one_host_is_told_in_order_while_c_is_slow(
     v.control.release_dialled();
     first.await.expect("the first ran").expect("answered");
     second.await.expect("the second ran").expect("answered");
-    let told = told_other(v.companion(), &v.a_ref);
+    // Every state C's contact makes carries A's entry too: A's changes are the entries that differ
+    // from the one before.
+    let mut told = told_other(v.companion(), &v.a_ref);
+    told.dedup_by(|later, earlier| later["contact"] == earlier["contact"]);
     let states: Vec<&str> = told
         .iter()
         .filter_map(|other| other["contact"]["state"].as_str())
@@ -3334,11 +3352,13 @@ async fn an_answered_visit_without_a_complete_inbox_ends_a_loss_and_adds_no_resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failure_is_stamped_when_the_visit_completed() {
     let v = visiting().await;
-    v.control.lose_the_answer_to(Some(Method::AttentionRead));
+    let _arrivals = v.control.hold_dialled(v.a.network().endpoint_id());
     let before = now_ms();
     v.pass().await.expect("ran").expect("answered");
     let after = now_ms();
+    v.control.release_dialled();
     let lost = contact_of(v.companion(), &v.a_ref);
+    assert_eq!(lost["state"], "out_of_contact", "{lost}");
     let since = lost["since_ms"].as_u64().expect("since when");
     assert!(
         since >= before + 9_000 && since <= after,
@@ -3504,8 +3524,8 @@ async fn a_visitor_queued_across_a_forget_takes_no_connection_and_makes_no_recor
         .call("hosts_forget", json!({ "reference": v.a_ref }))
         .expect("A is forgotten");
     hold.release();
-    first.await.expect("ran").expect("answered");
     drop(visits);
+    first.await.expect("ran").expect("answered");
     queued.await.expect("ran").expect("answered");
     assert_eq!(
         v.control.asked_of(&endpoint),
@@ -3588,7 +3608,7 @@ async fn a_host_left_behind_keeps_its_loss_and_start() {
     let leaving = v
         .companion()
         .start_call("hosts_use", json!({ "reference": first_ref }));
-    v.companion().told_host(&first_ref).await;
+    until_last_told_host(v.companion(), &first_ref).await;
     let kept = contact_of(v.companion(), &v.a_ref);
     assert_eq!(kept["state"], "out_of_contact", "{kept}");
     assert_eq!(kept["since_ms"].as_u64(), Some(since), "{kept}");
@@ -3626,7 +3646,10 @@ async fn a_loss_after_a_restore_is_a_new_record() {
     v.pass().await.expect("ran").expect("answered");
     assert_eq!(contact_of(v.companion(), &v.a_ref)["state"], "in_contact");
     tokio::time::sleep(Duration::from_millis(50)).await;
+    // The restoring visit kept its connection, so the second loss is one of the answer to the read
+    // over it, and of the fresh connection that follows.
     v.control.end_connections(true);
+    v.control.lose_the_answer_to(Some(Method::AttentionRead));
     v.pass().await.expect("ran").expect("answered");
     let second = contact_of(v.companion(), &v.a_ref)["since_ms"]
         .as_u64()
