@@ -14,12 +14,21 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
+use kr_cli::cli::EnvironmentSelector;
+use kr_cli::daemon::Daemon;
+use kr_cli::error::CliError;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::BuildId;
+use kr_protocol::launch_commands::{
+    NamedLaunch, ShellLaunchCommandsListParams, ShellLaunchCommandsListResult,
+    ShellLaunchCommandsSaveParams,
+};
+use kr_protocol::method::Method;
 use serde_json::Value;
 
 mod support;
@@ -821,4 +830,48 @@ async fn a_reply_lost_after_the_host_saved_the_change_is_an_unconfirmed_outcome_
         Vec::<String>::new(),
         "the removal was saved"
     );
+}
+
+/// KR-REQ-13.11: an answer of the host that `kr` cannot read leaves the outcome unconfirmed, as a
+/// lost answer does: the host saved the change, and `kr` has only not read what it answered. The
+/// write is called as `kr launch add` calls it, for a result type that the host's answer does not
+/// decode into, and the failure is the host's own `OUTCOME_UNKNOWN`, which `kr` tells in the one
+/// sentence for it and exits 8 with, as in the case for a lost answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_kr_cannot_read_after_the_host_saved_the_change_is_an_unconfirmed_outcome() {
+    let host = Host::start().await;
+    let mut daemon = Daemon::open(
+        host.temp.paths(),
+        &EnvironmentSelector { environment: None },
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the daemon is reached"));
+    let listed: ShellLaunchCommandsListResult = daemon
+        .read(
+            Method::ShellLaunchCommandsList,
+            &ShellLaunchCommandsListParams {},
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the list is read"));
+    let saved: Result<ShellLaunchCommandsSaveParams, CliError> = daemon
+        .mutate_unconfirmable(
+            Method::ShellLaunchCommandsSave,
+            &ShellLaunchCommandsSaveParams {
+                expected_revision: listed.revision,
+                command: NamedLaunch {
+                    label: "Claude".to_owned(),
+                    program: "claude".to_owned(),
+                    arguments: Vec::new(),
+                },
+            },
+        )
+        .await;
+    match saved {
+        Err(CliError::Refused(refused)) => {
+            assert_eq!(refused.code, ErrorCode::OutcomeUnknown);
+        }
+        Ok(_) => panic!("the host's answer was read as a type it is not"),
+        Err(_) => panic!("an answer that cannot be read was not the unknown outcome"),
+    }
+    assert_eq!(labels(&host.listed()), ["Claude"], "the change was saved");
 }
