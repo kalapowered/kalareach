@@ -166,9 +166,10 @@ windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "W
 
 # The workspace forbids unsafe code, which a crate that calls the console API cannot honour. This
 # package denies it instead. Two product modules relax the rule: `platform`, and `windows::records`,
-# which reads the console's input records on Windows. One unit-test helper,
-# `shell::tests::question_table`, relaxes it for the process that it runs in. Nothing else in the
-# library does, and each integration program under `tests/` that does gives its own reason.
+# which reads the console's input records on Windows. Two unit-test helpers,
+# `shell::tests::question_table` and the Windows interrupt cases' helper that sends Ctrl-Break to its
+# own console, relax it for the process that they run in. Nothing else in the library does, and
+# each integration program under `tests/` that does gives its own reason.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

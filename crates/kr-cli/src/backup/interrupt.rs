@@ -151,6 +151,10 @@ pub fn stopped() -> CliError {
 
 #[cfg(all(test, windows))]
 mod tests {
+    use std::os::windows::process::CommandExt as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+
     use super::*;
 
     /// The process still holds a receiver for Ctrl-C and for Ctrl-Break after the interrupt that
@@ -168,5 +172,103 @@ mod tests {
             kept.is_some(),
             "a receiver for each of Ctrl-C and Ctrl-Break is held after the command's own are dropped"
         );
+    }
+
+    /// The variable that makes the helper below run: `armed` arms an interrupt and drops it,
+    /// `plain` does neither.
+    const CHILD: &str = "KR_TEST_INTERRUPT_CHILD";
+    /// How the system's default handler ends a process that has no handler of its own for the event.
+    const STATUS_CONTROL_C_EXIT: i32 = i32::from_ne_bytes(0xC000_013A_u32.to_ne_bytes());
+    /// The code the helper ends with when the system would not send the event.
+    const NOT_SENT: i32 = 42;
+
+    /// A Ctrl-Break that comes after the command let go of its interrupt does not end the process:
+    /// the helper arms an interrupt, drops it, and sends Ctrl-Break to its own console. It runs as
+    /// a program of its own with a console of its own, since the event ends the process that has
+    /// no handler for it. The case needs only the exit code: 0 when the event was taken.
+    #[test]
+    fn a_ctrl_break_after_the_command_let_go_of_its_interrupt_does_not_end_the_process() {
+        assert_the_event_ends_a_process_that_has_no_handler(run_the_helper("plain"));
+        assert_eq!(
+            run_the_helper("armed"),
+            Some(0),
+            "a Ctrl-Break after the interrupt was dropped ended the process by the default handler"
+        );
+    }
+
+    /// The case's condition, asserted in a helper so that a run that cannot make it reads as a
+    /// set-up fault and never as the kill of the mutation the case is named for: the event reaches
+    /// a program that has no handler, and ends it as the default handler does.
+    fn assert_the_event_ends_a_process_that_has_no_handler(code: Option<i32>) {
+        assert_eq!(
+            code,
+            Some(STATUS_CONTROL_C_EXIT),
+            "this case could not make its condition: a program with no handler for Ctrl-Break was \
+             not ended by it, so the event does not reach a program on a console of its own here"
+        );
+    }
+
+    /// Runs the helper below in `mode` as a program with its own console, and gives its exit code.
+    /// A helper that could not send the event fails here, in words.
+    fn run_the_helper(mode: &str) -> Option<i32> {
+        let me = std::env::current_exe().expect("this test program has a path");
+        let status = std::process::Command::new(me)
+            .args([
+                "--exact",
+                "backup::interrupt::tests::the_program_that_is_sent_ctrl_break_after_it_lets_go",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE)
+            .status()
+            .expect("starts the helper");
+        assert_ne!(
+            status.code(),
+            Some(NOT_SENT),
+            "this case could not make its condition: the system would not send Ctrl-Break to the \
+             helper's console"
+        );
+        status.code()
+    }
+
+    /// The helper of the case above. It does nothing in an ordinary run.
+    #[test]
+    fn the_program_that_is_sent_ctrl_break_after_it_lets_go() {
+        let Some(mode) = std::env::var_os(CHILD) else {
+            return;
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let _entered = runtime.enter();
+        if mode == "armed" {
+            let mut interrupt = Interrupt::install().expect("the interrupt is installed");
+            interrupt.arm().expect("the interrupt is armed");
+            drop(interrupt);
+        }
+        if !send_ctrl_break_to_this_console() {
+            std::process::exit(NOT_SENT);
+        }
+        // A process that has no handler is ended within this time, and one that took the event
+        // goes on and ends with the code of an ordinary run.
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    /// Sends Ctrl-Break to every program on this process's console, which is its own.
+    #[expect(
+        unsafe_code,
+        reason = "a console event has no safe interface in the standard library"
+    )]
+    fn send_ctrl_break_to_this_console() -> bool {
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+
+        // SAFETY: the call takes the event and a process group, zero meaning every process on this
+        // console, and touches no memory of this program.
+        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) != 0 }
     }
 }
