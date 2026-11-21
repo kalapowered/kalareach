@@ -279,6 +279,41 @@ describe('when the saved launch commands are read', () => {
     expect(result.current.list).toEqual(LISTED(['Claude']))
   })
 
+  it('a_list_read_in_flight_is_answered_after_a_wake_started_a_surface_read', async () => {
+    const surface = held<LaunchSurfaceReading>()
+    const list = held<LaunchCommandsReading>()
+    const { result, options } = run(surface.read, { wake: 0, readList: list.read })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    await surface.answer(SURFACE)
+
+    // Output wakes the surface's read while the list read is still out; the list's answer is shown.
+    for (let wake = 1; wake <= 3; wake += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300)
+      })
+      options({ wake, readList: list.read })
+      await surface.answer(SURFACE)
+    }
+    expect(list.started()).toBe(1)
+    await list.answer(LISTED(['Claude']))
+    expect(result.current.list).toEqual(LISTED(['Claude']))
+  })
+
+  it('a_surface_read_in_flight_is_answered_after_the_list_read_began', async () => {
+    const surface = held<LaunchSurfaceReading>()
+    const list = held<LaunchCommandsReading>()
+    const { result } = run(surface.read, { wake: 0, readList: list.read })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    // The list read began after the surface read, which is still out.
+    expect([surface.started(), list.started()]).toEqual([1, 1])
+    await surface.answer(SURFACE)
+    expect(result.current.reading).toEqual(SURFACE)
+  })
+
   it('a_host_that_does_not_serve_the_list_is_asked_no_more_and_nothing_is_said', async () => {
     const surface = held<LaunchSurfaceReading>()
     const list = held<LaunchCommandsReading>()
