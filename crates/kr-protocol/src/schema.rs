@@ -142,6 +142,11 @@ use crate::invitation::{
     PairCancelParams, PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult,
     PairingSecurityEvent, RendezvousMessage,
 };
+use crate::launch_commands::{
+    NamedLaunch, ShellLaunchCommandsListParams, ShellLaunchCommandsListResult,
+    ShellLaunchCommandsRemoveParams, ShellLaunchCommandsRemoveResult,
+    ShellLaunchCommandsSaveParams, ShellLaunchCommandsSaveResult,
+};
 use crate::local::{
     ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalHello, LocalHelloAck,
 };
@@ -489,6 +494,7 @@ pub fn protocol_schema() -> Value {
         "invitation_preview" => InvitationPreview,
         "live_screen_preview" => LiveScreenPreview,
         "named_approval_preview" => NamedApprovalPreview,
+        "named_launch" => NamedLaunch,
         "named_question_preview" => NamedQuestionPreview,
         "offer_key" => OfferKey,
         "offline_validity_policy" => OfflineValidityPolicy,
@@ -641,6 +647,12 @@ pub fn protocol_schema() -> Value {
         "session_screen_preview_params" => SessionScreenPreviewParams,
         "session_screen_preview_result" => SessionScreenPreviewResult,
         "session_summary" => SessionSummary,
+        "shell_launch_commands_list_params" => ShellLaunchCommandsListParams,
+        "shell_launch_commands_list_result" => ShellLaunchCommandsListResult,
+        "shell_launch_commands_remove_params" => ShellLaunchCommandsRemoveParams,
+        "shell_launch_commands_remove_result" => ShellLaunchCommandsRemoveResult,
+        "shell_launch_commands_save_params" => ShellLaunchCommandsSaveParams,
+        "shell_launch_commands_save_result" => ShellLaunchCommandsSaveResult,
         "shell_launch_params" => ShellLaunchParams,
         "shell_launch_result" => ShellLaunchResult,
         "shell_launch_surface_params" => ShellLaunchSurfaceParams,

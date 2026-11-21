@@ -129,8 +129,8 @@ pub enum ResultContent {
     /// A result an application source reads about its own question or alert. Only the local caller
     /// that created it is shown it.
     Source,
-    /// A result that quotes questions, approvals, a session's description or the text of a share's
-    /// preview, which this table shows to the owner alone. A device that delegated a share is
+    /// A result that quotes questions, approvals, a session's description, the text of a share's
+    /// preview or the saved launch commands, which this table shows to the owner alone. A device that delegated a share is
     /// answered its own delegation by the control daemon, from the record it keeps of the action,
     /// and reads none of it back through the worker.
     Owner,
@@ -185,7 +185,10 @@ pub const fn result_content(method: Method) -> ResultContent {
         Method::SessionCreate | Method::SessionRename => SessionMetadata,
         Method::SessionClose => SessionDescription,
         Method::QuestionCreate | Method::QuestionCancelOwn | Method::AlertCreate => Source,
-        Method::GrantCreate | Method::VoiceDelegate => Owner,
+        Method::GrantCreate
+        | Method::VoiceDelegate
+        | Method::ShellLaunchCommandsSave
+        | Method::ShellLaunchCommandsRemove => Owner,
         Method::EnvironmentEnrol
         | Method::EnvironmentForget
         | Method::EnvironmentRefresh

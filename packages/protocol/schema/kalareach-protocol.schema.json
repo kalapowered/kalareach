@@ -23143,6 +23143,21 @@
           "type": "string"
         },
         {
+          "const": "shell.launch.commands.list",
+          "description": "The launch commands saved on this host, in the order they were first saved, and the revision of the list. A paired device that may manage the host reads the exact command lines, which can hold a secret.",
+          "type": "string"
+        },
+        {
+          "const": "shell.launch.commands.save",
+          "description": "Save a launch command, or put it in place of the command with the same label. A request decided against a revision the list has left writes nothing and is answered with the list as it stands. The host refuses a command that breaks its rules. Only the local caller saves.",
+          "type": "string"
+        },
+        {
+          "const": "shell.launch.commands.remove",
+          "description": "Remove the launch command with a label. A request decided against a revision the list has left writes nothing and is answered with the list as it stands. Only the local caller removes.",
+          "type": "string"
+        },
+        {
           "const": "agent.capabilities",
           "description": "What the bound agent can currently do, with its capability evidence.",
           "type": "string"
@@ -24032,6 +24047,33 @@
         "resource_id",
         "summary",
         "created_at_ms"
+      ],
+      "type": "object"
+    },
+    "NamedLaunch": {
+      "additionalProperties": false,
+      "description": "One saved launch command: the label a button shows, the program, and the arguments as the\nperson wrote them. An argument may be empty. The host refuses a control, format, invisible or\nline-break character in any of the three fields.",
+      "properties": {
+        "arguments": {
+          "description": "The arguments, at most 16 of at most 512 bytes each; the whole command is at most 3,072\nbytes.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "label": {
+          "description": "What the button shows: 1 to 48 characters once trimmed, unique on this host when compared\nin lower case.",
+          "type": "string"
+        },
+        "program": {
+          "description": "The program: 1 to 512 bytes, a full path or a program on the shell's path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "program",
+        "arguments"
       ],
       "type": "object"
     },
@@ -38558,6 +38600,140 @@
       ],
       "type": "object"
     },
+    "ShellLaunchCommandsListParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `shell.launch.commands.list`. There are none.",
+      "type": "object"
+    },
+    "ShellLaunchCommandsListResult": {
+      "description": "The result of `shell.launch.commands.list`: the commands the host holds, in the order they\nwere first saved, and the revision of the list.\n\nThis is the only launch-command type that carries read-only metadata, so a later release may\nadd an optional member to it without a change of level.",
+      "properties": {
+        "commands": {
+          "description": "The saved commands.",
+          "items": {
+            "$ref": "#/$defs/NamedLaunch"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of the list; 0 when the host has saved no command."
+        }
+      },
+      "required": [
+        "revision",
+        "commands"
+      ],
+      "type": "object",
+      "x-kalareach-read-only-metadata": true
+    },
+    "ShellLaunchCommandsRemoveParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `shell.launch.commands.remove`.",
+      "properties": {
+        "expected_revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of the list this removal was decided from."
+        },
+        "label": {
+          "description": "The label to remove, compared in lower case.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_revision",
+        "label"
+      ],
+      "type": "object"
+    },
+    "ShellLaunchCommandsRemoveResult": {
+      "additionalProperties": false,
+      "description": "The result of `shell.launch.commands.remove`.",
+      "properties": {
+        "applied": {
+          "description": "Whether the removal was decided against the current revision. False means the list changed\nfirst: nothing was written and `commands` is the list as it stands.",
+          "type": "boolean"
+        },
+        "commands": {
+          "description": "The list after the request.",
+          "items": {
+            "$ref": "#/$defs/NamedLaunch"
+          },
+          "type": "array"
+        },
+        "removed": {
+          "description": "Whether a command was removed. False when no saved command has that label.",
+          "type": "boolean"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of the list after the request."
+        }
+      },
+      "required": [
+        "applied",
+        "removed",
+        "revision",
+        "commands"
+      ],
+      "type": "object"
+    },
+    "ShellLaunchCommandsSaveParams": {
+      "additionalProperties": false,
+      "description": "The parameters of `shell.launch.commands.save`.",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/NamedLaunch",
+          "description": "The command to add, or to put in place of the command with the same label."
+        },
+        "expected_revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of the list this save was decided from."
+        }
+      },
+      "required": [
+        "expected_revision",
+        "command"
+      ],
+      "type": "object"
+    },
+    "ShellLaunchCommandsSaveResult": {
+      "additionalProperties": false,
+      "description": "The result of `shell.launch.commands.save`.",
+      "properties": {
+        "applied": {
+          "description": "Whether the save was decided against the current revision. False means the list changed\nfirst: nothing was written and `commands` is the list as it stands.",
+          "type": "boolean"
+        },
+        "changed": {
+          "description": "Whether the list changed. False when it already held this command as written.",
+          "type": "boolean"
+        },
+        "commands": {
+          "description": "The list after the request.",
+          "items": {
+            "$ref": "#/$defs/NamedLaunch"
+          },
+          "type": "array"
+        },
+        "replaced": {
+          "description": "Whether the command took the place of a saved command with the same label.",
+          "type": "boolean"
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "The revision of the list after the request."
+        }
+      },
+      "required": [
+        "applied",
+        "changed",
+        "replaced",
+        "revision",
+        "commands"
+      ],
+      "type": "object"
+    },
     "ShellLaunchParams": {
       "additionalProperties": false,
       "description": "Parameters of `shell.launch`.",
@@ -45504,6 +45680,9 @@
     "named_approval_preview": {
       "$ref": "#/$defs/NamedApprovalPreview"
     },
+    "named_launch": {
+      "$ref": "#/$defs/NamedLaunch"
+    },
     "named_question_preview": {
       "$ref": "#/$defs/NamedQuestionPreview"
     },
@@ -46172,6 +46351,24 @@
     },
     "shell_command_params": {
       "$ref": "#/$defs/ShellCommandParams"
+    },
+    "shell_launch_commands_list_params": {
+      "$ref": "#/$defs/ShellLaunchCommandsListParams"
+    },
+    "shell_launch_commands_list_result": {
+      "$ref": "#/$defs/ShellLaunchCommandsListResult"
+    },
+    "shell_launch_commands_remove_params": {
+      "$ref": "#/$defs/ShellLaunchCommandsRemoveParams"
+    },
+    "shell_launch_commands_remove_result": {
+      "$ref": "#/$defs/ShellLaunchCommandsRemoveResult"
+    },
+    "shell_launch_commands_save_params": {
+      "$ref": "#/$defs/ShellLaunchCommandsSaveParams"
+    },
+    "shell_launch_commands_save_result": {
+      "$ref": "#/$defs/ShellLaunchCommandsSaveResult"
     },
     "shell_launch_params": {
       "$ref": "#/$defs/ShellLaunchParams"

@@ -322,6 +322,16 @@ fn params_for_a_route(
         Method::HostPolicyConfirm => {
             Some(ParamsValue::from_typed(&HostPolicyConfirmParams {}).expect("encodes"))
         }
+        // A removal of a label no command has: it changes nothing, so the walk can send it.
+        Method::ShellLaunchCommandsRemove => Some(
+            ParamsValue::from_typed(
+                &kr_protocol::launch_commands::ShellLaunchCommandsRemoveParams {
+                    expected_revision: kr_protocol::scalars::U64::ZERO,
+                    label: "no such command".to_owned(),
+                },
+            )
+            .expect("encodes"),
+        ),
         // The request for the launch alone: it stops nothing, so the walk can send it.
         Method::HostStop => Some(
             ParamsValue::from_typed(&kr_protocol::update::HostStopParams { launch_only: true })
@@ -394,6 +404,7 @@ const WITHOUT_A_FIXTURE: &[Method] = &[
     Method::AgentToolsRemove,
     Method::SessionCreate,
     Method::SessionRename,
+    Method::ShellLaunchCommandsSave,
     Method::AgentPromptSubmit,
     Method::AgentPromptQueue,
     Method::DraftUpdate,

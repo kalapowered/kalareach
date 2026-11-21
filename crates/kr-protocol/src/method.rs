@@ -1216,6 +1216,33 @@ methods! {
           asking connection stands to the session's input, the shell's name, and the agents the \
           host has a package for.";
 
+    ShellLaunchCommandsList = "shell.launch.commands.list", ShellLaunch,
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY,
+    freshness: CurrentAuthority, confirmation: None, idempotency: READ,
+    doc: "The launch commands saved on this host, in the order they were first saved, and the \
+          revision of the list. A paired device that may manage the host reads the exact command \
+          lines, which can hold a secret.";
+
+    ShellLaunchCommandsSave = "shell.launch.commands.save", ShellLaunch,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow, confirmation: None,
+    idempotency: compare_and_swap("the revision of the saved launch commands the request was \
+                                   decided from"),
+    doc: "Save a launch command, or put it in place of the command with the same label. A request \
+          decided against a revision the list has left writes nothing and is answered with the \
+          list as it stands. The host refuses a command that breaks its rules. Only the local \
+          caller saves.";
+
+    ShellLaunchCommandsRemove = "shell.launch.commands.remove", ShellLaunch,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow, confirmation: None,
+    idempotency: compare_and_swap("the revision of the saved launch commands the request was \
+                                   decided from"),
+    doc: "Remove the launch command with a label. A request decided against a revision the list \
+          has left writes nothing and is answered with the list as it stands. Only the local \
+          caller removes.";
+
     // ----- Agent state ----------------------------------------------------------------------
     AgentCapabilities = "agent.capabilities", AgentState,
     effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
@@ -2171,6 +2198,9 @@ mod tests {
         ("input.interrupt", &[ActionRight::TerminalInput]),
         ("input.write", &[ActionRight::TerminalInput]),
         ("shell.launch", &[ActionRight::TerminalInput]),
+        ("shell.launch.commands.list", &[ActionRight::HostManage]),
+        ("shell.launch.commands.save", &[ActionRight::HostManage]),
+        ("shell.launch.commands.remove", &[ActionRight::HostManage]),
         // Attachments. Transfer and palette each need their own explicit right; observation needs
         // only the view.
         (

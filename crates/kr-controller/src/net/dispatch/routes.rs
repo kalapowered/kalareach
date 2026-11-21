@@ -144,6 +144,7 @@ impl DeviceRead {
             | Method::HostDoctor
             | Method::DeviceList
             | Method::OrganisationList
+            | Method::ShellLaunchCommandsList
             | Method::PrivacyStatus
             | Method::DescriptionSetup => Self::Daemon,
             Method::ProjectList
