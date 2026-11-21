@@ -832,7 +832,7 @@ fn a_failed_scan_is_a_text_of_its_own() {
     world.current.sightings = Err("boom".to_owned());
     assert_eq!(
         world.own(),
-        vec![said("the scan of this checkout failed: boom")]
+        vec![said("the reading of this checkout failed: boom")]
     );
 }
 
