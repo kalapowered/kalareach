@@ -1634,7 +1634,7 @@ const LIST: &[Listed] = &[
                 1,
             ),
             (
-                "The command does not give what the report gives the step: `KR_TEST_ARTIFACTS_DIR`, the runner, and",
+                "The command does not give what the report gives the step: `KR_TEST_ARTIFACTS_DIR`,",
                 1,
             ),
             (
