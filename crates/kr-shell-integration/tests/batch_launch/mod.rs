@@ -361,7 +361,7 @@ fn program_word(launch: &Launched) -> Option<String> {
 }
 
 /// `text` as the inside of a PowerShell word in single quotes: an apostrophe is written doubled.
-fn single_quoted(text: &str) -> String {
+pub fn single_quoted(text: &str) -> String {
     text.replace('\'', "''")
 }
 
