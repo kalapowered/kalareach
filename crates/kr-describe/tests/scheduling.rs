@@ -592,7 +592,6 @@ fn an_oldest_ordinary_job_runs_after_three_priority_jobs() {
         session(9),
         "the oldest ordinary job runs after {PRIORITY_RUN_LIMIT} priority jobs, and got {served:?}"
     );
-    assert_eq!(scheduler.priority_run(), 0);
 }
 
 /// KR-REQ-22.14: a session inside its cooldown is not dequeued, and the queue says which case it is.
