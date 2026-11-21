@@ -31,6 +31,7 @@ use std::rc::Rc;
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
 use quote::ToTokens as _;
+use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
@@ -764,7 +765,7 @@ impl CrateIndex {
                 syn::Item::Static(item) => (Kind::Named, vec![item.ident.to_string()]),
                 syn::Item::Macro(item) => match &item.ident {
                     Some(name) if item.mac.path.is_ident("macro_rules") => {
-                        (Kind::MacroRules, vec![name.to_string()])
+                        (Kind::MacroRules, vec![name.unraw().to_string()])
                     }
                     _ => (
                         Kind::Invocation(
@@ -772,7 +773,9 @@ impl CrateIndex {
                                 .path
                                 .segments
                                 .last()
-                                .map_or_else(String::new, |segment| segment.ident.to_string()),
+                                .map_or_else(String::new, |segment| {
+                                    segment.ident.unraw().to_string()
+                                }),
                         ),
                         Vec::new(),
                     ),
@@ -1079,7 +1082,7 @@ fn type_name(ty: &syn::Type) -> String {
             .path
             .segments
             .last()
-            .map_or_else(String::new, |segment| segment.ident.to_string()),
+            .map_or_else(String::new, |segment| segment.ident.unraw().to_string()),
         syn::Type::Reference(reference) => type_name(&reference.elem),
         _ => String::new(),
     }
@@ -1297,7 +1300,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
         let segments: Vec<String> = path
             .segments
             .iter()
-            .map(|segment| segment.ident.to_string())
+            .map(|segment| segment.ident.unraw().to_string())
             .collect();
         if let Some(first) = segments.first() {
             if self.workspace.contains(first) && first != self.own && segments.len() > 1 {
@@ -1314,7 +1317,7 @@ impl<'ast> Visit<'ast> for Collector<'_> {
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if let Some(last) = mac.path.segments.last() {
-            self.refs.push(Ref::Macro(last.ident.to_string()));
+            self.refs.push(Ref::Macro(last.ident.unraw().to_string()));
         }
         self.tokens(&mac.tokens);
         syn::visit::visit_macro(self, mac);
@@ -1973,8 +1976,8 @@ impl Scanner {
                 }
                 syn::Item::Macro(call) => {
                     let kinds = kinds_of(&plain());
-                    if let (Some(name), true) = (&call.ident, call.mac.path.is_ident("macro_rules"))
-                    {
+                    if let (Some(name), true) = (&call.ident, is_macro_rules(&call.mac.path)) {
+                        let name = name.unraw();
                         self.macro_rules.insert(name.to_string());
                         let mut inner = Calls::default();
                         for expansion in transcribers(&call.mac.tokens) {
@@ -1988,7 +1991,7 @@ impl Scanner {
                         continue;
                     }
                     if let Some(last) = call.mac.path.segments.last() {
-                        self.calls.sighted.insert(last.ident.to_string());
+                        self.calls.sighted.insert(last.ident.unraw().to_string());
                     }
                     calls_in(&call.mac.tokens, &mut self.calls);
                     match defined_name(&call.mac.tokens) {
@@ -1999,7 +2002,9 @@ impl Scanner {
                                 .path
                                 .segments
                                 .last()
-                                .map_or_else(String::new, |segment| segment.ident.to_string());
+                                .map_or_else(String::new, |segment| {
+                                    segment.ident.unraw().to_string()
+                                });
                             self.scan_only_body(
                                 format!("{macro_name}! invocation @{under_src}"),
                                 file,
@@ -2137,18 +2142,27 @@ pub(super) fn transcribers(arms: &TokenStream) -> Vec<TokenStream> {
         .collect()
 }
 
+/// Whether `path` is `macro_rules`, as written or raw.
+pub(super) fn is_macro_rules(path: &syn::Path) -> bool {
+    path.segments.len() == 1 && path.segments[0].ident.unraw() == "macro_rules"
+}
+
 /// The path that the macro name at `flat[at]` is written with: the segments before it that `::`
 /// joins to it, `$crate` as one segment.
 pub(super) fn path_before(flat: &[TokenTree], at: usize) -> Vec<String> {
     let colon = |tree: &TokenTree| matches!(tree, TokenTree::Punct(one) if one.as_char() == ':');
-    let mut path = vec![flat[at].to_string()];
+    let word = |tree: &TokenTree| match tree {
+        TokenTree::Ident(ident) => ident.unraw().to_string(),
+        other => other.to_string(),
+    };
+    let mut path = vec![word(&flat[at])];
     let mut index = at;
     while index >= 3
         && colon(&flat[index - 1])
         && colon(&flat[index - 2])
         && let TokenTree::Ident(segment) = &flat[index - 3]
     {
-        let mut text = segment.to_string();
+        let mut text = segment.unraw().to_string();
         index -= 3;
         if text == "crate"
             && index >= 1
@@ -2171,7 +2185,7 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
     let mut at = 0;
     while at < flat.len() {
         match &flat[at] {
-            TokenTree::Ident(word) if word == "macro_rules" => {
+            TokenTree::Ident(word) if word.unraw() == "macro_rules" => {
                 if let (
                     Some(TokenTree::Punct(bang)),
                     Some(TokenTree::Ident(name)),
@@ -2183,7 +2197,7 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
                     for expansion in transcribers(&arms.stream()) {
                         calls_in(&expansion, &mut inner);
                     }
-                    calls.absorb(name.to_string(), inner);
+                    calls.absorb(name.unraw().to_string(), inner);
                     at += 4;
                     continue;
                 }
@@ -2193,7 +2207,7 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
                 if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
                     && matches!(flat.get(at + 2), Some(TokenTree::Group(_))) =>
             {
-                let name = ident.to_string();
+                let name = ident.unraw().to_string();
                 calls.all.names.insert(name.clone());
                 if at > 0
                     && matches!(&flat[at - 1], TokenTree::Punct(dollar) if dollar.as_char() == '$')
@@ -2277,7 +2291,7 @@ fn collect_kinds(stream: &TokenStream, kinds: &mut BTreeSet<SightKind>, owner: O
                 let right = at >= 3
                     && is_colon(flat.get(at - 1))
                     && is_colon(flat.get(at - 2))
-                    && matches!(flat.get(at - 3), Some(TokenTree::Ident(before)) if before == "ActionRight");
+                    && matches!(flat.get(at - 3), Some(TokenTree::Ident(before)) if before.unraw() == "ActionRight");
                 if VARIANTS.contains(&word) && !right {
                     kinds.insert(SightKind::Names);
                 }

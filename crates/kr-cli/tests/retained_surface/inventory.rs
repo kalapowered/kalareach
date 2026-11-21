@@ -25,7 +25,7 @@ use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
 use super::condition;
-use super::walker::{VARIANTS, normalised, path_before, transcribers};
+use super::walker::{VARIANTS, is_macro_rules, normalised, path_before, transcribers};
 
 /// The macros of other crates that product code may call at item position and in a transcriber, each
 /// with the paths that name its provider (`""` is a bare call) and why none of them can make a module
@@ -504,14 +504,23 @@ impl Reader<'_> {
 
     /// Refuses a `type` alias of `MutationRequest` or `ActionTarget`.
     fn refuse_alias(&mut self, alias: &syn::Ident, ty: &syn::Type) {
+        // Parentheses and invisible groups around the type name the same type.
+        let mut ty = ty;
+        while let syn::Type::Paren(syn::TypeParen { elem, .. })
+        | syn::Type::Group(syn::TypeGroup { elem, .. }) = ty
+        {
+            ty = elem;
+        }
         if self.error.is_none()
             && let syn::Type::Path(path) = ty
             && let Some(last) = path.path.segments.last()
-            && (last.ident == "MutationRequest" || last.ident == "ActionTarget")
+            && (last.ident.unraw() == "MutationRequest" || last.ident.unraw() == "ActionTarget")
         {
             self.error = Some(format!(
-                "{}: the scan does not read a type alias of {} ({alias})",
-                self.at, last.ident
+                "{}: the scan does not read a type alias of {} ({})",
+                self.at,
+                last.ident.unraw(),
+                alias.unraw()
             ));
         }
     }
@@ -567,7 +576,10 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                 ));
             }
             if let Some((_, rename)) = &node.rename {
-                self.note_renames(vec![(node.ident.to_string(), rename.to_string())]);
+                self.note_renames(vec![(
+                    node.ident.unraw().to_string(),
+                    rename.unraw().to_string(),
+                )]);
             }
             syn::visit::visit_item_extern_crate(self, node);
         }
@@ -652,8 +664,8 @@ impl<'ast> Visit<'ast> for Reader<'_> {
             return;
         }
         match &node.ident {
-            Some(name) if node.mac.path.is_ident("macro_rules") => {
-                self.defined.push(name.to_string());
+            Some(name) if is_macro_rules(&node.mac.path) => {
+                self.defined.push(name.unraw().to_string());
                 for expansion in transcribers(&node.mac.tokens) {
                     token_calls(&expansion, &mut self.calls);
                 }
@@ -683,7 +695,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                 .path
                 .segments
                 .last()
-                .map(|segment| segment.ident.to_string())
+                .map(|segment| segment.ident.unraw().to_string())
                 .unwrap_or_default();
             if name == "include" {
                 self.error = Some(format!("{}: the scan does not read include!", self.at));
@@ -782,14 +794,14 @@ fn form_in(tokens: &TokenStream) -> Option<Form> {
                     return Some(found);
                 }
             }
-            TokenTree::Ident(word) if word == "include" => {
+            TokenTree::Ident(word) if word.unraw() == "include" => {
                 if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
                     && matches!(flat.get(at + 2), Some(TokenTree::Group(_)))
                 {
                     return Some(Form::Include);
                 }
             }
-            TokenTree::Ident(word) if word == "macro_rules" => {
+            TokenTree::Ident(word) if word.unraw() == "macro_rules" => {
                 if let (
                     Some(TokenTree::Punct(bang)),
                     Some(TokenTree::Ident(name)),
@@ -797,7 +809,7 @@ fn form_in(tokens: &TokenStream) -> Option<Form> {
                 ) = (flat.get(at + 1), flat.get(at + 2), flat.get(at + 3))
                     && bang.as_char() == '!'
                 {
-                    return Some(Form::Rules(name.to_string()));
+                    return Some(Form::Rules(name.unraw().to_string()));
                 }
             }
             TokenTree::Ident(word) if word == "mod" => {
@@ -858,7 +870,7 @@ fn token_calls(stream: &TokenStream, calls: &mut Vec<(Position, Vec<String>)>) {
 fn use_paths(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<(String, Vec<String>)>) {
     match tree {
         syn::UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
+            prefix.push(path.ident.unraw().to_string());
             use_paths(&path.tree, prefix, out);
             prefix.pop();
         }
@@ -869,16 +881,16 @@ fn use_paths(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<(Strin
                     out.push((last.clone(), full));
                 }
             } else {
-                full.push(name.ident.to_string());
-                out.push((name.ident.to_string(), full));
+                full.push(name.ident.unraw().to_string());
+                out.push((name.ident.unraw().to_string(), full));
             }
         }
         syn::UseTree::Rename(rename) => {
             let mut full = prefix.clone();
             if rename.ident != "self" {
-                full.push(rename.ident.to_string());
+                full.push(rename.ident.unraw().to_string());
             }
-            out.push((rename.rename.to_string(), full));
+            out.push((rename.rename.unraw().to_string(), full));
         }
         syn::UseTree::Glob(_) => {}
         syn::UseTree::Group(group) => {
