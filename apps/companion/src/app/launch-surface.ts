@@ -187,8 +187,10 @@ export function useLaunchSurface(
     )
     // The saved commands have a cadence of their own, which no wake reaches. A host that does not
     // serve them, or a connection that may not read them, is asked no more until the connection
-    // changes.
+    // changes. `connection` counts those changes: an answer to a read that began on an earlier
+    // connection says nothing of this one, so it neither shows a list nor remembers a refusal.
     let remembered = false
+    let connection = 0
     newestList.current = null
     const listCadence =
       readList === null
@@ -196,9 +198,10 @@ export function useLaunchSurface(
         : readOnCadence(() => {
             const current = readSaved?.() ?? null
             if (current === null || remembered) return Promise.resolve()
+            const asked = connection
             return ask(readList).then(
               (reading) => {
-                if (!current()) return
+                if (!current() || asked !== connection) return
                 if (reading.state === 'served') {
                   newestList.current = { readList, list: reading.list }
                   setList({ readList, reading, unread: null })
@@ -225,6 +228,7 @@ export function useLaunchSurface(
     const watched = watch(
       [
         port.onConnection((state) => {
+          connection += 1
           remembered = false
           if (state.connected) {
             cadence.now()
