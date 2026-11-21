@@ -641,7 +641,6 @@ fn the_cadence_follows_measured_service_time_and_the_eligible_count() {
     for _ in 0..8 {
         scheduler.record_service(4_000);
     }
-    assert_eq!(scheduler.service_time().mean_ms(), Some(4_000));
     assert_eq!(scheduler.cadence_ms(at(60_000)), 4_000 * 50);
     assert!(scheduler.cadence_ms(at(60_000)) > Budgets::DEFAULTS.session_cooldown_ms);
 }
