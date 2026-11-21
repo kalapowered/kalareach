@@ -7983,6 +7983,14 @@ mod tests {
         let removed = installer
             .remove(&params)
             .expect("a removal keeps what it did not write");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("its record is kept")),
+            "the removal says that the entry and its record stay: {:?}",
+            removed.retained
+        );
         assert_held_and_finished(&installer, &params, &document, &removed);
     }
 
@@ -8002,6 +8010,14 @@ mod tests {
         let removed = installer
             .remove(&params(amp(), InstallScope::User))
             .expect("a removal keeps what it did not write");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("its record is kept")),
+            "the removal says that the entry and its record stay: {:?}",
+            removed.retained
+        );
         assert_held_and_finished(
             &installer,
             &params(amp(), InstallScope::User),
@@ -8064,11 +8080,20 @@ mod tests {
             removed.is_ok(),
             "a document that changed under the write is told, not refused: {removed:?}"
         );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("its record is kept")),
+            "the removal says that the entry and its record stay: {:?}",
+            removed.retained
+        );
         assert_held_and_finished(
             &installer,
             &params(amp(), InstallScope::User),
             &document,
-            &removed.expect("a removal"),
+            &removed,
         );
     }
 
