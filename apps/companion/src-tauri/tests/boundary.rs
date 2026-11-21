@@ -1656,8 +1656,8 @@ fn without_comments(document: &str) -> String {
 /// KR-REQ-13.17: "Take a photo" opens the camera on Android. The page's file input asks for the
 /// camera, and the WebView's file chooser opens it only after it finds an application that answers
 /// the image-capture action. The application targets Android 11 or later, where an application sees
-/// only the apps its own manifest names, so without this entry the chooser finds none and shows the
-/// photo picker in place of the camera.
+/// only the apps its own manifest names and some system apps, so without this entry, from Android 11
+/// on, package visibility can hide camera apps and make 'Take a photo' open the photo picker.
 #[test]
 fn the_android_manifest_names_the_image_capture_action_so_take_a_photo_finds_the_camera() {
     let manifest =
