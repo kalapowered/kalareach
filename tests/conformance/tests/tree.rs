@@ -243,10 +243,7 @@ fn a_process_that_writes_more_than_a_pipe_holds_when_asked_to_end_is_read_throug
         writing(&[(1, 600_000)], 20)
     );
     let call = run(bash(&script, &[&marker, &pids]), deadline_in(3));
-    assert!(
-        call.is_some(),
-        "the call did not return in time: the process was blocked on its write"
-    );
+    assert!(call.is_some(), "the call did not return in time");
     let captured = timed_out(returned(call));
     let written = std::fs::read_to_string(&marker).unwrap_or_default();
     assert_eq!(
