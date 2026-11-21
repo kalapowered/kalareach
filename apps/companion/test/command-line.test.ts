@@ -16,11 +16,21 @@ import { commandLine } from '../src/model/command-line'
 const POSIX: readonly LaunchShell[] = ['sh', 'zsh', 'bash']
 
 describe('a command written for the shell that reads it', () => {
-  it('leaves a command made only of plain words as it is, in every shell that reads one so', () => {
+  it('the_stock_shell_line_quotes_the_program_word and every_word_after_it, in every shell that reads one so', () => {
     for (const kind of ['sh', 'zsh', 'bash', 'fish'] as const) {
       expect(commandLine(['pnpm', 'test', '--filter=app', './a/b.sh'], kind)).toBe(
-        'pnpm test --filter=app ./a/b.sh'
+        "'pnpm' 'test' '--filter=app' './a/b.sh'"
       )
+      // A first word that is an assignment, and a reserved word, run as themselves when bare.
+      expect(commandLine(['X=1', 'uname'], kind)).toBe("'X=1' 'uname'")
+      expect(commandLine(['if', 'time', 'alias'], kind)).toBe("'if' 'time' 'alias'")
+    }
+  })
+
+  it('quotes a word a zsh global alias would expand at an argument position, in zsh and in an sh session', () => {
+    // `alias -g KR_WORD=changed` makes a bare KR_WORD an argument that reads `changed`.
+    for (const kind of ['zsh', 'sh'] as const) {
+      expect(commandLine(['printf', '<%s>\n', 'KR_WORD'], kind)).toBe("'printf' '<%s>\n' 'KR_WORD'")
     }
   })
 
@@ -47,15 +57,15 @@ describe('a command written for the shell that reads it', () => {
   })
 
   it('quotes a word Zsh reads as the path of a command and one Fish reads as a process number', () => {
-    expect(commandLine(['show', '=ls'], 'zsh')).toBe("show '=ls'")
-    expect(commandLine(['show', 'a=b', '50%'], 'zsh')).toBe('show a=b 50%')
-    expect(commandLine(['show', '%self'], 'fish')).toBe("show '%self'")
+    expect(commandLine(['show', '=ls'], 'zsh')).toBe("'show' '=ls'")
+    expect(commandLine(['show', 'a=b', '50%'], 'zsh')).toBe("'show' 'a=b' '50%'")
+    expect(commandLine(['show', '%self'], 'fish')).toBe("'show' '%self'")
   })
 
-  it('leaves the words PowerShell would take for splatting, a list or its stop-parsing token as they are in the other shells', () => {
+  it('quotes the words PowerShell would take for splatting, a list or its stop-parsing token like any other word in the other shells', () => {
     for (const kind of ['sh', 'zsh', 'bash', 'fish'] as const) {
       expect(commandLine(['show', '@payload', 'a,b', '--%', '-a.b'], kind)).toBe(
-        'show @payload a,b --% -a.b'
+        "'show' '@payload' 'a,b' '--%' '-a.b'"
       )
     }
   })

@@ -267,9 +267,9 @@ describe('creating a session (KR-REQ-07.21)', () => {
     expect(surface).toHaveTextContent('nothing is typed into it for you')
     expect(screen.queryByTestId('launch-surface')).toBeNull()
     await person.click(within(surface).getByRole('button', { name: 'Codex CLI' }))
-    expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent('Type this at the prompt: codex')
+    expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent("Type this at the prompt: 'codex'")
     await person.click(within(surface).getByRole('button', { name: 'Gemini CLI' }))
-    expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent('Type this at the prompt: gemini')
+    expect(within(surface).getByTestId('launch-instruction')).toHaveTextContent("Type this at the prompt: 'gemini'")
     expect(controls.launches).toEqual([])
   })
 
@@ -277,8 +277,8 @@ describe('creating a session (KR-REQ-07.21)', () => {
   // PowerShell prompt is not what they type at a POSIX one. How a hard word is quoted in each is
   // held by the command-line cases.
   it.each([
-    ['zsh', 'codex'],
-    ['fish', 'codex'],
+    ['zsh', "'codex'"],
+    ['fish', "'codex'"],
     ['powershell', "& 'codex'"]
   ] as const)(
     'shows a stock %s session’s command as that shell reads it',

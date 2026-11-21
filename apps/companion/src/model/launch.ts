@@ -52,6 +52,7 @@ export type LaunchDrawing =
   /** The editor is verified at a prompt and this link holds the input: the buttons are usable. */
   | {
       readonly kind: 'live'
+      readonly shell: LaunchShell | null
       readonly offers: LaunchOffers
       readonly promptGeneration: string
       readonly bufferRevision: string
@@ -78,6 +79,7 @@ export function drawing(reading: LaunchSurfaceReading, mayType: boolean): Launch
   if (input === 'held_here') {
     return {
       kind: 'live',
+      shell,
       offers,
       promptGeneration: editor.prompt_generation,
       bufferRevision: editor.buffer_revision
@@ -112,13 +114,22 @@ export const UNVERIFIED_WORDS: Readonly<Record<LaunchUnverifiedReason, string>> 
  * whether the failure left the outcome unknown, which the host says by the category of its code as
  * well as by the code (`leavesOutcomeUnknown`).
  */
-export function pressRefusal(code: string | null, words: string, unknown: boolean): string {
+export function pressRefusal(
+  code: string | null,
+  words: string,
+  unknown: boolean,
+  shell: LaunchShell | null = null
+): string {
   if (unknown) {
     return 'The terminal could not confirm whether the launch was installed. Look at the prompt before trying again.'
   }
   switch (code) {
     case 'DRAFT_CONFLICT':
-      return 'The prompt changed before the launch was installed. Nothing was typed.'
+      // PowerShell types no line for a command it cannot run as it was saved, and refuses the same
+      // way as a prompt that moved, so its words say both.
+      return shell === 'powershell'
+        ? 'The launch was not installed, and nothing was typed. The prompt may have changed, or PowerShell cannot run this command.'
+        : 'The prompt changed before the launch was installed. Nothing was typed.'
     case 'EDITOR_BUSY':
       return 'The terminal was busy, so the launch was not installed. Nothing was typed.'
     case 'LEASE_LOST':
