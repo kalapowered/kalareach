@@ -427,3 +427,105 @@ fn judges_a_forwarder_answer(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Part 2b: an agent started by hand is detected, and offered only observation and the terminal.
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-12.32, case 2, part 2b: an agent started by hand is detected as section 12 requires of a
+/// manual launch and offered only observation and the terminal: it is announced as one
+/// native-terminal instance of the installed package with every bridge refused, no typed action is
+/// advertised as usable, every typed agent mutation and each of the package's upstream actions
+/// sent for that instance at its revision is refused while nothing it carried reaches the agent,
+/// no resource appears, no command backend exists, and the refusals leave the instance and its
+/// revision as they were. Each check is also shown observations made wrong on purpose, which it
+/// must reject. The live control for the offered surface, which does not break it, is terminal
+/// input under the input lease; the live control for detection breaks it: the agent ends, and the
+/// same check fails.
+#[test]
+fn gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused()
+ {
+    const TEST: &str = "gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_every_typed_action_is_refused";
+    by_hand_case("2b", TEST, Setup::default(), |ctx, session| {
+        let session_id = session.session_id();
+        let agent = HandAgent::starts(ctx, session);
+        let shown = detects(ctx, &session.remote, session_id);
+        let running = launched(&agent);
+        let detected = check_detected(&running, &shown)
+            .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
+        let (offered, reads) = surface(ctx, session, &session.remote, session_id, &shown);
+        check_observation_only(&offered)
+            .unwrap_or_else(|why| panic!("only observation and the terminal are offered: {why}"));
+        let after = shown_now(ctx, &session.remote, session_id);
+        check_unchanged(Held::of(&shown), &after)
+            .unwrap_or_else(|why| panic!("the refusals change nothing: {why}"));
+        let states = capability_states(&session.remote, &ctx.runtime, &codex());
+        advertises_nothing_as_available(&states).unwrap_or_else(|why| panic!("{why}"));
+        shows_no_trace(&session.person.window.screen(), TYPED_PROMPT)
+            .unwrap_or_else(|why| panic!("no refused prompt reached the agent: {why}"));
+        agent
+            .runs()
+            .unwrap_or_else(|why| panic!("the agent goes on after the refusals: {why}"));
+        let checker = checker_controls(&running, &shown, &offered);
+        all_rejected(&checker).unwrap_or_else(|why| panic!("{why}"));
+        // The live control for the surface, which does not break it: terminal input under the
+        // lease, which the same device's connection delivers.
+        let (input, shows) = harmless(ctx);
+        let mut keys = keyboard(ctx, session, true);
+        let written = keys
+            .type_text(&session.remote, &ctx.runtime, &input)
+            .unwrap_or_else(|why| panic!("{why}"));
+        forwarded_whole(written.forwarded_bytes.get(), &input)
+            .unwrap_or_else(|why| panic!("the input is forwarded: {why}"));
+        let _ = session
+            .person
+            .sees(&shows, "the agent's composer shows the keystroke");
+        // The live control for detection, which breaks it: the agent ends, and the check fails.
+        agent.ends();
+        let gone = shown_gone(ctx, &session.remote, session_id);
+        let ended = launched(&agent);
+        let ended_check = check_detected(&ended, &gone);
+        assert!(
+            ended_check.is_err(),
+            "the detection check fails once the agent has ended: {}",
+            gone.detection.evidence()
+        );
+        check_ended(&gone).unwrap_or_else(|why| panic!("the host ends the instance: {why}"));
+        serde_json::json!({
+            "arm": arm(ctx),
+            "detection": shown.detection.evidence(),
+            "binding": shown.binding,
+            "live_bindings": shown.live_bindings,
+            "detected": detected.identity,
+            "surface": offered.evidence(),
+            "agent_reads": reads.iter().map(Reply::evidence).collect::<Vec<_>>(),
+            "after": after.detection.evidence(),
+            "capability_states": states,
+            "checker_controls": checker,
+            "control": { "what": "terminal input under the lease", "breaks_property": false },
+            "detection_control": {
+                "what": "the agent ended by its recorded identity",
+                "breaks_property": true,
+                "after": gone.detection.evidence(),
+                "check": ended_check.err().map(|undetected| undetected.why),
+            },
+        })
+    });
+}
+
+/// A capability the host advertises as qualified and available is refused by the check.
+#[test]
+fn a_capability_advertised_as_qualified_and_available_fails_the_check_of_2b() {
+    let states = |state: &str| vec![("agent.prompt.submit".to_owned(), state.to_owned())];
+    assert!(advertises_nothing_as_available(&states("unavailable")).is_ok());
+    assert!(advertises_nothing_as_available(&[]).is_ok());
+    assert!(advertises_nothing_as_available(&states("qualified_available")).is_err());
+}
+
+/// A refused prompt on the agent's screen, and a screen that never showed it.
+#[test]
+fn a_typed_prompt_that_reached_the_agents_screen_fails_the_check_of_2b() {
+    let rows = |text: &str| vec!["> ".to_owned(), text.to_owned()];
+    assert!(shows_no_trace(&rows("by hand"), TYPED_PROMPT).is_ok());
+    assert!(shows_no_trace(&rows(TYPED_PROMPT), TYPED_PROMPT).is_err());
+}
