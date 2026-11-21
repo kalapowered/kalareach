@@ -170,35 +170,58 @@ fn a_command_whose_time_is_spent_before_it_starts_is_not_started() {
 /// group still holds the pipe is not reaped until the group is ended: through the wait for the
 /// signal that asks to end, through the grace, which a process that ignores that signal outlasts,
 /// and up to the signal that ends it by force. The leader and the process are looked at inside the
-/// grace.
+/// grace by a third process of the group: the signal that asks to end reaches it, it looks at once
+/// and goes on looking until the group is ended by force, so what it saw is inside the grace
+/// whatever the case's own thread is doing meanwhile.
 #[test]
 fn a_leader_that_ended_while_a_process_of_its_group_holds_the_pipe_is_not_reaped_before_the_end() {
     let place = tempfile::tempdir().expect("a directory");
     let pids = place.path().join("pids.txt");
-    let script = "trap '' TERM\nsleep 61 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"$1\"\nexit 0";
+    let seen = place.path().join("seen.txt");
+    let armed = place.path().join("armed.txt");
+    // The leader records its pids once the observer is armed and ends, so a case that has them
+    // knows the signal that asks to end finds the observer in place. The observer's loop is
+    // bounded, so it ends by itself if it is reached and nothing ends the group.
+    let script = concat!(
+        "trap '' TERM\n",
+        "sleep 61 &\n",
+        "leader=$$\n",
+        "sleeper=$!\n",
+        "(\n",
+        "  trap 'n=0; while [ \"$n\" -lt 100 ]; do\n",
+        "    kill -0 \"$leader\" 2>/dev/null && l=alive || l=gone\n",
+        "    kill -0 \"$sleeper\" 2>/dev/null && s=alive || s=gone\n",
+        "    printf \"%s %s\\n\" \"$l\" \"$s\" >> \"$2\"\n",
+        "    sleep 0.1; n=$((n + 1))\n",
+        "  done' TERM\n",
+        "  : > \"$3\"\n",
+        "  sleep 61 & wait\n",
+        ") &\n",
+        "until [ -e \"$3\" ]; do sleep 0.01; done\n",
+        "printf '%s\\n%s\\n' \"$leader\" \"$sleeper\" > \"$1\"\n",
+        "exit 0"
+    );
     let deadline = deadline_in(3);
-    let call = start(bash(script, &[&pids]), deadline);
+    let call = start(bash(script, &[&pids, &seen, &armed]), deadline);
     let started = recorded_pids(&pids, 2);
     assert!(
         Instant::now() < deadline.at,
         "the fixture did not start in time"
     );
-    // The signal that asks to end is sent at the deadline and the one that ends by force two
-    // seconds later: the window is inside the grace with a second of slack at its end.
-    std::thread::sleep(
-        (deadline.at + Duration::from_millis(500)).saturating_duration_since(Instant::now()),
-    );
-    let mut seen = Vec::new();
-    while Instant::now() < deadline.at + Duration::from_millis(1200) {
-        seen.push((alive(&started[0]), alive(&started[1])));
-        std::thread::sleep(Duration::from_millis(100));
-    }
     let waited = returned(call.within(BOUND));
+    let seen: Vec<String> = std::fs::read_to_string(&seen)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
     let left = left_after(&started, Duration::from_secs(10));
     assert!(matches!(waited, Waited::TimedOut(_)), "{waited:?}");
-    assert!(!seen.is_empty());
     assert!(
-        seen.iter().all(|state| *state == (true, true)),
+        !seen.is_empty(),
+        "the signal that asks to end did not reach the observer of the group"
+    );
+    assert!(
+        seen.iter().all(|state| state == "alive alive"),
         "the leader and the process that ignores the first signal, in the grace: {seen:?}"
     );
     assert!(
