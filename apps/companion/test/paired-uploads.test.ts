@@ -164,6 +164,34 @@ describe('the store reads the application, and the application is the one that s
     expect(phase !== undefined && canCancel(phase)).toBe(true)
   })
 
+  it('keeps the reason a finished file was not added when the application is read again', async () => {
+    const { uploads, scripted } = reached()
+    const refused = { code: 'PERMISSION_DENIED', message: words.DRAFT_GONE }
+    const sent = uploads.send({ key: 'k-8', sessionId: 's-1', subject, file }, () => Promise.reject(refused))
+    await wait(() => scripted.started.length === 1)
+    scripted.finish('k-8')
+    const handle = await sent
+    const reason = words.sentence(words.DRAFT_GONE)
+    expect(uploads.snapshot().get('k-8')?.phase).toEqual({ kind: 'kept', words: reason })
+    // The application lists the published file until it is bound, and says nothing of why it was not.
+    scripted.leave([
+      {
+        key: 'k-8',
+        state: 'published',
+        sessionId: 's-1',
+        fileName: 'a.pdf',
+        byteLen: 10,
+        acknowledgedChunks: 0,
+        chunks: 0,
+        stage: null,
+        handle,
+        said: null
+      }
+    ])
+    await uploads.restore()
+    expect(uploads.snapshot().get('k-8')?.phase).toEqual({ kind: 'kept', words: reason })
+  })
+
   it('shows the file at once, follows its chunks by asking again, and stops asking when it is done', async () => {
     const { uploads, scripted } = reached()
     const sent = uploads.send({ key: 'k-1', sessionId: 's-1', subject, file }, () => Promise.resolve())

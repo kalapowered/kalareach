@@ -455,7 +455,11 @@ export class PairedUploads {
           row.phase.kind === 'stuck' ||
           (!row.awaited && row.phase.kind === 'kept')
         ) {
-          set({ ...row, phase: phaseOf(view), handle: view.handle ?? row.handle })
+          const next = phaseOf(view)
+          // A file kept after the draft refused it keeps the reason it was refused for: the
+          // application lists it as published and says nothing of why it was not added.
+          const phase = row.phase.kind === 'kept' && next.kind === 'kept' ? row.phase : next
+          set({ ...row, phase, handle: view.handle ?? row.handle })
         }
       }
       // A file the application no longer lists, which no call of this window waits for, has ended.
