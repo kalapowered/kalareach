@@ -71,6 +71,7 @@ fn paired_of(companion: &Companion) -> Paired {
     Paired {
         device_id,
         environment_id,
+        account: None,
         session,
     }
 }
@@ -651,6 +652,7 @@ async fn published_with_a_lost_answer(adopted: &Adopted, phone: &Phone) -> (Uuid
         key,
         paired.environment_id,
         paired.device_id,
+        None,
         net_support::on_the_host(&adopted.host),
         upload.transfer_id().copied(),
         testing::Got::Finishing,
@@ -707,6 +709,7 @@ async fn kr_req_13_12_a_reservation_whose_answer_never_came_is_said_to_be_unreco
         key,
         paired.environment_id,
         paired.device_id,
+        None,
         net_support::on_the_host(&adopted.host),
         None,
         testing::Got::Beginning,
@@ -742,6 +745,7 @@ async fn kr_req_13_12_a_restart_drops_an_entry_the_host_does_not_know_and_its_co
         key,
         paired.environment_id,
         paired.device_id,
+        None,
         net_support::on_the_host(&adopted.host),
         Some(kr_protocol::ids::TransferId::new(kr_ipc::new_uuid())),
         testing::Got::Begun,
@@ -1207,6 +1211,7 @@ async fn on_another_connection(companion: &Companion, old: &Arc<kr_client::Sessi
                 return Paired {
                     device_id,
                     environment_id,
+                    account: None,
                     session,
                 };
             }
@@ -1462,6 +1467,7 @@ async fn kr_req_13_12_a_copy_that_no_upload_needs_is_removed_at_the_next_reach()
         lost,
         paired.environment_id,
         paired.device_id,
+        None,
         net_support::on_the_host(&adopted.host),
         None,
         testing::Got::Beginning,
@@ -1507,6 +1513,7 @@ async fn kr_req_13_12_an_entry_of_another_principal_is_dropped_with_its_copy_and
         key,
         other.environment_id,
         other.device_id,
+        None,
         net_support::on_the_host(&adopted.host),
         Some(kr_protocol::ids::TransferId::new(kr_ipc::new_uuid())),
         testing::Got::Begun,
@@ -2410,6 +2417,7 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
         key,
         earlier.environment_id,
         earlier.device_id,
+        None,
         net_support::on_the_host(&adopted.host),
         Some(kr_protocol::ids::TransferId::new(kr_ipc::new_uuid())),
         testing::Got::Begun,
@@ -2459,6 +2467,113 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
         control.sent(Method::UploadStatus),
         status_reads,
         "nothing of the earlier principal is read from the host or resumed"
+    );
+    gate.release();
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12, KR-REQ-23.41: a new sign-in on the same pairing. A host that answers to an
+/// organisation sees one principal whoever is signed in, so what is kept is told apart by the
+/// account: the new account is shown nothing of the earlier one's and reads none of its draft, and
+/// when the host is reached under the new account an upload still sent under the earlier one is
+/// stopped with its copy, and an entry, a copy and a draft the earlier account left are dropped.
+/// Nothing of the earlier account is read from the host or resumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_new_sign_in_on_the_same_pairing_drops_what_the_earlier_account_kept() {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let paired = paired_of(companion);
+    let session = adopted.workers[0].session_id;
+    // The same device on the same host: only the sign-in differs.
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let now = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..paired.clone()
+    };
+
+    // An upload still sent under the earlier account, held in its content.
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let running = {
+        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let (desk, earlier) = (Arc::clone(&desk), earlier.clone());
+        tokio::spawn(async move { desk.send(earlier, sent).await })
+    };
+    gate.reached().await;
+    // What a process under the earlier account left: an entry with its copy, and a draft.
+    let left = vec![9_u8; 16];
+    let key = kr_ipc::new_uuid();
+    testing::keep(
+        &folder(&phone),
+        key,
+        earlier.environment_id,
+        earlier.device_id,
+        earlier.account,
+        net_support::on_the_host(&adopted.host),
+        Some(kr_protocol::ids::TransferId::new(kr_ipc::new_uuid())),
+        testing::Got::Begun,
+        16,
+        Held::new(left.clone()).digest(),
+        testing::Where::Copy,
+    );
+    testing::keep_copy(&folder(&phone), key, &left);
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    drafts.keep_for_test(
+        &earlier,
+        session,
+        &net_support::on_the_session(&adopted.host, session),
+        Some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid())),
+        Some(kr_protocol::ids::DraftRevision::new(1)),
+    );
+    assert_eq!(entries_in(&folder(&phone)), 2);
+    assert_eq!(copies_in(&folder(&phone)), 2);
+    assert_eq!(drafts_in(&folder(&phone)), 1);
+
+    // Before the host is reached again the new account is shown none of it.
+    assert!(
+        desk.open(&now).is_empty(),
+        "the new sign-in is shown nothing of the earlier account's uploads"
+    );
+    assert!(
+        !drafts.kept(&now, session).made,
+        "the new sign-in does not read the earlier account's draft"
+    );
+    let status_reads = control.sent(Method::UploadStatus);
+
+    // The host is reached under the new account.
+    desk.host_reached(now.clone());
+    drafts.sweep_after_reach(now.clone()).await;
+
+    let stopped = tokio::time::timeout(WATCHDOG, running)
+        .await
+        .expect("the upload of the earlier account ends")
+        .expect("the task ran")
+        .expect_err("an upload of another account is not sent on");
+    assert_eq!(stopped.message, companion_tauri::open_transfers::CANCELLED);
+    tokio::time::timeout(WATCHDOG, async {
+        while entries_in(&folder(&phone)) + copies_in(&folder(&phone)) + drafts_in(&folder(&phone))
+            > 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every entry, copy and draft of the earlier account is dropped");
+    assert_eq!(
+        control.sent(Method::UploadStatus),
+        status_reads,
+        "nothing of the earlier account is read from the host or resumed"
     );
     gate.release();
     adopted.stop().await;

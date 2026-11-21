@@ -171,6 +171,12 @@ impl LeaseDesk {
         self.hosts().remove(&host);
     }
 
+    /// The account signed in on this device, as the mark records name an account by without saying
+    /// who it is; none when no account is signed in or the sign-in cannot be read.
+    pub async fn account(&self) -> Option<AccountMark> {
+        self.signed_in().await.ok().map(|signed| signed.mark)
+    }
+
     /// The account signed in on this device, which sign-in it is and which account it marks.
     async fn signed_in(&self) -> Result<SignedIn, LeaseStop> {
         let Some(account) = (self.inner.account)().await else {

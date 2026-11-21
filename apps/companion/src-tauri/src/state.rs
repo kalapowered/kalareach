@@ -291,18 +291,77 @@ impl AppState {
     pub fn paired_snapshot(
         &self,
     ) -> Result<(kr_protocol::ids::DeviceId, EnvironmentId, Arc<Session>)> {
+        let (device_id, environment_id, session, _) = self.paired_parts()?;
+        Ok((device_id, environment_id, session))
+    }
+
+    /// The device, the environment and the session of the connection to a paired host, read
+    /// together, and whether the host's grant answers to an organisation.
+    fn paired_parts(
+        &self,
+    ) -> Result<(
+        kr_protocol::ids::DeviceId,
+        EnvironmentId,
+        Arc<Session>,
+        bool,
+    )> {
         let held = self.contact.held();
         let connection = held.as_ref().ok_or_else(CommandError::not_connected)?;
         match connection.standing() {
-            Standing::Paired { device_id, .. } => Ok((
+            Standing::Paired {
+                device_id, host, ..
+            } => Ok((
                 *device_id,
                 connection.environment_id(),
                 connection.session(),
+                host.proposed_grant.organisation.as_ref().is_some(),
             )),
             Standing::Owner => Err(CommandError::refused(
                 "this application is the owner of the host it is connected to, not a paired device",
             )),
         }
+    }
+
+    /// The host this application is connected to as a paired device, as an upload or a draft is kept
+    /// for it: the connection, this device's principal on it and, when the host's grant answers to
+    /// an organisation, the account signed in.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::paired_snapshot`], and a refusal when the host answers to an organisation and no
+    /// account is signed in.
+    pub async fn paired(&self) -> Result<crate::open_transfers::Paired> {
+        let (device_id, environment_id, session, organisation) = self.paired_parts()?;
+        let account = self.account_of(organisation).await?;
+        Ok(crate::open_transfers::Paired {
+            device_id,
+            environment_id,
+            account,
+            session,
+        })
+    }
+
+    /// The account the records of a paired host are kept for: the account signed in on a host whose
+    /// grant answers to an organisation, none on another.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when the host answers to an organisation and no account is signed in.
+    pub async fn account_of(
+        &self,
+        organisation: bool,
+    ) -> Result<Option<kr_client::services::AccountMark>> {
+        if !organisation {
+            return Ok(None);
+        }
+        let desk = self.device()?.leases().cloned();
+        let mark = match desk {
+            Some(desk) => desk.account().await,
+            None => None,
+        };
+        mark.map(Some).ok_or_else(|| {
+            CommandError::refused(kr_client::organisation::LeaseStop::SignIn.to_string())
+        })
     }
 
     /// The sessions this application has opened on a host it is paired with.

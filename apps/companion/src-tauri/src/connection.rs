@@ -1034,17 +1034,20 @@ async fn supervise<R: Runtime>(
     // The uploads that waited for a connection resume on it, and what a restart left is read
     // against the host's own record.
     if let Some(device_id) = paired_device {
-        state
-            .transfers()
-            .host_reached(device_id, environment_id, Arc::clone(&session));
-        // The drafts kept for sessions the host no longer lists are ended.
-        let drafts = state.paired_drafts();
-        let paired = crate::open_transfers::Paired {
-            device_id,
-            environment_id,
-            session: Arc::clone(&session),
-        };
-        tauri::async_runtime::spawn(async move { drafts.sweep_after_reach(paired).await });
+        // On a host that answers to an organisation what is kept belongs to the account signed in;
+        // while none is, the connection is ending and nothing kept is acted on.
+        if let Ok(account) = state.account_of(leased.is_some()).await {
+            let paired = crate::open_transfers::Paired {
+                device_id,
+                environment_id,
+                account,
+                session: Arc::clone(&session),
+            };
+            state.transfers().host_reached(paired.clone());
+            // The drafts kept for sessions the host no longer lists are ended.
+            let drafts = state.paired_drafts();
+            tauri::async_runtime::spawn(async move { drafts.sweep_after_reach(paired).await });
+        }
     }
     if let Some(first) = first.take() {
         let _ = first.send(());
