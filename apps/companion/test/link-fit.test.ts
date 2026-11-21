@@ -442,6 +442,25 @@ describe('the room that the page gives the links of a message', () => {
     }
   })
 
+  it('gives a completed link the least size where the words are off the 1/64 grid, as a page zoom lays them out (what a link lacks, the gap to its neighbour)', () => {
+    // A zoom moves the words off the grid that an engine lays out on. The first layout keeps the least size only where what a link lacks is rounded up to
+    // the grid, the second only where the gap between two links is rounded down to it.
+    for (const [label, start, words] of [
+      ['what a link lacks', 0.4, [[4.3, 27.6], [47.6, 65.5]]],
+      ['the gap between two links', 0.7, [[9.1, 24.1], [49.8, 75.8], [99.5, 116.3]]]
+    ] as const) {
+      const { pane: root, messages } = pane(1, (message) => {
+        computed.set(message, { 'padding-left': `${String(start)}px` })
+        for (const [left, right] of words) link(message, left, right)
+      })
+      fitLinks(root, messages)
+      const boxes = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
+      boxes.forEach((box, at) => expect(box.right - box.left, `the rounding of ${label}: the box of link ${String(at)}`).toBeGreaterThanOrEqual(LEAST))
+      for (let at = 0; at + 1 < boxes.length; at += 1) expect((boxes[at] as { right: number }).right, `the end of box ${String(at)}`).toBeLessThanOrEqual((boxes[at + 1] as { left: number }).left)
+      document.body.replaceChildren()
+    }
+  })
+
   it('leaves a short link that cannot be completed the gap that a completed neighbour does not need of it', () => {
     // [8] has a wide link touching its left and 4 px to [9], which is completed and has the rest of the line on its right.
     const { pane: root, messages } = pane(1, (message) => {
