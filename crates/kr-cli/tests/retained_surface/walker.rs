@@ -1728,7 +1728,7 @@ impl Tree {
                 let defined = &self.inventory(other)?.defined;
                 if defined.contains(old) || defined.contains(new) {
                     return Err(format!(
-                        "{file}: the scan does not read a use of {old} under another name (as {new})"
+                        "{file}: the scan does not read {old} under another name (as {new})"
                     ));
                 }
             }

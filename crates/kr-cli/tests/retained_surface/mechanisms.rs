@@ -122,7 +122,7 @@ fn fixture(mechanism: Mechanism) -> Fixture {
         Rename => one(
             "use kr_protocol::Method as M;\npub fn f() { let _ = M::AgentTurnCancel; }\n",
             Refused(
-                "crates/kr-sender/src/lib.rs: the scan does not read a use of Method under another name (as M)",
+                "crates/kr-sender/src/lib.rs: the scan does not read Method under another name (as M)",
             ),
         ),
         Glob => one(
@@ -159,7 +159,7 @@ fn fixture(mechanism: Mechanism) -> Fixture {
         ExternCrateRename => one(
             "extern crate core as Method;\n",
             Refused(
-                "crates/kr-sender/src/lib.rs: the scan does not read a use of core under another name (as Method)",
+                "crates/kr-sender/src/lib.rs: the scan does not read core under another name (as Method)",
             ),
         ),
         CargoRename => Fixture {
@@ -219,7 +219,7 @@ fn fixture(mechanism: Mechanism) -> Fixture {
         ExternalMacroUnlisted => one(
             "other::thing! { }\n",
             Refused(
-                "crates/kr-sender/src/lib.rs: thing! is called at item position, is not defined in kr_sender and is not written as one of the macros the scan accepts",
+                "crates/kr-sender/src/lib.rs: other::thing! is called at item position and is not written as one of the macros the scan accepts",
             ),
         ),
         Escape => one(

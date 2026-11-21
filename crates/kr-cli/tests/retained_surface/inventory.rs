@@ -153,7 +153,8 @@ type FileCalls = (String, Imports, Vec<(Position, Vec<String>)>);
 /// the crate's own (a bare call, or one written from `crate`, `self`, `super`, `$crate` or one of its
 /// modules, of a name the crate defines), a macro of the standard library that makes no item (by its
 /// bare name or by a path of `std`, `core` or `alloc`), or one of [`ACCEPTED`] written with the path
-/// of its provider. A bare name that the file imports stands for the paths it imports.
+/// of its provider. A bare name that the file imports stands for the paths it imports; a qualified
+/// call is judged as written.
 fn accepts(
     path: &[String],
     imports: &Imports,
@@ -163,13 +164,13 @@ fn accepts(
     let Some(first) = path.first() else {
         return false;
     };
+    // Only a bare call takes the paths its name stands for from the file's imports: a qualified call
+    // is judged by the path as written, so a name that stands for a module gives it no provider.
     match imports.get(first) {
-        Some(fulls) => fulls.iter().all(|full| {
-            let mut written = full.clone();
-            written.extend_from_slice(&path[1..]);
-            written_as_accepted(&written, defined, modules)
-        }),
-        None => written_as_accepted(path, defined, modules),
+        Some(fulls) if path.len() == 1 => fulls
+            .iter()
+            .all(|full| written_as_accepted(full, defined, modules)),
+        _ => written_as_accepted(path, defined, modules),
     }
 }
 
@@ -366,18 +367,16 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
     let mut unaccepted: BTreeMap<String, (String, Position)> = BTreeMap::new();
     for (at, imports, found) in &calls {
         for (position, path) in found {
-            if let Some(name) = path.last()
-                && !accepts(path, imports, &defined, &module_set)
-            {
+            if !path.is_empty() && !accepts(path, imports, &defined, &module_set) {
                 unaccepted
-                    .entry(name.clone())
+                    .entry(path.join("::"))
                     .or_insert_with(|| (at.clone(), *position));
             }
         }
     }
-    if let Some((name, (at, position))) = unaccepted.into_iter().next() {
+    if let Some((path, (at, position))) = unaccepted.into_iter().next() {
         return Err(format!(
-            "{at}: {name}! is called at {}, is not defined in {krate} and is not written as one of the macros the scan accepts",
+            "{at}: {path}! is called at {} and is not written as one of the macros the scan accepts",
             position.words()
         ));
     }
@@ -494,7 +493,7 @@ impl Reader<'_> {
         for (old, new) in found {
             if self.error.is_none() && (read_by_name(&old) || read_by_name(&new)) {
                 self.error = Some(format!(
-                    "{}: the scan does not read a use of {old} under another name (as {new})",
+                    "{}: the scan does not read {old} under another name (as {new})",
                     self.at
                 ));
             }
