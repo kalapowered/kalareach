@@ -490,6 +490,23 @@ describe('the Settings form for the saved commands', () => {
     expect(controls.launches).toEqual([])
   })
 
+  it('tells a stale remove of a label whose case changed elsewhere as a conflict, not as an absent command', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.launchCommands.changeElsewhere([{ label: 'Agent', program: 'agent', arguments: [] }])
+    settings(port)
+    const list = await screen.findByTestId('launch-commands-list')
+    // Somewhere else the same command is saved again under a label of another case; the host
+    // compares labels in lower case, so it is the same command, and it stays.
+    const held = controls.hold('launchCommands')
+    controls.launchCommands.changeElsewhere([{ label: 'agent', program: 'agent', arguments: [] }])
+    await person.click(within(list).getByRole('button', { name: 'Remove Agent' }))
+    expect(await screen.findByTestId('launch-commands-conflict')).toBeInTheDocument()
+    expect(screen.getByTestId('said')).not.toHaveTextContent('No launch command is named')
+    held.release()
+    expect(controls.launchCommands.commands.map((each) => each.label)).toEqual(['agent'])
+  })
+
   it('shows the host its words for a refusal the form did not foresee, and saves nothing', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()
