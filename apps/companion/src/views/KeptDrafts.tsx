@@ -309,7 +309,7 @@ export function KeptDrafts({
             () => channels.remove(removal).then(() => undefined),
             all
               ? 'This device could not remove all of these messages now. Some of them may still be in place.'
-              : 'This device could not remove this message now. It is still in place.'
+              : 'This device could not remove this message now. It may still be in place.'
           )
         }}
         onClearHold={(holdId, sessionId) => {
@@ -320,7 +320,7 @@ export function KeptDrafts({
                 // The record is gone, and the row it held the next message for goes with it.
                 if (sessionId !== null) states.dropHoldRow(sessionId, holdId)
               }),
-            'This device could not remove this record now. It is still in place.'
+            'This device could not remove this record now. It may still be in place.'
           )
         }}
       />
