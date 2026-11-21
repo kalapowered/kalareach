@@ -7112,7 +7112,16 @@ fn session_with_a_probe_on_the_path(
     kind: ShellKind,
     package: &Package,
 ) -> (Session, std::path::PathBuf) {
-    let mut session = Session::start(package);
+    session_with_a_probe_on_the_path_and(kind, package, Profile::ORDINARY)
+}
+
+/// [`session_with_a_probe_on_the_path`] with `profile` in the person's startup.
+fn session_with_a_probe_on_the_path_and(
+    kind: ShellKind,
+    package: &Package,
+    profile: Profile<'_>,
+) -> (Session, std::path::PathBuf) {
+    let mut session = Session::start_with_profile(package, profile);
     session.first_prompt();
     session.forget_events();
     assert!(session.answered("kr-ready"));
@@ -7257,37 +7266,83 @@ pub fn an_alias_never_stands_in_for_the_program_in_bash_and_zsh(kind: ShellKind)
     );
 }
 
-/// KR-REQ-13.11: a program the shell cannot find is the shell's own message at the prompt, in Bash,
-/// Zsh and Fish, and the shell is at a prompt after it.
+/// What a host's own fish configuration can hold: a handler that says a program is not found in
+/// words of its own, in place of fish's.
+const FISH_NOT_FOUND_HANDLER: &str =
+    "function fish_command_not_found; printf '%s: command not found\\n' $argv[1]; end\n";
+
+/// KR-REQ-13.11: a program the shell cannot find is the shell's own business at the prompt, in
+/// Bash, Zsh and Fish. The line runs, the shell finishes it with its status 127, which is its own
+/// for a command it did not find, and the shell is at a prompt after it. No KalaReach text is drawn.
+///
+/// The shell's words are not asserted: a host's own configuration may print others, which Fish is
+/// run with as well, and the line the editor accepted names the program.
 pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish(
     kind: ShellKind,
 ) {
+    const PROGRAM: &str = "kr-no-such-program";
     in_each_locale(
         kind,
         "a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish",
         || {
             let package = Package::built(kind);
-            let (mut session, _) = session_with_a_probe_on_the_path(kind, &package);
-            let message = match kind {
-                ShellKind::Fish => "Unknown command",
-                _ => "not found",
+            let handlers: &[&str] = if kind == ShellKind::Fish {
+                &["", FISH_NOT_FOUND_HANDLER]
+            } else {
+                &[""]
             };
-            assert!(
-                launch_vector_drew(
-                    &mut session,
-                    vec!["kr-no-such-program".to_owned()],
-                    message,
-                    25,
-                    0x7a,
-                ),
-                "the shell did not say {message:?} for a program it cannot find:\n{}",
-                session.terminal_output()
-            );
-            assert!(
-                session.answered("kr-still-here"),
-                "{}",
-                session.terminal_output()
-            );
+            for handler in handlers {
+                let (mut session, _) = session_with_a_probe_on_the_path_and(
+                    kind,
+                    &package,
+                    Profile {
+                        after_configuration: handler,
+                        ..Profile::ORDINARY
+                    },
+                );
+                assert!(
+                    launch_vector_drew(&mut session, vec![PROGRAM.to_owned()], PROGRAM, 25, 0x7a,),
+                    "the launch of a program the shell cannot find was not accepted:\n{}",
+                    session.terminal_output()
+                );
+                let finished = |commands: &Commands| {
+                    commands.blocks.iter().any(|block| {
+                        block.command.contains(PROGRAM) && block.exit_status.0.is_some()
+                    })
+                };
+                session.until(
+                    "the finished block of the line that names the program",
+                    finished,
+                );
+                let block = session
+                    .commands
+                    .blocks
+                    .iter()
+                    .find(|block| block.command.contains(PROGRAM) && block.exit_status.0.is_some())
+                    .expect("the finished block")
+                    .clone();
+                assert_eq!(
+                    block.exit_status.0.map(|status| status.get()),
+                    Some(127),
+                    "the status the shell holds for a program it cannot find ({}):\n{}",
+                    if handler.is_empty() {
+                        "its own words"
+                    } else {
+                        "a handler of the configuration's own"
+                    },
+                    session.terminal_output()
+                );
+                assert!(
+                    session.answered("kr-still-here"),
+                    "{}",
+                    session.terminal_output()
+                );
+                assert!(
+                    !session.terminal_output().contains("KalaReach"),
+                    "the shell's line is its own to report, and no KalaReach text is drawn:\n{}",
+                    session.terminal_output()
+                );
+            }
         },
     );
 }
