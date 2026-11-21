@@ -452,7 +452,8 @@ mod tests {
     /// nothing: the leader's number may be another process's. The unit holds the leader unreaped,
     /// and the wait is a stand-in that gives ECHILD once the pipes have closed. A process of the
     /// group that writes a line when it is asked to end has its trap set before the call begins; its
-    /// file is empty when the call returns, and the [`Leader`] ends the group after.
+    /// file is empty when the call returns. The unit sends no signal after: [`Held`] only waits for
+    /// the leader, and the processes of the group end by themselves.
     #[test]
     fn a_wait_that_fails_gives_its_error_and_no_signal_is_sent() {
         let place = tempfile::tempdir().expect("a directory");
@@ -472,20 +473,22 @@ mod tests {
             .stdin(Stdio::null());
         Group::prepare(&mut command);
         command.stdout(Stdio::piped());
-        let mut leader = Leader(Some(command.spawn().expect("a command")));
+        let mut leader = Held(command.spawn().expect("a command"));
         let until = Instant::now() + Duration::from_secs(30);
         while !ready.exists() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(20));
         }
         let set = ready.exists();
-        // The barrier is let go whatever came of the wait, so that a failed case leaves nothing.
+        // The barrier is let go whatever came of the wait, so that a failed case leaves nothing: the
+        // processes of the group end by themselves, the holder when the file exists and the other
+        // one in 20 s.
         std::fs::write(&release, "").expect("the release file");
         let deadline = Deadline {
             at: Instant::now() + Duration::from_secs(600),
             seconds: 600,
             budget: false,
         };
-        let waited = watch(leader.child(), deadline, |_| {
+        let waited = watch(&mut leader.0, deadline, |_| {
             Err(io::Error::from(rustix::io::Errno::CHILD))
         });
         let asked = std::fs::read_to_string(&marker).unwrap_or_default();
@@ -570,6 +573,18 @@ mod tests {
         leader.end(&mut pipes);
         assert!(queued, "the command wrote nothing");
         assert_eq!(pipes.into_captured().stdout, b"queued");
+    }
+
+    /// The leader of a group that a unit holds unreaped and only waits for: when it is dropped, at
+    /// the end of the unit or in a panic, [`Child::wait`] is the whole of its cleanup. It sends no
+    /// signal, so no path of the unit signals a group whose leader a call has reaped; a leader that
+    /// a call has reaped is not waited for again.
+    struct Held(Child);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let _ = self.0.wait();
+        }
     }
 
     /// The leader of a group a case started: owned until it is ended. [`Leader::end`] ends the group
