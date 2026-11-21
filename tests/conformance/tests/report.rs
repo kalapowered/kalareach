@@ -4314,10 +4314,11 @@ fn platform_drift(plan: &Plan) -> Result<(), String> {
         }
     }
 
-    // macOS: the workspace step leaves out what the workflow's macOS job leaves out, by name.
+    // macOS: the workspace's tests, which the job's two legs divide by package, leave out what the
+    // workflow's macOS job leaves out, by name.
     let workspace = workflow_commands("macos", "cargo test")
         .into_iter()
-        .find(|command| command.starts_with("cargo test --locked --workspace"))
+        .find(|command| command.starts_with("cargo test --locked ${{ matrix.packages }}"))
         .expect("the macOS job's workspace run");
     let mut left_out: Vec<String> = workspace
         .split_whitespace()

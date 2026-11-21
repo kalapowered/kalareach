@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       macos:
-        description: "Run the macOS jobs (macos, macos-demonstrations, macos-shipped-hold, macos-powershell, macos-shell-packages, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
+        description: "Run the macOS jobs (macos-tests-1, macos-tests-2, macos-demonstrations, macos-shipped-hold, macos-powershell, macos-shell-packages, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
         type: boolean
         default: true
       ios:
@@ -2865,21 +2865,63 @@ jobs:
     runs-on: macos-15
     strategy:
       fail-fast: false
-      # Two runners, one definition. They set up the same way and then divide the work, so that the
-      # tests and the demonstrations do not wait for one another: `tests` runs the lint and the
-      # workspace's tests, and `demonstrations` the end-to-end demonstrations and the performance
-      # measurements. A step that names neither part is both's.
+      # Three runners, one definition. They set up the same way and then divide the work, so that the
+      # two halves of the workspace's tests and the demonstrations do not wait for one another:
+      # `tests-1` and `tests-2` each run the tests of the packages their entry names, and
+      # `demonstrations` runs the end-to-end demonstrations and the performance measurements. The
+      # lint and the documentation are `tests-2`'s, and the cases that need another filesystem are
+      # `tests-1`'s. A step that names no part is every leg's. `cache` names the entry of the
+      # third-party build output a leg restores; the two test legs save theirs, and the
+      # demonstrations restore `tests-2`'s, which holds the packages they build. `minutes` is the
+      # limit of a test leg's Test step.
+      #
+      # The packages of the two test legs are the workspace's, less kr-sync-integration, every test
+      # of which is a leg against a live deployment, which the rust job runs. A package in both lists
+      # runs its tests twice and one in neither runs them in no leg, so
+      # `scripts/check-macos-test-division.py` fails each leg before its tests when the lists have
+      # either fault or name a package the workspace does not have, and a new crate has to be put in
+      # a list before the job passes.
+      #
+      # The division is by the minutes the test programs of each package took in the run of 20
+      # November, which ran the whole workspace in one step: 768 programs in 159 minutes, after 32
+      # minutes of build. kr-controller alone took 68 of them, kr-cli 25, companion-tauri 20 and
+      # kr-worker 18, and the other 43 packages 28 between them. `tests-1` has kr-controller, the
+      # four packages that hold the cases that need another filesystem (kr-changeset, kr-ipc,
+      # kr-project and kr-transfer) and five more, 86 minutes of those programs; `tests-2` has the
+      # other 37 packages, 73 minutes. Move a package between the lists by its minutes, and keep
+      # those four packages in `tests-1`.
       matrix:
         include:
-          - name: macos
-            part: tests
+          - name: macos-tests-1
+            part: tests-1
+            cache: macos-tests-1
+            minutes: 174
+            packages: >-
+              -p kr-changeset -p kr-client -p kr-conformance -p kr-controller -p kr-hook
+              -p kr-ipc -p kr-project -p kr-term -p kr-transfer -p kr-transport
+          - name: macos-tests-2
+            part: tests-2
+            cache: macos-tests-2
+            minutes: 158
+            packages: >-
+              -p companion-platform -p companion-preview -p companion-tauri -p kr-attention
+              -p kr-automation -p kr-backup-integration -p kr-cbor -p kr-cli -p kr-codex-stand-in
+              -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents
+              -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-keys -p kr-loopback -p kr-pairing
+              -p kr-perf -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime
+              -p kr-plugin-sdk -p kr-plugin-service -p kr-privacy-integration -p kr-protocol
+              -p kr-release -p kr-release-matrix-check -p kr-service-stand-in
+              -p kr-shell-integration -p kr-term-probe -p kr-test-artifacts -p kr-voice
+              -p kr-width -p kr-worker
           - name: macos-demonstrations
             part: demonstrations
+            cache: macos-tests-2
     # Every step has a limit of its own, and the limits add up to less than this one, so a step that
     # hangs is ended and the steps after it still report. A step that builds or runs tests, other
-    # than the measurement step, has a limit of at least twice the longest it has taken, so that
-    # its work can grow before the limit is reached. The measurement step's limit is set by its own
-    # waits. The job's own limit is under GitHub's six hours.
+    # than the measurement step and the Test step of the two test legs, has a limit of at least
+    # twice the longest it has taken, so that its work can grow before the limit is reached. The
+    # measurement step's limit is set by its own waits, and the Test step's by the budget its own
+    # comment gives. The job's own limit is under GitHub's six hours.
     timeout-minutes: 355
     # The launchd checks and the daemons the workspace's tests, the demonstrations and the
     # measurements start load jobs into the account's own launchd, and stand down with a printed
@@ -3009,11 +3051,11 @@ jobs:
         timeout-minutes: 10
         uses: ./.github/actions/cargo-cache-restore
         with:
-          name: macos
+          name: ${{ matrix.cache }}
 
-      # The release profile's third-party output apart from the debug profile's, which the other leg
-      # saves: this leg is the one that builds in release, and an entry of its own keeps the debug
-      # profile's output from being saved twice.
+      # The release profile's third-party output apart from the debug profile's, which the two test
+      # legs save: this leg is the one that builds in release, and an entry of its own keeps the
+      # debug profile's output from being saved twice.
       - name: Restore the release build output
         id: release-cache
         if: ${{ matrix.part == 'demonstrations' }}
@@ -3032,6 +3074,16 @@ jobs:
       - name: Build the test components
         timeout-minutes: 10
         run: bash scripts/build-plugin-fixtures.sh
+
+      # The two test legs' package lists against the workspace, before either leg's tests: the check
+      # is put through its own cases first, so that a pass says it can tell a package left out or
+      # named twice, and then run against the workspace.
+      - name: The two test legs hold every package once
+        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
+        timeout-minutes: 5
+        run: |
+          python3 scripts/check-macos-test-division.py self-test
+          python3 scripts/check-macos-test-division.py check --locked
 
       # A graphical login domain in which this account can bootstrap and start a job, in the
       # background domain as well, done here the way the host starts a worker for a desktop-bound
@@ -3090,20 +3142,21 @@ jobs:
       # From here each step runs whatever the one before it did, unless the job itself was
       # cancelled, so each reports its own result, and any one of them failing fails the job.
       - name: Clippy
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests-2' }}
         timeout-minutes: 30
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: What the disk holds after the lint
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests-2' }}
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the lint"
 
       # The rust job's documentation step for this platform's own code: a doc comment on an item
-      # only macOS compiles is read by this build and no other. The crates are that step's.
+      # only macOS compiles is read by this build and no other. The crates are that step's. The
+      # lint and this step are `tests-2`'s, whose test programs take the fewer minutes of the two.
       - name: Documentation without warnings
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests-2' }}
         timeout-minutes: 9
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -3119,7 +3172,7 @@ jobs:
             -p kr-transport -p kr-voice -p kr-worker
 
       - name: What the disk holds after the documentation
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests-2' }}
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the documentation"
@@ -3133,20 +3186,33 @@ jobs:
       #   has it, and its test step runs them.
       # - The cases that need another filesystem, which the step after this one runs.
       #
-      # The step builds the workspace's tests and then runs them, and it grows with the tests. On a
-      # hosted runner it has taken 108 to 141 minutes when it passed, and on a runner 15 to 30 per
-      # cent slower in every suite it ran into a limit of 145 minutes with 38 suites not started.
-      # Its limit is 197 minutes: the limits of the part add up to 351 of the job's 355 minutes.
-      # That is under twice the longest it has taken.
+      # Each leg runs the packages its matrix entry names. The step builds their tests and then runs
+      # them, and it grows with the tests. Before the split one step did both for the whole
+      # workspace: it took 172 minutes in a run on main and 190 in the run of 20 November (32 to
+      # build and 157 to run the 768 test programs, from the times of that run's log), and on 21
+      # November it ran into its limit of 197 minutes. A leg's figure is its share of those 157
+      # minutes (86 of the 159 that the programs took for `tests-1`, 73 for `tests-2`) and the 32
+      # minutes of the whole build, which a leg's own build cannot exceed: 118 minutes for `tests-1`
+      # and 105 for `tests-2`. The limits are 174 and 158 minutes, about half as much again, and
+      # the limits of each leg add up to 300 of the job's 355 minutes.
+      #
+      # The Codex stand-in is the one program the suites of `tests-1` start that its packages do not
+      # build: the controller's and the forwarder's gateway suites find it beside their own test
+      # programs, and `tests-2` has the package it comes from.
+      - name: Build the Codex stand-in the gateway suites start
+        if: ${{ !cancelled() && matrix.part == 'tests-1' }}
+        timeout-minutes: 10
+        run: cargo build --locked -p kr-codex-stand-in
+
       - name: Test
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 197
+        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
+        timeout-minutes: ${{ matrix.minutes }}
         env:
           # The terminfo checks that run tmux and tic stand down with a printed reason where the
           # host has none. Here a missing tmux or tic fails them.
           KR_REQUIRE_MULTIPLEXERS: "1"
         run: >-
-          cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
+          cargo test --locked ${{ matrix.packages }} --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
           --skip a_running_container_is_observed_as_running_and_a_stopped_one_as_stopped
           --skip a_reused_container_name_is_not_the_identity_that_was_enrolled
@@ -3175,7 +3241,7 @@ jobs:
       # the step needs: the cases that stage a release refuse to start with less than their own
       # margin to spare.
       - name: What the disk holds after the workspace's tests
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the workspace's tests"
@@ -3193,8 +3259,11 @@ jobs:
       # temporary directory is a volume of its own, added to the startup disk's container for the
       # step and deleted after it: internal rather than removable, and another filesystem from
       # /private/tmp.
+      #
+      # The cases are in four packages, which `tests-1` holds and this step is the only one to run
+      # here, so the step builds the tests of those four and no other.
       - name: The cases that need another filesystem
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests-1' }}
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -3280,7 +3349,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$volume"
           diskutil info "$volume" | grep -E 'Device Identifier|Mount Point|Owners|Removable Media|Device Location' || true
           echo "device of /private/tmp: $(stat -f %d /private/tmp); of $volume: $(stat -f %d "$volume")"
-          TMPDIR="$volume" cargo test --locked --workspace --exclude kr-sync-integration \
+          TMPDIR="$volume" cargo test --locked -p kr-changeset -p kr-ipc -p kr-project -p kr-transfer \
             --lib --test capture --test locations --test authority --test filesystems \
             --test workspaces --test apply --test volumes -- \
             --exact --show-output --test-threads=1 "${cases[@]}" 2>&1 | tee "$log"
@@ -3296,7 +3365,7 @@ jobs:
           done
 
       - name: What the disk holds after the cases that need another filesystem
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && matrix.part == 'tests-1' }}
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the cases that need another filesystem"
@@ -3390,7 +3459,7 @@ jobs:
       # What the disk had left once every step above was done, and for the tests the lowest free
       # space of every stretch of the job.
       - name: What the disk has left
-        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh end "what the disk has left"
@@ -3402,7 +3471,7 @@ jobs:
         run: bash scripts/disk-report.sh report "what the disk has left"
 
       - name: Save the cargo cache
-        if: ${{ success() && matrix.part == 'tests' }}
+        if: ${{ success() && startsWith(matrix.part, 'tests') }}
         timeout-minutes: 15
         uses: ./.github/actions/cargo-cache-save
         with:
