@@ -4153,6 +4153,23 @@ fn launch_vector_drew(
     prompt_seed: u8,
     transaction_seed: u8,
 ) -> bool {
+    let before_install = launch_vector_installed(session, vector, prompt_seed, transaction_seed);
+    session
+        .drew_after(before_install, expected, REPLY)
+        .was_drawn()
+}
+
+/// Installs `vector` through a launch at a fenced empty prompt, waits for the shell to accept the
+/// line and the editor to leave, and says how much the terminal had shown before the line was
+/// installed.
+///
+/// A launch the reader refuses is a fault of the case, which is stopped there.
+fn launch_vector_installed(
+    session: &mut Session,
+    vector: Vec<String>,
+    prompt_seed: u8,
+    transaction_seed: u8,
+) -> usize {
     let (enter, fence) = session.fenced_prompt(prompt_seed);
     let before_install = session.written();
     let decision = session.launched(LaunchMailboxRequest {
@@ -4176,9 +4193,7 @@ fn launch_vector_drew(
     session.expect_event("editor_leave", |event| {
         matches!(event, BridgeEvent::EditorLeave(_))
     });
-    session
-        .drew_after(before_install, expected, REPLY)
-        .was_drawn()
+    before_install
 }
 
 /// KR-REQ-23.54: a launch is quoted for the shell that reads it and is never evaluated.
@@ -7273,10 +7288,13 @@ const FISH_NOT_FOUND_HANDLER: &str =
 
 /// KR-REQ-13.11: a program the shell cannot find is the shell's own business at the prompt, in
 /// Bash, Zsh and Fish. The line runs, the shell finishes it with its status 127, which is its own
-/// for a command it did not find, and the shell is at a prompt after it. No KalaReach text is drawn.
+/// for a command it did not find, and the shell is at a prompt after it. The shell's own message
+/// names the program, and no KalaReach text is drawn anywhere in the output, startup text included.
 ///
-/// The shell's words are not asserted: a host's own configuration may print others, which Fish is
-/// run with as well, and the line the editor accepted names the program.
+/// The words of the message are not asserted: a host's own configuration may print others, which
+/// Fish is run with as well. What is read is the text drawn after the line ran, which names the
+/// program in the words of each; the line's own echo and the title and mark sequences are left
+/// out, since they name the program whether or not the shell says anything.
 pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish(
     kind: ShellKind,
 ) {
@@ -7300,11 +7318,8 @@ pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and
                         ..Profile::ORDINARY
                     },
                 );
-                assert!(
-                    launch_vector_drew(&mut session, vec![PROGRAM.to_owned()], PROGRAM, 25, 0x7a,),
-                    "the launch of a program the shell cannot find was not accepted:\n{}",
-                    session.terminal_output()
-                );
+                let before_line =
+                    launch_vector_installed(&mut session, vec![PROGRAM.to_owned()], 25, 0x7a);
                 let finished = |commands: &Commands| {
                     commands.blocks.iter().any(|block| {
                         block.command.contains(PROGRAM) && block.exit_status.0.is_some()
@@ -7337,6 +7352,13 @@ pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and
                     "{}",
                     session.terminal_output()
                 );
+                let drawn = drawn_while_the_line_ran(&session.terminal_output(), before_line);
+                assert!(
+                    drawn.contains(PROGRAM),
+                    "the shell drew no message that names the program after the line ran; \
+                     what was drawn after it ran:\n{drawn:?}\nthe whole output:\n{}",
+                    session.terminal_output()
+                );
                 assert!(
                     !session.terminal_output().contains("KalaReach"),
                     "the shell's line is its own to report, and no KalaReach text is drawn:\n{}",
@@ -7345,6 +7367,43 @@ pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and
             }
         },
     );
+}
+
+/// The text the terminal drew while the line installed after `from` ran: what comes after the
+/// point where the shell took the line to run it, with every operating system command left out.
+///
+/// The shell takes the line when it ends the editor's bracketed paste mode, and Fish also marks
+/// the start of the line's output; the later of the two is where the line's own echo ends. The
+/// title that Fish sets and the `cmdline_url` of its mark are operating system commands, and they
+/// name the program whether or not the shell says anything about it, so a reading that kept them
+/// would find the program in a shell that printed nothing.
+fn drawn_while_the_line_ran(output: &str, from: usize) -> String {
+    const MARK: &str = "\x1b]133;C";
+    const PASTE_OFF: &str = "\x1b[?2004l";
+    let after = output
+        .get(from..)
+        .expect("the output before the line was installed is text up to a character boundary");
+    let mark = after.find(MARK);
+    let paste_off = after.find(PASTE_OFF).map(|at| at + PASTE_OFF.len());
+    let Some(started) = mark.max(paste_off) else {
+        return String::new();
+    };
+    let mut kept = String::new();
+    let mut rest = &after[started..];
+    while let Some(at) = rest.find("\x1b]") {
+        kept.push_str(&rest[..at]);
+        let body = &rest[at + 2..];
+        // An operating system command ends at a bell or at a string terminator.
+        let (stop, width) = match (body.find('\x07'), body.find("\x1b\\")) {
+            (Some(bell), Some(terminator)) if bell < terminator => (bell, 1),
+            (_, Some(terminator)) => (terminator, 2),
+            (Some(bell), None) => (bell, 1),
+            (None, None) => (body.len(), 0),
+        };
+        rest = &body[stop + width..];
+    }
+    kept.push_str(rest);
+    kept
 }
 
 /// Says that the shell's own history holds `line` whole, by a command that prints a word only when
