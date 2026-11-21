@@ -1682,6 +1682,9 @@ fn a_set_aside_waits_for_the_ledgers_file_lock() {
 fn a_set_aside_with_no_message_directory_keeps_its_flush_owed() {
     let data = data();
     let window = Window::over(data.path());
+    // The draft store is open before the refusal is made, so that only the proof of the data
+    // directory can refuse the later read.
+    window.drafts().expect("the drafts are read once");
     std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
     let _clock = testing::clock(data.path(), 11);
     let slot = Arc::new(Mutex::new(None));
@@ -1793,6 +1796,11 @@ fn a_set_aside_refuses_while_an_entrys_name_is_not_proved_durable() {
 fn another_state_proves_a_set_aside_durable_before_it_reads_with_no_message_folder() {
     let data = data();
     let first = Window::over(data.path());
+    let second = Window::over(data.path());
+    // Each state has opened the draft store before the refusal is made, so that only the proof of
+    // the data directory can refuse the second state's read.
+    first.drafts().expect("the first state reads once");
+    second.drafts().expect("the second state reads once");
     std::fs::write(data.path().join("drafts-removals"), b"not a list").expect("a damaged list");
     let slot = Arc::new(Mutex::new(None));
     let hold_slot = Arc::clone(&slot);
@@ -1808,7 +1816,6 @@ fn another_state_proves_a_set_aside_durable_before_it_reads_with_no_message_fold
     drop(at);
     assert_eq!(done["moved"], true, "{done}");
     assert_eq!(done["confirmed"], false, "{done}");
-    let second = Window::over(data.path());
     {
         let refusal = (second.drafts()).clone().expect_err("the read is refused");
         assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
@@ -2175,6 +2182,9 @@ fn the_lock_file_of_the_folder_holds_a_keep_a_repair_a_removal_and_a_listing_bac
 fn a_read_that_waited_for_a_set_aside_settles_the_flush_it_owes() {
     let data = data();
     let window = Window::over(data.path());
+    // The draft store is open before the refusal is made, so that only the flush the set-aside
+    // owes can refuse the read.
+    window.drafts().expect("the drafts are read once");
     std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
     let _clock = testing::clock(data.path(), 13);
     let (hook, reached, release) = a_wait();
@@ -2220,4 +2230,132 @@ fn a_read_that_waited_for_a_set_aside_settles_the_flush_it_owes() {
     slot.lock().expect("a lock").take();
     let again = window.drafts();
     assert!(again.is_ok(), "the read answers once the flush is made");
+}
+
+/// KR-REQ-12.26: a read over a data directory that does not exist yet makes it, as the draft store
+/// does, and answers; the durability proof does not refuse a directory that is only not there yet.
+#[test]
+fn a_read_over_a_data_directory_that_does_not_exist_yet_makes_it_and_answers() {
+    let root = data();
+    let fresh = root.path().join("not-yet-made");
+    let window = Window::over(&fresh);
+    let read = window.drafts();
+    assert!(
+        read.as_ref()
+            .is_ok_and(|answer| answer["ledger"] == "ok" && answer["sources"] == "known"),
+        "the read answers over a directory that is made now: {read:?}"
+    );
+    assert!(fresh.is_dir(), "the data directory is made");
+}
+
+const CHILD_DATA: &str = "CHANNEL_MESSAGES_TEST_CHILD_DATA";
+const CHILD_SIGNALS: &str = "CHANNEL_MESSAGES_TEST_CHILD_SIGNALS";
+const CHILD_CASE: &str = "the_second_process_of_the_cross_process_case_does_nothing_by_itself";
+
+/// Waits for a file that another process makes.
+fn file_appears(path: &Path, limit: Duration) -> bool {
+    let end = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < end {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    path.exists()
+}
+
+/// A second process of this test program, ended when it is dropped.
+struct Process(std::process::Child);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The second process of `a_read_with_no_folder_of_messages_holds_the_ledger_lock_against_another_process`.
+/// It is a test of this program so that the program can start itself, and it does nothing unless the
+/// case that starts it names the directories. It reads the drafts of a data directory that has no
+/// folder of messages, stops after the read has proved the directory durable, and goes on when the
+/// case says so.
+#[test]
+fn the_second_process_of_the_cross_process_case_does_nothing_by_itself() {
+    let (Ok(data), Ok(signals)) = (std::env::var(CHILD_DATA), std::env::var(CHILD_SIGNALS)) else {
+        return;
+    };
+    let (data, signals) = (PathBuf::from(data), PathBuf::from(signals));
+    let window = Window::over(&data);
+    let own = signals.clone();
+    let _stopped = testing::at(dir(&data), Point::AbsentProved, move || {
+        std::fs::write(own.join("proved"), b"")?;
+        let _ = file_appears(&own.join("go"), WAIT * 3);
+        Ok(())
+    });
+    let answered = window.drafts();
+    let note = json!({
+        "answered": answered.is_ok(),
+        "ledger": answered.as_ref().map_or(Value::Null, |read| read["ledger"].clone()),
+    });
+    std::fs::write(signals.join("read"), note.to_string()).expect("the note of the read");
+}
+
+/// KR-REQ-12.26: a read with no folder of messages holds the ledger's lock from the proof of the
+/// data directory to the read of the drafts, against another PROCESS: a set-aside there waits until
+/// the read has ended, and the read saw the list as it was before the set-aside. The case starts a
+/// second process of this program, which stops after its proof, because two windows of one process
+/// share the gates and cannot tell this lock from them.
+#[test]
+fn a_read_with_no_folder_of_messages_holds_the_ledger_lock_against_another_process() {
+    let data = data();
+    let signals = PrivateTempDir::create();
+    std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
+    let reader = Process(
+        std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args(["--exact", CHILD_CASE, "--test-threads", "1"])
+            .env(CHILD_DATA, data.path())
+            .env(CHILD_SIGNALS, signals.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a second process"),
+    );
+    assert!(
+        file_appears(&signals.path().join("proved"), WAIT * 2),
+        "the second process reached the point after its proof"
+    );
+    let set_aside = on_thread(data.path(), |window| {
+        window.call("device_drafts_ledger_set_aside", json!(null))
+    });
+    assert!(
+        set_aside.recv_timeout(SHORT).is_err(),
+        "a set-aside in another process waits while the read holds the ledger's lock"
+    );
+    assert_eq!(
+        ledger_bytes(data.path()),
+        Some(b"[ truncated".to_vec()),
+        "the list is as it was"
+    );
+    std::fs::write(signals.path().join("go"), b"").expect("let the read go on");
+    let moved = set_aside.recv_timeout(WAIT).expect("the set-aside ends");
+    assert!(
+        moved
+            .as_ref()
+            .is_ok_and(|done| done["moved"] == true && done["confirmed"] == true),
+        "the set-aside runs once the read has ended: {moved:?}"
+    );
+    assert!(
+        file_appears(&signals.path().join("read"), WAIT),
+        "the second process ended its read"
+    );
+    let note: Value = serde_json::from_slice(
+        &std::fs::read(signals.path().join("read")).expect("the note of the read"),
+    )
+    .expect("a note");
+    assert_eq!(note["answered"], true, "{note}");
+    assert_eq!(
+        note["ledger"], "damaged",
+        "the read saw the list before the set-aside: {note}"
+    );
+    drop(reader);
 }
