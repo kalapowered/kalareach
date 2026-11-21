@@ -2090,3 +2090,108 @@ async fn kr_req_23_41_the_wait_for_a_lost_create_runs_out_and_the_draft_is_made_
     );
     adopted.stop().await;
 }
+
+/// A prompt that names `draft_id`, for the agent `instance` of `session`, as the page sends it.
+fn draft_prompt(
+    session: kr_protocol::ids::SessionId,
+    instance: kr_protocol::ids::ApplicationInstanceId,
+    draft_id: kr_protocol::ids::DraftId,
+) -> Value {
+    serde_json::to_value(kr_protocol::agent::AgentPromptParams {
+        target: kr_protocol::agent::AgentMutationTarget {
+            subject: kr_worker::broker::subject(session, instance),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+        },
+        draft_id: Nullable::some(draft_id),
+        text: Nullable::null(),
+    })
+    .expect("encodes")
+}
+
+fn made_draft(bound: &Value) -> kr_protocol::ids::DraftId {
+    serde_json::from_value(bound["value"]["draftId"].clone()).expect("a draft id")
+}
+
+/// KR-REQ-23.41: a prompt that names the draft, sent to a live agent over the paired door, ends what
+/// this device kept of the draft only when the host applied it and only for the draft the entry is
+/// for. An outcome nobody can establish leaves the draft where it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_draft_prompt_to_a_live_agent_ends_the_kept_draft_only_when_applied_for_that_draft()
+ {
+    let adopted = Adopted::start(3).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let held = Arc::new(net_support::worker::HeldUpstream::default());
+    let taken = [
+        Arc::new(net_support::worker::Upstream::default()),
+        Arc::new(net_support::worker::Upstream::default()),
+    ];
+    let instances = [
+        adopted.workers[0].register_agent_on(Arc::clone(&held) as _),
+        adopted.workers[1].register_agent_on(Arc::clone(&taken[0]) as _),
+        adopted.workers[2].register_agent_on(Arc::clone(&taken[1]) as _),
+    ];
+    let sessions = [
+        adopted.workers[0].session_id,
+        adopted.workers[1].session_id,
+        adopted.workers[2].session_id,
+    ];
+    // The page opens each session's screen first, and sends the prompt under that opening.
+    for session in sessions {
+        companion
+            .call(
+                "session_open",
+                json!({ "sessionId": session.to_string(), "grantId": null, "opening": "screen" }),
+            )
+            .expect("the session opens");
+    }
+    let prompt_for = |at: usize, draft_id| {
+        companion.call(
+            "agent_prompt_submit",
+            json!({
+                "params": draft_prompt(sessions[at], instances[at], draft_id),
+                "opening": "screen",
+            }),
+        )
+    };
+
+    // An outcome nobody can establish: the agent has the prompt and nothing says it was applied.
+    let unknown = made_draft(&bind(companion, sessions[0], &handed(companion)).expect("a bind"));
+    let answer = prompt_for(0, unknown).expect("an outcome nobody can establish is an answer");
+    assert!(answer["value"].is_null(), "{answer}");
+    let stays = kept(companion, sessions[0]);
+    assert_eq!(stays["made"], true, "the draft stays: {stays}");
+    assert_eq!(stays["draftId"], unknown.to_string());
+
+    // A prompt the host applied for the kept draft ends what is kept of it.
+    let used = made_draft(&bind(companion, sessions[1], &handed(companion)).expect("a bind"));
+    prompt_for(1, used).expect("the prompt is applied");
+    assert_eq!(taken[0].prompts().len(), 1, "the agent has the prompt");
+    assert_eq!(
+        kept(companion, sessions[1])["made"],
+        false,
+        "the entry of a draft that was sent ends"
+    );
+
+    // A prompt for another draft than the one kept leaves the entry: the host applies it for the
+    // draft it names, and the entry is for a later draft.
+    let named = made_draft(&bind(companion, sessions[2], &handed(companion)).expect("a bind"));
+    let later = kr_protocol::ids::DraftId::new(kr_ipc::new_uuid());
+    companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts()
+        .keep_for_test(
+            &paired_of(companion),
+            sessions[2],
+            &net_support::on_the_session(&adopted.host, sessions[2]),
+            Some(later),
+            Some(kr_protocol::ids::DraftRevision::new(1)),
+        );
+    prompt_for(2, named).expect("the prompt is applied");
+    assert_eq!(taken[1].prompts().len(), 1);
+    let entry = kept(companion, sessions[2]);
+    assert_eq!(entry["draftId"], later.to_string(), "{entry}");
+    held.release();
+    adopted.stop().await;
+}
