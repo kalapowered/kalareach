@@ -22,7 +22,8 @@ use kr_protocol::receipt::ActionReadParams;
 use kr_protocol::scalars::{Nullable, Uuid};
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
-    DraftAttachment, DraftCreateParams, DraftCreateResult, DraftDiscardParams,
+    DraftAttachment, DraftCreateParams, DraftCreateResult, DraftDiscardParams, DraftUpdateParams,
+    DraftUpdateResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,13 @@ pub const UPDATE_THE_HOST: &str =
 /// What a bind is told when the session or the draft is gone on the host.
 pub const GONE: &str =
     "the session or the draft this file was for is gone on the host: the file was not added to it";
+
+/// What a text is told when the session or the draft it was for is gone on the host.
+pub const GONE_FOR_TEXT: &str =
+    "the session or the draft this message was for is gone on the host: the message was not sent";
+
+/// What a text is told when this device keeps no draft for the session.
+pub const NO_DRAFT: &str = "this device keeps no draft for this session: add a file to it first";
 
 const EXTENSION: &str = "draft";
 
@@ -109,6 +117,18 @@ pub struct Bound {
     pub revision: DraftRevision,
     /// The binding.
     pub attachment: DraftAttachment,
+}
+
+/// What a text update answers: the draft after it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Updated {
+    /// The draft.
+    pub draft_id: DraftId,
+    /// Its revision after the update.
+    pub revision: DraftRevision,
+    /// The text the host holds, from its answer.
+    pub text: String,
 }
 
 /// What `draft_create` answers on a paired host: the draft this device keeps for the session.
@@ -358,6 +378,98 @@ impl Drafts {
         }
         Err(CommandError::unavailable(
             "the draft changed again while the file was being added: the file was not added",
+        ))
+    }
+
+    /// Sets the text of the draft kept for the session, with `draft.update` at the kept revision.
+    ///
+    /// The prompt that names a draft carries no text of its own, so the draft holds what the person
+    /// typed. A stale revision is read from the host's own words and the update goes on once; a
+    /// lost answer leaves the revision unknown, and the draft is ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NO_DRAFT`] when no draft is kept for the session, [`GONE_FOR_TEXT`] when the host
+    /// has no such session or draft, and the host's refusal otherwise.
+    pub async fn set_text(
+        &self,
+        paired: Paired,
+        target: ActionTarget,
+        session_id: SessionId,
+        text: String,
+    ) -> Result<Updated> {
+        let Some(mut file) = self.read(&paired, session_id)? else {
+            return Err(CommandError::refused(NO_DRAFT));
+        };
+        if file.discard_action.is_some() || file.draft_id.is_none() {
+            return Err(CommandError::refused(NO_DRAFT));
+        }
+        for attempt in 0..2 {
+            let (Some(draft_id), Some(expected_revision)) = (file.draft_id, file.revision) else {
+                break;
+            };
+            let asked = paired
+                .session
+                .mutate(
+                    Method::DraftUpdate,
+                    target.clone(),
+                    None,
+                    &NoPreconditions {},
+                    &DraftUpdateParams {
+                        draft_id,
+                        expected_revision,
+                        text: text.clone(),
+                    },
+                    MUTATION_TTL,
+                )
+                .await;
+            match asked {
+                Ok(settled) => {
+                    let result: DraftUpdateResult = settled.to_typed()?;
+                    file.revision = Some(result.draft.revision);
+                    self.write(&paired, &file)?;
+                    return Ok(Updated {
+                        draft_id,
+                        revision: result.draft.revision,
+                        text: result.draft.text,
+                    });
+                }
+                Err(error) if error.code() == ErrorCode::DraftConflict && attempt == 0 => {
+                    let message = match &error {
+                        ClientError::Host(refused) => refused.message.clone(),
+                        ClientError::Refused { error, .. } => error.message.clone(),
+                        other => other.to_string(),
+                    };
+                    if let Some(revision) = revision_in(&message) {
+                        file.revision = Some(revision);
+                        self.write(&paired, &file)?;
+                    } else {
+                        // The host's words do not carry the revision: the draft is ended.
+                        file.revision = None;
+                        self.write(&paired, &file)?;
+                        let _ = self.finish_ending(&paired, &target, &mut file).await;
+                        return Err(error.into());
+                    }
+                }
+                Err(error) if unknown_draft(&error) => {
+                    self.remove(&paired, session_id);
+                    return Err(CommandError::refused(GONE_FOR_TEXT));
+                }
+                Err(
+                    error
+                    @ (ClientError::SubmissionUncertain { .. } | ClientError::ConnectionEnded),
+                ) => {
+                    // The answer is lost: the revision is not known, so the draft is ended.
+                    file.revision = None;
+                    self.write(&paired, &file)?;
+                    let _ = self.finish_ending(&paired, &target, &mut file).await;
+                    return Err(error.into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(CommandError::unavailable(
+            "the draft changed again while the message was being set: the message was not sent",
         ))
     }
 

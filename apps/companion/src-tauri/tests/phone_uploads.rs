@@ -370,6 +370,45 @@ async fn kr_req_13_12_a_cancel_shows_the_released_bytes_from_the_answer() {
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12: the open view names the session an upload is for, so that a restart can show a
+/// kept upload on its own session's composer, and says so with no session for one that has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_the_open_view_names_the_session_the_file_is_for() {
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let session = adopted.workers[0].session_id;
+    let desk = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .transfers();
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let sent = Request {
+        session_id: Some(session),
+        target: net_support::on_the_session(&adopted.host, session),
+        ..request(&adopted, &bytes, content, key)
+    };
+    let paired = paired_of(companion);
+    let sending = tokio::spawn(async move { desk.send(paired, sent).await });
+    gate.reached().await;
+
+    let listed = open(companion);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["key"], key.to_string());
+    assert_eq!(
+        listed[0]["sessionId"],
+        session.to_string(),
+        "the view names the session: {}",
+        listed[0]
+    );
+    gate.release();
+    let _ = companion.call("upload_cancel", json!({ "transferKey": key.to_string() }));
+    let _ = sending.await;
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12: a connection that ends pauses the upload, and the next one resumes it under the
 /// same transfer with the content the process holds: the call that began it gets the handle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1072,5 +1111,109 @@ async fn kr_req_23_41_a_start_ends_the_drafts_of_sessions_the_host_no_longer_lis
     assert_eq!(kept(companion, gone)["made"], true);
     drafts.sweep_after_reach(paired).await;
     assert_eq!(kept(companion, gone)["made"], false);
+    adopted.stop().await;
+}
+
+/// Sets the text of the draft kept for `session`, as the page does before it sends the prompt that
+/// names the draft.
+fn set_text(
+    companion: &Companion,
+    session: kr_protocol::ids::SessionId,
+    text: &str,
+) -> Result<Value, Value> {
+    companion.call(
+        "draft_set_text",
+        json!({
+            "subject": on_session(session),
+            "sessionId": session.to_string(),
+            "text": text,
+        }),
+    )
+}
+
+/// KR-REQ-23.41: the text the person typed reaches the draft the files are bound to, at the
+/// revision this device keeps, and each answer moves the kept revision on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_the_text_reaches_the_draft_at_the_kept_revision() {
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let session = adopted.workers[0].session_id;
+    let first = bind(companion, session, &handed(companion)).expect("the first bind");
+    assert_eq!(first["value"]["revision"], "2", "{first}");
+
+    let one = set_text(companion, session, "first words").expect("the text is set");
+    assert_eq!(one["text"], "first words", "the host holds it: {one}");
+    assert_eq!(one["revision"], "3", "{one}");
+    assert_eq!(one["draftId"], first["value"]["draftId"], "{one}");
+    let two = set_text(companion, session, "other words").expect("the text is set again");
+    assert_eq!(two["text"], "other words", "{two}");
+    assert_eq!(two["revision"], "4", "{two}");
+    assert_eq!(kept(companion, session)["revision"], "4");
+    adopted.stop().await;
+}
+
+/// KR-REQ-23.41: a text update at a stale revision takes the revision from the host's words and
+/// goes on once, and the draft is neither ended nor made again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_stale_revision_of_a_text_update_is_taken_from_the_message() {
+    use kr_protocol::ids::{DraftId, DraftRevision};
+    use kr_protocol::method::Method;
+    use kr_protocol::transfer::{DraftUpdateParams, DraftUpdateResult};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let session = adopted.workers[0].session_id;
+    let first = bind(companion, session, &handed(companion)).expect("the first bind");
+    let draft_id: DraftId = first["value"]["draftId"]
+        .as_str()
+        .expect("a draft")
+        .parse()
+        .expect("an identifier");
+    let paired = paired_of(companion);
+    let _: DraftUpdateResult = paired
+        .session
+        .mutate(
+            Method::DraftUpdate,
+            net_support::on_the_session(&adopted.host, session),
+            None,
+            &json!({}),
+            &DraftUpdateParams {
+                draft_id,
+                expected_revision: DraftRevision::new(2),
+                text: "moved".to_owned(),
+            },
+            kr_protocol::scalars::DurationMs::new(60_000),
+        )
+        .await
+        .expect("the draft moves")
+        .to_typed()
+        .expect("a result");
+
+    let set = set_text(companion, session, "mine").expect("the update goes on");
+    assert_eq!(set["draftId"], first["value"]["draftId"], "{set}");
+    assert_eq!(set["revision"], "4", "{set}");
+    assert_eq!(set["text"], "mine", "{set}");
+    assert_eq!(kept(companion, session)["revision"], "4");
+    adopted.stop().await;
+}
+
+/// KR-REQ-23.41: a text for a session this device keeps no draft for is refused in words, and
+/// makes no draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_text_with_no_kept_draft_is_refused_in_words() {
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let session = adopted.workers[0].session_id;
+
+    let refused = set_text(companion, session, "words").expect_err("there is no draft to set");
+    assert_eq!(
+        refused["message"],
+        companion_tauri::paired_drafts::NO_DRAFT,
+        "{refused}"
+    );
+    assert_eq!(kept(companion, session)["made"], false);
     adopted.stop().await;
 }

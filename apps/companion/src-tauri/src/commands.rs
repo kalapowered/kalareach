@@ -105,6 +105,8 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ),
     // The draft this device keeps for a session on a paired host ends when the composer drops it.
     ("draft_end", None),
+    // The text a draft on a paired host holds, which the prompt that names the draft sends.
+    ("draft_set_text", None),
     ("attachment_upload", Some(Method::UploadBegin)),
     ("attachment_upload_bytes", Some(Method::UploadBegin)),
     ("attachment_upload_status", Some(Method::UploadStatus)),
@@ -629,6 +631,8 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     ),
     // A draft kept on a paired host is ended by the host's own method.
     ("draft_end", &[Method::DraftDiscard]),
+    // The text of that draft is set by the host's own method.
+    ("draft_set_text", &[Method::DraftUpdate]),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -675,6 +679,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         draft_create,
         draft_add_attachment,
         draft_end,
+        draft_set_text,
         attachment_upload,
         attachment_upload_bytes,
         attachment_upload_status,
@@ -1769,6 +1774,37 @@ mutate_result_command!(
     session_create, Method::SessionCreate, kr_protocol::session::SessionCreateParams
         => kr_protocol::session::SessionCreateResult
 );
+/// Sets the text of the draft this device keeps for a session on the host it is paired with, so
+/// that the prompt that names the draft sends it.
+#[tauri::command]
+pub async fn draft_set_text(
+    state: State<'_, AppState>,
+    subject: Subject,
+    session_id: String,
+    text: String,
+) -> Result<Value> {
+    let session_id = session_id
+        .parse()
+        .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
+    let (device_id, environment_id, session) = state.paired_snapshot()?;
+    let target = subject.target(environment_id)?;
+    encode(
+        &state
+            .paired_drafts()
+            .set_text(
+                crate::open_transfers::Paired {
+                    device_id,
+                    environment_id,
+                    session,
+                },
+                target,
+                session_id,
+                text,
+            )
+            .await?,
+    )
+}
+
 session_mutate_command!(
     /// Closes a session, after the interface has shown what closing does.
     ///
