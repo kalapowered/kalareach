@@ -52,6 +52,9 @@ tokio.workspace = true
 rustix = { workspace = true, features = ["fs", "net", "process", "termios"] }
 
 [dev-dependencies]
+# A runtime whose clock is paused, so that a case reads a bound off the runtime's clock and not off
+# the time the machine took.
+tokio = { workspace = true, features = ["test-util"] }
 # The keys and expiry a test signs a catalogue generation of its own with, through the catalogue's
 # own generation builder, and the connector package the host reads.
 aws-lc-rs.workspace = true

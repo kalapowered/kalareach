@@ -5720,8 +5720,14 @@ fn a_request_the_terminal_was_asked_for_twice_is_counted_twice_though_the_screen
 /// it is returned or says why.
 #[test]
 fn a_connection_that_would_finish_late_fails_within_the_bound_the_restart_gave_it() {
-    let runtime = runtime();
-    let started = Instant::now();
+    // The runtime's clock is paused: the connection's three seconds and the bound's 200 ms are
+    // both read off a clock only the runtime moves, so a delay of the machine moves neither.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .expect("a runtime with a clock of its own");
+    let started = runtime.block_on(async { tokio::time::Instant::now() });
     let late = within(
         &runtime,
         Duration::from_millis(200),
@@ -5731,12 +5737,12 @@ fn a_connection_that_would_finish_late_fails_within_the_bound_the_restart_gave_i
             Ok::<_, String>(1)
         },
     );
+    let waited = runtime.block_on(async { started.elapsed() });
     let said = late.expect_err("a connection that finishes after the bound fails");
     assert!(said.contains("did not finish within"), "{said}");
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the failure came at the bound, not when the connection would have finished: {:?}",
-        started.elapsed()
+        waited < Duration::from_secs(1),
+        "the failure came at the bound, not when the connection would have finished: {waited:?}"
     );
     assert_eq!(
         within(&runtime, Duration::from_secs(5), "the connection", async {
