@@ -3608,11 +3608,13 @@ take or wait for. Sent, orphaned and spent drafts stay in the journal and the bo
 them, so a device can hold more than 64 drafts in all. Each `draft.update` adds one row
 to the journal's events and a receipt that holds the updated draft for the de-duplication window.
 
-A phone sends its files to this host through the four upload methods and keeps one draft for each
+A phone sends its files to this host through the five upload methods and keeps one draft for each
 session with `draft.create` at the first bind, `draft.update` for its text and `draft.discard` when
 it drops its files; the phone's own half is described in `docs/transfer`. The host sees nothing of
 a phone's store: a phone that restarts reads `upload.status` and goes on, or cancels, and an upload
-whose reservation the phone lost the answer to is held until this host's 24-hour sweep releases it.
+whose reservation the phone lost the answer to is held, if the host agreed to it, until this host's
+24-hour sweep releases it.
+
 `draft.discard` ends a draft of the device's own that it no longer uses. It names the draft and no
 revision, so a device that has lost the revision it last saw can still end it. One transaction under
 the journal's write lock revokes the read grants of the draft's attachments and deletes the draft,
