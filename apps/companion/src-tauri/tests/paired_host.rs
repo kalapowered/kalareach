@@ -1633,6 +1633,10 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
     pair(&phone, &other, &owner, &[ActionRight::SessionView]).await;
     connection(companion, true).await;
     companion.told_everything().await;
+    let other_pairing = companion
+        .device()
+        .host_by_reference(&the_host(companion))
+        .expect("the pairing with the other host is listed");
     // The pairing with the first host that a second pairing commits: the same host, and another
     // identity this device has with it. A host does not pair an endpoint it holds a second time, so
     // only this record is written.
@@ -1650,9 +1654,10 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
         .expect("the pairing is recorded again");
     let before = state.connection_state();
     let in_use = companion.device().host_in_use().map(|host| host.device_id);
-    assert!(
-        in_use.is_some(),
-        "a host is selected and its use is recorded"
+    assert_eq!(
+        in_use,
+        Some(other_pairing.device_id),
+        "the host in use is the one paired after the forget, and its use is recorded"
     );
     let session = state
         .session()
@@ -1670,6 +1675,16 @@ async fn a_choice_that_waits_for_the_gate_across_a_forget_and_a_repair_is_refuse
         companion.device().host_in_use().map(|host| host.device_id),
         in_use,
         "the device's own record of the host in use"
+    );
+    assert_eq!(
+        companion
+            .device()
+            .paired_as(current.host_device_id)
+            .expect("the records read"),
+        Some(kr_protocol::ids::DeviceId::new(
+            kr_protocol::scalars::Uuid::from_bytes([42; 16])
+        )),
+        "the pairing recorded again is the one the device holds"
     );
     assert!(
         state.session().is_ok_and(|now| Arc::ptr_eq(&now, &session)),
