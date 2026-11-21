@@ -27,7 +27,9 @@ use kr_protocol::envelope::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hello::ActionWindow;
 use kr_protocol::ids::{ActionId, GrantId, RequestId, SessionId, StreamId};
+use kr_protocol::launch_commands::{ShellLaunchCommandsListParams, ShellLaunchCommandsListResult};
 use kr_protocol::method::Method;
+use kr_protocol::organisation::{OrganisationListParams, OrganisationListResult};
 use kr_protocol::receipt::{ActionReadParams, ActionReadResult, Receipt};
 use kr_protocol::root::{ShellLaunchSurfaceParams, ShellLaunchSurfaceResult};
 use kr_protocol::scalars::{DurationMs, Nullable};
@@ -86,6 +88,30 @@ impl std::fmt::Debug for LaunchSurfaceRead {
         match self {
             Self::Served(_) => formatter.write_str("Served(..)"),
             Self::NotServed => formatter.write_str("NotServed"),
+        }
+    }
+}
+
+/// What a read of the host's saved launch commands came to.
+#[derive(Clone, PartialEq, Eq)]
+pub enum LaunchCommandsRead {
+    /// The host served the read.
+    Served(ShellLaunchCommandsListResult),
+    /// The host does not serve the read: it is of a release that does not.
+    NotServed,
+    /// The host refused the read for a right this connection does not hold. It is no sign that
+    /// the host is old.
+    Refused,
+}
+
+impl std::fmt::Debug for LaunchCommandsRead {
+    /// Whether the host served the read, and never what it answered: the answer holds the
+    /// commands, which may name a secret.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Served(_) => formatter.write_str("Served(..)"),
+            Self::NotServed => formatter.write_str("NotServed"),
+            Self::Refused => formatter.write_str("Refused"),
         }
     }
 }
@@ -875,6 +901,56 @@ impl Session {
             Err(error) if refused_as_unlisted(&error) || refused_as_unsupported(&error) => {
                 Ok(LaunchSurfaceRead::NotServed)
             }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reads the launch commands saved on a host that may be of a release that does not serve
+    /// them.
+    ///
+    /// The read needs `host.manage`, and a host that does not list a method refuses it as it
+    /// refuses any method it does not list, `PERMISSION_DENIED`, which a connection without the
+    /// right is refused as well. The two are told apart by asking for what the same right reads at
+    /// the host, `organisation.list`, not a session's read: where that is refused too, the right
+    /// is missing and the read is [`LaunchCommandsRead::Refused`]; where it is answered, the first
+    /// read is asked once more, in case the host refused it for a reason that has passed, and a
+    /// second refusal means the host does not serve the read. None of these reads raises
+    /// [`Self::standing_in_doubt`]: a connection that never held the right was not withdrawn, and a
+    /// device that holds a share only is refused every time it asks. Any other failure is returned
+    /// as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's error when it refuses the read for a reason other than not permitting
+    /// it, and any other failure of the connection.
+    pub async fn read_launch_commands(&self) -> Result<LaunchCommandsRead> {
+        let params = ShellLaunchCommandsListParams {};
+        let refused = |error: &ClientError| matches!(error, ClientError::Host(refusal) if refusal.code == ErrorCode::PermissionDenied);
+        match self
+            .read_unsignalled(Method::ShellLaunchCommandsList, &params)
+            .await
+        {
+            Ok(listed) => return Ok(LaunchCommandsRead::Served(listed)),
+            Err(error) if refused(&error) => {}
+            Err(error) => return Err(error),
+        }
+        match self
+            .read_unsignalled::<_, OrganisationListResult>(
+                Method::OrganisationList,
+                &OrganisationListParams::default(),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if refused(&error) => return Ok(LaunchCommandsRead::Refused),
+            Err(error) => return Err(error),
+        }
+        match self
+            .read_unsignalled(Method::ShellLaunchCommandsList, &params)
+            .await
+        {
+            Ok(listed) => Ok(LaunchCommandsRead::Served(listed)),
+            Err(error) if refused(&error) => Ok(LaunchCommandsRead::NotServed),
             Err(error) => Err(error),
         }
     }

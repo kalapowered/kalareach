@@ -783,6 +783,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             kr_cli::workspace::run(&paths, command, cli.json).await?;
             Ok(Completion::Done)
         }
+        Command::Launch(command) => kr_cli::launch::run(&paths, command, cli.json).await,
         Command::Changeset(command) => {
             kr_cli::changeset::run(&paths, command, cli.json).await?;
             Ok(Completion::Done)

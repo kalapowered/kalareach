@@ -86,6 +86,9 @@ pub enum Command {
     /// never moved from the one it runs in.
     #[command(subcommand)]
     Workspace(WorkspaceCommand),
+    /// Manage the commands that the launch buttons offer beside the installed agents.
+    #[command(subcommand)]
+    Launch(LaunchCommand),
     /// Capture, read or materialise exact versions of a workspace's work.
     #[command(subcommand)]
     Changeset(ChangesetCommand),
@@ -272,6 +275,48 @@ pub struct ProjectAdoptArguments {
     /// The label the repository is shown with. The directory's name when absent.
     #[arg(long)]
     pub label: Option<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr launch` operation.
+#[derive(Subcommand)]
+pub enum LaunchCommand {
+    /// List the launch commands saved on this host.
+    List(LaunchListArguments),
+    /// Save a launch command, or replace the command that has the same label.
+    Add(LaunchAddArguments),
+    /// Remove the launch command with this label.
+    Remove(LaunchRemoveArguments),
+}
+
+/// `kr launch list`.
+#[derive(Args)]
+pub struct LaunchListArguments {
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr launch add`.
+#[derive(Args)]
+pub struct LaunchAddArguments {
+    /// The label the launch button shows.
+    pub label: String,
+    /// The program, then its arguments. Write them after --.
+    #[arg(last = true, required = true, num_args = 1..)]
+    pub command: Vec<String>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr launch remove`.
+#[derive(Args)]
+pub struct LaunchRemoveArguments {
+    /// The label the launch button shows.
+    pub label: String,
     /// The environment.
     #[command(flatten)]
     pub selector: EnvironmentSelector,

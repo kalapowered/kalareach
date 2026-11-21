@@ -1333,6 +1333,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             inside_the_launch_commands_commit: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
+            launch_commands_listed: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
             after_the_environment_is_recorded: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
             environment_observer: std::sync::Mutex::new(None),

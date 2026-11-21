@@ -53,6 +53,14 @@ impl Controller {
         self.inside_the_launch_commands_commit.arm()
     }
 
+    /// How many reads of the saved launch commands this daemon has answered, so that a test can
+    /// wait until a client has read the list. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn launch_commands_listed(&self) -> u64 {
+        self.launch_commands_listed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Answers `shell.launch.commands.list`: the commands the host holds and the revision of the
     /// list.
     ///
@@ -61,6 +69,9 @@ impl Controller {
     /// Returns a storage error when the file cannot be read or breaks a rule.
     pub(super) fn launch_commands_list(&self) -> Result<ParamsValue> {
         let stored = store::read(self.paths.state_dir())?;
+        #[cfg(feature = "testing")]
+        self.launch_commands_listed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         encode(&ShellLaunchCommandsListResult {
             revision: U64::new(stored.revision),
             commands: named(&stored),

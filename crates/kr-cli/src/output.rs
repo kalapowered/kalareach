@@ -94,6 +94,9 @@ pub enum Request {
     TerminalProfile,
     /// A retained receipt's method and the failure recorded for it: `kr action`.
     Actions,
+    /// The labels, programs and arguments of the launch commands saved on this host, as their owner
+    /// wrote them: `kr launch`.
+    LaunchCommands,
 }
 
 /// Content the person asked to read.
