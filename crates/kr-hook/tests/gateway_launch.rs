@@ -1059,8 +1059,11 @@ fn kr_req_07_60_a_server_whose_record_cannot_be_written_is_not_left_running() {
 /// evidence the bind gave, and the backend's record keeps the same words; the program runs as typed,
 /// its server is ended, and the file that stood where the socket belongs is left as it was.
 ///
-/// The bind is the last step of a start that has the launcher's window to itself, so a start that
-/// uses the window up leaves no time to write the refusal; this case fails then, by its own words.
+/// The bind is the last step of a start that has the worker's own window to itself, counted from its
+/// read of the launcher's "going", so a start that uses that window up leaves no time to write the
+/// refusal; this case fails then, by its own words. The launcher counts from before it wrote
+/// "going", so it can have stopped waiting first: the case holds what the worker wrote, not that
+/// the launcher was still waiting.
 #[test]
 fn kr_req_12_07_a_gateway_that_cannot_bind_tells_the_launcher_why() {
     let shell = Gateway::new();
