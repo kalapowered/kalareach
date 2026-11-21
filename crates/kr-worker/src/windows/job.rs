@@ -47,7 +47,7 @@
 
 use std::collections::BTreeMap;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use kr_protocol::identity::ProcessStartIdentity;
 use windows_sys::Win32::Foundation::{
@@ -89,60 +89,6 @@ pub enum MemberReading {
 #[derive(Debug)]
 pub struct SessionJob {
     job: Job,
-    /// What this session's launches and its closure have to agree on: the agents the session ran
-    /// under the reduced-ownership profile, whether the session has been closed, and how many
-    /// launches are in flight.
-    ///
-    /// Kept for as long as the session is: the session's closure lists what the jobs hold and ends
-    /// it, and a worker that dies takes them down because they are kill-on-close and this is where
-    /// the last handle to each of them is.
-    state: Mutex<State>,
-    /// Signalled when the last launch in flight leaves, which is what a closure waits for.
-    launches_left: Condvar,
-    /// Told when a closure begins to wait for a launch, for this host's own tests.
-    #[cfg(feature = "testing")]
-    waiting: Mutex<Option<Notice>>,
-}
-
-/// What a session's launches and its closure share.
-#[derive(Debug, Default)]
-struct State {
-    agents: Vec<Arc<AgentJob>>,
-    closed: bool,
-    /// Launches that were admitted and have not yet finished: until one has committed or undone
-    /// everything it made, the closure cannot tell what the session holds.
-    launching: usize,
-}
-
-/// What a test asked to be told, once.
-#[cfg(feature = "testing")]
-struct Notice(Box<dyn FnOnce() + Send>);
-
-#[cfg(feature = "testing")]
-impl std::fmt::Debug for Notice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Notice")
-    }
-}
-
-/// One launch in flight on a session, which the session's closure waits for.
-///
-/// Held from the moment a launch is admitted until it has either handed its agent over or undone
-/// everything it made; dropping it is how the launch leaves.
-#[derive(Debug)]
-#[must_use = "a launch is in flight for exactly as long as this is held"]
-pub struct Launching<'a> {
-    session: &'a SessionJob,
-}
-
-impl Drop for Launching<'_> {
-    fn drop(&mut self) {
-        let mut state = self.session.lock();
-        state.launching -= 1;
-        if state.launching == 0 {
-            self.session.launches_left.notify_all();
-        }
-    }
 }
 
 impl SessionJob {
@@ -151,8 +97,8 @@ impl SessionJob {
     /// # Errors
     ///
     /// Returns the operating system's failure when the job cannot be created or its limits cannot
-    /// be set. A caller that cannot have a job has a named launch failure to report or a
-    /// reduced-ownership profile to select explicitly; it never carries on as though it had one.
+    /// be set. A caller that cannot have a job has a named launch failure to report; it never
+    /// carries on as though it had one.
     pub fn create() -> std::io::Result<Self> {
         let job = Job::create(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
         // Read back from the operating system before this job is anybody's boundary. A job whose
@@ -168,19 +114,7 @@ impl SessionJob {
                 "the session's job object would let a child break away from it",
             ));
         }
-        Ok(Self {
-            job,
-            state: Mutex::new(State::default()),
-            launches_left: Condvar::new(),
-            #[cfg(feature = "testing")]
-            waiting: Mutex::new(None),
-        })
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        Ok(Self { job })
     }
 
     /// Returns the handle a process creation names this job by.
@@ -189,73 +123,6 @@ impl SessionJob {
     /// system performs the assignment itself rather than leaving it to a second call.
     pub(super) fn handle(&self) -> HANDLE {
         self.job.raw()
-    }
-
-    /// Admits a launch to this session, or says the session is closing.
-    ///
-    /// A closure ends the session's jobs and then waits for every launch admitted before it
-    /// marked the session ([`Self::await_launches`]), so a launch that holds the answer has either
-    /// been ended with those jobs or will end itself, and the closure reads the session only after
-    /// it has. A session that is closing admits none.
-    pub fn admit_launch(&self) -> Option<Launching<'_>> {
-        let mut state = self.lock();
-        if state.closed {
-            return None;
-        }
-        state.launching += 1;
-        Some(Launching { session: self })
-    }
-
-    /// Waits until every launch this session admitted has left, for at most `bound`, and says
-    /// whether none is left.
-    ///
-    /// Called by a closure after it has marked the session closed, which is when no further launch
-    /// is admitted, so the count only falls.
-    #[must_use]
-    pub fn await_launches(&self, bound: std::time::Duration) -> bool {
-        let state = self.lock();
-        if state.launching == 0 {
-            return true;
-        }
-        #[cfg(feature = "testing")]
-        if let Some(Notice(tell)) = self
-            .waiting
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            tell();
-        }
-        let (state, _) = self
-            .launches_left
-            .wait_timeout_while(state, bound, |state| state.launching > 0)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.launching == 0
-    }
-
-    /// Calls `tell` once, when a closure begins to wait for a launch, for this host's own tests. It
-    /// is compiled away in every shipped build.
-    #[cfg(feature = "testing")]
-    pub fn tell_when_a_closure_waits(&self, tell: impl FnOnce() + Send + 'static) {
-        *self
-            .waiting
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Notice(Box::new(tell)));
-    }
-
-    /// Returns the jobs of the agents this session ran under the reduced-ownership profile.
-    #[must_use]
-    pub fn reduced_agents(&self) -> Vec<Arc<AgentJob>> {
-        self.lock().agents.clone()
-    }
-
-    /// Returns whether this session's closure has begun.
-    ///
-    /// A process created in a job after the job was ended is not ended with it, so a launch asks
-    /// again once its process exists, and ends the process itself where the answer is yes.
-    #[must_use]
-    pub fn is_closed(&self) -> bool {
-        self.lock().closed
     }
 
     /// Returns whether a process is inside this job.
@@ -314,18 +181,12 @@ impl SessionJob {
         self.job.process_ids()
     }
 
-    /// Ends every process the job holds, at once, and marks this session closed.
-    ///
-    /// The mark is made before the job is ended, so a launch that creates its process afterwards
-    /// finds it ([`Self::is_closed`]) and a launch that created it before is ended with the job.
-    /// A launch that was admitted before the mark is still in flight: the closure waits for it
-    /// with [`Self::await_launches`] before it reads what the session held.
+    /// Ends every process the job holds, at once.
     ///
     /// # Errors
     ///
     /// Returns the operating system's failure when the job will not be terminated.
     pub fn terminate(&self, code: u32) -> std::io::Result<()> {
-        self.lock().closed = true;
         self.job.terminate(code)
     }
 }
@@ -372,18 +233,16 @@ impl AgentJob {
         Ok(created)
     }
 
-    /// Creates the job an agent runs in under the reduced-ownership profile: unnamed, breakaway
-    /// disabled, and kill-on-close with this the only handle to it.
-    ///
-    /// The agent is not in the session's job, so nothing else ends what this holds when the session
-    /// does. This does: the worker closes the session by ending it, and a worker that dies, or
-    /// that lets the last handle go, takes the agent and everything it started down with it.
+    /// Creates a job of its own for a process that runs in no session's job, as a launch probe
+    /// does: unnamed, breakaway disabled, and kill-on-close with this the only handle to it.
+    /// Nothing else ends what it holds. Closing that handle does, so a worker that dies takes the
+    /// process and everything it started down with it.
     ///
     /// # Errors
     ///
     /// Returns the operating system's failure when the job cannot be created or its limits cannot
     /// be set, and a failure of its own when the kernel does not report kill-on-close and no
-    /// breakaway: an agent this host could not end is not one it may start.
+    /// breakaway: a process this host could not end is not one it may start.
     pub fn create_owning() -> std::io::Result<Self> {
         let job = Job::create(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
         if !job.kills_on_close()? {
