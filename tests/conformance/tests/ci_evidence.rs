@@ -1770,7 +1770,8 @@ const LIST: &[Listed] = &[
             ),
         ],
     ),
-    // A document that names the variable as the evidence directory of the report and of the workflow.
+    // A document that names the variable as the evidence directory of the report and of the workflow,
+    // and as what the report gives a step and the command of a test does not.
     lines(
         "docs/conformance/README.md",
         &[
@@ -1792,6 +1793,10 @@ const LIST: &[Listed] = &[
             ),
             (
                 "`KR_TEST_ARTIFACTS_DIR` and uploads that directory: `companion-evidence-<runner>` for the browser",
+                1,
+            ),
+            (
+                "The command does not give what the report gives the step: `KR_TEST_ARTIFACTS_DIR`, the runner, and",
                 1,
             ),
             (
