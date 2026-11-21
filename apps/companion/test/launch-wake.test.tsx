@@ -40,6 +40,7 @@ function replaceable(): { readonly port: HostPort; readonly publish: () => void 
     reason: null,
     rights: ['host.manage'],
     paired: false,
+    organisation: false,
     replaced: 0,
     revision: 1,
     link: 1,

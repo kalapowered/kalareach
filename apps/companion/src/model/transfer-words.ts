@@ -154,3 +154,6 @@ export function refusalOf(failure: unknown): Refusal {
       return { kind: 'other', words: sentence(words) }
   }
 }
+
+/** Said once when the sign-in changed and the files this window held for the earlier one were taken off the screen. */
+export const FILES_OF_EARLIER_SIGN_IN_REMOVED = 'Files added under the earlier sign-in were removed from this screen.'

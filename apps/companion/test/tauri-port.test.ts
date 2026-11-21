@@ -389,6 +389,7 @@ describe('the desktop port and the connection state', () => {
     reason,
     rights: null,
     paired: false,
+    organisation: false,
     replaced: 0,
     revision,
     link: 1,
@@ -437,6 +438,7 @@ describe('the desktop port and the connection state', () => {
       environment_id: '3f1a2c40-11aa-4b2c-9d3e-000000000001',
       rights: ['session.view', 'agent.prompt'],
       paired: true,
+      organisation: true,
       host: { kind: 'paired', reference: 'studio', name: 'Studio' },
       contact: { state: 'in_contact' },
       inbox_epoch: 1

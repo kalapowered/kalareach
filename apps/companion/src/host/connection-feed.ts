@@ -42,7 +42,11 @@ export interface FeedSource {
   readonly visible?: () => boolean
 }
 
-/** What a state is a change of, for a view whose reads depend on these members alone. */
+/**
+ * What a state is a change of, for a view whose reads depend on these members alone. Whether the host
+ * answers to an organisation is one of them: what the page keeps for an account is cleared only on such
+ * a host, so a revision that changes that alone is a change.
+ */
 export function triggerKey(state: ConnectionState): string {
   return JSON.stringify([
     state.host,
@@ -50,6 +54,7 @@ export function triggerKey(state: ConnectionState): string {
     state.environment_id,
     state.rights,
     state.paired,
+    state.organisation,
     state.replaced,
     state.link
   ])

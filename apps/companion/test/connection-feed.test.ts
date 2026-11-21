@@ -16,6 +16,7 @@ const state = (revision: number, over: Partial<ConnectionState> = {}): Connectio
   reason: null,
   rights: ['session.view'],
   paired: false,
+  organisation: false,
   replaced: 0,
   revision,
   link: 1,

@@ -16,7 +16,7 @@ import type { AttachmentHandle, SessionSubject } from '../host/port'
 import { failureWords } from '../host/port'
 import { attachContribution } from '../model/manual-paths'
 import type { UploadRow } from '../model/paired-uploads'
-import { boundIdsOf, lineOf } from '../model/paired-uploads'
+import { boundIdsOf, isReset, lineOf } from '../model/paired-uploads'
 import { refusalOf } from '../model/transfer-words'
 import { ask } from './model/call'
 import type { Picked } from './model/media'
@@ -65,6 +65,8 @@ export function usePairedFiles({
 }): PairedFiles {
   const { port, say, uploads } = useApp()
   const rows = useSyncExternalStore(uploads.subscribe, uploads.snapshot)
+  // The cycle moves when the files of an earlier sign-in were cleared: the application is read again.
+  const cycle = useSyncExternalStore(uploads.subscribe, () => uploads.cycle)
   const files = draft.attachments
 
   const found = useMemo(
@@ -80,7 +82,7 @@ export function usePairedFiles({
     if (!active) return
     let current = true
     void (async () => {
-      await uploads.restore()
+      const listed = await uploads.restore()
       const subject = await nameSession()
       const connection = await port.connectionState()
       if (connection.environment_id === null) return
@@ -96,9 +98,25 @@ export function usePairedFiles({
       )
       if (!current) return
       const boundIds = boundIdsOf(made.value)
+      // The stored drafts keep no account, so a restart restores the cards of whoever was signed in
+      // before. A card is kept only for a file this window has a row for, the application lists for
+      // the account in force, or the kept draft holds; any other is dropped from the composer. An
+      // application that could not be read says nothing, and nothing is dropped for it.
+      const listedIds =
+        listed === null ? null : new Set(listed.flatMap((view) => (view.handle ? [view.handle.transfer_id] : [])))
+      const known = (file: DraftAttachment): boolean =>
+        file.handle === null ||
+        listedIds === null ||
+        listedIds.has(file.handle.transfer_id) ||
+        boundIds.has(file.handle.transfer_id) ||
+        uploads.snapshot().has(file.localId)
+      const foreign = new Set(
+        files.filter((file) => file.upload === 'uploaded' && file.handle !== null && !known(file)).map((file) => file.localId)
+      )
+      if (foreign.size > 0) changeFiles((current) => current.filter((each) => !foreign.has(each.localId)))
       uploads.noteFiles(
         files.flatMap((file) =>
-          file.upload === 'uploaded' && file.handle !== null
+          file.upload === 'uploaded' && file.handle !== null && !foreign.has(file.localId)
             ? [
                 {
                   row: {
@@ -125,12 +143,15 @@ export function usePairedFiles({
     }
     // Asked when the screen opens and when contact returns, not on each change of a file.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, sessionId, uploads, port])
+  }, [active, sessionId, uploads, port, cycle])
 
   /** Adds a published file to the draft the device keeps for this session. */
   const bind = useCallback(
     async (handle: AttachmentHandle): Promise<void> => {
+      // A reset while the session is named leaves the file unbound: it belongs to an earlier sign-in.
+      const still = uploads.guard()
       const subject = await nameSession()
+      still()
       await port.draftAddAttachment(
         {
           session_id: sessionId,
@@ -142,7 +163,7 @@ export function usePairedFiles({
         subject
       )
     },
-    [nameSession, port, sessionId, draft.target.applicationInstanceId, draft.text]
+    [nameSession, port, sessionId, uploads, draft.target.applicationInstanceId, draft.text]
   )
 
   const send = useCallback(
@@ -165,9 +186,14 @@ export function usePairedFiles({
       const settle = (change: Partial<DraftAttachment>) => {
         changeFiles((current) => current.map((each) => (each.localId === key ? { ...each, ...change } : each)))
       }
+      // A reset while the file is read or the session is named sends nothing: the file is the earlier
+      // sign-in's, and its card is already off the composer.
+      const still = uploads.guard()
       ask(() => file.arrayBuffer())
         .then(async (buffer) => {
+          still()
           const subject = await nameSession()
+          still()
           return await uploads.send(
             { key, sessionId, subject, file: { name: picked.name, bytes: new Uint8Array(buffer) } },
             bind
@@ -189,6 +215,7 @@ export function usePairedFiles({
           else if (row !== undefined) say(`${handle.original_file_name}: ${lineOf(row.phase).text}`, 'danger')
         })
         .catch((failure: unknown) => {
+          if (isReset(failure)) return
           settle({ upload: 'failed' })
           if (removed.current.has(key)) return
           const refusal = refusalOf(failure)
@@ -247,11 +274,17 @@ export function usePairedFiles({
           }
         ])
       }
-      void uploads.bind(row.key, handle, bind).then(() => {
-        const after = uploads.snapshot().get(row.key)
-        if (after?.phase.kind === 'bound') say(`${handle.original_file_name} is sent and added to this draft.`)
-        else if (after !== undefined) say(`${handle.original_file_name}: ${lineOf(after.phase).text}`, 'danger')
-      })
+      void uploads
+        .bind(row.key, handle, bind)
+        .then(() => {
+          const after = uploads.snapshot().get(row.key)
+          if (after?.phase.kind === 'bound') say(`${handle.original_file_name} is sent and added to this draft.`)
+          else if (after !== undefined) say(`${handle.original_file_name}: ${lineOf(after.phase).text}`, 'danger')
+        })
+        .catch((failure: unknown) => {
+          // A reset ended the bind: the file belongs to an earlier sign-in, and nothing is said of it.
+          if (!isReset(failure)) throw failure
+        })
     },
     [bind, changeFiles, files, say, uploads]
   )

@@ -1892,6 +1892,7 @@ describe('whether this device is reaching the host', () => {
             reason: 'this host cannot be contacted right now',
             rights: null,
             paired: false,
+            organisation: false,
             replaced: 0,
             revision: 1,
             link: 1,

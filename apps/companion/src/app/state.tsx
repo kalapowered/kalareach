@@ -24,7 +24,8 @@ import type { HostPort, StoredHold, TerminalPlace } from '../host/port'
 import { AnnouncementScope } from '../components/announcements'
 import { closeSheets, type ToastAction, type ToastMessage } from '../components/ui'
 import { ChannelShelf } from '../model/channel-messages'
-import { AccountMark, stampedPort } from '../host/stamped'
+import { AccountMark, ConnectedHost, stampedPort } from '../host/stamped'
+import { followAccountChange } from './account-clear'
 import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
 import { PairedUploads } from '../model/paired-uploads'
@@ -143,8 +144,11 @@ export function AppProvider({
   // which native code compares with the account signed in at the command's entry.
   const [accountMark] = useState(() => new AccountMark())
   const markNow = accountMark.read
-  const port = useMemo(() => stampedPort(hostPort, markNow), [hostPort, markNow])
-  useEffect(() => accountMark.follow(hostPort), [hostPort, accountMark])
+  const [connectedHost] = useState(() => new ConnectedHost())
+  const port = useMemo(
+    () => stampedPort(hostPort, markNow, connectedHost.note),
+    [hostPort, markNow, connectedHost]
+  )
   const [place, setPlace] = useState<Place>(initialPlace)
   const [toast, setToast] = useState<ToastMessage | null>(null)
   const [tabs, setTabs] = useState<readonly string[]>([])
@@ -181,6 +185,12 @@ export function AppProvider({
       setToast({ id: Date.now() + Math.random(), text, spoken, tone, action })
     },
     []
+  )
+
+  // When the account changes, what this window holds for the earlier one goes from the screen.
+  useEffect(
+    () => followAccountChange({ port: hostPort, mark: accountMark, host: connectedHost, uploads, drafts, say }),
+    [hostPort, accountMark, connectedHost, uploads, drafts, say]
   )
 
   // The window is in the colour mode native code keeps, whoever changed it and whatever is on

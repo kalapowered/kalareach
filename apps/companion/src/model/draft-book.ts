@@ -270,6 +270,8 @@ export interface EarlierPrompt {
 interface Flight {
   /** Its name among the prompts that have not ended. */
   readonly id: string
+  /** How many times the files of the composers were cleared when it was sent: see `dropUploads`. */
+  readonly epoch?: number
   /** The composer it was sent from. */
   readonly composer: string
   /** Its number among the sends of this window: 0 for a prompt of an earlier run. */
@@ -362,6 +364,11 @@ function writtenSince(before: Draft, after: Draft): boolean {
 function sameFiles(a: Draft, b: Draft): boolean {
   const ids = (draft: Draft) => storable(draft).map((handle) => handle.transfer_id)
   return JSON.stringify(ids(a)) === JSON.stringify(ids(b))
+}
+
+/** Whether a file on a composer is one this window's uploads made: it carries a handle or is going up. */
+function isUpload(file: DraftAttachment): boolean {
+  return file.handle !== null || file.upload === 'uploading'
 }
 
 /** Whether the store has anything to keep of a draft. */
@@ -532,6 +539,8 @@ export class DraftBook {
   #moves = 0
   #settling = false
   #sends = 0
+  /** How many times `dropUploads` ran: a prompt sent before one does not take its files back. */
+  #uploadEpoch = 0
   readonly #listeners = new Set<() => void>()
   readonly #notices = new Set<(words: string) => void>()
   #cached: BookSnapshot | null = null
@@ -739,6 +748,27 @@ export class DraftBook {
     }
   }
 
+  /**
+   * Takes off every composer the files that came from this window's uploads: the ones with a handle
+   * and the ones still going up. The text is left exactly as it is and nothing is discarded in the
+   * store of kept drafts; what is changed goes through `setDrafts`, so the stored drafts lose the
+   * handles too. A prompt sent before this and refused afterwards does not put those files back.
+   * Answers how many files were taken off.
+   */
+  dropUploads(): number {
+    let dropped = 0
+    this.#uploadEpoch += 1
+    this.setDrafts((drafts) =>
+      drafts.map((draft) => {
+        const kept = draft.attachments.filter((file) => !isUpload(file))
+        if (kept.length === draft.attachments.length) return draft
+        dropped += draft.attachments.length - kept.length
+        return { ...draft, attachments: kept, updatedAtMs: Date.now() }
+      })
+    )
+    return dropped
+  }
+
   /** The connection went away: every draft keeps its text and loses its association. */
   connectionLost(): void {
     this.setDrafts((drafts) => drafts.map(connectionLost))
@@ -803,7 +833,15 @@ export class DraftBook {
     const key = sent.draftId
     this.#sends += 1
     const token = `send-${String(this.#sends)}`
-    const flight: Flight = { id: token, composer: key, order: this.#sends, sent, record: null, earlier: null }
+    const flight: Flight = {
+      id: token,
+      epoch: this.#uploadEpoch,
+      composer: key,
+      order: this.#sends,
+      sent,
+      record: null,
+      earlier: null
+    }
     this.#flights.set(token, flight)
     let claim: { resolve: (stored: string | null) => void; reject: (failure: unknown) => void } = {
       resolve: () => undefined,
@@ -1515,7 +1553,11 @@ export class DraftBook {
    */
   async #giveBack(flight: Flight): Promise<boolean> {
     const key = flight.composer
-    const sent = flight.sent
+    // A prompt that was sent before the files of the composers were cleared does not put them back.
+    const sent =
+      flight.epoch === undefined || flight.epoch === this.#uploadEpoch
+        ? flight.sent
+        : { ...flight.sent, attachments: flight.sent.attachments.filter((file) => !isUpload(file)) }
     let record = flight.record
     if (record === null && this.#status === 'ready' && !holdsNothing(sent)) {
       // The first write failed, or the draft was never stored: try again now that the text matters.
