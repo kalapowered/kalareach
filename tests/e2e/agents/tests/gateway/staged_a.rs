@@ -529,3 +529,109 @@ fn a_typed_prompt_that_reached_the_agents_screen_fails_the_check_of_2b() {
     assert!(shows_no_trace(&rows("by hand"), TYPED_PROMPT).is_ok());
     assert!(shows_no_trace(&rows(TYPED_PROMPT), TYPED_PROMPT).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Part 2c: under the binding a supported action is admitted and an unsupported one refused.
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-12.32, case 2, part 2c: under the binding the host made when it detected the agent, an
+/// action the installed evidence supports, the package's presentation action, is admitted with its
+/// receipt, while each typed agent mutation and each of the package's upstream actions is refused,
+/// every call a new action with an identifier of its own, and the calls leave the instance and its
+/// revision as they were. The control breaks the property: once the agent has ended and its binding
+/// with it, the same presentation action is refused.
+#[test]
+fn gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_refused() {
+    const TEST: &str =
+        "gateway_under_a_binding_a_supported_action_is_permitted_and_an_unsupported_one_is_refused";
+    by_hand_case("2c", TEST, Setup::default(), |ctx, session| {
+        let session_id = session.session_id();
+        let agent = HandAgent::starts(ctx, session);
+        let shown = detects(ctx, &session.remote, session_id);
+        check_detected(&launched(&agent), &shown)
+            .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
+        let held = Held::of(&shown).expect("the binding could not be read");
+        let actions = package_actions();
+        let presentation: Vec<&Action> = actions
+            .iter()
+            .filter(|action| action.presentation())
+            .collect();
+        let upstream: Vec<Action> = actions.iter().filter(|a| a.upstream()).cloned().collect();
+        let (target, envelope) =
+            target_of(&session.remote, session_id, held.instance, held.revision);
+        let send = |action: &Action| {
+            invoke(
+                &session.remote,
+                &ctx.runtime,
+                &envelope,
+                target,
+                &codex(),
+                action,
+            )
+        };
+        let supported: Vec<Reply> = presentation.iter().map(|action| send(action)).collect();
+        let unsupported: Vec<Reply> = typed_actions(
+            &session.remote,
+            &ctx.runtime,
+            session_id,
+            &codex(),
+            &upstream,
+            Some((held.instance, held.revision)),
+        )
+        .into_iter()
+        .filter(|answer| !AGENT_READS.contains(&answer.call.as_str()))
+        .collect();
+        presentation_admitted_and_upstream_refused(&supported, &unsupported)
+            .unwrap_or_else(|why| panic!("under the binding: {why}"));
+        let after = shown_now(ctx, &session.remote, session_id);
+        check_unchanged(Some(held), &after)
+            .unwrap_or_else(|why| panic!("the calls change nothing: {why}"));
+        // The control breaks the property: the binding ends with the agent, and the same action,
+        // sent again as a new action, is refused.
+        agent.ends();
+        let gone = shown_gone(ctx, &session.remote, session_id);
+        check_ended(&gone).unwrap_or_else(|why| panic!("the instance has ended: {why}"));
+        let after_end: Vec<Reply> = presentation.iter().map(|action| send(action)).collect();
+        all_refused(&after_end).unwrap_or_else(|why| panic!("once the binding has ended: {why}"));
+        serde_json::json!({
+            "arm": arm(ctx),
+            "detection": shown.detection.evidence(),
+            "binding": shown.binding,
+            "held": { "instance": held.instance.to_string(), "revision": held.revision.get() },
+            "supported": supported.iter().map(Reply::evidence).collect::<Vec<_>>(),
+            "unsupported": unsupported.iter().map(Reply::evidence).collect::<Vec<_>>(),
+            "after": after.detection.evidence(),
+            "control": {
+                "what": "the agent ended, its binding with it, and the same presentation action sent again as a new action",
+                "breaks_property": true,
+                "answers": after_end.iter().map(Reply::evidence).collect::<Vec<_>>(),
+            },
+        })
+    });
+}
+
+/// The calls of 2c: a presentation action that is refused, an upstream action that is admitted and
+/// a part that sent no presentation action each fail it.
+#[test]
+fn a_presentation_action_that_is_refused_or_an_upstream_one_that_is_admitted_fails_2c() {
+    let reply = |call: &str, refused: Option<&str>| Reply {
+        call: call.to_owned(),
+        refused: refused.map(str::to_owned),
+        error: None,
+        detail: String::new(),
+    };
+    let admitted = [reply("plugin.action.invoke thread.refresh", None)];
+    let refused = [reply("agent.prompt.submit", Some("UNSUPPORTED_CAPABILITY"))];
+    assert!(presentation_admitted_and_upstream_refused(&admitted, &refused).is_ok());
+    assert!(presentation_admitted_and_upstream_refused(&[], &refused).is_err());
+    assert!(
+        presentation_admitted_and_upstream_refused(
+            &[reply("plugin.action.invoke thread.refresh", Some("DENIED"))],
+            &refused
+        )
+        .is_err()
+    );
+    assert!(presentation_admitted_and_upstream_refused(&admitted, &admitted).is_err());
+    assert!(all_refused(&refused).is_ok());
+    assert!(all_refused(&admitted).is_err());
+}
