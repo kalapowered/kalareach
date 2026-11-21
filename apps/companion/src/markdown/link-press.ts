@@ -97,7 +97,7 @@ import { useEffect, type RefObject } from 'react'
 import { LOOK_HOLD, SLOP, contestRadius, decide, keepsPress, linkAt, lookAt, opensByRule, type Layout, type Named, type PaneLink, type Press, type Rect } from './link-target'
 
 /** The message controls that are not links. */
-const OTHER_CONTROLS = 'button:not(.md-link), a[href], input, select, textarea, summary'
+export const OTHER_CONTROLS = 'button:not(.md-link), a[href], input, select, textarea, summary'
 
 /** What the pane keeps of the press that is going on or that ended last. */
 interface Recorded extends Press<HTMLElement> {

@@ -707,14 +707,18 @@
 }
 
 /*
- * The box of a link, as high as the least size (`--target`, 44 points on iOS and 48 dp on Android): the
+ * The box of a link, as large as the least size (`--target`, 44 points on iOS and 48 dp on Android): the
  * bounds that VoiceOver and TalkBack read for the link are the button's own box, and a link's words are
- * about a line high. The button is padded out above and below by half of what its line lacks of the least
- * size (and a twentieth of a pixel, so that an engine's rounding to 1/64 px never leaves the box under it),
- * and the margin takes the same room back, so the line, the words and the paragraph lie where they would
- * with no padding. Beside the words there is no padding: a box that reaches past the end of a line scrolls
- * the pane sideways, and a message's own wide content (a table, a long word) already does, so the width of a
- * link narrower than the least size is the words' width.
+ * about a line high and often narrow.
+ *
+ * Above and below, the button is padded out by half of what its line lacks of the least size (and a
+ * twentieth of a pixel, so that an engine's rounding to 1/64 px never leaves the box under it). Beside the
+ * words the page measures what the link lacks (`startLinkFit`) and sets it as `--md-link-left` and
+ * `--md-link-right`: only a link narrower than the least size has any, and none reaches past its message's
+ * column (a box that did would scroll the pane sideways) or over the box of a link or control beside it.
+ * The margin takes the same room back on every side, so the line, the words and the paragraph lie where
+ * they would with no padding. The properties are physical: the page measures left and right, whatever
+ * the direction of the text.
  *
  * The padded room takes no tap: the button has no hit of its own and its words, the label, have theirs.
  * A box that took taps would lie over the link on the line above it, and the later link would win a tap on
@@ -725,7 +729,11 @@
 .m-node .md-link {
   --md-link-pad: max(0px, calc((var(--target) - 1lh) / 2 + 0.05px));
   padding-block: var(--md-link-pad);
+  padding-left: var(--md-link-left, 0px);
+  padding-right: var(--md-link-right, 0px);
   margin-block: calc(-1 * var(--md-link-pad));
+  margin-left: calc(-1 * var(--md-link-left, 0px));
+  margin-right: calc(-1 * var(--md-link-right, 0px));
   pointer-events: none;
 }
 

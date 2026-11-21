@@ -83,6 +83,7 @@ import {
 } from '../../model/receipts'
 import type { Supersession } from '../../model/receipt-reads'
 import { draftMark, readBeforeQuoting, useReceiptReads } from '../../app/receipts'
+import { useLinkFit } from '../../markdown/link-fit'
 import { useLinkPress } from '../../markdown/link-press'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
@@ -258,6 +259,7 @@ export function MobileSession({
   const positions = useRef<Record<Pane, number>>({ semantic: 0, terminal: 0, output: 0 })
   const paneRef = useRef<HTMLDivElement | null>(null)
   useLinkPress(paneRef)
+  useLinkFit(paneRef)
 
   // The clock is read once, when this screen opens. Reading it while rendering would make the
   // empty draft a different object on every render and the composer would lose what was typed.
