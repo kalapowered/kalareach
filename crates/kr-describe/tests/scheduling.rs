@@ -779,7 +779,7 @@ fn a_description_behind_the_revision_is_exposed_as_stale() {
 #[test]
 fn queue_wait_and_execution_latency_are_published_apart_at_each_session_count() {
     let mut ledger = LatencyLedger::new();
-    assert_eq!(ledger.unmeasured(), PUBLISHED_SESSION_COUNTS.to_vec());
+    assert!(ledger.published().is_empty());
     for sessions in PUBLISHED_SESSION_COUNTS {
         for sample in 1..=100_u64 {
             ledger.record(sessions, sample * u64::from(sessions), 1_000 + sample);
@@ -787,7 +787,13 @@ fn queue_wait_and_execution_latency_are_published_apart_at_each_session_count() 
     }
     let published = ledger.published();
     assert_eq!(published.len(), 4);
-    assert!(ledger.unmeasured().is_empty());
+    assert_eq!(
+        published
+            .iter()
+            .map(|reading| reading.sessions)
+            .collect::<Vec<_>>(),
+        PUBLISHED_SESSION_COUNTS
+    );
     for reading in &published {
         assert_eq!(reading.queue_wait.samples, 100);
         assert_eq!(reading.execution.samples, 100);

@@ -136,14 +136,4 @@ impl LatencyLedger {
             .filter_map(|sessions| self.reading(*sessions))
             .collect()
     }
-
-    /// Returns which of section 22's four counts have not been measured.
-    #[must_use]
-    pub fn unmeasured(&self) -> Vec<u32> {
-        PUBLISHED_SESSION_COUNTS
-            .iter()
-            .copied()
-            .filter(|sessions| !self.by_sessions.contains_key(sessions))
-            .collect()
-    }
 }
