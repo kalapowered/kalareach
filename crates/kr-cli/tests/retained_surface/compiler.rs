@@ -1581,26 +1581,67 @@ fn is_return_type(trees: &[TokenTree], at: usize) -> bool {
     }
 }
 
-/// Whether the group at `at` is the brackets of `#[doc = "..."]` or `#![doc = "..."]`, which is what a
-/// `///` or `//!` comment is read as: its text is documentation, not a use.
-fn is_doc_attribute(trees: &[TokenTree], at: usize, group: &Group) -> bool {
+/// Whether the group at `at` holds the brackets of an attribute (`#[..]`, `#![..]`).
+fn is_attribute(trees: &[TokenTree], at: usize, group: &Group) -> bool {
     let punct = |index: Option<usize>, wanted: char| {
         index.is_some_and(
             |index| matches!(trees.get(index), Some(TokenTree::Punct(found)) if found.as_char() == wanted),
         )
     };
-    let inner = group.stream().into_iter().collect::<Vec<_>>();
     group.delimiter() == Delimiter::Bracket
         && (punct(at.checked_sub(1), '#')
             || (punct(at.checked_sub(1), '!') && punct(at.checked_sub(2), '#')))
-        && matches!(
-            inner.as_slice(),
-            [TokenTree::Ident(name), TokenTree::Punct(equals), TokenTree::Literal(_)]
-                if name == "doc" && equals.as_char() == '='
-        )
 }
 
-fn walk_tokens(stream: TokenStream, found: &mut Vec<Candidate>) {
+/// Whether the group at `at` holds the tokens of a macro: the arguments of a call (`name!(..)`,
+/// `name![..]`, `name! {..}`) or the rules of a definition (`macro_rules! name {..}`). A macro may do
+/// anything with its tokens, so what stands in them is not an attribute or a function.
+fn is_macro_group(trees: &[TokenTree], at: usize) -> bool {
+    let punct = |index: Option<usize>, wanted: char| {
+        index.is_some_and(
+            |index| matches!(trees.get(index), Some(TokenTree::Punct(found)) if found.as_char() == wanted),
+        )
+    };
+    let word = |index: Option<usize>| match index.and_then(|index| trees.get(index)) {
+        Some(TokenTree::Ident(word)) => word.to_string(),
+        _ => String::new(),
+    };
+    (punct(at.checked_sub(1), '!') && !word(at.checked_sub(2)).is_empty())
+        || (!word(at.checked_sub(1)).is_empty()
+            && punct(at.checked_sub(2), '!')
+            && word(at.checked_sub(3)) == "macro_rules")
+}
+
+/// The tokens of an attribute's brackets at an item or a statement. What a `doc` attribute holds is
+/// documentation and no use: `doc = ".."` (what `///` and `//!` are read as), `doc(alias = "..")` and
+/// `doc = concat!(..)`, alone or as an attribute of `cfg_attr(<condition>, ..)`. Any other attribute,
+/// and the condition of a `cfg_attr`, is read as it stands.
+fn walk_attribute(stream: TokenStream, found: &mut Vec<Candidate>) {
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    match trees.as_slice() {
+        [TokenTree::Ident(name), ..] if name == "doc" => {}
+        [TokenTree::Ident(name), TokenTree::Group(arguments)]
+            if name == "cfg_attr" && arguments.delimiter() == Delimiter::Parenthesis =>
+        {
+            let arguments: Vec<TokenTree> = arguments.stream().into_iter().collect();
+            for (index, part) in arguments
+                .split(|tree| matches!(tree, TokenTree::Punct(comma) if comma.as_char() == ','))
+                .enumerate()
+            {
+                let part: TokenStream = part.iter().cloned().collect();
+                if index == 0 {
+                    walk_tokens(part, found, false);
+                } else {
+                    walk_attribute(part, found);
+                }
+            }
+        }
+        _ => walk_tokens(trees.into_iter().collect(), found, false),
+    }
+}
+
+/// The tokens of `stream` that name a stamped item; `in_macro` is set inside the tokens of a macro.
+fn walk_tokens(stream: TokenStream, found: &mut Vec<Candidate>, in_macro: bool) {
     let trees: Vec<TokenTree> = stream.into_iter().collect();
     let punct = |at: usize| match trees.get(at) {
         Some(TokenTree::Punct(punct)) => Some(punct.as_char()),
@@ -1618,8 +1659,12 @@ fn walk_tokens(stream: TokenStream, found: &mut Vec<Candidate>) {
         };
         match tree {
             TokenTree::Group(group) => {
-                if !is_doc_attribute(&trees, at, group) {
-                    walk_tokens(group.stream(), found);
+                if in_macro {
+                    walk_tokens(group.stream(), found, true);
+                } else if is_attribute(&trees, at, group) {
+                    walk_attribute(group.stream(), found);
+                } else {
+                    walk_tokens(group.stream(), found, is_macro_group(&trees, at));
                 }
             }
             TokenTree::Ident(ident) => {
@@ -1662,7 +1707,7 @@ pub fn candidates(text: &str, file: &str) -> Result<Vec<Candidate>, String> {
         .parse()
         .map_err(|error| format!("{file}: the file cannot be tokenised ({error})"))?;
     let mut found = Vec::new();
-    walk_tokens(stream, &mut found);
+    walk_tokens(stream, &mut found, false);
     Ok(found)
 }
 

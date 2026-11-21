@@ -729,6 +729,51 @@ fn a_return_type_before_a_body_is_no_struct_value_but_a_name_after_a_macros_arro
     );
 }
 
+#[test]
+fn documentation_is_no_candidate_as_an_attribute_but_a_literal_in_the_tokens_of_a_macro() {
+    let found = tokens(
+        "#[doc = \"agent.turn.cancel\"]\n\
+         fn a() {}\n\
+         #[cfg_attr(feature = \"docs\", doc = \"agent.turn.cancel\")]\n\
+         fn b() {}\n\
+         #[cfg_attr(feature = \"docs\", doc(alias = \"agent.turn.cancel\"), allow(dead_code))]\n\
+         fn c() {}\n\
+         #[doc(alias = \"agent.turn.cancel\")]\n\
+         fn d() {}\n\
+         #[doc = concat!(\"see \", \"agent.turn.cancel\")]\n\
+         fn e() {}\n\
+         #[cfg_attr(a, cfg_attr(b, doc = \"agent.turn.cancel\"))]\n\
+         fn f() {}\n\
+         fn g() { #![doc = \"agent.turn.cancel\"] }\n\
+         const H: &str = wire!(#[doc = \"agent.turn.cancel\"]);\n\
+         wire! {\n\
+         /// agent.turn.cancel\n\
+         }\n\
+         fn i() { wire![#![doc = \"agent.turn.steer\"]]; }\n\
+         #[cfg_attr(feature = \"agent.turn.cancel\", allow(dead_code))]\n\
+         fn j() {}\n\
+         #[cfg_attr(a, deprecated(note = \"agent.turn.cancel\"))]\n\
+         fn k() {}\n\
+         macro_rules! m {\n\
+         () => { #[doc = \"agent.prompt.submit\"] fn z() {} };\n\
+         }\n",
+    );
+    // The text of a `doc` attribute, `///` and `//!` among them, is documentation: no candidate. The same
+    // tokens in the arguments or the rules of a macro are what the macro makes of them (a runtime string,
+    // here), and so are a literal. Nothing else that a `cfg_attr` holds is documentation.
+    assert_eq!(
+        found,
+        [
+            ("\"agent.turn.cancel\"".to_owned(), 14),
+            ("\"agent.turn.cancel\"".to_owned(), 16),
+            ("\"agent.turn.steer\"".to_owned(), 18),
+            ("\"agent.turn.cancel\"".to_owned(), 19),
+            ("\"agent.turn.cancel\"".to_owned(), 21),
+            ("\"agent.prompt.submit\"".to_owned(), 24),
+        ]
+    );
+}
+
 fn reports_for_refusals() -> (tempfile::TempDir, Meta, Platform) {
     let root = tempfile::tempdir().expect("a folder");
     forms(root.path());
