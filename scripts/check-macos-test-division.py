@@ -16,7 +16,11 @@ two lists from the workflow, asks Cargo for the workspace's members, and fails w
   * the matrix has a test leg twice, has none, or has a test part besides the two (the Test step
     runs every part that begins with `tests`, so an extra one would run packages again), where a
     part is read as GitHub reads it: quoted or plain, with a comment after it, in any case,
-  * the matrix has a part or an entry in a form this does not read (a flow mapping, an expression).
+  * the matrix has a part or an entry in a form this does not read (a flow mapping, an expression),
+    or a `part` key written other than as the bare word `part` before its colon (in quotes, in
+    capitals, with a space before the colon, or as a complex key), which YAML and GitHub read as the
+    same key and a line-by-line reader does not. Any quoted key is refused, whatever it spells: a
+    double-quoted key can spell `part` with an escape.
 
 A new crate therefore has to be put in one of the lists before the job passes.
 
@@ -35,9 +39,10 @@ form that has the whole workspace's features, which the conformance case holds.
 `self-test` puts the check through a workflow and a workspace that are written out here: the
 division that holds, a member left out, a member in both lists, a member twice in one list, a name
 that is no member, the left-out package named, a word that is no package, a leg that is missing, a
-leg twice, an extra test leg (also quoted, in another case, or with a comment), a part in a form not
-read, an empty list, and the comparison of features. Each fault must be
-refused and named, and the division that holds must pass.
+leg twice, an extra test leg (also quoted, in another case, or with a comment, or with its `part`
+key in quotes with or without an escape, in capitals, spaced or complex), a part in a form not
+read, an empty list, and the comparison of features. Each fault must be refused and named, and the
+division that holds must pass.
 """
 
 import argparse
@@ -79,15 +84,31 @@ def decode(value):
     return value.lower() if re.fullmatch(r"[A-Za-z0-9_-]+", value) else None
 
 
+def other_spelling(text):
+    """Whether a line has the key `part` in a spelling that YAML reads as the same key and this does
+    not: quoted, in capitals (GitHub looks a matrix property up without regard to case), with a
+    space before the colon, or as a complex key (`? part`). A quoted key of any name is refused
+    without being decoded, since a double-quoted key can spell `part` with an escape."""
+    if re.match(r"(?:-\s+)?\?\s+['\"]?part['\"]?\s*(?:#.*)?$", text, re.IGNORECASE):
+        return True
+    if re.match(r"(?:-\s+)?(['\"]).*?\1\s*:(?:\s|$)", text):
+        return True
+    key = re.match(r"(?:-\s+)?(['\"]?)([A-Za-z0-9_-]+)\1(\s*):(?:\s|$)", text)
+    if not key or key.group(2).lower() != "part":
+        return False
+    return bool(key.group(1) or key.group(3)) or key.group(2) != "part"
+
+
 def unreadable(workflow):
     """The lines of the job that name a part or open an entry in a form this does not read: an
-    entry written as a flow mapping or a flow sequence, and a part that is not a name."""
+    entry written as a flow mapping or a flow sequence, a `part` key in another spelling, and a part
+    that is not a name."""
     odd = []
     for line in job_text(workflow):
         text = line.strip()
         if text.startswith("#"):
             continue
-        if re.match(r"-\s+[{\[]", text):
+        if re.match(r"-\s+[{\[]", text) or other_spelling(text):
             odd.append(text)
         elif re.search(r"\bpart:", text):
             matched = re.match(r"(?:-\s+)?part:\s*(.*)$", text)
@@ -589,6 +610,29 @@ def self_test():
             ["tests-1 names no package"],
         ),
     ]
+    # An extra test leg, with the packages of tests-2, whose `part` key is spelled so that YAML reads
+    # it as `part` and a plain-text reader does not. The fault must name the line.
+    for spelling, key in [
+        ("in single quotes", "'part': tests-3"),
+        ("in double quotes", '"part": tests-3'),
+        ("with a space before the colon", "part : tests-3"),
+        ("in capitals, which GitHub reads as the same property", "Part: tests-3"),
+        ("as a complex key", "? part\n            : tests-3"),
+        ("in double quotes with an escape, which YAML reads as `part`", '"p\\u0061rt": tests-3'),
+    ]:
+        leg = (
+            "          - name: macos-tests-3\n"
+            f"            {key}\n"
+            "            packages: >-\n"
+            "              -p gamma -p delta\n"
+        )
+        cases.append(
+            (
+                f"an extra test leg whose key is spelled {spelling}",
+                fixture(["alpha", "beta"], ["gamma", "delta"], raw=leg),
+                ["a form the check does not read", key.splitlines()[0]],
+            )
+        )
     failed = False
     for what, workflow, expected in cases:
         faults = problems(workflow, members)
