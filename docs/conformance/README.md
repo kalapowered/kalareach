@@ -382,21 +382,21 @@ rule and Cargo disagree`. The run does not pass.
 
 A Rust test's `command` is a POSIX shell line. It comes from the step that ran the test or, where
 none did, from the first step that covers its target, narrowed to the test's target and name, and to
-its package unless the step's features say otherwise (see below). It begins `cd <directory> && `
+its package when the step selects no other package (see below). It begins `cd <directory> && `
 when the test's workspace is not the root. It repeats the step's variables whose value holds no
 placeholder, written `NAME=value`, and the step's profile, `--target`, `--config` and feature flags.
 A flag whose value holds a placeholder is left out, because the run gives a placeholder its value.
 
-The feature flags are cut to what a command for the test's package alone accepts: the package's own
-features and its dependencies' stay, a feature of a package that the test's package depends on is
-written with the dependency's name, and the features of other packages go. Cargo turns on, for one
-build, the features that any selected package asks for, so where the step turns on features that a
-command for one package cannot say (a feature of a package that the test's package does not depend
-on, or `--all-features` in a step that selects other packages), the command keeps the step's own
-package flags in place of `-p`. The options the step passes the test binary stay with their values,
-except the filters, `--skip`, `--exact`, `--list`, `--show-output` and `--logfile`. A variable whose
-value holds a placeholder is named in the test's `needs`, and an option whose value holds one is left
-out. The command of a TypeScript test is not changed.
+Cargo builds the selected packages together and turns on, in each package, the features that any of
+them asks for, and the report cannot see which selected packages reach the test's package. A step
+that selects only the test's package therefore gives its command `-p <package>` and the step's
+feature flags. A step that selects other packages (`--workspace`, several `-p`, or the default
+members of a workspace with several packages) keeps its own package flags and feature flags, so the
+command builds the package with the features the step built it with. The options the step passes
+the test binary stay with their values, except the filters, `--skip`, `--exact`, `--list`,
+`--show-output` and `--logfile`. A variable whose value holds a placeholder is named in the test's
+`needs`, and an option whose value holds one is left out. The command of a TypeScript test is not
+changed.
 
 ## How a test names what it proves
 

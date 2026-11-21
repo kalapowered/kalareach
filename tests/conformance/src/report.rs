@@ -1553,9 +1553,10 @@ impl<'a> Resolver<'a> {
     }
 
     /// The command that reproduces a Rust test: the step that ran it, or the first that selects its
-    /// target where none did, narrowed to the test's package, its target and the test. It runs in the
-    /// directory of the package's workspace, with the variables the step sets that hold no
-    /// placeholder, the step's features and profile, and the options the step passes the test binary.
+    /// target where none did, narrowed to the test's target and the test, and to its package where the
+    /// step selects no other package. It runs in the directory of the package's workspace, with the
+    /// variables the step sets that hold no placeholder, the step's features and profile, and the
+    /// options the step passes the test binary.
     fn rust_command(&self, target: &TargetId, name: &str, runs: &[RunRecord]) -> String {
         let step = self.reproducing_step(target, runs).map(|done| &done.step);
         let mut line = String::new();

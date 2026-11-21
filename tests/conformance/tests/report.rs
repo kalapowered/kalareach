@@ -2378,7 +2378,6 @@ fn package_of(name: &str, workspace: &str, targets: &[(TargetKind, &str, bool)])
         manifest: PathBuf::from("Cargo.toml"),
         registry_crates: BTreeSet::new(),
         dependency_names: BTreeSet::new(),
-        dependency_aliases: BTreeMap::new(),
         workspace: workspace.to_owned(),
         workspace_members: vec![name.to_owned()],
         workspace_default_members: vec![name.to_owned()],
@@ -2771,9 +2770,14 @@ fn a_command_reproduces_the_step_in_its_directory_with_its_features_profile_and_
 /// The command that reproduces the test `a` of the library `p` for `step`, where `package` is the
 /// package `p` in the root workspace.
 fn reproduction(step: &Step, package: Package) -> String {
+    reproduction_in(step, vec![package])
+}
+
+/// The same, where the workspace holds `packages`, the first of which is the package `p`.
+fn reproduction_in(step: &Step, packages: Vec<Package>) -> String {
     let lib = target_of("p", TargetKind::Lib, "p");
     let mut map = Map {
-        packages: vec![package],
+        packages,
         ..Map::default()
     };
     key_in(&mut map, "KR-REQ-03.01", &lib, "a");
@@ -2872,52 +2876,50 @@ fn a_command_keeps_the_options_a_step_passes_the_test_binary_with_their_values()
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// A command for one package gives the features of that package and of its dependencies, and not
-/// the features of the other packages that the step's command named.
+/// A step that selects no package but the test's gives a command for that package, with the step's
+/// features as it wrote them. A step that selects other packages gives a command with its own
+/// package flags and features, because Cargo turns on, in the test's package, what the other packages
+/// ask for.
 #[test]
-fn a_command_gives_the_features_of_the_package_it_runs_and_not_those_of_the_others() {
-    let mut package = package_of("p", ".", &[(TargetKind::Lib, "p", true)]);
-    package.features = BTreeMap::from([("f".to_owned(), Vec::new())]);
-    package.dependency_names = BTreeSet::from(["dep".to_owned()]);
-    let step = Step::cargo(
-        "rust",
-        "the workspace",
-        &[
-            "test",
-            "--locked",
-            "--workspace",
-            "--features",
-            "p/f,q/g,f,h,dep/x",
-            "--target",
-            "t",
-            "--config",
-            "build.jobs=2",
-        ],
-    );
-    // `q/g` cannot be said for `p`, so the command keeps the step's own features and package flags.
-    assert_eq!(
-        reproduction(&step, package.clone()),
-        "cargo test --locked --target t --config build.jobs=2 --features p/f,q/g,f,h,dep/x --workspace --lib -- --exact a"
-    );
-    let step = Step::cargo(
-        "rust",
-        "the workspace",
-        &[
-            "test",
-            "--locked",
-            "--workspace",
-            "--features",
-            "p/f,f,dep/x",
-            "--target",
-            "t",
-            "--config",
-            "build.jobs=2",
-        ],
-    );
-    assert_eq!(
-        reproduction(&step, package),
-        "cargo test --locked --target t --config build.jobs=2 --features f,dep/x -p p --lib -- --exact a"
-    );
+fn a_command_keeps_the_package_and_feature_flags_of_a_step_that_selects_other_packages() {
+    let package = package_of("p", ".", &[(TargetKind::Lib, "p", true)]);
+    let other = package_of("q", ".", &[(TargetKind::Lib, "q", true)]);
+    let step = |words: &[&str]| {
+        let mut all = vec!["test", "--locked"];
+        all.extend(words);
+        all.extend(["--target", "t", "--config", "build.jobs=2"]);
+        Step::cargo("rust", "the workspace", &all)
+    };
+    let mut wrong = Vec::new();
+    for (words, expected) in [
+        (
+            &["--workspace", "--features", "p/f,q/g,f"][..],
+            "--features p/f,q/g,f --workspace",
+        ),
+        (
+            &["--workspace", "--exclude", "q", "--features", "p/f,f"][..],
+            "--features p/f,f -p p",
+        ),
+        (
+            &["-p", "p", "-p", "q", "--features", "q/g"][..],
+            "--features q/g -p p -p q",
+        ),
+        (
+            &["--workspace", "--all-features"][..],
+            "--all-features --workspace",
+        ),
+        (&["-p", "p", "--features", "f"][..], "--features f -p p"),
+        (&["-p", "p", "--all-features"][..], "--all-features -p p"),
+    ] {
+        let have = reproduction_in(&step(words), vec![package.clone(), other.clone()]);
+        let want = format!(
+            "cargo test --locked --target t --config build.jobs=2 {expected} --lib -- --exact a"
+        );
+        if have != want {
+            wrong.push(format!("{words:?}: {have}, not {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// A cargo flag whose value holds a placeholder is left out of the command, because the run gives a
@@ -2963,218 +2965,318 @@ fn a_command_leaves_out_a_cargo_flag_whose_value_holds_a_placeholder() {
     );
 }
 
+/// A workspace on disk that Cargo has locked, and the packages the report reads from it.
+#[cfg(unix)]
+struct OnDisk {
+    directory: tempfile::TempDir,
+    target: PathBuf,
+    packages: Vec<Package>,
+}
+
+/// The manifest of the package `name`, with `extra` after its `[package]` table.
+#[cfg(unix)]
+fn manifest(name: &str, extra: &str) -> String {
+    format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n{extra}"
+    )
+}
+
+/// A workspace of the packages `members` with the files `files` (a path in the workspace and its text).
+#[cfg(unix)]
+fn on_disk(members: &[&str], files: &[(String, String)]) -> OnDisk {
+    use std::process::Command;
+    let directory = tempfile::tempdir().expect("a directory");
+    let root = directory.path();
+    let listed: Vec<String> = members.iter().map(|name| format!("\"{name}\"")).collect();
+    let mut all = vec![(
+        "Cargo.toml".to_owned(),
+        format!(
+            "[workspace]\nresolver = \"3\"\nmembers = [{}]\n",
+            listed.join(", ")
+        ),
+    )];
+    all.extend(files.iter().cloned());
+    for (relative, text) in all {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
+        std::fs::write(path, text).expect("a file");
+    }
+    let target = root.join("target");
+    let lock = Command::new("cargo")
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", &target)
+        .args(["generate-lockfile", "--offline"])
+        .output()
+        .expect("cargo runs");
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let read = kr_conformance::workspace::read(root, &["Cargo.toml".to_owned()]);
+    assert!(read.problems.is_empty(), "{:?}", read.problems);
+    OnDisk {
+        directory,
+        target,
+        packages: read.packages,
+    }
+}
+
+/// The command the report gives for the test `test` of the target `target`, for the step `step`.
+#[cfg(unix)]
+fn command_for(disk: &OnDisk, step: &Step, target: &TargetId, test: &str) -> String {
+    let mut map = Map {
+        packages: disk.packages.clone(),
+        ..Map::default()
+    };
+    key_in(&mut map, "KR-REQ-03.01", target, test);
+    let plan = Plan::of_steps("rust", vec![step.clone()]);
+    let document = assembled(plan, &map, &[passing(step.clone(), target, &[test])]);
+    document.identifiers["KR-REQ-03.01"].tests[0]
+        .command
+        .clone()
+        .expect("a command")
+}
+
 /// The command a report gives for a test runs: in a workspace of two packages that each have a
-/// feature, a step that turns both on, with options for the test binary, gives a command for one
-/// package that Cargo accepts and that runs the test.
+/// feature, a step that turns both on, with options for the test binary, gives a command that Cargo
+/// accepts and that runs the test, and a step that selects one of them gives a command for it alone.
 #[cfg(unix)]
 #[test]
 fn a_reproduced_command_runs_for_each_package_of_a_workspace_that_a_step_gave_features() {
     use std::process::Command;
-    let directory = tempfile::tempdir().expect("a directory");
-    let root = directory.path();
-    let write = |relative: &str, text: &str| {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
-        std::fs::write(path, text).expect("a file");
-    };
-    write(
-        "Cargo.toml",
-        "[workspace]\nresolver = \"3\"\nmembers = [\"a\", \"b\"]\n",
-    );
+    let mut files = Vec::new();
     for (name, feature) in [("a", "f"), ("b", "g")] {
-        write(
-            &format!("{name}/Cargo.toml"),
-            &format!(
-                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[features]\n{feature} = []\n"
-            ),
-        );
-        write(&format!("{name}/src/lib.rs"), "");
-        write(
-            &format!("{name}/tests/t{name}.rs"),
-            "#[test]\nfn works() {}\n",
-        );
+        files.push((
+            format!("{name}/Cargo.toml"),
+            manifest(name, &format!("[features]\n{feature} = []\n")),
+        ));
+        files.push((format!("{name}/src/lib.rs"), String::new()));
+        files.push((
+            format!("{name}/tests/t{name}.rs"),
+            "#[test]\nfn works() {}\n".to_owned(),
+        ));
     }
-    let target = root.join("target");
-    let lock = Command::new("cargo")
-        .current_dir(root)
-        .env("CARGO_TARGET_DIR", &target)
-        .args(["generate-lockfile", "--offline"])
-        .output()
-        .expect("cargo runs");
-    assert!(
-        lock.status.success(),
-        "{}",
-        String::from_utf8_lossy(&lock.stderr)
-    );
-    let read = kr_conformance::workspace::read(root, &["Cargo.toml".to_owned()]);
-    assert!(read.problems.is_empty(), "{:?}", read.problems);
-    let step = Step::cargo(
-        "rust",
-        "the workspace",
-        &[
-            "test",
-            "--locked",
-            "--workspace",
-            "--features",
-            "a/f,b/g",
-            "--",
-            "--test-threads",
-            "1",
-            "--format",
-            "terse",
-        ],
-    );
-    for name in ["a", "b"] {
-        let test = target_of(name, TargetKind::Test, &format!("t{name}"));
-        let mut map = Map {
-            packages: read.packages.clone(),
-            ..Map::default()
-        };
-        key_in(&mut map, "KR-REQ-03.01", &test, "works");
-        let plan = Plan::of_steps("rust", vec![step.clone()]);
-        let document = assembled(plan, &map, &[passing(step.clone(), &test, &["works"])]);
-        let command = document.identifiers["KR-REQ-03.01"].tests[0]
-            .command
-            .clone()
-            .expect("a command");
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(root)
-            .env("CARGO_TARGET_DIR", &target)
-            .output()
-            .expect("a shell runs");
-        let shown = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && shown.contains("1 passed"),
-            "{command}\n{shown}\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    let disk = on_disk(&["a", "b"], &files);
+    let root = disk.directory.path();
+    for (words, names, flags) in [
+        (
+            &["--workspace", "--features", "a/f,b/g"][..],
+            &["a", "b"][..],
+            " --workspace ",
+        ),
+        (&["-p", "a", "--features", "f"][..], &["a"][..], " -p a "),
+    ] {
+        let mut all = vec!["test", "--locked"];
+        all.extend(words);
+        all.extend(["--", "--test-threads", "1", "--format", "terse"]);
+        let step = Step::cargo("rust", "the workspace", &all);
+        for name in names {
+            let test = target_of(name, TargetKind::Test, &format!("t{name}"));
+            let command = command_for(&disk, &step, &test, "works");
+            assert!(command.contains(flags), "{command}: lacks `{flags}`");
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .current_dir(root)
+                .env("CARGO_TARGET_DIR", &disk.target)
+                .output()
+                .expect("a shell runs");
+            let shown = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && shown.contains("1 passed"),
+                "{command}\n{shown}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 
-/// The command a report gives for a test keeps what the step turned on for the packages that the test's
-/// package depends on, and for the ones it does not depend on: in a workspace where `a` depends on `b`
-/// under the name `dep` and on `c`, the test `ta` asks which features are on, and Cargo turns on, for one
-/// build, what any selected package asks for.
+/// The command a report gives for a test builds the test's package with the features that its step
+/// built it with, in each way another package can turn a feature on: through a feature that a
+/// second package has by the same name, through that package's default feature, through a feature of
+/// a package that the test's package does not depend on, and through a dependency that asks for a
+/// feature. Each row runs the step's own command and the report's command for the same test, and both
+/// must find the test's package built the same way.
 #[cfg(unix)]
 #[test]
-fn a_reproduced_command_keeps_the_features_a_step_turned_on_in_packages_beside_the_test_s() {
+fn a_reproduced_command_builds_the_test_s_package_with_the_features_its_step_built_it_with() {
     use std::process::Command;
-    let directory = tempfile::tempdir().expect("a directory");
-    let root = directory.path();
-    let write = |relative: &str, text: &str| {
-        let path = root.join(relative);
-        std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
-        std::fs::write(path, text).expect("a file");
+    let on =
+        |feature: &str| format!("pub fn on() -> bool {{\n    cfg!(feature = \"{feature}\")\n}}\n");
+    let dependent = |name: &str, feature_table: &str, test: &str| {
+        vec![
+            (
+                format!("{name}/Cargo.toml"),
+                manifest(
+                    name,
+                    &format!("[dependencies]\nc = {{ path = \"../c\" }}\n\n{feature_table}"),
+                ),
+            ),
+            (format!("{name}/src/lib.rs"), String::new()),
+            (format!("{name}/tests/ta.rs"), test.to_owned()),
+        ]
     };
-    write(
-        "Cargo.toml",
-        "[workspace]\nresolver = \"3\"\nmembers = [\"a\", \"b\", \"c\", \"e\"]\n",
-    );
-    let manifest = |name: &str, extra: &str| {
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n{extra}"
-        )
+    let c = |table: &str| {
+        vec![
+            ("c/Cargo.toml".to_owned(), manifest("c", table)),
+            ("c/src/lib.rs".to_owned(), on("x")),
+        ]
     };
-    write("c/Cargo.toml", &manifest("c", "[features]\nx = []\n"));
-    write(
-        "c/src/lib.rs",
-        "pub fn x_on() -> bool {\n    cfg!(feature = \"x\")\n}\n",
-    );
-    write(
-        "b/Cargo.toml",
-        &manifest(
-            "b",
-            "[dependencies]\nc = { path = \"../c\" }\n\n[features]\ng = [\"c/x\"]\n",
+    let x_is_on = "#[test]\nfn x_is_on() {\n    assert!(c::on());\n}\n";
+    let mut shared = c("[features]\nx = []\n");
+    shared.extend(dependent("a", "[features]\nf = []\n", x_is_on));
+    shared.extend(vec![
+        (
+            "b/Cargo.toml".to_owned(),
+            manifest(
+                "b",
+                "[dependencies]\nc = { path = \"../c\" }\n\n[features]\nf = [\"c/x\"]\n",
+            ),
         ),
-    );
-    write(
-        "b/src/lib.rs",
-        "pub fn g_on() -> bool {\n    cfg!(feature = \"g\")\n}\n",
-    );
-    write(
-        "e/Cargo.toml",
-        &manifest(
-            "e",
-            "[dependencies]\nc = { path = \"../c\" }\n\n[features]\nh = [\"c/x\"]\n",
+        ("b/src/lib.rs".to_owned(), String::new()),
+    ]);
+    let mut default = c("[features]\nx = []\n");
+    default.extend(dependent("a", "", x_is_on));
+    default.extend(vec![
+        (
+            "b/Cargo.toml".to_owned(),
+            manifest(
+                "b",
+                "[dependencies]\nc = { path = \"../c\" }\n\n[features]\ndefault = [\"c/x\"]\n",
+            ),
         ),
-    );
-    write("e/src/lib.rs", "");
-    write(
-        "a/Cargo.toml",
-        &manifest(
-            "a",
-            "[dependencies]\ndep = { package = \"b\", path = \"../b\" }\nc = { path = \"../c\" }\n",
+        ("b/src/lib.rs".to_owned(), String::new()),
+    ]);
+    let optional = vec![
+        (
+            "b/Cargo.toml".to_owned(),
+            manifest("b", "[features]\ng = []\n"),
         ),
-    );
-    write("a/src/lib.rs", "");
-    write(
-        "a/tests/ta.rs",
-        "#[test]\nfn dep_feature_is_on() {\n    assert!(dep::g_on());\n}\n\n#[test]\nfn c_feature_is_on() {\n    assert!(c::x_on());\n}\n",
-    );
-    let target = root.join("target");
-    let lock = Command::new("cargo")
-        .current_dir(root)
-        .env("CARGO_TARGET_DIR", &target)
-        .args(["generate-lockfile", "--offline"])
-        .output()
-        .expect("cargo runs");
-    assert!(
-        lock.status.success(),
-        "{}",
-        String::from_utf8_lossy(&lock.stderr)
-    );
-    let read = kr_conformance::workspace::read(root, &["Cargo.toml".to_owned()]);
-    assert!(read.problems.is_empty(), "{:?}", read.problems);
+        ("b/src/lib.rs".to_owned(), String::new()),
+        (
+            "a/Cargo.toml".to_owned(),
+            manifest(
+                "a",
+                "[dependencies]\ndep = { package = \"b\", path = \"../b\", optional = true }\n",
+            ),
+        ),
+        ("a/src/lib.rs".to_owned(), String::new()),
+        (
+            "a/tests/ta.rs".to_owned(),
+            "#[test]\nfn dep_is_off() {\n    assert!(!cfg!(feature = \"dep\"));\n}\n".to_owned(),
+        ),
+    ];
+    let reached = vec![
+        (
+            "b/Cargo.toml".to_owned(),
+            manifest(
+                "b",
+                "[features]\ndefault = [\"g\"]\nf = []\ng = []\nh = []\n",
+            ),
+        ),
+        (
+            "b/src/lib.rs".to_owned(),
+            [("f", "f"), ("g", "g"), ("h", "h")]
+                .iter()
+                .map(|(function, feature)| {
+                    format!(
+                        "pub fn {function}_on() -> bool {{\n    cfg!(feature = \"{feature}\")\n}}\n"
+                    )
+                })
+                .collect(),
+        ),
+        (
+            "a/Cargo.toml".to_owned(),
+            manifest(
+                "a",
+                "[dependencies]\nb = { path = \"../b\", default-features = false }\n\n[features]\nf = []\n",
+            ),
+        ),
+        ("a/src/lib.rs".to_owned(), String::new()),
+        (
+            "a/tests/ta.rs".to_owned(),
+            ["f", "g", "h"]
+                .iter()
+                .map(|name| {
+                    format!("#[test]\nfn {name}_is_on() {{\n    assert!(b::{name}_on());\n}}\n\n")
+                })
+                .collect(),
+        ),
+        (
+            "c/Cargo.toml".to_owned(),
+            manifest(
+                "c",
+                "[dependencies]\nb = { path = \"../b\", features = [\"h\"] }\n",
+            ),
+        ),
+        ("c/src/lib.rs".to_owned(), String::new()),
+    ];
+    let fixtures = [
+        ("shared", on_disk(&["a", "b", "c"], &shared)),
+        ("default", on_disk(&["a", "b", "c"], &default)),
+        ("optional", on_disk(&["a", "b"], &optional)),
+        ("reached", on_disk(&["a", "b", "c"], &reached)),
+    ];
     let ta = target_of("a", TargetKind::Test, "ta");
-    // Each row: the features the step turns on, the test that asks for them, and the package flags
-    // the reproduced command must hold. `b/g` is said for `a` as `dep/g`, so the command names `a`;
-    // the others turn on `c`'s feature through a package that `a` does not depend on, which only the
-    // step's own package flags keep.
-    for (features, test, flags) in [
-        (&["--features", "b/g"][..], "dep_feature_is_on", " -p a "),
-        (&["--features", "b/g"][..], "c_feature_is_on", " -p a "),
+    for (name, words, test) in [
+        ("shared", &["--workspace", "--features", "f"][..], "x_is_on"),
+        ("default", &["--workspace"][..], "x_is_on"),
         (
-            &["--features", "e/h"][..],
-            "c_feature_is_on",
-            " --workspace ",
+            "optional",
+            &["--workspace", "--features", "b/g"][..],
+            "dep_is_off",
         ),
         (
-            &["--all-features"][..],
-            "dep_feature_is_on",
-            " --workspace ",
+            "reached",
+            &["--workspace", "--features", "f"][..],
+            "f_is_on",
         ),
-        (&["--all-features"][..], "c_feature_is_on", " --workspace "),
+        ("reached", &["--workspace"][..], "g_is_on"),
+        ("reached", &["--workspace"][..], "h_is_on"),
     ] {
-        let mut words = vec!["test", "--locked", "--workspace"];
-        words.extend(features);
-        words.extend(["--test", "ta", "--", "--test-threads", "1"]);
-        let step = Step::cargo("rust", "the workspace", &words);
-        let mut map = Map {
-            packages: read.packages.clone(),
-            ..Map::default()
-        };
-        key_in(&mut map, "KR-REQ-03.01", &ta, test);
-        let plan = Plan::of_steps("rust", vec![step.clone()]);
-        let document = assembled(plan, &map, &[passing(step.clone(), &ta, &[test])]);
-        let command = document.identifiers["KR-REQ-03.01"].tests[0]
-            .command
-            .clone()
-            .expect("a command");
-        assert!(command.contains(flags), "{command}: lacks `{flags}`");
-        let output = Command::new("sh")
+        let disk = &fixtures
+            .iter()
+            .find(|(label, _)| *label == name)
+            .expect("a fixture")
+            .1;
+        let root = disk.directory.path();
+        let mut step_words = vec!["test", "--locked"];
+        step_words.extend(words);
+        step_words.extend(["--test", "ta", "--", "--test-threads", "1"]);
+        let step = Step::cargo("rust", "the workspace", &step_words);
+        let mut original = vec!["test", "--locked", "--offline"];
+        original.extend(words);
+        original.extend(["--test", "ta", "--", "--exact", test]);
+        let original = Command::new("cargo")
+            .current_dir(root)
+            .env("CARGO_TARGET_DIR", &disk.target)
+            .args(&original)
+            .output()
+            .expect("cargo runs");
+        let shown = String::from_utf8_lossy(&original.stdout);
+        assert!(
+            original.status.success() && shown.contains("1 passed"),
+            "{name} {words:?} {test}: the step's own command fails\n{shown}\n{}",
+            String::from_utf8_lossy(&original.stderr)
+        );
+        let command = command_for(disk, &step, &ta, test);
+        assert!(
+            command.contains(" --workspace "),
+            "{name} {words:?} {test}: {command}: lacks the step's package flags"
+        );
+        let reproduced = Command::new("sh")
             .arg("-c")
             .arg(&command)
             .current_dir(root)
-            .env("CARGO_TARGET_DIR", &target)
+            .env("CARGO_TARGET_DIR", &disk.target)
             .output()
             .expect("a shell runs");
-        let shown = String::from_utf8_lossy(&output.stdout);
+        let shown = String::from_utf8_lossy(&reproduced.stdout);
         assert!(
-            output.status.success() && shown.contains("1 passed"),
-            "{command}\n{shown}\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            reproduced.status.success() && shown.contains("1 passed"),
+            "{name} {words:?} {test}: the report's command fails: {command}\n{shown}\n{}",
+            String::from_utf8_lossy(&reproduced.stderr)
         );
     }
 }

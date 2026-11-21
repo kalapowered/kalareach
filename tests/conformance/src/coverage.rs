@@ -215,27 +215,6 @@ fn package_spec(text: &str) -> Result<Pattern, String> {
     Pattern::new(text)
 }
 
-/// One feature of a step's `--features`, written as a command for `package` alone says it, or `None`
-/// where such a command cannot: the package's own feature as `f`, a feature of a dependency of it
-/// with the name the package knows the dependency by, and nothing for a feature of another package.
-fn say(package: &Package, item: &str) -> Option<String> {
-    let Some((owner, feature)) = item.split_once('/') else {
-        return package.features.contains_key(item).then(|| item.to_owned());
-    };
-    let name = owner.trim_end_matches('?');
-    let weak = if owner.ends_with('?') { "?" } else { "" };
-    if name == package.name {
-        Some(feature.to_owned())
-    } else if package.dependency_names.contains(name) {
-        Some(item.to_owned())
-    } else {
-        package
-            .dependency_aliases
-            .get(name)
-            .map(|alias| format!("{alias}{weak}/{feature}"))
-    }
-}
-
 /// Whether a flag takes a value.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Takes {
@@ -634,14 +613,11 @@ impl Selection {
     /// the workspace, and `held` the words of the step's command whose value holds a placeholder,
     /// which the run gives and which are left out.
     ///
-    /// The features are written as a command for `package` alone can say them: a feature of the
-    /// package (`f` or `<package>/f`) stays, a feature of a dependency of it is written with the
-    /// dependency's name, and the features of other packages go, because a command that names one
-    /// package refuses them. The command then names the package with `-p`. Cargo turns on, for one
-    /// build, the features that any selected package asks for, so where the step turns on features
-    /// that a command for one package cannot say (a feature of a package that `package` does not
-    /// depend on, or `--all-features` in a step that selects other packages) the command keeps the
-    /// step's own features and package flags.
+    /// Cargo builds the selected packages together and turns on, in each package, the features that
+    /// any of them asks for, and the selection cannot say which selected packages reach `package`.
+    /// A step that selects no package but `package` gives `-p <package>`. A step that selects another
+    /// package keeps its own package flags (`--workspace`, `--exclude`, each `-p`). The features,
+    /// `--all-features` and `--no-default-features` are the step's own in both.
     #[must_use]
     pub fn reproduce(
         &self,
@@ -663,28 +639,12 @@ impl Selection {
         for config in self.configs.iter().filter(kept) {
             words.extend(["--config".to_owned(), config.value.clone()]);
         }
-        let asked: Vec<&str> = self
+        let features: Vec<&str> = self
             .features
             .iter()
             .filter(kept)
             .map(|item| item.value.as_str())
             .collect();
-        let others = members
-            .iter()
-            .any(|other| other.name != package.name && self.selects_package(other));
-        let said: Vec<Option<String>> = asked.iter().map(|item| say(package, item)).collect();
-        let narrowed = said.iter().all(Option::is_some) && !(self.all_features && others);
-        let chosen: Vec<String> = if narrowed {
-            said.into_iter().flatten().collect()
-        } else {
-            asked.iter().map(|item| (*item).to_owned()).collect()
-        };
-        let mut features: Vec<String> = Vec::new();
-        for item in chosen {
-            if !features.contains(&item) {
-                features.push(item);
-            }
-        }
         if !features.is_empty() {
             words.extend(["--features".to_owned(), features.join(",")]);
         }
@@ -694,10 +654,13 @@ impl Selection {
         if self.no_default_features {
             words.push("--no-default-features".to_owned());
         }
-        if narrowed {
-            words.extend(["-p".to_owned(), package.name.clone()]);
-        } else {
+        let others = members
+            .iter()
+            .any(|other| other.name != package.name && self.selects_package(other));
+        if others {
             words.extend(self.package_words());
+        } else {
+            words.extend(["-p".to_owned(), package.name.clone()]);
         }
         words
     }
@@ -876,7 +839,6 @@ mod tests {
             manifest: PathBuf::from("Cargo.toml"),
             registry_crates: BTreeSet::new(),
             dependency_names: BTreeSet::new(),
-            dependency_aliases: BTreeMap::new(),
             workspace: ".".to_owned(),
             workspace_members: vec!["a".to_owned(), "ab".to_owned(), "b".to_owned()],
             workspace_default_members: defaults.iter().map(|name| (*name).to_owned()).collect(),
@@ -1632,29 +1594,19 @@ mod tests {
     }
 
     #[test]
-    fn a_command_repeats_the_profile_the_targets_the_configuration_and_the_features_of_its_package()
-    {
-        let mut one = package("a", Vec::new(), &["a"]);
-        one.features = BTreeMap::from([
-            ("f".to_owned(), Vec::new()),
-            ("g".to_owned(), Vec::new()),
-            ("dep".to_owned(), vec!["dep:dep".to_owned()]),
-        ]);
-        // The package `c` is a dependency of `a` that the manifest renames to `other`.
-        one.dependency_names = BTreeSet::from(["dep".to_owned(), "other".to_owned()]);
-        one.dependency_aliases = BTreeMap::from([("c".to_owned(), "other".to_owned())]);
-        let mut two = package("b", Vec::new(), &["a"]);
-        two.features = BTreeMap::from([("h".to_owned(), Vec::new())]);
+    fn a_command_repeats_the_profile_the_targets_the_configuration_and_the_features_of_its_step() {
+        let one = package("a", Vec::new(), &["a"]);
+        let two = package("b", Vec::new(), &["a"]);
         let members = [&one, &two];
         let reproduced = |line: &str, package: &Package| {
             parse(&words(line))
                 .expect("a command")
                 .reproduce(package, &members, &[])
         };
-        // Every feature can be said for `a`, so the command names `a` alone.
+        // A step that selects no package but `a` gives `-p a`, with the step's own flags and features.
         assert_eq!(
             reproduced(
-                "cargo test --locked -p a --release --features f,a/g,dep/x,c/y --all-features --no-default-features --target t --target u --config c=1 --config d=2 -j 2 -- --nocapture",
+                "cargo test --locked -p a --release --features f,a/g,dep/x --all-features --no-default-features --target t --target u --config c=1 --config d=2 -j 2 -- --nocapture",
                 &one
             ),
             [
@@ -1668,7 +1620,7 @@ mod tests {
                 "--config",
                 "d=2",
                 "--features",
-                "f,g,dep/x,other/y",
+                "f,a/g,dep/x",
                 "--all-features",
                 "--no-default-features",
                 "-p",
@@ -1676,41 +1628,41 @@ mod tests {
             ]
         );
         assert_eq!(
-            reproduced(
-                "cargo test --workspace --features a/f,dep?/x,c?/y --profile ci",
-                &one
-            ),
-            [
-                "--profile",
-                "ci",
-                "--features",
-                "f,dep?/x,other?/y",
-                "-p",
-                "a"
-            ]
-        );
-        assert_eq!(
             reproduced("cargo test -F a/f -r", &one),
-            ["--release", "--features", "f", "-p", "a"]
+            ["--release", "--features", "a/f", "-p", "a"]
         );
-        assert_eq!(reproduced("cargo test -qr", &two), ["--release", "-p", "b"]);
         assert_eq!(
-            reproduced("cargo test --workspace --locked", &one),
-            ["-p", "a"]
+            reproduced("cargo test -p b -qr", &two),
+            ["--release", "-p", "b"]
         );
-        // A feature of a package that `a` does not depend on cannot be said for `a`: Cargo turns on,
-        // for one build, what any selected package asks for, so the command keeps the step's own
-        // features and package flags.
+        for line in [
+            "cargo test -p a --all-features",
+            "cargo test --workspace --exclude b --all-features",
+        ] {
+            assert_eq!(
+                reproduced(line, &one),
+                ["--all-features", "-p", "a"],
+                "{line}"
+            );
+        }
+        // A step that selects another package keeps its own package flags, because Cargo turns on, in
+        // the package's build, the features that the other packages ask for: its features stay as it
+        // gave them, whatever package they name.
         for (line, expected) in [
             (
-                "cargo test --workspace --features a/f,b/h,g,h,dep?/x,c?/y --profile ci",
+                "cargo test --workspace --features a/f,b/h,g,h,dep?/x --profile ci",
                 &[
                     "--profile",
                     "ci",
                     "--features",
-                    "a/f,b/h,g,h,dep?/x,c?/y",
+                    "a/f,b/h,g,h,dep?/x",
                     "--workspace",
                 ][..],
+            ),
+            ("cargo test --workspace --locked", &["--workspace"][..]),
+            (
+                "cargo test --workspace --features f",
+                &["--features", "f", "--workspace"][..],
             ),
             (
                 "cargo test --workspace --exclude c* --features b/h",
@@ -1719,10 +1671,6 @@ mod tests {
             (
                 "cargo test -p a -p b --features b/h",
                 &["--features", "b/h", "-p", "a", "-p", "b"][..],
-            ),
-            (
-                "cargo test --features=b/h --profile=ci",
-                &["--profile", "ci", "--features", "b/h"][..],
             ),
             (
                 "cargo test --workspace --all-features",
@@ -1742,17 +1690,14 @@ mod tests {
         ] {
             assert_eq!(reproduced(line, &one), expected, "{line}");
         }
-        // `--all-features` of a step that selects no other package is said for `a`.
-        for line in [
-            "cargo test -p a --all-features",
-            "cargo test --workspace --exclude b --all-features",
-        ] {
-            assert_eq!(
-                reproduced(line, &one),
-                ["--all-features", "-p", "a"],
-                "{line}"
-            );
-        }
+        // The default members of a workspace with several packages are several packages.
+        let first = package("a", Vec::new(), &["a", "b"]);
+        let second = package("b", Vec::new(), &["a", "b"]);
+        let defaults = [&first, &second];
+        let found = parse(&words("cargo test --features f"))
+            .expect("a command")
+            .reproduce(&first, &defaults, &[]);
+        assert_eq!(found, ["--features", "f"]);
     }
 
     #[test]
