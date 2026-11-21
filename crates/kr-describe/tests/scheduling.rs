@@ -592,6 +592,20 @@ fn an_oldest_ordinary_job_runs_after_three_priority_jobs() {
         session(9),
         "the oldest ordinary job runs after {PRIORITY_RUN_LIMIT} priority jobs, and got {served:?}"
     );
+
+    // The run starts again after the ordinary job: with another ordinary job waiting, the three
+    // priority jobs left go first and the ordinary one after them.
+    scheduler.enqueue(Priority::Ordinary, context_for(&session(10), 1), at(13_000));
+    let mut next = Vec::new();
+    for step in 1..=4 {
+        let job = scheduler.dequeue(at(13_000 + step * 1_000)).expect("a job");
+        next.push(job.session_id);
+    }
+    assert_eq!(
+        next,
+        [session(4), session(5), session(6), session(10)],
+        "after the ordinary job {PRIORITY_RUN_LIMIT} priority jobs go first again, and got {next:?}"
+    );
 }
 
 /// KR-REQ-22.14: a session inside its cooldown is not dequeued, and the queue says which case it is.
