@@ -372,9 +372,9 @@ unless their manifest says `bench = false`, and a test or an example that sets `
 `--test`, and so on for each plural flag; the report reads no pattern that a plural flag supersedes.
 `--lib` selects the library. `--bins`, `--examples`, `--bin`, `--example`,
 `--test` and `--bench` select targets whatever their manifest says, and the singular flags take a name
-or a pattern of `*`, `?` and `[...]`. A test of the report builds 229 commands in five workspaces
-with `cargo test --no-run --message-format=json` and requires the covered set to equal the targets
-Cargo builds.
+or a pattern of `*`, `?`, `[...]` and `**` as a whole path component. A test of the report builds 229
+commands in five workspaces with `cargo test --no-run --message-format=json` and requires the covered
+set to equal the targets Cargo builds.
 
 A target with `required-features` is covered only when the command turns on each one: with
 `--all-features`; with `--features` naming it, or a feature that enables it, as `f` or
