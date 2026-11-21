@@ -9,13 +9,15 @@
 //! both take their files from here.
 //!
 //! What the inventory does not read it refuses, with an error that names the file (the crate, for a
-//! crate with no target): a path through a link or outside the checkout, a module declared in a
-//! block or by a macro, `include!`, a `#[path]` that is not one string, a module that is at no file
-//! or at two, a crate with no target, a `macro_rules!` written in the tokens of another macro,
-//! `#[macro_use]` on `extern crate`, and an item-position macro of another crate that is not on the
-//! list of those accepted. The macros called in the transcribers of a `macro_rules!` definition, at
-//! any depth, are held to the same list. A `macro_rules!` name that is defined more than once is one
-//! definition under it.
+//! crate with no target): a path through a link, with `..` or from the root of the file system, a
+//! module declared in a block or by a macro, `include!`, a `#[path]` that is not one string, a module
+//! that is at no file or at two, a crate with no target, a `macro_rules!` written in the tokens of
+//! another macro, `#[macro_use]` on `extern crate`, a `use` or `extern crate` that renames a name the
+//! scan reads, a `type` alias of `MutationRequest` or `ActionTarget`, a definition named
+//! `ActionRight`, and an item-position macro of
+//! another crate that is not on the list of those accepted. The macros called in the transcribers of
+//! a `macro_rules!` definition, at any depth, are held to the same list. A `macro_rules!` name that
+//! is defined more than once is one definition under it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -501,6 +503,17 @@ impl Reader<'_> {
         }
     }
 
+    /// Refuses a definition named `ActionRight`: the scan leaves out `ActionRight::<Variant>` as the
+    /// right of that name, so a crate that defines the name another way hides a variant.
+    fn refuse_definition(&mut self, name: &syn::Ident, kind: &str) {
+        if self.error.is_none() && name.unraw() == "ActionRight" {
+            self.error = Some(format!(
+                "{}: the scan does not read a {kind} named ActionRight",
+                self.at
+            ));
+        }
+    }
+
     /// Refuses a `type` alias of `MutationRequest` or `ActionTarget`.
     fn refuse_alias(&mut self, alias: &syn::Ident, ty: &syn::Type) {
         // Parentheses and invisible groups around the type name the same type.
@@ -553,13 +566,9 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         visit_item_const => visit_item_const(syn::ItemConst);
         visit_item_fn => visit_item_fn(syn::ItemFn);
         visit_item_impl => visit_item_impl(syn::ItemImpl);
-        visit_item_enum => visit_item_enum(syn::ItemEnum);
         visit_item_foreign_mod => visit_item_foreign_mod(syn::ItemForeignMod);
         visit_item_static => visit_item_static(syn::ItemStatic);
-        visit_item_struct => visit_item_struct(syn::ItemStruct);
-        visit_item_trait => visit_item_trait(syn::ItemTrait);
         visit_item_trait_alias => visit_item_trait_alias(syn::ItemTraitAlias);
-        visit_item_union => visit_item_union(syn::ItemUnion);
         visit_impl_item_const => visit_impl_item_const(syn::ImplItemConst);
         visit_variant => visit_variant(syn::Variant);
         visit_field => visit_field(syn::Field);
@@ -588,8 +597,37 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         }
     }
 
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        if self.enter(&node.attrs) {
+            self.refuse_definition(&node.ident, "enum");
+            syn::visit::visit_item_enum(self, node);
+        }
+    }
+
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        if self.enter(&node.attrs) {
+            self.refuse_definition(&node.ident, "struct");
+            syn::visit::visit_item_struct(self, node);
+        }
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if self.enter(&node.attrs) {
+            self.refuse_definition(&node.ident, "trait");
+            syn::visit::visit_item_trait(self, node);
+        }
+    }
+
+    fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+        if self.enter(&node.attrs) {
+            self.refuse_definition(&node.ident, "union");
+            syn::visit::visit_item_union(self, node);
+        }
+    }
+
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
         if self.enter(&node.attrs) {
+            self.refuse_definition(&node.ident, "type alias");
             self.refuse_alias(&node.ident, &node.ty);
             syn::visit::visit_item_type(self, node);
         }
@@ -613,6 +651,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
             return;
         }
         let name = node.ident.unraw().to_string();
+        self.refuse_definition(&node.ident, "module");
         self.module_names.push(name.clone());
         match path_attribute(&node.attrs) {
             Err(()) => {

@@ -44,6 +44,7 @@ enum Mechanism {
     PathAttribute,
     ParentPath,
     Link,
+    ActionRightDefinition,
 }
 
 /// The mechanism after `mechanism`, with an arm for each one: the table is walked by this, so a
@@ -86,7 +87,8 @@ fn next(mechanism: Mechanism) -> Option<Mechanism> {
         CfgAttrOther => Some(PathAttribute),
         PathAttribute => Some(ParentPath),
         ParentPath => Some(Link),
-        Link => None,
+        Link => Some(ActionRightDefinition),
+        ActionRightDefinition => None,
     }
 }
 
@@ -305,6 +307,13 @@ fn fixture(mechanism: Mechanism) -> Fixture {
                 "crates/kr-sender/src/lib.rs: the scan does not read a path through a link, with .. or from the root of the file system (<root>/crates/kr-sender/src/linked.rs is a link)",
             ),
         },
+        // A crate that defines the name `ActionRight` hides which type `ActionRight::<Variant>` is.
+        ActionRightDefinition => one(
+            "type ActionRight = kr_protocol::method::Method;\npub fn f() { let _ = ActionRight::AgentTurnCancel; }\n",
+            Refused(
+                "crates/kr-sender/src/lib.rs: the scan does not read a type alias named ActionRight",
+            ),
+        ),
     }
 }
 
@@ -365,6 +374,6 @@ fn each_way_rust_can_bind_a_name_is_read_by_its_names_or_refused_with_a_text_of_
         }
         at = next(mechanism);
     }
-    assert_eq!(count, 36, "the table holds {count} mechanisms");
+    assert_eq!(count, 37, "the table holds {count} mechanisms");
     assert!(mismatches.is_empty(), "\n{}", mismatches.join("\n"));
 }
