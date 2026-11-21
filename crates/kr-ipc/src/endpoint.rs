@@ -267,6 +267,8 @@ mod platform {
 
     #[cfg(target_vendor = "apple")]
     mod apple;
+    #[cfg(test)]
+    pub(in crate::endpoint) mod copies;
     pub(in crate::endpoint) mod live;
 
     #[derive(Debug)]
@@ -534,7 +536,16 @@ mod platform {
     /// one that bound first ends up with an address that no longer names its socket.
     #[derive(Debug)]
     pub(super) struct EndpointGuard {
-        _file: std::fs::File,
+        file: std::fs::File,
+    }
+
+    impl Drop for EndpointGuard {
+        fn drop(&mut self) {
+            // The lock ends with the guard, not with the last copy of its file: a program that
+            // another thread starts while the guard is held keeps a copy until its own program
+            // takes over, and the next bind of the address would wait for that.
+            let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+        }
     }
 
     /// How long a guard waits for the other holder to finish its change.
@@ -561,7 +572,7 @@ mod platform {
             let deadline = std::time::Instant::now() + GUARD_WAIT;
             loop {
                 match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                    Ok(()) => return Ok(Self { _file: file }),
+                    Ok(()) => return Ok(Self { file }),
                     Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
