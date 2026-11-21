@@ -63,6 +63,8 @@ export class FakeDraftStore {
   #unreadable = 0
   #refuseSaves: { code: string; message: string } | null = null
   #refuseDiscards: { code: string; message: string } | null = null
+  #refuseMarks: { code: string; message: string } | null = null
+  #refuseMarksLeft = 0
   readonly #disk: DraftDisk | null
   /** Every save and discard this store was asked for, for a test to read. */
   readonly calls: { readonly kind: 'save' | 'retarget' | 'discard'; readonly text?: string }[] = []
@@ -119,6 +121,16 @@ export class FakeDraftStore {
   /** Makes every discard refuse with `code` until it is cleared. */
   refuseDiscards(refusal: { code: string; message: string } | null): void {
     this.#refuseDiscards = refusal
+  }
+
+  /**
+   * Makes the next `times` changes of the list of removals refuse with `refusal`, one by default, as
+   * a refused write is: the list stays as it was. A change is a mark, a set of marks, or the
+   * replacement a set-aside makes.
+   */
+  refuseMarks(refusal: { code: string; message: string } | null, times = 1): void {
+    this.#refuseMarks = refusal
+    this.#refuseMarksLeft = times
   }
 
   /** Makes the store report `count` files it could not read, which it leaves where they are. */
@@ -179,8 +191,32 @@ export class FakeDraftStore {
 
   /** Records a removal the page could not make. */
   markRemoval(request: DraftDiscardRequest): void {
-    this.#removals.set(removalKey(request), request)
+    this.markRemovals([request])
+  }
+
+  /**
+   * Records removals in one change, as native code does: the list holds all of them or none, so a
+   * refused change leaves it as it was. A version already named is not written again.
+   */
+  markRemovals(requests: readonly DraftDiscardRequest[]): void {
+    this.#takeRefusal()
+    for (const request of requests) this.#removals.set(removalKey(request), request)
     this.#write()
+  }
+
+  /** Replaces the list of removals whole, as a set-aside does: one change, all or none. */
+  replaceRemovals(requests: readonly DraftDiscardRequest[]): void {
+    this.#takeRefusal()
+    this.#removals = new Map(requests.map((request) => [removalKey(request), request]))
+    this.#write()
+  }
+
+  #takeRefusal(): void {
+    const refusal = this.#refuseMarks
+    if (refusal === null) return
+    this.#refuseMarksLeft -= 1
+    if (this.#refuseMarksLeft <= 0) this.#refuseMarks = null
+    refuse(refusal.code, refusal.message)
   }
 
   save(request: DraftSaveRequest): DraftSaved {
