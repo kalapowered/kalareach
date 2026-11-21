@@ -1595,6 +1595,12 @@ fn is_attribute(trees: &[TokenTree], at: usize, group: &Group) -> bool {
             || (punct(at.checked_sub(1), '!') && punct(at.checked_sub(2), '#')))
 }
 
+/// The keywords that may stand before a `!` that is the operator and no macro call (`return !{..}`,
+/// `if !(..)`, `while !(..)`).
+const BEFORE_A_NOT: [&str; 8] = [
+    "if", "while", "match", "return", "in", "else", "break", "yield",
+];
+
 /// Whether the group at `at` holds the tokens of a macro: the arguments of a call (`name!(..)`,
 /// `name![..]`, `name! {..}`) or the rules of a definition (`macro_rules! name {..}`). A macro may do
 /// anything with its tokens, so what stands in them is not an attribute or a function.
@@ -1608,7 +1614,9 @@ fn is_macro_group(trees: &[TokenTree], at: usize) -> bool {
         Some(TokenTree::Ident(word)) => word.to_string(),
         _ => String::new(),
     };
-    (punct(at.checked_sub(1), '!') && !word(at.checked_sub(2)).is_empty())
+    (punct(at.checked_sub(1), '!')
+        && !word(at.checked_sub(2)).is_empty()
+        && !BEFORE_A_NOT.contains(&word(at.checked_sub(2)).as_str()))
         || (!word(at.checked_sub(1)).is_empty()
             && punct(at.checked_sub(2), '!')
             && word(at.checked_sub(3)) == "macro_rules")

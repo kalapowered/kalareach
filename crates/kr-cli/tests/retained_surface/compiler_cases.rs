@@ -771,11 +771,14 @@ fn documentation_is_no_candidate_as_an_attribute_but_a_literal_in_the_tokens_of_
          fn k() {}\n\
          macro_rules! m {\n\
          () => { #[doc = \"agent.prompt.submit\"] fn z() {} };\n\
-         }\n",
+         }\n\
+         fn l() -> bool { return !{ #[doc = \"agent.turn.cancel\"] const FLAG: bool = false; FLAG }; }\n\
+         fn n() { if !{ #[doc = \"agent.turn.steer\"] const A: bool = true; A } {} while !(#[doc = \"agent.prompt.queue\"] 1) {} }\n",
     );
     // The text of a `doc` attribute, `///` and `//!` among them, is documentation: no candidate. The same
     // tokens in the arguments or the rules of a macro are what the macro makes of them (a runtime string,
-    // here), and so are a literal. Nothing else that a `cfg_attr` holds is documentation.
+    // here), and so are a literal. Nothing else that a `cfg_attr` holds is documentation. A `!` that
+    // follows a keyword (`return !{..}`, `if !{..}`, `while !(..)`) is the operator, and no macro call.
     assert_eq!(
         found,
         [
