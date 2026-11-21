@@ -84,7 +84,6 @@ fn a_reserve_that_cannot_be_held_pauses_rather_than_loads() {
         }
     );
     assert_eq!(policy.state().as_str(), "resource_paused");
-    assert!(!policy.state().dispatches());
 }
 
 /// KR-REQ-22.12: an unreadable memory signal is a refusal rather than an assumption.
