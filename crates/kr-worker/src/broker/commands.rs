@@ -3644,11 +3644,18 @@ mod tests {
         // A window part used up leaves the rest of it, less the margin, and a write that waits
         // past that is not claimed: a second of the two is gone, so seven hundred and fifty
         // milliseconds are left.
-        let (mut part, _unread) = stream_of(8);
+        // The peer takes what was written at nine hundred milliseconds, after the seven hundred
+        // and fifty that are left and before the seventeen hundred and fifty of a whole window
+        // less its margin: a write that ran on past what is left would finish and be claimed.
+        let (mut part, mut unread) = stream_of(8);
         let begun = tokio::time::Instant::now();
         let going_at = begun
             .checked_sub(std::time::Duration::from_secs(1))
             .expect("the clock has run for a second");
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            let _ = tokio::io::copy(&mut unread, &mut tokio::io::sink()).await;
+        });
         assert!(
             !refuse(&mut part, "why", going_at).await,
             "a write that waits past what is left of the window is not claimed"
@@ -3658,6 +3665,7 @@ mod tests {
             COMMIT_WINDOW - REFUSAL_MARGIN - std::time::Duration::from_secs(1),
             "it waited for what was left, and no longer"
         );
+        reader.abort();
 
         // A window already used up leaves no budget, and nothing is written.
         let (mut late, mut there) = stream_of(1 << 16);
