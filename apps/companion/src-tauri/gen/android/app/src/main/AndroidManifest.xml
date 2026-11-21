@@ -45,7 +45,7 @@
       The camera path leaves each photo in this application's own Pictures folder on external
       storage, and Auto Backup and a device transfer copy that folder unless told not to. Both rules
       files leave it out (the first is read from Android 12, the second before it), and MainActivity
-      empties the folder when the application starts.
+      empties the folder when it starts with no saved state.
     -->
     <application
         android:dataExtractionRules="@xml/data_extraction_rules"
