@@ -787,6 +787,8 @@ jobs:
       #     `a_create_that_launches_nothing::`, `attention::`, `a_share_that_names_a_current_decision::`,
       #     `service::a_read_that_meets_a_worker_on_its_way_out::` and `service::net::dispatch::tests::`,
       #     and its `attention`, `barrier`, `configuration` and `network_host` suites;
+      #   - the Windows boundary's cases that need no guest: all of `kr-boundary-windows` as it
+      #     builds here, without its `testing` feature;
       #   - the forwarder: all of `kr-hook`.
       # The second leg runs:
       #   - the worker over its own pipe and the launch endpoint: `windows_endpoint`, `listener`,
@@ -991,6 +993,19 @@ jobs:
       - name: Test the daemon's attention, barrier, configuration and diagnostics
         if: ${{ !cancelled() && matrix.part == 'first' }}
         run: cargo test --locked -p kr-controller --test attention --test barrier --test configuration --test network_host
+
+      # The Windows boundary's cases that need no guest, which the compile and lint above only
+      # built: the policy, the records, the journal, the pipe's frames and the doctor's grading
+      # over real bytes and real files, and the cases that only this platform builds: the journal's
+      # file calls, the removal of a directory through the handle that held it, the trust of a
+      # registry key and the search window's reading of the event log's errors. The step names no
+      # filter. The crate's `testing` feature, which the guest's builds set, is off here, so the
+      # programs that hold only guest cases build empty; every case that installs the boundary or
+      # reads the platform's answers for a removal or a rename is ignored and says it needs a
+      # disposable guest as SYSTEM; and the cases that `cfg(unix)` holds do not build here.
+      - name: Test the Windows boundary's cases that need no guest
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        run: cargo test --locked -p kr-boundary-windows
 
       # The forwarder, all of it. Its own library: the registration it reads, the named pipe it connects
       # to, and the credential file it presents only when that file's own access list is its owner's.
