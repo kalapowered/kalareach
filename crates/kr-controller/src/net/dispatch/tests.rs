@@ -2852,10 +2852,10 @@ async fn a_voice_context_read_in_the_state_between_two_changes_is_refused_when_t
         "the context is read in the state between the two changes: {:?}",
         answer.frame
     );
-    let frame = a_voice_context_written_after(&connection, &kept, answer, || {
-        privacy_mode_is_turned_on(controller)
-    })
-    .await;
+    // The mode goes on again before the writer first decides, so that the state it compares with
+    // the one the read began under has the same mode and a later generation.
+    privacy_mode_is_turned_on(controller).await;
+    let frame = a_voice_context_written_after(&connection, &kept, answer, || async {}).await;
     assert!(
         matches!(
             &frame,

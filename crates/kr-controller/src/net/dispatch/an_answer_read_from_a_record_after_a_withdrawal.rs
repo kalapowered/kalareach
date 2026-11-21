@@ -32,8 +32,12 @@ const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 type Receipt = Arc<dyn Fn(SessionId) -> Outcome + Send + Sync>;
 
 /// A daemon whose worker answers every mutation forwarded to it from a receipt it kept, which its
-/// frame says, as a worker's does for a copy of an action it carried out or refused before.
-async fn a_worker_that_answers_from_its_receipt(receipt: Receipt) -> fake::Silent {
+/// frame says, as a worker's does for a copy of an action it carried out or refused before. Every
+/// frame the worker is sent after its handshake is kept in `recorded`.
+async fn a_worker_that_answers_from_its_receipt(
+    receipt: Receipt,
+    recorded: fake::Recorded,
+) -> fake::Silent {
     fake::fake_world(move |listener, identity, endpoint_text| {
         tokio::spawn(async move {
             loop {
@@ -43,6 +47,7 @@ async fn a_worker_that_answers_from_its_receipt(receipt: Receipt) -> fake::Silen
                 let identity = Arc::clone(&identity);
                 let endpoint_text = endpoint_text.clone();
                 let receipt = Arc::clone(&receipt);
+                let recorded = Arc::clone(&recorded);
                 tokio::spawn(async move {
                     let (mut reader, mut writer) =
                         kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
@@ -59,67 +64,80 @@ async fn a_worker_that_answers_from_its_receipt(receipt: Receipt) -> fake::Silen
                             &stated,
                         ) {
                             Some(replies) => replies,
-                            None => match &frame {
-                                ControlFrame::AuthorityRevision(notice) => {
-                                    vec![ControlFrame::AuthorityRevisionAck(
-                                        kr_protocol::worker::AuthorityRevisionAck {
-                                            session_id: identity.session_id(),
-                                            revision: notice.revision,
-                                            fence: None,
-                                        },
-                                    )]
-                                }
-                                ControlFrame::Request(request)
-                                    if request.method == Method::SessionRead.into() =>
-                                {
-                                    vec![ControlFrame::Response(Response {
-                                        request_id: request.request_id,
-                                        outcome: Outcome::Ok(
-                                            ParamsValue::from_typed(&fake::read_result(
-                                                identity.session_id(),
-                                            ))
-                                            .expect("encodes"),
-                                        ),
-                                    })]
-                                }
-                                ControlFrame::Forwarded(forwarded) => {
-                                    vec![ControlFrame::RetainedResponse(Box::new(Response {
-                                        request_id: forwarded.mutation.request_id,
-                                        outcome: receipt(identity.session_id()),
-                                    }))]
-                                }
-                                // A read of the receipt of an action this worker answered: the
-                                // receipt, and the result it kept when it kept one.
-                                ControlFrame::ForwardedRead(forwarded)
-                                    if forwarded.request.method == Method::ActionRead.into() =>
-                                {
-                                    let request = &forwarded.request;
-                                    let kept = match request.params.to_typed::<ActionReadParams>() {
-                                        Ok(params) => match receipt(identity.session_id()) {
-                                            Outcome::Ok(result) => Some((params.action_id, result)),
-                                            Outcome::Error(_) => None,
-                                        },
-                                        Err(_) => None,
-                                    };
-                                    vec![ControlFrame::Response(Response {
-                                        request_id: request.request_id,
-                                        outcome: match kept {
-                                            Some((action_id, result)) => Outcome::Ok(
-                                                ParamsValue::from_typed(&ActionReadResult {
-                                                    receipt: a_receipt_of(action_id),
-                                                    result: Nullable::some(result),
-                                                })
+                            None => {
+                                let replies = match &frame {
+                                    ControlFrame::AuthorityRevision(notice) => {
+                                        vec![ControlFrame::AuthorityRevisionAck(
+                                            kr_protocol::worker::AuthorityRevisionAck {
+                                                session_id: identity.session_id(),
+                                                revision: notice.revision,
+                                                fence: None,
+                                            },
+                                        )]
+                                    }
+                                    ControlFrame::Request(request)
+                                        if request.method == Method::SessionRead.into() =>
+                                    {
+                                        vec![ControlFrame::Response(Response {
+                                            request_id: request.request_id,
+                                            outcome: Outcome::Ok(
+                                                ParamsValue::from_typed(&fake::read_result(
+                                                    identity.session_id(),
+                                                ))
                                                 .expect("encodes"),
                                             ),
-                                            None => Outcome::Error(ProtocolError::new(
-                                                ErrorCode::ResourceUnavailable,
-                                                "this worker holds no receipt for that action",
-                                            )),
-                                        },
-                                    })]
-                                }
-                                _ => Vec::new(),
-                            },
+                                        })]
+                                    }
+                                    ControlFrame::Forwarded(forwarded) => {
+                                        vec![ControlFrame::RetainedResponse(Box::new(Response {
+                                            request_id: forwarded.mutation.request_id,
+                                            outcome: receipt(identity.session_id()),
+                                        }))]
+                                    }
+                                    // A read of the receipt of an action this worker answered: the
+                                    // receipt, and the result it kept when it kept one.
+                                    ControlFrame::ForwardedRead(forwarded)
+                                        if forwarded.request.method
+                                            == Method::ActionRead.into() =>
+                                    {
+                                        let request = &forwarded.request;
+                                        let kept = match request
+                                            .params
+                                            .to_typed::<ActionReadParams>()
+                                        {
+                                            Ok(params) => match receipt(identity.session_id()) {
+                                                Outcome::Ok(result) => {
+                                                    Some((params.action_id, result))
+                                                }
+                                                Outcome::Error(_) => None,
+                                            },
+                                            Err(_) => None,
+                                        };
+                                        vec![ControlFrame::Response(Response {
+                                            request_id: request.request_id,
+                                            outcome: match kept {
+                                                Some((action_id, result)) => Outcome::Ok(
+                                                    ParamsValue::from_typed(&ActionReadResult {
+                                                        receipt: a_receipt_of(action_id),
+                                                        result: Nullable::some(result),
+                                                    })
+                                                    .expect("encodes"),
+                                                ),
+                                                None => Outcome::Error(ProtocolError::new(
+                                                    ErrorCode::ResourceUnavailable,
+                                                    "this worker holds no receipt for that action",
+                                                )),
+                                            },
+                                        })]
+                                    }
+                                    _ => Vec::new(),
+                                };
+                                recorded
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(frame);
+                                replies
+                            }
                         };
                         for reply in replies {
                             if writer.write_message(&reply).await.is_err() {
@@ -311,7 +329,8 @@ async fn a_close_the_worker_answers_from_its_receipt_is_not_shown_when_a_fence_l
     ];
     for (what, receipt) in kept {
         for owed in [false, true] {
-            let world = a_worker_that_answers_from_its_receipt(Arc::clone(&receipt)).await;
+            let world =
+                a_worker_that_answers_from_its_receipt(Arc::clone(&receipt), Arc::default()).await;
             let (connection, _) = paired_connection(&world.controller, 42, EVERY_RIGHT);
             let close = a_close_of(&world, &connection, world.session_id);
             let answered =
@@ -349,7 +368,8 @@ async fn a_mutation_the_worker_answers_from_its_receipt_is_not_shown_when_a_fenc
     ];
     for (what, receipt) in kept {
         for owed in [false, true] {
-            let world = a_worker_that_answers_from_its_receipt(Arc::clone(&receipt)).await;
+            let world =
+                a_worker_that_answers_from_its_receipt(Arc::clone(&receipt), Arc::default()).await;
             let (connection, _) = paired_connection(&world.controller, 43, EVERY_RIGHT);
             let prompt = a_prompt_to(&world, &connection, world.session_id);
             let answered = answered_with_the_fence(
@@ -416,9 +436,11 @@ async fn a_mutation_refused_from_a_closure_record_is_not_shown_when_a_fence_land
 async fn a_mutation_the_worker_answers_from_its_receipt_is_not_shown_when_privacy_mode_starts_before_it_is_sent()
  {
     for starts in [false, true] {
-        let world =
-            a_worker_that_answers_from_its_receipt(Arc::new(|_| Outcome::Ok(ParamsValue::empty())))
-                .await;
+        let world = a_worker_that_answers_from_its_receipt(
+            Arc::new(|_| Outcome::Ok(ParamsValue::empty())),
+            Arc::default(),
+        )
+        .await;
         let (connection, recording) = paired_connection(&world.controller, 46, EVERY_RIGHT);
         let prompt = a_prompt_to(&world, &connection, world.session_id);
         let answered = connection
@@ -508,9 +530,12 @@ fn an_answer_to_a_question_of(
 async fn a_repeat_answered_from_a_receipt_with_a_question_is_not_shown_when_privacy_mode_starts_before_it_is_sent()
  {
     for starts in [false, true] {
-        let world =
-            a_worker_that_answers_from_its_receipt(Arc::new(the_result_of_answering_a_question))
-                .await;
+        let recorded: fake::Recorded = Arc::default();
+        let world = a_worker_that_answers_from_its_receipt(
+            Arc::new(the_result_of_answering_a_question),
+            Arc::clone(&recorded),
+        )
+        .await;
         let (connection, recording) = paired_connection(&world.controller, 47, EVERY_RIGHT);
         let answer = an_answer_to_a_question_of(&world, &connection, world.session_id);
         // The first submission is dispatched, which records the action's route; its answer is not
@@ -523,6 +548,29 @@ async fn a_repeat_answered_from_a_receipt_with_a_question_is_not_shown_when_priv
             .answer_now(ControlFrame::Mutation(Box::new(answer)))
             .await
             .expect("the repeat is answered");
+        // The first submission was forwarded to the worker, and the repeat read the worker's
+        // receipt and forwarded nothing: the answer is the one `retained_remotely` reads, not the
+        // one a second forwarding gives.
+        let reached: Vec<&str> = recorded
+            .lock()
+            .expect("the worker's record")
+            .iter()
+            .filter_map(|frame| match frame {
+                ControlFrame::Forwarded(_) => Some("a forwarded mutation"),
+                ControlFrame::ForwardedRead(forwarded)
+                    if forwarded.request.method == Method::ActionRead.into() =>
+                {
+                    Some("a forwarded read of a receipt")
+                }
+                ControlFrame::ForwardedRead(_) => Some("another forwarded read"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reached,
+            ["a forwarded mutation", "a forwarded read of a receipt"],
+            "the repeat is answered from the worker's receipt on the action's route"
+        );
         assert!(
             repeated
                 .asked
