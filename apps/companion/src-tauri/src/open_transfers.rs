@@ -386,10 +386,17 @@ fn not_kept(error: &std::io::Error) -> ClientError {
 
 impl Kept {
     fn kept(&self, change: impl FnOnce(&mut UploadFile)) -> kr_client::Result<()> {
-        self.live.change(&self.store, change).map_err(|error| {
-            self.live.journal_failed.store(true, Ordering::Release);
-            not_kept(&error)
-        })
+        match self.live.change(&self.store, change) {
+            Ok(()) => {
+                // A write that succeeds after a failed one ends the failure.
+                self.live.journal_failed.store(false, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.live.journal_failed.store(true, Ordering::Release);
+                Err(not_kept(&error))
+            }
+        }
     }
 }
 
@@ -1621,6 +1628,33 @@ mod tests {
         journal.begun(id).expect("the write is made again");
         assert_eq!(live.file().transfer_id, Some(id));
         assert!(store.path(live.file().key, UPLOAD_EXTENSION).exists());
+    }
+
+    /// KR-REQ-13.12: a journal write that succeeds after a failed one clears the failure, so a later
+    /// connection failure is told as a connection failure and the upload goes on a newer connection.
+    #[test]
+    fn a_successful_journal_retry_clears_the_failure() {
+        let (_dir, desk, live, store) = held(None, Reached::Beginning);
+        let _ = &desk;
+        let journal = Kept {
+            live: Arc::clone(&live),
+            store: store.clone(),
+        };
+        let id = TransferId::new(kr_ipc::new_uuid());
+        let folder = store.root.clone();
+        std::fs::remove_dir_all(&folder).expect("the folder goes");
+        std::fs::write(&folder, b"in the way").expect("a file in its place");
+        assert!(journal.begun(id).is_err());
+        assert!(
+            live.journal_failed.load(Ordering::Acquire),
+            "the failure is noted"
+        );
+        std::fs::remove_file(&folder).expect("the way is cleared");
+        journal.begun(id).expect("the write is made again");
+        assert!(
+            !live.journal_failed.load(Ordering::Acquire),
+            "a write that succeeds clears the failure"
+        );
     }
 
     /// KR-REQ-13.12: a request that never left is asked again and is no unrecoverable reservation; one
