@@ -22,7 +22,7 @@
 //! | [`priority`] | Background CPU and IO priority, through the mechanism each platform qualifies |
 //! | [`summary`] | A requested summary of what changed in a session: the request, its result and when one is wanted |
 //! | [`queue`] | One latest job per session, aging, fairness and the cadence |
-//! | [`metrics`] | Queue-wait and execution latency, published separately, beside whole-product figures |
+//! | [`metrics`] | Queue-wait and execution latency, published separately, at the four session counts |
 //! | [`supervise`] | The daemon's side of the description process: starting it, its timers, ending it |
 //! | [`store`] | Names, pins and generated-description provenance, which outlive the session |
 //! | [`privacy`] | Privacy mode's four calls over this crate's own stores |
