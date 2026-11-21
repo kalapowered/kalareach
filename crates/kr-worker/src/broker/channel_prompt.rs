@@ -322,7 +322,7 @@ pub fn is_approval_shaped(text: &str) -> bool {
 /// The filter reads the text once, in its compatibility decomposition (NFKD, so a full-width
 /// bracket is a bracket and a letter with an accent is the letter and its mark; NFKD and not NFKC,
 /// because composing joins a `>` and a combining mark after it into one character and hides the
-/// tag's own bytes), with a marker in place of each character that [`is_dropped`] names and every
+/// tag's own bytes), with a marker in place of each character that `is_dropped` names and every
 /// other character in lower case. Its grammar, with `D` a marked character and `W` white space
 /// (`char::is_whitespace`):
 ///
@@ -336,8 +336,8 @@ pub fn is_approval_shaped(text: &str) -> bool {
 /// whether any choice of deleting each marked character or writing a space in its place gives a
 /// text that holds `<`, white space, an optional `/`, white space, `channel`, and then white space,
 /// `>`, `/` or the end of the text, and each marked character makes its own choice: one may vanish
-/// inside the name while another stands for the space after it. [`Scan`] is the state machine that
-/// reads it, so the choices are never listed. The Unicode versions are those of [`is_dropped`].
+/// inside the name while another stands for the space after it. `Scan` is the state machine that
+/// reads it, so the choices are never listed. The Unicode versions are those of `is_dropped`.
 ///
 /// The filter states the tag's own bytes under that grammar. It does not establish that two texts
 /// look alike for every character: some characters it drops are visible, and it refuses more than
