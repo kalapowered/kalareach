@@ -180,7 +180,7 @@ heldProblems(
   ['does not ask for android.permission.CAMERA']
 )
 
-const NO_CAMERA_QUERY = ['android.media.action.IMAGE_CAPTURE', "package visibility can hide camera apps and make 'Take a photo' open the photo picker"]
+const NO_CAMERA_QUERY = ['android.media.action.IMAGE_CAPTURE', "package visibility can hide camera apps and make 'Take a photo' open a picker in place of the camera"]
 heldProblems('a manifest with no queries is refused for the camera action', problemsInAndroidManifest(manifest({ queries: 'none' }), WANT), NO_CAMERA_QUERY)
 heldProblems('a manifest that queries only the browser service is refused for the camera action', problemsInAndroidManifest(manifest({ queries: 'browser-only' }), WANT), NO_CAMERA_QUERY)
 heldProblems('a manifest that queries the video action and not the photo one is refused', problemsInAndroidManifest(manifest({ queries: 'video-only' }), WANT), NO_CAMERA_QUERY)

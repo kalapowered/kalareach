@@ -199,9 +199,9 @@ export function problemsInAndroidManifest(facts, want) {
   // Android 11 and later show an application the apps its manifest names and only a few others, such
   // as some system apps, and the WebView's file chooser opens the camera only when it finds one that
   // answers this action; without the entry, from Android 11 on, package visibility can hide camera
-  // apps and make 'Take a photo' open the photo picker.
+  // apps and make 'Take a photo' open a picker in place of the camera.
   if (!queriesAction(facts.root, IMAGE_CAPTURE_ACTION)) {
-    problems.push(`the manifest does not query ${IMAGE_CAPTURE_ACTION} in a <queries> intent, so, from Android 11 on, package visibility can hide camera apps and make 'Take a photo' open the photo picker`)
+    problems.push(`the manifest does not query ${IMAGE_CAPTURE_ACTION} in a <queries> intent, so, from Android 11 on, package visibility can hide camera apps and make 'Take a photo' open a picker in place of the camera`)
   }
   return problems
 }
