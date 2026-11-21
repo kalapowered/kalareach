@@ -17,13 +17,44 @@ import {
   type InputCounts,
   type LaunchSurfaceOptions
 } from '../src/app/launch-surface'
-import type { HostPort, LaunchCommandsReading, LaunchSurfaceReading } from '../src/host/port'
+import type {
+  ConnectionState,
+  HostPort,
+  LaunchCommandsReading,
+  LaunchSurfaceReading
+} from '../src/host/port'
 
 /** A port that lets the hook watch the connection and says nothing else. */
 function port(): HostPort {
   return {
     onConnection: () => Promise.resolve(() => undefined)
   } as unknown as HostPort
+}
+
+/** A port whose connection the test replaces: it hands the hook's listener the state it is told. */
+function replaceable(): { readonly port: HostPort; readonly publish: () => void } {
+  const listeners: ((state: ConnectionState) => void)[] = []
+  const live: ConnectionState = {
+    connected: true,
+    environment_id: 'environment-1',
+    reason: null,
+    rights: ['host.manage'],
+    paired: false,
+    replaced: 0
+  }
+  let replaced = 0
+  return {
+    port: {
+      onConnection: (listener: (state: ConnectionState) => void) => {
+        listeners.push(listener)
+        return Promise.resolve(() => undefined)
+      }
+    } as unknown as HostPort,
+    publish: () => {
+      replaced += 1
+      for (const listener of listeners) listener({ ...live, replaced })
+    }
+  }
 }
 
 /** Reads the test answers by hand: how many started, and the answer of the oldest. */
@@ -64,12 +95,12 @@ const LISTED = (labels: readonly string[]): LaunchCommandsReading => ({
 /** Runs the hook with the options the test changes between renders. */
 function run(
   surface: () => Promise<LaunchSurfaceReading>,
-  first: LaunchSurfaceOptions
+  first: LaunchSurfaceOptions,
+  fake: HostPort = port()
 ): {
   readonly result: { readonly current: ReturnType<typeof useLaunchSurface> }
   readonly options: (next: LaunchSurfaceOptions) => void
 } {
-  const fake = port()
   const { result, rerender } = renderHook(
     ({ options }: { options: LaunchSurfaceOptions }) => useLaunchSurface(fake, surface, 0, options),
     { initialProps: { options: first } }
@@ -347,6 +378,36 @@ describe('when the saved launch commands are read', () => {
     await second.answer(LISTED(['Codex']))
     expect(result.current.list).toEqual(LISTED(['Codex']))
     expect(result.current.listNow()?.commands.map((each) => each.label)).toEqual(['Codex'])
+  })
+
+  it('a_refusal_answered_for_a_connection_that_was_replaced_does_not_stop_the_list_reads', async () => {
+    const surface = held<LaunchSurfaceReading>()
+    const list = held<LaunchCommandsReading>()
+    const link = replaceable()
+    const { result } = run(surface.read, { wake: 0, readList: list.read }, link.port)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    await surface.answer(SURFACE)
+    // The list read is out when the host replaces the connection, and the readers are the same
+    // functions as before: nothing starts the watch over.
+    expect(list.started()).toBe(1)
+    await act(async () => {
+      link.publish()
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(list.started()).toBe(1)
+
+    // The old connection's refusal reaches the page after the replacement. It says nothing of the
+    // new connection, so the read the replacement owed starts and its list appears.
+    await list.answer({ state: 'refused' })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(list.started()).toBe(2)
+    await list.answer(LISTED(['Claude']))
+    expect(result.current.list).toEqual(LISTED(['Claude']))
+    expect(result.current.listNow()?.commands.map((each) => each.label)).toEqual(['Claude'])
   })
 
   it('a_host_that_does_not_serve_the_list_is_asked_no_more_and_nothing_is_said', async () => {
