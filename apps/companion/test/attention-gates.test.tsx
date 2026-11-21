@@ -5,7 +5,8 @@
  *
  * The scripted host stands in for native code. A case holds the reads it needs to order and answers
  * them by index, or holds the connection's publications, so what decides each outcome is the order
- * of the calls and never the time a call takes. The one case that depends on a clock sets it.
+ * of the calls and never the time a call takes. A case that counts reads, or that depends on a
+ * clock, runs on one that only the test moves.
  */
 
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
@@ -16,6 +17,7 @@ import { AppProvider } from '../src/app/state'
 import { fakeHost, type FakeHostControls, type HeldReads } from '../src/host/fake'
 import type { HostError, HostLabel } from '../src/host/port'
 import { receivedFailure } from '../src/host/tauri'
+import { ATTENTION_READ_CADENCE_MS } from '../src/model/attention'
 
 afterEach(() => {
   cleanup()
@@ -46,6 +48,30 @@ function start(before: (controls: FakeHostControls) => void = () => undefined): 
     </AppProvider>
   )
   return { controls }
+}
+
+/**
+ * The same, on a clock that only the test moves: no cadence timer fires and no time passes until the
+ * test advances it, so the reads a case counts are the ones its own calls make. The first read has
+ * answered when it returns.
+ */
+async function startOnFakeClock(
+  before: (controls: FakeHostControls) => void = () => undefined
+): Promise<{ readonly controls: FakeHostControls }> {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
+  const started = start(before)
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(screen.getByTestId('attention-list')).toBeInTheDocument()
+  return started
+}
+
+/** Moves the test's clock on by `ms`, and lets what that set off settle. */
+async function advance(ms: number): Promise<void> {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms)
+  })
 }
 
 /** A loss that began `ago` ms ago and reaches its next level 60,000 ms after it began. */
@@ -230,10 +256,9 @@ describe('what the host in use shows is stored and shown under the owner’s key
   // gone when it ends (the completion is late), or the host moved before the page was told (the
   // publication is late): in both, the read is dropped and one new read follows.
   it('a_desktop_result_with_another_key_is_dropped_whether_its_publication_or_its_completion_is_held', async () => {
-    const { controls } = start((host) => {
+    const { controls } = await startOnFakeClock((host) => {
       host.setHostInUse(STUDIO)
     })
-    await screen.findByTestId('attention-list')
     const held = controls.hold('attentionRead')
     const first = held.count
 
@@ -296,10 +321,9 @@ describe('what the host in use shows is stored and shown under the owner’s key
   // A change of host that comes while a read is on its way asks for a read of its own. The one new
   // read that follows a dropped answer is that read, so two drops across the change make two reads.
   it('a_desktop_change_of_host_during_a_dropped_read_is_read_by_the_retry_and_not_again', async () => {
-    const { controls } = start((host) => {
+    const { controls } = await startOnFakeClock((host) => {
       host.setHostInUse(STUDIO)
     })
-    await screen.findByTestId('attention-list')
     controls.supersedeNextInboxReads(2)
     const held = controls.hold('attentionRead')
     const first = held.count
@@ -326,10 +350,9 @@ describe('what the host in use shows is stored and shown under the owner’s key
 
   // The retry covers the change that came before it began and no later one.
   it('a_desktop_change_of_host_during_the_retry_still_makes_a_read_of_its_own', async () => {
-    const { controls } = start((host) => {
+    const { controls } = await startOnFakeClock((host) => {
       host.setHostInUse(STUDIO)
     })
-    await screen.findByTestId('attention-list')
     controls.supersedeNextInboxReads(1)
     const held = controls.hold('attentionRead')
     const first = held.count
@@ -373,10 +396,9 @@ describe('what the host in use shows is stored and shown under the owner’s key
   // A numbers read that is dropped, under another key than the connection's, is a drop like the
   // inbox's: one new read follows and a second drop waits for the cadence.
   it('a_desktop_numbers_only_drop_makes_one_new_read_and_then_waits_for_the_cadence', async () => {
-    const { controls } = start((host) => {
+    const { controls } = await startOnFakeClock((host) => {
       host.setHostInUse(STUDIO)
     })
-    await screen.findByTestId('attention-list')
     const numbers = controls.hold('sessionNumbers')
     const first = numbers.count
     readNow()
@@ -407,10 +429,9 @@ describe('what the host in use shows is stored and shown under the owner’s key
   })
 
   it('a_desktop_superseded_reply_makes_one_new_read', async () => {
-    const { controls } = start((host) => {
+    const { controls } = await startOnFakeClock((host) => {
       host.setHostInUse(STUDIO)
     })
-    await screen.findByTestId('attention-list')
     controls.supersedeNextInboxReads(2)
     const held = controls.hold('attentionRead')
     const first = held.count
@@ -428,8 +449,10 @@ describe('what the host in use shows is stored and shown under the owner’s key
     await settle()
     expect(held.count).toBe(first + 2)
     expect(screen.queryByText(NOT_READ)).toBeNull()
-    readNow()
-    await settle()
+    // The cadence reads again once it has passed since the answer, and not before.
+    await advance(ATTENTION_READ_CADENCE_MS - 1)
+    expect(held.count).toBe(first + 2)
+    await advance(1)
     expect(held.count).toBe(first + 3)
   })
 
@@ -473,8 +496,7 @@ describe('what the host in use shows is stored and shown under the owner’s key
   })
 
   it('a_connection_change_starts_a_read', async () => {
-    const { controls } = start()
-    await screen.findByTestId('attention-list')
+    const { controls } = await startOnFakeClock()
     const held = controls.hold('attentionRead')
     const first = held.count
     act(() => {
@@ -487,10 +509,9 @@ describe('what the host in use shows is stored and shown under the owner’s key
   // A refusal moves the epoch and no more: the page reads a refused host on its cadence and not once
   // for each change the host makes to its record.
   it('a_desktop_persistent_refusal_costs_one_read_per_cadence_and_no_more', async () => {
-    const { controls } = start((host) => {
+    const { controls } = await startOnFakeClock((host) => {
       host.setHostInUse(STUDIO)
     })
-    await screen.findByTestId('attention-list')
     const held = controls.hold('attentionRead')
     const first = held.count
     act(() => {
@@ -503,8 +524,9 @@ describe('what the host in use shows is stored and shown under the owner’s key
     })
     await settle()
     expect(held.count).toBe(first)
-    readNow()
-    await settle()
+    await advance(ATTENTION_READ_CADENCE_MS - 1)
+    expect(held.count).toBe(first)
+    await advance(1)
     expect(held.count).toBe(first + 1)
   })
 })
