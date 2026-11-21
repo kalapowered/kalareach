@@ -1731,12 +1731,24 @@ async fn a_client_refuses_a_server_of_another_account_and_the_host_bind_fails() 
 
     // The host cannot take a name another account already holds, so it does not start on it, and it
     // says the name is held rather than giving a bare access denial.
-    let refused = Listener::bind(&endpoint)
-        .expect_err("the host does not bind a name another account holds")
-        .to_string();
+    let refused =
+        Listener::bind(&endpoint).expect_err("the host does not bind a name another account holds");
     assert!(
-        refused.contains("the name is held by another pipe"),
-        "the host says the name is held: {refused}"
+        matches!(
+            refused,
+            kr_ipc::IpcError::Listen {
+                refusal: kr_ipc::listen::ListenRefusal::NameTaken,
+                ..
+            }
+        ),
+        "the host's refusal is a name taken: {refused:?}"
+    );
+    let said = refused.to_string();
+    assert!(
+        said.contains(
+            "the pipe is already in use by another program, or another account made it first"
+        ),
+        "the host says the name is held: {said}"
     );
 
     // Nothing the client would have sent the host reached the other account.
