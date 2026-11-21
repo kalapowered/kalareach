@@ -579,6 +579,7 @@ fn a_command_the_loader_refuses_for_its_flags_is_one_cargo_refuses_or_answers_wi
         "-p a**",
         "--workspace --exclude a**",
         "--test a**",
+        "--test **x",
         "--test ***",
         "--bin a**b",
         "--example a[b",
