@@ -1,7 +1,7 @@
 /**
  * The room that a link of a message is given beside its words, as numbers and as the page applies it.
  *
- * `besideOf` is the rule, over rectangles alone. `fitLinks` and `startLinkFit` read a page's boxes and write
+ * `packRooms` is the rule, over rectangles alone (`besideOf` below is a test helper that packs one link with the boxes near it). `fitLinks` and `startLinkFit` read a page's boxes and write
  * the custom properties that the stylesheet pads and takes back by: jsdom has no layout, so the page's
  * geometry is made here, and the box of a link is its words' box grown by the room it has been given, as the
  * stylesheet grows it. The browser cases (`e2e/accessibility.spec.ts`, "the box of a link in a message") hold
@@ -286,6 +286,57 @@ describe('the room that the page gives the links of a message', () => {
     const boxes = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
     for (const box of boxes.slice(0, 3)) expect(box.right - box.left, 'the box of a link that a row of four allows the least size').toBeGreaterThanOrEqual(LEAST)
     for (let at = 0; at + 1 < boxes.length; at += 1) expect((boxes[at] as { right: number }).right, `the end of box ${String(at)}`).toBeLessThanOrEqual((boxes[at + 1] as { left: number }).left)
+  })
+
+  it('completes both of two links that fit at exactly the least size, though the least size and the slack together would not fit', () => {
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 0, 9)
+      link(message, 47, 56)
+      link(message, 88, 380)
+    })
+    fitLinks(root, messages)
+    const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    if (!first || !second) throw new Error('the made page has no links')
+    expect(boxOf(first).right - boxOf(first).left, 'the first box').toBeGreaterThanOrEqual(LEAST)
+    expect(boxOf(second).right - boxOf(second).left, 'the second box').toBeGreaterThanOrEqual(LEAST)
+    expect(boxOf(first).right, 'the end of the first box').toBeLessThanOrEqual(boxOf(second).left)
+  })
+
+  it('completes two short links on neighbouring lines whose heights reach each other, at 44 and at 48', () => {
+    for (const [least, upper, lower] of [
+      [44, [0, 9, 20], [58, 67, 44]],
+      [48, [0, 9, 20], [58, 67, 44]],
+      [44, [70, 79, 20], [0, 9, 42]],
+      [48, [70, 79, 20], [0, 9, 42]]
+    ] as const) {
+      const { pane: root, messages } = pane(1, (message) => {
+        link(message, upper[0], upper[1], upper[2])
+        link(message, lower[0], lower[1], lower[2])
+      })
+      computed.set(root, { '--target': `${String(least)}px` })
+      fitLinks(root, messages)
+      const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
+      if (!first || !second) throw new Error('the made page has no links')
+      const label = `${String(least)}: words ${String(upper[0])} to ${String(upper[1])} above ${String(lower[0])} to ${String(lower[1])}`
+      expect(first.right - first.left, `${label}, the upper box`).toBeGreaterThanOrEqual(least)
+      expect(second.right - second.left, `${label}, the lower box`).toBeGreaterThanOrEqual(least)
+      expect(first.right <= second.left || second.right <= first.left, `${label}, the boxes keep apart`).toBe(true)
+      document.body.replaceChildren()
+    }
+  })
+
+  it('leaves a short link that cannot be completed the gap that a completed neighbour does not need of it', () => {
+    // [8] has a wide link touching its left and 4 px to [9], which is completed and has the rest of the line on its right.
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 0, 100)
+      link(message, 100, 108)
+      link(message, 112, 121)
+    })
+    fitLinks(root, messages)
+    const [, eight, nine] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    if (!eight || !nine) throw new Error('the made page has no links')
+    expect(boxOf(nine).right - boxOf(nine).left, 'the box of the completed link').toBeGreaterThanOrEqual(LEAST)
+    expect(given(eight).right, 'the gap to the completed link, which it keeps').toBe(4)
   })
 
   it('moves a neighbour’s room to its far side where that frees the gap for the link beside a wide link', () => {

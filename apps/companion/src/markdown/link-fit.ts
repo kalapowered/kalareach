@@ -73,7 +73,10 @@ const NONE: Beside = { left: 0, right: 0 }
 /** The same line: boxes that are as high as one another, which is how an engine lays out the buttons of a line of text. */
 const sameLine = (a: Rect, b: Rect): boolean => Math.abs(a.top - b.top) <= 1 && Math.abs(a.bottom - b.bottom) <= 1
 
-/** What the packing of one line knows of a link: its words, what it lacks, and the room its walls leave on each side. */
+/** Whether the boxes' heights intersect, so that their boxes have to keep apart wherever their words do not lie one over the other. */
+const reach = (a: Rect, b: Rect): boolean => a.bottom > b.top && a.top < b.bottom
+
+/** What the packing of a row knows of a link: its words, what it lacks, and the room its walls leave on each side. */
 interface Slot {
   readonly at: number
   readonly left: number
@@ -84,57 +87,93 @@ interface Slot {
 }
 
 /**
- * The room of each of `items`, in order: none for a control and for a link that is as wide as `least`.
- * `slack` is what is added to the room a link lacks on each side (see `SLACK`).
+ * The room of each of `items`, in order: none for a control and for a link that is as wide as `least`. `slack` is
+ * the most that a completed link is given beyond the least size on each side, from room that nothing else uses.
+ *
+ * The links whose heights reach one another are one group. Where every two links of a group reach one another and
+ * none lies over another's words (a line, or two neighbouring lines whose links stand apart), the group is one
+ * row, packed as one: each box holds its words and the packing completes as many short links as any assignment
+ * does. Any other group (links over one another, lines three apart) is packed line by line (connected groups of
+ * `sameLine`), with the middle of the gap to a short link of another line, or the edge of another line's wide link,
+ * as the wall: a short link there can stay short where a joint packing would complete it. A control is a wall
+ * of every link whose height it reaches.
  */
 export function packRooms(items: readonly Item[], least: number, slack: number = SLACK): Beside[] {
   const rooms: Beside[] = items.map(() => NONE)
   const width = (item: Item): number => item.box.right - item.box.left
-  const short = (item: Item): boolean => item.link && width(item) > 0 && width(item) < least
-  // The walls of each short link: its column, and every box on a line that reaches its height that does not lie on its own line.
-  const walls = new Map<number, { left: number; right: number }>()
-  items.forEach((item, at) => {
-    if (!short(item)) return
+  const drawnLink = (at: number): boolean => (items[at]).link && width(items[at]) > 0
+  const short = (at: number): boolean => drawnLink(at) && width(items[at]) < least
+  const links = items.flatMap((_, at) => (drawnLink(at) ? [at] : []))
+  const controls = items.flatMap((item, at) => (!item.link && width(item) > 0 ? [at] : []))
+  /** The walls of the link `at`: its column, the controls beside it, and the links of `others` that are not of its row. */
+  const wallsOf = (at: number, others: readonly number[]): { left: number; right: number } => {
+    const item = items[at]
     let left = Math.min(item.column.left, item.box.left)
     let right = Math.max(item.column.right, item.box.right)
-    items.forEach((other, index) => {
-      if (index === at || width(other) <= 0) return
-      if (other.box.bottom <= item.box.top || other.box.top >= item.box.bottom) return
-      if (other.link && sameLine(other.box, item.box)) return
-      const middle = other.link && short(other)
+    for (const index of [...others, ...controls]) {
+      const other = items[index]
+      if (index === at || !reach(other.box, item.box)) continue
+      const middle = other.link && short(index)
       if (other.box.right <= item.box.left) left = Math.max(left, middle ? (other.box.right + item.box.left) / 2 : other.box.right)
       else if (other.box.left >= item.box.right) right = Math.min(right, middle ? (item.box.right + other.box.left) / 2 : other.box.left)
-    })
-    walls.set(at, { left, right })
-  })
-  // The lines that hold a short link, each of them packed alone.
-  const lines: number[][] = []
-  const placed = new Set<number>()
-  for (const at of walls.keys()) {
-    if (placed.has(at)) continue
-    const line = items.flatMap((other, index) => (other.link && width(other) > 0 && sameLine(other.box, (items[at]).box) ? [index] : []))
-    line.sort((a, b) => (items[a]).box.left - (items[b]).box.left)
-    for (const index of line) placed.add(index)
-    lines.push(line)
+    }
+    return { left, right }
   }
-  for (const line of lines) {
-    const slots: Slot[] = line.map((index) => {
-      const item = items[index]
-      const wall = walls.get(index)
-      return {
-        at: index,
-        left: item.box.left,
-        right: item.box.right,
-        lack: short(item) ? least - width(item) + 2 * slack : 0,
-        leftRoom: wall === undefined ? 0 : Math.max(0, item.box.left - wall.left),
-        rightRoom: wall === undefined ? 0 : Math.max(0, wall.right - item.box.right)
-      }
-    })
-    const given = packLine(slots)
+  const slotsOf = (row: readonly number[], others: (at: number) => readonly number[]): Slot[] =>
+    row
+      .map((at) => {
+        const item = items[at]
+        const wall = short(at) ? wallsOf(at, others(at)) : undefined
+        return {
+          at,
+          left: item.box.left,
+          right: item.box.right,
+          lack: short(at) ? least - width(item) : 0,
+          leftRoom: wall === undefined ? 0 : Math.max(0, item.box.left - wall.left),
+          rightRoom: wall === undefined ? 0 : Math.max(0, wall.right - item.box.right)
+        }
+      })
+      .sort((a, b) => a.left - b.left)
+  const pack = (slots: readonly Slot[]): void => {
+    const given = packLine(slots, slack)
     slots.forEach((slot, index) => {
       const own = given[index] ?? NONE
       rooms[slot.at] = { left: held(own.left), right: held(own.right) }
     })
+  }
+  // The groups of links whose heights reach one another, each of them with a short link.
+  const seen = new Set<number>()
+  for (const start of links) {
+    if (!short(start) || seen.has(start)) continue
+    const group = [start]
+    seen.add(start)
+    for (let next = 0; next < group.length; next += 1) {
+      for (const other of links) {
+        if (seen.has(other) || !reach(items[other].box, items[group[next]].box)) continue
+        seen.add(other)
+        group.push(other)
+      }
+    }
+    // One row where every two links reach one another and stand apart.
+    const apart = group.every((a) => group.every((b) => a === b || (reach(items[a].box, items[b].box) && (items[a].box.right <= items[b].box.left || items[b].box.right <= items[a].box.left))))
+    if (apart) {
+      pack(slotsOf(group, () => []))
+      continue
+    }
+    // Otherwise each line, once: the connected groups of `sameLine`.
+    const lineOf = new Map<number, number>()
+    for (const at of group) {
+      if (lineOf.has(at)) continue
+      lineOf.set(at, at)
+      const line = [at]
+      for (let next = 0; next < line.length; next += 1) {
+        for (const other of group) if (!lineOf.has(other) && sameLine(items[other].box, items[line[next]].box)) {
+          lineOf.set(other, at)
+          line.push(other)
+        }
+      }
+      pack(slotsOf(line, (index) => group.filter((other) => lineOf.get(other) !== lineOf.get(index))))
+    }
   }
   return rooms
 }
@@ -146,7 +185,7 @@ const EPSILON = 1e-9
  * any assignment allows), and how much of it each takes from each side. Two neighbours share the gap between
  * their words, and a link's room on a side is no more than its wall leaves.
  */
-function packLine(slots: readonly Slot[]): Beside[] {
+function packLine(slots: readonly Slot[], slack: number): Beside[] {
   const count = slots.length
   const gap = (k: number): number => Math.max(0, (slots[k + 1]).left - (slots[k]).right)
   interface State {
@@ -192,7 +231,9 @@ function packLine(slots: readonly Slot[]): Beside[] {
     const room = Math.min(slot.rightRoom, k < count - 1 ? gap(k) - (needs[k + 1] ?? 0) : Infinity)
     needs[k] = Math.max(0, slot.lack - room)
   }
-  // The completed links, from the left: each takes the half of what it lacks from each side that the others leave it.
+  // The completed links, from the left. A completed link takes half of what it lacks from each side, or all of it from the side whose
+  // neighbour is a short link that cannot be completed, so that the neighbour keeps the gap; the others leave it what they can.
+  const open = (k: number): boolean => k >= 0 && k < count && (slots[k]).lack > 0 && !done[k]
   const given: { left: number; right: number }[] = slots.map(() => ({ left: 0, right: 0 }))
   let taken = 0
   for (let k = 0; k < count; k += 1) {
@@ -203,13 +244,14 @@ function packLine(slots: readonly Slot[]): Beside[] {
       continue
     }
     const free = Math.min(slot.leftRoom, slot.lack, k > 0 ? gap(k - 1) - taken : Infinity)
-    own.left = Math.min(Math.max(slot.lack / 2, needs[k] ?? 0), Math.max(0, free))
+    const half = Math.floor((slot.lack / 2) * GRID) / GRID
+    const want = open(k - 1) && !open(k + 1) ? 0 : open(k + 1) && !open(k - 1) ? slot.lack : half
+    own.left = Math.min(Math.max(want, needs[k] ?? 0), Math.max(0, free))
     own.right = slot.lack - own.left
     taken = own.right
   }
   // The links that cannot be completed have all the room that is left: a gap between two of them is shared in halves.
   const rest = (k: number): number => gap(k) - (done[k] ? (given[k] as { right: number }).right : 0) - (done[k + 1] ? (given[k + 1] as { left: number }).left : 0)
-  const open = (k: number): boolean => (slots[k]).lack > 0 && !done[k]
   for (let k = 0; k < count; k += 1) {
     if (!open(k)) continue
     const slot = slots[k]
@@ -230,7 +272,15 @@ function packLine(slots: readonly Slot[]): Beside[] {
     ;(given[k] as { right: number }).right = right
     ;(given[k + 1] as { left: number }).left = left
   }
-  return given
+  // The room that nothing uses goes to the completed links, up to `slack` on a side, and a gap that two of them share is halved.
+  const spare = (k: number): number => gap(k) - (given[k]).right - (given[k + 1]).left
+  const extra = slots.map((slot, k) => {
+    if (!done[k]) return { left: 0, right: 0 }
+    const left = k === 0 ? slot.leftRoom - (given[k]).left : Math.min(slot.leftRoom - (given[k]).left, spare(k - 1) / (done[k - 1] ? 2 : 1))
+    const right = k === count - 1 ? slot.rightRoom - (given[k]).right : Math.min(slot.rightRoom - (given[k]).right, spare(k) / (done[k + 1] ? 2 : 1))
+    return { left: Math.min(slack, Math.max(0, left)), right: Math.min(slack, Math.max(0, right)) }
+  })
+  return given.map((own, k) => ({ left: own.left + (extra[k]).left, right: own.right + (extra[k]).right }))
 }
 
 /** `value` rounded down to the engine's grid, and never below nothing. */
