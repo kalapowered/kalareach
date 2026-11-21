@@ -9,7 +9,9 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_ipc::endpoint::Listener;
@@ -22,9 +24,17 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::scalars::Uuid;
 
-/// A host process, ended when the case ends, however it ends.
+/// A host process, collected as soon as it ends and ended when the case ends, however it ends.
+///
+/// A host that ended and was not collected stays a zombie that the system still names, which a
+/// launcher can authenticate: so a thread of its own collects the child and the case reads the
+/// identity at once, before the host has had time to end.
 struct Running {
-    child: Child,
+    /// The host's identity as the service manager would have reported it.
+    identity: kr_protocol::identity::ProcessStartIdentity,
+    ended: Arc<Mutex<Option<ExitStatus>>>,
+    stop: Arc<AtomicBool>,
+    collector: Option<std::thread::JoinHandle<()>>,
     /// Where its home is, kept until the process is gone.
     _home: PrivateTempDir,
 }
@@ -32,7 +42,7 @@ struct Running {
 impl Running {
     fn start(arguments: &[String]) -> Self {
         let home = PrivateTempDir::create();
-        let child = Command::new(env!("CARGO_BIN_EXE_kr-plugin-host"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_kr-plugin-host"))
             .args(arguments)
             .env_clear()
             .env("HOME", home.path())
@@ -42,18 +52,66 @@ impl Running {
             .stderr(Stdio::null())
             .spawn()
             .expect("the plugin host starts");
-        Self { child, _home: home }
+        let identity =
+            kr_ipc::identity::process_start_identity(child.id()).expect("the host's identity");
+        let ended = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let collector = {
+            let (ended, stop) = (Arc::clone(&ended), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                loop {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        *ended.lock().expect("the status") = Some(status);
+                        return;
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        let _killed = child.kill();
+                        let _collected = child.wait();
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        Self {
+            identity,
+            ended,
+            stop,
+            collector: Some(collector),
+            _home: home,
+        }
     }
 
     fn identity(&self) -> kr_protocol::identity::ProcessStartIdentity {
-        kr_ipc::identity::process_start_identity(self.child.id()).expect("the host's identity")
+        self.identity.clone()
+    }
+
+    /// How the host ended, when it has.
+    fn status(&self) -> Option<ExitStatus> {
+        *self.ended.lock().expect("the status")
+    }
+
+    /// How the host ended, waiting for it for at most `limit`.
+    async fn ends_within(&self, limit: Duration) -> Option<ExitStatus> {
+        let until = tokio::time::Instant::now() + limit;
+        loop {
+            if let Some(status) = self.status() {
+                return Some(status);
+            }
+            if tokio::time::Instant::now() > until {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let _killed = self.child.kill();
-        let _collected = self.child.wait();
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(collector) = self.collector.take() {
+            let _joined = collector.join();
+        }
     }
 }
 
@@ -86,30 +144,28 @@ impl Setup {
         reservation.arguments(&self.environment, &packages)
     }
 
-    /// What the launcher hears from a host started with `arguments`, `delay` after the host was
-    /// started and before the launcher accepts.
+    /// What the launcher gives when a host started with `arguments` is accepted `delay` after the
+    /// host was started.
     async fn heard_after(
         &self,
         reservation: HostReservation,
         arguments: &[String],
         delay: Duration,
-    ) -> LaunchError {
+    ) -> Result<(), LaunchError> {
         let host = Running::start(arguments);
         tokio::time::sleep(delay).await;
         reservation
             .accept(&self.environment, &host.identity(), Duration::from_secs(20))
             .await
-            .expect_err("a host that cannot start does not report in")
+            .map(|_| ())
     }
 
-    async fn failure_of(&self, delay: Duration) -> String {
+    /// [`Self::heard_after`] for a reservation and arguments made here.
+    async fn heard(&self, delay: Duration) -> Result<(), LaunchError> {
         let reservation =
             HostReservation::open(&self.environment, HostProtocol::THIS).expect("a reservation");
         let arguments = self.arguments(&reservation);
-        match self.heard_after(reservation, &arguments, delay).await {
-            LaunchError::HostFailed { reason } => reason,
-            other => panic!("the host's reason, not {other:?}"),
-        }
+        self.heard_after(reservation, &arguments, delay).await
     }
 }
 
@@ -130,7 +186,13 @@ async fn a_host_whose_endpoint_has_a_file_on_it_tells_the_launcher_why() {
     let setup = Setup::new();
     let path = setup.path();
     std::fs::write(&path, b"mine").expect("a file at the endpoint");
-    let reason = setup.failure_of(Duration::ZERO).await;
+    let heard = setup
+        .heard(Duration::ZERO)
+        .await
+        .expect_err("a host that cannot start does not report in");
+    let LaunchError::HostFailed { reason } = heard else {
+        panic!("the host's reason, not {heard:?}");
+    };
     assert!(
         reason.starts_with("the plugin host could not listen on ")
             && reason.contains(&path.display().to_string())
@@ -147,7 +209,13 @@ async fn a_host_whose_endpoint_has_a_file_on_it_tells_the_launcher_why() {
 async fn a_host_whose_endpoint_is_held_by_a_live_listener_tells_the_launcher_why() {
     let setup = Setup::new();
     let _held = Listener::bind(&setup.endpoint()).expect("a live listener of this process");
-    let reason = setup.failure_of(Duration::ZERO).await;
+    let heard = setup
+        .heard(Duration::ZERO)
+        .await
+        .expect_err("a host that cannot start does not report in");
+    let LaunchError::HostFailed { reason } = heard else {
+        panic!("the host's reason, not {heard:?}");
+    };
     assert!(
         reason.contains(&format!("process {} started", std::process::id())),
         "{reason}"
@@ -161,7 +229,13 @@ async fn a_host_whose_endpoint_is_held_by_a_live_listener_tells_the_launcher_why
 async fn a_failure_is_heard_when_the_launcher_accepts_a_second_late() {
     let setup = Setup::new();
     std::fs::write(setup.path(), b"mine").expect("a file at the endpoint");
-    let reason = setup.failure_of(Duration::from_millis(1500)).await;
+    let heard = setup
+        .heard(Duration::from_millis(1500))
+        .await
+        .expect_err("a host that cannot start does not report in");
+    let LaunchError::HostFailed { reason } = heard else {
+        panic!("the host's reason, not {heard:?}");
+    };
     assert!(reason.contains("could not listen on"), "{reason}");
 }
 
@@ -178,16 +252,17 @@ async fn a_step_before_the_endpoint_exists_says_it_could_not_start() {
         "--runtime-dir",
         &blocker.join("run").display().to_string(),
     );
-    match setup
+    let heard = setup
         .heard_after(reservation, &arguments, Duration::ZERO)
         .await
-    {
-        LaunchError::HostFailed { reason } => assert!(
-            reason.starts_with("the plugin host could not start: ") && !reason.contains("listen"),
-            "{reason}"
-        ),
-        other => panic!("the host's reason, not {other:?}"),
-    }
+        .expect_err("a host that cannot start does not report in");
+    let LaunchError::HostFailed { reason } = heard else {
+        panic!("the host's reason, not {heard:?}");
+    };
+    assert!(
+        reason.starts_with("the plugin host could not start: ") && !reason.contains("listen"),
+        "{reason}"
+    );
 }
 
 /// A host whose launcher's rendezvous path is as long as a socket path can be still sends its
@@ -286,27 +361,16 @@ async fn a_host_waits_for_the_launcher_to_close_and_then_ends_by_itself() {
         "--rendezvous",
         &rendezvous.as_text(),
     );
-    let mut host = Running::start(&arguments);
+    let host = Running::start(&arguments);
     // The connection is accepted and held open: nothing is read from it and nothing is closed.
     let _held = tokio::time::timeout(Duration::from_secs(20), daemon.accept())
         .await
         .expect("the host connects")
         .expect("an accepted connection");
-    let ended = tokio::task::spawn_blocking(move || {
-        let until = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = host.child.try_wait().expect("the host's state") {
-                return Some(status);
-            }
-            if std::time::Instant::now() > until {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    })
-    .await
-    .expect("the wait");
-    let status = ended.expect("the host ends by itself");
+    let status = host
+        .ends_within(Duration::from_secs(30))
+        .await
+        .expect("the host ends by itself");
     assert!(!status.success(), "{status}");
 }
 
@@ -327,10 +391,11 @@ async fn a_host_that_cannot_connect_binds_nothing() {
             .display()
             .to_string(),
     );
-    let mut host = Running::start(&arguments);
-    let status = tokio::task::spawn_blocking(move || host.child.wait().expect("the host ends"))
+    let host = Running::start(&arguments);
+    let status = host
+        .ends_within(Duration::from_secs(30))
         .await
-        .expect("the wait");
+        .expect("the host ends");
     assert!(!status.success(), "{status}");
     assert!(!setup.path().exists(), "the host bound its endpoint");
 }
