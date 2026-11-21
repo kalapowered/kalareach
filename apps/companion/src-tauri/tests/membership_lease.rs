@@ -1688,6 +1688,107 @@ async fn a_connection_to_a_member_host_tells_the_page_so() {
     assert_eq!(state["organisation"], true, "{state}");
 }
 
+/// KR-REQ-13.12: on a member host a command the page made under an account's mark is refused at its
+/// entry once another account is signed in, before the page is told of the change, and so is a
+/// command that carries no mark. The refusal is in the sign-in words, no file is made of the bytes
+/// and the host is asked for nothing; a command under the account in force is not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_stamped_with_an_earlier_account_or_with_none_is_refused_at_its_entry_on_a_member_host()
+ {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let state = rig.companion().app.state::<companion_tauri::AppState>();
+    let ada = state
+        .account_of(true)
+        .await
+        .expect("an account is signed in")
+        .expect("a mark")
+        .to_hex();
+    // The person signs in as another member. The connection to the host ends with the change, and
+    // the page has not been told, so its commands still carry the earlier account's mark.
+    rig.signs_in_as("grace").await;
+    let grace = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            if let Ok(Some(mark)) = state.account_of(true).await
+                && mark.to_hex() != ada
+            {
+                return mark.to_hex();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the account in force is the new one");
+
+    let key = kr_ipc::new_uuid().to_string();
+    let bytes = vec![7_u8; 1000];
+    let stamped = [
+        ("kr-file-name", "a.bin"),
+        ("kr-transfer-key", key.as_str()),
+        ("kr-mark", ada.as_str()),
+    ];
+    let unstamped = [("kr-file-name", "a.bin"), ("kr-transfer-key", key.as_str())];
+    let companion = rig.companion();
+    let answers = [
+        (
+            "the bytes of a file under the earlier account's mark",
+            companion.call_bytes("attachment_upload_bytes", bytes.clone(), &stamped),
+        ),
+        (
+            "the bytes of a file with no mark",
+            companion.call_bytes("attachment_upload_bytes", bytes.clone(), &unstamped),
+        ),
+        (
+            "the open uploads under the earlier account's mark",
+            companion.call("uploads_open", json!({ "mark": ada })),
+        ),
+        (
+            "the open uploads with no mark",
+            companion.call("uploads_open", json!({})),
+        ),
+        (
+            "a cancel under the earlier account's mark",
+            companion.call("upload_cancel", json!({ "transferKey": key, "mark": ada })),
+        ),
+        (
+            "a cancel with no mark",
+            companion.call("upload_cancel", json!({ "transferKey": key })),
+        ),
+    ];
+    for (what, answer) in answers {
+        let said = answer.err();
+        assert!(
+            said.as_ref().is_some_and(asks_to_sign_in),
+            "{what} is refused in the sign-in words: {said:?}"
+        );
+    }
+    assert_eq!(
+        rig.control.sent(Method::UploadBegin),
+        0,
+        "the host was asked for nothing"
+    );
+    let kept = companion_tauri::open_transfers::kept_in(rig.phone.data.path());
+    assert_eq!(
+        std::fs::read_dir(&kept).map_or(0, Iterator::count),
+        0,
+        "no file was made of the bytes"
+    );
+
+    // A command under the account now in force is not refused as a sign-out.
+    let read = companion.call("uploads_open", json!({ "mark": grace }));
+    assert!(read.is_ok(), "the open uploads are read: {read:?}");
+    let own = [
+        ("kr-file-name", "a.bin"),
+        ("kr-transfer-key", key.as_str()),
+        ("kr-mark", grace.as_str()),
+    ];
+    let sent = companion.call_bytes("attachment_upload_bytes", bytes, &own);
+    assert!(
+        !sent.as_ref().err().is_some_and(asks_to_sign_in),
+        "a file under the account in force is not refused as a sign-out: {sent:?}"
+    );
+}
+
 /// KR-REQ-17.53: the inbox keeps its connection to a host that is not in use between passes, and
 /// nothing keeps the lease of that host fresh. When the lease the host holds has ended, the next
 /// pass presents the device's lease again over the connection it kept, asks the organisation's
