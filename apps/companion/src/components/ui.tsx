@@ -203,6 +203,97 @@ export function CommitButton({
   )
 }
 
+/** How long a control that waits for its second press stays armed, in milliseconds. */
+export const ARMED_FOR_MS = 6_000
+
+/**
+ * A control that commits on its second press. A removal that cannot be taken back is not made by
+ * one press, whatever the press was: the first arms the control, in the danger colours, with a
+ * label that says what the second press does, and the second commits. It disarms by itself when
+ * focus leaves it, when Escape is pressed in it, and after [`ARMED_FOR_MS`], so a press that was
+ * made and forgotten is not a decision made later.
+ *
+ * Each press is a [`CommitButton`]'s, so each is still decided on release inside the control. The
+ * armed label is the button's own text, so its accessible name changes with it, and a polite status
+ * says it too for a screen reader that does not announce a change of name. The change is a colour
+ * change, with no movement, so a person who asks for less motion sees the same states.
+ */
+export function TwoPressButton({
+  onCommit,
+  armedLabel,
+  tone = 'quiet',
+  children,
+  disabled,
+  ...rest
+}: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'className' | 'onClick'> & {
+  readonly onCommit: () => void
+  /** What the control says while it waits for its second press. */
+  readonly armedLabel: string
+  readonly tone?: ButtonTone
+  readonly children: ReactNode
+}): ReactNode {
+  const [armed, setArmed] = useState(false)
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const disarm = useCallback(() => {
+    if (timer.current !== null) clearTimeout(timer.current)
+    timer.current = null
+    setArmed(false)
+  }, [])
+
+  useEffect(
+    () => () => {
+      if (timer.current !== null) clearTimeout(timer.current)
+    },
+    []
+  )
+
+  // A control that is disabled is not armed when it is enabled again.
+  const [wasDisabled, setWasDisabled] = useState(disabled === true)
+  if ((disabled === true) !== wasDisabled) {
+    setWasDisabled(disabled === true)
+    // The timer that is left ends in a disarm of a control that is not armed.
+    if (disabled === true) setArmed(false)
+  }
+
+  return (
+    <span
+      className="two-press"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) disarm()
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape' && armed) {
+          event.stopPropagation()
+          disarm()
+        }
+      }}
+    >
+      <CommitButton
+        tone={tone}
+        disabled={disabled}
+        data-armed={armed ? 'true' : undefined}
+        data-wraps=""
+        onCommit={() => {
+          if (!armed) {
+            setArmed(true)
+            timer.current = setTimeout(disarm, ARMED_FOR_MS)
+            return
+          }
+          disarm()
+          onCommit()
+        }}
+        {...rest}
+      >
+        {armed ? armedLabel : children}
+      </CommitButton>
+      <span className="visually-hidden" role="status">
+        {armed ? armedLabel : ''}
+      </span>
+    </span>
+  )
+}
+
 /* ---- Small pieces ---------------------------------------------------------------------------- */
 
 /** A status chip. */
