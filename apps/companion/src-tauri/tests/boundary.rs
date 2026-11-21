@@ -1657,8 +1657,8 @@ fn without_comments(document: &str) -> String {
 /// camera, and the WebView's file chooser opens it only after it finds an application that answers
 /// the image-capture action. The application targets Android 11 or later, where an application sees
 /// the apps its own manifest names and only a few others, such as some system apps, so without this
-/// entry, from Android 11 on, package visibility can hide camera apps and make 'Take a photo' open
-/// the photo picker.
+/// entry, from Android 11 on, package visibility can hide camera apps and make 'Take a photo' open a
+/// picker in place of the camera.
 #[test]
 fn the_android_manifest_names_the_image_capture_action_so_take_a_photo_finds_the_camera() {
     let manifest =
@@ -1680,7 +1680,7 @@ fn the_android_manifest_names_the_image_capture_action_so_take_a_photo_finds_the
         .collect();
     assert!(
         queried.contains(&"android.media.action.IMAGE_CAPTURE"),
-        "no `<queries>` intent names android.media.action.IMAGE_CAPTURE, so, from Android 11 on, package visibility can hide camera apps and make \"Take a photo\" open the photo picker: {queried:?}"
+        "no `<queries>` intent names android.media.action.IMAGE_CAPTURE, so, from Android 11 on, package visibility can hide camera apps and make \"Take a photo\" open a picker in place of the camera: {queried:?}"
     );
 }
 
