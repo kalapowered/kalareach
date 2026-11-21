@@ -375,8 +375,9 @@ impl InboxDesk {
         .unwrap_or(Visited::Unreached);
         #[cfg(feature = "testing")]
         self.at_the_visit(host.host_device_id).await;
-        // A re-pair after the first check and before this one can still commit one read over the old
-        // pairing; the next visit finds another pairing and replaces the record.
+        // A re-pair since the visit began is refused here, and nothing is committed over the old
+        // pairing. One that comes after this check and before the commit can still commit one read
+        // over it; the next visit finds another pairing and replaces the record.
         if !still_paired_as(device, host.host_device_id, host.device_id) {
             drop(visited);
             drop(self.owner.discard(&ticket));
