@@ -469,18 +469,25 @@ fn the_targets_a_command_covers_are_the_targets_cargo_builds_for_it() {
         let members: Vec<&kr_conformance::workspace::Package> = read.packages.iter().collect();
         asked += rows.len();
         for words in rows {
+            commands += 1;
             let built = built(&workspace, &target, &read.packages, &words);
             let mut command = vec!["cargo".to_owned(), "test".to_owned()];
             command.extend(words.iter().map(|word| (*word).to_owned()));
-            let covered = coverage::parse(&command)
-                .unwrap_or_else(|why| panic!("{words:?}: {why}"))
-                .covers(&members);
             assert!(
                 !built.is_empty(),
                 "{name}: `{}` built nothing",
                 words.join(" ")
             );
-            commands += 1;
+            let covered = match coverage::parse(&command) {
+                Ok(selection) => selection.covers(&members),
+                Err(why) => {
+                    wrong.push(format!(
+                        "{name}: `cargo test {}` is refused, and Cargo builds it: {why}",
+                        words.join(" ")
+                    ));
+                    continue;
+                }
+            };
             if covered != built {
                 let show = |set: &BTreeSet<TargetId>| {
                     set.iter()
