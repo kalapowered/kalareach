@@ -463,6 +463,9 @@ mod window {
         wait_for("the connection being held", || {
             owner.revision() >= started_at + 2
         })?;
+        // The revision of the state that announces the connection, which the publisher tells once
+        // the hold is released.
+        let held_revision = owner.revision();
         runtime.block_on(async {
             link.push(
                 "session.state",
@@ -486,66 +489,85 @@ mod window {
         std::thread::sleep(Duration::from_secs(1));
         let early = heard(window)[before..].to_vec();
         // The keeper stops waiting for the state after `STATE_FIRST_WITHIN` whether it was told or
-        // not, and a case cannot move that bound. What the page has not heard is asserted only
-        // while the bound cannot have passed: a run that took longer than that to get here, on a
-        // machine that stalled, says nothing about the order and is not failed for it.
-        if !before_the_bound(offered_at) {
-            hold.release();
-            session.close();
-            println!(
-                "host_events: the order of a host's first events was not asserted: more than \
-                 {STATE_FIRST_WITHIN:?} passed after the connection was offered"
+        // not, and a case cannot move that bound. What the page has not heard, and in what order it
+        // hears things, is asserted only while the bound cannot have passed: the time since the
+        // offer, taken after the read, is never less than the time the keeper has waited. A machine
+        // that stalled for longer says nothing about that order and is not failed for it. What the
+        // bound does not explain is always asserted: that the state and both events arrive, and
+        // what they name.
+        let held_in_time = before_the_bound(offered_at);
+        if held_in_time {
+            assert!(
+                early.is_empty(),
+                "the page heard {early:?} before the state that announces the connection was told"
             );
-            return Ok(());
+        } else {
+            println!(
+                "host_events: what the page heard while the state was held was not asserted: more \
+                 than {STATE_FIRST_WITHIN:?} passed after the connection was offered"
+            );
         }
-        assert!(
-            early.is_empty(),
-            "the page heard {early:?} before the state that announces the connection was told"
-        );
 
         hold.release();
+        // The state is told once the hold is released, and the time is taken after that: a state
+        // told inside the bound was told before the keeper's wait for it could end, however slowly
+        // the page hears it.
+        if !runtime.block_on(owner.emitted_through(held_revision, LIVENESS)) {
+            return Err(format!(
+                "the publisher did not tell the state that announces the connection within \
+                 {LIVENESS:?} of its release"
+            ));
+        }
+        let in_time = before_the_bound(offered_at);
         let heard_now = || heard(window)[before..].to_vec();
         wait_for("the page hearing the state and both events", || {
-            heard_now()
-                .iter()
+            let now = heard_now();
+            now.iter()
                 .filter(|each| each.get("connection").is_none())
                 .count()
                 >= 2
+                && now.iter().any(|each| {
+                    each.get("connection").is_some_and(|state| {
+                        state["revision"].as_u64().unwrap_or(0) >= held_revision
+                    })
+                })
         })?;
         let told = heard_now();
-        // Events heard before the state are a fault only if the keeper's bound had not passed when
-        // they were read, which the time since the offer, taken after the read, shows.
-        if !before_the_bound(offered_at) {
-            session.close();
-            println!(
-                "host_events: the order of a host's first events was not asserted: more than \
-                 {STATE_FIRST_WITHIN:?} passed after the connection was offered"
-            );
-            return Ok(());
-        }
-        let first_event = told
+        let events: Vec<&Value> = told
             .iter()
-            .position(|each| each.get("connection").is_none());
-        let last_state = told
+            .filter(|each| each.get("connection").is_none())
+            .collect();
+        let Some(last_state) = told
             .iter()
-            .rposition(|each| each.get("connection").is_some());
-        let (Some(first_event), Some(last_state)) = (first_event, last_state) else {
+            .rposition(|each| each.get("connection").is_some())
+        else {
             panic!("the page heard no state beside the events: {told:?}");
         };
-        assert!(
-            last_state < first_event,
-            "the page heard the host's first events before the state that announces the connection: {told:?}"
-        );
         let announced = &told[last_state]["connection"];
         assert_eq!(announced["connected"], json!(true), "{announced}");
         assert!(
             announced["revision"].as_u64().unwrap_or(0) > started_at,
             "the state names a revision after the choice: {announced}"
         );
-        for event in &told[first_event..] {
+        for event in events {
             assert_eq!(
                 event["revision"], announced["revision"],
                 "each event names the revision of the state it follows: {told:?}"
+            );
+        }
+        if held_in_time && in_time {
+            let first_event = told
+                .iter()
+                .position(|each| each.get("connection").is_none())
+                .expect("the events were heard");
+            assert!(
+                last_state < first_event,
+                "the page heard the host's first events before the state that announces the connection: {told:?}"
+            );
+        } else {
+            println!(
+                "host_events: the order of a host's first events was not asserted: more than \
+                 {STATE_FIRST_WITHIN:?} passed after the connection was offered"
             );
         }
         session.close();
