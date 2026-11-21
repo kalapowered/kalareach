@@ -1317,15 +1317,11 @@ fn a_home_folder_with_an_apostrophe_is_given_to_the_shell_quoted() {
     );
 }
 
-/// KR-REQ-13.11: a program that names no application or script has no line, and the refusal the
-/// reader gives for a command it has no line for is a draft conflict, which the page reads with
-/// the surface's shell to say that PowerShell cannot run the command.
+/// KR-REQ-13.11: a program that names no application or script has no line in the module's
+/// decision on Windows. No reader runs here, so the refusal it gives for such a command is the
+/// package case's, which a Unix run drives.
 #[test]
-fn a_program_that_names_no_application_has_no_line_in_powershell_and_the_press_is_a_draft_conflict()
-{
+fn a_program_that_names_no_application_has_no_line_in_the_modules_decision() {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    batch_launch::assert_a_program_that_names_no_application_has_no_line_and_the_refusal_is_a_draft_conflict(
-        directory.path(),
-        false,
-    );
+    batch_launch::assert_a_program_that_names_no_application_has_no_line(directory.path(), false);
 }

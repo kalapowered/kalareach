@@ -2476,14 +2476,11 @@ fn a_home_folder_with_an_apostrophe_is_given_to_the_shell_quoted() {
     );
 }
 
-/// KR-REQ-13.11: a program that names no application or script has no line, and the refusal the
-/// reader gives for it is a draft conflict.
+/// KR-REQ-13.11: a program that names no application or script has no line in the module's
+/// decision. The refusal the reader gives for it is the package case's, above.
 #[test]
 #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
 fn a_program_that_names_no_application_has_no_line_in_the_modules_decision() {
     let directory = tempfile::tempdir().expect("a temporary directory");
-    batch_launch::assert_a_program_that_names_no_application_has_no_line_and_the_refusal_is_a_draft_conflict(
-        directory.path(),
-        true,
-    );
+    batch_launch::assert_a_program_that_names_no_application_has_no_line(directory.path(), true);
 }
