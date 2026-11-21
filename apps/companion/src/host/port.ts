@@ -2839,6 +2839,12 @@ export interface Watch {
    * newest read started and the watch has not ended.
    */
   readonly read: () => (() => boolean) | null
+  /**
+   * A reader of its own, for a view that reads two things on two cadences: its reads are numbered
+   * apart from `read`'s and from every other reader's, so a read of one thing never outdates the
+   * read of another. It starts a read on the same terms as `read` and answers the same check.
+   */
+  readonly reader: () => () => (() => boolean) | null
 }
 
 /**
@@ -2857,7 +2863,6 @@ export function watch(
 ): Watch {
   let stage: 'registering' | 'listening' | 'ended' = 'registering'
   let unregistered = registrations.length
-  let newest = 0
   const stops: (() => void)[] = []
   const stop = () => {
     stage = 'ended'
@@ -2887,15 +2892,16 @@ export function watch(
       }
     )
   }
-  return {
-    stop,
-    read: () => {
+  const reader = () => {
+    let newest = 0
+    return () => {
       if (stage !== 'listening') return null
       newest += 1
       const started = newest
       return () => stage === 'listening' && started === newest
     }
   }
+  return { stop, read: reader(), reader }
 }
 
 /**

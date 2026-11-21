@@ -258,6 +258,30 @@ describe('the reads a watch makes', () => {
     expect(reads.read()).toBeNull()
   })
 
+  it('numbers the reads of each reader apart from the reads of every other', async () => {
+    const only = pending()
+    const reads = watch([only.registration])
+    const first = reads.reader()
+    const second = reads.reader()
+    expect(first()).toBeNull()
+
+    only.complete()
+    await settled(only.registration)
+    const surface = first()
+    const saved = second()
+    // A read of the second reader does not outdate the first's, and the other way round.
+    expect(surface?.()).toBe(true)
+    expect(saved?.()).toBe(true)
+    const newer = first()
+    expect(surface?.()).toBe(false)
+    expect(saved?.()).toBe(true)
+    expect(newer?.()).toBe(true)
+
+    reads.stop()
+    expect(saved?.()).toBe(false)
+    expect(second()).toBeNull()
+  })
+
   it('ends its reads when a registration is refused', async () => {
     const kept = pending()
     const refused = pending()
