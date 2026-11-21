@@ -2019,7 +2019,7 @@ fn the_result_names_every_command_and_no_path_of_the_checkout() {
     let test = &document.identifiers["KR-REQ-03.02"].tests[0];
     assert_eq!(
         test.command.as_deref(),
-        Some("cargo test --locked -p forms --test flow -- --exact documented")
+        Some("cargo test --locked --workspace --no-fail-fast --test flow -- --exact documented")
     );
     assert_eq!(
         document.steps[0].command,
@@ -2576,9 +2576,10 @@ fn a_step_that_failed_is_the_reason_of_its_own_workspace_and_no_other() {
         .command
         .clone()
         .unwrap_or_default();
-    assert!(
-        command.starts_with("cd second && cargo test --locked -p beta --test flow"),
-        "{command}"
+    // Its step built no target, so the command keeps the step's own words.
+    assert_eq!(
+        command,
+        "cd second && cargo test --locked -- --exact passes"
     );
 }
 
@@ -2719,10 +2720,12 @@ fn a_target_a_step_ran_that_no_step_covers_is_a_problem_and_fails_the_run() {
 }
 
 /// The command of a test is its step's own, in the directory of the test's workspace and with the
-/// step's features, profile and variables that hold no placeholder; a variable that holds one is
-/// named in `needs`, because the run gives a placeholder its value. Where no step ran the test, the
-/// step that selects it gives the command. A profile is chosen by `--release` or by `--profile`,
-/// and Cargo takes one of them, so the two are two commands.
+/// step's words and its variables that hold no placeholder; a variable that holds one is named in
+/// `needs`, because the run gives a placeholder its value. Where no step ran the test, the step
+/// that selects it gives the command. A profile is chosen by `--release` or by `--profile`, and
+/// Cargo takes one of them, so the two are two commands. The test's own flag stands for the step's
+/// target flags where the step built the test's target, and the step's own flag stays where it did
+/// not.
 #[test]
 fn a_command_reproduces_the_step_in_its_directory_with_its_features_profile_and_variables() {
     let lib = target_of("p", TargetKind::Lib, "p");
@@ -2733,14 +2736,16 @@ fn a_command_reproduces_the_step_in_its_directory_with_its_features_profile_and_
     map.packages[0].features =
         BTreeMap::from([("f".to_owned(), Vec::new()), ("g".to_owned(), Vec::new())]);
     key_in(&mut map, "KR-REQ-03.01", &lib, "a");
-    for (profile, expected) in [
+    for (profile, built, kept) in [
         (
             vec!["--release", "--features", "f,g"],
-            "cd first && A=on B='two words' cargo test --locked --release --features f,g -p p --lib -- --nocapture --exact a",
+            "cd first && A=on B='two words' cargo test --locked -p p --release --features f,g --lib -- --nocapture --exact a",
+            "cd first && A=on B='two words' cargo test --locked -p p --lib --release --features f,g -- --nocapture --exact a",
         ),
         (
             vec!["--profile", "ci", "--features", "f"],
-            "cd first && A=on B='two words' cargo test --locked --profile ci --features f -p p --lib -- --nocapture --exact a",
+            "cd first && A=on B='two words' cargo test --locked -p p --profile ci --features f --lib -- --nocapture --exact a",
+            "cd first && A=on B='two words' cargo test --locked -p p --lib --profile ci --features f -- --nocapture --exact a",
         ),
     ] {
         let mut words = vec!["test", "--locked", "-p", "p", "--lib"];
@@ -2758,7 +2763,10 @@ fn a_command_reproduces_the_step_in_its_directory_with_its_features_profile_and_
             ..Step::cargo("rust", "the library", &words)
         };
         let plan = Plan::of_steps("rust", vec![step.clone()]);
-        for executed in [passing(step.clone(), &lib, &["a"]), quiet(step.clone())] {
+        for (executed, expected) in [
+            (passing(step.clone(), &lib, &["a"]), built),
+            (quiet(step.clone()), kept),
+        ] {
             let document = assembled(plan.clone(), &map, &[executed]);
             let record = &document.identifiers["KR-REQ-03.01"].tests[0];
             assert_eq!(record.command.as_deref(), Some(expected), "{record:?}");
@@ -2876,44 +2884,89 @@ fn a_command_keeps_the_options_a_step_passes_the_test_binary_with_their_values()
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// A step that selects no package but the test's gives a command for that package, with the step's
-/// features as it wrote them. A step that selects other packages gives a command with its own
-/// package flags and features, because Cargo turns on, in the test's package, what the other packages
-/// ask for.
+/// A command keeps the words of its step as the step wrote them and in order, whatever packages the
+/// step selects: its package, feature, profile, platform and configuration words, and each word that
+/// it does not read. The test's own target flag follows them where the step built every target that
+/// flag names in its packages, and the step's own target flags and test names stay where it did not.
+/// A step without `--locked` gives a command without it.
 #[test]
-fn a_command_keeps_the_package_and_feature_flags_of_a_step_that_selects_other_packages() {
+fn a_command_keeps_the_words_of_its_step_and_the_targets_flag_follows_the_targets_it_built() {
     let package = package_of("p", ".", &[(TargetKind::Lib, "p", true)]);
     let other = package_of("q", ".", &[(TargetKind::Lib, "q", true)]);
-    let step = |words: &[&str]| {
-        let mut all = vec!["test", "--locked"];
+    let lib = target_of("p", TargetKind::Lib, "p");
+    let other_lib = target_of("q", TargetKind::Lib, "q");
+    let rest = [
+        "--target",
+        "t",
+        "--config",
+        "build.jobs=2",
+        "--ignore-rust-version",
+    ];
+    let command_of = |words: &[&str], built: &[&TargetId]| {
+        let mut all = vec!["test"];
         all.extend(words);
-        all.extend(["--target", "t", "--config", "build.jobs=2"]);
-        Step::cargo("rust", "the workspace", &all)
+        all.extend(rest);
+        let step = Step::cargo("rust", "the workspace", &all);
+        let mut map = Map {
+            packages: vec![package.clone(), other.clone()],
+            ..Map::default()
+        };
+        key_in(&mut map, "KR-REQ-03.01", &lib, "a");
+        let plan = Plan::of_steps("rust", vec![step.clone()]);
+        let executed = Executed {
+            built: built.iter().map(|target| (*target).clone()).collect(),
+            ..passing(step, &lib, &["a"])
+        };
+        assembled(plan, &map, &[executed]).identifiers["KR-REQ-03.01"].tests[0]
+            .command
+            .clone()
+            .expect("a command")
     };
     let mut wrong = Vec::new();
-    for (words, expected) in [
+    for (words, built, expected) in [
+        // The step built every library its flag names: the test's flag stands for `--lib`.
         (
-            &["--workspace", "--features", "p/f,q/g,f"][..],
-            "--features p/f,q/g,f --workspace",
+            &[
+                "--locked",
+                "--workspace",
+                "--features",
+                "p/f,q/g,f",
+                "--lib",
+            ][..],
+            &[&lib, &other_lib][..],
+            "--locked --workspace --features p/f,q/g,f {rest} --lib",
         ),
         (
-            &["--workspace", "--exclude", "q", "--features", "p/f,f"][..],
-            "--features p/f,f -p p",
+            &["--workspace", "--exclude", "q", "--all-features", "--tests"][..],
+            &[&lib][..],
+            "--workspace --exclude q --all-features {rest} --lib",
         ),
         (
-            &["-p", "p", "-p", "q", "--features", "q/g"][..],
-            "--features q/g -p p -p q",
+            &["-p", "p", "-p", "q", "--features", "q/g", "--lib"][..],
+            &[&lib, &other_lib][..],
+            "-p p -p q --features q/g {rest} --lib",
         ),
         (
-            &["--workspace", "--all-features"][..],
-            "--all-features --workspace",
+            &["-qp", "p", "--no-default-features"][..],
+            &[&lib][..],
+            "-qp p --no-default-features {rest} --lib",
         ),
-        (&["-p", "p", "--features", "f"][..], "--features f -p p"),
-        (&["-p", "p", "--all-features"][..], "--all-features -p p"),
+        // The step did not build the library of `q`: its own target flags and test names stay.
+        (
+            &["--workspace", "--features", "f", "--lib", "x"][..],
+            &[&lib][..],
+            "--workspace --features f --lib x {rest}",
+        ),
+        (
+            &["--locked", "-p", "p", "-p", "q", "--tests"][..],
+            &[][..],
+            "--locked -p p -p q --tests {rest}",
+        ),
     ] {
-        let have = reproduction_in(&step(words), vec![package.clone(), other.clone()]);
+        let have = command_of(words, built);
         let want = format!(
-            "cargo test --locked --target t --config build.jobs=2 {expected} --lib -- --exact a"
+            "cargo test {} -- --exact a",
+            expected.replace("{rest}", &rest.join(" "))
         );
         if have != want {
             wrong.push(format!("{words:?}: {have}, not {want}"));
@@ -2961,7 +3014,39 @@ fn a_command_leaves_out_a_cargo_flag_whose_value_holds_a_placeholder() {
     };
     assert_eq!(
         reproduction(&step, package),
-        "cargo test --locked --config build.jobs=2 -p p --lib -- --exact a"
+        "cargo test --locked -p p --config build.jobs=2 --lib -- --exact a"
+    );
+}
+
+/// A test that no step covers gets `--locked`, `-p <package>` and its target's flag, and none of the
+/// options or variables of a step.
+#[test]
+fn a_command_for_a_test_no_step_covers_names_its_package_and_its_targets_flag() {
+    let lib = target_of("p", TargetKind::Lib, "p");
+    let mut map = Map {
+        packages: vec![
+            package_of("p", ".", &[(TargetKind::Lib, "p", true)]),
+            package_of("q", ".", &[(TargetKind::Lib, "q", true)]),
+        ],
+        ..Map::default()
+    };
+    key_in(&mut map, "KR-REQ-03.01", &lib, "a");
+    // The one step selects `q`, so no step covers `p`'s library.
+    let step = Step {
+        env: vec![("A".to_owned(), "on".to_owned())],
+        ..Step::cargo(
+            "rust",
+            "the other package",
+            &["test", "--locked", "-p", "q", "--", "--test-threads", "1"],
+        )
+    };
+    let plan = Plan::of_steps("rust", vec![step.clone()]);
+    let document = assembled(plan, &map, &[quiet(step)]);
+    assert_eq!(
+        document.identifiers["KR-REQ-03.01"].tests[0]
+            .command
+            .as_deref(),
+        Some("cargo test --locked -p p --lib -- --exact a")
     );
 }
 
@@ -3092,16 +3177,14 @@ fn a_reproduced_command_runs_for_each_package_of_a_workspace_that_a_step_gave_fe
     }
 }
 
-/// The command a report gives for a test builds the test's package with the features that its step
-/// built it with, in each way another package can turn a feature on: through a feature that a
-/// second package has by the same name, through that package's default feature, through a feature of
-/// a package that the test's package does not depend on, and through a dependency that asks for a
-/// feature. Each row runs the step's own command and the report's command for the same test, and both
-/// must find the test's package built the same way.
+/// The workspaces in which another package turns a feature on in the test's package: through a
+/// feature that a second package has by the same name (`shared`), through that package's default
+/// feature (`default`), through a feature of a package that the test's package does not depend on
+/// (`optional`), through a dependency that asks for a feature (`reached`), and through the
+/// dev-dependency of a package that the test's package does not depend on (`dev`). Each has the
+/// integration test `ta` in the package `a`.
 #[cfg(unix)]
-#[test]
-fn a_reproduced_command_builds_the_test_s_package_with_the_features_its_step_built_it_with() {
-    use std::process::Command;
+fn feature_fixtures() -> Vec<(&'static str, OnDisk)> {
     let on =
         |feature: &str| format!("pub fn on() -> bool {{\n    cfg!(feature = \"{feature}\")\n}}\n");
     let dependent = |name: &str, feature_table: &str, test: &str| {
@@ -3212,12 +3295,41 @@ fn a_reproduced_command_builds_the_test_s_package_with_the_features_its_step_bui
         ),
         ("c/src/lib.rs".to_owned(), String::new()),
     ];
-    let fixtures = [
+    let dev = {
+        let mut files = c("[features]\nx = []\n");
+        files.extend(dependent("a", "", x_is_on));
+        files.extend(vec![
+            (
+                "b/Cargo.toml".to_owned(),
+                manifest(
+                    "b",
+                    "[dev-dependencies]\nc = { path = \"../c\", features = [\"x\"] }\n",
+                ),
+            ),
+            ("b/src/lib.rs".to_owned(), String::new()),
+        ]);
+        files
+    };
+    vec![
         ("shared", on_disk(&["a", "b", "c"], &shared)),
         ("default", on_disk(&["a", "b", "c"], &default)),
         ("optional", on_disk(&["a", "b"], &optional)),
         ("reached", on_disk(&["a", "b", "c"], &reached)),
-    ];
+        ("dev", on_disk(&["a", "b", "c"], &dev)),
+    ]
+}
+
+/// The command a report gives for a test builds the test's package with the features that its step
+/// built it with, in each way another package can turn a feature on: through a feature that a
+/// second package has by the same name, through that package's default feature, through a feature of
+/// a package that the test's package does not depend on, and through a dependency that asks for a
+/// feature. Each row runs the step's own command and the report's command for the same test, and both
+/// must find the test's package built the same way.
+#[cfg(unix)]
+#[test]
+fn a_reproduced_command_builds_the_test_s_package_with_the_features_its_step_built_it_with() {
+    use std::process::Command;
+    let fixtures = feature_fixtures();
     let ta = target_of("a", TargetKind::Test, "ta");
     for (name, words, test) in [
         ("shared", &["--workspace", "--features", "f"][..], "x_is_on"),
@@ -3279,6 +3391,500 @@ fn a_reproduced_command_builds_the_test_s_package_with_the_features_its_step_bui
             String::from_utf8_lossy(&reproduced.stderr)
         );
     }
+}
+
+/// What the report's command for a test did after its step ran in a workspace on disk. The report's
+/// own run ran the step, so Cargo's record of its build is the step's `built`, and the command then
+/// ran in the same target folder.
+#[cfg(unix)]
+struct Reproduced {
+    /// Why the step itself did not end with exit 0 and no error, when it did not.
+    step_failed: Option<String>,
+    /// The report's command for the test.
+    command: String,
+    /// The command's exit status.
+    exit: Option<i32>,
+    /// What the command printed, both streams in the order they came.
+    shown: String,
+    /// The lines of it that say a crate was compiled.
+    compiled: Vec<String>,
+    /// The program of each target of the step's build, by the file name Cargo gave it.
+    programs: BTreeMap<TargetId, String>,
+    /// The programs the command ran, by file name.
+    ran: BTreeSet<String>,
+    /// Whether the program that the step's build gave the test's target printed the test's `ok` line.
+    passed_in_its_program: bool,
+}
+
+#[cfg(unix)]
+impl Reproduced {
+    /// The programs that the step's build gave `targets`.
+    fn programs_of(&self, targets: &[&TargetId]) -> BTreeSet<String> {
+        targets
+            .iter()
+            .filter_map(|target| self.programs.get(*target).cloned())
+            .collect()
+    }
+
+    /// Every program the step's build made.
+    fn all_programs(&self) -> BTreeSet<String> {
+        self.programs.values().cloned().collect()
+    }
+}
+
+/// The file name of the program a `Running` line names, which Cargo writes last, in parentheses.
+#[cfg(unix)]
+fn program_of(line: &str) -> Option<String> {
+    let inside = line.trim_end().strip_suffix(')')?;
+    let path = &inside[inside.rfind('(')? + 1..];
+    Some(path.rsplit('/').next().unwrap_or(path).to_owned())
+}
+
+/// Runs the step `cargo <words>` in the workspace `disk` through the report's own run, takes the
+/// command the report gives for the test `test` of `target`, and runs it in the same directory and
+/// target folder.
+#[cfg(unix)]
+fn reproduced(disk: &OnDisk, words: &[&str], target: &TargetId, test: &str) -> Reproduced {
+    use std::process::Command;
+    let step = Step::cargo("rust", "the workspace", words);
+    let root = disk.directory.path();
+    let evidence = tempfile::tempdir().expect("a directory");
+    let lister = lister();
+    let environment = [(
+        "CARGO_TARGET_DIR".to_owned(),
+        disk.target.to_string_lossy().into_owned(),
+    )];
+    let place = kr_conformance::run::Place {
+        root,
+        directory: root,
+        evidence: evidence.path(),
+        environment: &environment,
+        lister: &lister,
+        deadline: None,
+    };
+    let executed = kr_conformance::run::execute(&step, 1, &place, &disk.packages);
+    let step_failed = (executed.exit != Some(0) || executed.error.is_some()).then(|| {
+        format!(
+            "exit {:?}, error {:?}, log {}",
+            executed.exit, executed.error, executed.log
+        )
+    });
+    let programs: BTreeMap<TargetId, String> = executed
+        .binaries
+        .iter()
+        .filter(|(_, binary)| !binary.executable.starts_with("doc-tests "))
+        .filter_map(|(found, binary)| {
+            let name = binary.executable.rsplit('/').next()?.to_owned();
+            Some((found.clone()?, name))
+        })
+        .collect();
+    let mut map = Map {
+        packages: disk.packages.clone(),
+        ..Map::default()
+    };
+    key_in(&mut map, "KR-REQ-03.01", target, test);
+    let plan = Plan::of_steps("rust", vec![step.clone()]);
+    let command = assembled(plan, &map, &[executed]).identifiers["KR-REQ-03.01"].tests[0]
+        .command
+        .clone()
+        .expect("a command");
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("( {command} ) 2>&1"))
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", &disk.target)
+        .output()
+        .expect("a shell runs");
+    let shown = String::from_utf8_lossy(&output.stdout).into_owned();
+    let compiled: Vec<String> = shown
+        .lines()
+        .filter(|line| line.trim_start().starts_with("Compiling "))
+        .map(str::to_owned)
+        .collect();
+    let mut ran = BTreeSet::new();
+    let mut passed_in_its_program = false;
+    let own = programs.get(target);
+    let mut in_own = false;
+    for line in shown.lines() {
+        if line.trim_start().starts_with("Running ") {
+            let program = program_of(line);
+            in_own = program.is_some() && program.as_ref() == own;
+            ran.extend(program);
+        } else if line.trim_start().starts_with("Doc-tests ") {
+            in_own = false;
+        } else if in_own && line.trim() == format!("test {test} ... ok") {
+            passed_in_its_program = true;
+        }
+    }
+    Reproduced {
+        step_failed,
+        command,
+        exit: output.status.code(),
+        shown,
+        compiled,
+        programs,
+        ran,
+        passed_in_its_program,
+    }
+}
+
+/// A file `path` of a workspace on disk with the text `text`.
+#[cfg(unix)]
+fn file(path: &str, text: &str) -> (String, String) {
+    (path.to_owned(), text.to_owned())
+}
+
+/// A test, as the integration test of a package holds it.
+#[cfg(unix)]
+const WORKS: &str = "#[test]\nfn works() {}\n";
+
+/// A library with a unit test.
+#[cfg(unix)]
+const UNIT: &str = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn works() {}\n}\n";
+
+/// A library that tells which of its features are on.
+#[cfg(unix)]
+fn tells_features(features: &[&str]) -> String {
+    features
+        .iter()
+        .map(|feature| {
+            format!("pub fn {feature}_on() -> bool {{\n    cfg!(feature = \"{feature}\")\n}}\n")
+        })
+        .collect()
+}
+
+/// A test of the step's build runs with it in each case below: the case runs the step, then the
+/// command in the same target folder, and the command exits 0, compiles nothing, prints the test's
+/// `ok` line from the program that the step's build gave the test's target, and starts only programs
+/// of that build.
+///
+/// Here the step gives a feature of each of two packages. A command for the test's package alone
+/// keeps both features and is refused: `-p a` does not take `b/g`.
+#[cfg(unix)]
+#[test]
+fn a_command_for_a_step_with_a_feature_in_each_package_runs_in_the_steps_build() {
+    let files = [
+        file("a/Cargo.toml", &manifest("a", "[features]\nf = []\n")),
+        file("a/src/lib.rs", UNIT),
+        file("b/Cargo.toml", &manifest("b", "[features]\ng = []\n")),
+        file("b/src/lib.rs", ""),
+        file("b/tests/tb.rs", WORKS),
+    ];
+    let disk = on_disk(&["a", "b"], &files);
+    let (a, b) = (
+        target_of("a", TargetKind::Lib, "a"),
+        target_of("b", TargetKind::Lib, "b"),
+    );
+    let words = [
+        "test",
+        "--locked",
+        "--workspace",
+        "--features",
+        "a/f,b/g",
+        "--",
+        "--test-threads",
+        "1",
+    ];
+    let ran = reproduced(&disk, &words, &a, "tests::works");
+    assert_eq!(ran.step_failed, None);
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.ran, ran.programs_of(&[&a, &b]), "{}", ran.command);
+    assert!(ran.command.contains(" --lib "), "{}", ran.command);
+}
+
+/// Another package of the step turns a feature on in the test's package, or the test's package
+/// leaves one off, in each workspace of `feature_fixtures`. A command for the test's package alone
+/// builds it again with other features.
+#[cfg(unix)]
+#[test]
+fn a_command_runs_in_the_steps_build_where_another_package_turns_a_feature_on() {
+    let ta = target_of("a", TargetKind::Test, "ta");
+    let fixtures = feature_fixtures();
+    for (name, words, test) in [
+        ("shared", &["--workspace", "--features", "f"][..], "x_is_on"),
+        ("default", &["--workspace"][..], "x_is_on"),
+        (
+            "optional",
+            &["--workspace", "--features", "b/g"][..],
+            "dep_is_off",
+        ),
+        (
+            "reached",
+            &["--workspace", "--features", "f"][..],
+            "f_is_on",
+        ),
+        ("reached", &["--workspace"][..], "g_is_on"),
+        ("reached", &["--workspace"][..], "h_is_on"),
+        ("dev", &["--workspace"][..], "x_is_on"),
+    ] {
+        let disk = &fixtures
+            .iter()
+            .find(|(label, _)| *label == name)
+            .expect("a fixture")
+            .1;
+        let mut step = vec!["test", "--locked"];
+        step.extend(words);
+        step.extend(["--", "--test-threads", "1", "--exact", test]);
+        let ran = reproduced(disk, &step, &ta, test);
+        let row = format!("{name} {words:?} {test}: {}", ran.command);
+        assert_eq!(ran.step_failed, None, "{row}");
+        assert_eq!(ran.exit, Some(0), "{row}\n{}", ran.shown);
+        assert_eq!(ran.compiled, Vec::<String>::new(), "{row}");
+        assert!(ran.passed_in_its_program, "{row}\n{}", ran.shown);
+        assert_eq!(ran.ran, ran.programs_of(&[&ta]), "{row}");
+        assert!(ran.command.contains(" --test ta "), "{row}");
+    }
+}
+
+/// The package `b` has a target `ta` that needs a feature the step leaves off, so the step does not
+/// build it, and Cargo refuses `--workspace --test ta`. The command keeps the step's own target
+/// flags, and `a`'s test finds the features of `b` as the step gave them.
+#[cfg(unix)]
+#[test]
+fn a_command_keeps_the_steps_flags_where_another_package_has_a_target_with_its_features_off() {
+    let files = [
+        file(
+            "b/Cargo.toml",
+            &manifest(
+                "b",
+                "[features]\ndefault = [\"g\"]\nf = []\ng = []\n\n[[test]]\nname = \"ta\"\nrequired-features = [\"f\"]\n",
+            ),
+        ),
+        file("b/src/lib.rs", &tells_features(&["f", "g"])),
+        file("b/tests/ta.rs", WORKS),
+        file(
+            "a/Cargo.toml",
+            &manifest(
+                "a",
+                "[dependencies]\nb = { path = \"../b\", default-features = false }\n",
+            ),
+        ),
+        file("a/src/lib.rs", ""),
+        file(
+            "a/tests/ta.rs",
+            "#[test]\nfn features_match() {\n    assert!(b::g_on());\n    assert!(!b::f_on());\n}\n",
+        ),
+    ];
+    let disk = on_disk(&["a", "b"], &files);
+    let (ta, b_ta) = (
+        target_of("a", TargetKind::Test, "ta"),
+        target_of("b", TargetKind::Test, "ta"),
+    );
+    let words = ["test", "--locked", "--workspace"];
+    let ran = reproduced(&disk, &words, &ta, "features_match");
+    assert_eq!(ran.step_failed, None);
+    assert!(!ran.programs.contains_key(&b_ta), "the step built b's ta");
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert!(ran.ran.is_subset(&ran.all_programs()), "{}", ran.command);
+    assert!(!ran.command.contains(" --test ta "), "{}", ran.command);
+}
+
+/// A step in a virtual workspace that names no package takes every member, and the member `b` has a
+/// target `t` that needs a feature the step leaves off. Cargo refuses `--test t` for it, so the
+/// command keeps the step's own words, whichever package holds the test.
+#[cfg(unix)]
+#[test]
+fn a_command_keeps_the_steps_flags_where_a_target_of_another_member_has_its_features_off() {
+    let files = [
+        file("a/Cargo.toml", &manifest("a", "")),
+        file("a/src/lib.rs", ""),
+        file("a/tests/t.rs", WORKS),
+        file(
+            "b/Cargo.toml",
+            &manifest(
+                "b",
+                "[features]\nslow = []\n\n[[test]]\nname = \"t\"\nrequired-features = [\"slow\"]\n",
+            ),
+        ),
+        file("b/src/lib.rs", ""),
+        file("b/tests/t.rs", WORKS),
+    ];
+    let disk = on_disk(&["a", "b"], &files);
+    let (t, b_t) = (
+        target_of("a", TargetKind::Test, "t"),
+        target_of("b", TargetKind::Test, "t"),
+    );
+    let ran = reproduced(&disk, &["test", "--locked"], &t, "works");
+    assert_eq!(ran.step_failed, None);
+    assert!(!ran.programs.contains_key(&b_t), "the step built b's t");
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert!(ran.ran.is_subset(&ran.all_programs()), "{}", ran.command);
+    assert!(!ran.command.contains(" --test t "), "{}", ran.command);
+}
+
+/// The package `b` has a target `t` with `test = false` and a harness of its own: the step does not
+/// build it, and `--test t` would build it and run it. The command keeps the step's own words.
+#[cfg(unix)]
+#[test]
+fn a_command_keeps_the_steps_flags_where_another_package_has_a_target_that_is_not_tested() {
+    let files = [
+        file("a/Cargo.toml", &manifest("a", "")),
+        file("a/src/lib.rs", ""),
+        file("a/tests/t.rs", WORKS),
+        file(
+            "b/Cargo.toml",
+            &manifest(
+                "b",
+                "[[test]]\nname = \"t\"\ntest = false\nharness = false\n",
+            ),
+        ),
+        file("b/src/lib.rs", ""),
+        file(
+            "b/tests/t.rs",
+            "fn main() {\n    println!(\"b t ran with {:?}\", std::env::args().skip(1).collect::<Vec<_>>());\n}\n",
+        ),
+    ];
+    let disk = on_disk(&["a", "b"], &files);
+    let (t, b_t) = (
+        target_of("a", TargetKind::Test, "t"),
+        target_of("b", TargetKind::Test, "t"),
+    );
+    let ran = reproduced(&disk, &["test", "--locked", "--workspace"], &t, "works");
+    assert_eq!(ran.step_failed, None);
+    assert!(!ran.programs.contains_key(&b_t), "the step built b's t");
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert!(ran.ran.is_subset(&ran.all_programs()), "{}", ran.command);
+    assert!(!ran.command.contains(" --test t "), "{}", ran.command);
+}
+
+/// The package `b` has a library with `test = false` that does not compile as a test: the step does
+/// not build it as one, and `--lib` would. The command keeps the step's own words.
+#[cfg(unix)]
+#[test]
+fn a_command_keeps_the_steps_flags_where_another_package_has_a_library_that_is_not_tested() {
+    let files = [
+        file("a/Cargo.toml", &manifest("a", "")),
+        file("a/src/lib.rs", UNIT),
+        file("b/Cargo.toml", &manifest("b", "[lib]\ntest = false\n")),
+        file(
+            "b/src/lib.rs",
+            "#[cfg(test)]\ncompile_error!(\"b is not built to test\");\n",
+        ),
+    ];
+    let disk = on_disk(&["a", "b"], &files);
+    let (a, b) = (
+        target_of("a", TargetKind::Lib, "a"),
+        target_of("b", TargetKind::Lib, "b"),
+    );
+    let ran = reproduced(
+        &disk,
+        &["test", "--locked", "--workspace"],
+        &a,
+        "tests::works",
+    );
+    assert_eq!(ran.step_failed, None);
+    assert!(!ran.programs.contains_key(&b), "the step built b's library");
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert!(ran.ran.is_subset(&ran.all_programs()), "{}", ran.command);
+    assert!(!ran.command.contains(" --lib "), "{}", ran.command);
+}
+
+/// A step with no package flag in a workspace whose root package is the only default member: the
+/// command gives no package flag either, because `--workspace` would take the member `m` and its
+/// target `t` that needs a feature the step leaves off.
+#[cfg(unix)]
+#[test]
+fn a_command_gives_no_package_flag_where_the_step_gave_none_in_a_workspace_with_a_root_package() {
+    let files = [
+        file(
+            "Cargo.toml",
+            &manifest("r", "[workspace]\nresolver = \"3\"\nmembers = [\"m\"]\n"),
+        ),
+        file("src/lib.rs", ""),
+        file("tests/t.rs", WORKS),
+        file(
+            "m/Cargo.toml",
+            &manifest(
+                "m",
+                "[features]\nslow = []\n\n[[test]]\nname = \"t\"\nrequired-features = [\"slow\"]\n",
+            ),
+        ),
+        file("m/src/lib.rs", ""),
+        file("m/tests/t.rs", WORKS),
+    ];
+    let disk = on_disk(&["m"], &files);
+    let (t, m_t) = (
+        target_of("r", TargetKind::Test, "t"),
+        target_of("m", TargetKind::Test, "t"),
+    );
+    let ran = reproduced(&disk, &["test", "--locked"], &t, "works");
+    assert_eq!(ran.step_failed, None);
+    assert!(!ran.programs.contains_key(&m_t), "the step built m's t");
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.ran, ran.programs_of(&[&t]), "{}", ran.command);
+    assert!(ran.command.contains(" --test t "), "{}", ran.command);
+    assert!(!ran.command.contains("--workspace"), "{}", ran.command);
+}
+
+/// Two packages each have the target `ta`, and the step built both: the test's own flag names both,
+/// both run, and no other program of the step does.
+#[cfg(unix)]
+#[test]
+fn a_command_starts_only_the_programs_its_target_flag_names_in_the_steps_packages() {
+    let files = [
+        file("a/Cargo.toml", &manifest("a", "")),
+        file("a/src/lib.rs", UNIT),
+        file("a/tests/ta.rs", WORKS),
+        file("b/Cargo.toml", &manifest("b", "")),
+        file("b/src/lib.rs", UNIT),
+        file("b/tests/ta.rs", WORKS),
+    ];
+    let disk = on_disk(&["a", "b"], &files);
+    let (a_ta, b_ta) = (
+        target_of("a", TargetKind::Test, "ta"),
+        target_of("b", TargetKind::Test, "ta"),
+    );
+    let ran = reproduced(&disk, &["test", "--locked", "--workspace"], &a_ta, "works");
+    assert_eq!(ran.step_failed, None);
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert!(ran.ran.is_subset(&ran.all_programs()), "{}", ran.command);
+    assert_eq!(
+        ran.ran,
+        ran.programs_of(&[&a_ta, &b_ta]),
+        "{}\n{}",
+        ran.command,
+        ran.shown
+    );
+    assert!(ran.command.contains(" --test ta "), "{}", ran.command);
+}
+
+/// A step that gives `--ignore-rust-version` over a package whose `rust-version` the toolchain does
+/// not meet: the command keeps the word, which `Selection` does not read, so Cargo accepts it.
+#[cfg(unix)]
+#[test]
+fn a_command_keeps_a_word_of_its_step_that_the_selection_does_not_read() {
+    let files = [
+        file("a/Cargo.toml", &manifest("a", "rust-version = \"1.999\"\n")),
+        file("a/src/lib.rs", UNIT),
+    ];
+    let disk = on_disk(&["a"], &files);
+    let a = target_of("a", TargetKind::Lib, "a");
+    let words = ["test", "--locked", "--workspace", "--ignore-rust-version"];
+    let ran = reproduced(&disk, &words, &a, "tests::works");
+    assert_eq!(ran.step_failed, None);
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.ran, ran.programs_of(&[&a]), "{}", ran.command);
+    assert!(
+        ran.command.contains(" --ignore-rust-version "),
+        "{}",
+        ran.command
+    );
 }
 
 fn repository() -> PathBuf {
