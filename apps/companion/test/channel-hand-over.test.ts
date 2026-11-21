@@ -428,6 +428,9 @@ describe('a message handed over to the channel store', () => {
     expect(book.snapshot().kept.map((each) => each.text)).toEqual(['the draft that was held'])
     // The person edits it in another window; the retirement names the version that was held.
     const newer = save(apart.id, apart.revision, 'edited since')
+    // The newer revision is already listed when the retirement of the older one is asked for.
+    await book.reload()
+    expect(book.snapshot().kept.map((each) => each.text)).toEqual(['edited since'])
     await book.retireHeld([{ id: apart.id, revision: apart.revision }])
     await book.settled()
     expect(of.drafts.all().map((each) => each.text)).toContain('edited since')
@@ -437,6 +440,41 @@ describe('a message handed over to the channel store', () => {
     await book.retireHeld([{ id: newer.id, revision: newer.revision }])
     await book.settled()
     expect(book.snapshot().kept).toEqual([])
+  })
+
+  it('leaves a newer revision listed when the retirement conflicts and the read after it fails too', async () => {
+    const of = world()
+    let failing = false
+    const book = new DraftBook({
+      ...of.port,
+      deviceDrafts: () => (failing ? Promise.reject(new Error('refused')) : of.port.deviceDrafts())
+    })
+    await book.hydrate()
+    const save = (id: string | null, expectedRevision: string | null, text: string) =>
+      of.drafts.save({
+        id,
+        expectedRevision,
+        sessionId: MAIN,
+        applicationInstanceId: null,
+        agentBindingRevision: null,
+        state: 'open',
+        text,
+        attachments: []
+      }).draft
+    const held = save(null, null, 'the composer’s text')
+    await book.reload()
+    const apart = save(null, null, 'the draft that was held')
+    await book.reload()
+    expect(book.snapshot().kept.map((each) => each.text)).toEqual(['the draft that was held'])
+    const newer = save(apart.id, apart.revision, 'edited since')
+    await book.reload()
+    expect(book.snapshot().kept.map((each) => each.text)).toEqual(['edited since'])
+    failing = true
+    await book.retireHeld([{ id: apart.id, revision: apart.revision }])
+    await book.settled()
+    // Only the version that was held is dropped: the newer one is listed with no read to bring it back.
+    expect(book.snapshot().kept.map((each) => [each.text, each.revision])).toEqual([['edited since', newer.revision]])
+    expect(held.id).not.toBe(apart.id)
   })
 
   it('names the keep and the submission in the type of a handed-over end', () => {
