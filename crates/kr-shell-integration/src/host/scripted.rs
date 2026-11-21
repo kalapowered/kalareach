@@ -18,12 +18,19 @@ use kr_ipc::framed::{FrameReader, FrameWriter, split};
 use kr_ipc::paths::Endpoint;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{RequestId, SessionId};
-use kr_protocol::root::FencePublication;
+use kr_protocol::root::{
+    CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, FenceAcknowledgement,
+    FencePublication, KeyQueueSnapshot, PendingReaderInput, PromptGeneration, QueueDrainReport,
+    ReaderContext, ReaderRevision, RootCommandBlockParams, RootEditorEnterParams,
+    RootEditorFenceResult,
+};
+use kr_protocol::scalars::{Nullable, TimestampMs};
 
 use crate::contract::events::BridgeEvent;
 use crate::contract::qualification::{BridgeAbi, ShellKind};
 use crate::contract::requests::{
-    BridgeAnswer, LaunchRejectionReason, LaunchTransactionId, WorkerRequest,
+    BridgeAnswer, LaunchAccepted, LaunchDecision, LaunchMailboxRequest, LaunchRejectionReason,
+    LaunchTransactionId, WorkerRequest,
 };
 use crate::contract::transport::{
     BRIDGE_PROTOCOL, BRIDGE_STREAM_KIND, BridgeEndpoint, BridgeFrame, BridgeHello, EventOutcome,
@@ -242,6 +249,224 @@ impl ScriptedBridge {
                 Err(wrong("answer"))
             }
         }
+    }
+}
+
+/// The numbers a scripted reader reports. The caller supplies every one, so a scenario can move
+/// them (a prompt that advances, a buffer that changes) and the reader decides none of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReaderNumbers {
+    /// The prompt generation the reader reports in every event and answer.
+    pub prompt_generation: u64,
+    /// The reader's own revision.
+    pub reader_revision: u64,
+    /// The buffer revision the reader enters the prompt with.
+    pub entered_buffer_revision: u64,
+    /// The buffer revision the reader proves a fence at; an accepted launch moves it by one.
+    pub buffer_revision: u64,
+    /// The working-directory revision.
+    pub cwd_revision: u64,
+}
+
+/// A scripted bridge that speaks as a root shell's reader at a primary prompt with an empty buffer.
+///
+/// Each step sends what the contract has the reader send and reads what the worker sends back; no
+/// step waits for a time, so a caller bounds a step with its own timeout.
+#[derive(Debug)]
+pub struct ScriptedReader {
+    /// The connection the steps use, for a frame a scenario sends itself.
+    pub bridge: ScriptedBridge,
+    /// The session the reader is the root shell of.
+    pub session_id: SessionId,
+    /// The root shell's process, which the worker expects on its endpoint.
+    pub root_process: ProcessStartIdentity,
+    /// What the reader reports; a scenario may change it between steps.
+    pub numbers: ReaderNumbers,
+}
+
+impl ScriptedReader {
+    /// A reader that reports `numbers` over `bridge`.
+    #[must_use]
+    pub const fn new(
+        bridge: ScriptedBridge,
+        session_id: SessionId,
+        root_process: ProcessStartIdentity,
+        numbers: ReaderNumbers,
+    ) -> Self {
+        Self {
+            bridge,
+            session_id,
+            root_process,
+            numbers,
+        }
+    }
+
+    /// The editor the reader reports: an empty buffer, the emacs keymap, nothing pending.
+    #[must_use]
+    pub const fn editor_state(buffer_revision: u64) -> EditorState {
+        EditorState {
+            buffer_empty: true,
+            buffer_revision: EditorBufferRevision::new(buffer_revision),
+            keymap: EditorKeymap::Emacs,
+            pending: PendingReaderInput::NONE,
+        }
+    }
+
+    /// Reads the next frame the worker sends the reader.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScriptedBridge::recv`].
+    pub async fn next(&mut self) -> Result<ToBridge> {
+        self.bridge.recv().await
+    }
+
+    /// The reader enters the primary prompt with an empty buffer, and the worker has handled it
+    /// when this returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bridge's error when a frame cannot be sent or read.
+    pub async fn enters_the_prompt(&mut self) -> Result<()> {
+        self.enters().await?;
+        self.settled().await
+    }
+
+    /// The reader enters the primary prompt with an empty buffer and goes no further: a request
+    /// the worker makes of it in answer, such as a fence, is still to be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bridge's error when the event cannot be sent.
+    pub async fn enters(&mut self) -> Result<()> {
+        let numbers = self.numbers;
+        self.bridge
+            .send_event(BridgeEvent::EditorEnter(RootEditorEnterParams {
+                session_id: self.session_id,
+                root_process: self.root_process.clone(),
+                prompt_generation: PromptGeneration::new(numbers.prompt_generation),
+                reader_revision: ReaderRevision::new(numbers.reader_revision),
+                reader_context: ReaderContext::Primary,
+                editor: Self::editor_state(numbers.entered_buffer_revision),
+                cwd_revision: CwdRevision::new(numbers.cwd_revision),
+            }))
+            .await?;
+        Ok(())
+    }
+
+    /// Returns once the worker has handled every event sent before this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bridge's error when a frame cannot be sent or read.
+    pub async fn settled(&mut self) -> Result<()> {
+        self.settled_seeing().await.map(|_| ())
+    }
+
+    /// As [`Self::settled`], and returns every other frame the worker sent before it had handled
+    /// the events: a request the worker made of the reader in the meantime is among them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bridge's error when a frame cannot be sent or read.
+    pub async fn settled_seeing(&mut self) -> Result<Vec<ToBridge>> {
+        self.bridge
+            .send_event(BridgeEvent::CommandBlock(Box::new(
+                RootCommandBlockParams {
+                    session_id: self.session_id,
+                    prompt_generation: PromptGeneration::new(self.numbers.prompt_generation),
+                    command: "true".to_owned(),
+                    started_at_ms: TimestampMs::new(1_700_000_000_000),
+                    duration_ms: Nullable::null(),
+                    exit_status: Nullable::null(),
+                    cwd: "/tmp".to_owned(),
+                    cwd_revision: CwdRevision::new(self.numbers.cwd_revision),
+                },
+            )))
+            .await?;
+        let mut seen = Vec::new();
+        loop {
+            let frame = self.next().await?;
+            if let ToBridge::EventResult { result, .. } = &frame
+                && matches!(**result, EventOutcome::CommandBlockRecorded(_))
+            {
+                return Ok(seen);
+            }
+            seen.push(frame);
+        }
+    }
+
+    /// The reader answers the worker's request for a fence, and returns what the worker published.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bridge's error when a frame cannot be sent or read.
+    pub async fn proves_a_fence(&mut self) -> Result<FencePublication> {
+        let fence_id = loop {
+            if let ToBridge::Request { request, .. } = self.next().await?
+                && let WorkerRequest::Fence(params) = *request
+            {
+                break params.fence_id;
+            }
+        };
+        let numbers = self.numbers;
+        self.bridge
+            .answer(
+                RequestId::new(0),
+                BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(FenceAcknowledgement {
+                    fence_id,
+                    prompt_generation: PromptGeneration::new(numbers.prompt_generation),
+                    reader_revision: ReaderRevision::new(numbers.reader_revision),
+                    reader_context: ReaderContext::Primary,
+                    queues: QueueDrainReport::CLEAR,
+                    snapshot: KeyQueueSnapshot::drained(),
+                    editor: Self::editor_state(numbers.buffer_revision),
+                    cwd_revision: CwdRevision::new(numbers.cwd_revision),
+                })),
+            )
+            .await?;
+        loop {
+            if let ToBridge::FencePublished(published) = self.next().await? {
+                return Ok(published);
+            }
+        }
+    }
+
+    /// The next install the worker asks the reader for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bridge's error when a frame cannot be read.
+    pub async fn install_asked(&mut self) -> Result<LaunchMailboxRequest> {
+        loop {
+            if let ToBridge::Request { request, .. } = self.next().await?
+                && let WorkerRequest::Launch(request) = *request
+            {
+                return Ok(request);
+            }
+        }
+    }
+
+    /// The reader installs what it was asked to, at the prompt it stands at.
+    ///
+    /// # Errors
+    ///
+    /// Returns the bridge's error when the answer cannot be sent.
+    pub async fn installs(&mut self, asked: &LaunchMailboxRequest) -> Result<()> {
+        let numbers = self.numbers;
+        self.bridge
+            .answer(
+                RequestId::new(0),
+                BridgeAnswer::Launch(LaunchDecision::Accepted(LaunchAccepted {
+                    transaction: asked.transaction,
+                    installed: asked.command.clone(),
+                    fence_id: asked.fence_id,
+                    prompt_generation: PromptGeneration::new(numbers.prompt_generation),
+                    buffer_revision: EditorBufferRevision::new(numbers.buffer_revision + 1),
+                    reader_revision: ReaderRevision::new(numbers.reader_revision),
+                })),
+            )
+            .await
     }
 }
 
