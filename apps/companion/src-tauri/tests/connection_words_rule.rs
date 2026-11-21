@@ -304,18 +304,18 @@ const EXCEPTIONS: [Exception; 71] = [
         reason: "the one classification of a connection that was not opened: the host's bound and this computer's budget are refusals of the connection in their own words; it reads no code",
     },
     Exception {
+        file: "contact.rs",
+        function: "retire_read",
+        needle: "Asked::Connection",
+        lines: 1,
+        reason: "a read whose connection this device ended, because the account it was opened under left, is retired as a refusal of the connection in the account's words; it reads no code",
+    },
+    Exception {
         file: "commands.rs",
         function: "is_a_conflict",
         needle: COMPARED,
         lines: 1,
         reason: "the conflict a host answers an inbox page with that continues after an item it no longer holds, answered on a connection that is open; it decides nothing about a connection that was not opened",
-    },
-    Exception {
-        file: "inbox.rs",
-        function: "Missed::from",
-        needle: "Asked::Connection",
-        lines: 1,
-        reason: "tells the causes that are no refusal of a request, the host's bound and this computer's budget, as the visit's refusal in their own words; it reads no code",
     },
     Exception {
         file: "inbox.rs",

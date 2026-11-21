@@ -2118,8 +2118,9 @@ pub mod testing {
     }
 }
 
+/// What the library's test modules share: the connection of an account that can leave.
 #[cfg(all(test, feature = "testing"))]
-pub(crate) mod tests {
+pub mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use kr_client::error::Result as ClientResult;
@@ -2219,9 +2220,7 @@ pub(crate) mod tests {
 
     /// A connection of its own, the flag that says its transport was closed, and the flag that
     /// makes the transport say this device ended it, as when the account it was opened under left.
-    pub(crate) fn connection_of_an_account(
-        byte: u8,
-    ) -> (Connection, Arc<AtomicBool>, Arc<AtomicBool>) {
+    pub fn connection_of_an_account(byte: u8) -> (Connection, Arc<AtomicBool>, Arc<AtomicBool>) {
         let closed = Arc::new(AtomicBool::new(false));
         let left = Arc::new(AtomicBool::new(false));
         let session = Session::start(Arc::new(Silent {
