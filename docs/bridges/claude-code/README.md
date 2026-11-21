@@ -111,9 +111,12 @@ Windows that is a file whose access list names an account the machine does not a
 
 ## Launching from the shell
 
-When the Claude Code connector's command integration is on for a session, which it is for the
-sessions created after its owner ran `kr plugin integration enable kalareach/claude-code`, a
-`claude` typed at a managed Zsh or Bash prompt starts under a launch the worker made for it. The
+When the Claude Code connector's command integration is on for a session, a `claude` typed at a
+managed Zsh or Bash prompt starts under a launch the worker made for it. A session created while the
+installation holds `command_integration.launch`, which the owner confirms when installing the
+release, and while the session's list of integrations names `kalareach/claude-code`, has it on. The
+session's list is the profile's where the profile names a list of its own, and the host's
+otherwise; `kr plugin integration enable kalareach/claude-code` adds the package to the host's. The
 shell asks the worker about the command before it forks, as the shell integration's contract
 describes, and for an integrated command the worker establishes a backend: an endpoint in a fresh
 owner-only directory, a credential, and a launch record, `launch`, that names the two and the
