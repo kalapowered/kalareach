@@ -319,13 +319,34 @@ describe('the files on the draft go with the prompt that names it', () => {
     })
     expect(controls.pairedUploads.texts).toEqual([{ sessionId: SESSION, text: 'read the file' }])
     const sent = controls.promptParams[0]
-    expect(sent?.draft_id).toBe('draft-1')
+    expect(sent?.draft_id).toBe('00000000-0000-4000-8000-000000000001')
     expect(sent?.text).toBeNull()
   })
 
-  // The composer keeps the card of a file that went with a taken prompt: the draft book returns the
-  // files of a send to the composer, and removing them after a taken prompt is not built.
-  it.todo('takes the files that went with a taken prompt off the composer')
+  it('takes the files that went with a taken prompt off the composer, and keeps the next file', async () => {
+    const { controls, person } = await open()
+    await pick(person, 'sent.pdf')
+    const key = await started(controls)
+    act(() => {
+      controls.pairedUploads.finish(key)
+    })
+    await waitFor(() => {
+      expect(line()).toBe('Added to this draft')
+    })
+    await person.type(screen.getByRole('textbox', { name: 'Message this session' }), 'read the file')
+    await person.click(screen.getByRole('button', { name: /^Send/ }))
+    await waitFor(() => {
+      expect(controls.promptParams).toHaveLength(1)
+    })
+    await waitFor(() => {
+      expect(screen.queryByText('sent.pdf')).toBeNull()
+    })
+    expect(screen.queryByTestId('draft-attachments')).toBeNull()
+    // The next file is the person's own, and is not taken with the one that was sent.
+    await pick(person, 'next.pdf')
+    await started(controls, 2)
+    expect(screen.getByText('next.pdf')).toBeInTheDocument()
+  })
 
   it('sends inline text when no file is bound', async () => {
     const { controls, person } = await open()
