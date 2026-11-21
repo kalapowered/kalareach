@@ -553,7 +553,7 @@ export class DraftBook {
     }
   }
 
-  /** Subscribes to the end of each read that follows the first, so that what depends on the store is read again. */
+  /** Subscribes to the end of each read that follows the first, whether or not it worked, so that what depends on the store is read again. */
   onReloaded(listener: () => void): () => void {
     this.#reloaded.add(listener)
     return () => {
@@ -650,25 +650,30 @@ export class DraftBook {
    */
   async reload(): Promise<void> {
     if (this.#status !== 'ready') return
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const seen = this.#moves
-      try {
-        const stored = await this.#port.deviceDrafts()
-        // A read that a removal or a move overtook lists a record where it no longer is: it is
-        // never merged, so after the last attempt the book is left as it was.
-        if (this.#moves !== seen) continue
-        this.#unreadable = stored.unreadable
-        this.#ledger = stored.ledger
-        this.#sources = stored.sources
-        this.#oweFrom(stored.pendingRemovals)
-        this.#merge(stored.drafts)
-        this.#changed()
-        for (const listener of this.#reloaded) listener()
-      } catch (failure) {
-        this.#problem = failureMessage(failure)
-        this.#changed()
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const seen = this.#moves
+        try {
+          const stored = await this.#port.deviceDrafts()
+          // A read that a removal or a move overtook lists a record where it no longer is: it is
+          // never merged, so after the last attempt the book is left as it was.
+          if (this.#moves !== seen) continue
+          this.#unreadable = stored.unreadable
+          this.#ledger = stored.ledger
+          this.#sources = stored.sources
+          this.#oweFrom(stored.pendingRemovals)
+          this.#merge(stored.drafts)
+          this.#changed()
+        } catch (failure) {
+          this.#problem = failureMessage(failure)
+          this.#changed()
+        }
+        return
       }
-      return
+    } finally {
+      // Each attempt ends in this notice, a read that failed or was overtaken included: what
+      // depends on the store is read again whatever this read found.
+      for (const listener of this.#reloaded) listener()
     }
   }
 

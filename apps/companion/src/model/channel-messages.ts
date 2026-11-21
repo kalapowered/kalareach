@@ -90,6 +90,8 @@ export class ChannelShelf {
   #withText = false
   #reads = 0
   #pages = 0
+  /** The book's first read, while it has not ended: no read of the shelf starts before it ends. */
+  #first: Promise<void> | null = null
 
   constructor(port: HostPort) {
     this.#port = port
@@ -103,6 +105,23 @@ export class ChannelShelf {
   }
 
   snapshot = (): ShelfSnapshot => this.#state
+
+  /**
+   * Holds every read of the shelf, whoever asks for it, until `first` has ended whether or not it
+   * worked: what the shelf says about the messages and what the book says about the drafts are one
+   * moment's, so the shelf is never read before the drafts are. A read asked for while it waits
+   * begins when it ends, and only the newest of them is made.
+   */
+  after(first: Promise<unknown>): void {
+    const held = first.then(
+      () => undefined,
+      () => undefined
+    )
+    this.#first = held
+    void held.then(() => {
+      if (this.#first === held) this.#first = null
+    })
+  }
 
   /**
    * Notes that the page that lists the messages with their text is open, and reads them. Every read
@@ -121,13 +140,15 @@ export class ChannelShelf {
   }
 
   /**
-   * Reads the shelf again. A failure leaves what the shelf held, marks it stale, and never throws:
-   * a caller that awaits it learns nothing from it, the snapshot says it. An answer that a later
-   * read overtook is dropped.
+   * Reads the shelf again, once the book's first read has ended. A failure leaves what the shelf
+   * held, marks it stale, and never throws: a caller that awaits it learns nothing from it, the
+   * snapshot says it. An answer that a later read overtook is dropped.
    */
   async refresh(): Promise<void> {
     this.#reads += 1
     const mine = this.#reads
+    if (this.#first !== null) await this.#first
+    if (mine !== this.#reads) return
     const withText = this.#withText
     let listed: ChannelMessageList
     try {
