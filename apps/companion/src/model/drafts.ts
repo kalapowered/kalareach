@@ -202,20 +202,25 @@ function holdsUnsentFiles(draft: Draft): boolean {
   return draft.attachments.some((attachment) => !attachment.acceptedUpstream)
 }
 
-/** Whether the person may submit this draft as it stands. */
-export function submittable(draft: Draft): boolean {
+/**
+ * Whether the person may submit this draft as it stands.
+ *
+ * `carriesFiles` is true where the prompt names a draft that holds the files, as it does over a host
+ * the phone is paired with: the files then go with it and are no reason to hold it back.
+ */
+export function submittable(draft: Draft, carriesFiles = false): boolean {
   return (
     draft.state === 'bound' &&
-    !holdsUnsentFiles(draft) &&
+    (carriesFiles || !holdsUnsentFiles(draft)) &&
     (draft.text.trim().length > 0 || draft.attachments.length > 0)
   )
 }
 
 /** Why the draft cannot be submitted, for the composer to say. */
-export function notSubmittableBecause(draft: Draft): string | null {
+export function notSubmittableBecause(draft: Draft, carriesFiles = false): string | null {
   switch (draft.state) {
     case 'bound':
-      if (holdsUnsentFiles(draft)) {
+      if (!carriesFiles && holdsUnsentFiles(draft)) {
         return 'A prompt sent from here cannot carry the files on this draft. Remove them to send the text on its own.'
       }
       return draft.text.trim().length === 0 && draft.attachments.length === 0

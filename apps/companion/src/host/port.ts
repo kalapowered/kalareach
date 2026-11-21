@@ -1832,6 +1832,59 @@ export interface HandedFile {
   readonly bytes: Uint8Array
 }
 
+/**
+ * One upload this device holds open on a host it is paired with, as `uploads_open` reads it. The
+ * application owns the upload between calls, so a screen reads where it stands from here, and finds
+ * the ones a restart left.
+ */
+export interface OpenUpload {
+  /** What the upload is called to the commands: the key the page chose, or one made for it. */
+  readonly key: string
+  /**
+   * `sending` while chunks go out or the host is asked, `paused` when the connection ended,
+   * `waiting` for one kept from before that the host has not been asked about, `published` for one
+   * sent in full and not yet bound to a draft, and the last two for one that cannot go on.
+   */
+  readonly state: 'sending' | 'paused' | 'waiting' | 'published' | 'cannotResume' | 'unrecoverable'
+  /** The session the file is for, when it is for one. */
+  readonly sessionId: string | null
+  readonly fileName: string
+  readonly byteLen: number
+  /** The chunks the host has acknowledged. */
+  readonly acknowledgedChunks: number
+  /** The chunks the file has. Zero until the host has been asked. */
+  readonly chunks: number
+  /** What the driver is doing while it runs. */
+  readonly stage: 'starting' | 'sending' | 'resuming' | 'publishing' | 'published' | null
+  /** The handle, once the upload is published. */
+  readonly handle: AttachmentHandle | null
+  /** The approved words that say what is wrong, when something is. */
+  readonly said: string | null
+}
+
+/** What a cancel did, from the host's own answer. */
+export interface UploadCancelled {
+  readonly key: string
+  /** `published` when the upload was already sent in full and the host keeps it. */
+  readonly state: 'cancelled' | 'published' | 'forgotten'
+  /** The bytes the host released, a decimal string, from its answer and nothing else. */
+  readonly releasedByteLen: string | null
+  readonly handle: AttachmentHandle | null
+}
+
+/** What binding a file to the draft a paired device keeps for a session answers. */
+export interface PairedBound {
+  readonly draftId: string
+  readonly revision: string
+}
+
+/** What setting the text of that draft answers: the text the host holds, from its answer. */
+export interface PairedText {
+  readonly draftId: string
+  readonly revision: string
+  readonly text: string
+}
+
 /** A session's live agent instances, and every request its agents' broker is still arbitrating. */
 export interface SessionAgents {
   readonly instances: AgentInstanceList
@@ -2277,8 +2330,30 @@ export interface HostPort {
    * The page hands the bytes to native code, which sends them through the same upload a dropped
    * file takes. A file larger than {@link MAX_HANDED_BYTES} is refused there.
    */
-  attachmentUploadBytes(file: HandedFile, subject: SessionSubject): Promise<AttachmentHandle>
+  attachmentUploadBytes(
+    file: HandedFile,
+    subject: SessionSubject,
+    transferKey?: string
+  ): Promise<AttachmentHandle>
   draftAddAttachment(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * The uploads this device holds open on the host it is paired with, read from the application:
+   * the ones sending, the ones paused for want of a connection, the published ones not yet bound to
+   * a draft, and the ones a restart found. Progress is read by asking again.
+   */
+  uploadsOpen(): Promise<readonly OpenUpload[]>
+  /**
+   * Cancels an open upload by its key, and answers from the host's own answer. An upload the host
+   * has published is never cancelled: the answer says it is kept, with its handle.
+   */
+  uploadCancel(transferKey: string): Promise<UploadCancelled>
+  /** Ends the draft this device keeps for the session on a paired host, because its files were dropped. */
+  draftEnd(subject: SessionSubject, sessionId: string): Promise<void>
+  /**
+   * Sets the text of the draft this device keeps for the session on a paired host, which the prompt
+   * that names the draft then sends.
+   */
+  draftSetText(subject: SessionSubject, sessionId: string, text: string): Promise<PairedText>
 
   /**
    * One page of a session's retained output, from the cursor and within the byte bound the

@@ -6,29 +6,22 @@
  * photo library, and no filter opens the file browser. That is the platform's picker, with the
  * platform's permission prompt, rather than a second one built here.
  *
- * What is picked then has to reach the host, and that is where the size rule is. A chunk rides the
- * control connection, whose complete frame is bounded at one mebibyte including its own length
- * prefix, and a chunk carries encoded metadata beside the bytes. So the largest content this lane
- * can carry is a mebibyte less the metadata allowance, and something larger is refused by name
- * here rather than failing on the wire.
+ * What is picked then has to reach the host, and that is where the size rule is. The platform gives
+ * the page the file, so the page hands its bytes to native code in one piece, and native code takes
+ * at most 64 MiB that way (`MAX_HANDED_BYTES` in the application's `transfers.rs`). Past that the
+ * file is refused here by name and size, rather than failing at the boundary. A host takes a file of
+ * up to 2 GiB, so the phone's hand-over is the smaller bound and the one a person meets. Nothing here
+ * limits what a connection carries: the file goes to the host in chunks, over the connection's own
+ * transfer lane, and a connection that ends does not end the upload.
  */
 
-import type { CameraAccess } from '../../host/port'
+import { MAX_HANDED_BYTES, type CameraAccess } from '../../host/port'
 
-/** Maximum size of a complete control frame, from the protocol's limits. */
-export const MAX_CONTROL_FRAME_LEN = 1024 * 1024
+/** The largest file the page hands to native code: 64 MiB, the application's own bound. */
+export const HANDED_FILE_LIMIT = MAX_HANDED_BYTES
 
-/** Maximum encoded metadata and framing around one chunk, from the protocol's limits. */
-export const MAX_ATTACHMENT_METADATA_LEN = 4 * 1024
-
-/**
- * The largest content this lane can carry.
- *
- * The protocol's chunk length is a mebibyte and the layout is the host's to choose, so a client on
- * this lane cannot ask for smaller chunks. Until an attachment-chunk stream exists, one chunk plus
- * its metadata has to fit one control frame, which bounds the whole transfer at one chunk.
- */
-export const MAX_CONTROL_LANE_UPLOAD_LEN = MAX_CONTROL_FRAME_LEN - MAX_ATTACHMENT_METADATA_LEN
+/** The largest file a host takes: 2 GiB. */
+export const HOST_FILE_LIMIT = 2 * 1024 * 1024 * 1024
 
 /** Where a picked file came from. */
 export type PickSource = 'camera' | 'library' | 'files'
@@ -64,21 +57,20 @@ export interface Picked {
 
 /** Whether a picked file can be sent, and why not when it cannot. */
 export type Admission =
-  | { readonly admitted: true; readonly chunks: 1 }
-  | { readonly admitted: false; readonly reason: string; readonly code: 'TOO_LARGE_FOR_LANE' }
+  | { readonly admitted: true }
+  | { readonly admitted: false; readonly reason: string }
 
 /**
  * Decides whether one picked file can go.
  *
- * The refusal names the bound and the size, because "it did not work" leaves a person guessing and
- * "22 MB is more than this connection can carry in one chunk" tells them what to do instead.
+ * The refusal names the file, its size and the bound, because "it did not work" leaves a person
+ * guessing and "this phone sends a file of at most 64 MB" tells them what to choose instead.
  */
 export function admit(picked: Picked): Admission {
-  if (picked.byteLen <= MAX_CONTROL_LANE_UPLOAD_LEN) return { admitted: true, chunks: 1 }
+  if (picked.byteLen <= HANDED_FILE_LIMIT) return { admitted: true }
   return {
     admitted: false,
-    code: 'TOO_LARGE_FOR_LANE',
-    reason: `${picked.name} is ${describeBytes(picked.byteLen)}. This connection carries an attachment in one chunk of at most ${describeBytes(MAX_CONTROL_LANE_UPLOAD_LEN)}. Send it from a desktop, or send a smaller one.`
+    reason: `${picked.name} is ${describeBytes(picked.byteLen)}. This phone sends a picked file of at most ${describeBytes(HANDED_FILE_LIMIT).replace('.0 ', ' ')} (a host takes up to ${describeBytes(HOST_FILE_LIMIT).replace('.0 ', ' ')}). Choose a smaller file.`
   }
 }
 
@@ -86,7 +78,8 @@ export function admit(picked: Picked): Admission {
 export function describeBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} bytes`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
 }
 
 /** What the picker says when the camera is not allowed, and how to allow it. */
