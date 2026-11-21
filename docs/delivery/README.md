@@ -406,8 +406,9 @@ restarts. It differs in when it ends. While the gateway is out of the list the d
 the gateway has revoked the authorisation or has refused the opening of the revocation with
 `FORBIDDEN`, and it is never given up after thirty days. A gateway that never answers stays owed, at
 one ask every six hours, and no command drops the debt. If the owner lists the gateway again, it is
-an allowed gateway once more and a debt owed to it is given up after thirty days as any other is.
-The revocation is sent with the reason `Unpaired`, which is the one a revocation of this kind has;
+an allowed gateway once more and a debt owed to it is given up as any other is: at an ask that gets
+neither of those answers, made thirty days or more after the debt was written, after at least three
+earlier asks and once the host has let go of the credential. The revocation is sent with the reason `Unpaired`, which is the one a revocation of this kind has;
 the device is still paired. A later unpairing, or a new authorisation that replaces the one a
 device holds, owes one more revocation at the official gateway once the debt has settled; that
 gateway holds no such authorisation and refuses it, which ends that debt.
@@ -430,7 +431,8 @@ A release that reads configuration level 6 ignores the section, registers a cred
 official gateway only, and goes on using the credentials it holds. It reads the delivery journal,
 so a revocation that is owed when the host is rolled back to it is asked for there: it does not
 load a credential that an owed revocation names, it removes the item from the secret store, and it
-asks the gateway at the recorded origin to revoke. It gives a debt up after thirty days. A removal
+asks the gateway at the recorded origin to revoke. It gives a debt up after thirty days and a few
+asks. A removal
 that no release that knows the section has put into force, because the document was edited and the
 host rolled back before any such release ran, is not carried to the earlier release.
 

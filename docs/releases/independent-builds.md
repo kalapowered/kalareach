@@ -76,7 +76,9 @@ next time the host reads it (a question about itself, `kr doctor`, or a start). 
 and renewing every credential issued by that gateway, writes down that it owes the gateway a
 revocation of each authorisation, and then forgets the credentials. It asks for the revocations
 again until the gateway has made them or says it holds no such authorisation. If the owner lists the
-gateway again, a debt still owed to it is given up after thirty days, as any other is.
+gateway again, a debt still owed to it is given up as any other is: at an ask that gets neither of
+those answers, made thirty days or more after the debt was written, after at least three earlier
+asks and once the host has let go of the credential.
 The device stays paired. Notifications for it are not sent until its app registers a credential from
 a gateway the host allows. A host rolled back to an earlier release asks for the same revocations,
 because the debt is kept in the delivery journal that release reads. `docs/delivery/README.md`
