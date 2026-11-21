@@ -14,6 +14,7 @@
 use super::*;
 
 use kr_e2e_agents::conversation;
+use kr_e2e_agents::stage::Keyboard;
 use kr_e2e_agents::transfer::{self, Caller, Transfer};
 
 /// The colour that fills [`COLOUR_PNG`], as a one-word answer names it.
@@ -927,4 +928,283 @@ fn the_two_approval_markers_are_as_long_as_each_other_and_differ() {
     let (first, second) = approval_markers("kr0123456789ab");
     assert_eq!(first.len(), second.len());
     assert_ne!(first, second);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Part 4: the device goes after the agent took its prompt and before the reply.
+// ---------------------------------------------------------------------------------------------
+
+/// Whether a conversation holds one prompt and one finished reply for it.
+///
+/// # Errors
+///
+/// Returns what it holds instead.
+fn once(prompts: usize, replies: usize) -> Result<(), String> {
+    if prompts == 1 && replies == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "the conversation holds {prompts} prompt(s) and {replies} finished reply(s)"
+        ))
+    }
+}
+
+/// Whether the reply was still unfinished when the device went: the moment between the agent's
+/// admission of the prompt and its reply is the one the part is about.
+///
+/// # Errors
+///
+/// Returns that the reply had finished, so the device went after it.
+fn reply_unfinished(replies_at_the_drop: usize) -> Result<(), String> {
+    if replies_at_the_drop == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "the agent's record held {replies_at_the_drop} finished reply(s) when the device \
+             went, so the device did not go between the prompt and its reply"
+        ))
+    }
+}
+
+/// The prompts and the finished replies `text` holds: the lines that hold the part's mark and the
+/// build list's mark of a prompt, and those that hold the end marker and its mark of a reply.
+fn counted(
+    text: &str,
+    mark: &str,
+    end: &str,
+    prompt_line: &str,
+    reply_line: &str,
+) -> (usize, usize) {
+    let prompts = text
+        .lines()
+        .filter(|line| line.contains(mark) && line.contains(prompt_line))
+        .count();
+    let replies = text
+        .lines()
+        .filter(|line| line.contains(end) && line.contains(reply_line))
+        .count();
+    (prompts, replies)
+}
+
+/// KR-REQ-12.32, case 4, part 4: the device sends a prompt that asks for a slow reply, begun and
+/// ended by markers. The moment the agent's own record holds the prompt, and before it holds a
+/// reply, the device's connection closes. The reply finishes while the device is away. The device
+/// connects again with a connection of its own: the thread is idle, the old attachment's next input
+/// is refused, and the conversation holds the prompt once with one finished reply. The control
+/// breaks the property: the same prompt sent again, and the same count, read again, is two. On the
+/// stand-in route the terminal's own turn, held on its approval, is the one in flight, and the
+/// server's count of the requests that start a turn is what is counted.
+#[test]
+fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplicate_work() {
+    const TEST: &str = "gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplicate_work";
+    login_case("4", TEST, HELD_TURN, |ctx, session| {
+        let instance = session.starts_the_agent(&[], None, &[]);
+        match &ctx.route {
+            Route::StandIn => {
+                let _ = session.binding_until(
+                    instance,
+                    "the stream names the thread and the turn",
+                    |binding| names(binding, "thread-1", Some("turn-1")),
+                );
+                let admitted = requests_of(ctx, "turn/start");
+                assert_eq!(
+                    admitted, 1,
+                    "the server received one request that starts a turn"
+                );
+                let mut keyboard =
+                    Keyboard::attach(&session.remote, &ctx.runtime, session.session_id())
+                        .unwrap_or_else(|why| panic!("the device's keyboard attaches: {why}"));
+                // The device goes while the turn is in flight, and the turn ends while it is away.
+                session.remote.close();
+                releases(ctx);
+                let fresh = reconnects(ctx, session);
+                let started = Instant::now();
+                let idle = loop {
+                    let binding = ctx.binding(&fresh, session.session_id(), instance);
+                    if names(&binding, "thread-1", None) {
+                        break binding;
+                    }
+                    assert!(
+                        started.elapsed() < LIVENESS,
+                        "the turn ends while the device is away: the binding is {binding:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                let prompts = requests_of(ctx, "turn/start");
+                once(prompts, 1).unwrap_or_else(|why| panic!("no duplicate work: {why}"));
+                let stale = keyboard.type_text(&fresh, &ctx.runtime, "x");
+                assert!(stale.is_err(), "the old attachment's next input is refused");
+                // The control: the same prompt sent again is a second request that starts a turn.
+                let again = ctx
+                    .prompts(
+                        &fresh,
+                        session.session_id(),
+                        instance,
+                        &idle,
+                        "run it again",
+                    )
+                    .unwrap_or_else(|why| panic!("the control's prompt is carried: {why:?}"));
+                assert!(again.turn_id.0.is_some(), "the host started a turn");
+                let waited = Instant::now();
+                while requests_of(ctx, "turn/start") < 2 && waited.elapsed() < LIVENESS {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let prompts_twice = requests_of(ctx, "turn/start");
+                let control = once(prompts_twice, 1);
+                assert!(
+                    control.is_err(),
+                    "the count fails once the prompt is sent again"
+                );
+                serde_json::json!({
+                    "arm": arm(ctx),
+                    "turn_requests": prompts,
+                    "stale_input": stale.err().map(|refusal| refusal.detail),
+                    "control": { "what": "the same prompt sent again", "breaks_property": true,
+                                 "turn_requests": prompts_twice, "check": control.err() },
+                })
+            }
+            Route::Real(real) => {
+                let idle = session.binding_until(
+                    instance,
+                    "the stream names a thread and no turn",
+                    |binding| {
+                        binding.thread_id.0.is_some()
+                            && binding.turn_id.0.is_none()
+                            && unsuspended(binding)
+                    },
+                );
+                let marked = mark();
+                let upper = marked.to_uppercase();
+                let end = format!("{upper}-END");
+                let prompt = format!(
+                    "Without using any tool or file, begin your reply with the code {marked} in \
+                     upper case followed by -START, then count from 1 to 60, one number per line, \
+                     then write the same code in upper case followed by -END, and nothing else."
+                );
+                let account = &real.account;
+                let counts = |text: &str| {
+                    counted(
+                        text,
+                        &marked,
+                        &end,
+                        &account.prompt_line,
+                        &account.reply_line,
+                    )
+                };
+                let mut keyboard =
+                    Keyboard::attach(&session.remote, &ctx.runtime, session.session_id())
+                        .unwrap_or_else(|why| panic!("the device's keyboard attaches: {why}"));
+                real.charge(&ctx.run, "4", "a prompt with a slow reply");
+                let started = ctx
+                    .prompts(
+                        &session.remote,
+                        session.session_id(),
+                        instance,
+                        &idle,
+                        &prompt,
+                    )
+                    .unwrap_or_else(|why| {
+                        panic!(
+                            "the device's prompt is carried: {why:?}\n{}",
+                            session.diagnosis()
+                        )
+                    });
+                assert!(started.turn_id.0.is_some(), "the host started a turn");
+                // The agent's own record of the prompt is its admission.
+                let admitted_at = Instant::now();
+                loop {
+                    if let Ok(text) = real.conversations(&ctx.run)
+                        && counts(&text).0 >= 1
+                    {
+                        break;
+                    }
+                    assert!(
+                        admitted_at.elapsed() < LIVENESS,
+                        "the agent's record holds the prompt"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                // The device goes: its connection closes, and the record is read after it.
+                session.remote.close();
+                let at_the_drop = counts(&record(ctx, real));
+                reply_unfinished(at_the_drop.1).unwrap_or_else(|why| panic!("{why}"));
+                // The reply finishes while the device is away.
+                let replied_at = Instant::now();
+                while counts(&record(ctx, real)).1 == 0 {
+                    assert!(
+                        replied_at.elapsed() < LIVENESS,
+                        "the agent finishes its reply while the device is away"
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let fresh = reconnects(ctx, session);
+                let ended = Instant::now();
+                let after = loop {
+                    let binding = ctx.binding(&fresh, session.session_id(), instance);
+                    if binding.turn_id.0.is_none() && unsuspended(&binding) {
+                        break binding;
+                    }
+                    assert!(
+                        ended.elapsed() < LIVENESS,
+                        "the turn ends: the binding is {binding:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                };
+                std::thread::sleep(Duration::from_secs(1));
+                let (prompts, replies) = counts(&record(ctx, real));
+                once(prompts, replies)
+                    .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
+                let stale = keyboard.type_text(&fresh, &ctx.runtime, &account.clear);
+                assert!(stale.is_err(), "the old attachment's next input is refused");
+                // The control: the same prompt sent again, and the count, read again, is two.
+                real.charge(&ctx.run, "4", "the control's prompt sent again");
+                let again = ctx
+                    .prompts(&fresh, session.session_id(), instance, &after, &prompt)
+                    .unwrap_or_else(|why| panic!("the control's prompt is carried: {why:?}"));
+                assert!(again.turn_id.0.is_some(), "the host started a turn");
+                let again_at = Instant::now();
+                while counts(&record(ctx, real)).1 < 2 {
+                    assert!(
+                        again_at.elapsed() < LIVENESS,
+                        "the prompt sent again is answered"
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let (prompts_twice, replies_twice) = counts(&record(ctx, real));
+                let control = once(prompts_twice, replies_twice);
+                assert!(
+                    control.is_err(),
+                    "the count fails once the prompt is sent again"
+                );
+                serde_json::json!({
+                    "arm": arm(ctx),
+                    "markers": { "reply_ends": end },
+                    "at_the_drop": { "prompts": at_the_drop.0, "finished_replies": at_the_drop.1 },
+                    "after_reconnect": { "prompts": prompts, "finished_replies": replies },
+                    "stale_input": stale.err().map(|refusal| refusal.detail),
+                    "control": { "what": "the same prompt sent again", "breaks_property": true,
+                                 "prompts": prompts_twice, "finished_replies": replies_twice,
+                                 "check": control.err() },
+                })
+            }
+        }
+    });
+}
+
+#[test]
+fn a_prompt_or_a_reply_counted_twice_fails_the_check_of_part_4() {
+    assert!(once(1, 1).is_ok());
+    assert!(once(2, 1).is_err());
+    assert!(once(1, 2).is_err());
+    assert!(once(1, 0).is_err());
+    assert!(once(0, 0).is_err());
+    let text = "p KRX\nr KRX-END reply\nr KRX-END reply\n";
+    assert_eq!(counted(text, "KRX", "KRX-END", "p ", "r "), (1, 2));
+    assert_eq!(counted(text, "KRX", "KRX-END", "q ", "s "), (0, 0));
+}
+
+#[test]
+fn a_reply_that_finished_before_the_device_went_fails_the_check_of_part_4() {
+    assert!(reply_unfinished(0).is_ok());
+    assert!(reply_unfinished(1).is_err());
 }
