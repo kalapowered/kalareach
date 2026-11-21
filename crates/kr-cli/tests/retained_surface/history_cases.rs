@@ -7,7 +7,8 @@ use std::process::Command;
 use quote::ToTokens as _;
 
 use super::history::{
-    Group, Report, Shown, Snapshot, Span, Tagged, audit_tags, expected_below, read_history,
+    Group, Report, Shown, Snapshot, Span, Tagged, audit_tags, expected_below,
+    in_threads_of_their_own, read_history,
 };
 use super::history_gate::{
     audit_differences, expected_audit_problems, level_above, listed_releases, release_problems,
@@ -1033,6 +1034,47 @@ fn each_tag_is_read_in_a_thread_of_its_own_so_the_source_map_that_the_files_fill
         entry_end + 1,
         "the reader added files to the source map of the thread that called it"
     );
+}
+
+#[test]
+fn the_tags_are_read_a_few_at_once_each_in_a_thread_that_no_other_tag_uses_and_in_order() {
+    let ran = std::sync::Mutex::new(Vec::new());
+    let live = std::sync::atomic::AtomicUsize::new(0);
+    let most = std::sync::atomic::AtomicUsize::new(0);
+    let caller = std::thread::current().id();
+    let results = in_threads_of_their_own((0..12).collect(), 3, |item: usize| {
+        let now = live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        most.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ran.lock()
+            .expect("a lock")
+            .push(std::thread::current().id());
+        live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        item * 2
+    });
+    // The results are in the order of the items.
+    assert_eq!(results, (0..12).map(|item| item * 2).collect::<Vec<_>>());
+    // Each item ran in a thread that no other item ran in, and none ran in the caller's.
+    let ids = ran.into_inner().expect("a lock");
+    let distinct: std::collections::BTreeSet<String> =
+        ids.iter().map(|id| format!("{id:?}")).collect();
+    assert_eq!(ids.len(), 12);
+    assert_eq!(distinct.len(), 12, "a thread read more than one tag");
+    assert!(
+        !ids.contains(&caller),
+        "a tag was read in the caller's thread"
+    );
+    // At most three ran at once, and more than one did.
+    let most = most.load(std::sync::atomic::Ordering::SeqCst);
+    assert!((2..=3).contains(&most), "{most} ran at once");
+    // A panic of a reading is the panic of the call.
+    let panicked = std::panic::catch_unwind(|| {
+        in_threads_of_their_own(vec![1, 2, 3], 2, |item: usize| {
+            assert!(item != 2, "the second tag");
+            item
+        })
+    });
+    assert!(panicked.is_err());
 }
 
 /// The tags `git` lists below level 0.11, which the fixture's entry is made for.

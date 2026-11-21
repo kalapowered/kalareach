@@ -466,32 +466,85 @@ pub fn read_history(
         .to_owned();
     releases::agree_with_origin(repository, &inventory, &head)?;
     let expected = expected_below(repository, level)?;
-    let mut snapshots = Vec::new();
+    let mut tagged = Vec::new();
     for release in inventory.iter().filter(|release| release.level() < level) {
-        let tagged = Tagged {
+        tagged.push(Tagged {
             tag: release.tag.clone(),
             commit: release.commit.clone(),
             version: release.version,
             committed: committed(repository, &release.commit)?,
-        };
-        snapshots.push(in_a_thread_of_its_own(|| {
-            snapshot_at(repository, entry, tagged)
-        })?);
+        });
+    }
+    let results = in_threads_of_their_own(tagged, READ_WIDTH, |tagged| {
+        let tag = tagged.tag.clone();
+        let started = std::time::Instant::now();
+        let snapshot = snapshot_at(repository, entry, tagged);
+        println!("read {tag} in {:?}", started.elapsed());
+        snapshot
+    });
+    let mut snapshots = Vec::new();
+    for result in results {
+        snapshots.push(result?);
     }
     snapshots.sort_by(|left, right| left.at.order().cmp(&right.at.order()));
     Ok((expected, snapshots))
 }
 
-/// Runs `read` in a thread of its own and gives back what it returns. With `span-locations`,
-/// proc-macro2 keeps the text of every file a thread parses behind one 32-bit offset, so a thread
-/// that parses about 4 GiB of source in all overflows it, and the 124 tags hold more than that
-/// (each file is parsed about three times for a tag). A tag read in a thread of its own gives the
-/// thread's source map back with the thread.
-fn in_a_thread_of_its_own<T: Send>(read: impl FnOnce() -> T + Send) -> T {
-    std::thread::scope(|scope| match scope.spawn(read).join() {
-        Ok(value) => value,
-        Err(panic) => std::panic::resume_unwind(panic),
-    })
+/// How many tags are read at once: each in a thread of its own, so that the reading of the 124 tags
+/// ends within the hour that the history case is held to, on the box as well as here.
+const READ_WIDTH: usize = 4;
+
+/// Runs `read` on each of `items` in a thread of its own, at most `width` of them at once, and gives
+/// back what each returns, in the order of the items. With `span-locations`, proc-macro2 keeps the
+/// text of every file a thread parses behind one 32-bit offset, so a thread that parses about 4 GiB
+/// of source in all overflows it, and the 124 tags hold more than that (each file is parsed about
+/// three times for a tag). A tag read in a thread that no other tag uses gives the thread's source
+/// map back with the thread. A panic of a reading is the panic of this call.
+pub(super) fn in_threads_of_their_own<T: Send, R: Send>(
+    items: Vec<T>,
+    width: usize,
+    read: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    let total = items.len();
+    let mut results: Vec<Option<R>> = (0..total).map(|_| None).collect();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let mut pending = items.into_iter().enumerate();
+        let mut running = 0;
+        loop {
+            while running < width.max(1)
+                && let Some((at, item)) = pending.next()
+            {
+                let sender = sender.clone();
+                let read = &read;
+                scope.spawn(move || {
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(item)));
+                    let _ = sender.send((at, outcome));
+                });
+                running += 1;
+            }
+            if running == 0 {
+                break;
+            }
+            let (at, outcome) = receiver.recv().expect("a reading ends with a result");
+            match outcome {
+                Ok(value) => results[at] = Some(value),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+            running -= 1;
+        }
+    });
+    results
+        .into_iter()
+        .map(|result| result.expect("each item is read"))
+        .collect()
+}
+
+/// Whether the crate is read at the head by the reader's check of this checkout: every crate but the
+/// two that receive a mutation, the daemon among them.
+pub(super) fn reads_at_head(krate: &str) -> bool {
+    !RECEIVER_CRATES.contains(&krate)
 }
 
 /// Extracts a release's tree into a folder of this function's own, reads the entry's crates,
