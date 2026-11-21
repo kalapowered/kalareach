@@ -844,7 +844,9 @@ enum Locking {
 
 /// The file locks of a store's lock files: advisory `flock` on Unix, and on Windows a lock of the
 /// whole file by the open handle, which the standard library asks of the system. Either belongs to
-/// the open file and goes when the last handle to it is closed.
+/// the open file and goes when the last handle to it is closed, which a program started by another
+/// thread may delay until its own program takes over: a lock that must end when its holder ends is
+/// let go of with `release` before the handle closes.
 mod filelock {
     use std::fs::File;
 
@@ -980,6 +982,19 @@ fn probe_is_free(file: &File) -> std::io::Result<bool> {
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+/// A file this process holds locked exclusively, unlocked when this is dropped and before the file
+/// closes, on every path that ends the lock: a program started meanwhile has a copy of the file
+/// until its own program takes over, and a lock left to the close would stay with that copy.
+#[cfg(unix)]
+struct Locked(File);
+
+#[cfg(unix)]
+impl Drop for Locked {
+    fn drop(&mut self) {
+        let _ = filelock::release(&self.0);
     }
 }
 
@@ -1653,6 +1668,7 @@ impl Store {
                 return Err(InstallError::io("lock", &path, std::io::Error::from(error)));
             }
         }
+        let locked = Locked(file);
         crate::paths::create_private_directory(&self.trash()).map_err(|error| {
             InstallError::io(
                 "create the store directory",
@@ -1676,7 +1692,7 @@ impl Store {
         std::fs::rename(&directory, &removed)
             .map_err(|error| InstallError::io("move", &directory, error))?;
         sync_directory(&self.versions())?;
-        drop(file);
+        drop(locked);
         remove_tree(&removed)?;
         Ok(true)
     }
