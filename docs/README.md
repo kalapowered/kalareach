@@ -150,7 +150,10 @@ stops, so a limit that a part has is written in that part's own document.
   `gemini` that npm installs is one, so a signed index cannot make the Gemini CLI bridge apply to that
   distribution. Where a bridge applies, Claude Code's approvals are answered over its bridge channel and
   Gemini CLI's hooks reach the worker. The Qoder CLI package reports an agent's hooks to the worker,
-  with no bridge, in a session its command integration launched. An approval is only ever created from the agent's own protocol: [the
+  with no bridge, in a session its command integration launched. No bundled package declares an
+  attachment path. An uploaded file is bound for the manual terminal workflow: the host gives its
+  path, the person gives that path to the agent, and nothing is inserted into the agent's composer.
+  An approval is only ever created from the agent's own protocol: [the
   broker](host/README.md#the-broker), [the bridges](bridges/claude-code/README.md) and
   [plugins](plugins/README.md).
 - **Attaching from elsewhere.** `kr attach` in an ordinary terminal, and the companion application
