@@ -657,13 +657,17 @@ where
 {
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let mutation = client.compose(method, action_id, target, params).await?;
-    let outcome = client.repeat(&mutation).await.map_err(|failure| {
-        CliError::Refused(kr_client::error::refusal(
-            ErrorCode::OutcomeUnknown,
-            Shown::ipc(&failure),
-        ))
-    })?;
-    decode(outcome.map_err(CliError::Refused)?)
+    let unknown = |shown: Shown| {
+        CliError::Refused(kr_client::error::refusal(ErrorCode::OutcomeUnknown, shown))
+    };
+    let outcome = client
+        .repeat(&mutation)
+        .await
+        .map_err(|failure| unknown(Shown::ipc(&failure)))?;
+    outcome
+        .map_err(CliError::Refused)?
+        .to_typed()
+        .map_err(|error| unknown(Shown::cbor(&error)))
 }
 
 fn decode<T: kr_protocol::wire::WireMessage>(value: ParamsValue) -> Result<T> {
