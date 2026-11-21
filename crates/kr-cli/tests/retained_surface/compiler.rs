@@ -752,6 +752,7 @@ fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<
         reports: Vec::new(),
         files: BTreeSet::new(),
     };
+    let mut errors_said: Vec<String> = Vec::new();
     for line in std::io::BufReader::new(stdout).lines() {
         let line = line.map_err(|error| error.to_string())?;
         let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -760,6 +761,12 @@ fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<
         match message["reason"].as_str() {
             Some("build-finished") => built.finished = message["success"] == true,
             Some("compiler-message") => {
+                if message["message"]["level"] == "error"
+                    && errors_said.len() < 6
+                    && let Some(text) = message["message"]["rendered"].as_str()
+                {
+                    errors_said.push(text.lines().take(14).collect::<Vec<_>>().join("\n"));
+                }
                 if let Some(report) = report_of(&message, config, meta) {
                     built.reports.push(report);
                 }
@@ -805,7 +812,8 @@ fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<
         .code()
         .unwrap_or(-1);
     if built.exit != 0 || !built.finished {
-        // What Cargo said, for the person who reads the log: the last of its errors.
+        // What Cargo and the compiler said, for the person who reads the log: the last of Cargo's lines and
+        // the compiler's first errors.
         use std::io::{Read as _, Seek as _};
         let mut said = String::new();
         errors.rewind().map_err(|error| error.to_string())?;
@@ -819,6 +827,13 @@ fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<
             built.exit,
             tail.into_iter().rev().collect::<Vec<_>>().join("\n")
         );
+        if !errors_said.is_empty() {
+            println!(
+                "{}: the compiler's errors:\n{}",
+                config.name,
+                errors_said.join("\n--\n")
+            );
+        }
     }
     Ok(built)
 }
