@@ -634,6 +634,38 @@ where
     decode(outcome.map_err(CliError::Refused)?)
 }
 
+/// Calls a mutation on the daemon and tells a failure of the link by when it came.
+///
+/// A failure before the request is composed sent nothing and is returned as it is. From the moment
+/// it is composed, the request may be on its way, and a failure to send it, to wait for the reply
+/// or to read the reply says nothing of what the host did: the host may have carried the request
+/// out and lost only its answer. That is the host's own "outcome unknown", returned as a refusal
+/// with that code, so a command tells it as it tells an outcome the host could not confirm.
+///
+/// # Errors
+///
+/// Returns the host's refusal, a failure before the request was sent, or the unknown outcome.
+pub async fn mutate_unconfirmable<P, T>(
+    client: &mut LocalClient,
+    method: Method,
+    target: ActionTarget,
+    params: &P,
+) -> Result<T>
+where
+    P: serde::Serialize + ?Sized,
+    T: kr_protocol::wire::WireMessage,
+{
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let mutation = client.compose(method, action_id, target, params).await?;
+    let outcome = client.repeat(&mutation).await.map_err(|failure| {
+        CliError::Refused(kr_client::error::refusal(
+            ErrorCode::OutcomeUnknown,
+            Shown::ipc(&failure),
+        ))
+    })?;
+    decode(outcome.map_err(CliError::Refused)?)
+}
+
 fn decode<T: kr_protocol::wire::WireMessage>(value: ParamsValue) -> Result<T> {
     value.to_typed().map_err(|error| {
         CliError::Other(shown!(
