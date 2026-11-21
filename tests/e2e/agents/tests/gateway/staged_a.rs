@@ -402,8 +402,14 @@ fn judges_a_forwarder_answer(
     stopped_at: Option<&str>,
     timed: bool,
 ) -> Result<(), String> {
-    if result["exit"] != 0 {
-        return Err(format!("the forwarder did not exit 0: {result}"));
+    match exit_of(&result["wait_status"]) {
+        Ok(0) => {}
+        Ok(code) => {
+            return Err(format!(
+                "the forwarder did not exit 0 (it exited {code}): {result}"
+            ));
+        }
+        Err(why) => return Err(format!("the forwarder did not exit: {why}: {result}")),
     }
     if result["stdout"].as_str().map(str::trim) != Some("{}") {
         return Err(format!(
@@ -1003,26 +1009,55 @@ fn probe(
     let read = |suffix: &str| {
         std::fs::read_to_string(forgeries.path(&format!("{name}.{suffix}"))).unwrap_or_default()
     };
-    let exit: i64 = read("exit").trim().parse().unwrap_or(-1);
+    // The whole wait status, as Perl's `system` left it in `$?`: the exit code is read from it by
+    // `exit_of`, which refuses a status that is not an exit.
+    let wait_status = read("wait").trim().parse::<i64>().ok();
     let elapsed_ms: i64 = read("ms").trim().parse().unwrap_or(-1);
     serde_json::json!({
         "probe": name,
         "surface": run.surface,
-        "exit": exit,
+        "wait_status": wait_status,
         "elapsed_ms": elapsed_ms,
         "stdout": read("out"),
         "stderr_first_line": read("err").lines().next().unwrap_or_default(),
     })
 }
 
+/// The exit code of a program that ended by exiting, read from the whole wait status the probe
+/// recorded: Perl's `$?` after `system`, which is -1 where the program could not be run, holds the
+/// number of the signal that ended it in its low seven bits (and a core-dump flag above them), and
+/// the exit code above its low byte. A status that is not an exit is refused here, before any exit
+/// code is read from it: a program a signal killed has no exit code, and zero is not one.
+///
+/// # Errors
+///
+/// Returns why the status is not an exit.
+fn exit_of(wait_status: &serde_json::Value) -> Result<i64, String> {
+    let Some(status) = wait_status.as_i64() else {
+        return Err("no wait status was recorded".to_owned());
+    };
+    if status < 0 {
+        return Err(format!(
+            "the program could not be run (wait status {status})"
+        ));
+    }
+    if status & 0x7f != 0 {
+        return Err(format!(
+            "a signal ended the program (signal {}, wait status {status})",
+            status & 0x7f
+        ));
+    }
+    Ok(status >> 8)
+}
+
 /// The script a forging session runs the forwarder through: the forged registration and session
-/// claim in its environment, the forged input on its standard input, and its exit status, output
+/// claim in its environment, the forged input on its standard input, and its wait status, output
 /// and time in files beside the input.
 const PROBE_SCRIPT: &str = r#"hook="$1"; surface="$2"; registration="$3"; claim="$4"; input="$5"; out="$6"
 if [ -n "$registration" ]; then export KR_REGISTRATION="$registration"; else unset KR_REGISTRATION; fi
 export KR_SESSION="$claim"
-/usr/bin/perl -MTime::HiRes=time -e '$s = time; system(@ARGV); printf STDERR "%d %d\n", $? >> 8, (time - $s) * 1000' -- "$hook" claude-code "$surface" <"$input" >"$out.out" 2>"$out.err.all"
-tail -n 1 "$out.err.all" | { read -r status ms; printf '%s\n' "$status" >"$out.exit"; printf '%s\n' "$ms" >"$out.ms"; }
+/usr/bin/perl -MTime::HiRes=time -e '$s = time; system(@ARGV); printf STDERR "%d %d\n", $?, (time - $s) * 1000' -- "$hook" claude-code "$surface" <"$input" >"$out.out" 2>"$out.err.all"
+tail -n 1 "$out.err.all" | { read -r status ms; printf '%s\n' "$status" >"$out.wait"; printf '%s\n' "$ms" >"$out.ms"; }
 sed '$d' "$out.err.all" >"$out.err"
 "#;
 
@@ -1387,6 +1422,8 @@ fn judges_a_channel_answer(
     result: &serde_json::Value,
     stopped_at: Option<&str>,
 ) -> Result<(), String> {
+    let exit = exit_of(&result["wait_status"])
+        .map_err(|why| format!("the forged channel did not exit: {why}: {result}"))?;
     let stdout = result["stdout"].as_str().unwrap_or_default();
     let said = result["stderr_first_line"].as_str().unwrap_or_default();
     match stopped_at {
@@ -1397,7 +1434,7 @@ fn judges_a_channel_answer(
                     serde_json::from_str(line).map_err(|error| format!("{error}: {result}"))
                 })
                 .collect::<Result<_, _>>()?;
-            if result["exit"] == 0
+            if exit == 0
                 && lines.len() == 1
                 && lines[0]["id"] == 1
                 && lines[0]["result"]["capabilities"] == serde_json::json!({})
@@ -1411,7 +1448,7 @@ fn judges_a_channel_answer(
             }
         }
         Some(stage) => {
-            if result["exit"] == 1 && stdout.is_empty() && said.contains(stage) {
+            if exit == 1 && stdout.is_empty() && said.contains(stage) {
                 Ok(())
             } else {
                 Err(format!(
@@ -1426,7 +1463,7 @@ fn judges_a_channel_answer(
 /// answer where it is timed, and a stop where the registration does not lead.
 #[test]
 fn a_forwarder_answer_that_is_not_neutral_or_not_on_time_fails_the_check_of_8a() {
-    let answer = |exit: i64, stdout: &str, ms: i64, said: &str| serde_json::json!({ "exit": exit, "stdout": stdout, "elapsed_ms": ms, "stderr_first_line": said });
+    let answer = |exit: i64, stdout: &str, ms: i64, said: &str| serde_json::json!({ "wait_status": exit << 8, "stdout": stdout, "elapsed_ms": ms, "stderr_first_line": said });
     assert!(judges_a_forwarder_answer(&answer(0, "{}\n", 40, ""), None, true).is_ok());
     assert!(judges_a_forwarder_answer(&answer(1, "{}\n", 40, ""), None, true).is_err());
     assert!(judges_a_forwarder_answer(&answer(0, "{\"x\":1}", 40, ""), None, true).is_err());
@@ -1447,10 +1484,46 @@ fn a_forwarder_answer_that_is_not_neutral_or_not_on_time_fails_the_check_of_8a()
     );
 }
 
+/// A forwarder that a signal ended, or that could not be run, has no exit code, so no answer it
+/// wrote before it went counts: its recorded wait status is refused before any exit code is read
+/// from it, whatever the output holds.
+#[test]
+fn a_forwarder_that_a_signal_ended_or_that_could_not_run_fails_the_check_of_8a() {
+    let neutral = |wait_status: serde_json::Value| serde_json::json!({ "wait_status": wait_status, "stdout": "{}\n", "elapsed_ms": 40, "stderr_first_line": "" });
+    assert_eq!(exit_of(&serde_json::json!(0)), Ok(0));
+    assert_eq!(exit_of(&serde_json::json!(256)), Ok(1));
+    for refused in [9, 137, 15, 11] {
+        assert!(
+            exit_of(&serde_json::json!(refused)).is_err(),
+            "wait status {refused} is a signal"
+        );
+    }
+    assert!(exit_of(&serde_json::json!(-1)).is_err());
+    assert!(exit_of(&serde_json::Value::Null).is_err());
+    assert!(judges_a_forwarder_answer(&neutral(serde_json::json!(0)), None, true).is_ok());
+    for refused in [
+        serde_json::json!(9),
+        serde_json::json!(-1),
+        serde_json::Value::Null,
+    ] {
+        assert!(
+            judges_a_forwarder_answer(&neutral(refused.clone()), None, true).is_err(),
+            "a forwarder that left {refused} is not neutral"
+        );
+    }
+    let handshake = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}\n";
+    let channel = |wait_status: serde_json::Value| serde_json::json!({ "wait_status": wait_status, "stdout": handshake, "stderr_first_line": "" });
+    assert!(judges_a_channel_answer(&channel(serde_json::json!(0)), None).is_ok());
+    assert!(judges_a_channel_answer(&channel(serde_json::json!(9)), None).is_err());
+    let stopped = |wait_status: serde_json::Value| serde_json::json!({ "wait_status": wait_status, "stdout": "", "stderr_first_line": "could not be reached" });
+    assert!(judges_a_channel_answer(&stopped(serde_json::json!(256)), Some("could not")).is_ok());
+    assert!(judges_a_channel_answer(&stopped(serde_json::json!(9)), Some("could not")).is_err());
+}
+
 /// The channel's answers that the check of 8a rejects.
 #[test]
 fn a_forged_channel_that_declares_a_capability_or_writes_after_a_stop_fails_the_check_of_8a() {
-    let answer = |exit: i64, stdout: &str, said: &str| serde_json::json!({ "exit": exit, "stdout": stdout, "stderr_first_line": said });
+    let answer = |exit: i64, stdout: &str, said: &str| serde_json::json!({ "wait_status": exit << 8, "stdout": stdout, "stderr_first_line": said });
     let handshake = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}\n";
     let declares =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"experimental\":{}}}}\n";
