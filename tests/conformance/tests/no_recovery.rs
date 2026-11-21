@@ -11,7 +11,7 @@
 //!
 //! The files of the cases that run processes under a time limit are read too: `tests/tree.rs`,
 //! `tests/execution.rs` and the fixture `time-limits`. No case sends a signal, and no case reaps a
-//! process by its number but the one that proves what the report does when another waiter has.
+//! process by its number.
 
 use std::path::{Path, PathBuf};
 
@@ -876,11 +876,6 @@ const SIGNALLERS: [&str; 4] = ["kill", "pkill", "killall", "taskkill"];
 /// The names of the calls that reap a process by its number.
 const REAPS: [&str; 3] = ["waitpid", "waitid", "wait4"];
 
-/// The one case that reaps a process by its number: it proves what the report does when another
-/// waiter has reaped the leader, and holds the pipe open until it has.
-const THE_REAPING_CASE: &str =
-    "a_leader_reaped_by_another_waiter_gives_the_error_and_no_signal_is_sent";
-
 /// Whether `text`, taken as shell text, sends a signal: a part that starts one of the programs of
 /// [`SIGNALLERS`], but for `kill -0`, which asks whether a process exists and sends nothing. The
 /// parts are cut as in [`runs_one`].
@@ -903,40 +898,18 @@ fn signals_by_text(text: &str) -> bool {
         })
 }
 
-/// The tokens, from the `fn` of the item named `name` to its closing brace, as a range of positions.
-fn body_of(tokens: &[Token], name: &str) -> Option<std::ops::Range<usize>> {
-    let opens = (0..tokens.len()).find(|&at| {
-        tokens[at].ident() == Some("fn") && tokens.get(at + 1).and_then(Token::ident) == Some(name)
-    })?;
-    let mut depth = 0_usize;
-    for (at, token) in tokens.iter().enumerate().skip(opens) {
-        match token.tok {
-            Tok::Punct('{') => depth += 1,
-            Tok::Punct('}') => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(opens..at + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// What in the Rust source of a case file sends a signal or reaps a process by its number, each with
 /// its line: a text that runs a program of [`SIGNALLERS`] (but for `kill -0`), the type `Signal`,
 /// every name of a signal and every name that begins `kill` (which covers `Child::kill` and
-/// `kill_process_group`), and a call of [`REAPS`] but inside the body of the case `reaps_in`.
-fn case_refused(source: &str, reaps_in: Option<&str>) -> Result<Vec<String>, String> {
+/// `kill_process_group`), and a call of [`REAPS`], which no case makes.
+fn case_refused(source: &str) -> Result<Vec<String>, String> {
     let tokens: Vec<Token> = lex(source)
         .map_err(|error| format!("line {}: {}", error.line, error.what))?
         .into_iter()
         .filter(|token| !token.is_comment())
         .collect();
-    let allowed = reaps_in.and_then(|name| body_of(&tokens, name));
     let mut found = Vec::new();
-    for (at, token) in tokens.iter().enumerate() {
+    for token in &tokens {
         let what = match &token.tok {
             Tok::Str(text, _) if signals_by_text(text) => format!("the text {text:?}"),
             Tok::Ident(name)
@@ -944,8 +917,7 @@ fn case_refused(source: &str, reaps_in: Option<&str>) -> Result<Vec<String>, Str
                     || name.starts_with("kill")
                     || (name.starts_with("SIG")
                         && name.chars().nth(3).is_some_and(char::is_uppercase))
-                    || (REAPS.contains(&name.as_str())
-                        && !allowed.as_ref().is_some_and(|range| range.contains(&at))) =>
+                    || REAPS.contains(&name.as_str()) =>
             {
                 format!("`{name}`")
             }
@@ -986,22 +958,16 @@ fn fixture_files(directory: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// What in the file at `path` the check of the case files refuses: only `tests/tree.rs` holds the
-/// case that may reap by number.
+/// What in the file at `path` the check of the case files refuses.
 fn case_file_refused(path: &Path, source: &str) -> Result<Vec<String>, String> {
     if path.extension().is_some_and(|extension| extension == "sh") {
         return Ok(script_refused(source));
     }
-    let reaps = (path.file_name().is_some_and(|name| name == "tree.rs")
-        && path
-            .parent()
-            .is_some_and(|folder| folder.ends_with("tests")))
-    .then_some(THE_REAPING_CASE);
-    case_refused(source, reaps)
+    case_refused(source)
 }
 
 #[test]
-fn the_case_files_send_no_signal_and_reap_by_number_in_one_case_only() {
+fn the_case_files_send_no_signal_and_reap_by_number_in_no_case() {
     let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut files = vec![tests.join("tree.rs"), tests.join("execution.rs")];
     let fixture = fixture_files(&tests.join("fixtures").join("time-limits"));
@@ -1020,9 +986,9 @@ fn the_case_files_send_no_signal_and_reap_by_number_in_one_case_only() {
 }
 
 /// The check of the case files refuses each way a case can send a signal and each call that reaps by
-/// number outside the one case, and lets through a look (`kill -0`) and that case's call.
+/// number, and lets through a look (`kill -0`).
 #[test]
-fn the_check_of_the_case_files_refuses_each_signal_and_lets_through_a_look_and_one_reap() {
+fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_look() {
     let refused_rust = [
         (
             "a signal to a group",
@@ -1066,16 +1032,13 @@ fn the_check_of_the_case_files_refuses_each_signal_and_lets_through_a_look_and_o
             "fn f() { run(\"killall sleep\"); }",
         ),
         (
-            "a reap in another case",
-            "fn another() { waitpid(None, WaitOptions::empty()); }\nfn the_one() {}",
+            "a reap by number",
+            "fn another() { waitpid(None, WaitOptions::empty()); }",
         ),
-        (
-            "an import of the reap",
-            "use rustix::process::waitpid;\nfn the_one() {}",
-        ),
+        ("an import of the reap", "use rustix::process::waitpid;"),
         (
             "a reap by `waitid`",
-            "fn the_one() {}\nfn other() { waitid(P::Pid(x), W::EXITED); }",
+            "fn other() { waitid(P::Pid(x), W::EXITED); }",
         ),
     ];
     let let_through_rust = [
@@ -1084,10 +1047,6 @@ fn the_check_of_the_case_files_refuses_each_signal_and_lets_through_a_look_and_o
             "fn f(pid: &str) { run(&format!(\"kill -0 {pid} 2>/dev/null\")); }",
         ),
         ("a look, written alone", "fn f() { run(\"kill -0 123\"); }"),
-        (
-            "the reap of the one case",
-            "fn the_one() { let a = waitpid(Some(x), WaitOptions::empty()); }",
-        ),
         (
             "an ignored signal",
             "fn f() { run(\"trap '' TERM; sleep 61\"); }",
@@ -1103,18 +1062,12 @@ fn the_check_of_the_case_files_refuses_each_signal_and_lets_through_a_look_and_o
     ];
     let mut wrong = Vec::new();
     for (what, code) in refused_rust {
-        if case_refused(code, Some("the_one"))
-            .expect("a source")
-            .is_empty()
-        {
+        if case_refused(code).expect("a source").is_empty() {
             wrong.push(format!("{what}: let through"));
         }
     }
     for (what, code) in let_through_rust {
-        if !case_refused(code, Some("the_one"))
-            .expect("a source")
-            .is_empty()
-        {
+        if !case_refused(code).expect("a source").is_empty() {
             wrong.push(format!("{what}: refused"));
         }
     }

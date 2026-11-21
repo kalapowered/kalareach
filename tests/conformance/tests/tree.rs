@@ -15,8 +15,6 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, WaitOptions};
-
 use kr_conformance::tree::{self, Captured, Deadline, GRACE, Waited};
 
 fn deadline_in(seconds: u64) -> Deadline {
@@ -123,47 +121,6 @@ fn run(command: Command, deadline: Deadline) -> Option<Call> {
 fn returned(call: Option<Call>) -> Waited<Output> {
     call.expect("the call did not return in time")
         .expect("a started command")
-}
-
-/// KR-REQ-29.01, the part about reproducible commands: when the leader was reaped by another waiter,
-/// the report's wait for it fails, and the report gives that error and signals nothing: the leader's
-/// number may be another process's. The case reaps the leader itself, by its number, behind a
-/// barrier: a process of the group holds the pipe until the case has done it, and the report reaps
-/// the leader only when every pipe has closed, so no other waiter comes first. A process of the group
-/// that writes a line when it is asked to end has its trap set before the case reaps, and its file
-/// is empty when the call returns: every signal of a call comes before its return.
-#[test]
-fn a_leader_reaped_by_another_waiter_gives_the_error_and_no_signal_is_sent() {
-    let place = tempfile::tempdir().expect("a directory");
-    let pids = place.path().join("pids.txt");
-    let marker = place.path().join("asked.txt");
-    let release = place.path().join("release");
-    // The leader records its pid, leaves a process of its group that writes `term` to the marker
-    // when it is asked to end, holds no pipe and records `ready` when its trap is set, and a process
-    // of its group that holds the pipe until the release file exists, for 40 s at most; then it ends.
-    let script = "printf '%s\\n' \"$$\" > \"$1\"\n( trap 'printf \"%s\\n\" term >> \"$2\"; exit 0' TERM; printf '%s\\n' ready >> \"$1\"; sleep 20 & wait ) >/dev/null 2>&1 &\n( i=0; while [ ! -e \"$3\" ] && [ $i -lt 200 ]; do sleep 0.2; i=$((i+1)); done ) &\nexit 0";
-    let call = start(bash(script, &[&pids, &marker, &release]), deadline_in(20));
-    let recorded = recorded_pids(&pids, 2);
-    let leader = Pid::from_raw(recorded[0].parse().expect("a pid")).expect("a process");
-    let reaped = rustix::process::waitpid(Some(leader), WaitOptions::empty());
-    // The barrier is let go whatever came of the reap, so that a failed case leaves nothing.
-    std::fs::write(&release, "").expect("the release file");
-    let (reaped, status) = reaped
-        .expect("the wait for the leader")
-        .expect("the leader, which this case reaps");
-    let call = call.within(Duration::from_secs(15));
-    let asked = std::fs::read_to_string(&marker).unwrap_or_default();
-    assert_eq!(reaped, leader, "the number that the wait reaped");
-    assert_eq!(
-        status.exit_status(),
-        Some(0),
-        "the leader that ended at once"
-    );
-    assert!(
-        matches!(call, Some(Err(_))),
-        "the call gave {call:?}, not the error of a wait that failed"
-    );
-    assert_eq!(asked, "", "a signal was sent to the group");
 }
 
 /// KR-REQ-29.01, the part about reproducible commands: a command whose time is spent before it is

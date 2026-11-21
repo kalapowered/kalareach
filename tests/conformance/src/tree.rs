@@ -161,10 +161,22 @@ fn supervised(
         command.stdout(Stdio::piped());
     }
     let mut child = command.spawn()?;
-    let mut pipes = match Pipes::of(&mut child) {
+    watch(&mut child, deadline, Child::try_wait)
+}
+
+/// Supervises `child`, which [`supervised`] started, until its time `deadline` is spent. `try_wait`
+/// is the wait for the leader: it is a seam, so that a unit that holds the unreaped leader can give
+/// the failure that another waiter's reap gives, and see that the report signals nothing then.
+#[cfg(unix)]
+fn watch(
+    child: &mut Child,
+    deadline: Deadline,
+    mut try_wait: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
+) -> io::Result<Waited<Output>> {
+    let mut pipes = match Pipes::of(child) {
         Ok(pipes) => pipes,
         Err(error) => {
-            Group::end(&mut child, &mut Pipes::none(), GRACE);
+            Group::end(child, &mut Pipes::none(), GRACE);
             return Err(error);
         }
     };
@@ -176,7 +188,7 @@ fn supervised(
     while pipes.open() {
         match pipes.pass(deadline.at, Instant::now) {
             Pass::Ended => break,
-            Pass::Spent => return Ok(Waited::TimedOut(Group::ended(&mut child, pipes))),
+            Pass::Spent => return Ok(Waited::TimedOut(Group::ended(child, pipes))),
             Pass::Open(true) => {}
             Pass::Open(false) => {
                 std::thread::sleep(POLL.min(deadline.at.saturating_duration_since(Instant::now())));
@@ -184,12 +196,12 @@ fn supervised(
         }
     }
     let status = loop {
-        match child.try_wait() {
+        match try_wait(child) {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 let now = Instant::now();
                 if now >= deadline.at {
-                    return Ok(Waited::TimedOut(Group::ended(&mut child, pipes)));
+                    return Ok(Waited::TimedOut(Group::ended(child, pipes)));
                 }
                 std::thread::sleep(POLL.min(deadline.at - now));
             }
@@ -421,6 +433,57 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    /// KR-REQ-29.01, the part about reproducible commands: when the wait for the leader fails, as it
+    /// does when another waiter has reaped the leader, the report gives that error and signals
+    /// nothing: the leader's number may be another process's. The unit holds the leader unreaped,
+    /// and the wait is a stand-in that gives ECHILD once the pipes have closed. A process of the
+    /// group that writes a line when it is asked to end has its trap set before the call begins; its
+    /// file is empty when the call returns, and the [`Leader`] ends the group after.
+    #[test]
+    fn a_wait_that_fails_gives_its_error_and_no_signal_is_sent() {
+        let place = tempfile::tempdir().expect("a directory");
+        let marker = place.path().join("asked.txt");
+        let ready = place.path().join("ready.txt");
+        let release = place.path().join("release.txt");
+        // The leader ends at once. One process of its group writes `term` to the marker when it is
+        // asked to end and `ready` when its trap is set, and holds no pipe, for 20 s at most;
+        // another holds the pipe until the release file exists, for 40 s at most.
+        let script = "( trap 'printf \"%s\\n\" term >> \"$1\"; exit 0' TERM; printf '%s\\n' ready >> \"$2\"; sleep 20 & wait ) >/dev/null 2>&1 &\n( i=0; while [ ! -e \"$3\" ] && [ $i -lt 200 ]; do sleep 0.2; i=$((i+1)); done ) &\nexit 0";
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("bash")
+            .args([&marker, &ready, &release])
+            .stdin(Stdio::null());
+        Group::prepare(&mut command);
+        command.stdout(Stdio::piped());
+        let mut leader = Leader(Some(command.spawn().expect("a command")));
+        let until = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let set = ready.exists();
+        // The barrier is let go whatever came of the wait, so that a failed case leaves nothing.
+        std::fs::write(&release, "").expect("the release file");
+        let deadline = Deadline {
+            at: Instant::now() + Duration::from_secs(600),
+            seconds: 600,
+            budget: false,
+        };
+        let waited = watch(leader.child(), deadline, |_| {
+            Err(io::Error::from(rustix::io::Errno::CHILD))
+        });
+        let asked = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(set, "the trap was not set in 30 s");
+        let error = waited.expect_err("a wait that failed gave a result");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error())
+        );
+        assert_eq!(asked, "", "a signal was sent to the group");
+    }
 
     /// KR-REQ-29.01, the part about reproducible commands: the report finds a host that cannot wait
     /// for a command it started before it runs a step with a limit. A wait that fails, as it does
