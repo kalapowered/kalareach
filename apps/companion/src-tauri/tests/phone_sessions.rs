@@ -2197,7 +2197,7 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
             "agent_prompt_queue",
             prompt(shared.session_id, instance, "queued"),
         ),
-        "RESOURCE_UNAVAILABLE",
+        "UNSUPPORTED_CAPABILITY",
         "agent.prompt.queue",
     );
     let target =
