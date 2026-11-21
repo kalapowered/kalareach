@@ -39,6 +39,15 @@ function refusal(call: () => unknown): string | null {
   }
 }
 
+function messageOf(call: () => unknown): string | null {
+  try {
+    call()
+    return null
+  } catch (failure) {
+    return failureMessage(failure)
+  }
+}
+
 describe('the scripted store of channel messages keeps the native rules', () => {
   it('counts a message’s text in UTF-8 bytes: 64 KiB is kept, one byte more is refused', () => {
     const drafts = new FakeDraftStore()
@@ -60,6 +69,31 @@ describe('the scripted store of channel messages keeps the native rules', () => 
     expect(store.all().map((each) => each.actionId)).toEqual([id(2)])
     expect(refusal(() => store.remove({ actionIds: [] }))).toBe('INVALID_ARGUMENT')
     expect(store.all()).toHaveLength(1)
+  })
+
+  it('says in the words of native code that a record is over the bound and that a read owes a flush', () => {
+    const drafts = new FakeDraftStore()
+    const store = new FakeChannelMessageStore()
+    store.lowerLimits({ holds: 1 })
+    const hold = {
+      holdId: 'hold-one',
+      localId: 's-1-test',
+      sessionId: '8a7b6c50-22bb-4c3d-8e4f-000000000101',
+      applicationInstanceId: null,
+      agentBindingRevision: null,
+      environmentId: null,
+      hostName: 'studio',
+      sentAtMs: '1',
+      drafts: []
+    }
+    store.createHold(hold)
+    const over = messageOf(() => store.createHold({ ...hold, holdId: 'hold-two' }))
+    expect(over).toBe('Too many messages have no confirmed outcome. Check the sessions, then send again.')
+    store.damageLedger('damaged')
+    store.leaveSetAsideUnconfirmed()
+    store.setAside(drafts)
+    const owed = messageOf(() => store.drafts(drafts))
+    expect(owed).toBe('This device could not read or write its list of removals.')
   })
 
   it('lets a file that cannot be read take its place against the bound of entries', () => {

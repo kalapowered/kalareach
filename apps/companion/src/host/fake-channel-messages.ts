@@ -357,7 +357,7 @@ export class FakeChannelMessageStore {
     this.calls.push({ kind: 'hold-create' })
     if (this.#refuseHoldWrites) refuse(this.#refuseHoldWrites.code, this.#refuseHoldWrites.message)
     if (this.#holds.has(request.holdId)) refuse('INVALID_ARGUMENT', 'a record is already kept under this identity')
-    if (this.#holds.size >= this.#limits.holds) refuse('QUOTA_EXCEEDED', 'too many records of messages being sent are kept')
+    if (this.#holds.size >= this.#limits.holds) refuse('QUOTA_EXCEEDED', 'Too many messages have no confirmed outcome. Check the sessions, then send again.')
     this.#holds.set(request.holdId, { ...request, actionId: null })
     this.#write()
   }
@@ -394,7 +394,7 @@ export class FakeChannelMessageStore {
     if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'This device could not read or write its channel messages.')
     if (this.#flushOwed) {
       this.#flushOwed = false
-      refuse('STORAGE_UNAVAILABLE', 'the data directory could not be made durable yet')
+      refuse('STORAGE_UNAVAILABLE', 'This device could not read or write its list of removals.')
     }
     const read = draftStore.list()
     // Every draft a durable entry holds the text of, and that is still stored at that version, is owed.
