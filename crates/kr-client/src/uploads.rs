@@ -652,6 +652,66 @@ impl Upload {
 #[derive(Debug, serde::Serialize)]
 struct Unconditional {}
 
+/// What a caller that keeps an upload across a stop of its own process is told, each time before the
+/// call that needs what it is told.
+///
+/// A method returns the caller's own failure as an error, and [`send`] then ends before the
+/// call it guards: nothing is asked of the host that the caller could not keep.
+pub trait Journal: Send + Sync {
+    /// `upload.begin` is about to be sent. From here until [`Journal::begun`] the host may hold a
+    /// reservation that this client cannot name.
+    ///
+    /// # Errors
+    ///
+    /// The caller's failure to keep this; the reservation is then not asked for.
+    fn beginning(&self) -> Result<()>;
+
+    /// The host answered `upload.begin` with `transfer_id`. Called before any chunk or finish of the
+    /// transfer is sent.
+    ///
+    /// # Errors
+    ///
+    /// The caller's failure to keep the identifier.
+    fn begun(&self, transfer_id: TransferId) -> Result<()>;
+
+    /// `upload.finish` for `transfer_id` is about to be sent: the host may publish whatever becomes of
+    /// the answer.
+    ///
+    /// # Errors
+    ///
+    /// The caller's failure to keep this; the finish is then not sent.
+    fn finishing(&self, transfer_id: TransferId) -> Result<()>;
+
+    /// The upload is published as `handle`. Called before [`send`] returns it.
+    ///
+    /// # Errors
+    ///
+    /// The caller's failure to keep the handle.
+    fn published(&self, handle: &AttachmentHandle) -> Result<()>;
+}
+
+/// A journal that keeps nothing, for a caller whose upload does not outlive its process.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoJournal;
+
+impl Journal for NoJournal {
+    fn beginning(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn begun(&self, _transfer_id: TransferId) -> Result<()> {
+        Ok(())
+    }
+
+    fn finishing(&self, _transfer_id: TransferId) -> Result<()> {
+        Ok(())
+    }
+
+    fn published(&self, _handle: &AttachmentHandle) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Drives one upload to its published handle: the reservation, the status and the publication on
 /// `session`, every chunk on the lane `route` opens for the transfer.
 ///
@@ -698,13 +758,17 @@ struct Unconditional {}
 ///   refusal. A reply that was lost, a refusal saying the outcome is unknown, a receipt with no
 ///   result and a call abandoned part way all leave the plan refusing to reserve again.
 ///
+/// `journal` is told of each step of the transfer before the call that needs it ([`Journal`]); a
+/// caller whose upload does not outlive its process passes [`NoJournal`].
+///
 /// # Errors
 ///
 /// Returns [`ClientError::SubmissionUncertain`] when the session ended with a reservation or a
 /// finish sent and unanswered, the reason this device ended the connection when a call found it
 /// ended, [`ClientError::ConnectionEnded`] when the host or the network did, a refusal the host
-/// decided under its own code, the last failure once the retries are spent, and the plan's refusal
-/// when the host's status says the upload was cancelled, invalidated or expired.
+/// decided under its own code, the last failure once the retries are spent, the plan's refusal
+/// when the host's status says the upload was cancelled, invalidated or expired, and the journal's
+/// own failure.
 pub async fn send(
     session: &Session,
     route: &ChunkRoute,
@@ -712,8 +776,19 @@ pub async fn send(
     plan: &mut Upload,
     requested_ttl: DurationMs,
     progress: &watch::Sender<Progress>,
+    journal: &dyn Journal,
 ) -> Result<AttachmentHandle> {
-    match drive(session, route, target, plan, requested_ttl, progress).await {
+    match drive(
+        session,
+        route,
+        target,
+        plan,
+        requested_ttl,
+        progress,
+        journal,
+    )
+    .await
+    {
         Err(ClientError::ConnectionEnded) => Err(session
             .transport()
             .ended_by_this_device()
@@ -732,6 +807,7 @@ async fn drive(
     plan: &mut Upload,
     requested_ttl: DurationMs,
     progress: &watch::Sender<Progress>,
+    journal: &dyn Journal,
 ) -> Result<AttachmentHandle> {
     // A plan that holds a transfer is resuming it: the host's bitmap decides what is sent.
     let mut resuming = plan.transfer_id().is_some();
@@ -747,8 +823,9 @@ async fn drive(
     loop {
         match plan.next()? {
             Step::Begin(params) => {
-                // Recorded before the request can leave: a caller that abandons this call part way
-                // leaves a plan that knows a reservation may exist.
+                // Kept by the caller before the request can leave, and recorded on the plan: a caller
+                // that abandons this call part way leaves a plan that knows a reservation may exist.
+                journal.beginning()?;
                 plan.reserving();
                 let answered = session
                     .mutate(
@@ -808,6 +885,9 @@ async fn drive(
                     }
                 };
                 plan.accept(Answer::Begun(Box::new(begun)))?;
+                if let Some(transfer_id) = plan.transfer_id().copied() {
+                    journal.begun(transfer_id)?;
+                }
             }
             Step::Chunk(params) => {
                 let confirmed = plan.acknowledged_chunks();
@@ -884,6 +964,7 @@ async fn drive(
                 // Every chunk is acknowledged, so the lane has nothing left to carry.
                 lane = None;
                 publish(progress, plan.progress_at(Stage::Publishing));
+                journal.finishing(params.transfer_id)?;
                 let finished = session
                     .mutate(
                         Method::UploadFinish,
@@ -918,6 +999,7 @@ async fn drive(
                 }
             }
             Step::Done(handle) => {
+                journal.published(&handle)?;
                 publish(progress, plan.progress_at(Stage::Published));
                 return Ok(*handle);
             }

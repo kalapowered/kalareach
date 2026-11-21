@@ -4581,6 +4581,7 @@ async fn kr_req_19_08_an_upload_goes_out_on_a_data_stream_of_the_connection_that
         ),
     )
     .await
+            &kr_client::uploads::NoJournal,
     .expect("the upload ends")
     .expect("the upload is published");
 
@@ -4794,6 +4795,7 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
             )
             .await;
             (sent, route)
+                &kr_client::uploads::NoJournal,
         }
     });
 
