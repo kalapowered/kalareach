@@ -9,6 +9,9 @@
 
 import { failureCode, failureWords, isHostError } from '../host/port'
 
+/** A cancel names no upload this device holds. */
+export const NO_OPEN_UPLOAD = 'no open upload has that key'
+
 /** A third open upload is refused. */
 export const TOO_MANY_OPEN =
   'two files are open on this host already: wait for one to finish, or cancel one'
@@ -124,6 +127,11 @@ const APPLICATION_WORDS: readonly (readonly [string, RefusalKind])[] = [
  * full staging area says its quota, a changed file says its source changed, and a right the device
  * lacks is a permission refusal. Anything else is shown in the host's own words.
  */
+/** Whether `failure` says the application holds no upload under the key: nothing was cancelled. */
+export function isNoOpenUpload(failure: unknown): boolean {
+  return failureWords(failure) === NO_OPEN_UPLOAD
+}
+
 export function refusalOf(failure: unknown): Refusal {
   const words = failureWords(failure)
   for (const [known, kind] of APPLICATION_WORDS) {

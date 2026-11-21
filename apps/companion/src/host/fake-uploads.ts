@@ -39,7 +39,7 @@ interface Live {
   readonly byteLen: number
   readonly sessionId: string | null
   readonly handle: AttachmentHandle
-  state: 'sending' | 'paused'
+  state: 'sending' | 'paused' | 'cancelAsked'
   stage: NonNullable<OpenUpload['stage']>
   done: number
   of: number
@@ -72,6 +72,8 @@ export class FakeUploads {
   #refuseNext: ScriptedFailure | null = null
   #bindRefusal: ScriptedFailure | null = null
   #cancelState: UploadCancelled['state'] = 'cancelled'
+  #askedSaid: string | null = null
+  #cancelFailure: ScriptedFailure | null = null
   #cancelGate: { readonly promise: Promise<void>; readonly release: () => void } | null = null
   #draftCounter = 0
 
@@ -135,6 +137,17 @@ export class FakeUploads {
     if (live === undefined && left === undefined) {
       this.#throw({ code: 'INVALID_ARGUMENT', message: 'no open upload has that key' })
     }
+    // The application records a cancel first: whatever fails after it, the upload is cancelled, and
+    // it is listed as such until the cancel is finished.
+    if (this.#cancelState === 'asked' || this.#cancelFailure !== null) {
+      this.#markAsked(key)
+      if (this.#cancelFailure !== null) {
+        const failure = this.#cancelFailure
+        this.#cancelFailure = null
+        this.#throw(failure)
+      }
+      return { key, state: 'asked', releasedByteLen: null, handle: null, said: this.#askedSaid }
+    }
     this.#left = this.#left.filter((each) => each.key !== key)
     if (this.#cancelState === 'published') {
       const handle = live?.handle ?? left?.handle ?? null
@@ -142,7 +155,7 @@ export class FakeUploads {
         this.#live.delete(key)
         live.resolve(live.handle)
       }
-      return { key, state: 'published', releasedByteLen: null, handle }
+      return { key, state: 'published', releasedByteLen: null, handle, said: null }
     }
     if (live !== undefined) {
       this.#live.delete(key)
@@ -152,7 +165,8 @@ export class FakeUploads {
       key,
       state: this.#cancelState,
       releasedByteLen: this.#cancelState === 'cancelled' ? String(live?.byteLen ?? left?.byteLen ?? 0) : null,
-      handle: null
+      handle: null,
+      said: null
     }
   }
 
@@ -280,9 +294,25 @@ export class FakeUploads {
     this.#bindRefusal = failure
   }
 
-  /** What the next cancels answer: released, already published and kept, or nothing the host holds. */
-  answerCancelsWith(state: UploadCancelled['state']): void {
+  /** What the next cancels answer: released, already published and kept, kept to be finished, or nothing the host holds. */
+  answerCancelsWith(state: UploadCancelled['state'], said: string | null = null): void {
     this.#cancelState = state
+    this.#askedSaid = said
+  }
+
+  /** The next cancel fails after the application has recorded it, as a call does when the host is out of reach. */
+  failNextCancel(failure: ScriptedFailure): void {
+    this.#cancelFailure = failure
+  }
+
+  /** The application finished the cancel it kept: the host released the reservation and the upload is gone. */
+  finishAskedCancel(key: string): void {
+    const live = this.#live.get(key)
+    if (live !== undefined) {
+      this.#live.delete(key)
+      live.reject({ code: 'PERMISSION_DENIED', message: CANCELLED_WORDS })
+    }
+    this.#left = this.#left.filter((each) => each.key !== key)
   }
 
   /** Holds the host's answer to a cancel until `releaseCancels`. */
@@ -309,6 +339,12 @@ export class FakeUploads {
     }
     this.#drafts.set(sessionId, draft)
     return draft
+  }
+
+  #markAsked(key: string): void {
+    const live = this.#live.get(key)
+    if (live !== undefined) live.state = 'cancelAsked'
+    this.#left = this.#left.map((each) => (each.key === key ? { ...each, state: 'cancelAsked' } : each))
   }
 
   #need(key: string): Live {

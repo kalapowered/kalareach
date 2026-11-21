@@ -214,7 +214,10 @@ export function usePairedFiles({
       }
       void uploads.cancel(key).then(() => {
         const row = uploads.snapshot().get(key)
-        if (row !== undefined) say(`${row.name}: ${lineOf(row.phase).text}`)
+        if (row !== undefined) {
+          const said = row.phase.kind === 'cancelAsked' && row.phase.said !== null ? ` ${row.phase.said}` : ''
+          say(`${row.name}: ${lineOf(row.phase).text}${said}`)
+        }
         if (row?.phase.kind === 'cancelled') {
           changeFiles((current) => current.map((each) => (each.localId === key ? { ...each, upload: 'failed' } : each)))
         }

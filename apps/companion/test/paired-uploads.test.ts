@@ -4,9 +4,10 @@
  * write them, so a change there cannot pass here unseen.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { fakeHost } from '../src/host/fake'
+import type { OpenUpload } from '../src/host/port'
 import { PairedUploads, boundIdsOf, canCancel, lineOf, type Phase } from '../src/model/paired-uploads'
 import * as words from '../src/model/transfer-words'
 import openTransfers from '../src-tauri/src/open_transfers.rs?raw'
@@ -33,6 +34,7 @@ describe("the application's sentences are the ones the page recognises and shows
     ['open_transfers.rs', 'KEY_IN_USE', words.KEY_IN_USE],
     ['open_transfers.rs', 'UNRECOVERABLE', words.UNRECOVERABLE],
     ['open_transfers.rs', 'CANCELLED', words.CANCELLED_BEFORE_SENT],
+    ['open_transfers.rs', 'NO_OPEN_UPLOAD', words.NO_OPEN_UPLOAD],
     ['paired_drafts.rs', 'GONE', words.DRAFT_GONE],
     ['paired_drafts.rs', 'GONE_FOR_TEXT', words.DRAFT_GONE_FOR_TEXT],
     ['paired_drafts.rs', 'NO_DRAFT', words.NO_DRAFT],
@@ -101,6 +103,11 @@ describe('each state of a file in words (KR-REQ-13.12)', () => {
     [{ kind: 'waiting' }, 'Waiting for the host', null],
     [{ kind: 'finishing' }, 'Finishing with the host', 1],
     [{ kind: 'cancelling' }, 'Cancelling', null],
+    [
+      { kind: 'cancelAsked', said: null },
+      'Cancel asked: no more of this file is sent, and the cancel is finished when the host can be reached.',
+      null
+    ],
     [{ kind: 'cancelled', released: null }, 'Cancelled.', null],
     [{ kind: 'cancelled', released: '4404019' }, 'Cancelled. The host released 4.2 MB.', null],
     [{ kind: 'adding' }, 'Sent in full. Adding it to this draft', 1],
@@ -128,8 +135,8 @@ describe('each state of a file in words (KR-REQ-13.12)', () => {
       const phase = { kind, done: 0, of: 1, words: '' } as Phase
       expect(canCancel(phase), kind).toBe(true)
     }
-    for (const kind of ['cancelling', 'cancelled', 'adding', 'bound', 'kept', 'refused'] as const) {
-      const phase = { kind, released: null, words: null, refusal: { kind: 'other', words: '' } } as Phase
+    for (const kind of ['cancelling', 'cancelAsked', 'cancelled', 'adding', 'bound', 'kept', 'refused'] as const) {
+      const phase = { kind, released: null, words: null, said: null, refusal: { kind: 'other', words: '' } } as Phase
       expect(canCancel(phase), kind).toBe(false)
     }
   })
@@ -256,6 +263,99 @@ describe('the store reads the application, and the application is the one that s
     refuse = false
     await uploads.bind('k-4', handle, bind)
     expect(uploads.snapshot().get('k-4')?.phase).toEqual({ kind: 'bound' })
+  })
+
+  const left = (state: 'waiting' | 'cancelAsked' | 'published', handle: OpenUpload['handle'] = null): OpenUpload => ({
+    key: 'found-1',
+    state,
+    sessionId: 's-1',
+    fileName: 'left.bin',
+    byteLen: 9,
+    acknowledgedChunks: 0,
+    chunks: 0,
+    stage: null,
+    handle,
+    said: null
+  })
+
+  it('says cancel asked, keeps asking, and ends cancelled when the application stops listing the file', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: ['files.upload', 'agent.prompt'] })
+    const scripted = controls.pairedUploads
+    const uploads = new PairedUploads(port, 5)
+    scripted.leave([left('waiting')])
+    await uploads.restore()
+    scripted.answerCancelsWith('asked')
+    await uploads.cancel('found-1')
+    expect(uploads.snapshot().get('found-1')?.phase).toEqual({ kind: 'cancelAsked', said: null })
+    // No send waits for this row, so only the poll can move it: it asks the application again.
+    const asked = vi.spyOn(port, 'uploadsOpen')
+    scripted.finishAskedCancel('found-1')
+    await wait(() => asked.mock.calls.length > 0)
+    await wait(() => uploads.snapshot().get('found-1')?.phase.kind === 'cancelled')
+    expect(uploads.snapshot().get('found-1')?.phase).toEqual({ kind: 'cancelled', released: null })
+  })
+
+  it('leaves the row cancel asked, with the words, when the call fails after the cancel was sent', async () => {
+    const { uploads, scripted } = reached()
+    const sent = uploads.send({ key: 'k-5', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    sent.catch(() => undefined)
+    await wait(() => scripted.started.length === 1)
+    scripted.pause('k-5')
+    await wait(() => uploads.snapshot().get('k-5')?.phase.kind === 'paused')
+    scripted.failNextCancel({ code: 'HOST_NOT_CONFIGURED', message: 'the host is not connected' })
+    await uploads.cancel('k-5')
+    const row = uploads.snapshot().get('k-5')
+    expect(row?.phase).toEqual({ kind: 'cancelAsked', said: 'The host is not connected' })
+    expect(lineOf(row?.phase as Phase).text).not.toContain('Sending resumes')
+    // Asking again does not turn it back into a paused file.
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(uploads.snapshot().get('k-5')?.phase.kind).toBe('cancelAsked')
+  })
+
+  it('reads a stored cancel as cancel asked and not as waiting', async () => {
+    const { uploads, scripted } = reached()
+    scripted.leave([left('cancelAsked')])
+    await uploads.restore()
+    expect(uploads.found('s-1', new Set())[0]?.phase).toEqual({ kind: 'cancelAsked', said: null })
+    expect(canCancel(uploads.found('s-1', new Set())[0]?.phase)).toBe(false)
+  })
+
+  it('says a cancel asked was not carried out when the upload turns out to be published', async () => {
+    const { uploads, scripted } = reached()
+    scripted.leave([left('cancelAsked')])
+    await uploads.restore()
+    const handle = {
+      transfer_id: 't-1',
+      environment_id: 'e-1',
+      byte_len: '9',
+      content_digest: 'b'.repeat(64),
+      declared_media_type: 'application/octet-stream',
+      original_file_name: 'left.bin',
+      presented_as_image: false,
+      session_id: null,
+      preview: null,
+      published_at_ms: '1',
+      expires_at_ms: '2',
+      submitted: false
+    }
+    scripted.leave([left('published', handle)])
+    await wait(() => uploads.snapshot().get('found-1')?.phase.kind === 'kept')
+    expect(uploads.snapshot().get('found-1')?.note).toBe(words.sentence(words.PUBLISHED_AND_KEPT))
+  })
+
+  it('says it was kept when a send that waited for a cancel asked ends with the file published', async () => {
+    const { uploads, scripted } = reached()
+    const sent = uploads.send({ key: 'k-6', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    await wait(() => scripted.started.length === 1)
+    scripted.answerCancelsWith('asked')
+    await uploads.cancel('k-6')
+    expect(uploads.snapshot().get('k-6')?.phase).toEqual({ kind: 'cancelAsked', said: null })
+    scripted.finish('k-6')
+    await sent
+    const row = uploads.snapshot().get('k-6')
+    expect(row?.phase).toEqual({ kind: 'bound' })
+    expect(row?.note).toBe(words.sentence(words.PUBLISHED_AND_KEPT))
   })
 
   it('finds what a restart left on the session it was for, and drops what the application no longer lists', async () => {

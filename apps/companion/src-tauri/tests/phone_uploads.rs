@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use companion_tauri::open_transfers::{Desk, Keeping, Paired, Request, kept_in, testing};
+use companion_tauri::open_transfers::{Desk, Keeping, Paired, Request, Who, kept_in, testing};
 use kr_client::uploads::{Content, Held};
 use kr_protocol::limits::UPLOAD_CHUNK_LEN;
 use kr_protocol::rights::ActionRight;
@@ -394,7 +394,7 @@ async fn kr_req_13_12_a_cancel_shows_the_released_bytes_from_the_answer() {
     // that the upload cannot publish before it.
     let cancelling = {
         let (desk, paired) = (Arc::clone(&desk), paired_of(companion).await);
-        tokio::spawn(async move { desk.cancel(paired, key).await })
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
     tokio::time::sleep(Duration::from_millis(500)).await;
     gate.release();
@@ -1363,14 +1363,18 @@ async fn kr_req_13_12_a_cancel_the_host_cannot_be_asked_is_finished_when_it_is_r
     session.transport().close();
     let cancelling = {
         let desk = Arc::clone(&desk);
-        tokio::spawn(async move { desk.cancel(paired, key).await })
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
     tokio::time::sleep(Duration::from_millis(300)).await;
     gate.release();
-    cancelling
+    let answer = cancelling
         .await
         .expect("the task ran")
-        .expect_err("the host cannot be asked");
+        .expect("the cancel is answered");
+    assert_eq!(
+        answer.state, "asked",
+        "the host cannot be asked, so the cancel is kept"
+    );
 
     control.stop_holding();
     control.release_all();
@@ -2706,7 +2710,7 @@ async fn kr_req_13_12_a_cancel_while_the_copy_is_written_stops_the_upload_from_s
     })
     .await
     .expect("the copy is written");
-    desk.cancel(paired, key)
+    desk.cancel(paired.who(), Some(paired), key)
         .await
         .expect("the cancel is answered");
     gate.add_permits(1);
@@ -2831,7 +2835,7 @@ async fn kr_req_13_12_a_cancel_before_the_key_is_registered_refuses_the_send_and
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
     let answer = desk
-        .cancel(paired, key)
+        .cancel(paired.who(), Some(paired), key)
         .await
         .expect("a cancel of a key nothing holds is answered");
     assert_eq!(answer.state, "forgotten");
@@ -2881,7 +2885,7 @@ async fn kr_req_13_12_a_cancel_that_comes_while_the_sender_starts_leaves_the_hos
     first_line.until_passed(1).await;
     let cancelling = {
         let desk = Arc::clone(&desk);
-        tokio::spawn(async move { desk.cancel(paired, key).await })
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
     began.until_passed(1).await;
     started.release();
@@ -2950,7 +2954,7 @@ async fn kr_req_13_12_a_handle_is_stored_before_the_cancel_can_take_it() {
     started.until_passed(1).await;
     let cancelling = {
         let desk = Arc::clone(&desk);
-        tokio::spawn(async move { desk.cancel(paired, key).await })
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
     began.until_passed(1).await;
     started.release();
@@ -2998,7 +3002,7 @@ async fn kr_req_13_12_a_cancel_and_a_send_started_together_never_leave_work_behi
             tokio::task::yield_now().await;
         }
         let answer = desk
-            .cancel(paired.clone(), key)
+            .cancel(paired.who(), Some(paired.clone()), key)
             .await
             .expect("the cancel is answered");
         let told = tokio::time::timeout(WATCHDOG, sending)
@@ -3077,7 +3081,7 @@ async fn kr_req_13_12_a_restart_does_not_start_an_upload_cancelled_while_its_con
 
     let cancelling = {
         let (desk, paired) = (Arc::clone(&desk), paired_of(companion).await);
-        tokio::spawn(async move { desk.cancel(paired, key).await })
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
     until("the key is recorded as cancelled", || {
         desk.is_cancelled(key)
@@ -3125,7 +3129,7 @@ async fn kr_req_13_12_a_cancel_waits_for_a_sender_that_is_inside_a_blocking_writ
     writing.until_passed(1).await;
     let cancelling = {
         let desk = Arc::clone(&desk);
-        tokio::spawn(async move { desk.cancel(paired, key).await })
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
     // The cancel is in its step 2, waiting for the sender; it is not ready while the sender is held.
     waiting.until_passed(1).await;
@@ -3246,12 +3250,12 @@ async fn kr_req_13_12_a_second_cancel_waits_for_the_first_and_does_not_rewrite_t
     writing.until_passed(1).await;
     let first = {
         let (desk, paired) = (Arc::clone(&desk), paired.clone());
-        tokio::spawn(async move { desk.cancel(paired, key).await })
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
     waiting.until_passed(1).await;
     let second = {
         let desk = Arc::clone(&desk);
-        tokio::spawn(async move { desk.cancel(paired, key).await })
+        tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
     began.until_passed(2).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -3341,5 +3345,292 @@ async fn kr_req_13_12_a_reach_between_a_stop_and_a_removal_starts_no_sender() {
         "no entry is written after the removal"
     );
     assert_eq!(copies_in(&folder(&phone)), 0, "no copy is left");
+    adopted.stop().await;
+}
+
+/// Makes a folder unwritable for as long as it lives.
+struct Unwritable(PathBuf);
+
+impl Unwritable {
+    fn new(folder: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o555))
+            .expect("the folder is read only");
+        Self(folder.to_path_buf())
+    }
+}
+
+impl Drop for Unwritable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// KR-REQ-13.12: a cancel pressed while the host is out of reach is kept, read as cancel asked, and
+/// finished at the reach: the host is told once, no chunk or finish goes after it, and nothing is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cancel_with_the_host_out_of_reach_is_kept_and_finished_at_the_reach() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let paired = paired_of(companion).await;
+    let session = Arc::clone(&paired.session);
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    gate.reached().await;
+    control.hold();
+    session.transport().close();
+    gate.release();
+    until("the upload is paused", || {
+        try_open(companion).is_ok_and(|views| views.iter().any(|view| view["state"] == "paused"))
+    })
+    .await;
+
+    let answered = companion
+        .call("upload_cancel", json!({ "transferKey": key.to_string() }))
+        .expect("the cancel is answered with no connection");
+    assert_eq!(answered["state"], "asked");
+    let listed = open(companion);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["state"], "cancelAsked");
+
+    control.stop_holding();
+    control.release_all();
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends once the host is reached")
+        .expect("the task ran")
+        .expect_err("cancelled");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    desk.idle().await;
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host is told once"
+    );
+    assert_eq!(
+        control.sent(Method::UploadFinish),
+        0,
+        "nothing is finished after it"
+    );
+    assert_eq!(host_open(&control), 0, "the host holds nothing");
+    assert_eq!(entries_in(&folder(&phone)), 0);
+    assert_eq!(copies_in(&folder(&phone)), 0);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: a reach that comes while a cancel waits for a sender that has not noticed its
+/// connection end does not leave the cancel waiting for the next reach: the command looks for a
+/// connection again and finishes the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reach_during_a_cancel_finishes_it_at_once() {
+    use kr_protocol::method::Method;
+    use testing::{Point, Step};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    // The sender is held inside the write that keeps the host's identifier: it is still sending.
+    let writing = testing::hold_at(key, Point::Writing(Step::Begun));
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let paired = paired_of(companion).await;
+    let session = Arc::clone(&paired.session);
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    writing.until_passed(1).await;
+    control.hold();
+    session.transport().close();
+    until("the connection ends", || {
+        companion
+            .call("connection_state", json!({}))
+            .is_ok_and(|state| state["connected"] != true)
+    })
+    .await;
+    // Once the cancel waits for the sender, contact returns and the host is reached; only then is
+    // the sender let go.
+    let returning = {
+        let (control, desk, app) = (
+            Arc::clone(&control),
+            Arc::clone(&desk),
+            companion.app.handle().clone(),
+        );
+        let old = Arc::clone(&session);
+        tokio::spawn(async move {
+            waiting.until_passed(1).await;
+            control.stop_holding();
+            control.release_all();
+            until("the desk is told the host was reached", || {
+                app.state::<companion_tauri::AppState>()
+                    .paired_snapshot()
+                    .is_ok_and(|(device_id, environment_id, session)| {
+                        !Arc::ptr_eq(&session, &old)
+                            && desk.holds_newest_for_test(&Paired {
+                                device_id,
+                                environment_id,
+                                account: None,
+                                session,
+                            })
+                    })
+            })
+            .await;
+            writing.release();
+        })
+    };
+    // The command finds no connection the first time, and the second time finds the new one.
+    let answered = companion
+        .call("upload_cancel", json!({ "transferKey": key.to_string() }))
+        .expect("the cancel is answered");
+    returning.await.expect("the task ran");
+    assert_eq!(
+        answered["state"], "cancelled",
+        "the second look finished it"
+    );
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends")
+        .expect("the task ran")
+        .expect_err("cancelled");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    desk.idle().await;
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host is told once"
+    );
+    assert_eq!(host_open(&control), 0);
+    assert_eq!(entries_in(&folder(&phone)), 0);
+    adopted.stop().await;
+}
+
+/// An upload that a first process began and left paused, with its entry in the folder, and the dials
+/// held so that no reach has happened yet.
+async fn left_paused(
+    adopted: &Adopted,
+    phone: &Phone,
+    control: &LinkControl,
+    bytes: &[u8],
+) -> (Uuid, Arc<Desk>, Who) {
+    let companion = &phone.companion;
+    let first = Arc::new(Desk::default());
+    first.keep_at(folder(phone));
+    let (content, gate, release) = gated(bytes);
+    let key = kr_ipc::new_uuid();
+    let sent = request(adopted, bytes, content, key);
+    let paired = paired_of(companion).await;
+    let (session, who) = (Arc::clone(&paired.session), paired.who());
+    let first_process = {
+        let first = Arc::clone(&first);
+        tokio::spawn(async move { first.send(paired, sent).await })
+    };
+    gate.reached().await;
+    control.hold();
+    session.transport().close();
+    gate.release();
+    drop(release);
+    until("the first process pauses the upload", || {
+        first
+            .open(&who)
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
+    })
+    .await;
+    first_process.abort();
+    (key, first, who)
+}
+
+/// KR-REQ-13.12: an unfinished cancel that an earlier process recorded is read as cancel asked by the
+/// application that starts next, and its first reach tells the host and removes the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_restart_finishes_an_asked_cancel_and_shows_it_as_asked() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let bytes = pattern(5);
+    let (key, first, who) = left_paused(&adopted, &phone, &control, &bytes).await;
+    let asked = first
+        .cancel(who.clone(), None, key)
+        .await
+        .expect("the earlier process records the cancel");
+    assert_eq!(asked.state, "asked");
+
+    let desk = desk_of(companion);
+    let read = desk.open(&who);
+    assert_eq!(read.len(), 1);
+    assert_eq!(
+        read[0].state,
+        companion_tauri::open_transfers::OpenState::CancelAsked
+    );
+
+    control.stop_holding();
+    control.release_all();
+    open_where(companion, <[Value]>::is_empty).await;
+    desk.idle().await;
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host is told once"
+    );
+    assert_eq!(host_open(&control), 0);
+    assert_eq!(entries_in(&folder(&phone)), 0);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: a restored upload whose cancel could not be recorded is still read as cancelled, and
+/// the next reach finishes the cancel and never resumes the upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_restored_upload_whose_cancel_record_failed_is_finished_at_the_reach() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let bytes = pattern(5);
+    let (key, _first, who) = left_paused(&adopted, &phone, &control, &bytes).await;
+    let desk = desk_of(companion);
+    let answer = {
+        let _unwritable = Unwritable::new(&folder(&phone));
+        desk.cancel(who.clone(), None, key).await
+    }
+    .expect("the cancel is answered");
+    assert_eq!(answer.state, "asked");
+    assert!(answer.said.is_some(), "the failed record is said");
+    let read = desk.open(&who);
+    assert_eq!(
+        read[0].state,
+        companion_tauri::open_transfers::OpenState::CancelAsked,
+        "read as cancelled, not as waiting"
+    );
+
+    control.stop_holding();
+    control.release_all();
+    open_where(companion, <[Value]>::is_empty).await;
+    desk.idle().await;
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host is told once"
+    );
+    assert_eq!(host_open(&control), 0, "the upload is not resumed");
+    assert_eq!(entries_in(&folder(&phone)), 0);
     adopted.stop().await;
 }
