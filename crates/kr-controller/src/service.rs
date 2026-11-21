@@ -843,9 +843,9 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_retained_lookup: ReadPause,
-    /// Where this host's own tests stop a paired device's read of a voice call's context, once the
-    /// privacy state it is held to has been taken and before the context is read, so that privacy
-    /// mode can change in between. Compiled away in every shipped build.
+    /// Where this host's own tests stop a paired device's voice read, after the privacy state a
+    /// context read is held to has been taken and before the read, so that privacy mode can change
+    /// in between. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_voice_state_was_taken: ReadPause,
     /// Where this host's own tests stop a first admission at the local door that holds its action
