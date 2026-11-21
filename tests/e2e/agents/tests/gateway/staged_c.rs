@@ -84,7 +84,7 @@ fn package_actions() -> Vec<Action> {
 
 /// One of a case's sessions.
 #[derive(Clone, Copy)]
-enum Seat {
+pub(super) enum Seat {
     First,
     Second,
 }
@@ -307,12 +307,12 @@ fn surface(
 // ---------------------------------------------------------------------------------------------
 
 /// The turns a case charged to the budget and the ones it submitted.
-struct Turns<'a> {
+pub(super) struct Turns<'a> {
     ctx: &'a Context,
     real: &'a Real,
     part: &'a str,
-    charged: u64,
-    submitted: u64,
+    pub(super) charged: u64,
+    pub(super) submitted: u64,
 }
 
 /// Whether the turn about to be submitted, the `submitted`th, was charged before: no turn is
@@ -336,7 +336,7 @@ fn charged_first(charged: u64, submitted: u64) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns what the counts say.
-fn turns_as_planned(charged: u64, submitted: u64, planned: u64) -> Result<(), String> {
+pub(super) fn turns_as_planned(charged: u64, submitted: u64, planned: u64) -> Result<(), String> {
     if charged == submitted && charged == planned {
         Ok(())
     } else {
@@ -347,7 +347,7 @@ fn turns_as_planned(charged: u64, submitted: u64, planned: u64) -> Result<(), St
 }
 
 /// The device's keyboard on a session, and the person's screen it types at.
-struct Typing<'a> {
+pub(super) struct Typing<'a> {
     ctx: &'a Context,
     at: Seated<'a>,
     keys: Keyboard,
@@ -355,7 +355,7 @@ struct Typing<'a> {
 
 impl<'a> Typing<'a> {
     /// Attaches the device's keyboard to the session at `seat` and takes the input lease.
-    fn attach(ctx: &'a Context, session: &'a Session<'_>, seat: Seat) -> Self {
+    pub(super) fn attach(ctx: &'a Context, session: &'a Session<'_>, seat: Seat) -> Self {
         let at = seated(session, seat);
         let mut keys = Keyboard::attach(at.remote, &ctx.runtime, at.session_id)
             .unwrap_or_else(|why| panic!("the device's keyboard attaches: {why}"));
@@ -365,7 +365,7 @@ impl<'a> Typing<'a> {
     }
 
     /// Types `text` from the device: every byte is forwarded to the terminal.
-    fn types(&mut self, text: &str) {
+    pub(super) fn types(&mut self, text: &str) {
         let written = self
             .keys
             .type_text(self.at.remote, &self.ctx.runtime, text)
@@ -402,7 +402,14 @@ impl<'a> Typing<'a> {
 
     /// Charges one turn, then types `text` at the composer from the device, waits until the screen
     /// shows `mark`, which begins the text, and types `key` once the line end can arrive on its own.
-    fn submits(&mut self, turns: &mut Turns<'_>, what: &str, text: &str, mark: &str, key: &str) {
+    pub(super) fn submits(
+        &mut self,
+        turns: &mut Turns<'_>,
+        what: &str,
+        text: &str,
+        mark: &str,
+        key: &str,
+    ) {
         self.no_dialog(turns.real, "before the case typed a prompt");
         turns.real.charge(&turns.ctx.run, turns.part, what);
         turns.charged += 1;
@@ -429,7 +436,7 @@ impl<'a> Typing<'a> {
 }
 
 impl<'a> Turns<'a> {
-    fn new(ctx: &'a Context, real: &'a Real, part: &'a str) -> Self {
+    pub(super) fn new(ctx: &'a Context, real: &'a Real, part: &'a str) -> Self {
         Self {
             ctx,
             real,
