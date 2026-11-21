@@ -785,7 +785,7 @@ struct Turn {
 /// `Live.generation`, the immutable `Live.owner` and `Live.key`, and the atomic `Live.published`;
 /// then `sessions`, `verdicts` and `root`. No helper takes the gate again when its caller holds it:
 /// it is handed the guard. `Live.file` is never taken under the gate and the gate is never taken
-/// inside [`Live::change`], so the gate reads `owner` and `published`, not the entry. The gate is
+/// inside `Live::change`, so the gate reads `owner` and `published`, not the entry. The gate is
 /// held across no `.await` and across no write of an entry; it covers a read of the folder, which
 /// admission needs to be one step with the count, and the removal of the orphaned copies that
 /// `restart` makes (each a flush), which is what stops `restart` from removing the copy a send has
