@@ -17,6 +17,8 @@ use kr_e2e_agents::conversation;
 use kr_e2e_agents::stage::Keyboard;
 use kr_e2e_agents::transfer::{self, Caller, Transfer};
 
+use super::staged_c::{Seat, Turns, Typing, turns_as_planned};
+
 /// The colour that fills [`COLOUR_PNG`], as a one-word answer names it.
 const COLOUR: &str = "red";
 
@@ -324,6 +326,13 @@ fn gateway_a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_s
                 })
             }
             Route::Real(real) => {
+                // The marker of an image in the agent's record is read before anything is charged:
+                // an entry that names none stops the part with nothing spent.
+                let marker = real
+                    .account
+                    .image_line
+                    .as_deref()
+                    .expect("the build list names a marker for an image in the agent's record");
                 let idle = session.binding_until(
                     instance,
                     "the stream names a thread and no turn",
@@ -336,7 +345,10 @@ fn gateway_a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_s
                 let marked = mark();
                 let root = ctx.run.root().display().to_string();
                 let (question, sum) = session.person.asks(&[&marked, &root]);
+                let mut turns = Turns::new(ctx, real, "1");
                 real.charge(&ctx.run, "1", "a prompt from a device");
+                turns.charged += 1;
+                turns.submitted += 1;
                 let before = session.person.window.screen();
                 let started = ctx
                     .prompts(
@@ -371,21 +383,27 @@ fn gateway_a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_s
                     .clone()
                     .expect("the host published a file for the transfer");
                 let upper = marked.to_uppercase();
-                real.charge(&ctx.run, "1", "an image and its question");
-                session
-                    .person
-                    .window
-                    .type_text(image_input(&real.account, &file).as_bytes());
+                // The image, the question and the key that submits go through the device's own
+                // keyboard under its input lease, as a phone types them, and the local terminal
+                // shows what arrives: the case does not pass where the device's terminal input
+                // cannot deliver an image to the composer.
+                let mut typing = Typing::attach(ctx, session, Seat::First);
+                typing.types(&image_input(&real.account, &file));
                 std::thread::sleep(Duration::from_millis(500));
                 // A mark of its own: the first prompt's is on the screen already.
                 let image_mark = mark();
-                session.person.composes(
+                typing.submits(
+                    &mut turns,
+                    "an image and its question",
                     &format!(
                         " What colour fills this image? ({image_mark}) Reply with one lowercase \
                          word, a space, and the code {marked} in upper case."
                     ),
                     &image_mark,
+                    "\r",
                 );
+                turns_as_planned(turns.charged, turns.submitted, 2)
+                    .unwrap_or_else(|why| panic!("the part's turns: {why}"));
                 // A model's displayed reasoning can quote the code before its answer: the wait goes
                 // on until a row holds the code beside the colour, which only the answer does.
                 let mut rows = session
@@ -404,11 +422,6 @@ fn gateway_a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_s
                     )
                 });
                 // The agent's own record of the image it was given.
-                let marker = real
-                    .account
-                    .image_line
-                    .as_deref()
-                    .expect("the build list names a marker for an image in the agent's record");
                 let recorded = transfer::images_recorded(&record(ctx, real), marker);
                 image_received_is_the_one_sent(
                     &sent_digest,
