@@ -374,14 +374,14 @@ pub struct Kept {
     pub resumed: bool,
 }
 
-/// What to remove: one message, or every message of a session.
+/// What to remove: the messages with these identities, and no others. A message kept after the
+/// window listed them is not named here, so it stays.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RemoveParams {
-    /// One message.
-    pub action_id: Option<ActionId>,
-    /// Every message of one session.
-    pub session_id: Option<SessionId>,
+    /// The identities of the messages to remove: at least one, and no more than the entries this
+    /// device keeps. A name twice counts once, and a name with no message is already removed.
+    pub action_ids: Vec<ActionId>,
 }
 
 /// What a removal did.
@@ -1065,18 +1065,22 @@ impl ChannelDesk {
         Ok(Kept { resumed: !wrote })
     }
 
-    /// Removes a message, or every message of a session. A file that cannot be read is never
-    /// touched.
+    /// Removes the messages with the identities named, and only those, with one flush of the
+    /// folder. A file that cannot be read is never touched.
     ///
     /// # Errors
     ///
-    /// Returns why the removal could not be made durable.
+    /// Returns why the removal could not be made durable. A refusal after the first file went
+    /// leaves that file removed: the answer says the removal is unconfirmed, not that nothing
+    /// changed.
     pub fn remove(&self, params: &RemoveParams) -> Result<Removed> {
-        if params.action_id.is_some() == params.session_id.is_some() {
+        if params.action_ids.is_empty() || params.action_ids.len() > MAX_ENTRIES {
             return Err(CommandError::invalid(
-                "name one message or one session to remove",
+                "name the messages to remove, and no more than a device keeps",
             ));
         }
+        let named: std::collections::HashSet<ActionId> =
+            params.action_ids.iter().copied().collect();
         let held = self.lock(false)?;
         if !held.present {
             return Ok(Removed { removed: 0 });
@@ -1084,9 +1088,7 @@ impl ChannelDesk {
         let found = scan(&held.directory).map_err(|error| storage(STORE, &error))?;
         let mut removed = 0;
         for message in &found.messages {
-            let chosen = params.action_id == Some(message.action_id)
-                || params.session_id == Some(message.session_id);
-            if !chosen {
+            if !named.contains(&message.action_id) {
                 continue;
             }
             match std::fs::remove_file(

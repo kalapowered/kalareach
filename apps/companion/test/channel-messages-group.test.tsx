@@ -297,6 +297,51 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(asked(of, 'remove')).toBe(2)
   })
 
+  it('K4b removes the messages "Remove all" showed and a message kept after the read stays', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    keepMessage(of, { text: 'one' })
+    keepMessage(of, { text: 'two' })
+    startOver(of)
+    const all = await screen.findByTestId('channel-session-remove-all')
+    expect(screen.getAllByTestId('channel-message')).toHaveLength(2)
+    // Another window keeps a third message of the session. This window has not read it.
+    keepMessage(of, { text: 'third, never shown' })
+    await person.click(all)
+    expect(asked(of, 'remove')).toBe(0)
+    await person.click(all)
+    await waitFor(() => {
+      expect(of.messages.all().map((each) => each.text)).toEqual(['third, never shown'])
+    })
+    expect(await screen.findByTestId('channel-message-text')).toHaveTextContent('third, never shown')
+    expect(asked(of, 'remove')).toBe(1)
+  })
+
+  it('K4c ends the armed state of "Remove all" when the list of the session changes', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    keepMessage(of, { text: 'one' })
+    keepMessage(of, { text: 'two' })
+    startOver(of)
+    const all = await screen.findByTestId('channel-session-remove-all')
+    await person.click(all)
+    expect(all).toHaveTextContent('Press again to remove all')
+    keepMessage(of, { text: 'three' })
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(screen.getAllByTestId('channel-message')).toHaveLength(3)
+    })
+    const again = screen.getByTestId('channel-session-remove-all')
+    expect(again).not.toHaveTextContent('Press again')
+    await person.click(again)
+    expect(asked(of, 'remove')).toBe(0)
+    expect(of.messages.all()).toHaveLength(3)
+    expect(again).toHaveTextContent('Press again to remove all')
+  })
+
   it('K5 says what could not be read, shows no empty group, and reads again on a failed read', async () => {
     const of = world()
     of.messages.leaveUnreadable('messages', { layout: 2 })

@@ -50,6 +50,18 @@ describe('the scripted store of channel messages keeps the native rules', () => 
     expect(other.all()).toEqual([])
   })
 
+  it('removes the messages a removal names and no other of their session, and refuses a removal that names none', () => {
+    const drafts = new FakeDraftStore()
+    const store = new FakeChannelMessageStore()
+    const id = (n: number) => `6a7b6c50-22bb-4c3d-8e4f-0000000005${String(n).padStart(2, '0')}`
+    for (const n of [1, 2, 3]) store.keep(request({ actionId: id(n) }), drafts)
+    // A name twice counts once, and a name with no message is already removed.
+    expect(store.remove({ actionIds: [id(1), id(3), id(3), id(9)] })).toEqual({ removed: 2 })
+    expect(store.all().map((each) => each.actionId)).toEqual([id(2)])
+    expect(refusal(() => store.remove({ actionIds: [] }))).toBe('INVALID_ARGUMENT')
+    expect(store.all()).toHaveLength(1)
+  })
+
   it('lets a file that cannot be read take its place against the bound of entries', () => {
     const drafts = new FakeDraftStore()
     const store = new FakeChannelMessageStore()
