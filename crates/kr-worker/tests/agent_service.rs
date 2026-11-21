@@ -6510,6 +6510,57 @@ fn stored_provenance(host: &Host, action_id: kr_protocol::ids::ActionId) -> Opti
         .expect("the receipt is stored")
 }
 
+/// What a channel's answer is refused with when the worker stopped waiting before the channel's
+/// queue took it: nothing was sent.
+const NOT_QUEUED_IN_TIME: &str =
+    "The worker stopped waiting before the channel's queue took the answer. Nothing was sent.";
+
+/// Answers `resource_id` until the worker's own bound passes with the channel's queue holding the
+/// answer, and gives that try's action, its outcome and what `arm` armed for it.
+///
+/// The bound is real time. A thread that is slow to make the call can pass it before the queue
+/// takes the answer, and the worker then proves that nothing was sent: the refusal of
+/// [`NOT_QUEUED_IN_TIME`], after which the request is pending again and repeating the answer has
+/// no effect. That outcome says the case's own situation did not arise, and it is not what the
+/// case is about, so the answer is repeated with the bound doubled, from `first_deadline`, up to
+/// five tries. What decides is the state the worker proves, never a delay: any other outcome is
+/// the case's to assert, and a case that never had one fails with each try's bound and outcome.
+/// `arm` is called before each try, because a pause is taken by the gate of one call. The tries'
+/// request numbers are `first_request` and every tenth one after it.
+async fn answered_once_the_queue_took_it<A>(
+    client: &mut LocalClient,
+    host: &Host,
+    resource_id: kr_protocol::ids::PendingResourceId,
+    first_request: u64,
+    first_deadline: std::time::Duration,
+    mut arm: impl FnMut() -> A,
+) -> (kr_protocol::ids::ActionId, Outcome, A) {
+    let mut tries = Vec::new();
+    for attempt in 0..5_u32 {
+        let deadline = first_deadline * 2_u32.pow(attempt);
+        host.service.set_upstream_deadline_for_tests(deadline);
+        let armed = arm();
+        let mutation = approval_mutation(
+            client,
+            host,
+            first_request + 10 * u64::from(attempt),
+            resource_id,
+        );
+        let action_id = mutation.action_id;
+        let outcome = send(client, mutation).await;
+        let unsent =
+            matches!(&outcome, Outcome::Error(error) if error.message == NOT_QUEUED_IN_TIME);
+        if !unsent {
+            return (action_id, outcome, armed);
+        }
+        tries.push(format!("{deadline:?}: refused as not sent"));
+    }
+    panic!(
+        "the channel's queue took no answer within the worker's bound in any try: {}",
+        tries.join("; ")
+    );
+}
+
 /// KR-REQ-12.18: two requests wait on one channel and each is answered through the decoder's own
 /// answer. Each answer is written to the channel, each ends as an outcome nobody can establish
 /// (the channel confirms nothing), and the first does not hold the second back.
@@ -6657,13 +6708,17 @@ async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_e
     let first = channel.relay(&host, "abcde").await;
     let second = channel.relay(&host, "fghij").await;
     let mut client = cli(&host).await;
-    host.service
-        .set_upstream_deadline_for_tests(std::time::Duration::from_secs(1));
-    let (arrived, release) = host.service.broker().pause_before_channel_write();
 
-    let mutation = approval_mutation(&client, &host, 60, first);
-    let action_id = mutation.action_id;
-    let Outcome::Error(error) = send(&mut client, mutation).await else {
+    let (action_id, outcome, (arrived, release)) = answered_once_the_queue_took_it(
+        &mut client,
+        &host,
+        first,
+        60,
+        std::time::Duration::from_secs(1),
+        || host.service.broker().pause_before_channel_write(),
+    )
+    .await;
+    let Outcome::Error(error) = outcome else {
         panic!("an answer nobody wrote in time ends as an outcome nobody can establish");
     };
     assert_eq!(error.code, ErrorCode::OutcomeUnknown);
@@ -6685,6 +6740,9 @@ async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_e
         "the answer the worker stopped waiting for is written all the same"
     );
 
+    // What follows is decided by what the channel writes, not by the bound.
+    host.service
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     let next = approval_mutation(&client, &host, 61, second);
     let next_id = next.action_id;
     let Outcome::Error(error) = send(&mut client, next).await else {
@@ -6733,13 +6791,17 @@ async fn kr_req_12_18_an_answer_the_queue_took_is_a_channel_end_before_the_call_
     let first = channel.relay(&host, "abcde").await;
     let second = channel.relay(&host, "fghij").await;
     let mut client = cli(&host).await;
-    host.service
-        .set_upstream_deadline_for_tests(std::time::Duration::from_secs(1));
-    let (arrived, release) = host.service.broker().pause_after_queueing();
 
-    let mutation = approval_mutation(&client, &host, 60, first);
-    let action_id = mutation.action_id;
-    let Outcome::Error(error) = send(&mut client, mutation).await else {
+    let (action_id, outcome, (arrived, release)) = answered_once_the_queue_took_it(
+        &mut client,
+        &host,
+        first,
+        60,
+        std::time::Duration::from_secs(1),
+        || host.service.broker().pause_after_queueing(),
+    )
+    .await;
+    let Outcome::Error(error) = outcome else {
         panic!("an answer whose call had not returned at the bound ends as an unknown outcome");
     };
     assert_eq!(error.code, ErrorCode::OutcomeUnknown);
@@ -6765,6 +6827,9 @@ async fn kr_req_12_18_an_answer_the_queue_took_is_a_channel_end_before_the_call_
         "the answer the queue took is written all the same"
     );
 
+    // What follows is decided by what the channel writes, not by the bound.
+    host.service
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     let next = approval_mutation(&client, &host, 61, second);
     let next_id = next.action_id;
     let Outcome::Error(error) = send(&mut client, next).await else {
@@ -7733,10 +7798,12 @@ async fn kr_req_12_26_an_answer_the_queue_had_not_taken_when_the_worker_stopped_
         ErrorCode::OutcomeUnknown,
         "nothing went out, so nothing is unknown"
     );
-    assert!(
-        arrived.try_recv().is_ok(),
-        "the call was held before its queue"
-    );
+    // The call is held before its queue whenever it gets there, so its arrival is waited for and
+    // not looked for at the moment the refusal came.
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends")
+        .expect("the call was held before its queue");
     assert_eq!(
         receipt(&mut client, first_id).await.state,
         ReceiptState::Refused,
@@ -7753,6 +7820,9 @@ async fn kr_req_12_26_an_answer_the_queue_had_not_taken_when_the_worker_stopped_
     );
 
     release.send(()).expect("the held call is let go");
+    // What follows is decided by what the channel writes, not by the bound.
+    host.service
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     let second = channel_answer(&client, &host, &channel.connector, 61, resource_id, "deny");
     let Outcome::Error(error) = send(&mut client, second).await else {
         panic!("the second answer ends as an outcome nobody can establish");
