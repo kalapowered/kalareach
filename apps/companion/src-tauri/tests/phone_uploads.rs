@@ -3044,17 +3044,18 @@ async fn kr_req_13_12_a_begin_refused_for_the_devices_count_frees_the_other_acco
     }
 }
 
-/// A draft the host holds for this device, which no entry of this application names.
-async fn host_draft(
+/// The request that makes a draft on the host for `session`, composed and not sent.
+async fn compose_create(
     adopted: &Adopted,
     paired: &Paired,
     session: kr_protocol::ids::SessionId,
-) -> kr_protocol::ids::DraftId {
+    text: &str,
+) -> kr_client::session::ComposedMutation {
     use kr_protocol::ids::ActionId;
     use kr_protocol::method::Method;
-    use kr_protocol::transfer::{DraftCreateParams, DraftCreateResult};
+    use kr_protocol::transfer::DraftCreateParams;
 
-    let composed = paired
+    paired
         .session
         .compose(
             Method::DraftCreate,
@@ -3067,12 +3068,23 @@ async fn host_draft(
                 device_id: Nullable::null(),
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
-                text: "a draft the host holds".to_owned(),
+                text: text.to_owned(),
             },
             kr_protocol::scalars::DurationMs::new(60_000),
         )
         .await
-        .expect("composed");
+        .expect("composed")
+}
+
+/// A draft the host holds for this device, which no entry of this application names.
+async fn host_draft(
+    adopted: &Adopted,
+    paired: &Paired,
+    session: kr_protocol::ids::SessionId,
+) -> kr_protocol::ids::DraftId {
+    use kr_protocol::transfer::DraftCreateResult;
+
+    let composed = compose_create(adopted, paired, session, "a draft the host holds").await;
     let made: DraftCreateResult = paired
         .session
         .send(&composed)
@@ -3190,6 +3202,222 @@ async fn kr_req_23_41_a_draft_creation_refused_for_the_devices_count_discards_th
         drafts_in(&folder(&phone)),
         1,
         "only the new account's entry is kept"
+    );
+    adopted.stop().await;
+}
+
+/// The earlier account keeps a known draft for each of `sessions`, and the device holds the host's
+/// whole bound of 64 open drafts.
+async fn fill_the_hosts_drafts(
+    adopted: &Adopted,
+    drafts: &companion_tauri::paired_drafts::Drafts,
+    paired: &Paired,
+    earlier: &Paired,
+    sessions: &[kr_protocol::ids::SessionId],
+) {
+    for session in sessions {
+        let id = host_draft(adopted, paired, *session).await;
+        drafts.keep_for_test(
+            earlier,
+            *session,
+            &net_support::on_the_session(&adopted.host, *session),
+            Some(id),
+            Some(kr_protocol::ids::DraftRevision::new(1)),
+        );
+    }
+    for _ in sessions.len()..64 {
+        host_draft(adopted, paired, sessions[0]).await;
+    }
+}
+
+/// KR-REQ-23.41: the freeing of another account's drafts reads each entry again in its own turn. A
+/// draft its account bound again since the entries were collected, whose creation has no answer yet,
+/// is left, and so is one its account has ended; only the draft that is still there as it was
+/// collected is discarded, and the creation that was refused is tried again with the place freed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_draft_bound_again_after_the_cleanup_collected_it_is_left_alone() {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(3).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let paired = paired_of(companion).await;
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let now = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..paired.clone()
+    };
+    let sessions: Vec<_> = adopted
+        .workers
+        .iter()
+        .map(|worker| worker.session_id)
+        .collect();
+    let target = |index: usize| net_support::on_the_session(&adopted.host, sessions[index]);
+    fill_the_hosts_drafts(&adopted, &drafts, &paired, &earlier, &sessions).await;
+    let bytes = vec![7_u8; 1000];
+    let handle = desk
+        .send(
+            now.clone(),
+            request(
+                &adopted,
+                &bytes,
+                Arc::new(Held::new(bytes.clone())),
+                kr_ipc::new_uuid(),
+            ),
+        )
+        .await
+        .expect("the upload is published");
+    let creates = control.sent(Method::DraftCreate);
+    let discards = control.sent(Method::DraftDiscard);
+    let collected = drafts.hold_after_collecting_for_test();
+    let binding = {
+        let bind: companion_tauri::paired_drafts::Bind = serde_json::from_value(json!({
+            "session_id": sessions[0].to_string(),
+            "text": "see the file",
+            "transfer_id": handle.transfer_id,
+            "contribution": contribution(),
+        }))
+        .expect("a bind");
+        let (drafts, now, target) = (Arc::clone(&drafts), now.clone(), target(0));
+        tokio::spawn(async move { drafts.bind(now, target, bind).await })
+    };
+    until("the freeing has collected the entries", || {
+        collected.passed() >= 1
+    })
+    .await;
+
+    // Since then the earlier account bound its second session's draft again, and the creation has
+    // no answer, and it ended its third session's draft.
+    let composed = compose_create(&adopted, &earlier, sessions[1], "bound again").await;
+    drafts.keep_create_for_test(&earlier, sessions[1], &target(1), &composed);
+    drafts
+        .end(earlier.clone(), target(2), sessions[2])
+        .await
+        .expect("the earlier account ends its draft");
+    collected.release();
+    let bound = binding.await.expect("the task ran");
+
+    assert!(
+        bound.is_ok(),
+        "the creation is tried again with the place freed: {bound:?}"
+    );
+    assert_eq!(
+        control.sent(Method::DraftCreate) - creates,
+        2,
+        "refused once, then tried again"
+    );
+    assert_eq!(
+        control.sent(Method::DraftDiscard) - discards,
+        2,
+        "the earlier account's own end, and the one draft the freeing found as it was collected"
+    );
+    assert_eq!(
+        drafts_in(&folder(&phone)),
+        2,
+        "the new account's entry and the earlier account's draft whose creation has no answer"
+    );
+    assert!(
+        !drafts
+            .kept(&earlier, sessions[0])
+            .expect("the draft is read")
+            .made,
+        "the draft still there as it was collected is gone"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-23.41: a freeing that finds no draft left as it was collected frees no place, so the
+/// creation that was refused is not tried again: the one draft the earlier account kept was bound
+/// again meanwhile and its creation has no answer, and the host's refusal stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_cleanup_that_finds_no_draft_left_as_collected_frees_no_place_and_asks_no_more()
+ {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let paired = paired_of(companion).await;
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let now = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..paired.clone()
+    };
+    let session = adopted.workers[0].session_id;
+    let target = net_support::on_the_session(&adopted.host, session);
+    fill_the_hosts_drafts(&adopted, &drafts, &paired, &earlier, &[session]).await;
+    let bytes = vec![7_u8; 1000];
+    let handle = desk
+        .send(
+            now.clone(),
+            request(
+                &adopted,
+                &bytes,
+                Arc::new(Held::new(bytes.clone())),
+                kr_ipc::new_uuid(),
+            ),
+        )
+        .await
+        .expect("the upload is published");
+    let creates = control.sent(Method::DraftCreate);
+    let discards = control.sent(Method::DraftDiscard);
+    let collected = drafts.hold_after_collecting_for_test();
+    let binding = {
+        let bind: companion_tauri::paired_drafts::Bind = serde_json::from_value(json!({
+            "session_id": session.to_string(),
+            "text": "see the file",
+            "transfer_id": handle.transfer_id,
+            "contribution": contribution(),
+        }))
+        .expect("a bind");
+        let (drafts, now, target) = (Arc::clone(&drafts), now.clone(), target.clone());
+        tokio::spawn(async move { drafts.bind(now, target, bind).await })
+    };
+    until("the freeing has collected the entry", || {
+        collected.passed() >= 1
+    })
+    .await;
+    let composed = compose_create(&adopted, &earlier, session, "bound again").await;
+    drafts.keep_create_for_test(&earlier, session, &target, &composed);
+    collected.release();
+    let bound = binding.await.expect("the task ran");
+
+    assert!(
+        bound.is_err(),
+        "the host's refusal stands, no place was freed: {bound:?}"
+    );
+    assert_eq!(
+        control.sent(Method::DraftCreate) - creates,
+        1,
+        "the creation was asked for once"
+    );
+    assert_eq!(
+        control.sent(Method::DraftDiscard) - discards,
+        0,
+        "nothing was discarded"
+    );
+    assert_eq!(
+        drafts_in(&folder(&phone)),
+        2,
+        "the earlier account's draft whose creation has no answer is left, beside the new account's entry"
     );
     adopted.stop().await;
 }

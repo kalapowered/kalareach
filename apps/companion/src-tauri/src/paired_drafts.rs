@@ -298,6 +298,9 @@ pub struct Drafts {
     /// How many times a freeing of other accounts' drafts freed something, so that a creation that
     /// was refused while another creation's freeing ran knows a place may be free.
     places_freed: std::sync::atomic::AtomicU64,
+    /// A suite's hold on the freeing of other accounts' drafts, after it has collected their entries.
+    #[cfg(feature = "testing")]
+    collected: Mutex<Option<Arc<crate::open_transfers::testing::Hold>>>,
 }
 
 impl std::fmt::Debug for Drafts {
@@ -865,6 +868,8 @@ impl Drafts {
                 file.session_id,
             ));
         }
+        #[cfg(feature = "testing")]
+        self.hold_after_collecting();
         let mut freed = false;
         for (theirs, session_id) in others {
             let Some(_turn) = self.try_turn(&theirs, session_id) else {
@@ -1165,6 +1170,28 @@ fn unkept(error: std::io::Error) -> CommandError {
 /// What a suite keeps in the folder to stand for a draft that an earlier process left.
 #[cfg(feature = "testing")]
 impl Drafts {
+    /// Stops every freeing of other accounts' drafts after it has collected their entries and before
+    /// it takes the first turn, until the returned hold is released, and counts each that comes.
+    pub fn hold_after_collecting_for_test(&self) -> Arc<crate::open_transfers::testing::Hold> {
+        let hold = Arc::new(crate::open_transfers::testing::Hold::default());
+        *self
+            .collected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&hold));
+        hold
+    }
+
+    fn hold_after_collecting(&self) {
+        let hold = self
+            .collected
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hold) = hold {
+            hold.arrive(true);
+        }
+    }
+
     /// Keeps an entry for the draft of `session_id`, as an earlier process left it.
     ///
     /// # Panics
