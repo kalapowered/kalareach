@@ -1034,7 +1034,7 @@ async fn a_reused_catalogue_identifier_is_refused_for_a_fence_and_is_no_copy_of_
 
     let control = attempt(&reused, false).await;
     assert!(
-        !control.is_copied() && !control.is_withheld(),
+        !control.is_copied() && control.origin() != crate::given::Origin::Withheld,
         "a reused identifier is the host's own word and no copy of the receipt"
     );
     assert_eq!(
@@ -1047,7 +1047,7 @@ async fn a_reused_catalogue_identifier_is_refused_for_a_fence_and_is_no_copy_of_
 
     let fenced = attempt(&reused, true).await;
     assert!(
-        !fenced.is_withheld() && !fenced.is_copied(),
+        fenced.origin() != crate::given::Origin::Withheld && !fenced.is_copied(),
         "the fence's refusal answers for this request alone"
     );
     refused_for_a_fence(
@@ -1059,7 +1059,7 @@ async fn a_reused_catalogue_identifier_is_refused_for_a_fence_and_is_no_copy_of_
 
     let copy = attempt(&first, true).await;
     assert!(
-        copy.is_withheld(),
+        copy.origin() == crate::given::Origin::Withheld,
         "a copy of the receipt is still withheld"
     );
     controller.hold_fence(false);

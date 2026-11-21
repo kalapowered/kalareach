@@ -1277,7 +1277,7 @@ mod tests {
             .enable(finished.repeat, Arc::new(Fenced { owed: true }))
             .await;
         assert!(
-            given.is_withheld(),
+            given.origin() == crate::given::Origin::Withheld,
             "a repeat while a fence is owed is withheld"
         );
         assert!(matches!(

@@ -4150,7 +4150,7 @@ mod tests {
         release.send(()).expect("the repeat goes on");
         let refused = waiting.await.expect("the repeat finishes");
         assert!(
-            refused.is_withheld(),
+            refused.origin() == crate::given::Origin::Withheld,
             "the repeat found the first submission's record and did not register again, and the \
              refusal is a copy the service withheld"
         );

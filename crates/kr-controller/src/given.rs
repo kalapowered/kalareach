@@ -123,13 +123,6 @@ impl<T> Given<T> {
         matches!(self.origin, Origin::Copied)
     }
 
-    /// Whether the service read the record of an earlier submission and withheld what it holds.
-    #[cfg(any(test, feature = "testing"))]
-    #[must_use]
-    pub const fn is_withheld(&self) -> bool {
-        matches!(self.origin, Origin::Withheld)
-    }
-
     /// Where the answer came from, for a door that tells a device the answer.
     pub(crate) const fn origin(&self) -> Origin {
         self.origin
@@ -506,7 +499,7 @@ mod tests {
         assert_eq!(given.into_answer_for_test().ok(), Some(7));
 
         let given = Recorded::read(Ok::<_, ControllerError>(7)).checked(|| Err(refusal()));
-        assert!(given.is_withheld());
+        assert!(given.origin() == crate::given::Origin::Withheld);
         assert!(matches!(
             given.into_answer_for_test(),
             Err(ControllerError::PermissionDenied { .. })
