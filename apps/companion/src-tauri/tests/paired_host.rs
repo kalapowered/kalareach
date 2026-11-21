@@ -3129,6 +3129,39 @@ async fn visit_held(
     .expect("the visit reaches its hold")
 }
 
+/// Holds the visit to `host` at its hold, which is outside the ten seconds a visit is bound to, so
+/// that no time a case takes ends it: the hold is given once the visit reaches it. Every other
+/// visit goes on as it reaches its hold, and so does a later visit to `host`.
+fn hold_visit_of(
+    mut visits: tokio::sync::mpsc::UnboundedReceiver<companion_tauri::inbox::testing::VisitHold>,
+    host: kr_protocol::ids::DeviceId,
+) -> tokio::sync::oneshot::Receiver<companion_tauri::inbox::testing::VisitHold> {
+    let (given, reached) = tokio::sync::oneshot::channel();
+    let mut given = Some(given);
+    tokio::spawn(async move {
+        while let Some(hold) = visits.recv().await {
+            if hold.host == host
+                && let Some(given) = given.take()
+            {
+                let _ = given.send(hold);
+            } else {
+                hold.release();
+            }
+        }
+    });
+    reached
+}
+
+/// The hold of the visit that [`hold_visit_of`] waits for, once the visit reaches it.
+async fn slow_visit(
+    reached: tokio::sync::oneshot::Receiver<companion_tauri::inbox::testing::VisitHold>,
+) -> companion_tauri::inbox::testing::VisitHold {
+    tokio::time::timeout(WATCHDOG, reached)
+        .await
+        .expect("the slow visit reaches its hold")
+        .expect("the hold is given")
+}
+
 /// A row of a pass's answer, by the reference of its host.
 fn row_of<'a>(reply: &'a serde_json::Value, reference: &str) -> Option<&'a serde_json::Value> {
     hosts_of(reply)
@@ -3141,7 +3174,9 @@ fn row_of<'a>(reply: &'a serde_json::Value, reference: &str) -> Option<&'a serde
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_host_does_not_delay_another_hosts_contact_event() {
     let v = visiting().await;
-    let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
+    // C's visit is held after its read, outside the ten seconds a visit is bound to, so no time
+    // the case takes ends it.
+    let slow = hold_visit_of(v.companion().inbox().watch_visits(), v.id_of(&v.c_ref));
     v.control
         .refuse_request(Some((Method::AttentionRead, lapsed())));
     let pass = v.pass();
@@ -3152,7 +3187,7 @@ async fn a_slow_host_does_not_delay_another_hosts_contact_event() {
         "A's refusal was told before the pass returned"
     );
     v.control.refuse_request(None);
-    v.control.release_dialled();
+    slow_visit(slow).await.release();
     pass.await
         .expect("the pass ran")
         .expect("the pass answered");
@@ -3164,7 +3199,9 @@ async fn a_slow_host_does_not_delay_another_hosts_contact_event() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_visits_contact_is_published_while_the_pass_reply_is_held() {
     let v = visiting().await;
-    let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
+    // C's visit is held after its read, outside the ten seconds a visit is bound to, so no time
+    // the case takes ends it.
+    let slow = hold_visit_of(v.companion().inbox().watch_visits(), v.id_of(&v.c_ref));
     v.control.end_connections(true);
     let pass = v.pass();
     let lost = until_told(v.companion(), &v.a_ref, "out_of_contact").await;
@@ -3175,7 +3212,7 @@ async fn a_visits_contact_is_published_while_the_pass_reply_is_held() {
         "out_of_contact"
     );
     v.control.end_connections(false);
-    v.control.release_dialled();
+    slow_visit(slow).await.release();
     pass.await
         .expect("the pass ran")
         .expect("the pass answered");
@@ -3187,7 +3224,9 @@ async fn a_visits_contact_is_published_while_the_pass_reply_is_held() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_then_a_recovery_of_one_host_is_told_in_order_while_c_is_slow() {
     let v = visiting().await;
-    let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
+    // C's visit is held after its read, outside the ten seconds a visit is bound to, so no time
+    // the case takes ends it.
+    let slow = hold_visit_of(v.companion().inbox().watch_visits(), v.id_of(&v.c_ref));
     v.control
         .refuse_request(Some((Method::AttentionRead, lapsed())));
     let first = v.pass();
@@ -3199,7 +3238,7 @@ async fn a_refusal_then_a_recovery_of_one_host_is_told_in_order_while_c_is_slow(
         !first.is_finished() && !second.is_finished(),
         "C holds both"
     );
-    v.control.release_dialled();
+    slow_visit(slow).await.release();
     first.await.expect("the first ran").expect("answered");
     second.await.expect("the second ran").expect("answered");
     // Every state C's contact makes carries A's entry too: A's changes are the entries that differ
