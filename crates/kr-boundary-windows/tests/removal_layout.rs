@@ -288,9 +288,12 @@ fn a_name_is_said_to_be_gone_only_where_a_read_of_it_afterwards_found_nothing() 
             && text.contains("is still there after its removal answered that it was done"),
         "{text}"
     );
-    // A look that fails for another reason than not found: whether it is gone is not known.
-    let below_a_file = there.join("child");
-    let text = found_after_removal(&below_a_file).expect("a look below a file cannot tell");
+    // A look that fails for another reason than not found: whether it is gone is not known. A name
+    // that holds a NUL byte is refused by every platform before any file is asked, as invalid
+    // input. A name below a file is not used: Unix answers "not a directory" for it and Windows
+    // answers "path not found", which is an answer of absence.
+    let unreadable = folder.path().join("a\0b");
+    let text = found_after_removal(&unreadable).expect("a look at such a name cannot tell");
     assert!(
         text.contains("so whether it is gone is not known") && !text.contains("is gone."),
         "{text}"
