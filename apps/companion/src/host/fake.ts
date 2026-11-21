@@ -2224,14 +2224,14 @@ export function fakeHost(
     deviceDraftSave: (request) => Promise.resolve(drafts.save(request)),
     deviceDraftRetarget: (request) => Promise.resolve(drafts.retarget(request)),
     deviceDraftDiscard: (request) => Promise.resolve(drafts.discard(request)),
-    deviceDraftMarkRemoval: (request) => Promise.resolve(drafts.markRemoval(request)),
+    deviceDraftMarkRemoval: (request) => Promise.resolve(channelMessages.markRemoval(request, drafts)),
     deviceChannelMessages: (request) => Promise.resolve(channelMessages.list(request.withText)),
     deviceChannelMessageKeep: (request) => Promise.resolve(channelMessages.keep(request, drafts)),
     deviceChannelMessageRemove: (request) => Promise.resolve(channelMessages.remove(request)),
     deviceChannelHoldCreate: (request) => Promise.resolve(channelMessages.createHold(request)),
     deviceChannelHoldUpdate: (request) => Promise.resolve(channelMessages.updateHold(request)),
     deviceChannelHoldClear: (request) => Promise.resolve(channelMessages.clearHold(request)),
-    deviceDraftsLedgerSetAside: () => Promise.resolve(channelMessages.setAside()),
+    deviceDraftsLedgerSetAside: () => Promise.resolve(channelMessages.setAside(drafts)),
 
     draftCreate: (params, subject) => {
       requireConnection()

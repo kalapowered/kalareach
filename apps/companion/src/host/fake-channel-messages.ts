@@ -10,16 +10,17 @@
  * draft store's own ledger.
  */
 
-import type {
-  ChannelHoldCreate,
-  ChannelMessageKeep,
-  ChannelMessageList,
-  ChannelMessageRemoval,
-  DraftDiscardRequest,
-  LedgerSetAside,
-  StoredChannelMessage,
-  StoredDrafts,
-  StoredHold
+import {
+  failureMessage,
+  type ChannelHoldCreate,
+  type ChannelMessageKeep,
+  type ChannelMessageList,
+  type ChannelMessageRemoval,
+  type DraftDiscardRequest,
+  type LedgerSetAside,
+  type StoredChannelMessage,
+  type StoredDrafts,
+  type StoredHold
 } from './port'
 import type { DraftDisk } from './fake-drafts'
 import type { FakeDraftStore } from './fake-drafts'
@@ -46,10 +47,38 @@ interface Entry extends StoredChannelMessage {
 const encoder = new TextEncoder()
 /** Bytes, as native code counts them: a bound on text and on a record is on UTF-8, not on UTF-16 units. */
 const bytesOf = (text: string): number => encoder.encode(text).length
-const sizeOf = (entry: Entry): number => bytesOf(JSON.stringify(entry))
+/**
+ * The file a message is in, as native code writes it: these members in this order, the time as a
+ * number and each draft by its own members. The bound on bytes counts this file's length.
+ */
+const fileOf = (entry: Entry): string =>
+  JSON.stringify({
+    version: 1,
+    action_id: entry.actionId,
+    hold_id: entry.holdId,
+    local_id: entry.localId,
+    session_id: entry.sessionId,
+    application_instance_id: entry.applicationInstanceId,
+    agent_binding_revision: entry.agentBindingRevision,
+    environment_id: entry.environmentId,
+    host_name: entry.hostName,
+    text: entry.text,
+    sent_at_ms: Number(entry.sentAtMs),
+    drafts: entry.drafts.map((each) => ({ id: each.id, expectedRevision: each.expectedRevision }))
+  })
+const sizeOf = (entry: Entry): number => bytesOf(fileOf(entry))
+/** The list of removals' own words when it cannot be read, as native code says them. */
+const LEDGER_UNREADABLE = 'This device could not read its list of removals.'
+const NOT_SET_ASIDE = 'This device could not set the list aside. The original list is still in place.'
+const key = (each: DraftDiscardRequest): string => `${each.id}\n${each.expectedRevision}`
+/** The references of `entries`, each once, in the order they are first named. */
+const referencesOf = (entries: Iterable<Entry>): DraftDiscardRequest[] => {
+  const seen = new Map<string, DraftDiscardRequest>()
+  for (const entry of entries) for (const each of entry.drafts) if (!seen.has(key(each))) seen.set(key(each), each)
+  return [...seen.values()]
+}
 /** Whether two lists name the same drafts, as sets: an order or a repeat makes no difference. */
 const sameDrafts = (left: readonly DraftDiscardRequest[], right: readonly DraftDiscardRequest[]): boolean => {
-  const key = (each: DraftDiscardRequest): string => `${each.id}\n${each.expectedRevision}`
   const a = new Set(left.map(key))
   const b = new Set(right.map(key))
   return a.size === b.size && [...a].every((each) => b.has(each))
@@ -61,6 +90,7 @@ export class FakeChannelMessageStore {
   #holds = new Map<string, StoredHold>()
   #limits: { entries: number; bytes: number; holds: number } = { ...FAKE_CHANNEL_LIMITS }
   #unreadableMessages = { layout: 0, now: 0 }
+  #unreadableMessageBytes = 0
   #unreadableHolds = { layout: 0, now: 0 }
   #damagedHolds: string[] = []
   #refuseKeeps: { code: string; message: string } | null = null
@@ -113,11 +143,16 @@ export class FakeChannelMessageStore {
     this.#limits = { ...this.#limits, ...limits }
   }
 
-  /** Makes the store report files it could not read, which it leaves where they are. */
-  leaveUnreadable(kind: 'messages' | 'holds', counts: { layout?: number; now?: number }): void {
+  /**
+   * Makes the store report files it could not read, which it leaves where they are. The messages'
+   * files take their places and their `bytes` (all together) against the bounds, as native code
+   * counts the sizes the folder gives.
+   */
+  leaveUnreadable(kind: 'messages' | 'holds', counts: { layout?: number; now?: number; bytes?: number }): void {
     const target = kind === 'messages' ? this.#unreadableMessages : this.#unreadableHolds
     if (counts.layout !== undefined) target.layout = counts.layout
     if (counts.now !== undefined) target.now = counts.now
+    if (kind === 'messages' && counts.bytes !== undefined) this.#unreadableMessageBytes = counts.bytes
   }
 
   /** Lists records of this layout whose bytes do not parse, by name. */
@@ -160,17 +195,32 @@ export class FakeChannelMessageStore {
     this.#setAsideUnconfirmed = true
   }
 
-  /** Sets a damaged list aside: nothing else is set aside, and a list that is readable is refused. */
-  setAside(): LedgerSetAside {
+  /**
+   * Sets a damaged list aside and replaces it with the list the entries rebuild, every draft a
+   * message names once: nothing else is set aside, a list that is readable is refused, and a
+   * change of the list that is refused leaves the damaged one in place.
+   */
+  setAside(draftStore: FakeDraftStore): LedgerSetAside {
     this.calls.push({ kind: 'set-aside' })
     if (this.#refuseSetAside) refuse(this.#refuseSetAside.code, this.#refuseSetAside.message)
     if (this.#ledger !== 'damaged') refuse('INVALID_ARGUMENT', 'The list of removals is not damaged, so it was not set aside.')
+    try {
+      draftStore.replaceRemovals(referencesOf(this.#entries.values()))
+    } catch (failure) {
+      refuse('LOCAL_FAILURE', `${NOT_SET_ASIDE} ${failureMessage(failure)}`)
+    }
     this.#ledger = 'ok'
     const confirmed = !this.#setAsideUnconfirmed
     this.#setAsideUnconfirmed = false
     // A move that is not on disk yet is made so by the next read of the drafts, which refuses until then.
     this.#flushOwed = !confirmed
     return { moved: true, confirmed }
+  }
+
+  /** A removal recorded by the page, as native code records one: over a list that cannot be read it fails. */
+  markRemoval(request: DraftDiscardRequest, draftStore: FakeDraftStore): void {
+    if (this.#ledger !== 'ok') refuse('LOCAL_FAILURE', LEDGER_UNREADABLE)
+    draftStore.markRemoval(request)
   }
 
   /** The messages kept, with their text, oldest first, as a test reads them. */
@@ -202,7 +252,7 @@ export class FakeChannelMessageStore {
       unreadableHolds: this.#unreadableHolds,
       used: {
         entries: entries.length + this.#unreadableMessages.layout + this.#unreadableMessages.now,
-        bytes: entries.reduce((sum, entry) => sum + sizeOf(entry), 0)
+        bytes: entries.reduce((sum, entry) => sum + sizeOf(entry), this.#unreadableMessageBytes)
       },
       limits: this.#limits
     }
@@ -236,7 +286,7 @@ export class FakeChannelMessageStore {
       resumed = true
     } else {
       const entry: Entry = { ...request }
-      const used = [...this.#entries.values()].reduce((sum, each) => sum + sizeOf(each), 0)
+      const used = [...this.#entries.values()].reduce((sum, each) => sum + sizeOf(each), this.#unreadableMessageBytes)
       // A file that cannot be read still takes its place: it counts against the bound of entries.
       const places = this.#entries.size + this.#unreadableMessages.layout + this.#unreadableMessages.now
       if (places >= this.#limits.entries || used + sizeOf(entry) > this.#limits.bytes) {
@@ -249,9 +299,20 @@ export class FakeChannelMessageStore {
       this.#stopAfterEntry = false
       refuse('RESOURCE_UNAVAILABLE', 'the process stopped after the message was kept')
     }
-    // A list of removals that cannot be read is never written over: the entry stays, and the keep fails.
-    if (this.#ledger !== 'ok') refuse('LOCAL_FAILURE', 'This device could not read its list of removals.')
-    for (const reference of request.drafts) draftStore.markRemoval(reference)
+    // Every keep, a resume and one with no references included, takes the ledger step: one change
+    // that names all the drafts or none. A list that cannot be read is never written over.
+    if (this.#ledger !== 'ok') refuse('LOCAL_FAILURE', LEDGER_UNREADABLE)
+    try {
+      draftStore.markRemovals(request.drafts)
+    } catch (failure) {
+      // An entry this keep wrote is undone while the list names none of its drafts; a resume's stays.
+      const named = draftStore.pendingRemovals().some((line) => request.drafts.some((each) => key(each) === key(line)))
+      if (!resumed && !named) {
+        this.#entries.delete(request.actionId)
+        this.#write()
+      }
+      throw failure
+    }
     if (this.#ledgerFaultAfterRename) {
       this.#ledgerFaultAfterRename = false
       refuse('RESOURCE_UNAVAILABLE', 'This device could not read or write its list of removals.')
@@ -317,24 +378,38 @@ export class FakeChannelMessageStore {
       refuse('STORAGE_UNAVAILABLE', 'the data directory could not be made durable yet')
     }
     const read = draftStore.list()
-    if (!this.#withoutRepair) {
-      for (const entry of this.#entries.values()) {
-        for (const reference of entry.drafts) {
-          if (read.drafts.some((draft) => draft.id === reference.id && draft.revision === reference.expectedRevision)) {
-            draftStore.markRemoval(reference)
-          }
-        }
-        for (const hold of [...this.#holds.values()]) {
-          if (hold.holdId === entry.holdId || (hold.actionId !== null && hold.actionId === entry.actionId)) {
-            this.#holds.delete(hold.holdId)
-          }
-        }
+    // Every draft a durable entry holds the text of, and that is still stored at that version, is owed.
+    const owed = this.#withoutRepair
+      ? []
+      : referencesOf(this.#entries.values()).filter((each) =>
+          read.drafts.some((draft) => draft.id === each.id && draft.revision === each.expectedRevision)
+        )
+    if (!this.#withoutRepair && this.#ledger === 'ok') {
+      let named = true
+      try {
+        draftStore.markRemovals(owed)
+      } catch {
+        // The owed references are still returned below; the records of sends stay for the next read.
+        named = false
       }
-      this.#write()
+      if (named) {
+        for (const entry of this.#entries.values()) {
+          for (const hold of [...this.#holds.values()]) {
+            if (hold.holdId === entry.holdId || (hold.actionId !== null && hold.actionId === entry.actionId)) {
+              this.#holds.delete(hold.holdId)
+            }
+          }
+        }
+        this.#write()
+      }
     }
+    // A list that cannot be read names nothing; what the entries owe is returned whatever happened to it.
+    const lines = this.#ledger === 'ok' ? draftStore.pendingRemovals() : []
+    const pendingRemovals = [...lines]
+    for (const each of owed) if (!pendingRemovals.some((line) => key(line) === key(each))) pendingRemovals.push(each)
     return {
       ...read,
-      pendingRemovals: draftStore.pendingRemovals(),
+      pendingRemovals,
       sources: this.#unreadableMessages.now > 0 || this.#ledger !== 'ok' ? 'unknown' : 'known',
       ledger: this.#ledger
     }
