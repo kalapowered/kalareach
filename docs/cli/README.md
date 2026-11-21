@@ -2044,9 +2044,15 @@ spelling.
 
 The program and each argument are kept and typed exactly as written. They are never joined into
 one string, and a leading `~`, a `$VARIABLE`, a pipe or a redirection is not expanded. On bash,
-zsh, fish and sh every word is single-quoted when it is typed, so the shell finds the program
-itself and the arguments reach it as they were saved. POSIX shells split the words, so the vector
-is exact. On Windows a program parses its own command line, and Windows PowerShell 5.1 drops an
+zsh and fish every word is single-quoted when it is typed, so the shell finds the program itself
+and the arguments reach it as they were saved; for sh and the other stock shells the page shows
+the line to type, with every word single-quoted. POSIX shells split the words, so the vector is
+exact. PowerShell is the one place where a `~` is read: it looks for a program word that begins
+with `~` under the home folder, and an argument that begins with `~` stays as written. Where the
+session runs PowerShell the page says: "The program and each argument are passed as written: a
+$VARIABLE, or a ~ at the start of an argument, is not expanded, and there are no pipes or
+redirections. A program that begins with ~ is looked for under the home folder. Use a full path, or
+a program on the shell's path." On Windows a program parses its own command line, and Windows PowerShell 5.1 drops an
 empty argument and changes quotes inside an argument; the companion's form shows what it will
 type.
 
@@ -2065,7 +2071,8 @@ again by itself:
 - A confirmed save or removal exits 0, including a save that asks for what the list already holds
   (`The launch command "x" is already saved as written.`) and a removal of a label that is not
   there (`No launch command is named "x".`).
-- A write that the host did not apply because the list moved prints
+- A write that the host did not apply because the list moved, where the list does not already hold
+  the result (the command as written for a save, no command with the label for a removal), prints
   `The saved launch commands changed before this request could apply. Run the command again.`,
   with the list as it now stands, and exits 8. Nothing was applied. Running the command again
   applies it against the new list.

@@ -10,7 +10,8 @@
 //! The file holds a format number, a revision and the commands in the order they were first saved.
 //! The revision is a random non-zero number made for each change, compared for equality only; 0 is
 //! the revision of a host with no file. An emptied list stays a file with a fresh revision, so a
-//! revision never stands for two different lists even after a person moves a damaged file away.
+//! revision stands for two different lists only by a chance of about one in 2^64, also after a
+//! person moves a damaged file away.
 //!
 //! A write names the revision it read. A request against a revision the list has left writes
 //! nothing and is answered with the list as it stands. The check of a command is one function in
@@ -956,7 +957,6 @@ mod tests {
         );
         assert!(failed.to_string().contains(FILE_NAME), "{failed}");
     }
-}
 
     /// Puts `bytes` where the host keeps its file, as the host writes it: owner only, whatever the
     /// umask. A row that wrote with `std::fs::write` would be refused for its mode under a umask of
@@ -985,3 +985,4 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("a mode");
         assert_eq!(labels(&read(dir.path()).expect("reads")), ["one"]);
     }
+}
