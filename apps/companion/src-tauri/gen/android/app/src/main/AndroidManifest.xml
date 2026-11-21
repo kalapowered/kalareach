@@ -25,6 +25,18 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
+    <!--
+      Package visibility, from Android 11 on: an application sees only the apps its own manifest
+      names. "Take a photo" is a file input with a capture hint, and the WebView's file chooser
+      (wry's RustWebChromeClient) opens the camera only after it finds an app that answers this
+      action. Without the entry it finds none, and the person gets the photo picker instead.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
+
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
