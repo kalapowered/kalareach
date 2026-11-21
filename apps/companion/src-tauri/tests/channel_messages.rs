@@ -1678,8 +1678,10 @@ fn a_set_aside_whose_flush_failed_is_owed_and_completed_before_any_adoption() {
             "nothing moved"
         );
     }
-    let _copy = data.path().join("drafts-removals.set-aside-7");
-    std::fs::remove_file(&_copy).expect("the stray copy of the first attempt");
+    assert!(
+        !data.path().join("drafts-removals.set-aside-7").exists(),
+        "the first attempt stopped at its first proof and copied nothing"
+    );
     let slot = Arc::new(Mutex::new(None));
     let hold_slot = Arc::clone(&slot);
     let root = data.path().to_path_buf();
@@ -1823,10 +1825,10 @@ fn a_set_aside_waits_for_the_ledgers_file_lock() {
     drop(window);
 }
 
-/// KR-REQ-12.26: with no message directory, a refused flush after a set-aside still keeps the flush
-/// owed, so the drafts refuse until it is made.
+/// KR-REQ-12.26: a set-aside made with no folder of messages makes the folder, under its lock, and a
+/// refused flush after it keeps the flush owed, so the drafts refuse until it is made.
 #[test]
-fn a_set_aside_with_no_message_directory_keeps_its_flush_owed() {
+fn a_set_aside_keeps_its_flush_owed_over_the_folder_it_made() {
     let data = data();
     let window = Window::over(data.path());
     // The draft store is open before the refusal is made, so that only the proof of the data
@@ -1845,7 +1847,10 @@ fn a_set_aside_with_no_message_directory_keeps_its_flush_owed() {
     window
         .call("device_drafts_ledger_set_aside", json!(null))
         .expect("moved");
-    assert!(!dir(data.path()).exists(), "no message directory exists");
+    assert!(
+        dir(data.path()).is_dir(),
+        "the set-aside made the folder of messages and took its lock"
+    );
     {
         let refusal = (window.drafts()).clone().expect_err("the call is refused");
         assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
@@ -1938,9 +1943,10 @@ fn a_set_aside_refuses_while_an_entrys_name_is_not_proved_durable() {
 }
 
 /// KR-REQ-12.26: another state over the data directory, which owes nothing itself, proves a
-/// set-aside durable before it reads, whether or not there is a folder of messages.
+/// set-aside durable before it reads. The set-aside made the folder of messages, so the read takes
+/// the folder's lock too.
 #[test]
-fn another_state_proves_a_set_aside_durable_before_it_reads_with_no_message_folder() {
+fn another_state_proves_a_set_aside_durable_before_it_reads() {
     let data = data();
     let first = Window::over(data.path());
     let second = Window::over(data.path());
@@ -1972,7 +1978,10 @@ fn another_state_proves_a_set_aside_durable_before_it_reads_with_no_message_fold
         second.drafts().is_ok(),
         "the read answers once the flush can be made"
     );
-    assert!(!dir(data.path()).exists(), "there is no folder of messages");
+    assert!(
+        dir(data.path()).is_dir(),
+        "the set-aside made the folder of messages"
+    );
 }
 
 /// A change to the members of a stored file, as a case under test makes it.
@@ -2565,6 +2574,88 @@ fn a_read_with_no_folder_of_messages_holds_the_ledger_lock_against_another_proce
         "the read saw the list before the set-aside: {note}"
     );
     drop(reader);
+}
+
+const CHILD_WRITER_CASE: &str = "the_writer_process_of_the_set_aside_case_does_nothing_by_itself";
+
+/// The second process of `a_record_written_in_another_process_waits_for_a_set_aside_that_began_with_no_folder`.
+/// It writes the record of a send, which makes the folder of messages when there is none, and then
+/// reads the drafts; it does nothing unless the case that starts it names the directories.
+#[test]
+fn the_writer_process_of_the_set_aside_case_does_nothing_by_itself() {
+    let (Ok(data), Ok(signals)) = (std::env::var(CHILD_DATA), std::env::var(CHILD_SIGNALS)) else {
+        return;
+    };
+    let (data, signals) = (PathBuf::from(data), PathBuf::from(signals));
+    let window = Window::over(&data);
+    let made = window.create_hold("hold-b", &[]);
+    let read = window.drafts();
+    let note = json!({
+        "made": made.is_ok(),
+        "answered": read.is_ok(),
+        "ledger": read.as_ref().map_or(Value::Null, |read| read["ledger"].clone()),
+    });
+    std::fs::write(signals.join("wrote"), note.to_string()).expect("the note of the writer");
+}
+
+/// KR-REQ-12.26: a set-aside that began with no folder of messages holds the folder's lock as well,
+/// so a process that writes the first record of a send meanwhile waits for it, and its read then
+/// sees the rebuilt list and not a list that is not yet on disk.
+#[test]
+fn a_record_written_in_another_process_waits_for_a_set_aside_that_began_with_no_folder() {
+    let data = data();
+    let signals = PrivateTempDir::create();
+    std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
+    let own = signals.path().to_path_buf();
+    let _at = testing::at(data.path(), Point::SetAsideCopied, move || {
+        std::fs::write(own.join("copied"), b"")?;
+        let _ = file_appears(&own.join("go"), WAIT * 3);
+        Ok(())
+    });
+    let set_aside = on_thread(data.path(), |window| {
+        window.call("device_drafts_ledger_set_aside", json!(null))
+    });
+    assert!(
+        file_appears(&signals.path().join("copied"), WAIT * 2),
+        "the set-aside reached its copy"
+    );
+    let writer = Process(
+        std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args(["--exact", CHILD_WRITER_CASE, "--test-threads", "1"])
+            .env(CHILD_DATA, data.path())
+            .env(CHILD_SIGNALS, signals.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a second process"),
+    );
+    assert!(
+        !file_appears(&signals.path().join("wrote"), SHORT),
+        "the second process waits while the set-aside holds the folder's lock"
+    );
+    std::fs::write(signals.path().join("go"), b"").expect("let the set-aside go on");
+    let moved = set_aside.recv_timeout(WAIT).expect("the set-aside ends");
+    assert!(
+        moved
+            .as_ref()
+            .is_ok_and(|done| done["moved"] == true && done["confirmed"] == true),
+        "the set-aside ends: {moved:?}"
+    );
+    assert!(
+        file_appears(&signals.path().join("wrote"), WAIT),
+        "the second process ended once the set-aside had"
+    );
+    let note: Value = serde_json::from_slice(
+        &std::fs::read(signals.path().join("wrote")).expect("the note of the writer"),
+    )
+    .expect("a note");
+    assert_eq!(note["made"], true, "{note}");
+    assert_eq!(note["answered"], true, "{note}");
+    assert_eq!(
+        note["ledger"], "ok",
+        "the read saw the rebuilt list: {note}"
+    );
+    drop(writer);
 }
 
 /// KR-REQ-12.26: over a list of removals that cannot be read at all (a directory at its name) a
