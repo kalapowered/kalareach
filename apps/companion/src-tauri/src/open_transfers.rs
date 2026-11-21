@@ -1398,6 +1398,17 @@ fn view_of(
     }
 }
 
+#[cfg(feature = "testing")]
+impl Desk {
+    /// Whether `paired`'s connection is the newest one this desk was told the host was reached on.
+    #[must_use]
+    pub fn holds_newest_for_test(&self, paired: &Paired) -> bool {
+        locked(&self.sessions)
+            .get(&(paired.environment_id, paired.device_id))
+            .is_some_and(|newest| Arc::ptr_eq(newest, &paired.session))
+    }
+}
+
 /// What a suite keeps in the folder to stand for an upload that an earlier process left.
 #[cfg(feature = "testing")]
 pub mod testing {
