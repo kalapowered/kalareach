@@ -1679,7 +1679,7 @@ fn the_android_manifest_names_the_image_capture_action_so_take_a_photo_finds_the
         .collect();
     assert!(
         queried.contains(&"android.media.action.IMAGE_CAPTURE"),
-        "no `<queries>` intent names android.media.action.IMAGE_CAPTURE, so \"Take a photo\" cannot see the camera and opens the photo picker: {queried:?}"
+        "no `<queries>` intent names android.media.action.IMAGE_CAPTURE, so, from Android 11 on, package visibility can hide camera apps and make \"Take a photo\" open the photo picker: {queried:?}"
     );
 }
 
@@ -1731,12 +1731,12 @@ fn the_android_manifest_keeps_the_camera_photos_out_of_backup_and_device_transfe
     for section in ["cloud-backup", "device-transfer"] {
         assert!(
             excludes_the_photos(&extraction, section),
-            "the data extraction rules do not exclude the external Pictures folder from {section}, so a photo taken for an attachment is copied off the phone"
+            "the data extraction rules do not exclude the external Pictures folder from {section}, so a photo taken for an attachment can be copied off the phone"
         );
     }
     assert!(
         excludes_the_photos(&rules("fullBackupContent"), "full-backup-content"),
-        "the full backup rules do not exclude the external Pictures folder, so a photo taken for an attachment is copied off the phone"
+        "the full backup rules do not exclude the external Pictures folder, so a photo taken for an attachment can be copied off the phone"
     );
 }
 
