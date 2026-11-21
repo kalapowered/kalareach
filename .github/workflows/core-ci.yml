@@ -235,13 +235,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets --features kr-cli/upgrade-suite -- -D warnings
 
-      # The step grows with the tests. It has taken 99 to 107 minutes when it passed, and twice it
-      # ran to its limit of 110 minutes without finishing. A test that waits for something that
-      # never comes would otherwise hold the runner for the job's six hours and every branch's
-      # checks behind it, so the step is given a little over twice those 110 minutes and no more.
-      # With the limits of the job's other two limited steps that adds up to 265 of the job's 360
-      # minutes. The steps with no limit of their own took 75 minutes together when each ran as
-      # long as its longest, so the steps after this one still report when it runs to its limit.
+      # The step grows with the tests. It took 120 to 166 minutes in each of the last seven runs in
+      # which the job passed, 99 to 107 in those before, and twice it ran to its limit of 110
+      # minutes without finishing. A test that waits for something that never comes would otherwise
+      # hold the runner for the job's six hours and every branch's checks behind it, so the step is
+      # given a little over twice those 110 minutes and no more: 225, which is 1.35 times the
+      # longest of the seven. The job has no limit of its own, so it has GitHub's 360 minutes, and
+      # the limits of its steps do not all fit in them. They add up to 439: this step's 225, the
+      # release gate's 150, the pairing leg's 30 (a push to main, or a manual run that sets
+      # `deployment_legs`), 10 for each of the advisory check and the two stub-daemon steps, and 2
+      # for each of the two archive steps. What the steps took in those seven runs is what has to
+      # fit: the steps before this one 12 to 21 minutes, and 42 once, 26 of them for the desktop
+      # packages' install; the steps after it, the release gate apart, 17 to 25 minutes; and the
+      # gate 79 minutes in the one run that had it. A run of this step to its limit leaves the gate
+      # 89 minutes after the usual start and 68 after the slow one, so the gate is the step that
+      # the job's end cuts, and the steps between this one and the gate still report.
       - name: Test
         timeout-minutes: 225
         env:
@@ -270,13 +278,17 @@ jobs:
       # The cases that start a daemon through test trees made without a service manager are ignored
       # in the run above, which has this runner's account and so its own user manager. Each checks
       # that neither the account's runtime directory nor its message bus is in its environment, so
-      # these steps remove both, and no call can reach the account's manager.
+      # these steps remove both, and no call can reach the account's manager. Each has a limit of 10
+      # minutes, about four times the longest either took, 2.4 minutes, in the one run that had
+      # them.
       - name: A test tree made without a service manager calls none
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-controller --test teardown_jobs -- --nocapture --ignored --exact a_tree_without_a_service_manager_calls_none_at_its_end
 
       - name: A standalone start says why a stub daemon ended
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for
 
       # Documentation is built with warnings refused, so a link that resolves to nothing, or to an
