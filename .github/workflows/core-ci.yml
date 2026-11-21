@@ -293,7 +293,7 @@ jobs:
         run: |
           cargo doc --locked --no-deps \
             -p companion-platform -p companion-tauri -p kr-attention -p kr-automation \
-            -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
+            -p kr-backup-integration -p kr-boundary-windows -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
             -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents \
             -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-keys -p kr-loopback -p kr-pairing -p kr-perf \
             -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk \
@@ -1739,7 +1739,7 @@ jobs:
         run: >-
           cargo doc --locked --no-deps
           -p companion-platform -p companion-tauri -p kr-attention -p kr-automation
-          -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-cli -p kr-client
+          -p kr-backup-integration -p kr-boundary-windows -p kr-cbor -p kr-changeset -p kr-cli -p kr-client
           -p kr-conformance -p kr-controller -p kr-crypto -p kr-delivery -p kr-describe
           -p kr-describe-model -p kr-e2e-agents
           -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-keys -p kr-loopback -p kr-pairing -p kr-perf
@@ -3175,7 +3175,7 @@ jobs:
         run: |
           cargo doc --locked --no-deps \
             -p companion-platform -p companion-tauri -p kr-attention -p kr-automation \
-            -p kr-backup-integration -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
+            -p kr-backup-integration -p kr-boundary-windows -p kr-cbor -p kr-changeset -p kr-client -p kr-conformance \
             -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents \
             -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-hook -p kr-ipc -p kr-keys -p kr-loopback -p kr-pairing -p kr-perf \
             -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime -p kr-plugin-sdk \
