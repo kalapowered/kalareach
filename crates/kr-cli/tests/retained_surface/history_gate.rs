@@ -7,7 +7,7 @@
 //! whole run inside an hour.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -569,5 +569,145 @@ fn the_reader_reads_every_release_tag_with_a_scratch_entry() {
     assert!(
         took < Duration::from_secs(3600),
         "{took:?} is over the hour"
+    );
+}
+
+/// The files that the compiler read for the non-test targets of the workspace, from the dep-info
+/// files that Cargo writes beside each artifact: the messages of
+/// `cargo build --locked --workspace --lib --bins --message-format=json`, in the file that
+/// `KR_BUILD_MESSAGES` names. Each such file under the checkout and outside `target/` must be among
+/// the files that the inventory of its crate reaches (the inventory may reach more: it reads a file
+/// that some configuration builds, and the build is one configuration).
+#[test]
+#[ignore = "reads the messages of a build; run by hand with --show-output after the build"]
+fn the_inventory_holds_each_file_the_compiler_read() {
+    let messages = std::env::var_os("KR_BUILD_MESSAGES")
+        .expect("KR_BUILD_MESSAGES names the file with the build's messages");
+    let repository = super::repository();
+    let tree = Tree::at(&repository).expect("this checkout is read");
+    let known = tree
+        .product_files(&|krate| reads_at_head(krate))
+        .expect("the inventories");
+    let mut problems: Vec<String> = Vec::new();
+    let mut depinfo = 0;
+    let mut by_crate: BTreeMap<String, usize> = BTreeMap::new();
+    for line in std::fs::read_to_string(messages)
+        .expect("the messages")
+        .lines()
+    {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if message["reason"] != "compiler-artifact" || message["profile"]["test"] == true {
+            continue;
+        }
+        let kinds: Vec<&str> = message["target"]["kind"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if !kinds
+            .iter()
+            .any(|kind| matches!(*kind, "lib" | "rlib" | "bin"))
+        {
+            continue;
+        }
+        for artifact in message["filenames"].as_array().into_iter().flatten() {
+            let Some(artifact) = artifact.as_str() else {
+                continue;
+            };
+            let info = Path::new(artifact).with_extension("d");
+            let Ok(text) = std::fs::read_to_string(&info) else {
+                continue;
+            };
+            depinfo += 1;
+            for file in rs_files_of(&text) {
+                let path = if file.is_absolute() {
+                    file
+                } else {
+                    repository.join(file)
+                };
+                let Ok(path) = std::fs::canonicalize(&path) else {
+                    continue;
+                };
+                if !path.starts_with(&repository) || path.starts_with(repository.join("target")) {
+                    continue;
+                }
+                // The crate whose folder is the longest prefix of the file.
+                let Some((krate, (_, files))) = known
+                    .iter()
+                    .filter(|(_, (folder, _))| path.starts_with(folder))
+                    .max_by_key(|(_, (folder, _))| folder.components().count())
+                else {
+                    continue;
+                };
+                *by_crate.entry(krate.clone()).or_default() += 1;
+                if !files.contains(&path) {
+                    problems.push(format!(
+                        "{krate}: the compiler read {} and the inventory does not",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "{depinfo} dep-info files, files read by {} crates",
+        by_crate.len()
+    );
+    assert!(depinfo > 0, "no dep-info file was found beside an artifact");
+    assert!(
+        by_crate.len() > 1,
+        "the dep-info files name the files of {} crate(s) only",
+        by_crate.len()
+    );
+    problems.sort();
+    problems.dedup();
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The `.rs` files a dep-info file lists after the target's colon (a space in a name is escaped by
+/// a backslash).
+fn rs_files_of(text: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for line in text.lines() {
+        let Some((_, deps)) = line.split_once(": ") else {
+            continue;
+        };
+        let mut current = String::new();
+        let mut chars = deps.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if chars.peek() == Some(&' ') => {
+                    current.push(' ');
+                    chars.next();
+                }
+                ' ' => {
+                    if current.ends_with(".rs") {
+                        files.push(PathBuf::from(std::mem::take(&mut current)));
+                    }
+                    current.clear();
+                }
+                other => current.push(other),
+            }
+        }
+        if current.ends_with(".rs") {
+            files.push(PathBuf::from(current));
+        }
+    }
+    files
+}
+
+#[test]
+fn a_dep_info_file_lists_its_rust_files_with_escaped_spaces_and_no_other_file() {
+    let text = "target/debug/libkr_a.rlib: crates/kr-a/src/lib.rs crates/kr-a/src/my\\ mod.rs /home/x/dep.rs crates/kr-a/data.txt\n\ncrates/kr-a/src/lib.rs:\n";
+    assert_eq!(
+        rs_files_of(text),
+        [
+            PathBuf::from("crates/kr-a/src/lib.rs"),
+            PathBuf::from("crates/kr-a/src/my mod.rs"),
+            PathBuf::from("/home/x/dep.rs"),
+        ]
     );
 }
