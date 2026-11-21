@@ -300,7 +300,10 @@ fn leg_named(condition: &str) -> Option<(String, bool)> {
     let (after, prefix) = match compacted.split_once("matrix.part=='") {
         Some((_, after)) => (after.to_owned(), false),
         None => (
-            compacted.split_once("startsWith(matrix.part,'")?.1.to_owned(),
+            compacted
+                .split_once("startsWith(matrix.part,'")?
+                .1
+                .to_owned(),
             true,
         ),
     };
@@ -546,9 +549,11 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
             );
             if let Some((leg, prefix)) = when.and_then(leg_named) {
                 assert!(
-                    legs(&text)
-                        .iter()
-                        .any(|part| if prefix { part.starts_with(&leg) } else { *part == leg }),
+                    legs(&text).iter().any(|part| if prefix {
+                        part.starts_with(&leg)
+                    } else {
+                        *part == leg
+                    }),
                     "{class}: the {name} job's matrix has no {leg} leg, so a step that runs {tool} \
                      never runs"
                 );
@@ -574,6 +579,44 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                 );
             }
         }
+    }
+
+    // The macOS job's two test legs hold the workspace's packages once between them: both legs are
+    // in the matrix, and the checks of the division run in one step, not disabled, under the Test
+    // step's own condition and before the Test step, so that removing a leg or the checks cannot
+    // leave packages that run in no leg and still pass.
+    let macos = job(&workflow, "macos");
+    for leg in ["tests-1", "tests-2"] {
+        assert!(
+            legs(&macos).iter().any(|part| part == leg),
+            "the macos job's matrix has no {leg} leg"
+        );
+    }
+    let test_tool = "cargo test --locked ${{ matrix.packages }} --no-fail-fast --";
+    for tool in [
+        "python3 scripts/check-macos-test-division.py self-test",
+        "python3 scripts/check-macos-test-division.py check --locked",
+        "python3 scripts/check-macos-test-division.py features",
+    ] {
+        let held = steps_running(&macos, tool);
+        assert_eq!(held.len(), 1, "one step of the macos job runs {tool}");
+        assert!(
+            !is_disabled(&held[0]),
+            "the step that runs {tool} is disabled"
+        );
+        assert_eq!(
+            step_condition(&held[0]),
+            Some(compact(
+                "${{ !cancelled() && startsWith(matrix.part, 'tests') }}"
+            )),
+            "the step that runs {tool} does not run under the Test step's condition"
+        );
+        assert!(
+            position_of_tool(&macos, tool)
+                .zip(position_of_tool(&macos, test_tool))
+                .is_some_and(|(check, test)| check < test),
+            "the step that runs {tool} comes after the Test step"
+        );
     }
 
     // The landing workflow runs on every push to main and on every pull request, with no filter

@@ -651,7 +651,7 @@ jobs:
     runs-on: windows-2025
     strategy:
       fail-fast: false
-      # Two runners, one definition, as the macos job has. They set up the same way and the daemon,
+      # Two runners, one definition. They set up the same way and the daemon,
       # the worker and the forwarder are built on both, which the suites find beside them; then
       # each step's `if` names its leg. `first` compiles the whole workspace and its tests, runs
       # the steps down to the forwarder's tests and builds the desktop application; `second` runs
@@ -2414,7 +2414,8 @@ jobs:
   # architecture, the application built for the simulator with its Swift plugin, read back, and
   # then started in an iPhone simulator, with the native library's own cases run there beside it.
   # Nothing here holds a certificate, a profile or a secret. It runs in parallel with the other
-  # macOS jobs and is the fifth of them in a run, so a run holds five hosted macOS runners at once.
+  # macOS jobs, so a run holds nine hosted macOS runners at once: three of the macos job's legs, the
+  # shipped-programs, PowerShell, shell-package and reference jobs, the companion's and this one.
   #
   # As the Android job, it saves no cache, and its time is the cost of that.
   ios:
@@ -2846,9 +2847,9 @@ jobs:
 
   # The whole workspace on macOS: the lint, the workspace's tests, the end-to-end demonstrations and
   # the performance measurements, on the platform whose service manager, process table, disk images
-  # and pseudo-terminals the host's macOS paths are written against. It runs on two runners beside
-  # the companion's macOS leg, so that none of them waits for another: the lint and the tests on
-  # one, the demonstrations and the measurements on the other.
+  # and pseudo-terminals the host's macOS paths are written against. It runs on three runners beside
+  # the companion's macOS leg, so that none of them waits for another: the tests on two, the lint
+  # with the second of them, and the demonstrations and the measurements on the third.
   #
   # What it leaves to the other jobs, because they run it natively and nothing in it differs on
   # macOS: formatting and the generated-file checks (rust), the TypeScript packages (typescript),
@@ -2879,17 +2880,20 @@ jobs:
       # of which is a leg against a live deployment, which the rust job runs. A package in both lists
       # runs its tests twice and one in neither runs them in no leg, so
       # `scripts/check-macos-test-division.py` fails each leg before its tests when the lists have
-      # either fault or name a package the workspace does not have, and a new crate has to be put in
-      # a list before the job passes.
+      # either fault, name a package the workspace does not have, are empty, or when the matrix has
+      # a test leg twice or one more, and a new crate has to be put in a list before the job
+      # passes. The same script's `features` command fails on a package a leg builds with other
+      # features than the whole workspace's one step gave it, unless the script names it with its
+      # reason.
       #
       # The division is by the minutes the test programs of each package took in the run of 20
-      # November, which ran the whole workspace in one step: 768 programs in 159 minutes, after 32
-      # minutes of build. kr-controller alone took 68 of them, kr-cli 25, companion-tauri 20 and
-      # kr-worker 18, and the other 43 packages 28 between them. `tests-1` has kr-controller, the
-      # four packages that hold the cases that need another filesystem (kr-changeset, kr-ipc,
-      # kr-project and kr-transfer) and five more, 86 minutes of those programs; `tests-2` has the
-      # other 37 packages, 73 minutes. Move a package between the lists by its minutes, and keep
-      # those four packages in `tests-1`.
+      # November, which ran the whole workspace in one step: 668 programs in 157 minutes, after 32
+      # minutes of build with the cache restored. kr-controller alone took 68 of them, kr-cli 25,
+      # companion-tauri 20 and kr-worker 18, and the other 43 packages 28 between them. `tests-1`
+      # has kr-controller, the four packages that hold the cases that need another filesystem
+      # (kr-changeset, kr-ipc, kr-project and kr-transfer) and five more, 85 minutes of those
+      # programs; `tests-2` has the other 37 packages, 72 minutes. Move a package between the lists
+      # by its minutes, and keep those four packages in `tests-1`.
       matrix:
         include:
           - name: macos-tests-1
@@ -3077,13 +3081,15 @@ jobs:
 
       # The two test legs' package lists against the workspace, before either leg's tests: the check
       # is put through its own cases first, so that a pass says it can tell a package left out or
-      # named twice, and then run against the workspace.
+      # named twice, then run against the workspace, and then compares the features each leg builds
+      # with against those of the whole workspace, which the one step before the split built with.
       - name: The two test legs hold every package once
         if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         timeout-minutes: 5
         run: |
           python3 scripts/check-macos-test-division.py self-test
           python3 scripts/check-macos-test-division.py check --locked
+          python3 scripts/check-macos-test-division.py features
 
       # A graphical login domain in which this account can bootstrap and start a job, in the
       # background domain as well, done here the way the host starts a worker for a desktop-bound
@@ -3177,6 +3183,28 @@ jobs:
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the documentation"
 
+      # The programs a leg's suites start that the leg's own packages do not build. Suites find them
+      # beside their test programs and fail where one is missing ("is not built", "there is none
+      # at"), and `cargo test -p <package>` builds the programs of that package alone: the one step
+      # that ran the whole workspace built every package's, with the `testing` features that
+      # development dependencies asked for. `tests-1` builds the worker and the plugin host the
+      # controller's suites start, and the Codex stand-in its gateway suites and the forwarder's
+      # start. `tests-2` builds the control daemon, with the held build `kr-cli`'s startup and update
+      # suites start, and the forwarder the end-to-end suites start. The limit is a bound that no run
+      # has measured yet.
+      - name: Build the programs the suites of this leg start
+        if: ${{ !cancelled() && matrix.part == 'tests-1' }}
+        timeout-minutes: 45
+        run: >-
+          cargo build --locked -p kr-codex-stand-in -p kr-plugin-host -p kr-worker
+          --features kr-plugin-host/testing,kr-worker/testing --bins
+
+      - name: Build the programs the suites of this leg start
+        if: ${{ !cancelled() && matrix.part == 'tests-2' }}
+        timeout-minutes: 45
+        run: >-
+          cargo build --locked -p kr-controller -p kr-hook --features kr-controller/testing --bins
+
       # The workspace's tests, less what this runner cannot run, each left out by name here:
       #
       # - kr-sync-integration, every test of which is a leg against a live deployment and does
@@ -3189,21 +3217,14 @@ jobs:
       # Each leg runs the packages its matrix entry names. The step builds their tests and then runs
       # them, and it grows with the tests. Before the split one step did both for the whole
       # workspace: it took 172 minutes in a run on main and 190 in the run of 20 November (32 to
-      # build and 157 to run the 768 test programs, from the times of that run's log), and on 21
-      # November it ran into its limit of 197 minutes. A leg's figure is its share of those 157
-      # minutes (86 of the 159 that the programs took for `tests-1`, 73 for `tests-2`) and the 32
-      # minutes of the whole build, which a leg's own build cannot exceed: 118 minutes for `tests-1`
-      # and 105 for `tests-2`. The limits are 174 and 158 minutes, about half as much again, and
-      # the limits of each leg add up to 300 of the job's 355 minutes.
-      #
-      # The Codex stand-in is the one program the suites of `tests-1` start that its packages do not
-      # build: the controller's and the forwarder's gateway suites find it beside their own test
-      # programs, and `tests-2` has the package it comes from.
-      - name: Build the Codex stand-in the gateway suites start
-        if: ${{ !cancelled() && matrix.part == 'tests-1' }}
-        timeout-minutes: 10
-        run: cargo build --locked -p kr-codex-stand-in
-
+      # build, with the cache restored, and 157 to run 668 test programs and 45 sets of
+      # documentation tests, from the times of that run's log), and on 21 November it ran into its
+      # limit of 197 minutes. A leg's figure is its share of those 157 minutes (85 for `tests-1`, 72
+      # for `tests-2`) and the 32 minutes of the whole build, which a leg's own build does not
+      # exceed with the cache restored: 117 minutes for `tests-1` and 104 for `tests-2`, estimates
+      # that no run has measured, and a cold build is not among them. The limits are 174 and 158
+      # minutes, about half as much again, and each leg's limits, with the 45 minutes of its program
+      # build, add up to 335 and 345 of the job's 355 minutes.
       - name: Test
         if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         timeout-minutes: ${{ matrix.minutes }}
@@ -3260,8 +3281,8 @@ jobs:
       # step and deleted after it: internal rather than removable, and another filesystem from
       # /private/tmp.
       #
-      # The cases are in four packages, which `tests-1` holds and this step is the only one to run
-      # here, so the step builds the tests of those four and no other.
+      # The cases are in four packages, which `tests-1` holds. The step names that leg's packages
+      # as the Test step does, so that it builds what the Test step built and no more.
       - name: The cases that need another filesystem
         if: ${{ !cancelled() && matrix.part == 'tests-1' }}
         timeout-minutes: 15
@@ -3349,7 +3370,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$volume"
           diskutil info "$volume" | grep -E 'Device Identifier|Mount Point|Owners|Removable Media|Device Location' || true
           echo "device of /private/tmp: $(stat -f %d /private/tmp); of $volume: $(stat -f %d "$volume")"
-          TMPDIR="$volume" cargo test --locked -p kr-changeset -p kr-ipc -p kr-project -p kr-transfer \
+          TMPDIR="$volume" cargo test --locked ${{ matrix.packages }} \
             --lib --test capture --test locations --test authority --test filesystems \
             --test workspaces --test apply --test volumes -- \
             --exact --show-output --test-threads=1 "${cases[@]}" 2>&1 | tee "$log"
@@ -3557,9 +3578,9 @@ jobs:
 
   # The PowerShell package's cases on the macOS runner. The package's reader counts the input the
   # runtime has taken through .NET internals that differ by platform, and the shell-packages job
-  # runs these cases on Linux only. They take far longer than the macos job has left to give: its
-  # limits add up to 351 of its 355 minutes. So they run here, in a job that has the Rust
-  # toolchain and PowerShell and nothing else of that one. PowerShell is the release the
+  # runs these cases on Linux only. They take far longer than the macos job has left to give: the
+  # limits of its legs add up to 335 to 351 of its 355 minutes. So they run here, in a job that has
+  # the Rust toolchain and PowerShell and nothing else of that one. PowerShell is the release the
   # shell-packages job pins, from the macOS archive and checked against the digest its release
   # publishes: the package refuses a release that a published advisory affects, and the .NET
   # internals the reader reads can change between runner images, so a gate that took the image's
@@ -3689,9 +3710,9 @@ jobs:
   # shell-packages job runs these cases on Linux only, and how an editor draws and how a terminal
   # answers depend on the platform's C library, so a change to a package or to its bridge is run
   # on macOS at the landing and not first at a release. The cases are not steps of the macos job:
-  # it is the longest job of the run, and its limits add up to 351 of its 355 minutes. This job
-  # holds one runner for the length of its own steps and takes nothing from that budget. Every
-  # step has a limit of its own, and the limits add up to less than the job's.
+  # its legs are the longest jobs of the run, and their limits add up to 335 to 351 of 355 minutes.
+  # This job holds one runner for the length of its own steps and takes nothing from that budget.
+  # Every step has a limit of its own, and the limits add up to less than the job's.
   #
   # A red job here stops a landing: a landing needs the conclusion of the whole run at the top
   # commit to be a success, so no branch rule has to name the job, and a pull request's merge is
