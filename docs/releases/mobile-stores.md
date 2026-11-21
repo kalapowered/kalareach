@@ -85,10 +85,10 @@ line nor the long-lived Gradle process. `store-bundle.mjs --android` reads the f
   `debuggable` or `testOnly` flag, permits no cleartext traffic, declares the verified sign-in link
   `https://reach.kala.to/app/oauth/callback` in one intent filter (the `VIEW` action, the default
   and browsable categories, the `https` scheme, the host and the path), queries the
-  `android.media.action.IMAGE_CAPTURE` action in a `<queries>` intent (without it the WebView's
-  file chooser cannot see a camera app and "Take a photo" opens the photo picker), and asks for
-  exactly the permissions the checker lists (the application's own and the ones its libraries
-  add), so a library that starts to ask for another stops the build;
+  `android.media.action.IMAGE_CAPTURE` action in a `<queries>` intent (without it, from Android 11
+  on, package visibility can hide camera apps and make 'Take a photo' open the photo picker), and
+  asks for exactly the permissions the checker lists (the application's own and the ones its
+  libraries add), so a library that starts to ask for another stops the build;
 - the bundle holds the requested architectures, read from the directory names, and every loadable
   segment of every library is aligned to 16 KB;
 - `bundletool validate` accepts it and its configuration asks for 16 KB page alignment;
