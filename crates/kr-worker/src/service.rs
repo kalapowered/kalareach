@@ -718,10 +718,10 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     upstream_deadline_ms: std::sync::atomic::AtomicU64,
-    /// Ends the wait of an admitted operation for its upstream as its deadline ends it, at a moment
-    /// that this host's own tests choose. It is compiled away in every shipped build.
+    /// Ends a wait of an admitted operation for its upstream through the deadline's own path, at a
+    /// moment that this host's own tests choose. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    upstream_wait_ended: tokio::sync::Notify,
+    upstream_deadline_seam: Arc<DeadlineSeam>,
     /// A pause in the binding of a question's or an alert's source to the session, which this
     /// host's own tests arm to stand a caller there while a keystroke arrives. It is compiled
     /// away in every shipped build.
@@ -1568,7 +1568,7 @@ impl WorkerService {
                 u64::try_from(UPSTREAM_SUBMIT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
             ),
             #[cfg(feature = "testing")]
-            upstream_wait_ended: tokio::sync::Notify::new(),
+            upstream_deadline_seam: Arc::default(),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
@@ -2851,18 +2851,32 @@ impl WorkerService {
         );
     }
 
-    /// Ends one wait of the admitted operation for its upstream as its deadline ends it before the
-    /// call is made: the caller is told what a deadline tells, and what waited is dropped, while
-    /// whatever thread the operation already has goes on. A deadline that passes after the call is
-    /// made also hands on the late reply to be watched for; this end does not.
+    /// Ends the wait of the admitted operation for the transport's call that takes it, the way its
+    /// deadline ends it: the wait is dropped, the call's thread goes on, and the caller is told
+    /// what a deadline tells, or that nothing was sent where the channel's queue had not taken
+    /// what the call carries.
     ///
-    /// It exists so that this host's own tests can end the wait before the call is made, when a
-    /// thread of the operation stands where they put it, with the deadline set so long that it
-    /// cannot pass first. The end is kept for the next wait if none is waiting. It is compiled away
-    /// in every shipped build.
+    /// It exists so that this host's own tests can pass the deadline at a moment they choose, once
+    /// a thread of the operation stands where they put it, with the deadline set so long that it
+    /// cannot pass first. The end is kept for the next such wait if none is waiting. It is
+    /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    pub fn end_upstream_waits_for_tests(&self) {
-        self.upstream_wait_ended.notify_one();
+    pub fn pass_the_calls_deadline_for_tests(&self) {
+        self.upstream_deadline_seam.call.notify_one();
+    }
+
+    /// Ends the wait of the admitted operation for what the transport reports once it took the
+    /// operation, which for a request is the upstream's answer, the way its deadline ends it: the
+    /// receipt says unknown, the reply that comes later is handed on to be watched for, and what a
+    /// channel's queue took is a channel's end.
+    ///
+    /// It exists so that this host's own tests can pass the deadline at a moment they choose, once
+    /// the call has returned and nothing has answered, with the deadline set so long that it
+    /// cannot pass first. The end is kept for the next such wait if none is waiting. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pass_the_answers_deadline_for_tests(&self) {
+        self.upstream_deadline_seam.answer.notify_one();
     }
 
     /// How long an admitted operation has to reach its upstream.
@@ -2877,6 +2891,15 @@ impl WorkerService {
         #[cfg(not(feature = "testing"))]
         {
             UPSTREAM_SUBMIT_DEADLINE
+        }
+    }
+
+    /// The deadline of an operation that is admitted now.
+    fn upstream_deadline_from_now(&self) -> Deadline {
+        Deadline {
+            at: tokio::time::Instant::now() + self.upstream_deadline(),
+            #[cfg(feature = "testing")]
+            seam: Arc::clone(&self.upstream_deadline_seam),
         }
     }
 
@@ -7978,7 +8001,7 @@ impl WorkerService {
         // Everything the broker settles happens on this task, and the resource an answer resolves
         // is settled before the receipt is recorded and before the caller hears: at the deadline,
         // what `carry` was waiting for is dropped here, and an answer's claim goes with it.
-        let deadline = tokio::time::Instant::now() + self.upstream_deadline();
+        let deadline = self.upstream_deadline_from_now();
         let mut handoff = pending.handoff;
         let claim = handoff.claim.take();
         let (revision, operation, action, turn_id, provenance) = (
@@ -7988,15 +8011,7 @@ impl WorkerService {
             handoff.admitted.turn_id().cloned(),
             handoff.admitted.provenance(),
         );
-        let carried = handoff.carry(deadline);
-        // A test may end the wait before the deadline does, with the error the deadline gives.
-        #[cfg(feature = "testing")]
-        let (outcome, late) = tokio::select! {
-            done = carried => done,
-            () = self.upstream_wait_ended.notified() => (Err(unanswered()), None),
-        };
-        #[cfg(not(feature = "testing"))]
-        let (outcome, late) = carried.await;
+        let (outcome, late) = handoff.carry(deadline).await;
         let settled = off_the_executor(|| {
             self.settle_upstream(
                 &pending.actor_id,
@@ -14463,7 +14478,7 @@ impl UpstreamHandoff {
     /// transport does afterwards settles nothing.
     async fn carry(
         self,
-        deadline: tokio::time::Instant,
+        deadline: Deadline,
     ) -> (Result<ParamsValue>, Option<crate::broker::LateHandle>) {
         let mut late = None;
         let outcome = self.carry_with(deadline, &mut late).await;
@@ -14474,7 +14489,7 @@ impl UpstreamHandoff {
     /// the operation if it comes after this has stopped waiting for it.
     async fn carry_with(
         self,
-        deadline: tokio::time::Instant,
+        deadline: Deadline,
         late: &mut Option<crate::broker::LateHandle>,
     ) -> Result<ParamsValue> {
         let now = kr_ipc::now_ms();
@@ -14488,20 +14503,20 @@ impl UpstreamHandoff {
                 let pending = submit_within(
                     taken.transmission(),
                     Arc::clone(&gate),
-                    deadline,
+                    &deadline,
                     self.rechecked_before_submit(),
                     None,
                 )
                 .await?;
                 *late = pending.late_handle();
                 let flight = taken.submitted(pending);
-                match within(deadline, flight.settled()).await {
+                match within(&deadline, flight.settled()).await {
                     Ok(settled) => encode(&settled?),
                     Err(unanswered) => Err(gate.give_up().map_or(unanswered, WorkerError::Broker)),
                 }
             }
             UpstreamKind::Approval => {
-                let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
+                let answered = answer_within(&self.broker, &self.admitted, now, &deadline).await?;
                 encode(&answered)
             }
             UpstreamKind::PluginAction => {
@@ -14512,17 +14527,17 @@ impl UpstreamHandoff {
                 let pending = submit_within(
                     taken.transmission(),
                     self.broker.submit_gate(),
-                    deadline,
+                    &deadline,
                     self.rechecked_before_submit(),
                     open,
                 )
                 .await?;
                 *late = pending.late_handle();
                 let flight = taken.submitted(pending);
-                encode(&within(deadline, flight.settled()).await??)
+                encode(&within(&deadline, flight.settled()).await??)
             }
             UpstreamKind::PluginAnswer { action } => {
-                let answered = answer_within(&self.broker, &self.admitted, now, deadline).await?;
+                let answered = answer_within(&self.broker, &self.admitted, now, &deadline).await?;
                 encode(&kr_protocol::agent::PluginActionInvokeResult {
                     mutation: Nullable::some(answered.mutation),
                     action,
@@ -14538,7 +14553,7 @@ async fn answer_within(
     broker: &Arc<crate::broker::Broker>,
     admitted: &crate::broker::MutationAdmission,
     now: kr_protocol::scalars::TimestampMs,
-    deadline: tokio::time::Instant,
+    deadline: &Deadline,
 ) -> Result<kr_protocol::agent::AgentApprovalRespondResult> {
     broker.at_marker_pause().await;
     let marked = broker.mark_approval(admitted, now)?;
@@ -14602,7 +14617,7 @@ async fn submit_within(
         crate::broker::UpstreamRequest,
     ),
     gate: Arc<crate::broker::SubmitGate>,
-    deadline: tokio::time::Instant,
+    deadline: &Deadline,
     recheck: impl FnOnce(
         &crate::broker::UpstreamRequest,
     ) -> std::result::Result<(), crate::broker::BrokerError>
@@ -14620,7 +14635,7 @@ async fn submit_within(
         recheck(&request)?;
         dispatch.submit_gated(&request, &queueing)
     });
-    match tokio::time::timeout_at(deadline, submitting).await {
+    match deadline.call(submitting).await {
         Ok(Ok(submitted)) => Ok(submitted?),
         Ok(Err(_)) => Err(WorkerError::Broker(
             gate.give_up()
@@ -14645,12 +14660,83 @@ async fn submit_within(
 
 /// Waits for `waited` until `deadline`, and says the upstream did not answer when it passes.
 async fn within<T>(
-    deadline: tokio::time::Instant,
+    deadline: &Deadline,
     waited: impl core::future::Future<Output = T>,
 ) -> Result<T> {
-    tokio::time::timeout_at(deadline, waited)
-        .await
-        .map_err(|_| unanswered())
+    deadline.answer(waited).await.map_err(|Passed| unanswered())
+}
+
+/// The moment an admitted operation's waits for its upstream end, and, in a build that carries
+/// this host's own test seams, what ends them before it.
+///
+/// The two waits are the one for the transport's call that takes the operation and the one for
+/// what the transport reports once it took it. Each is ended by the deadline's passing, and a
+/// test's seam ends it as the deadline's passing does, so what follows is the code the deadline
+/// runs and not a copy of it.
+#[derive(Debug)]
+struct Deadline {
+    at: tokio::time::Instant,
+    #[cfg(feature = "testing")]
+    seam: Arc<DeadlineSeam>,
+}
+
+/// What a wait bounded by a [`Deadline`] ends as when the deadline passes.
+struct Passed;
+
+/// What this host's own tests use to pass an operation's deadline at a moment they choose, one
+/// for each of its two waits. Compiled away in every shipped build.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct DeadlineSeam {
+    call: tokio::sync::Notify,
+    answer: tokio::sync::Notify,
+}
+
+impl Deadline {
+    /// Waits for the transport's call that takes the operation until the deadline passes.
+    async fn call<T>(
+        &self,
+        waited: impl core::future::Future<Output = T>,
+    ) -> core::result::Result<T, Passed> {
+        #[cfg(feature = "testing")]
+        {
+            tokio::select! {
+                done = self.until_it_passes(waited) => done,
+                () = self.seam.call.notified() => Err(Passed),
+            }
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            self.until_it_passes(waited).await
+        }
+    }
+
+    /// Waits for what the transport reports of the operation until the deadline passes.
+    async fn answer<T>(
+        &self,
+        waited: impl core::future::Future<Output = T>,
+    ) -> core::result::Result<T, Passed> {
+        #[cfg(feature = "testing")]
+        {
+            tokio::select! {
+                done = self.until_it_passes(waited) => done,
+                () = self.seam.answer.notified() => Err(Passed),
+            }
+        }
+        #[cfg(not(feature = "testing"))]
+        {
+            self.until_it_passes(waited).await
+        }
+    }
+
+    async fn until_it_passes<T>(
+        &self,
+        waited: impl core::future::Future<Output = T>,
+    ) -> core::result::Result<T, Passed> {
+        tokio::time::timeout_at(self.at, waited)
+            .await
+            .map_err(|_| Passed)
+    }
 }
 
 /// The failure an operation meets when its upstream does not answer within this worker's bound.
@@ -14869,7 +14955,11 @@ mod tests {
             let outcome = super::submit_within(
                 (dispatch, message_request()),
                 Arc::new(crate::broker::SubmitGate::default()),
-                tokio::time::Instant::now() + Duration::from_millis(100),
+                &super::Deadline {
+                    at: tokio::time::Instant::now() + Duration::from_millis(100),
+                    #[cfg(feature = "testing")]
+                    seam: Arc::default(),
+                },
                 |_| Ok(()),
                 None,
             )

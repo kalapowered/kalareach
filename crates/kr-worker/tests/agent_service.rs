@@ -656,10 +656,20 @@ fn prompt_mutation(client: &LocalClient, host: &Host, request_id: u64) -> Mutati
 }
 
 async fn send(client: &mut Client<impl Codec>, mutation: MutationRequest) -> Outcome {
+    write_mutation(client, mutation).await;
+    outcome_of(client).await
+}
+
+/// Writes `mutation` and does not wait for its answer, which [`outcome_of`] reads.
+async fn write_mutation(client: &mut Client<impl Codec>, mutation: MutationRequest) {
     client
         .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the mutation");
+}
+
+/// What the worker answers the mutation that was written last.
+async fn outcome_of(client: &mut Client<impl Codec>) -> Outcome {
     loop {
         match client.recv().await.expect("the worker answers") {
             ControlFrame::Response(response) => return response.outcome,
@@ -2965,7 +2975,8 @@ async fn kr_req_09_05_a_reply_after_the_deadline_is_correlation_evidence_that_se
 
 /// KR-REQ-09.05: the host's own deadline for an operation can pass before the transport's wait for
 /// the upstream's answer has ended. The receipt then says unknown, and the reply that comes later
-/// still settles it.
+/// still settles it. The case passes the worker's deadline itself, at its wait for the answer once
+/// the upstream has read the request, so what decides is that order and not a delay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_09_05_a_reply_after_the_workers_own_deadline_still_settles_the_receipt() {
     let host = host().await;
@@ -2975,10 +2986,21 @@ async fn kr_req_09_05_a_reply_after_the_workers_own_deadline_still_settles_the_r
         .owner
         .set_acknowledgement_deadline(std::time::Duration::from_secs(3_600));
     host.service
-        .set_upstream_deadline_for_tests(std::time::Duration::from_millis(20));
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     let mut client = cli(&host).await;
-    let unknown = unanswered_prompt(&mut client, &host, 31).await;
+    let mutation = prompt_mutation(&client, &host, 31);
+    let action_id = mutation.action_id;
+    write_mutation(&mut client, mutation).await;
+    // The upstream has read the request, which the call queued. The deadline passes at the wait for
+    // the answer, which is held until the call has returned and so exists only then.
     let id = transport.identifier_of(1).await;
+    host.service.pass_the_answers_deadline_for_tests();
+    let Outcome::Error(failure) = outcome_of(&mut client).await else {
+        panic!("an operation nobody acknowledged is not a success");
+    };
+    assert_eq!(failure.code, ErrorCode::OutcomeUnknown);
+    let unknown = receipt(&mut client, action_id).await;
+    assert_eq!(unknown.state, ReceiptState::Unknown);
     transport
         .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
         .await
@@ -3332,10 +3354,10 @@ async fn kr_req_25_22_an_ending_binding_stays_while_the_thread_of_a_cancellation
             sending.await.expect("the mutation is answered").0
         );
     }
-    // The service's wait ends now, as its deadline ends it, while the thread stands at its pause:
-    // the caller is told that the outcome cannot be established, and the future that waited for
-    // the thread is gone.
-    host.service.end_upstream_waits_for_tests();
+    // The service's wait for the call ends now, as its deadline ends it, while the thread stands at
+    // its pause: the caller is told that the outcome cannot be established, and the future that
+    // waited for the thread is gone.
+    host.service.pass_the_calls_deadline_for_tests();
     let (outcome, _client) = sending.await.expect("the mutation is answered");
     let Outcome::Error(error) = outcome else {
         panic!("a cancellation whose call has not been made is not an applied one: {outcome:?}");
@@ -6520,57 +6542,6 @@ fn stored_provenance(host: &Host, action_id: kr_protocol::ids::ActionId) -> Opti
         .expect("the receipt is stored")
 }
 
-/// What a channel is refused with when the worker stopped waiting before the channel's queue took
-/// `taking`, an answer or a message: nothing was sent.
-fn not_queued_in_time(taking: &str) -> String {
-    format!(
-        "The worker stopped waiting before the channel's queue took the {taking}. Nothing was sent."
-    )
-}
-
-/// Sends the call `build` makes until the worker's own bound passes with the channel's queue
-/// holding what the call carried, and gives that try's action, its outcome and what `arm` armed
-/// for it. `taking` is what the call carries, an answer or a message.
-///
-/// The bound is real time. A thread that is slow to make the call can pass it before the queue
-/// takes what the call carries, and the worker then proves that nothing was sent: the refusal of
-/// [`not_queued_in_time`], after which the request is pending again and repeating the call has no
-/// effect. That outcome says the case's own situation did not arise, and it is not what the case
-/// is about, so the call is repeated with the bound doubled, from `first_deadline`, up to five
-/// tries. What decides is the state the worker proves, never a delay: any other outcome is the
-/// case's to assert, and a case that never had one fails with each try's bound and outcome. `arm`
-/// is called before each try, because a pause is taken by the gate of one call. `build` is given
-/// each try's request number: `first_request` and every tenth one after it.
-async fn repeated_until_the_queue_took_it<A>(
-    client: &mut LocalClient,
-    host: &Host,
-    taking: &str,
-    first_request: u64,
-    first_deadline: std::time::Duration,
-    mut arm: impl FnMut() -> A,
-    mut build: impl FnMut(&LocalClient, u64) -> MutationRequest,
-) -> (kr_protocol::ids::ActionId, Outcome, A) {
-    let refusal = not_queued_in_time(taking);
-    let mut tries = Vec::new();
-    for attempt in 0..5_u32 {
-        let deadline = first_deadline * 2_u32.pow(attempt);
-        host.service.set_upstream_deadline_for_tests(deadline);
-        let armed = arm();
-        let mutation = build(client, first_request + 10 * u64::from(attempt));
-        let action_id = mutation.action_id;
-        let outcome = send(client, mutation).await;
-        let unsent = matches!(&outcome, Outcome::Error(error) if error.message == refusal);
-        if !unsent {
-            return (action_id, outcome, armed);
-        }
-        tries.push(format!("{deadline:?}: refused as not sent"));
-    }
-    panic!(
-        "the channel's queue took no {taking} within the worker's bound in any try: {}",
-        tries.join("; ")
-    );
-}
-
 /// KR-REQ-12.18: two requests wait on one channel and each is answered through the decoder's own
 /// answer. Each answer is written to the channel, each ends as an outcome nobody can establish
 /// (the channel confirms nothing), and the first does not hold the second back.
@@ -6709,8 +6680,9 @@ async fn kr_req_12_18_the_packages_refresh_is_applied_after_an_answer_ended_unkn
 /// KR-REQ-12.18: an answer the channel's writer has not written when the worker's own bound passes
 /// is still a channel's end. The receipt says unknown and records that nothing will say more, so
 /// the next answer on the channel and the package's refresh are admitted, as they are after an
-/// answer the writer wrote in time. The writer is held before its write, so the bound passes first
-/// and what decides is the pause, not a delay.
+/// answer the writer wrote in time. The writer is held before its write, and the case passes the
+/// worker's deadline once the writer holds the answer, so what decides is the pause and not a
+/// delay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_end() {
     let host = host().await;
@@ -6719,24 +6691,23 @@ async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_e
     let second = channel.relay(&host, "fghij").await;
     let mut client = cli(&host).await;
 
-    let (action_id, outcome, (arrived, release)) = repeated_until_the_queue_took_it(
-        &mut client,
-        &host,
-        "answer",
-        60,
-        std::time::Duration::from_secs(1),
-        || host.service.broker().pause_before_channel_write(),
-        |client, request| approval_mutation(client, &host, request, first),
-    )
-    .await;
-    let Outcome::Error(error) = outcome else {
-        panic!("an answer nobody wrote in time ends as an outcome nobody can establish");
-    };
-    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    host.service
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
+    let (arrived, release) = host.service.broker().pause_before_channel_write();
+    let mutation = approval_mutation(&client, &host, 60, first);
+    let action_id = mutation.action_id;
+    write_mutation(&mut client, mutation).await;
+    // The queue took the answer when the writer reached it. The worker's wait for the answer ends
+    // here, as its deadline ends it.
     tokio::time::timeout(LIVENESS_DEADLINE, arrived)
         .await
         .expect("the writer reached the answer")
         .expect("the pause is armed");
+    host.service.pass_the_answers_deadline_for_tests();
+    let Outcome::Error(error) = outcome_of(&mut client).await else {
+        panic!("an answer nobody wrote in time ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
     assert_eq!(
         receipt(&mut client, action_id).await.state,
         ReceiptState::Unknown
@@ -6752,8 +6723,6 @@ async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_e
     );
 
     // What follows is decided by what the channel writes, not by the bound.
-    host.service
-        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     let next = approval_mutation(&client, &host, 61, second);
     let next_id = next.action_id;
     let Outcome::Error(error) = send(&mut client, next).await else {
@@ -6791,8 +6760,8 @@ async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_e
 
 /// KR-REQ-12.18: an answer the channel's queue took is a channel's end although the worker's own
 /// bound passes before the call that queued it has returned. The call is held after the queue took
-/// the answer and before it returns, so the bound passes first and what decides is the pause, not
-/// a delay. The receipt says unknown and the journal holds the provenance the answer went by; the
+/// the answer and before it returns, and the case passes the worker's deadline once the call
+/// stands there, so what decides is the pause and not a delay. The receipt says unknown and the journal holds the provenance the answer went by; the
 /// next answer on the channel and the package's refresh are admitted, the refresh applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_18_an_answer_the_queue_took_is_a_channel_end_before_the_call_that_queued_it_returns()
@@ -6803,24 +6772,21 @@ async fn kr_req_12_18_an_answer_the_queue_took_is_a_channel_end_before_the_call_
     let second = channel.relay(&host, "fghij").await;
     let mut client = cli(&host).await;
 
-    let (action_id, outcome, (arrived, release)) = repeated_until_the_queue_took_it(
-        &mut client,
-        &host,
-        "answer",
-        60,
-        std::time::Duration::from_secs(1),
-        || host.service.broker().pause_after_queueing(),
-        |client, request| approval_mutation(client, &host, request, first),
-    )
-    .await;
-    let Outcome::Error(error) = outcome else {
-        panic!("an answer whose call had not returned at the bound ends as an unknown outcome");
-    };
-    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    host.service
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
+    let (arrived, release) = host.service.broker().pause_after_queueing();
+    let mutation = approval_mutation(&client, &host, 60, first);
+    let action_id = mutation.action_id;
+    write_mutation(&mut client, mutation).await;
     tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
         .await
         .expect("the wait ends")
         .expect("the call reached the pause after its queue took the answer");
+    host.service.pass_the_calls_deadline_for_tests();
+    let Outcome::Error(error) = outcome_of(&mut client).await else {
+        panic!("an answer whose call had not returned at the bound ends as an unknown outcome");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
     assert_eq!(
         receipt(&mut client, action_id).await.state,
         ReceiptState::Unknown
@@ -6840,8 +6806,6 @@ async fn kr_req_12_18_an_answer_the_queue_took_is_a_channel_end_before_the_call_
     );
 
     // What follows is decided by what the channel writes, not by the bound.
-    host.service
-        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     let next = approval_mutation(&client, &host, 61, second);
     let next_id = next.action_id;
     let Outcome::Error(error) = send(&mut client, next).await else {
@@ -7569,10 +7533,9 @@ async fn kr_req_12_26_a_prompt_whose_write_failed_after_admission_is_unknown_not
 /// KR-REQ-12.26: a message the channel's queue took and the writer has not written when the
 /// worker's own bound passes is a channel's end. The receipt says unknown and holds the channel's
 /// provenance, so the next message from the same actor is admitted and written, as it is after a
-/// message the writer wrote in time. The writer is held before its write, so the bound passes
-/// first and what decides is the pause, not a delay. A thread that is slow to queue the message
-/// can pass the bound before the queue took it, which the worker answers as a message nothing was
-/// sent for, and the message is then sent again with the bound doubled.
+/// message the writer wrote in time. The writer is held before its write, and the case passes the
+/// worker's deadline once the writer holds the message, so what decides is the pause and not a
+/// delay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_26_a_prompt_still_queued_at_the_workers_bound_is_a_channel_end() {
     let host = host().await;
@@ -7581,17 +7544,21 @@ async fn kr_req_12_26_a_prompt_still_queued_at_the_workers_bound_is_a_channel_en
     let mut client = cli(&host).await;
 
     let window = client.action_window().action_window_id.clone();
-    let (first_id, outcome, (arrived, release)) = repeated_until_the_queue_took_it(
-        &mut client,
-        &host,
-        "message",
-        60,
-        std::time::Duration::from_secs(1),
-        || host.service.broker().pause_before_channel_write(),
-        |_, request| queue_mutation(&host, request, window.clone(), "held at the write"),
-    )
-    .await;
-    let Outcome::Error(error) = outcome else {
+    host.service
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
+    let (arrived, release) = host.service.broker().pause_before_channel_write();
+    let mutation = queue_mutation(&host, 60, window.clone(), "held at the write");
+    let first_id = mutation.action_id;
+    write_mutation(&mut client, mutation).await;
+    // The queue took the message when the writer reached it. The worker's wait for the message
+    // ends here, as its deadline ends it.
+    let reached = tokio::time::timeout(LIVENESS_DEADLINE, arrived).await;
+    assert!(
+        matches!(reached, Ok(Ok(_))),
+        "the writer reached the message: {reached:?}"
+    );
+    host.service.pass_the_answers_deadline_for_tests();
+    let Outcome::Error(error) = outcome_of(&mut client).await else {
         panic!("a message nobody wrote in time ends as an outcome nobody can establish");
     };
     assert_eq!(error.code, ErrorCode::OutcomeUnknown);
@@ -7600,11 +7567,6 @@ async fn kr_req_12_26_a_prompt_still_queued_at_the_workers_bound_is_a_channel_en
         "The host cannot tell whether Claude Code took this message. Claude Code does not \
          confirm messages on this channel.",
         "the person is told the channel's end, not that an upstream never answered"
-    );
-    let reached = tokio::time::timeout(LIVENESS_DEADLINE, arrived).await;
-    assert!(
-        matches!(reached, Ok(Ok(_))),
-        "the writer reached the message: {reached:?}"
     );
     let held = receipt(&mut client, first_id).await;
     assert_eq!(held.state, ReceiptState::Unknown);
@@ -7627,8 +7589,6 @@ async fn kr_req_12_26_a_prompt_still_queued_at_the_workers_bound_is_a_channel_en
     );
 
     // What follows is decided by what the channel writes, not by the bound.
-    host.service
-        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     let second = queue_mutation(&host, 61, window, "the next message");
     let second_id = second.action_id;
     let Outcome::Error(error) = send(&mut client, second).await else {
