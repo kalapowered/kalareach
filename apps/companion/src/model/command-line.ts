@@ -5,11 +5,14 @@
  * shell reads quotes its own way, and text quoted for another shell runs as something else in this
  * one, so the vector is quoted for the shell the session runs.
  *
- * Most shells write a word as it is when it holds only characters no shell treats as more than
- * themselves, and as one quoted string otherwise. PowerShell reads more as syntax (a leading `@`,
- * `-` or `$`, a comma, a bare number), so every word of its line is one quoted string. That line
- * is the one the shell integration installs when it launches the same vector, so a person who types
- * it runs what a launch would have run, with two limits that the page cannot see past. It does not
+ * Every word is one quoted string, the program too, in every shell. The shell integration quotes
+ * every word it types, and a word left bare can mean more than itself: a first word `X=1` is an
+ * assignment, a reserved word such as `if` or `time` starts a construct, and a zsh global alias
+ * expands wherever it stands in the line, an argument included. PowerShell reads more as syntax
+ * still (a leading `@`, `-` or `$`, a comma, a bare number), and its quoted program is run by the
+ * call operator. The line is the one the shell integration installs when it launches the same
+ * vector, so a person who types it runs what a launch would have run, with two limits that the page
+ * cannot see past. It does not
  * see which alias, function or cmdlet that shell finds before the program, so it shows the program
  * as named, where a launch writes the program's full path if something else would stand in for it.
  * And it does not see that the program is a batch file, which Windows runs through cmd.exe: a launch
@@ -19,9 +22,6 @@
  */
 
 import type { LaunchShell } from '@kalareach/protocol'
-
-/** Characters every other shell here reads as themselves. */
-const PLAIN = /^[\w@%+=:,./-]+$/
 
 /** The five characters PowerShell reads as a single quote: the ASCII one and four typographic ones. */
 const POWERSHELL_QUOTES = /['\u2018\u2019\u201A\u201B]/g
@@ -40,10 +40,6 @@ function powershellWord(argument: string): string {
 
 /** One argument as a single word of a shell other than PowerShell. */
 function word(argument: string, kind: Exclude<LaunchShell, 'powershell'>): string {
-  // Zsh reads a word that starts with `=` as the path of a command, and Fish reads `%self` as a
-  // process number, so neither is left bare.
-  const bare = PLAIN.test(argument) && !argument.startsWith('=') && !argument.startsWith('%')
-  if (bare) return argument
   if (kind === 'fish') return `'${argument.replaceAll('\\', '\\\\').replaceAll("'", "\\'")}'`
   return `'${argument.replaceAll("'", `'\\''`)}'`
 }
