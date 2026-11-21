@@ -330,6 +330,7 @@ allow crates/kr-worker/src/persistence/fault.rs observe describe new
 allow crates/kr-worker/src/projection.rs position from new
 allow crates/kr-worker/src/questions/binding.rs key get
 allow crates/kr-worker/src/questions/binding.rs source clone
+allow crates/kr-worker/src/questions/mod.rs check_create check_text
 allow crates/kr-worker/src/questions/mod.rs check_resolvable_reaching get
 allow crates/kr-worker/src/questions/mod.rs event clone
 allow crates/kr-worker/src/questions/mod.rs expiry_events collect iter

@@ -175,6 +175,7 @@ allow crates/kr-worker/src/persistence/fault.rs observe describe new
 allow crates/kr-worker/src/projection.rs position from new
 allow crates/kr-worker/src/questions/binding.rs key get
 allow crates/kr-worker/src/questions/binding.rs source clone
+allow crates/kr-worker/src/questions/mod.rs check_create check_text
 allow crates/kr-worker/src/questions/mod.rs check_resolvable_reaching get
 allow crates/kr-worker/src/questions/mod.rs locked lock
 allow crates/kr-worker/src/questions/store.rs check_request clone
