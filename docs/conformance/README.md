@@ -380,22 +380,31 @@ A target that a step built or ran and that no step of the selection covers is a 
 result: `step <number> built or ran <target>, but no step of this selection covers it: the selection
 rule and Cargo disagree`. The run does not pass.
 
-A Rust test's `command` is a POSIX shell line. It comes from the step that ran the test or, where
-none did, from the first step that covers its target, narrowed to the test's target and name, and to
-its package when the step selects no other package (see below). It begins `cd <directory> && `
-when the test's workspace is not the root. It repeats the step's variables whose value holds no
-placeholder, written `NAME=value`, and the step's profile, `--target`, `--config` and feature flags.
-A flag whose value holds a placeholder is left out, because the run gives a placeholder its value.
+A Rust test's `command` is a POSIX shell line that runs the test with the build its step made. It
+comes from the step that ran the test or, where none did, from the first step that covers its
+target. It begins `cd <directory> && ` when the test's workspace is not the root, and it repeats the
+step's variables whose value holds no placeholder, written `NAME=value`. Then come `cargo test` and
+the words of the step's command before `--`, as the step wrote them and in the same order, less
+`--no-run`, its target flags and its test names. Those words decide which packages Cargo builds and
+with which features, platforms and profile, so the command builds the test's program as the step
+did. It never narrows the step's package flags: a command for fewer packages can build the test's
+package and its dependencies with other features.
 
-Cargo builds the selected packages together and turns on, in each package, the features that any of
-them asks for, and the report cannot see which selected packages reach the test's package. A step
-that selects only the test's package therefore gives its command `-p <package>` and the step's
-feature flags. A step that selects other packages (`--workspace`, several `-p`, or the default
-members of a workspace with several packages) keeps its own package flags and feature flags, so the
-command builds the package with the features the step built it with. The options the step passes
-the test binary stay with their values, except the filters, `--skip`, `--exact`, `--list`,
-`--show-output` and `--logfile`. A variable whose value holds a placeholder is named in the test's
-`needs`, and an option whose value holds one is left out. The command of a TypeScript test is not
+In place of the step's target flags the command gives the test's own: `--lib`, or `--bin`,
+`--example`, `--test` or `--bench` with the target's name. Cargo applies that flag to every package
+the step selects, and refuses it for a target whose features are off, so the command gives it only
+when the step's build made every target the flag names in those packages. Otherwise it keeps the
+step's target flags and test names, and Cargo runs every program the step ran. After `--` come the
+options the step passes the test programs, with their values, except the filters, `--skip`,
+`--exact`, `--list`, `--show-output` and `--logfile`, then `--exact` and the test's name. Every
+program the command starts runs the tests of that exact name, so a test of the same name in another
+of them runs too. A test that no step covers gets `--locked`, `-p <package>` and its target's flag.
+
+The command does not give what the report gives the step: `KR_TEST_ARTIFACTS_DIR`, the runner, and
+the option that makes each test program write its record. A word whose value holds a placeholder is
+left out, because the run gives a placeholder its value, and each variable whose value holds one is
+named in the test's `needs`; such a command can build or run differently. The command is for the
+platform of the result: another host builds other programs. The command of a TypeScript test is not
 changed.
 
 ## How a test names what it proves
