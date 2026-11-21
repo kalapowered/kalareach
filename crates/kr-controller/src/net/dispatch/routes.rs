@@ -1163,7 +1163,10 @@ impl RemoteConnection {
                         // was read, stops it, and then present view authority over the session,
                         // under the decision the answer is then written under. The close itself
                         // happened: section 7's stop does not wait on this, and only the answer
-                        // does, so a close not shown is not told as one refused.
+                        // does, so a close not shown is not told as one refused. The answer carries
+                        // no privacy state: a close's result holds the session's state, its
+                        // closure record and a summary of the session, and no text a session or a
+                        // model wrote.
                         if retained != Retained::Not {
                             *asked = Some(decided.clone().kept(self.footing_of(validated)));
                             if self.admitted_to_answer(validated).is_err() {
