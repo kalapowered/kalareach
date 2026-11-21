@@ -7466,6 +7466,61 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.01: a document that was there before the installation, in a folder that every
+    /// user can change, is refused before anything is taken, in the words of a write: the folder
+    /// that holds it holds no folder the installation made, so only the document's own folder
+    /// check reaches it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_document_there_before_in_a_changeable_folder_is_refused_before_anything_is_taken() {
+        let tree = Tree::create();
+        let folder = tree.home().join(".amp");
+        std::fs::create_dir_all(folder.join("skills")).expect("the folders are there before");
+        let document = folder.join("mcp.json");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        set_mode(&folder, 0o757);
+        let refused = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a folder every user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(".amp/mcp.json") && detail.contains(FOLDER_WRITE_BIT)),
+            "{refused}"
+        );
+        assert_eq!(
+            recorded_files_gone(&tree),
+            Vec::<&str>::new(),
+            "nothing was removed before the refusal"
+        );
+    }
+
+    /// KR-REQ-11.01: a folder that holds only the folder the installation made is one every user
+    /// can change: the removal is refused before anything is taken, for the folder it would
+    /// remove, though no file it deletes is in the folder that is shared.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_that_holds_only_a_recorded_folder_is_judged_before_anything_is_taken() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        set_mode(&tree.home().join(".amp/skills"), 0o757);
+        let refused = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a folder every user can change is refused");
+        assert!(
+            matches!(&refused, ControllerError::PermissionDenied { detail }
+                if detail.contains(".amp/skills/kalareach-contact")
+                    && detail.contains(FOLDER_WRITE_BIT_REMOVING)),
+            "{refused}"
+        );
+        assert_eq!(
+            recorded_files_gone(&tree),
+            Vec::<&str>::new(),
+            "nothing was removed before the refusal"
+        );
+    }
+
     /// KR-REQ-11.01: a recorded file that another process makes changeable by every user after the
     /// check is judged at the removal, through a descriptor opened on it, and stays where it is.
     #[cfg(unix)]
