@@ -65,6 +65,7 @@ import type {
   HostContact,
   HostEvent,
   HostInbox,
+  HostLabel,
   HostError,
   HostPort,
   Keyed,
@@ -631,6 +632,21 @@ export interface FakeHostControls {
    * connection state counts one more replacement, and says so to everything listening.
    */
   replaceConnection(): void
+  /**
+   * Names the host the connection is to, as native code's state does: a paired host by its
+   * reference, the host on this computer, or none. The state tells it as a revision of its own.
+   * Once set, taking a host into use (`hostsUse`) names that host here and moves the epoch.
+   */
+  setHostInUse(host: HostLabel | null): void
+  /** Sets the epoch the host in use's inbox is valid under, and tells it as a revision of its own. */
+  setInboxEpoch(epoch: number): void
+  /**
+   * Holds back every change of the connection's state from now on, as native code does that has
+   * made a change and not yet published it: the host answers reads as it is now, the page is told
+   * nothing and a replay holds nothing newer than what it was told. Returns the function that
+   * tells the page each held change, in order.
+   */
+  holdPublications(): () => void
   /**
    * Has the connection go to another host, as choosing one does: the environment the connection
    * belongs to changes and is told, the host lists no sessions of the earlier one, and reads of its
@@ -1655,6 +1671,13 @@ export function fakeHost(
   let connectionRevision = 1
   const KEPT_STATES = 256
   let loseNext = false
+  /** The host the connection is to when a test named it; otherwise the pairing of the device says. */
+  let namedHost: HostLabel | null | undefined
+  /** The epoch of the host in use's inbox when a test set it; otherwise it is 1 for a paired device. */
+  let namedEpoch: number | undefined
+  /** Whether changes of the connection are kept from the page, and the newest revision it was told. */
+  let publicationsHeld = false
+  let toldThrough = 1
   const connectionBody = (): Omit<ConnectionState, 'revision'> => ({
     connected,
     environment_id: connected ? hostEnvironment : null,
@@ -1663,15 +1686,18 @@ export function fakeHost(
     paired: connected && pairedDevice,
     replaced: replacements,
     link: 1 + replacements,
-    host: pairedDevice
-      ? { kind: 'paired', reference: 'studio-reference', name: 'Studio' }
-      : { kind: 'local' },
+    host:
+      namedHost !== undefined
+        ? namedHost
+        : pairedDevice
+          ? { kind: 'paired', reference: 'studio-reference', name: 'Studio' }
+          : { kind: 'local' },
     contact:
       statedContact ??
       (connected
         ? { state: 'in_contact' }
         : { state: 'out_of_contact', since_ms: 0, escalates_at_ms: 0 }),
-    inbox_epoch: pairedDevice ? 1 : 0,
+    inbox_epoch: namedEpoch ?? (pairedDevice ? 1 : 0),
     others: otherHosts
   })
   const connectionNow = (): ConnectionState =>
@@ -1691,18 +1717,27 @@ export function fakeHost(
     if (connectionLog.length > KEPT_STATES) connectionLog.shift()
     if (loseNext) {
       loseNext = false
+      toldThrough = state.revision
       return
     }
+    if (publicationsHeld) return
+    toldThrough = state.revision
     for (const listener of connectionListeners) listener(state)
   }
+  /** The newest state the page may be told: the host's own, or what was told before a hold. */
+  const publishedNow = (): ConnectionState =>
+    publicationsHeld
+      ? (connectionLog.find((state) => state.revision === toldThrough) ?? connectionNow())
+      : connectionNow()
   const connectionSinceNow = (after: number): ConnectionSince => {
     const oldest = connectionLog[0]?.revision ?? connectionRevision
-    if (after + 1 < oldest || after > connectionRevision) {
-      return { revision: connectionRevision, states: [connectionNow()], resync: true }
+    const through = publicationsHeld ? toldThrough : connectionRevision
+    if (after + 1 < oldest || after > through) {
+      return { revision: through, states: [publishedNow()], resync: true }
     }
     return {
-      revision: connectionRevision,
-      states: connectionLog.filter((state) => state.revision > after),
+      revision: through,
+      states: connectionLog.filter((state) => state.revision > after && state.revision <= through),
       resync: false
     }
   }
@@ -2010,13 +2045,13 @@ export function fakeHost(
 
   // The one feed of the connection's state, over the raw events and the replay, as the desktop port's.
   const connectionFeed = createConnectionFeed({
-    read: () => reading('connectionState', connectionNow),
+    read: () => reading('connectionState', publishedNow),
     since: (after) => Promise.resolve(connectionSinceNow(after)),
     listen: (heard) => register(connectionListeners, heard)
   })
 
   const port: HostPort = {
-    connectionState: () => reading('connectionState', connectionNow),
+    connectionState: () => reading('connectionState', publishedNow),
     connectionSince: (after) => Promise.resolve(connectionSinceNow(after)),
     watchConnection: connectionFeed.watch,
     onConnection: connectionFeed.onChange,
@@ -2830,6 +2865,12 @@ export function fakeHost(
         hosts: pairing.hosts.map((host) => ({ ...host, in_use: host.reference === reference }))
       })
       connected = true
+      // A host the test named follows the choice, and a choice moves the epoch.
+      if (namedHost !== undefined) {
+        const chosen = pairing.hosts.find((host) => host.reference === reference)
+        namedHost = { kind: 'paired', reference, name: chosen?.name ?? reference }
+        namedEpoch = (namedEpoch ?? 0) + 1
+      }
       publishConnection()
       return Promise.resolve(connectionNow())
     },
@@ -3808,6 +3849,26 @@ export function fakeHost(
     replaceConnection() {
       replacements += 1
       publishConnection()
+    },
+    setHostInUse(host) {
+      namedHost = host
+      namedEpoch ??= host === null ? 0 : 1
+      publishConnection()
+    },
+    setInboxEpoch(epoch) {
+      namedEpoch = epoch
+      publishConnection()
+    },
+    holdPublications() {
+      publicationsHeld = true
+      return () => {
+        if (!publicationsHeld) return
+        publicationsHeld = false
+        for (const state of connectionLog.filter((each) => each.revision > toldThrough)) {
+          toldThrough = state.revision
+          for (const listener of connectionListeners) listener(state)
+        }
+      }
     },
     switchHost(environmentId, options) {
       hostEnvironment = environmentId
