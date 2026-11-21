@@ -121,21 +121,50 @@ mod unix {
     /// Leaves a socket at `path` that refuses every connect: what a listener that ended without
     /// removing it leaves.
     ///
-    /// The socket answers until every copy of its descriptor is closed, so this returns once a
-    /// connect is refused.
+    /// The socket answers until every copy of its descriptor is closed. A connect that is
+    /// answered waits in the queue of the listener that answered it and is reset when the last
+    /// copy closes, so the case makes one connect, waits for that reset, and then checks that the
+    /// next connect is refused. It makes no further connect while it waits: each would add to the
+    /// queue, and a full queue is refused on macOS and holds a connect on Linux.
     fn leave_a_refusing_socket(path: &Path) {
+        use std::io::Read as _;
+
         drop(StdListener::bind(path).expect("a socket"));
-        let begun = std::time::Instant::now();
-        loop {
-            match std::os::unix::net::UnixStream::connect(path) {
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
-                Err(error) => panic!("a connect to a left socket is refused, not {error:?}"),
-                Ok(_answered) if begun.elapsed() >= EXEC_WAIT => {
-                    panic!("a program another case started keeps the left socket listening");
-                }
-                Ok(_answered) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        let address = rustix::net::SocketAddrUnix::new(path).expect("an address");
+        let connect = || {
+            let socket = crate::endpoint::stream_socket().expect("a socket");
+            rustix::io::ioctl_fionbio(&socket, true).expect("a mode");
+            let result = rustix::net::connect(&socket, &address);
+            (std::os::unix::net::UnixStream::from(socket), result)
+        };
+        let (mut queued, first) = connect();
+        match first {
+            Err(Errno::CONNREFUSED) => return,
+            Ok(()) | Err(Errno::INPROGRESS) => {}
+            Err(other) => {
+                panic!("a connect to a left socket is answered or refused, not {other:?}")
             }
         }
+        let begun = std::time::Instant::now();
+        loop {
+            match queued.read(&mut [0_u8; 1]) {
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("a connect that waits in the queue is reset, not {other:?}"),
+            }
+            assert!(
+                begun.elapsed() < EXEC_WAIT,
+                "a program another case started keeps the left socket listening"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (_next, second) = connect();
+        assert_eq!(
+            second,
+            Err(Errno::CONNREFUSED),
+            "the left socket refuses once its last copy closed"
+        );
     }
 
     /// Makes the lock file of a leftover socket and writes in it the record a listener of this
