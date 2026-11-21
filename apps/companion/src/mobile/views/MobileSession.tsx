@@ -33,8 +33,11 @@ import { useSessionOpening } from '../../app/opening'
 import { useHeldConnection } from '../../app/rights'
 import { AttachmentPaths } from '../../components/AttachmentPaths'
 import { AttachmentThumb } from '../../components/AttachmentThumb'
+import { UploadRowView, type UploadActions } from '../components/upload-row'
+import { usePairedFiles, type PairedFiles } from '../usePairedFiles'
+import type { UploadRow } from '../../model/paired-uploads'
 import {
-  attachOffer,
+  phoneAttachOffer,
   composerInstance,
   composerOffers,
   subjectOf,
@@ -199,7 +202,7 @@ export function MobileSession({
   /** Whether the host is in contact, or null before the shell's first answer. */
   readonly connected: boolean | null
 }): ReactNode {
-  const { port, say, drafts: book, paths, openings, receiptReads } = useApp()
+  const { port, say, drafts: book, paths, uploads, openings, receiptReads } = useApp()
   const camera = useCameraControl(port, say)
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
@@ -311,7 +314,7 @@ export function MobileSession({
   const canControl = rights?.includes('terminal.input') === true
   // A file needs the host on this phone's own computer and the rights, and nothing of the agent.
   const fileOffer = useMemo(
-    () => attachOffer({ connected: connected === true, paired, rights: rights === null ? null : new Set(rights) }),
+    () => phoneAttachOffer({ connected: connected === true, paired, rights: rights === null ? null : new Set(rights) }),
     [connected, paired, rights]
   )
   // What the conversation does not show, said above what it does.
@@ -442,6 +445,23 @@ export function MobileSession({
     },
     [changeFiles, nameSession, paths, port, say, sessionId]
   )
+
+  // Over a host this phone is paired with the application owns each upload, and the composer shows
+  // where it stands and what the person can do about it.
+  const pairedFiles = usePairedFiles({
+    active: paired && connected === true,
+    sessionId,
+    draft,
+    nameSession,
+    changeFiles,
+    removed: removedFiles
+  })
+
+  // Files bound to the draft the device keeps on a paired host go with the prompt that names it.
+  const carriesFiles =
+    paired &&
+    draft.attachments.length > 0 &&
+    draft.attachments.every((file) => pairedFiles.rows.get(file.localId)?.phase.kind === 'bound')
 
   // A draft written before the agent was read keeps the first conversation it learns, so that a
   // later move is a conflict rather than a new conversation the text follows.
@@ -724,6 +744,12 @@ export function MobileSession({
       // which is the one `sendAnyway` has just read. With nothing of that kind to name it names
       // nothing, and the host decides.
       const quote = anyway ? quoting : null
+      const wentWith = new Set(draft.attachments.map((file) => file.localId))
+      const pairedDraft =
+        paired &&
+        [...uploads.snapshot().values()].some(
+          (row) => row.sessionId === sessionId && row.phase.kind === 'bound'
+        )
       ask(async () => {
         // The prompt is sent only once the stored draft is this window's to send: another window
         // that holds the same draft claims it first, and the other one sends nothing.
@@ -738,15 +764,18 @@ export function MobileSession({
           // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
           throw { code: 'UNSUPPORTED_CAPABILITY', message: 'No agent is running in this session.' }
         }
-        return await port.composerSubmit(
-          {
-            target: { subject: subjectOf(sessionId, instance), binding_revision: revision },
-            draft_id: null,
-            text
-          },
-          opening,
-          quote ?? undefined
-        )
+        const target = { subject: subjectOf(sessionId, instance), binding_revision: revision }
+        // Files bound to the draft the device keeps on a paired host are sent with the prompt that
+        // names the draft, which carries no text of its own: the text is set on the draft first.
+        if (pairedDraft) {
+          const kept = await port.draftSetText(await nameSession(), sessionId, text)
+          return await port.composerSubmit(
+            { target, draft_id: kept.draftId, text: null },
+            opening,
+            quote ?? undefined
+          )
+        }
+        return await port.composerSubmit({ target, draft_id: null, text }, opening, quote ?? undefined)
       })
         .then((answer) => {
           const state = answeredState(answer)
@@ -764,13 +793,21 @@ export function MobileSession({
             end('refused')
             return
           }
+          // The files that went with the prompt are the session's now, and no longer this composer's.
+          if (pairedDraft) uploads.forgetSent(sessionId)
           // The composer is cleared only when it still holds what was submitted. A person who
           // typed the next thing while this one was in flight keeps what they typed, whichever
           // opening they typed it under.
           book.setDrafts((drafts) =>
             drafts.map((each) =>
               each.draftId === draft.draftId && each.revision === submittedRevision
-                ? edit(each, '', Date.now())
+                ? {
+                    ...edit(each, '', Date.now()),
+                    // The files that went with the prompt are the session's now.
+                    attachments: pairedDraft
+                      ? each.attachments.filter((file) => !wentWith.has(file.localId))
+                      : each.attachments
+                  }
                 : each
             )
           )
@@ -813,7 +850,7 @@ export function MobileSession({
           if (stillHere()) setBusyUnder(null)
         })
     },
-    [draft, lifecycle, book, port, say, sessionId, openings, receiptReads]
+    [draft, lifecycle, book, port, say, sessionId, openings, receiptReads, paired, uploads, nameSession]
   )
 
 
@@ -959,7 +996,7 @@ export function MobileSession({
       ? ['Nothing more can be sent to this session from here.']
       : waiting.length > 0
         ? [unconfirmedWords(waiting.length)]
-        : [submitOffer.offered ? null : submitOffer.reason, asLine && emptyDraft ? null : notSubmittableBecause(draft)].filter(
+        : [submitOffer.offered ? null : submitOffer.reason, asLine && emptyDraft ? null : notSubmittableBecause(draft, carriesFiles)].filter(
             (each): each is string => each !== null
           )
   const whyIds = hints.map((_, index) => (index === 0 ? `composer-why-${sessionId}` : `composer-why-draft-${sessionId}`))
@@ -981,7 +1018,7 @@ export function MobileSession({
         data-testid="composer-send-anyway"
         data-wraps
         aria-describedby={describedBy}
-        disabled={!submittable(draft) || !submitOffer.offered || busy}
+        disabled={!submittable(draft, carriesFiles) || !submitOffer.offered || busy}
         style={{ minBlockSize: target }}
         onClick={() => {
           sendAnyway()
@@ -1062,7 +1099,7 @@ export function MobileSession({
     <Button
       id={sendId}
       tone="primary"
-      disabled={!submittable(draft) || !submitOffer.offered || busy || waiting.length > 0}
+      disabled={!submittable(draft, carriesFiles) || !submitOffer.offered || busy || waiting.length > 0}
       style={{ minBlockSize: target }}
       onClick={() => {
         send(draft.text)
@@ -1442,33 +1479,58 @@ export function MobileSession({
             </>
           ) : null}
 
-          {draft.attachments.length > 0 ? (
+          {draft.attachments.length > 0 || pairedFiles.found.length > 0 ? (
             <div className="m-attachments" data-testid="draft-attachments">
-              {draft.attachments.map((attachment) => (
-                <span
-                  key={attachment.localId}
-                  className="m-attachment"
-                  data-upload={attachment.upload}
-                >
-                  <AttachmentThumb attachment={attachment} />
-                  <span className="m-attachment-name">{attachment.name}</span>
-                  <span className="m-row-detail">
-                    {`${describeBytes(attachment.byteLen)} · ${UPLOAD_WORDS[attachment.upload]}`}
-                  </span>
-                  <Button
-                    tone="quiet"
-                    style={{ minBlockSize: target, minInlineSize: target }}
-                    aria-label={`Remove ${attachment.name} from this draft`}
-                    onClick={() => {
-                      removedFiles.current.add(attachment.localId)
-                      changeFiles((files) =>
-                        files.filter((each) => each.localId !== attachment.localId)
-                      )
-                    }}
+              {draft.attachments.map((attachment) => {
+                const row = paired ? (pairedFiles.rows.get(attachment.localId) ?? waitingRow(attachment)) : null
+                if (row !== null) {
+                  return (
+                    <UploadRowView
+                      key={attachment.localId}
+                      row={row}
+                      attachment={attachment}
+                      actions={actionsFor(pairedFiles, row)}
+                      target={target}
+                      others={boundOthers(pairedFiles.rows, sessionId, attachment.localId)}
+                    />
+                  )
+                }
+                return (
+                  <span
+                    key={attachment.localId}
+                    className="m-attachment"
+                    data-upload={attachment.upload}
                   >
-                    Remove
-                  </Button>
-                </span>
+                    <AttachmentThumb attachment={attachment} />
+                    <span className="m-attachment-name">{attachment.name}</span>
+                    <span className="m-row-detail">
+                      {`${describeBytes(attachment.byteLen)} · ${UPLOAD_WORDS[attachment.upload]}`}
+                    </span>
+                    <Button
+                      tone="quiet"
+                      style={{ minBlockSize: target, minInlineSize: target }}
+                      aria-label={`Remove ${attachment.name} from this draft`}
+                      onClick={() => {
+                        removedFiles.current.add(attachment.localId)
+                        changeFiles((files) =>
+                          files.filter((each) => each.localId !== attachment.localId)
+                        )
+                      }}
+                    >
+                      Remove
+                    </Button>
+                  </span>
+                )
+              })}
+              {pairedFiles.found.map((row) => (
+                <UploadRowView
+                  key={row.key}
+                  row={row}
+                  attachment={null}
+                  actions={actionsFor(pairedFiles, row)}
+                  target={target}
+                  others={0}
+                />
               ))}
             </div>
           ) : null}
@@ -1552,7 +1614,8 @@ export function MobileSession({
                       say(admission.reason, 'danger')
                       continue
                     }
-                    upload(picked, file)
+                    if (paired) pairedFiles.send(picked, file)
+                    else upload(picked, file)
                   }
                 }}
               />
@@ -1578,6 +1641,47 @@ function nearestZoom(scale: number): number {
     if (Math.abs(step - scale) < Math.abs((ZOOM_STEPS[nearest] ?? step) - scale)) nearest = index
   })
   return nearest
+}
+
+/** What a file shows before this window has asked the application about it: it is being checked. */
+function waitingRow(attachment: DraftAttachment): UploadRow {
+  return {
+    key: attachment.localId,
+    sessionId: null,
+    name: attachment.name,
+    byteLen: attachment.byteLen,
+    phase:
+      attachment.upload === 'failed'
+        ? { kind: 'cancelled', released: null }
+        : attachment.upload === 'uploaded'
+          ? { kind: 'bound' }
+          : { kind: 'checking' },
+    handle: attachment.handle,
+    note: null,
+    awaited: attachment.upload === 'uploading'
+  }
+}
+
+/** The files bound to this session's draft besides `key`. */
+function boundOthers(rows: ReadonlyMap<string, UploadRow>, sessionId: string, key: string): number {
+  return [...rows.values()].filter(
+    (row) => row.sessionId === sessionId && row.key !== key && row.phase.kind === 'bound'
+  ).length
+}
+
+/** What a person can do to the file a row stands for. */
+function actionsFor(files: PairedFiles, row: UploadRow): UploadActions {
+  return {
+    cancel: () => {
+      files.cancel(row.key)
+    },
+    remove: () => {
+      files.remove(row.key)
+    },
+    add: () => {
+      files.add(row)
+    }
+  }
 }
 
 /** Where a file's upload stands, in words. */
