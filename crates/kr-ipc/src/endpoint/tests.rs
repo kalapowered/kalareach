@@ -459,6 +459,13 @@ mod unix {
         let live = Listener::bind(&endpoint).expect("a listener");
         assert!(lock_is_held(path), "a live listener holds the lock");
         drop(live);
+        // A process another case starts in the same moment holds a copy of every descriptor this
+        // program has open until it executes its program, so the lock is free once that has
+        // happened, within a bound, and not at the instant of the drop.
+        let begun = std::time::Instant::now();
+        while lock_is_held(path) && begun.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             !lock_is_held(path),
             "the lock is free after the listener ends"
