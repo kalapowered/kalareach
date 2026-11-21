@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { fakeHost } from '../src/host/fake'
-import { PairedUploads, canCancel, lineOf, type Phase } from '../src/model/paired-uploads'
+import { PairedUploads, boundIdsOf, canCancel, lineOf, type Phase } from '../src/model/paired-uploads'
 import * as words from '../src/model/transfer-words'
 import openTransfers from '../src-tauri/src/open_transfers.rs?raw'
 import pairedDrafts from '../src-tauri/src/paired_drafts.rs?raw'
@@ -243,5 +243,15 @@ describe('the store reads the application, and the application is the one that s
     scripted.leave([])
     await uploads.restore()
     expect(uploads.found('s-1', new Set())).toEqual([])
+  })
+})
+
+describe('the draft the application keeps is read as it answers it', () => {
+  it('finds each bound transfer in the handle its attachment carries', () => {
+    expect(
+      boundIdsOf({ made: true, attachments: [{ handle: { transfer_id: 't-1' }, contribution: {} }] })
+    ).toEqual(new Set(['t-1']))
+    expect(boundIdsOf({ made: false, attachments: [] })).toEqual(new Set())
+    expect(boundIdsOf(null)).toEqual(new Set())
   })
 })

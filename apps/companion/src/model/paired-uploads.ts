@@ -446,3 +446,15 @@ export class PairedUploads {
     }
   }
 }
+
+/**
+ * The transfers the draft this device keeps holds, as the application answers it: each attachment
+ * carries the handle it was bound with, and the transfer is the handle's.
+ */
+export function boundIdsOf(view: unknown): ReadonlySet<string> {
+  const attachments =
+    (view as { attachments?: readonly { handle?: { transfer_id?: unknown } }[] } | null)?.attachments ?? []
+  return new Set(
+    attachments.flatMap((each) => (typeof each.handle?.transfer_id === 'string' ? [each.handle.transfer_id] : []))
+  )
+}

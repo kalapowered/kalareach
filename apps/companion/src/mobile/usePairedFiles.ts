@@ -16,7 +16,7 @@ import type { AttachmentHandle, SessionSubject } from '../host/port'
 import { failureWords } from '../host/port'
 import { attachContribution } from '../model/manual-paths'
 import type { UploadRow } from '../model/paired-uploads'
-import { lineOf } from '../model/paired-uploads'
+import { boundIdsOf, lineOf } from '../model/paired-uploads'
 import { refusalOf } from '../model/transfer-words'
 import { ask } from './model/call'
 import type { Picked } from './model/media'
@@ -95,8 +95,7 @@ export function usePairedFiles({
         subject
       )
       if (!current) return
-      const view = made.value as { attachments?: readonly { transfer_id?: unknown }[] } | null
-      const boundIds = new Set((view?.attachments ?? []).map((each) => each.transfer_id))
+      const boundIds = boundIdsOf(made.value)
       uploads.noteFiles(
         files.flatMap((file) =>
           file.upload === 'uploaded' && file.handle !== null
