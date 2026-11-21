@@ -646,6 +646,105 @@ async fn a_recorded_removal_goes_on_while_two_packages_declare_its_word() {
     assert!(!folder.exists(), "what the record named is removed");
 }
 
+/// KR-REQ-11.01: through the daemon, a removal carries out what the checks before the marker
+/// decided. A skill file that was changed, and that every user can change, is kept; another account
+/// putting its recorded bytes back while the daemon waits to register the action does not make it
+/// a file the removal deletes and then refuses, which would leave the marker with no outcome. The
+/// removal finishes, keeps the file, and the action is settled with its outcome.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_restored_while_the_daemon_waits_to_register_a_removal_is_still_kept() {
+    use kr_controller::catalogue::TestingPoint;
+    use std::os::unix::fs::PermissionsExt as _;
+    let host = host().await;
+    let params = install_for_amp(&host);
+    let home = host._temp.root().join("home");
+    std::fs::create_dir_all(&home).expect("a home");
+    let declared = serde_json::from_value(serde_json::json!({
+        "word": "amp", "project": { "skills": [".amp", "skills"] }
+    }))
+    .expect("a target");
+    kr_controller::agent_tools::Installer::new(
+        home,
+        host.state_dir.join("agent-tools"),
+        "/opt/kalareach/kr".to_owned(),
+    )
+    .with_declaration(Some(declared), Vec::new())
+    .install(&params)
+    .expect("the record is made");
+    let folder = host
+        ._temp
+        .root()
+        .join("project/.amp/skills/kalareach-contact");
+    let tools = folder.join("TOOLS.md");
+    let recorded = std::fs::read(&tools).expect("the installed file");
+    std::fs::write(&tools, "the person's own edit\n").expect("the person edits the file");
+    std::fs::set_permissions(&tools, std::fs::Permissions::from_mode(0o666))
+        .expect("and lets every user change it");
+    let (reached, reached_at) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let armed = std::sync::atomic::AtomicBool::new(true);
+    host._controller.catalogue().at_testing_point(move |point| {
+        if point == TestingPoint::FileChecks
+            && armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = reached.send(());
+            let _ = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(30));
+        }
+    });
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let target = ActionTarget::environment(host.environment_id);
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let asked = tokio::spawn({
+        let (target, params) = (target.clone(), params.clone());
+        async move {
+            client
+                .mutate(Method::AgentToolsRemove, action_id, target, &params)
+                .await
+                .expect("the call reaches the daemon")
+        }
+    });
+    let held = tokio::task::spawn_blocking(move || {
+        reached_at
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok()
+    })
+    .await
+    .expect("the wait ends");
+    assert!(held, "the checks of the agent's files were reached");
+    std::fs::write(&tools, &recorded).expect("another account puts the recorded bytes back");
+    release.send(()).expect("the checks are released");
+
+    let removed = asked.await.expect("the request ends");
+    assert!(
+        removed.is_ok(),
+        "the removal carries out what was decided before the marker: {removed:?}"
+    );
+    assert_eq!(
+        std::fs::read(&tools).ok().as_deref(),
+        Some(recorded.as_slice()),
+        "the file that was kept stays"
+    );
+    assert!(
+        !folder.join("SKILL.md").exists(),
+        "and the other file is taken"
+    );
+    let marks: Vec<String> = std::fs::read_dir(host.state_dir.join("agent-tools/actions"))
+        .expect("the folder of the actions")
+        .map(|entry| std::fs::read_to_string(entry.expect("an entry").path()).expect("an action"))
+        .collect();
+    assert!(
+        marks.len() == 1 && marks[0].contains("applied"),
+        "the action is settled with its outcome, not left as a marker: {marks:?}"
+    );
+}
+
 mod fence_support;
 
 /// KR-REQ-09.09, 09.12 and 26.16: a withdrawal whose fence could not be raised stops an

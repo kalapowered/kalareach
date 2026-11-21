@@ -1056,13 +1056,20 @@ impl Installer {
     ///
     /// Returns an error when the record cannot be read or a file cannot be removed.
     pub fn remove(&self, params: &AgentToolsParams) -> Result<AgentToolsRemoveResult> {
-        self.on_handle(params, false)?.remove_on(params)
+        let this = self.on_handle(params, false)?;
+        let plan = this.removable(params)?;
+        this.carry_out(params, plan)
     }
 
-    fn remove_on(&self, params: &AgentToolsParams) -> Result<AgentToolsRemoveResult> {
-        // The record is read, and read as valid, before anything is moved: a record this build
+    /// Carries out `read`, the plan a removal made from the tree as it was, and decides nothing
+    /// again.
+    fn carry_out(
+        &self,
+        params: &AgentToolsParams,
+        read: Option<RemovalPlan>,
+    ) -> Result<AgentToolsRemoveResult> {
+        // The record was read, and read as valid, before anything is moved: a record this build
         // does not understand must not change its name on the way to being refused.
-        let read = self.removable(params)?;
         self.migrate_records(params)?;
         let Some(RemovalPlan { record, steps }) = read else {
             return Ok(AgentToolsRemoveResult {
@@ -1092,9 +1099,10 @@ impl Installer {
         // configuration entries first, then the directories, deepest first. Record order is the
         // order the installation wrote things, and a repair can put a directory after the files
         // inside it, which reversed would try to remove a directory that is not empty yet.
-        // The plan was made before the marker, from the tree as it was then; what is carried out
-        // here is that plan, and nothing is decided again, so a name that was kept is never
-        // turned into one that is deleted or rewritten by a change made while the removal runs.
+        // The plan was made before the marker, from the tree as it was then, and the daemon
+        // carries out that plan, not one made after the marker: a name that was kept is never
+        // turned into one that is deleted or rewritten by a change made while the removal waits
+        // or runs.
         for Step { operation, what } in steps {
             let path = operation.path();
             match what {
@@ -2534,11 +2542,10 @@ impl Installer {
         &self,
         params: &AgentToolsParams,
         removal: bool,
-    ) -> std::result::Result<(), Declined> {
+    ) -> std::result::Result<Prepared, Declined> {
         let this = self
             .on_handle(params, !removal)
             .map_err(Declined::ByTheRequest)?;
-        let this = &this;
         let recorded = this
             .recorded(params)
             .map_err(|error| Declined::ByARecord(Recorded::read(error)))?;
@@ -2548,16 +2555,19 @@ impl Installer {
             if recorded.is_none() {
                 this.layout(params).map_err(Declined::ByTheRequest)?;
             }
-            return this
+            let plan = this
                 .removable_from(params, recorded)
-                .map(|_| ())
-                .map_err(Declined::ByTheRequest);
+                .map_err(Declined::ByTheRequest)?;
+            return Ok(Prepared::Removal(Box::new(PreparedRemoval {
+                installer: this,
+                plan,
+            })));
         }
         let layout = this.layout(params).map_err(Declined::ByTheRequest)?;
         this.moved_place(params, &layout, recorded.as_ref())
             .and_then(|()| this.check_before_writing(params, &layout, recorded.as_ref()))
-            .map(|_| ())
-            .map_err(Declined::ByTheRequest)
+            .map_err(Declined::ByTheRequest)?;
+        Ok(Prepared::Installation)
     }
 
     /// Commits the dispatch marker, before anything on disk changes.
@@ -2855,6 +2865,32 @@ fn merge(operations: &mut Vec<ChangeOperation>, operation: ChangeOperation) {
         return;
     }
     operations.push(operation);
+}
+
+/// What the checks before the marker leave for the change that follows them.
+pub(crate) enum Prepared {
+    /// An installation, which reads again where it writes.
+    Installation,
+    /// A removal: the installer, which holds the root the plan was made through, and the plan.
+    Removal(Box<PreparedRemoval>),
+}
+
+/// A removal decided before the marker, ready to be carried out.
+pub(crate) struct PreparedRemoval {
+    installer: Installer,
+    plan: Option<RemovalPlan>,
+}
+
+impl PreparedRemoval {
+    /// Carries out the plan that was made before the marker, through the root it was made through,
+    /// and decides nothing again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when a file or the record cannot be removed.
+    pub(crate) fn carry_out(self, params: &AgentToolsParams) -> Result<AgentToolsRemoveResult> {
+        self.installer.carry_out(params, self.plan)
+    }
 }
 
 /// What a removal will do to each name an installation recorded, decided before the marker, with

@@ -158,8 +158,8 @@ impl Controller {
                 ))));
             }
         };
-        match declined {
-            Ok(()) => {}
+        let prepared = match declined {
+            Ok(prepared) => prepared,
             Err(crate::agent_tools::Declined::ByTheRequest(refusal)) => {
                 return Given::fresh(Err(refusal));
             }
@@ -167,10 +167,11 @@ impl Controller {
             Err(crate::agent_tools::Declined::ByARecord(record)) => {
                 return record.copied().map(Err);
             }
-        }
+        };
         Given::fresh(
             self.install_or_remove(
-                actor_id, mutation, method, carried, &params, &installer, &digest, read_at,
+                actor_id, mutation, method, carried, &params, &installer, prepared, &digest,
+                read_at,
             )
             .await,
         )
@@ -189,6 +190,7 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
         params: &kr_protocol::skill::AgentToolsParams,
         installer: &crate::agent_tools::Installer,
+        prepared: crate::agent_tools::Prepared,
         digest: &kr_protocol::scalars::Digest256,
         read_at: Option<u64>,
     ) -> Result<ParamsValue> {
@@ -255,15 +257,11 @@ impl Controller {
         self.under_registration(&carried, || {
             installer.mark_dispatching(actor_id, mutation.action_id, digest)
         })??;
-        let result = match method {
-            Method::AgentToolsInstall => encode(&installer.install(params)?)?,
-            Method::AgentToolsRemove => encode(&installer.remove(params)?)?,
-            _ => {
-                return Err(ControllerError::InvalidArgument(format!(
-                    "{} is not an installation this daemon serves",
-                    method.as_str()
-                )));
-            }
+        // A removal carries out the plan its checks made before the marker, through the root they
+        // walked, and decides nothing again; an installation reads again where it writes.
+        let result = match prepared {
+            crate::agent_tools::Prepared::Installation => encode(&installer.install(params)?)?,
+            crate::agent_tools::Prepared::Removal(removal) => encode(&removal.carry_out(params)?)?,
         };
         installer.settle(actor_id, mutation.action_id, digest, &result, &params.agent)?;
         Ok(result)
