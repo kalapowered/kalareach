@@ -1054,6 +1054,125 @@ fn a_release_that_was_not_read_is_a_line_with_its_cause_and_gives_the_text_with_
     }
 }
 
+#[test]
+fn two_release_trees_read_in_a_row_in_one_target_folder_are_each_read_as_they_are() {
+    // A repository of two commits dated long ago, whose crate `kr-other` differs: the second tree's
+    // `kr-forms` calls a function that only the second `kr-other` has. The files of an unpacked tree
+    // carry the time of the unpacking, so Cargo never takes the first tree's outputs in the shared
+    // target folder as fresh for the second.
+    let repository = tempfile::tempdir().expect("a folder");
+    let git = |args: &[&str]| -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repository.path())
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_AUTHOR_NAME", "a")
+            .env("GIT_AUTHOR_EMAIL", "a@example.com")
+            .env("GIT_COMMITTER_NAME", "a")
+            .env("GIT_COMMITTER_EMAIL", "a@example.com")
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    forms(repository.path());
+    let lock = compiler::cargo_command()
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(repository.path())
+        .output()
+        .expect("cargo runs");
+    assert!(lock.status.success());
+    let mut commits = Vec::new();
+    for (function, method) in [
+        ("marker", "AgentTurnCancel"),
+        ("second_only", "AgentTurnSteer"),
+    ] {
+        write(
+            repository.path(),
+            "crates/kr-other/Cargo.toml",
+            &manifest("kr-other", ""),
+        );
+        write(
+            repository.path(),
+            "crates/kr-other/src/lib.rs",
+            &format!(
+                "pub fn marker() {{}}\n{}",
+                if function == "marker" {
+                    ""
+                } else {
+                    "pub fn second_only() {}\n"
+                }
+            ),
+        );
+        write(
+            repository.path(),
+            "crates/kr-forms/Cargo.toml",
+            &manifest(
+                "kr-forms",
+                "kr-protocol = { path = \"../kr-protocol\" }\nkr-other = { path = \"../kr-other\" }\n",
+            ),
+        );
+        write(
+            repository.path(),
+            "crates/kr-forms/src/lib.rs",
+            &format!(
+                "use kr_protocol::method::Method;\n\npub fn only_here() -> Method {{\n    kr_other::{function}();\n    Method::{method}\n}}\n"
+            ),
+        );
+        let lock = compiler::cargo_command()
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(repository.path())
+            .output()
+            .expect("cargo runs");
+        assert!(lock.status.success());
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", function]);
+        commits.push(git(&["rev-parse", "HEAD"]));
+    }
+    let target = tempfile::tempdir().expect("a folder");
+    let notes = |platform: &Platform| -> BTreeSet<String> {
+        platform
+            .reports
+            .iter()
+            .filter(|report| report.krate == "kr_forms")
+            .map(|report| report.note.clone())
+            .collect()
+    };
+    let mut read = Vec::new();
+    for (at, commit) in commits.iter().enumerate() {
+        let folder = tempfile::tempdir().expect("a folder");
+        compiler::unpack_commit(repository.path(), commit, folder.path()).expect("the tree");
+        read.push(compiler::read_platform(
+            folder.path(),
+            target.path(),
+            compiler::host_name(),
+            &format!("tree-{at}"),
+            commit,
+        ));
+    }
+    let builds = |platform: &Platform| -> Vec<(String, i32, bool)> { platform.builds.clone() };
+    let expected: Vec<(String, i32, bool)> = PLAN
+        .iter()
+        .map(|config| (config.name.to_owned(), 0, true))
+        .collect();
+    assert_eq!(builds(&read[0]), expected, "the first tree builds");
+    assert_eq!(builds(&read[1]), expected, "the second tree builds");
+    assert_eq!(
+        notes(&read[0]),
+        BTreeSet::from(["agent.turn.cancel".to_owned()])
+    );
+    assert_eq!(
+        notes(&read[1]),
+        BTreeSet::from(["agent.turn.steer".to_owned()])
+    );
+}
+
 fn releases_named(names: &[&str]) -> Vec<(String, String)> {
     names
         .iter()
