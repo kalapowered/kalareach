@@ -500,8 +500,11 @@ impl Anchor {
         }
     }
 
-    /// Writes as `write` does, but a file at the name that is not the one the caller checked is an
-    /// outcome, [`Written::Changed`], and nothing is written: the caller decides what it means.
+    /// Writes as `write` does, but a file that is not the one the caller checked, found at the name
+    /// or in the place when the names trade, is an outcome, [`Written::Changed`], and nothing is
+    /// replaced: the file that stood there stays, and the caller decides what it means. Only a
+    /// failure of storage, a refusal of the folder or the file, and a file that cannot go back are
+    /// errors.
     pub(crate) fn write_if_checked(
         &self,
         path: &Path,
@@ -533,19 +536,29 @@ impl Anchor {
             }
         };
         let existing = match checked {
-            Some(identity) => Some(file_to_replace(&parent, place.name, &identity, path)?),
+            Some(identity) => {
+                #[cfg(test)]
+                read_pause::run(path);
+                let Some(protection) = file_to_replace(&parent, place.name, &identity, path)?
+                else {
+                    return Ok(Written::Changed);
+                };
+                Some(protection)
+            }
             None => None,
         };
         let temporary = temporary_name(place.name);
-        Staged {
+        let written = Staged {
             parent: &parent,
             temporary: &temporary,
             name: place.name,
             path,
         }
         .publish(bytes, mode, replaces.zip(checked), existing.as_ref())?;
-        parent.flush().map_err(|_| not_confirmed(path))?;
-        Ok(Written::Done)
+        if matches!(written, Written::Done) {
+            parent.flush().map_err(|_| not_confirmed(path))?;
+        }
+        Ok(written)
     }
 
     /// Removes the file at `path` where it is the file the caller checked, the one whose contents
@@ -824,7 +837,6 @@ fn new_name_refusal(error: std::io::Error, path: &Path) -> ControllerError {
 /// Why the staged file and the place could not trade names.
 fn trade_refusal(error: std::io::Error, path: &Path) -> ControllerError {
     match error.kind() {
-        ErrorKind::NotFound => changed_since_checked(path),
         ErrorKind::Unsupported => no_exchange(path),
         _ => storage(error),
     }
@@ -841,21 +853,21 @@ fn check_folder(folder: &Dir, place: &Path, act: Act) -> Result<()> {
 }
 
 /// Reads the file at `name`, which the caller checked as `checked`, through a descriptor opened on
-/// it, and refuses a file another user can change or one that is not the file that was checked.
+/// it, and refuses a file another user can change. Where nothing stands at the name, or the file is
+/// not the one that was checked, there is nothing to replace: it gives `None`.
 fn file_to_replace(
     parent: &Dir,
     name: &str,
     checked: &Identity,
     path: &Path,
-) -> Result<Protection> {
-    let Some(protection) = parent.protection(name).map_err(storage)? else {
-        return Err(changed_since_checked(path));
-    };
-    if !protection.identity.same_object(checked) {
-        return Err(changed_since_checked(path));
+) -> Result<Option<Protection>> {
+    match parent.protection(name).map_err(storage)? {
+        Some(protection) if protection.identity.same_object(checked) => {
+            check_file(&protection, path, Act::Write)?;
+            Ok(Some(protection))
+        }
+        Some(_) | None => Ok(None),
     }
-    check_file(&protection, path, Act::Write)?;
-    Ok(protection)
 }
 
 /// Refuses the file `protection` describes, which is the file at `path`, where another user can
@@ -897,14 +909,16 @@ struct Staged<'a> {
 
 impl Staged<'_> {
     /// Stages `bytes` under the temporary name and publishes the staged file at the name, over the
-    /// file the caller checked (its digest and identity), or only where the name is free.
+    /// file the caller checked (its digest and identity), or only where the name is free. A file
+    /// that is not the checked one is an outcome, and the folder is made durable where the file that
+    /// came out of the place went back.
     fn publish(
         &self,
         bytes: &[u8],
         mode: u32,
         replaces: Option<(Digest256, Identity)>,
         existing: Option<&Protection>,
-    ) -> Result<()> {
+    ) -> Result<Written> {
         let staging = match self.parent.begin_stage(self.temporary, mode) {
             Ok(staging) => staging,
             Err(unstaged) => {
@@ -933,6 +947,7 @@ impl Staged<'_> {
             None => self
                 .parent
                 .rename_new(self.temporary, self.parent, self.name)
+                .map(|()| Written::Done)
                 .map_err(|error| {
                     self.remove_staged(&staged);
                     new_name_refusal(error, self.path)
@@ -957,17 +972,21 @@ impl Staged<'_> {
     /// and holds the `expected` contents. The two names trade places in one step, so the place is
     /// never absent and no check stands between a read and the replacement; the file that came out
     /// of the place is then read under the temporary name, and anything but the checked file is put
-    /// back.
+    /// back, which is an outcome, not an error.
     fn replace_checked(
         &self,
         staged: &Identity,
         checked: &Identity,
         expected: Digest256,
-    ) -> Result<()> {
+    ) -> Result<Written> {
         if let Err(error) = self.parent.exchange(self.temporary, self.parent, self.name) {
             // The names did not trade, so the staged file is still under its temporary name.
             self.remove_staged(staged);
-            return Err(trade_refusal(error, self.path));
+            // Nothing stands at the name, or nothing is left to trade: nothing was replaced.
+            return match error.kind() {
+                ErrorKind::NotFound => Ok(Written::Changed),
+                _ => Err(trade_refusal(error, self.path)),
+            };
         }
         #[cfg(test)]
         trade_pause::run(self.path);
@@ -977,16 +996,20 @@ impl Staged<'_> {
             {
                 #[cfg(test)]
                 cleanup_pause::run(self.path);
-                self.parent.remove_file(self.temporary).map_err(storage)
+                self.parent
+                    .remove_file(self.temporary)
+                    .map(|()| Written::Done)
+                    .map_err(storage)
             }
-            _ => Err(self.put_back(staged)),
+            _ => self.put_back(staged).map(|()| Written::Changed),
         }
     }
 
-    /// Undoes a trade that took a file other than the checked one out of the place. The staged file
-    /// is removed only where it is the one this write made; a file that is not, and the file taken
-    /// out of the place where it cannot go back, stay under the temporary name.
-    fn put_back(&self, staged: &Identity) -> ControllerError {
+    /// Undoes a trade that took a file other than the checked one out of the place, and makes the
+    /// folder durable. The staged file is removed only where it is the one this write made; a file
+    /// that is not, and the file taken out of the place where it cannot go back, stay under the
+    /// temporary name, and that is the error.
+    fn put_back(&self, staged: &Identity) -> Result<()> {
         let back = match self.parent.exchange(self.temporary, self.parent, self.name) {
             Ok(()) => true,
             // Something took the staged file from the place: the file taken out of it goes back to
@@ -998,15 +1021,21 @@ impl Staged<'_> {
             Err(_) => false,
         };
         match self.parent.look(self.temporary) {
-            Ok(Entry::Absent) if back => changed_since_checked(self.path),
+            Ok(Entry::Absent) if back => {}
             Ok(Entry::File(found)) if back && found.same_object(staged) => {
                 #[cfg(test)]
                 cleanup_pause::run(self.path);
                 let _ = self.parent.remove_file(self.temporary);
-                changed_since_checked(self.path)
             }
-            _ => kept_aside(self.path, self.temporary, &self.parent.join(self.temporary)),
+            _ => {
+                return Err(kept_aside(
+                    self.path,
+                    self.temporary,
+                    &self.parent.join(self.temporary),
+                ));
+            }
         }
+        self.parent.flush().map_err(storage)
     }
 }
 
@@ -1115,9 +1144,9 @@ pub(crate) mod removal_pause {
 #[cfg(all(test, unix))]
 pub(crate) use super::tree::flush_failure;
 
-/// What the unit tests run in a removal after it has read the file at a place and before it reads the
-/// protection of that file, to make the change another process could make in between. The hook is
-/// given the place's path.
+/// What the unit tests run in a removal or a write after it has read the file at a place and before
+/// it reads the protection of that file, to make the change another process could make in between.
+/// The hook is given the place's path.
 #[cfg(test)]
 pub(crate) mod read_pause {
     use std::cell::RefCell;
@@ -1129,7 +1158,8 @@ pub(crate) mod read_pause {
         static BEFORE_PROTECTION: RefCell<Option<Then>> = const { RefCell::new(None) };
     }
 
-    /// Runs `then` once, the next time a removal on this thread has read the file it will check.
+    /// Runs `then` once, the next time a removal or a write on this thread has read the file it will
+    /// check.
     #[cfg(unix)]
     pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
         BEFORE_PROTECTION.with(|before| *before.borrow_mut() = Some(Box::new(then)));
@@ -1208,8 +1238,8 @@ mod tests {
     }
 
     /// A file system that cannot add a file only where none is, or cannot trade two names, is
-    /// refused in the words a person is shown; a name that is taken, or a file that is gone, is the
-    /// refusal of a file that changed.
+    /// refused in the words a person is shown; a name that is taken is the refusal of a file that
+    /// changed.
     #[test]
     fn a_file_system_without_the_two_renames_is_refused_in_the_words_a_person_is_shown() {
         let path = Path::new("/home/p/.amp/mcp.json");
@@ -1223,15 +1253,14 @@ mod tests {
             "/home/p/.amp/mcp.json is on a file system that cannot swap two names in one step, \
              which an installation needs to replace a file safely, so nothing is written there"
         );
-        for refusal in [
-            new_name_refusal(Error::from(ErrorKind::AlreadyExists), path),
-            trade_refusal(Error::from(ErrorKind::NotFound), path),
-        ] {
-            assert!(
-                detail(refusal).contains("replaces only the file it checked"),
-                "a name that is taken or a file that is gone is a changed file"
-            );
-        }
+        assert!(
+            detail(new_name_refusal(
+                Error::from(ErrorKind::AlreadyExists),
+                path
+            ))
+            .contains("replaces only the file it checked"),
+            "a name that is taken is a changed file"
+        );
     }
 
     /// The refusals of a folder, a file and a copy are made in the words a person is shown.

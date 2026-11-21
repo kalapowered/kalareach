@@ -6728,6 +6728,8 @@ mod tests {
     pause_at!(when_read_before_its_check, read_pause);
     #[cfg(unix)]
     pause_at!(when_taken_out, trade_pause);
+    #[cfg(unix)]
+    pause_at!(when_published, publish_pause);
 
     /// Notes every place a removal or a write on this thread takes a file out of.
     #[cfg(unix)]
@@ -8094,6 +8096,161 @@ mod tests {
             &params(amp(), InstallScope::User),
             &document,
             &removed,
+        );
+    }
+
+    /// KR-REQ-11.01: a setting written into a document a removal rewrites, after the write staged
+    /// its file and before the two names trade, is an outcome, not an error: the trade takes out a
+    /// file that is not the one the removal checked, it goes back, and the entry, the host's and
+    /// unchanged, stays with its record.
+    #[cfg(unix)]
+    #[test]
+    fn a_setting_written_before_the_trade_of_a_rewritten_document_keeps_the_entry_and_its_record() {
+        let tree = Tree::create();
+        let amp_folder = tree.home().join(".amp");
+        std::fs::create_dir_all(amp_folder.join("skills")).expect("the folders are there before");
+        let document = amp_folder.join("mcp.json");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        let at = document.clone();
+        when_published(".amp/mcp.json", move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, text.replacen('{', "{\n  \"other\": 1,", 1))
+                .expect("another process writes a setting into the document in place");
+        });
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "a document that changed under the trade is told, not refused: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("its record is kept")),
+            "the removal says that the entry and its record stay: {:?}",
+            removed.retained
+        );
+        assert_held_and_finished(
+            &installer,
+            &params(amp(), InstallScope::User),
+            &document,
+            &removed,
+        );
+    }
+
+    /// KR-REQ-11.01: a document another process removes after the write of a rewrite staged its
+    /// file and before the names trade is an outcome too: the removal says the entry is gone, and
+    /// the record goes with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_removed_before_the_trade_of_a_rewritten_document_is_told_as_gone() {
+        let tree = Tree::create();
+        let amp_folder = tree.home().join(".amp");
+        std::fs::create_dir_all(amp_folder.join("skills")).expect("the folders are there before");
+        let document = amp_folder.join("mcp.json");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        let at = document.clone();
+        when_published(".amp/mcp.json", move || {
+            std::fs::remove_file(&at).expect("another process removes the document");
+        });
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "a document that is gone under the trade is told, not refused: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.ends_with("mcp.json: it is already gone")),
+            "the removal says that the entry is gone: {:?}",
+            removed.retained
+        );
+        assert!(
+            !installer
+                .record_path(&params(amp(), InstallScope::User))
+                .exists(),
+            "the record goes with an entry that is gone"
+        );
+    }
+
+    /// KR-REQ-11.01: a document another process replaces by another file after the write read it
+    /// and before the write reads its protection is an outcome: the file is not the one the removal
+    /// checked, the entry in it is the host's and unchanged, so it stays with its record.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_replaced_before_the_write_checks_it_keeps_the_entry_and_its_record() {
+        let tree = Tree::create();
+        let amp_folder = tree.home().join(".amp");
+        std::fs::create_dir_all(amp_folder.join("skills")).expect("the folders are there before");
+        let document = amp_folder.join("mcp.json");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        let at = document.clone();
+        when_read_before_its_check(".amp/mcp.json", move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            put_another_file(&at, text.replacen('{', "{\n  \"other\": 1,", 1).as_bytes());
+        });
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "a document that was replaced under the write is told, not refused: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("its record is kept")),
+            "the removal says that the entry and its record stay: {:?}",
+            removed.retained
+        );
+        assert_held_and_finished(
+            &installer,
+            &params(amp(), InstallScope::User),
+            &document,
+            &removed,
+        );
+    }
+
+    /// KR-REQ-11.01: a file that goes back to its place after a trade is made durable before the
+    /// removal goes on, and a flush that fails stops the removal before the record goes, as it does
+    /// for a file a removal put back.
+    #[cfg(unix)]
+    #[test]
+    fn a_flush_that_fails_after_a_rewritten_document_was_put_back_stops_the_removal() {
+        let tree = Tree::create();
+        let amp_folder = tree.home().join(".amp");
+        std::fs::create_dir_all(amp_folder.join("skills")).expect("the folders are there before");
+        let document = amp_folder.join("mcp.json");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        let at = document.clone();
+        when_published(".amp/mcp.json", move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, text.replacen('{', "{\n  \"other\": 1,", 1))
+                .expect("another process writes a setting into the document in place");
+            anchor::flush_failure::once_at(".amp");
+        });
+        let stopped = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            matches!(stopped, Err(ControllerError::Storage { .. })),
+            "a folder that cannot be made durable stops the removal: {stopped:?}"
+        );
+        assert!(
+            installer
+                .status(&params(amp(), InstallScope::User))
+                .expect("a status")
+                .installed,
+            "the record is still there"
         );
     }
 
