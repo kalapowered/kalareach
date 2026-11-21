@@ -346,11 +346,14 @@ pub fn is_approval_shaped(text: &str) -> bool {
 /// after the bracket does not hide the tag, and so is the same with a not-less-than sign (U+226E),
 /// which decomposes to a bracket and a mark. A type or markup that names the word, such as
 /// `Vec<Channel>`, `GreeterClient<Channel>`, `<Channel />` or the RSS element, is refused, and so
-/// is a word that a dropped character splits, such as a soft hyphen on each side of the `s` in
+/// is a word that a dropped character splits, such as a soft hyphen on each side of `nel` in
 /// `<chan\u{ad}nel\u{ad}s>`. A word that only starts with the name, such as `<channel_id>`,
 /// `<channels>` or `Arc<channel::Sender<T>>`, is a message. It does not stop every look-alike
 /// either: a look-alike of a letter, a bracket, a slash or a space, such as the blank U+2800,
-/// passes, and so do plain words that claim another sender.
+/// passes, and so do plain words that claim another sender. A format character, default ignorable
+/// code point or mark that a later Unicode version adds passes until the code is updated. A tag
+/// word followed by any other character, such as a quotation mark, an underscore or a private-use
+/// code point, passes, and so does such a character inside the word.
 #[must_use]
 pub fn is_tag_shaped(text: &str) -> bool {
     let mut scan = Scan::Outside;
@@ -459,7 +462,8 @@ const DEFAULT_IGNORABLE: [RangeInclusive<char>; 17] = [
 /// The Unicode versions, which the workspace pins with the crates: the decomposition and the marks
 /// are `unicode-normalization` 0.1.25's, Unicode 17.0.0; the format characters are
 /// `unicode-general-category` 1.1.0's, Unicode 16.0.0; and the default ignorable table is the
-/// ranges of Unicode 16.0.0. A mark that a later version adds passes until the crate is raised.
+/// ranges of Unicode 16.0.0. A format character, default ignorable code point or mark that a
+/// later Unicode version adds passes until the code is updated.
 fn is_dropped(character: char) -> bool {
     get_general_category(character) == GeneralCategory::Format
         || is_combining_mark(character)
