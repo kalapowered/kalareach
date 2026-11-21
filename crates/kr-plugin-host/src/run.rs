@@ -368,9 +368,8 @@ mod tests {
         }
     }
 
-    /// The write and the close of a failure's handoff share one bound: a write that takes most of
-    /// it leaves the close too little, and each that fits alone ends the handoff when together
-    /// they do not.
+    /// The write and the close of a failure's hand-over share one bound: a write that takes most
+    /// of it leaves the close too little. Each fits the bound alone, and together they do not.
     #[tokio::test]
     async fn the_write_and_the_close_of_a_failure_share_one_bound() {
         let bound = Duration::from_millis(400);
