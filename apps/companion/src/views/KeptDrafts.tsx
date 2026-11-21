@@ -608,8 +608,8 @@ function ChannelGroup({
                   <div className="row wrap">
                     <p className="eyebrow">{homeLine(sessions, sessionId)}</p>
                     <TwoPressButton
-                      // Keyed by the identities it removes: a change of the list ends the armed state.
-                      key={messages.map((each) => each.actionId).join(',')}
+                      // Armed for the identities it removes: a change of the list ends the armed state.
+                      armKey={messages.map((each) => each.actionId).join(',')}
                       tone="quiet"
                       data-testid="channel-session-remove-all"
                       armedLabel="Press again to remove all"

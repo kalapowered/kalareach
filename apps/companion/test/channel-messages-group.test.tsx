@@ -261,7 +261,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(of.messages.calls.filter((call) => call.kind === 'keep')).toHaveLength(2)
   })
 
-  it('K4 removes a message at its press, and every message of a session with "Remove all"', async () => {
+  it('K4 removes a message at its press, and the messages a session shows with "Remove all"', async () => {
     const of = world()
     const person = userEvent.setup()
     keepMessage(of, { text: 'one' })
@@ -344,6 +344,8 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
       expect(screen.getAllByTestId('channel-message')).toHaveLength(3)
     })
     const again = screen.getByTestId('channel-session-remove-all')
+    // The same element: the armed state ended and nothing was mounted again, so focus stays.
+    expect(again).toBe(all)
     expect(again).not.toHaveTextContent('Press again')
     await person.click(again)
     expect(asked(of, 'remove')).toBe(0)
