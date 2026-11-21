@@ -2897,10 +2897,7 @@ async fn keeper_with<'r>(
                     reopens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Box::pin(async move {
                         if let Some(dials) = &dials {
-                            while dials
-                                .reopen_held
-                                .load(std::sync::atomic::Ordering::SeqCst)
-                            {
+                            while dials.reopen_held.load(std::sync::atomic::Ordering::SeqCst) {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }
