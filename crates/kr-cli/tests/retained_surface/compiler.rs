@@ -2176,7 +2176,13 @@ pub fn unpack_commit(repository: &Path, commit: &str, dest: &Path) -> Result<(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    tar::Archive::new(output.stdout.as_slice())
+    // The files get the time of the unpacking and not the commit's time. Cargo takes the outputs of
+    // an earlier tree in the same target folder as fresh when every source of a crate is older than
+    // them, and the files of an old release are: a crate that differs between two releases would be
+    // read as the release before has it.
+    let mut archive = tar::Archive::new(output.stdout.as_slice());
+    archive.set_preserve_mtime(false);
+    archive
         .unpack(dest)
         .map_err(|error| format!("unpacking {commit}: {error}"))
 }
