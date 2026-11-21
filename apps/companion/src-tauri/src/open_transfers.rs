@@ -687,10 +687,11 @@ impl Desk {
                     error,
                     ClientError::SubmissionUncertain { .. } | ClientError::ConnectionEnded
                 ) || error.code() == ErrorCode::OutcomeUnknown;
-                if file.transfer_id.is_none() && !uncertain {
-                    if let Ok(store) = self.store() {
-                        let _ = store.remove(file.key);
-                    }
+                if file.transfer_id.is_none()
+                    && !uncertain
+                    && let Ok(store) = self.store()
+                {
+                    let _ = store.remove(file.key);
                 }
                 self.end(live, Outcome::Failed(CommandError::from(error)));
             }
@@ -939,10 +940,10 @@ impl Desk {
         }
         // What the send does between now and the answer is stopped first: the stream is reset and
         // nothing more is sent for a transfer that is being cancelled.
-        if let Some(live) = &held {
-            if let Some(task) = locked(&live.task).take() {
-                task.abort();
-            }
+        if let Some(live) = &held
+            && let Some(task) = locked(&live.task).take()
+        {
+            task.abort();
         }
         let Some(transfer_id) = file.transfer_id else {
             // A reservation whose answer never came: nothing this device can name is held.

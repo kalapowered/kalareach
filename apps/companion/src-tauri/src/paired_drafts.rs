@@ -129,6 +129,8 @@ pub struct KeptView {
 #[derive(Default)]
 pub struct Drafts {
     root: Mutex<Option<PathBuf>>,
+    /// A host of an earlier build refused `draft.discard` by name.
+    discard_refused: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Drafts {
@@ -146,6 +148,34 @@ fn key_of(paired: &Paired, session_id: SessionId) -> Uuid {
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Uuid::from_bytes(bytes)
+}
+
+/// What the host's answer to a `draft.discard` means for the entry kept for the draft.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// The draft is ended, or the host has no such draft, or it was used and is the session's.
+    Done,
+    /// The host does not list the method: it is of an earlier build.
+    OlderHost,
+    /// Anything else: the draft may still stand.
+    Failed,
+}
+
+fn discard_outcome(error: &ClientError) -> Ended {
+    if unknown_draft(error) || error.code() == ErrorCode::DraftConflict {
+        Ended::Done
+    } else if host_cannot_discard(error) {
+        Ended::OlderHost
+    } else {
+        Ended::Failed
+    }
+}
+
+/// What a refused create is told as: when the host's own bound on drafts is reached and its build
+/// cannot end one, the person is told to update the host. Otherwise nothing is added.
+fn at_the_bound(discard_refused: bool, error: &ClientError) -> Option<CommandError> {
+    (discard_refused && error.code() == ErrorCode::QuotaExceeded)
+        .then(|| CommandError::unsupported(UPDATE_THE_HOST))
 }
 
 /// Whether the host answered that it has no such draft.
@@ -368,7 +398,7 @@ impl Drafts {
             .session
             .read_receipt(&ActionReadParams {
                 action_id,
-                session_id: target.session_id.as_ref().copied(),
+                session_id: None,
             })
             .await
             .ok()
@@ -406,7 +436,12 @@ impl Drafts {
                         return Err(CommandError::refused(GONE));
                     }
                     // Not answered: the action is kept, and the next bind asks about it.
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        let flag = self
+                            .discard_refused
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        return Err(at_the_bound(flag, &error).unwrap_or_else(|| error.into()));
+                    }
                 }
             }
         };
@@ -421,8 +456,8 @@ impl Drafts {
     ///
     /// # Errors
     ///
-    /// Returns [`UPDATE_THE_HOST`] when an older host cannot end a draft and its bound is reached,
-    /// and the host's refusal otherwise.
+    /// Returns the host's refusal; a host of an earlier build that cannot end a draft is gone on
+    /// without, and [`UPDATE_THE_HOST`] is told only when its bound on drafts is reached.
     pub async fn end(
         &self,
         paired: Paired,
@@ -472,16 +507,20 @@ impl Drafts {
                 self.remove(paired, file.session_id);
                 Ok(())
             }
-            // The host has no such draft: it is ended. A draft that was used is the session's now.
-            Err(error) if unknown_draft(&error) || error.code() == ErrorCode::DraftConflict => {
-                self.remove(paired, file.session_id);
-                Ok(())
-            }
-            Err(error) if host_cannot_discard(&error) => {
-                self.remove(paired, file.session_id);
-                Err(CommandError::unsupported(UPDATE_THE_HOST))
-            }
-            Err(error) => Err(error.into()),
+            Err(error) => match discard_outcome(&error) {
+                Ended::Done => {
+                    self.remove(paired, file.session_id);
+                    Ok(())
+                }
+                // The client goes on without ending drafts, and says so only at the bound.
+                Ended::OlderHost => {
+                    self.discard_refused
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.remove(paired, file.session_id);
+                    Ok(())
+                }
+                Ended::Failed => Err(error.into()),
+            },
         }
     }
 
@@ -568,5 +607,55 @@ impl Drafts {
         file.revision = revision;
         file.create_action = create_action;
         self.write(paired, &file).expect("the entry is kept");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::error::ProtocolError;
+
+    fn refused(code: ErrorCode, message: &str) -> ClientError {
+        ClientError::Host(ProtocolError::new(code, message))
+    }
+
+    /// KR-REQ-23.41: a host that refuses `draft.discard` by name is read as of an earlier build; a
+    /// draft the host does not know or that was used is read as ended; anything else is not.
+    #[test]
+    fn a_refusal_of_a_discard_is_read_as_ended_older_or_failed() {
+        let older = refused(
+            ErrorCode::PermissionDenied,
+            kr_transport::actor::METHOD_NOT_AVAILABLE,
+        );
+        assert_eq!(discard_outcome(&older), Ended::OlderHost);
+        assert_eq!(
+            discard_outcome(&refused(ErrorCode::InvalidArgument, "no such draft")),
+            Ended::Done
+        );
+        assert_eq!(
+            discard_outcome(&refused(ErrorCode::DraftConflict, "the draft was sent")),
+            Ended::Done
+        );
+        assert_eq!(
+            discard_outcome(&refused(ErrorCode::PermissionDenied, "not yours")),
+            Ended::Failed
+        );
+    }
+
+    /// KR-REQ-23.41: the approved sentence is told only when an earlier-build host's bound on drafts
+    /// is reached, and not for any other refusal.
+    #[test]
+    fn update_the_host_is_told_only_at_the_bound_of_a_host_that_cannot_end_a_draft() {
+        let bound = refused(ErrorCode::QuotaExceeded, "64 drafts");
+        let told = at_the_bound(true, &bound).expect("told at the bound");
+        assert_eq!(told.message, UPDATE_THE_HOST);
+        assert!(
+            at_the_bound(false, &bound).is_none(),
+            "a host that can end drafts"
+        );
+        assert!(
+            at_the_bound(true, &refused(ErrorCode::InvalidArgument, "x")).is_none(),
+            "no other refusal"
+        );
     }
 }
