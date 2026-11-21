@@ -247,7 +247,7 @@ fn make_lines(
 
     let mut lines = Vec::new();
     for (commit, roles) in &commits {
-        let reading = if previous_reader::has_reader(setup.repository, commit) {
+        let reading = if previous_reader::has_reader(setup.repository, commit)? {
             let tree = previous_reader::extract(setup.repository, commit, setup.cache)?;
             previous_reader::write_patched(setup.repository, commit, &tree, setup.key_text)?;
             let target = setup.cache.join(commit).join("target");
@@ -749,6 +749,40 @@ fn a_commit_without_a_reader_is_recorded_no_reader_only_when_it_is_retained() {
         found
             .iter()
             .any(|line| line["commit"] == before && line["verdict"] == "no reader")
+    );
+}
+
+/// KR-REQ-17.46: a commit that the checkout does not hold is never recorded as a release with no
+/// reader, and the read of a commit that it does hold tells a reader from none.
+#[test]
+fn a_retained_commit_the_checkout_does_not_hold_is_refused() {
+    let fixture = fixture::repository();
+    let (before, head) = (fixture.commits[0].clone(), fixture.commits[2].clone());
+    assert_eq!(
+        previous_reader::has_reader(&fixture.work, &before),
+        Ok(false)
+    );
+    assert_eq!(previous_reader::has_reader(&fixture.work, &head), Ok(true));
+    let missing = "1".repeat(40);
+    let refused =
+        previous_reader::has_reader(&fixture.work, &missing).expect_err("an absent commit");
+    assert_eq!(
+        refused,
+        format!(
+            "The commit {missing} is not in this checkout. Fetch it, then run the readers again."
+        )
+    );
+    // The producer stops on it, where it recorded the commit with no reader before.
+    let readers = Readers::new(&[(head.as_str(), COMPATIBLE, 0)]);
+    let retained = [Retained {
+        commit: missing.clone(),
+        version: "0.77.0".to_owned(),
+    }];
+    let stopped = produce(&fixture, &readers, &[], &retained, "0.78.0")
+        .expect_err("a retained commit that is not in the checkout");
+    assert!(
+        stopped.contains(&format!("The commit {missing} is not in this checkout")),
+        "{stopped}"
     );
 }
 
