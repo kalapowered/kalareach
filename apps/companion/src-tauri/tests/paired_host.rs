@@ -3578,6 +3578,55 @@ async fn a_visit_that_began_before_the_host_was_used_and_recovered_commits_nothi
     v.stop().await;
 }
 
+/// A visit whose host was chosen while the visit was held, and whose second check then fails, lets
+/// go of nothing: the choice made the record the one in use's and moved its epoch, so it is no
+/// longer the record the visit was admitted on, even while it holds no outcome, no read and no
+/// connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_that_fails_its_second_check_after_its_host_was_chosen_leaves_the_record_of_the_host_in_use()
+ {
+    let v = visiting().await;
+    let mut visits = v.companion().inbox().watch_visits();
+    let pass = v.pass();
+    let a = v.id_of(&v.a_ref);
+    let hold = visit_held(&mut visits, a).await;
+    // The choice's dial stays pending, so the record of the host in use holds nothing yet: the
+    // state in which a visit that ends could let go of it.
+    v.control.hold_own();
+    let using = v
+        .companion()
+        .start_call("hosts_use", json!({ "reference": v.a_ref }));
+    v.companion().told_host(&v.a_ref).await;
+    let app_state = v.companion().app.state::<companion_tauri::AppState>();
+    let owner = app_state.contact_owner();
+    let generation = owner
+        .generation_of(a)
+        .expect("the host in use has a record");
+    // A is paired again under another identity, with no forget: the visit's second check fails.
+    let device = v.companion().device();
+    let old = device.host_by_reference(&v.a_ref).expect("A is listed");
+    let new = kr_client::pairing::paired::PairedHost {
+        device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+        ..old
+    };
+    device
+        .pairing()
+        .hosts
+        .record(new)
+        .expect("A is paired again");
+    hold.release();
+    drop(visits);
+    pass.await.expect("ran").expect("answered");
+    assert_eq!(
+        owner.generation_of(a),
+        Some(generation),
+        "the visit let go of the record of the host in use"
+    );
+    v.control.release_all();
+    drop(using.await);
+    v.stop().await;
+}
+
 /// A host that is the one in use when the visit is to begin is refused at the owner: no visit
 /// connection is asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

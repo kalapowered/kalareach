@@ -1459,15 +1459,19 @@ impl ContactOwner {
     }
 
     /// A visit that ends without writing anything lets go of its record, when the record is the one
-    /// it was admitted on and holds no outcome, no read and no connection. It makes no event.
+    /// it was admitted on (the generation and the epoch of the ticket, and not the host in use,
+    /// whose choice moved the epoch and which holds nothing until its first dial ends) and holds no
+    /// outcome, no read and no connection. It makes no event.
     pub fn discard(&self, ticket: &VisitTicket) -> Applied<()> {
         self.commit(|state, disposal| {
-            let bare = state.hosts.get(&ticket.key).is_some_and(|record| {
-                record.generation == ticket.generation
-                    && record.contact == HostContact::Unknown
-                    && record.read.is_none()
-                    && record.visit.connection.is_none()
-            });
+            let bare = state.in_use != Some(ticket.key)
+                && state.hosts.get(&ticket.key).is_some_and(|record| {
+                    record.generation == ticket.generation
+                        && record.inbox_epoch == ticket.epoch
+                        && record.contact == HostContact::Unknown
+                        && record.read.is_none()
+                        && record.visit.connection.is_none()
+                });
             if bare && let Some(record) = state.hosts.remove(&ticket.key) {
                 disposal.record(record);
             }
