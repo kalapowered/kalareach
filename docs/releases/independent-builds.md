@@ -81,8 +81,10 @@ provisioning profile and no key store. `scripts/check-release-secrets.py` refuse
 what it contains and by what it is called (`google-services.json`, `GoogleService-Info.plist`,
 `AuthKey_*.p8`, a PKCS #12 or Java key store), in the tracked files of a checkout, in a release tree
 and in a release archive. `release-checks.yml` runs it over the tracked files, and the jobs that
-build a release tree run it over the tree and the archive, after putting it through a planted example
-of every kind it refuses.
+build a release tree run it over the tree and the archive, after running its self-test. The self-test
+plants private keys, an APNs key, both Firebase configuration files, a Google API key and a
+service-account document, and finds each. It plants no key store and no provisioning profile, which
+the scan refuses by name all the same.
 
 A package built from the source is read as raw bytes by the same scan when it is given one (`.apk`,
 `.aab` and `.ipa` are not opened): a credential written into it in the clear is found, and one inside
