@@ -19,9 +19,10 @@
 #      prints one package name per line, which are installed with the PACKAGEs. It runs again in
 #      each attempt, after that attempt's last update, so the names match the indexes the download
 #      and the install use. A failure of the program ends the script.
-#   3. `apt-get install --simulate`, bound 120 s, with no network. When the update printed no
-#      warning, a failure is the packages' own (an unknown name, a conflict) and ends the script
-#      at once with apt's lines; otherwise the indexes may be the cause and the attempt is retried.
+#   3. `apt-get install --simulate`, bound 120 s, with no network. A call that the bound cut (status
+#      124 or 137) fails the attempt, like a cut update. When the update printed no warning, any
+#      other failure is the packages' own (an unknown name, a conflict) and ends the script at
+#      once with apt's lines; otherwise the indexes may be the cause and the attempt is retried.
 #      With --archive the call is `apt-get install --print-uris` instead, against an empty archive
 #      directory, so that it lists every archive the install needs as `FILE SIZE SHA256`; the
 #      archives of DIR (a directory a cache step restored) that match the list in name, size and
@@ -224,7 +225,8 @@ resolve() {
   if [ "$status" -eq 0 ]; then
     return 0
   fi
-  if [ "$last_warnings" -eq 0 ]; then
+  # A call that the bound cut says nothing about the packages: the attempt is retried.
+  if [ "$last_warnings" -eq 0 ] && [ "$status" -ne 124 ] && [ "$status" -ne 137 ]; then
     echo "apt-install: apt cannot plan the install of: ${all[*]}" >&2
     grep '^E:' "$work/resolve.log" >&2 || true
     exit 1
