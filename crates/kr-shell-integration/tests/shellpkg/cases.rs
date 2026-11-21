@@ -7381,6 +7381,11 @@ pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and
 /// `from` is an offset into the terminal's bytes, as [`Session::written`] gives it, and only the
 /// bytes after it are decoded, so an offset inside a character the shell was still drawing cannot
 /// stop the reading.
+///
+/// # Panics
+///
+/// Panics when the shell drew neither mark after `from`: there is then no point where the line's
+/// own echo ends, and the message names both marks.
 fn drawn_while_the_line_ran(session: &Session, from: usize) -> String {
     const MARK: &str = "\x1b]133;C";
     const PASTE_OFF: &str = "\x1b[?2004l";
@@ -7388,7 +7393,11 @@ fn drawn_while_the_line_ran(session: &Session, from: usize) -> String {
     let mark = after.find(MARK);
     let paste_off = after.find(PASTE_OFF).map(|at| at + PASTE_OFF.len());
     let Some(started) = mark.max(paste_off) else {
-        return String::new();
+        panic!(
+            "the shell drew neither an OSC 133;C mark nor ESC[?2004l after the line was installed, \
+             so the text drawn while the line ran cannot be told from the line's own echo; what \
+             was drawn after the line was installed:\n{after:?}"
+        );
     };
     let mut kept = String::new();
     let mut rest = &after[started..];
