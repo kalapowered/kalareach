@@ -26,6 +26,7 @@ import {
   certificateFingerprint,
   checkIos,
   declaresSignInLink,
+  IMAGE_CAPTURE_ACTION,
   codeIn,
   problemsInBundleConfig,
   problemsInEmbeddedSignature,
@@ -46,6 +47,7 @@ import {
   problemsInSignature,
   problemsInVersions,
   profileFromXml,
+  queriesAction,
   recordOf,
   redacted,
   secretNeedles,
@@ -110,6 +112,23 @@ function link(kind) {
   return [filter([action, ...categories, data(whole)])]
 }
 
+/**
+ * The `<queries>` element a bundle carries once the libraries' own are merged in: the browser
+ * service a library asks about, and the camera action "Take a photo" asks about. A named defect
+ * leaves the camera out, or puts its action where it is not a query.
+ */
+function queries(kind) {
+  const customTabs = xmlNode('intent', {}, [xmlNode('action', { name: 'android.support.customtabs.action.CustomTabsService' })])
+  const capture = xmlNode('intent', {}, [xmlNode('action', { name: 'android.media.action.IMAGE_CAPTURE' })])
+  if (kind === 'none') return []
+  if (kind === 'browser-only') return [xmlNode('queries', {}, [customTabs])]
+  if (kind === 'video-only') {
+    return [xmlNode('queries', {}, [customTabs, xmlNode('intent', {}, [xmlNode('action', { name: 'android.media.action.VIDEO_CAPTURE' })])])]
+  }
+  if (kind === 'split') return [xmlNode('queries', {}, [customTabs]), xmlNode('queries', {}, [capture])]
+  return [xmlNode('queries', {}, [customTabs, capture])]
+}
+
 function manifest(change = {}) {
   const option = (key, fallback) => (Object.hasOwn(change, key) ? change[key] : fallback)
   const permissions = option('permissions', ANDROID_PERMISSIONS)
@@ -117,11 +136,17 @@ function manifest(change = {}) {
     xmlNode('manifest', { package: 'to.kala.reach', versionCode: option('versionCode', '39800'), versionName: '0.1.0' }, [
       xmlNode('uses-sdk', { minSdkVersion: option('minSdk', '29'), targetSdkVersion: option('targetSdk', '36') }),
       ...permissions.map((name) => xmlNode('uses-permission', { name })),
+      ...queries(option('queries', 'merged')),
       xmlNode('application', {
         usesCleartextTraffic: option('cleartext', 'false'),
         ...(option('debuggable', null) === null ? {} : { debuggable: option('debuggable', null) }),
         ...(option('testOnly', null) === null ? {} : { testOnly: option('testOnly', null) })
-      }, option('link', true) ? [xmlNode('activity', {}, link(option('link', true)))] : [])
+      }, [
+        ...(option('link', true) ? [xmlNode('activity', {}, link(option('link', true)))] : []),
+        ...(option('captureFilter', false)
+          ? [xmlNode('activity', {}, [xmlNode('intent-filter', {}, [xmlNode('action', { name: 'android.media.action.IMAGE_CAPTURE' })])])]
+          : [])
+      ])
     ])
   )
 }
@@ -154,6 +179,19 @@ heldProblems(
   problemsInAndroidManifest(manifest({ permissions: ANDROID_PERMISSIONS.filter((each) => !each.endsWith('CAMERA')) }), WANT),
   ['does not ask for android.permission.CAMERA']
 )
+
+const NO_CAMERA_QUERY = ['android.media.action.IMAGE_CAPTURE', 'Take a photo']
+heldProblems('a manifest with no queries is refused for the camera action', problemsInAndroidManifest(manifest({ queries: 'none' }), WANT), NO_CAMERA_QUERY)
+heldProblems('a manifest that queries only the browser service is refused for the camera action', problemsInAndroidManifest(manifest({ queries: 'browser-only' }), WANT), NO_CAMERA_QUERY)
+heldProblems('a manifest that queries the video action and not the photo one is refused', problemsInAndroidManifest(manifest({ queries: 'video-only' }), WANT), NO_CAMERA_QUERY)
+heldProblems(
+  'a camera action an activity answers is not a query for it',
+  problemsInAndroidManifest(manifest({ queries: 'browser-only', captureFilter: true }), WANT),
+  NO_CAMERA_QUERY
+)
+held('the camera action in a second <queries> element is a query for it', [], problemsInAndroidManifest(manifest({ queries: 'split' }), WANT))
+held('the merged queries name the camera action', true, queriesAction(manifest().root, IMAGE_CAPTURE_ACTION))
+held('a manifest with no queries does not name it', false, queriesAction(manifest({ queries: 'none' }).root, IMAGE_CAPTURE_ACTION))
 
 // -- native libraries --------------------------------------------------------------------------
 

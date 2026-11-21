@@ -149,6 +149,22 @@ export function declaresSignInLink(root) {
   })
 }
 
+/** The action "Take a photo" asks the system to answer: the WebView's file chooser opens the camera for it. */
+export const IMAGE_CAPTURE_ACTION = 'android.media.action.IMAGE_CAPTURE'
+
+/** Whether a `<queries>` element of the manifest holds an `<intent>` whose action is `action`. */
+export function queriesAction(root, action) {
+  const queried = []
+  const walk = (element, inQueries) => {
+    if (inQueries && element.name === 'intent') queried.push(element)
+    element.children.forEach((child) => walk(child, inQueries || element.name === 'queries'))
+  }
+  walk(root, false)
+  return queried.some((entry) =>
+    entry.children.some((each) => each.name === 'action' && each.attributes.some(([key, found]) => key === 'name' && found === action))
+  )
+}
+
 /** What is wrong with the manifest of a release bundle. */
 export function problemsInAndroidManifest(facts, want) {
   const problems = []
@@ -179,6 +195,12 @@ export function problemsInAndroidManifest(facts, want) {
   // The sign-in's answer returns through this verified link; without it the answer opens a browser.
   if (!declaresSignInLink(facts.root)) {
     problems.push('the manifest does not declare the verified sign-in link https://reach.kala.to/app/oauth/callback in one intent filter')
+  }
+  // Android 11 and later show an application only the apps its manifest names, and the WebView's file
+  // chooser opens the camera only when it finds one that answers this action; without the entry the
+  // person gets the photo picker in place of the camera.
+  if (!queriesAction(facts.root, IMAGE_CAPTURE_ACTION)) {
+    problems.push(`the manifest does not query ${IMAGE_CAPTURE_ACTION} in a <queries> intent, so "Take a photo" cannot see the camera`)
   }
   return problems
 }
