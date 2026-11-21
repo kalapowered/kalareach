@@ -121,6 +121,8 @@ pub mod elsewhere;
 #[path = "../extra/more.rs"]
 pub mod more;
 
+pub const WIRE: &str = include_str!("../data/wire.json");
+
 pub fn direct() -> Method {
     Method::AgentTurnCancel
 }
@@ -270,6 +272,12 @@ fn forms(root: &Path) {
         root,
         "crates/kr-forms/extra/more.rs",
         "pub fn more() -> &'static str {\n    \"agent.prompt.queue\"\n}\n",
+    );
+    // A file that is no Rust, read through `include_str!` from outside `src`.
+    write(
+        root,
+        "crates/kr-forms/data/wire.json",
+        "{\"method\": \"agent.turn.cancel\"}\n",
     );
     // The build script of the crate: no report covers a wire name in it, and no dep-info file lists it.
     write(
@@ -460,6 +468,7 @@ fn each_way_a_client_names_a_stamped_item_is_read_by_the_compiler_and_the_rest_i
             "kr_forms Local Unread",
             "kr_forms direct Names",
             "kr_forms elsewhere Names",
+            "kr_forms file:crates/kr-forms/data/wire.json Unread",
             "kr_forms from_argument Names",
             "kr_forms from_data Names+Unread",
             "kr_forms from_macro Names",
