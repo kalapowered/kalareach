@@ -1367,7 +1367,8 @@
 }
 
 /* The bar is how much of the file the host holds, drawn with a transform so that it moves on the
-   compositor. It moves at the rate it is asked about, so it reads as one motion and not as steps. */
+   compositor. Constant motion is linear, and the duration is the stylesheets' own surface duration:
+   each answer carries the bar a short way, and the next carries it on. */
 .m-progress {
   block-size: 4px;
   border-radius: 2px;
@@ -1380,7 +1381,7 @@
   block-size: 100%;
   background: var(--accent);
   transform-origin: 0 50%;
-  transition: transform 400ms linear;
+  transition: transform var(--surface-in) linear;
 }
 
 [dir='rtl'] .m-progress-fill {

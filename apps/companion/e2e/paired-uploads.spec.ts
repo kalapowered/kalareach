@@ -179,7 +179,7 @@ for (const surface of ['ios', 'android'] as const) {
           }
         })
       expect(await styles()).toEqual({
-        fill: ['transform', '0.4s', 'linear'],
+        fill: ['transform', '0.2s', 'linear'],
         card: 'opacity, transform, border-color'
       })
       await expect(fill).toHaveCSS('transform-origin', /^0px /)
