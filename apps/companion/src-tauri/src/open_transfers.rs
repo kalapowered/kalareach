@@ -544,6 +544,9 @@ pub struct Desk {
     /// The newest connection of each host's device, so that an upload whose connection ended while
     /// a newer one was coming up goes on at once.
     sessions: Mutex<HashMap<(EnvironmentId, DeviceId), Arc<Session>>>,
+    /// What a suite holds a send at, once the copy of its content is written.
+    #[cfg(feature = "testing")]
+    after_copy: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl std::fmt::Debug for Desk {
@@ -689,6 +692,19 @@ impl Desk {
                 let _ = store.remove_copy(key);
                 return Err(error);
             }
+        }
+        #[cfg(feature = "testing")]
+        {
+            let gate = locked(&self.after_copy).clone();
+            if let Some(gate) = gate {
+                let _ = gate.acquire().await;
+            }
+        }
+        // A cancel that came while the copy was written found no sender to stop: the upload does not
+        // start, and its copy goes.
+        if live.file().cancel_asked || !locked(&self.live).contains_key(&key) {
+            let _ = store.remove_copy(key);
+            return Err(CommandError::refused(CANCELLED));
         }
         locked(&self.sessions).insert(
             (paired.environment_id, paired.device_id),
@@ -1407,6 +1423,13 @@ fn view_of(
 
 #[cfg(feature = "testing")]
 impl Desk {
+    /// Holds every send after its copy is written until the returned gate is given a permit.
+    pub fn hold_after_copy_for_test(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *locked(&self.after_copy) = Some(Arc::clone(&gate));
+        gate
+    }
+
     /// Whether `paired`'s connection is the newest one this desk was told the host was reached on.
     #[must_use]
     pub fn holds_newest_for_test(&self, paired: &Paired) -> bool {

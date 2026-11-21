@@ -2463,3 +2463,58 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
     gate.release();
     adopted.stop().await;
 }
+
+/// KR-REQ-13.12: a cancel that comes while the copy of the file is still being written finds no sender
+/// to stop, and the upload does not start afterwards: nothing reaches the host, the copy is gone, and
+/// the waiting call is told it was cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cancel_while_the_copy_is_written_stops_the_upload_from_starting() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let gate = desk.hold_after_copy_for_test();
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired_of(companion));
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    tokio::time::timeout(WATCHDOG, async {
+        while copies_in(&folder(&phone)) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the copy is written");
+    desk.cancel(paired_of(companion), key)
+        .await
+        .expect("the cancel is answered");
+    gate.add_permits(1);
+
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends")
+        .expect("the task ran")
+        .expect_err("a cancelled upload does not start");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    assert_eq!(
+        control.sent(Method::UploadBegin),
+        0,
+        "nothing reached the host"
+    );
+    assert_eq!(copies_in(&folder(&phone)), 0, "the copy is gone");
+    assert_eq!(entries_in(&folder(&phone)), 0, "the entry is gone");
+    // Nothing starts late either.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        control.sent(Method::UploadBegin),
+        0,
+        "nothing reaches the host late"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 0, "no entry is written late");
+    adopted.stop().await;
+}
