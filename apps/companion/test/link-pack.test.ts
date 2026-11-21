@@ -214,10 +214,10 @@ describe('the packing of a line', () => {
     expect(notRows, 'layouts that have a group that is not a row').toBeGreaterThan(300)
   })
 
-  it('completes the two links that fit where the row has them, whatever the order of the choices of the table (fixed lines)', () => {
-    // The first and the third link are completed (3 to 5 and 16 to 23 with 11 to 13 left short), not the second alone.
-    expect(verify(fixed([[3, 5], [11, 13], [16, 23]], { left: 0, right: 23 }), 'three links').completed).toBe(2)
-    // A skipped middle link leaves its gap whole: the first and the third reach 10 each, the second does not.
-    expect(verify(fixed([[5, 7], [10, 12], [17, 19]], { left: 0, right: 22 }), 'three links in a narrow column').completed).toBe(2)
+  it.each([
+    ['three links, the first and the third completed (3 to 5, 11 to 13, 16 to 23 in a column of 23)', [[3, 5], [11, 13], [16, 23]] as const, 23],
+    ['three links in a narrow column, the first and the third completed (5 to 7, 10 to 12, 17 to 19 in a column of 22)', [[5, 7], [10, 12], [17, 19]] as const, 22]
+  ] as const)('completes two of %s, whatever the choices of the table', (_name, words, right) => {
+    expect(verify(fixed(words, { left: 0, right }), 'fixed line').completed).toBe(2)
   })
 })
