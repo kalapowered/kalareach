@@ -1751,7 +1751,8 @@ describe('what the entry to the kept drafts says', () => {
     files: 0,
     why: 'other',
     updatedAtMs: 1,
-    inComposer: false
+    inComposer: false,
+    unread: false
   } as const
 
   it('says text is held in this window only, and does not call it a kept draft', () => {

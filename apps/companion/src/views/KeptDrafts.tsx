@@ -327,6 +327,11 @@ function KeptRow({
       <p className="small muted" data-testid="kept-draft-why">
         {whyWords(kept.why, unread)}
       </p>
+      {kept.unread && kept.why !== 'unread' ? (
+        <p className="small muted" data-testid="kept-draft-unread">
+          {unreadWords(unread)}
+        </p>
+      ) : null}
       <pre className="kept-draft-text" data-testid="kept-draft-text" tabIndex={0}>
         {kept.text.length === 0 ? '(no text)' : kept.text}
       </pre>

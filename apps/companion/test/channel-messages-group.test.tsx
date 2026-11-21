@@ -131,7 +131,8 @@ const kept = {
   files: 0,
   why: 'other',
   updatedAtMs: 1,
-  inComposer: false
+  inComposer: false,
+  unread: false
 } as const
 const message = {
   actionId: 'a',
@@ -408,6 +409,39 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
       ['draft and message', 'One kept draft and one channel message', 'are not in a composer.'],
       ['drafts unreadable only', 'Some drafts', 'could not be read.']
     ])
+  })
+
+  it('K6b shows the warning that a draft can be a message that was sent beside every reason it is listed, while sources are unknown', async () => {
+    const of = world()
+    const draftFor = (sessionId: string, state: 'orphaned' | 'conflicted', text: string) =>
+      of.drafts.save({
+        id: null,
+        expectedRevision: null,
+        sessionId,
+        applicationInstanceId: null,
+        agentBindingRevision: null,
+        state,
+        text,
+        attachments: []
+      })
+    draftFor(MAIN, 'orphaned', 'its session has gone')
+    draftFor(BUILD, 'conflicted', 'its conversation changed')
+    of.messages.leaveUnreadable('messages', { now: 1 })
+    startOver(of)
+    const rows = await screen.findAllByTestId('kept-draft')
+    expect(rows.map((row) => row.getAttribute('data-why')).sort()).toEqual(['conflicted', 'orphaned'])
+    for (const row of rows) {
+      expect(within(row).getByTestId('kept-draft-unread')).toHaveTextContent(
+        'This device could not read its channel messages, so this draft is not put in a composer by itself. It can be a message that was sent.'
+      )
+    }
+    cleanup()
+    const readable = world()
+    leaveDraft(readable, MAIN, 'a draft that was never sent')
+    leaveDraft(readable, MAIN, 'another draft of the same session')
+    startOver(readable)
+    expect(await screen.findByTestId('kept-draft')).toHaveAttribute('data-why', 'other')
+    expect(screen.queryByTestId('kept-draft-unread')).toBeNull()
   })
 
   it('K7 shows the line when another window keeps the first message, and the line opens the page', async () => {
