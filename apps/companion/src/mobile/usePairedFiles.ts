@@ -202,6 +202,16 @@ export function usePairedFiles({
 
   const cancel = useCallback(
     (key: string) => {
+      if (uploads.snapshot().get(key) === undefined) {
+        // The card is on the screen while the file is read, before the application has been told of
+        // it: the cancel is kept, nothing is handed over, and the card says so at once.
+        const file = files.find((each) => each.localId === key)
+        if (file?.upload !== 'uploading') return
+        void uploads.cancel(key)
+        changeFiles((current) => current.map((each) => (each.localId === key ? { ...each, upload: 'failed' } : each)))
+        say(`${file.name}: ${lineOf({ kind: 'cancelled', released: null }).text}`)
+        return
+      }
       void uploads.cancel(key).then(() => {
         const row = uploads.snapshot().get(key)
         if (row !== undefined) say(`${row.name}: ${lineOf(row.phase).text}`)
@@ -210,7 +220,7 @@ export function usePairedFiles({
         }
       })
     },
-    [changeFiles, say, uploads]
+    [changeFiles, files, say, uploads]
   )
 
   const add = useCallback(

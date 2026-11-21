@@ -5,7 +5,7 @@
  * names it. The host is the scripted one, which keeps an upload open until a test moves it on.
  */
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
@@ -86,6 +86,31 @@ describe('a file picked on a phone paired with a host', () => {
     expect(screen.getByRole('button', { name: 'Cancel sending report.pdf' })).toBeInTheDocument()
     expect(key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
     expect(controls.pairedUploads.started[0]).toMatchObject({ name: 'report.pdf', byteLen: 12, sessionId: SESSION })
+  })
+
+  it('starts nothing for a file the person cancelled before the page had read it', async () => {
+    const { controls, person } = await open()
+    // The page reads the file before the application hears of it, and the card is on the screen,
+    // with its Cancel, all that while.
+    let release: () => void = () => undefined
+    const read = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const reading = vi.spyOn(File.prototype, 'arrayBuffer').mockImplementation(() => read.then(() => new ArrayBuffer(12)))
+    try {
+      await pick(person)
+      await person.click(screen.getByRole('button', { name: 'Cancel sending report.pdf' }))
+      await waitFor(() => {
+        expect(line()).toBe('Cancelled.')
+      })
+      release()
+      // Long enough for the read to end and the upload, were it to start, to reach the host.
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(controls.pairedUploads.started).toHaveLength(0)
+      expect(line()).toBe('Cancelled.')
+    } finally {
+      reading.mockRestore()
+    }
   })
 
   it('shows how far it is in words and in a bar, follows a lost connection, and ends added to the draft', async () => {

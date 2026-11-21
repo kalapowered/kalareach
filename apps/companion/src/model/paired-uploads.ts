@@ -17,6 +17,7 @@
 import type { AttachmentHandle, HandedFile, HostPort, OpenUpload, SessionSubject } from '../host/port'
 import { describeBytes } from '../mobile/model/media'
 import {
+  CANCELLED_BEFORE_SENT,
   PUBLISHED_AND_KEPT,
   refusalOf,
   sentence,
@@ -203,6 +204,8 @@ export class PairedUploads {
   readonly #port: HostPort
   readonly #pollMs: number
   readonly #rows = new Map<string, UploadRow>()
+  /** Files cancelled before this store had a row for them: nothing is sent for them. */
+  readonly #cancelledEarly = new Set<string>()
   readonly #listeners = new Set<() => void>()
   #cached: ReadonlyMap<string, UploadRow> | null = null
   #timer: ReturnType<typeof setInterval> | null = null
@@ -234,6 +237,8 @@ export class PairedUploads {
    */
   send(input: Sending, bind: Bind): Promise<AttachmentHandle> {
     const { key, sessionId, subject, file } = input
+    // The person cancelled the file while the page was still reading it: it is never handed over.
+    if (this.#cancelledEarly.delete(key)) return Promise.reject(new Error(CANCELLED_BEFORE_SENT))
     this.#put({
       key,
       sessionId,
@@ -306,7 +311,13 @@ export class PairedUploads {
    */
   async cancel(key: string): Promise<void> {
     const row = this.#rows.get(key)
-    if (row === undefined || !canCancel(row.phase)) return
+    if (row === undefined) {
+      // A card is on the screen before the file has been read and handed to the application, and a
+      // cancel pressed then is kept for the send that would make the row.
+      this.#cancelledEarly.add(key)
+      return
+    }
+    if (!canCancel(row.phase)) return
     const before = row.phase
     this.#patch(key, { phase: { kind: 'cancelling' }, note: null })
     try {
