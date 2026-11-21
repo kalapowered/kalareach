@@ -157,7 +157,9 @@ export function keptEntry(
   shelf: Pick<
     ShelfSnapshot,
     'status' | 'stale' | 'messages' | 'holds' | 'damagedHolds' | 'unreadableMessages' | 'unreadableHolds'
-  >
+  >,
+  /** How many of the shelf's records of sends this window gives no Remove: their row waits for the host's answer. */
+  waitingHolds = 0
 ): KeptEntry | null {
   const alone = (label: string, rest: string): KeptEntry => ({ title: `${label} ${rest}`.replace(/\.$/, ''), label, rest })
   const messagesUnreadable = shelf.unreadableMessages.layout + shelf.unreadableMessages.now
@@ -181,7 +183,10 @@ export function keptEntry(
   if (stored === 0 && held === 0 && messages === 0) {
     if (holds > 0) {
       const label = holds === 1 ? 'One record of a message being sent' : `${String(holds)} records of messages being sent`
-      return alone(label, 'can be removed on this page.')
+      // The line promises a control only where the page gives one for each record.
+      return waitingHolds === 0
+        ? alone(label, 'can be removed on this page.')
+        : alone(label, holds === 1 ? 'is kept on this device.' : 'are kept on this device.')
     }
     return book.unreadable === 0
       ? null

@@ -13,7 +13,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card } from '../components/ui'
-import { useApp } from '../app/state'
+import { useApp, useWaitingHolds } from '../app/state'
 import { useChannelMessages } from '../app/channel-messages'
 import { useBook } from '../app/drafts'
 import { keptEntry } from '../model/draft-book'
@@ -70,7 +70,8 @@ export function sessionDescription(session: Session): string {
 export function Sessions(): ReactNode {
   const { port, go } = useApp()
   const rights = useConnectionRights()
-  const keptEntryLine = keptEntry(useBook(), useChannelMessages())
+  const channelShelf = useChannelMessages()
+  const keptEntryLine = keptEntry(useBook(), channelShelf, useWaitingHolds(channelShelf.holds))
   const [list, setList] = useState<SessionListResult | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [query, setQuery] = useState('')

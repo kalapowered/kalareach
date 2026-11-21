@@ -497,6 +497,9 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
       ['holds unreadable', keptEntry(none, shelf({ unreadableHolds: { layout: 0, now: 1 } }))],
       ['one hold', keptEntry(none, shelf({ holds: [hold] }))],
       ['holds', keptEntry(none, shelf({ holds: [hold, { ...hold, holdId: 'h2' }] }))],
+      ['one hold that waits', keptEntry(none, shelf({ holds: [hold] }), 1)],
+      ['holds, one that waits', keptEntry(none, shelf({ holds: [hold, { ...hold, holdId: 'h2' }] }), 1)],
+      ['holds that wait', keptEntry(none, shelf({ holds: [hold, { ...hold, holdId: 'h2' }] }), 2)],
       ['one message', keptEntry(none, shelf({ messages: [message] }))],
       ['messages', keptEntry(none, shelf({ messages: [message, { ...message, actionId: 'b' }] }))],
       ['draft and message', keptEntry({ ...none, kept: [kept] }, shelf({ messages: [message] }))],
@@ -513,6 +516,9 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
       ['holds unreadable', 'Some records of messages being sent', 'could not be read.'],
       ['one hold', 'One record of a message being sent', 'can be removed on this page.'],
       ['holds', '2 records of messages being sent', 'can be removed on this page.'],
+      ['one hold that waits', 'One record of a message being sent', 'is kept on this device.'],
+      ['holds, one that waits', '2 records of messages being sent', 'are kept on this device.'],
+      ['holds that wait', '2 records of messages being sent', 'are kept on this device.'],
       ['one message', 'One channel message', 'is not in a composer.'],
       ['messages', '2 channel messages', 'are not in a composer.'],
       ['draft and message', 'One kept draft and one channel message', 'are not in a composer.'],
@@ -832,6 +838,56 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(asked(of, 'list')).toBeGreaterThan(listed)
     // A list that no longer shows the record is not the answer of a removal that was refused: the row stays.
     expect(states().submissionsOf(MAIN).map((row) => row.holdId)).toEqual(['hold-unknown'])
+  })
+
+  it('K10h tells a session list that is still being read from one that failed, in the words of each', async () => {
+    const of = world()
+    keepHold(of, MAIN, 'hold-main')
+    let fail: (failure: Error) => void = () => undefined
+    startOver(of, KEPT_PAGE, (port) => ({
+      ...port,
+      sessionList: () =>
+        new Promise((_resolve, reject) => {
+          fail = reject
+        })
+    }))
+    const record = await screen.findByTestId('channel-hold')
+    expect(record.querySelector('p')?.textContent).toMatch(
+      /^A message to a session on studio, pressed at [^]+\. This device has not settled what became of it\. Removing this record sends nothing\.$/
+    )
+    expect(record.querySelector('p')?.textContent).not.toContain('cannot reach now')
+    act(() => {
+      fail(new Error('out of reach'))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('channel-hold').querySelector('p')?.textContent).toMatch(
+        /^A message to a session on studio, which this device cannot reach now, pressed at [^]+\. This device has not settled/
+      )
+    })
+  })
+
+  it('K10i gives the entry line no promise of a control for a record whose row waits, and the removable one keeps its Remove', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    keepHold(of, MAIN, 'hold-waits')
+    keepHold(of, MAIN, 'hold-free')
+    const { states } = startOver(of, { view: 'sessions' })
+    const line = await screen.findByTestId('kept-drafts-entry')
+    expect(line).toHaveTextContent('2 records of messages being sent can be removed on this page.')
+    act(() => {
+      states().update(MAIN, (current) => ({ ...current, submissions: [rowFor('hold-waits', 'queued')] }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('kept-drafts-entry')).toHaveTextContent(
+        '2 records of messages being sent are kept on this device.'
+      )
+    })
+    expect(screen.getByTestId('kept-drafts-entry')).not.toHaveTextContent('can be removed on this page.')
+    await person.click(within(screen.getByTestId('kept-drafts-entry')).getByRole('button'))
+    const records = await screen.findAllByTestId('channel-hold')
+    expect(records).toHaveLength(2)
+    expect(within(records[0]).queryByTestId('channel-hold-remove')).toBeNull()
+    expect(within(records[1]).queryByTestId('channel-hold-remove')).not.toBeNull()
   })
 
   it('K10c shows the warning from 900 records and not at 899', async () => {
