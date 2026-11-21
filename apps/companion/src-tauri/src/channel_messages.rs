@@ -87,6 +87,9 @@ pub enum Point {
     RepairNamed,
     /// A keep is about to remove the record of the send it ends.
     HoldRemoval,
+    /// A read with no folder of messages holds the ledger's lock and has proved the data directory
+    /// durable, and has not read the drafts. Keyed by the folder's path.
+    AbsentProved,
     /// A set-aside holds every lock and has read nothing. Keyed by the data directory.
     SetAsideLocked,
     /// A set-aside has copied the ledger and not replaced it. Keyed by the data directory.
@@ -915,16 +918,24 @@ impl ChannelDesk {
     /// proved durable: no draft may be put in a composer while that is unknown.
     pub fn read_drafts(&self, drafts: &DraftDesk) -> Result<Stored> {
         let held = self.lock(false)?;
-        // Under the lock, before any draft is read: the data directory that holds the list of
-        // removals is proved durable at every read, whichever process published the list, and
-        // whether or not there is a folder of messages.
-        drafts.settle_owed_flush()?;
-        if held.present {
+        // Under a lock another process takes too, before any draft is read: the data directory that
+        // holds the list of removals is proved durable at every read, whichever process published
+        // the list, and whether or not there is a folder of messages.
+        let _ledger = if held.present {
+            drafts.settle_owed_flush()?;
             self.make_durable(&held)?;
+            None
         } else {
+            // With no folder there is no store lock to hold, so the ledger's own lock stands in for
+            // it from the proof to the read. The draft store is opened first: that makes the data
+            // directory, each new name proved durable, which the proof below needs.
+            drafts.store()?;
+            let locked = drafts.lock_ledger()?;
             flush_directory(&self.data()?, NameKind::Directory)
                 .map_err(|error| crate::drafts::ledger_storage(&error))?;
-        }
+            let _ = reach(&held.directory, Point::AbsentProved);
+            Some(locked)
+        };
         held.sweep();
         let mut stored = drafts.read()?;
         if !held.present {
