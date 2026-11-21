@@ -12,29 +12,19 @@ use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
-use kr_protocol::ids::{
-    BuildId, ControllerGeneration, InputLeaseEpoch, RequestId, SessionEpoch, SessionId,
-};
-use kr_protocol::root::{
-    CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, FenceAcknowledgement,
-    KeyQueueSnapshot, PendingReaderInput, PromptGeneration, QueueDrainReport, ReaderContext,
-    ReaderRevision, RootCommandBlockParams, RootEditorEnterParams, RootEditorFenceResult,
-};
-use kr_protocol::scalars::{Nullable, TimestampMs};
+use kr_protocol::ids::{BuildId, ControllerGeneration, InputLeaseEpoch, SessionEpoch, SessionId};
+use kr_protocol::root::PromptGeneration;
+use kr_protocol::scalars::TimestampMs;
 use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
 use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
 use kr_shell_integration::contract::fence::LeaseView;
 use kr_shell_integration::contract::qualification::ShellKind;
-use kr_shell_integration::contract::requests::{
-    BridgeAnswer, LaunchAccepted, LaunchDecision, LaunchMailboxRequest, WorkerRequest,
-};
-use kr_shell_integration::contract::transport::{
-    EventOutcome, HandshakeOutcome, WorkerExpectation,
-};
+use kr_shell_integration::contract::requests::LaunchMailboxRequest;
+use kr_shell_integration::contract::transport::{HandshakeOutcome, WorkerExpectation};
 use kr_shell_integration::host::endpoint::HostEndpoint;
 use kr_shell_integration::host::scripted::{
-    ReferenceShell, ScriptedBridge, ToBridge, qualified_hello,
+    ReaderNumbers, ReferenceShell, ScriptedBridge, ScriptedReader, ToBridge, qualified_hello,
 };
 use kr_worker::fence::FenceDriver;
 use kr_worker::runtime::SessionRuntime;
@@ -60,7 +50,7 @@ pub const DIRECTORY: u64 = 5;
 pub struct Hosted {
     pub session_id: SessionId,
     pub runtime: Arc<SessionRuntime>,
-    pub bridge: ScriptedBridge,
+    pub reader: ScriptedReader,
     _service: Arc<WorkerService>,
     serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
     bridge_task: tokio::task::JoinHandle<()>,
@@ -71,7 +61,7 @@ pub struct Hosted {
 impl Hosted {
     /// Reads the next frame the worker sends the reader, or fails.
     pub async fn next(&mut self) -> ToBridge {
-        tokio::time::timeout(SOON, self.bridge.recv())
+        tokio::time::timeout(SOON, self.reader.next())
             .await
             .expect("the worker sent a frame")
             .expect("a frame")
@@ -80,114 +70,43 @@ impl Hosted {
     /// The reader enters the primary prompt `PROMPT` with an empty buffer, and the worker has
     /// handled it when this returns.
     pub async fn enters_the_prompt(&mut self) {
-        self.bridge
-            .send_event(BridgeEvent::EditorEnter(RootEditorEnterParams {
-                session_id: self.session_id,
-                root_process: kr_ipc::identity::current_process_start_identity()
-                    .expect("this process"),
-                prompt_generation: PromptGeneration::new(PROMPT),
-                reader_revision: ReaderRevision::new(1),
-                reader_context: ReaderContext::Primary,
-                editor: editor_state(),
-                cwd_revision: CwdRevision::new(DIRECTORY),
-            }))
+        tokio::time::timeout(SOON, self.reader.enters_the_prompt())
             .await
+            .expect("the worker handled the prompt")
             .expect("enters");
-        self.settled().await;
     }
 
     /// Returns once the worker has handled every event sent before this call.
     pub async fn settled(&mut self) {
-        self.bridge
-            .send_event(BridgeEvent::CommandBlock(Box::new(
-                RootCommandBlockParams {
-                    session_id: self.session_id,
-                    prompt_generation: PromptGeneration::new(PROMPT),
-                    command: "true".to_owned(),
-                    started_at_ms: TimestampMs::new(1_700_000_000_000),
-                    duration_ms: Nullable::null(),
-                    exit_status: Nullable::null(),
-                    cwd: "/tmp".to_owned(),
-                    cwd_revision: CwdRevision::new(DIRECTORY),
-                },
-            )))
+        tokio::time::timeout(SOON, self.reader.settled())
             .await
+            .expect("the worker handled the events")
             .expect("reports");
-        loop {
-            if let ToBridge::EventResult { result, .. } = self.next().await
-                && matches!(*result, EventOutcome::CommandBlockRecorded(_))
-            {
-                return;
-            }
-        }
     }
 
     /// The reader answers the worker's request for a fence, and the worker publishes it.
     pub async fn proves_a_fence(&mut self) {
-        let fence_id = loop {
-            if let ToBridge::Request { request, .. } = self.next().await
-                && let WorkerRequest::Fence(params) = *request
-            {
-                break params.fence_id;
-            }
-        };
-        self.bridge
-            .answer(
-                RequestId::new(0),
-                BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(FenceAcknowledgement {
-                    fence_id,
-                    prompt_generation: PromptGeneration::new(PROMPT),
-                    reader_revision: ReaderRevision::new(1),
-                    reader_context: ReaderContext::Primary,
-                    queues: QueueDrainReport::CLEAR,
-                    snapshot: KeyQueueSnapshot::drained(),
-                    editor: EditorState {
-                        buffer_revision: EditorBufferRevision::new(BUFFER),
-                        ..editor_state()
-                    },
-                    cwd_revision: CwdRevision::new(DIRECTORY),
-                })),
-            )
+        let published = tokio::time::timeout(SOON, self.reader.proves_a_fence())
             .await
+            .expect("the worker published the fence")
             .expect("acknowledges");
-        loop {
-            if let ToBridge::FencePublished(published) = self.next().await {
-                assert!(
-                    matches!(published, kr_protocol::root::FencePublication::Published(_)),
-                    "the fence was withheld: {published:?}"
-                );
-                return;
-            }
-        }
+        assert!(
+            matches!(published, kr_protocol::root::FencePublication::Published(_)),
+            "the fence was withheld: {published:?}"
+        );
     }
 
     /// The next install the worker asks the reader for.
     pub async fn install_asked(&mut self) -> LaunchMailboxRequest {
-        loop {
-            if let ToBridge::Request { request, .. } = self.next().await
-                && let WorkerRequest::Launch(request) = *request
-            {
-                return request;
-            }
-        }
+        tokio::time::timeout(SOON, self.reader.install_asked())
+            .await
+            .expect("the worker asked for an install")
+            .expect("a request")
     }
 
     /// The reader installs what it was asked to, at the prompt it stands at.
     pub async fn installs(&mut self, asked: &LaunchMailboxRequest) {
-        self.bridge
-            .answer(
-                RequestId::new(0),
-                BridgeAnswer::Launch(LaunchDecision::Accepted(LaunchAccepted {
-                    transaction: asked.transaction,
-                    installed: asked.command.clone(),
-                    fence_id: asked.fence_id,
-                    prompt_generation: PromptGeneration::new(PROMPT),
-                    buffer_revision: EditorBufferRevision::new(BUFFER + 1),
-                    reader_revision: ReaderRevision::new(1),
-                })),
-            )
-            .await
-            .expect("installs");
+        self.reader.installs(asked).await.expect("installs");
     }
 
     /// Closes the session and waits for it, so the shell ends with it.
@@ -204,15 +123,6 @@ impl Drop for Hosted {
     fn drop(&mut self) {
         self.serving.abort();
         self.bridge_task.abort();
-    }
-}
-
-pub fn editor_state() -> EditorState {
-    EditorState {
-        buffer_empty: true,
-        buffer_revision: EditorBufferRevision::new(1),
-        keymap: EditorKeymap::Emacs,
-        pending: PendingReaderInput::NONE,
     }
 }
 
@@ -349,7 +259,7 @@ pub async fn hosted(script: &str) -> Hosted {
             environment_id,
             display_number: display,
             boot_identity: boot,
-            process_start_identity: process,
+            process_start_identity: process.clone(),
             protocol_version: PROTOCOL_VERSION,
             endpoint: endpoint.as_text(),
             worker_public_key: *identity.public_key(),
@@ -358,11 +268,23 @@ pub async fn hosted(script: &str) -> Hosted {
         },
     )
     .expect("publishes the descriptor");
+    let reader = ScriptedReader::new(
+        bridge,
+        session_id,
+        process,
+        ReaderNumbers {
+            prompt_generation: PROMPT,
+            reader_revision: 1,
+            entered_buffer_revision: 1,
+            buffer_revision: BUFFER,
+            cwd_revision: DIRECTORY,
+        },
+    );
     Hosted {
         temp,
         session_id,
         runtime,
-        bridge,
+        reader,
         _service: service,
         serving,
         bridge_task,

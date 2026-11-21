@@ -27,19 +27,29 @@ use kr_protocol::identity::{
 };
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AuthorityRevision, BrokerBindingId, BuildId,
-    CapabilityId, CapabilityRevision, ConnectionId, ControllerGeneration, EnvironmentId, PluginId,
-    PublisherId, SessionEpoch, SessionId, UpstreamRequestId,
+    CapabilityId, CapabilityRevision, ConnectionId, ControllerGeneration, EnvironmentId,
+    InputLeaseEpoch, PluginId, PublisherId, SessionEpoch, SessionId, UpstreamRequestId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::question::{Question, QuestionCreateParams, QuestionKind};
+use kr_protocol::root::PromptGeneration;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, SessionState, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
+use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
+use kr_shell_integration::contract::fence::LeaseView;
+use kr_shell_integration::contract::qualification::ShellKind;
+use kr_shell_integration::contract::transport::{HandshakeOutcome, WorkerExpectation};
+use kr_shell_integration::host::endpoint::HostEndpoint;
+use kr_shell_integration::host::scripted::{
+    ReaderNumbers, ReferenceShell, ScriptedBridge, ScriptedReader, qualified_hello,
+};
 use kr_worker::action::time::TimeSources;
 use kr_worker::broker::{
     BrokerError, BrokerTransport, Credential, ManagedProcess, PendingTransmission, TransportHandle,
     UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
 };
+use kr_worker::fence::FenceDriver;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -70,6 +80,57 @@ impl HeldBoundary {
     }
 }
 
+/// Serves the bridge endpoint of a managed session and connects the reference reader to it as the
+/// root shell, which is this process, with its hooks live.
+async fn managed_reader(
+    runtime: &Arc<SessionRuntime>,
+    host_endpoint: HostEndpoint,
+    session_id: SessionId,
+    process: &ProcessStartIdentity,
+    numbers: ReaderNumbers,
+) -> (ScriptedReader, tokio::task::JoinHandle<()>) {
+    let address = host_endpoint.address().clone();
+    let secret = host_endpoint.secret().clone();
+    let server = kr_worker::fence::bridge::BridgeServer::new(
+        Arc::clone(runtime),
+        host_endpoint,
+        WorkerExpectation {
+            session_id,
+            root_process: process.clone(),
+            supported_editor_abis: vec!["zle-5.9".to_owned()],
+            supported_integration_versions: vec!["1".to_owned()],
+            launched_package: None,
+            already_registered: false,
+            gesture: kr_shell_integration::contract::events::EofGesture::default(),
+        },
+    );
+    let task = tokio::spawn(server.serve());
+    let declared = ReferenceShell::new(ShellKind::Zsh, "/bin/cat", "5.9", "zle-5.9");
+    let hello = qualified_hello(&declared, session_id, &address, process.clone(), &secret)
+        .expect("a hello");
+    let (mut bridge, outcome) =
+        tokio::time::timeout(super::LONG_WAIT, ScriptedBridge::connect(&address, &hello))
+            .await
+            .expect("the worker accepted a connection")
+            .expect("connects");
+    assert!(
+        matches!(outcome, HandshakeOutcome::Accepted(_)),
+        "a qualified root shell registers: {outcome:?}"
+    );
+    bridge
+        .send_event(BridgeEvent::HooksActivated(HooksActivated {
+            session_id,
+            prompt_generation: PromptGeneration::new(1),
+            modules: Vec::new(),
+        }))
+        .await
+        .expect("reports");
+    (
+        ScriptedReader::new(bridge, session_id, process.clone(), numbers),
+        task,
+    )
+}
+
 /// A worker for one session, in this process, on an environment tree a daemon of it serves.
 pub struct Worker {
     pub service: Arc<WorkerService>,
@@ -80,6 +141,28 @@ pub struct Worker {
     _runtime: Arc<SessionRuntime>,
     _closing: kr_worker::testing::ClosedOnDrop,
     serving: tokio::task::JoinHandle<()>,
+    /// The reference reader of a managed session ([`Self::start_managed`]); none for a session
+    /// with no reader.
+    reader: Option<tokio::sync::Mutex<ScriptedReader>>,
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// What the reader of a managed worker reports: all different, so that a report that reads one
+/// for another shows.
+pub const MANAGED_NUMBERS: ReaderNumbers = ReaderNumbers {
+    prompt_generation: 12,
+    reader_revision: 1,
+    entered_buffer_revision: 1,
+    buffer_revision: 3,
+    cwd_revision: 5,
+};
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        if let Some(task) = self.bridge_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl Worker {
@@ -212,6 +295,65 @@ impl Worker {
         dimensions: Dimensions,
         window: Option<usize>,
     ) -> Self {
+        Self::start_with_reader(
+            tree, display, reserved, script, time, dimensions, window, None,
+        )
+        .await
+    }
+
+    /// A reserved session in the registry whose shell is managed: its reader is the reference
+    /// reader of `kr_shell_integration`, which has registered and whose hooks are live, with no
+    /// prompt entered yet. The reader reports [`MANAGED_NUMBERS`]. `script` is the session's
+    /// application, a POSIX shell script.
+    pub async fn start_managed(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        script: &str,
+    ) -> Self {
+        Self::start_with_reader(
+            tree,
+            display,
+            true,
+            script,
+            TimeSources::system(),
+            Dimensions::new(80, 24),
+            None,
+            Some(MANAGED_NUMBERS),
+        )
+        .await
+    }
+
+    /// How many `shell.launch` requests this worker has been sent, whatever it answered: the
+    /// forwarding of a press, observed apart from what the reader was asked.
+    pub fn launches_received(&self) -> usize {
+        let launch = kr_protocol::method::MethodName::from(Method::ShellLaunch);
+        self.service
+            .received()
+            .iter()
+            .filter(|(name, _)| *name == launch)
+            .count()
+    }
+
+    /// The managed session's reader, for a step a case drives. Panics for a session with none.
+    pub async fn reader(&self) -> tokio::sync::MutexGuard<'_, ScriptedReader> {
+        self.reader
+            .as_ref()
+            .expect("a managed worker has a reader")
+            .lock()
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_reader(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        reserved: bool,
+        script: &str,
+        time: TimeSources,
+        dimensions: Dimensions,
+        window: Option<usize>,
+        managed: Option<ReaderNumbers>,
+    ) -> Self {
         let environment = tree.environment();
         let environment_id = tree.environment_id();
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
@@ -273,7 +415,11 @@ impl Worker {
             environment_id,
             display_number,
             shell: kr_worker::testing::posix_script(script),
-            shell_mode: ShellMode::NativeCompat,
+            shell_mode: if managed.is_some() {
+                ShellMode::Managed
+            } else {
+                ShellMode::NativeCompat
+            },
             worker_profile: WorkerProfile::HeadlessUser,
             desktop: DesktopBinding::none(),
             dimensions,
@@ -288,12 +434,37 @@ impl Worker {
             time,
             launch_profile: kr_protocol::session::LaunchProfile::default(),
         };
+        let host_endpoint = managed.map(|_| {
+            HostEndpoint::open_for_session(
+                environment.runtime_root(),
+                environment.runtime_dir(),
+                session_id,
+            )
+            .expect("binds the bridge")
+        });
         let mut session = Session::open(config).expect("opens the session");
         session.launch().expect("launches the shell");
+        if managed.is_some() {
+            // The machine reads a clock that only this test could move, and this test never moves
+            // it, so none of its deadlines passes because the test was slow to answer.
+            session.install_fence(FenceDriver::new(
+                session_id,
+                LeaseView::unheld(InputLeaseEpoch::new(0)),
+                Arc::new(kr_transport::clock::ManualClock::new()),
+            ));
+        }
         let runtime = Arc::new(
             SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
                 .expect("starts the runtime"),
         );
+        let (reader, bridge_task) = match (managed, host_endpoint) {
+            (Some(numbers), Some(host_endpoint)) => {
+                let (reader, task) =
+                    managed_reader(&runtime, host_endpoint, session_id, &process, numbers).await;
+                (Some(tokio::sync::Mutex::new(reader)), Some(task))
+            }
+            _ => (None, None),
+        };
         let endpoint = environment
             .worker_endpoint(display_number)
             .expect("an endpoint");
@@ -366,6 +537,8 @@ impl Worker {
             _closing: kr_worker::testing::ClosedOnDrop::of(&runtime),
             _runtime: runtime,
             serving,
+            reader,
+            bridge_task,
         }
     }
 
@@ -937,12 +1110,19 @@ impl Adopted {
     /// workers on the tree, each reserved and open in the registry as every session a daemon
     /// creates is, and starts the daemon again, which adopts them.
     pub async fn start(sessions: u64) -> Self {
-        Self::start_on(sessions, None, Clocks::system(), None).await
+        Self::start_on(sessions, None, Clocks::system(), None, false).await
     }
 
     /// As [`Self::start`], for one session whose application is `script`, a POSIX shell script.
     pub async fn start_running(script: &str) -> Self {
-        Self::start_on(1, None, Clocks::system(), Some(script)).await
+        Self::start_on(1, None, Clocks::system(), Some(script), false).await
+    }
+
+    /// As [`Self::start`], for one session whose shell is managed and whose reader is the
+    /// reference reader ([`Worker::start_managed`]): its application is `exec cat`, and no prompt
+    /// has been entered.
+    pub async fn start_managed() -> Self {
+        Self::start_on(1, None, Clocks::system(), None, true).await
     }
 
     /// As [`Self::start`], for a host whose configuration is `document`.
@@ -950,12 +1130,12 @@ impl Adopted {
         sessions: u64,
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
     ) -> Self {
-        Self::start_on(sessions, Some(document), Clocks::system(), None).await
+        Self::start_on(sessions, Some(document), Clocks::system(), None, false).await
     }
 
     /// As [`Self::start`], on the clocks a suite moves by hand.
     pub async fn start_on_clocks(sessions: u64, clocks: Clocks) -> Self {
-        Self::start_on(sessions, None, clocks, None).await
+        Self::start_on(sessions, None, clocks, None, false).await
     }
 
     async fn start_on(
@@ -963,6 +1143,7 @@ impl Adopted {
         document: Option<&kr_protocol::hostinfo::configuration::ConfigurationDocument>,
         clocks: Clocks,
         script: Option<&str>,
+        managed: bool,
     ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = match document {
@@ -973,6 +1154,7 @@ impl Adopted {
         let mut workers = Vec::new();
         for display in 1..=sessions {
             workers.push(match script {
+                _ if managed => Worker::start_managed(stopped.tree(), display, "exec cat").await,
                 Some(script) => Worker::start_running(stopped.tree(), display, script).await,
                 None => Worker::start_reserved(stopped.tree(), display).await,
             });

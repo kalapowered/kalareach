@@ -4962,3 +4962,427 @@ async fn a_session_opened_while_a_choice_is_cleaning_up_survives_the_cleanup() {
     );
     adopted.stop().await;
 }
+
+/// The numbers the managed worker's reader reports, as the page quotes them.
+const PROMPT: u64 = net_support::worker::MANAGED_NUMBERS.prompt_generation;
+const BUFFER: u64 = net_support::worker::MANAGED_NUMBERS.buffer_revision;
+
+/// The reader of the managed session enters its primary prompt with an empty buffer.
+async fn reader_enters_the_prompt(worker: &net_support::worker::Worker) {
+    tokio::time::timeout(WATCHDOG, async {
+        worker
+            .reader()
+            .await
+            .enters_the_prompt()
+            .await
+            .expect("the reader enters");
+    })
+    .await
+    .expect("the worker handled the prompt");
+}
+
+/// The reader answers the worker's next request for a fence, and the worker publishes it.
+async fn reader_proves_a_fence(worker: &net_support::worker::Worker) {
+    let published = tokio::time::timeout(WATCHDOG, async {
+        worker
+            .reader()
+            .await
+            .proves_a_fence()
+            .await
+            .expect("the reader answers")
+    })
+    .await
+    .expect("the worker asked for a fence");
+    assert!(
+        matches!(published, kr_protocol::root::FencePublication::Published(_)),
+        "the fence was withheld: {published:?}"
+    );
+}
+
+/// What the worker asked the reader for while it handled everything sent before now.
+async fn reader_requests_since(
+    worker: &net_support::worker::Worker,
+) -> Vec<kr_shell_integration::host::scripted::ToBridge> {
+    tokio::time::timeout(WATCHDOG, async {
+        worker
+            .reader()
+            .await
+            .settled_seeing()
+            .await
+            .expect("the worker handled the events")
+    })
+    .await
+    .expect("the worker handled the events")
+}
+
+fn asked_to_install(frames: &[kr_shell_integration::host::scripted::ToBridge]) -> bool {
+    frames.iter().any(|frame| {
+        matches!(
+            frame,
+            kr_shell_integration::host::scripted::ToBridge::Request { request, .. }
+                if matches!(**request, kr_shell_integration::contract::requests::WorkerRequest::Launch(_))
+        )
+    })
+}
+
+/// A phone paired under `rights` whose screen `opening` is open on `session` and whose view,
+/// publishing on `channel`, is showing.
+async fn phone_viewing(
+    adopted: &Adopted,
+    rights: &[ActionRight],
+    opening: &str,
+    channel: u32,
+) -> (Phone, String) {
+    let phone = phone_under(adopted, pairing(rights)).await;
+    let session = adopted.workers[0].session_id;
+    open(&phone.companion, session, None, opening).expect("the session opens");
+    let view = open_view(&phone.companion, session, opening, channel).expect("the view opens");
+    phone
+        .companion
+        .state_where(channel, |state| state["state"] == "showing")
+        .await;
+    (phone, view)
+}
+
+/// The view takes the input, and the reader proves the fence the take asks for.
+async fn view_takes_control_and_the_reader_proves_the_fence(
+    adopted: &Adopted,
+    phone: &Phone,
+    view: &str,
+    channel: u32,
+) {
+    let taking = phone.companion.start_call(
+        "terminal_view_input",
+        json!({ "view": view, "input": { "kind": "take", "number": 1 } }),
+    );
+    reader_proves_a_fence(&adopted.workers[0]).await;
+    taking.await.expect("ran").expect("the take is taken");
+    phone
+        .companion
+        .state_where(channel, |state| state["control"]["state"] == "controlling")
+        .await;
+}
+
+fn launch_surface(phone: &Phone, view: &str) -> Value {
+    phone
+        .companion
+        .call("terminal_view_launch_surface", json!({ "view": view }))
+        .expect("the launch surface is read")
+}
+
+/// A press of `arguments` quoting the prompt and the buffer given, started as the page starts it.
+fn start_press(
+    phone: &Phone,
+    view: &str,
+    arguments: &[&str],
+    prompt: u64,
+    buffer: u64,
+) -> tokio::task::JoinHandle<Result<Value, Value>> {
+    phone.companion.start_call(
+        "terminal_view_launch",
+        json!({ "view": view, "press": {
+            "command": { "arguments": arguments },
+            "expected_prompt_generation": prompt.to_string(),
+            "expected_buffer_revision": buffer.to_string(),
+        }}),
+    )
+}
+
+/// KR-REQ-13.11: a phone reads a paired host's launch surface through its view, on the view's own
+/// link, and sees the same states the host's own screen does. At a prompt with no fence nobody holds
+/// the input and the editor is unverified for want of a fence; once the phone's view takes control
+/// and the reader proves the fence, the surface says the input is held here and the editor verified
+/// at the numbers the reader reported. A second phone's view of a share with the live screen is told
+/// the input is held elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_phone_reads_a_paired_hosts_launch_surface_through_its_view() {
+    let adopted = Adopted::start_managed().await;
+    let worker = &adopted.workers[0];
+    let session = worker.session_id;
+    reader_enters_the_prompt(worker).await;
+    let (phone, view) = phone_viewing(
+        &adopted,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+        "launch-screen",
+        61,
+    )
+    .await;
+
+    let before = launch_surface(&phone, &view);
+    assert_eq!(before["state"], "served", "{before}");
+    assert_eq!(before["surface"]["input"], "free", "{before}");
+    assert_eq!(
+        before["surface"]["editor"]["state"], "unverified",
+        "{before}"
+    );
+    assert_eq!(
+        before["surface"]["editor"]["reason"], "no_fence",
+        "{before}"
+    );
+
+    view_takes_control_and_the_reader_proves_the_fence(&adopted, &phone, &view, 61).await;
+    let held = launch_surface(&phone, &view);
+    assert_eq!(held["state"], "served", "{held}");
+    assert_eq!(held["surface"]["input"], "held_here", "{held}");
+    let editor = &held["surface"]["editor"];
+    assert_eq!(editor["state"], "verified", "{held}");
+    assert_eq!(editor["prompt_generation"], PROMPT.to_string(), "{held}");
+    assert_eq!(editor["buffer_revision"], BUFFER.to_string(), "{held}");
+
+    // A viewer share with the live screen draws the terminal and is told who holds the input.
+    let mut grant = pairing(&[ActionRight::SessionView]);
+    grant.session_selector = kr_protocol::grant::SessionSelector::None;
+    let viewer = phone_under(&adopted, grant).await;
+    let share = shared_with(
+        &adopted,
+        &viewer,
+        session,
+        RoleSelection {
+            include_live_screen: true,
+            ..RoleSelection::plain(SessionRole::Viewer)
+        },
+    )
+    .await;
+    open(
+        &viewer.companion,
+        session,
+        Some(share.grant_id),
+        "viewer-screen",
+    )
+    .expect("the share opens");
+    let watching = open_view(&viewer.companion, session, "viewer-screen", 62).expect("opens");
+    viewer
+        .companion
+        .state_where(62, |state| state["state"] == "showing")
+        .await;
+    let elsewhere = launch_surface(&viewer, &watching);
+    assert_eq!(elsewhere["state"], "served", "{elsewhere}");
+    assert_eq!(
+        elsewhere["surface"]["input"], "held_elsewhere",
+        "{elsewhere}"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.11: a phone presses a launch through its view on a paired host and the reader is asked
+/// for exactly the vector pressed, at the prompt and the buffer the view read. The press travels
+/// the existing device route: the view's link, the daemon, the worker. A vector with an empty
+/// argument, an argument with a space and a Windows path reaches the reader unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_phone_presses_a_launch_through_its_view_on_a_paired_host() {
+    let adopted = Adopted::start_managed().await;
+    let worker = &adopted.workers[0];
+    reader_enters_the_prompt(worker).await;
+    let (phone, view) = phone_viewing(
+        &adopted,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+        "launch-screen",
+        63,
+    )
+    .await;
+    view_takes_control_and_the_reader_proves_the_fence(&adopted, &phone, &view, 63).await;
+    let surface = launch_surface(&phone, &view);
+    assert_eq!(
+        surface["surface"]["editor"]["state"], "verified",
+        "{surface}"
+    );
+
+    let vector = ["C:\\tools\\agent.exe", "--resume", "two words", ""];
+    let pressing = start_press(&phone, &view, &vector, PROMPT, BUFFER);
+    let asked = tokio::time::timeout(WATCHDOG, async {
+        worker.reader().await.install_asked().await
+    })
+    .await
+    .expect("the reader is asked")
+    .expect("a request");
+    assert_eq!(
+        asked.command,
+        kr_protocol::root::LaunchCommand::Arguments(
+            vector.iter().map(|word| (*word).to_owned()).collect()
+        )
+    );
+    assert_eq!(
+        asked.expected_prompt_generation,
+        kr_protocol::root::PromptGeneration::new(PROMPT)
+    );
+    assert_eq!(
+        asked.expected_buffer_revision,
+        kr_protocol::root::EditorBufferRevision::new(BUFFER)
+    );
+    worker
+        .reader()
+        .await
+        .installs(&asked)
+        .await
+        .expect("the reader installs");
+    let installed = pressing
+        .await
+        .expect("ran")
+        .expect("the launch is installed");
+    assert_eq!(
+        installed["prompt_generation"],
+        PROMPT.to_string(),
+        "{installed}"
+    );
+    assert_eq!(
+        installed["buffer_revision"],
+        (BUFFER + 1).to_string(),
+        "{installed}"
+    );
+    assert_eq!(worker.launches_received(), 1);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.11: a quote that was read before the reader's prompt generation advanced installs
+/// nothing when it is pressed through a paired view, although the reader has proved a fence at the
+/// new generation since: the worker refuses it as `DRAFT_CONFLICT` and the reader is never asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_stale_quote_pressed_through_a_paired_view_installs_nothing() {
+    let adopted = Adopted::start_managed().await;
+    let worker = &adopted.workers[0];
+    reader_enters_the_prompt(worker).await;
+    let (phone, view) = phone_viewing(
+        &adopted,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+        "launch-screen",
+        64,
+    )
+    .await;
+    view_takes_control_and_the_reader_proves_the_fence(&adopted, &phone, &view, 64).await;
+    let read = launch_surface(&phone, &view);
+    assert_eq!(read["surface"]["editor"]["state"], "verified", "{read}");
+
+    // The reader enters the next prompt and proves a fence at it, so a refusal by the state of the
+    // earlier fence does not stand in for the refusal by the generation.
+    worker.reader().await.numbers.prompt_generation = PROMPT + 1;
+    tokio::time::timeout(WATCHDOG, async { worker.reader().await.enters().await })
+        .await
+        .expect("the reader enters")
+        .expect("sent");
+    reader_proves_a_fence(worker).await;
+
+    let refused = start_press(&phone, &view, &["claude"], PROMPT, BUFFER)
+        .await
+        .expect("ran")
+        .expect_err("the quote is a generation old");
+    assert_eq!(code(&refused), "DRAFT_CONFLICT", "{refused}");
+    assert!(
+        !asked_to_install(&reader_requests_since(worker).await),
+        "the reader was not asked to install"
+    );
+    assert_eq!(
+        worker.launches_received(),
+        1,
+        "the press reached the worker once"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.11: a viewer share that carries no terminal input is refused a press at the daemon and
+/// nothing reaches the worker: no `shell.launch` frame is sent to it and the reader is not asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_viewer_share_is_refused_the_press_and_nothing_reaches_the_worker() {
+    let adopted = Adopted::start_managed().await;
+    let worker = &adopted.workers[0];
+    let session = worker.session_id;
+    reader_enters_the_prompt(worker).await;
+    let mut grant = pairing(&[ActionRight::SessionView]);
+    grant.session_selector = kr_protocol::grant::SessionSelector::None;
+    let phone = phone_under(&adopted, grant).await;
+    let share = shared_with(
+        &adopted,
+        &phone,
+        session,
+        RoleSelection {
+            include_live_screen: true,
+            ..RoleSelection::plain(SessionRole::Viewer)
+        },
+    )
+    .await;
+    open(
+        &phone.companion,
+        session,
+        Some(share.grant_id),
+        "viewer-screen",
+    )
+    .expect("the share opens");
+    let view = open_view(&phone.companion, session, "viewer-screen", 65).expect("opens");
+    phone
+        .companion
+        .state_where(65, |state| state["state"] == "showing")
+        .await;
+
+    let refused = start_press(&phone, &view, &["claude"], PROMPT, BUFFER)
+        .await
+        .expect("ran")
+        .expect_err("a viewer holds no terminal input");
+    assert_eq!(code(&refused), "PERMISSION_DENIED", "{refused}");
+    assert_eq!(
+        worker.launches_received(),
+        0,
+        "no shell.launch frame reached the worker"
+    );
+    assert!(
+        !asked_to_install(&reader_requests_since(worker).await),
+        "the reader was not asked to install"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.11: a phone whose view is lost after the reader was asked to install, and before the
+/// reader answered, is told the outcome is unknown and never that nothing was typed; the press is
+/// not sent again by anything: the worker was sent one `shell.launch` and the reader was asked once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_phone_whose_link_is_lost_after_the_reader_has_the_request_is_told_the_outcome_is_unknown()
+ {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start_managed().await;
+    let worker = &adopted.workers[0];
+    reader_enters_the_prompt(worker).await;
+    let (phone, view) = phone_viewing(
+        &adopted,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+        "launch-screen",
+        66,
+    )
+    .await;
+    view_takes_control_and_the_reader_proves_the_fence(&adopted, &phone, &view, 66).await;
+    let surface = launch_surface(&phone, &view);
+    assert_eq!(
+        surface["surface"]["editor"]["state"], "verified",
+        "{surface}"
+    );
+
+    let pressing = start_press(&phone, &view, &["claude"], PROMPT, BUFFER);
+    let asked = tokio::time::timeout(WATCHDOG, async {
+        worker.reader().await.install_asked().await
+    })
+    .await
+    .expect("the reader is asked")
+    .expect("a request");
+    phone
+        .companion
+        .app
+        .state::<companion_tauri::terminal::TerminalViews>()
+        .lose_connection(&view);
+    let told = pressing
+        .await
+        .expect("ran")
+        .expect_err("the view was lost before the reader answered");
+    assert_eq!(code(&told), "OUTCOME_UNKNOWN", "{told}");
+
+    // The reader answers late. Nothing sends the press again.
+    worker
+        .reader()
+        .await
+        .installs(&asked)
+        .await
+        .expect("the reader installs");
+    assert!(
+        !asked_to_install(&reader_requests_since(worker).await),
+        "the reader is asked no second time"
+    );
+    assert_eq!(worker.launches_received(), 1, "the press is not replayed");
+    adopted.stop().await;
+}

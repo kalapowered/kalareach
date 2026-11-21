@@ -689,6 +689,204 @@ async fn kr_req_13_11_a_device_reads_the_launch_surface_as_its_grant_allows() {
     adopted.stop().await;
 }
 
+/// A connection of `device` opened on the session, attached to its terminal with the input
+/// capability, and the attachment.
+async fn attached_for_input(
+    adopted: &Adopted,
+    device: &Device,
+    record: &DeviceRecord,
+    session_id: SessionId,
+) -> (RawDevice, kr_protocol::ids::AttachmentId) {
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    };
+    let connection = RawDevice::connect(&adopted.host, device, record).await;
+    open(&connection, Some(session_id), None)
+        .await
+        .expect("the session opens");
+    let attached: SessionAttachResult = connection
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(&adopted.host, session_id),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: [
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::Input,
+                ]
+                .into_iter()
+                .collect(),
+            },
+        )
+        .await
+        .expect("the attach is settled")
+        .to_typed()
+        .expect("an attachment");
+    (connection, attached.attachment.attachment_id)
+}
+
+/// A press of `arguments` at the prompt and the buffer the reader reported, from `connection`.
+async fn press(
+    adopted: &Adopted,
+    connection: &RawDevice,
+    session_id: SessionId,
+    arguments: &[&str],
+) -> Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+    use kr_protocol::root::{
+        EditorBufferRevision, LaunchCommand, PromptGeneration, ShellLaunchParams,
+    };
+    let numbers = net_support::worker::MANAGED_NUMBERS;
+    connection
+        .mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(&adopted.host, session_id),
+            &ShellLaunchParams {
+                session_id,
+                command: LaunchCommand::Arguments(
+                    arguments.iter().map(|word| (*word).to_owned()).collect(),
+                ),
+                expected_prompt_generation: PromptGeneration::new(numbers.prompt_generation),
+                expected_buffer_revision: EditorBufferRevision::new(numbers.buffer_revision),
+            },
+        )
+        .await
+}
+
+/// KR-REQ-13.11: a paired device's `shell.launch` reaches the worker under the device's own grant
+/// and attachment, by the route every write of the worker's table takes. A device that holds the
+/// input lease on its attachment presses and the reader is asked for the vector; a device with
+/// `terminal.input` whose attachment is not the one that holds the lease is refused `LEASE_LOST` by
+/// the worker and the reader is not asked; a device without `terminal.input` is refused by the
+/// daemon, and the worker is sent nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_devices_launch_reaches_the_worker_under_the_devices_grant() {
+    use kr_protocol::input::{InputAcquireParams, InputAcquireResult};
+    let adopted = Adopted::start_managed().await;
+    let worker = &adopted.workers[0];
+    let session_id = worker.session_id;
+    tokio::time::timeout(PATIENCE, async {
+        worker
+            .reader()
+            .await
+            .enters_the_prompt()
+            .await
+            .expect("the reader enters the prompt");
+    })
+    .await
+    .expect("the worker handled the prompt");
+
+    let (holder, holder_record) = viewer(
+        &adopted,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+    )
+    .await;
+    let (held, attachment) =
+        attached_for_input(&adopted, &holder, &holder_record, session_id).await;
+    // The lease asks the reader for a fence, which the reader proves while the acquire is waited for.
+    let acquire = InputAcquireParams {
+        session_id,
+        attachment_id: attachment,
+        expected_epoch: Nullable::null(),
+    };
+    let (acquired, published) = tokio::join!(
+        held.mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(&adopted.host, session_id),
+            &acquire,
+        ),
+        async {
+            tokio::time::timeout(PATIENCE, async {
+                worker.reader().await.proves_a_fence().await
+            })
+            .await
+            .expect("the worker asked for a fence")
+            .expect("the reader answers")
+        }
+    );
+    acquired
+        .expect("the lease is settled")
+        .to_typed::<InputAcquireResult>()
+        .expect("a lease");
+    assert!(matches!(
+        published,
+        kr_protocol::root::FencePublication::Published(_)
+    ));
+
+    // A second connection that holds an attachment with the input capability and not the lease.
+    let (other, other_record) = viewer(
+        &adopted,
+        &[ActionRight::SessionView, ActionRight::TerminalInput],
+    )
+    .await;
+    let (second, _) = attached_for_input(&adopted, &other, &other_record, session_id).await;
+    assert_eq!(
+        code(press(&adopted, &second, session_id, &["claude"]).await),
+        ErrorCode::LeaseLost,
+        "a connection that does not hold the input is refused by the worker"
+    );
+
+    // A device without terminal.input is refused before the worker is sent anything.
+    let (viewing, viewing_record) = viewer(&adopted, &[ActionRight::SessionView]).await;
+    let (watcher, _) = attached_for_input(&adopted, &viewing, &viewing_record, session_id).await;
+    assert_eq!(
+        code(press(&adopted, &watcher, session_id, &["claude"]).await),
+        ErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        worker.launches_received(),
+        1,
+        "only the refused press of the second connection reached the worker"
+    );
+    let frames = tokio::time::timeout(PATIENCE, async {
+        worker.reader().await.settled_seeing().await
+    })
+    .await
+    .expect("the worker handled the events")
+    .expect("handled");
+    assert!(
+        !frames.iter().any(|frame| matches!(
+            frame,
+            kr_shell_integration::host::scripted::ToBridge::Request { request, .. }
+                if matches!(**request, kr_shell_integration::contract::requests::WorkerRequest::Launch(_))
+        )),
+        "the reader was asked for nothing: {frames:?}"
+    );
+
+    // The holder's own press is installed.
+    let (pressed, asked) = tokio::join!(
+        press(&adopted, &held, session_id, &["claude", "two words", ""]),
+        async {
+            let mut reader = worker.reader().await;
+            let asked = tokio::time::timeout(PATIENCE, reader.install_asked())
+                .await
+                .expect("the reader is asked")
+                .expect("a request");
+            reader.installs(&asked).await.expect("the reader installs");
+            asked
+        }
+    );
+    pressed.expect("the holder's press is installed");
+    assert_eq!(
+        asked.command,
+        kr_protocol::root::LaunchCommand::Arguments(vec![
+            "claude".to_owned(),
+            "two words".to_owned(),
+            String::new()
+        ])
+    );
+    held.close();
+    second.close();
+    watcher.close();
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.11: a worker that does not state that it serves the launch surface is not asked for
 /// it. A worker of an earlier release has no row for the method and refuses it as it refuses any
 /// method it does not serve, which a device would read as a missing right; the daemon refuses the
