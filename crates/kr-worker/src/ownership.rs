@@ -12,13 +12,7 @@
 //! | --- | --- | --- |
 //! | A Linux control group the worker created | every descendant, including one that changed session | complete |
 //! | A Windows job object | every descendant, including one that detached | complete |
-//! | A Windows job object, and an agent in a job of its own | the agent's descendants, tracked by start identity | incomplete |
 //! | The terminal's process group | everything that stayed in the group | incomplete |
-//!
-//! The third row exists only where it was explicitly selected. An agent whose own sandbox cannot
-//! run under the session's job is launched in a kill-on-close job of its own, listed beside the
-//! session's, and the closure reads what both hold and ends both; it never reads complete, because
-//! the second job is not the one a session's closure rests on.
 //!
 //! On a Unix host without a delegated control group, the last row is read in one of two ways. On
 //! Linux the worker is the child subreaper, so a process whose parent exits becomes the worker's
@@ -1450,7 +1444,6 @@ impl OwnedProcesses {
             ));
             return false;
         };
-        self.note_reduced_agents(&job);
         let mut empty = true;
         match job.process_ids() {
             Ok(held) if held.is_empty() => {}
@@ -1467,26 +1460,6 @@ impl OwnedProcesses {
                     "the session's job object would not say what was left in it: {error}"
                 ));
                 empty = false;
-            }
-        }
-        for agent in job.reduced_agents() {
-            match agent.process_ids() {
-                Ok(held) if held.is_empty() => {}
-                Ok(held) => {
-                    self.note_unestablished(format!(
-                        "the job of an agent that ran under reduced ownership still held {} \
-                         process(es) when the closure was written",
-                        held.len()
-                    ));
-                    empty = false;
-                }
-                Err(error) => {
-                    self.note_unestablished(format!(
-                        "the job of an agent that ran under reduced ownership would not say what \
-                         was left in it: {error}"
-                    ));
-                    empty = false;
-                }
             }
         }
         empty
@@ -2127,7 +2100,6 @@ impl OwnedProcesses {
             ));
             return;
         };
-        self.note_reduced_agents(&job);
         let mut found = Vec::new();
         let mut unreadable = 0_usize;
         let mut read = |reading: crate::windows::job::MemberReading| match reading {
@@ -2149,19 +2121,6 @@ impl OwnedProcesses {
                 "the session's job object would not say which processes it holds: {error}"
             )),
         }
-        for agent in job.reduced_agents() {
-            match agent.process_ids() {
-                Ok(held) => {
-                    for pid in held {
-                        read(agent.member(pid));
-                    }
-                }
-                Err(error) => self.note_unestablished(format!(
-                    "the job of an agent that ran under reduced ownership would not say which \
-                     processes it holds: {error}"
-                )),
-            }
-        }
         if unreadable > 0 {
             self.note_unestablished(format!(
                 "the session's job object holds {unreadable} process(es) this host could not \
@@ -2169,23 +2128,6 @@ impl OwnedProcesses {
             ));
         }
         self.take(found);
-    }
-
-    /// Records that an agent of this session ran under the reduced-ownership profile, which keeps
-    /// the closure's coverage incomplete for as long as the session has one.
-    ///
-    /// The agent's processes are still read by start identity and still ended, but they were not
-    /// held by the session's job, and a closure that counted them as covered by it would be
-    /// claiming a boundary it did not have.
-    #[cfg(windows)]
-    fn note_reduced_agents(&self, job: &crate::windows::job::SessionJob) {
-        if !job.reduced_agents().is_empty() {
-            self.note_unestablished(
-                "an agent of this session ran under an explicitly selected reduced-ownership \
-                 profile: its processes were tracked by start identity in a job of their own and \
-                 not held by the session's job, so they are not counted as covered by it",
-            );
-        }
     }
 
     /// Records that a process was forced to stop rather than asked.
@@ -2363,15 +2305,9 @@ impl OwnedProcesses {
 /// There is one on this platform, and a live session has it. The terminal created the session's
 /// job object, read both of its limits back from the operating system, put the shell into it and
 /// asked the kernel to confirm that it holds it - all before the shell ran, and any one of those
-/// failing is a named launch failure rather than a session with less.
-///
-/// Section 7's other permitted outcome, an **explicitly selected** reduced-ownership execution
-/// profile, is an agent's and not a session's: no session is quietly given one instead of the
-/// boundary it asked for, and an agent runs under one only where its launch's profile records
-/// `reduced`. The session's boundary is the job either way, and an agent under the profile is
-/// recorded on it, which keeps the closure's coverage incomplete and puts the reason in its
-/// receipt. Where the job later stops answering, that is recorded as something this host could not
-/// establish, with the same consequence.
+/// failing is a named launch failure rather than a session with less. Where the job later stops
+/// answering, that is recorded as something this host could not establish, and the coverage then
+/// reads incomplete.
 #[cfg(windows)]
 #[must_use]
 pub fn boundary_for(_group: Option<i32>, root: &ProcessStartIdentity) -> OwnershipBoundary {
@@ -2527,73 +2463,36 @@ fn signal_surviving(
 #[cfg(not(unix))]
 pub const fn request_stop(_owned: &OwnedProcesses) {}
 
-/// How long a closure waits for the launches a session admitted before it closed.
-///
-/// A launch in flight reads the application's own configuration (which is bounded by the probe's
-/// own deadline), reserves its instance, makes its process, writes its files and either commits or
-/// undoes all of it. The bound is that deadline and five seconds for the rest, so it ties to the
-/// longest step; a closure that is still waiting when it ends carries that into its receipt rather
-/// than waiting for ever.
-#[cfg(windows)]
-const LAUNCHES_IN_FLIGHT_DEADLINE: std::time::Duration =
-    crate::broker::probe::DEADLINE.saturating_add(std::time::Duration::from_secs(5));
-
 /// Forces every process the boundary still holds to stop.
 ///
 /// Terminating the job reaches every descendant at once, including one that detached or changed
 /// its session, which is exactly what the boundary is for. A session without a job has only its
 /// root shell, which the caller has already ended through its own handle.
-///
-/// A launch the session admitted before it closed may still be under way, and a process made
-/// after the job was ended is not ended with it: that launch finds the session closing once its
-/// process exists and ends the process itself. This waits for every such launch to leave
-/// before it ends the jobs of the agents that ran under reduced ownership, so what the closure
-/// reads afterwards is what the session holds, and a launch that does not leave in time is
-/// something this host could not establish.
 #[cfg(not(unix))]
 pub fn force_stop(owned: &OwnedProcesses) {
     #[cfg(windows)]
-    force_stop_waiting(owned, LAUNCHES_IN_FLIGHT_DEADLINE);
-    #[cfg(not(windows))]
-    let _ = owned;
-}
-
-#[cfg(windows)]
-fn force_stop_waiting(owned: &OwnedProcesses, launches: std::time::Duration) {
-    if let OwnershipBoundary::JobObject { root } = *owned.boundary() {
-        match crate::windows::job::holding(root) {
-            // The code a forced process is recorded with. Nothing reads it back; it is there so
-            // that one ended this way is not indistinguishable from one that returned zero.
-            Some(job) => {
-                if let Err(error) = job.terminate(1) {
-                    owned.note_unestablished(format!(
-                        "the session's job object refused to end what it holds: {error}"
-                    ));
-                }
-                if !job.await_launches(launches) {
-                    owned.note_unestablished(
-                        "a launch of an agent was still under way when the session's jobs were \
-                         ended, so a process it made afterwards is not counted as covered",
-                    );
-                }
-                // An agent that ran under reduced ownership is in a job of its own, which the
-                // session's does not reach. Read after the wait, so one that a launch recorded
-                // late is in it.
-                for agent in job.reduced_agents() {
-                    if let Err(error) = agent.terminate(1) {
+    {
+        if let OwnershipBoundary::JobObject { root } = *owned.boundary() {
+            match crate::windows::job::holding(root) {
+                // The code a forced process is recorded with. Nothing reads it back; it is there
+                // so that one ended this way is not indistinguishable from one that returned
+                // zero.
+                Some(job) => {
+                    if let Err(error) = job.terminate(1) {
                         owned.note_unestablished(format!(
-                            "the job of an agent that ran under reduced ownership refused to end \
-                             what it holds: {error}"
+                            "the session's job object refused to end what it holds: {error}"
                         ));
                     }
                 }
+                None => owned.note_unestablished(format!(
+                    "the job object holding the session's root shell {root} is no longer this \
+                     worker's to end"
+                )),
             }
-            None => owned.note_unestablished(format!(
-                "the job object holding the session's root shell {root} is no longer this \
-                 worker's to end"
-            )),
         }
     }
+    #[cfg(not(windows))]
+    let _ = owned;
 }
 
 #[cfg(test)]
@@ -3875,40 +3774,18 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn a_closure_that_could_not_wait_out_a_launch_never_reads_complete() {
-        // A launch the session admitted is still in flight and the wait is given no time, which is
-        // what a launch that never leaves looks like from the closure. A control beside it: the
-        // same closure over a session with no launch in flight reads complete.
+    fn a_forced_stop_of_a_session_job_holding_nothing_reads_complete() {
+        // The shipped closure's path: the job is ended through the record of it, and the closure
+        // that reads the session afterwards finds nothing left and nothing it could not establish.
         let job =
             std::sync::Arc::new(crate::windows::job::SessionJob::create().expect("a job object"));
-        let root = 0xFFFF_FFF4;
+        let root = 0xFFFF_FFF5;
         crate::windows::job::record(root, &job);
-        let in_flight = job.admit_launch().expect("an open session admits a launch");
         let owned = OwnedProcesses::establish(
             OwnershipBoundary::JobObject { root },
             identity(u64::from(u32::MAX) + 1),
         );
-        force_stop_waiting(&owned, std::time::Duration::ZERO);
-        assert_eq!(owned.coverage(), OwnershipCoverage::Incomplete);
-        assert!(
-            owned
-                .surviving_resources()
-                .iter()
-                .any(|resource| resource.kind == "unestablished"
-                    && resource.detail.contains("launch")),
-            "and the receipt says a launch was still under way"
-        );
-        drop(in_flight);
-
-        let quiet =
-            std::sync::Arc::new(crate::windows::job::SessionJob::create().expect("a job object"));
-        let quiet_root = 0xFFFF_FFF5;
-        crate::windows::job::record(quiet_root, &quiet);
-        let owned = OwnedProcesses::establish(
-            OwnershipBoundary::JobObject { root: quiet_root },
-            identity(u64::from(u32::MAX) + 1),
-        );
-        force_stop_waiting(&owned, std::time::Duration::ZERO);
+        force_stop(&owned);
         assert_eq!(owned.coverage(), OwnershipCoverage::Complete);
     }
 
