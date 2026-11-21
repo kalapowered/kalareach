@@ -197,11 +197,6 @@ const ALLOWED: &[Allowed] = &[
         reason: "the report's runner program's own usage error",
     },
     Allowed {
-        path: "tests/e2e/agents/tests/cases.rs",
-        said: "the prompt waited for the turn",
-        reason: "the case ends as a failure that names its cause, right after the line",
-    },
-    Allowed {
         path: "tests/e2e/m1b/tests/checkpoint.rs",
         said: "a new candidate was served no record",
         reason: "the helper says what the room did and returns what it found, which the leg records",
