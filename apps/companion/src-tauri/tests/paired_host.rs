@@ -3324,6 +3324,8 @@ async fn a_refusal_clears_the_hosts_read_in_the_same_revision() {
     let v = visiting().await;
     let read = v.pass().await.expect("ran").expect("answered");
     assert!(row_of(&read, &v.a_ref).expect("A's row")["result"].is_object());
+    // The pass does not wait for the publisher: what A's read made is told before it is read.
+    v.companion().told_everything().await;
     let epoch = told_other(v.companion(), &v.a_ref)
         .last()
         .expect("A's contact was told")["inbox_epoch"]
@@ -3969,6 +3971,7 @@ async fn a_replace_after_the_host_was_chosen_and_reached_changes_nothing() {
         .expect("A is chosen");
     let state = connection(v.companion(), true).await;
     assert_eq!(state["host"]["reference"], v.a_ref.as_str(), "{state}");
+    v.companion().told_everything().await;
     let told = v.companion().told_connection().len();
     let closed = v.control.closed();
     let app_state = v.companion().app.state::<companion_tauri::AppState>();
@@ -3987,6 +3990,7 @@ async fn a_replace_after_the_host_was_chosen_and_reached_changes_nothing() {
         revision,
         "the refused replace made no revision"
     );
+    v.companion().told_everything().await;
     assert_eq!(
         v.companion().told_connection().len(),
         told,
