@@ -218,8 +218,12 @@ export const SECOND_PRESS_AFTER_MS = 500
  * label that says what the second press does, and the second commits. It disarms by itself when
  * focus leaves it, when Escape is pressed in it, and after [`ARMED_FOR_MS`], so a press that was
  * made and forgotten is not a decision made later. A press that begins less than
- * [`SECOND_PRESS_AFTER_MS`] after the one that armed it is not the second press: the control stays
- * armed and commits nothing, so a double click arms it and does no more.
+ * [`SECOND_PRESS_AFTER_MS`] after the release that armed it is not the second press, however long it
+ * is held: the control stays armed and commits nothing, so a double click arms it and does no more.
+ * The time is read when the press begins (its pointer-down, or the first key-down of its key), on a
+ * clock that never steps back; a click that counts no press begins when it comes. The control also
+ * stays armed only while `armKey` is the same: a change of it ends the armed state, with the same
+ * element, so focus stays where it was.
  *
  * Each press is a [`CommitButton`]'s, so each is still decided on release inside the control. The
  * armed label is the button's own text, so its accessible name changes with it, and a polite status
@@ -230,6 +234,7 @@ export const SECOND_PRESS_AFTER_MS = 500
 export function TwoPressButton({
   onCommit,
   armedLabel,
+  armKey = '',
   tone = 'quiet',
   children,
   disabled,
@@ -238,18 +243,23 @@ export function TwoPressButton({
   readonly onCommit: () => void
   /** What the control says while it waits for its second press. */
   readonly armedLabel: string
+  /** What the second press would commit, as a key: when it changes the control is no longer armed. */
+  readonly armKey?: string
   readonly tone?: ButtonTone
   readonly children: ReactNode
 }): ReactNode {
-  const [armed, setArmed] = useState(false)
+  const [armedOn, setArmedOn] = useState<string | null>(null)
+  const armed = armedOn === armKey
+  if (armedOn !== null && armedOn !== armKey) setArmedOn(null)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const armedAt = useRef(0)
+  const pressedAt = useRef<number | null>(null)
   const wrapper = useRef<HTMLSpanElement>(null)
 
   const disarm = useCallback(() => {
     if (timer.current !== null) clearTimeout(timer.current)
     timer.current = null
-    setArmed(false)
+    setArmedOn(null)
   }, [])
 
   useEffect(
@@ -284,13 +294,19 @@ export function TwoPressButton({
   if ((disabled === true) !== wasDisabled) {
     setWasDisabled(disabled === true)
     // The timer that is left ends in a disarm of a control that is not armed.
-    if (disabled === true) setArmed(false)
+    if (disabled === true) setArmedOn(null)
   }
 
   return (
     <span
       ref={wrapper}
       className="two-press"
+      onPointerDownCapture={(event) => {
+        if (event.button === 0) pressedAt.current = performance.now()
+      }}
+      onKeyDownCapture={(event) => {
+        if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) pressedAt.current = performance.now()
+      }}
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) disarm()
       }}
@@ -301,13 +317,16 @@ export function TwoPressButton({
         data-armed={armed ? 'true' : undefined}
         data-wraps=""
         onCommit={() => {
+          // When this press began; a click that counts no press begins when it comes.
+          const began = pressedAt.current ?? performance.now()
+          pressedAt.current = null
           if (!armed) {
-            setArmed(true)
-            armedAt.current = Date.now()
+            setArmedOn(armKey)
+            armedAt.current = performance.now()
             timer.current = setTimeout(disarm, ARMED_FOR_MS)
             return
           }
-          if (Date.now() - armedAt.current < SECOND_PRESS_AFTER_MS) return
+          if (began - armedAt.current < SECOND_PRESS_AFTER_MS) return
           disarm()
           onCommit()
         }}
