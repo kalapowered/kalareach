@@ -117,8 +117,9 @@ impl Drop for Running {
 
 /// One environment on a private tree, and the packages folder a host is told about.
 struct Setup {
-    tree: TempHost,
     environment: EnvironmentPaths,
+    /// Declared last: the folders go after everything that works in them.
+    tree: TempHost,
 }
 
 impl Setup {
@@ -126,7 +127,7 @@ impl Setup {
         let tree = TempHost::create();
         let environment = tree.environment();
         environment.create().expect("the environment's folders");
-        Self { tree, environment }
+        Self { environment, tree }
     }
 
     /// Where the host binds the endpoint workers use.
