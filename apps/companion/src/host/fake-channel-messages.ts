@@ -326,10 +326,13 @@ export class FakeChannelMessageStore {
 
   remove(request: ChannelMessageRemoval): { readonly removed: number } {
     this.calls.push({ kind: 'remove' })
+    if (request.actionIds.length === 0 || request.actionIds.length > this.#limits.entries) {
+      refuse('INVALID_ARGUMENT', 'name the messages to remove, and no more than a device keeps')
+    }
+    const named = new Set(request.actionIds)
     let removed = 0
     for (const entry of [...this.#entries.values()]) {
-      const chosen = request.actionId === undefined ? entry.sessionId === request.sessionId : entry.actionId === request.actionId
-      if (!chosen) continue
+      if (!named.has(entry.actionId)) continue
       this.#entries.delete(entry.actionId)
       removed += 1
     }

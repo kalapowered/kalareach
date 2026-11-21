@@ -1545,10 +1545,13 @@ export interface ChannelMessageKeep {
   readonly drafts: readonly DraftDiscardRequest[]
 }
 
-/** What to remove: one message, or every message of a session. */
-export type ChannelMessageRemoval =
-  | { readonly actionId: string; readonly sessionId?: undefined }
-  | { readonly sessionId: string; readonly actionId?: undefined }
+/**
+ * What to remove: the messages with these identities, and no others. A message kept after the
+ * window listed them is not named, so it stays.
+ */
+export interface ChannelMessageRemoval {
+  readonly actionIds: readonly string[]
+}
 
 /** A record of a send to make, before the send. */
 export interface ChannelHoldCreate {

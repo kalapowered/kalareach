@@ -314,7 +314,7 @@ fn a_message_is_kept_whole_listed_and_removed_only_by_a_person() {
     let removed = window
         .call(
             "device_channel_message_remove",
-            json!({ "actionId": action(1) }),
+            json!({ "actionIds": [action(1)] }),
         )
         .expect("one is removed");
     assert_eq!(removed["removed"], 1);
@@ -322,9 +322,9 @@ fn a_message_is_kept_whole_listed_and_removed_only_by_a_person() {
     let removed = window
         .call(
             "device_channel_message_remove",
-            json!({ "sessionId": SESSION }),
+            json!({ "actionIds": [action(3)] }),
         )
-        .expect("a session's are removed");
+        .expect("the third is removed");
     assert_eq!(removed["removed"], 1);
     let list = window.list();
     assert_eq!(messages(&list).len(), 1);
@@ -332,10 +332,56 @@ fn a_message_is_kept_whole_listed_and_removed_only_by_a_person() {
     let again = window
         .call(
             "device_channel_message_remove",
-            json!({ "actionId": action(1) }),
+            json!({ "actionIds": [action(1)] }),
         )
         .expect("a removal of what is gone is made");
     assert_eq!(again["removed"], 0);
+}
+
+/// KR-REQ-12.26: a removal names the messages the window showed. A message of the same session
+/// that the window never listed stays, a name twice counts once, and the old form by session is
+/// refused.
+#[test]
+fn a_removal_removes_the_messages_it_names_and_no_other_of_their_session() {
+    let data = data();
+    let window = Window::over(data.path());
+    for n in 1..=3 {
+        window
+            .keep(message(n, "kept", &[]))
+            .expect("a message of the session is kept");
+    }
+    let removed = window.call(
+        "device_channel_message_remove",
+        json!({ "actionIds": [action(1), action(3), action(3), action(9)] }),
+    );
+    assert_eq!(
+        removed.as_ref().ok().map(|done| &done["removed"]),
+        Some(&json!(2)),
+        "{removed:?}"
+    );
+    let list = window.list();
+    assert_eq!(messages(&list).len(), 1, "{list}");
+    assert_eq!(
+        messages(&list)[0]["actionId"],
+        action(2),
+        "the one that was not named stays"
+    );
+    for refused in [
+        json!({ "sessionId": SESSION }),
+        json!({ "actionId": action(2) }),
+        json!({ "actionIds": [] }),
+        json!({ "actionIds": [action(2)], "sessionId": SESSION }),
+    ] {
+        let refusal = window
+            .call("device_channel_message_remove", refused)
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
+    }
+    assert_eq!(
+        messages(&window.list()).len(),
+        1,
+        "a refused call removes nothing"
+    );
 }
 
 /// KR-REQ-12.26: what a read without text leaves out is the text alone, and nothing else changes.
@@ -417,13 +463,13 @@ fn a_file_of_another_layout_is_counted_and_left_and_never_replaced() {
     window
         .call(
             "device_channel_message_remove",
-            json!({ "sessionId": SESSION }),
+            json!({ "actionIds": [action(1)] }),
         )
         .expect("the readable one goes");
     window
         .call(
             "device_channel_message_remove",
-            json!({ "actionId": action(2) }),
+            json!({ "actionIds": [action(2)] }),
         )
         .expect("an unreadable one is not removed");
     assert_eq!(std::fs::read(&other).ok(), Some(newer));
@@ -738,7 +784,7 @@ fn the_bounds_refuse_and_evict_nothing_and_a_bad_text_is_not_a_quota() {
     window
         .call(
             "device_channel_message_remove",
-            json!({ "actionId": action(9) }),
+            json!({ "actionIds": [action(9)] }),
         )
         .expect("removed");
     let _limits = testing::lower_limits(
@@ -805,7 +851,7 @@ fn two_keeps_over_one_folder_with_one_place_left_never_pass_the_bound() {
         first
             .call(
                 "device_channel_message_remove",
-                json!({ "actionId": action(9) }),
+                json!({ "actionIds": [action(9)] }),
             )
             .expect("removed");
         let limits = if bound == "entries" {
@@ -1361,7 +1407,7 @@ fn a_removal_or_clear_whose_flush_is_refused_fails_even_for_an_absent_record() {
         {
             let refusal = (window.call(
                 "device_channel_message_remove",
-                json!({ "actionId": action(1) }),
+                json!({ "actionIds": [action(1)] }),
             ))
             .clone()
             .expect_err("the call is refused");
@@ -1778,7 +1824,7 @@ fn a_set_aside_loses_the_removal_of_a_message_the_person_removed() {
     window
         .call(
             "device_channel_message_remove",
-            json!({ "actionId": action(1) }),
+            json!({ "actionIds": [action(1)] }),
         )
         .expect("the person removes the entry");
     std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
@@ -2207,7 +2253,7 @@ fn the_lock_file_of_the_folder_holds_a_keep_a_repair_a_removal_and_a_listing_bac
                 window
                     .call(
                         "device_channel_message_remove",
-                        json!({ "actionId": action(9) }),
+                        json!({ "actionIds": [action(9)] }),
                     )
                     .is_ok()
             }),
@@ -2590,7 +2636,7 @@ fn a_message_removed_again_while_the_flush_is_refused_fails_until_it_works() {
     let removed = window
         .call(
             "device_channel_message_remove",
-            json!({ "actionId": action(1) }),
+            json!({ "actionIds": [action(1)] }),
         )
         .expect("the message is removed");
     assert_eq!(removed["removed"], 1, "{removed}");
@@ -2599,7 +2645,7 @@ fn a_message_removed_again_while_the_flush_is_refused_fails_until_it_works() {
         let refusal = window
             .call(
                 "device_channel_message_remove",
-                json!({ "actionId": action(1) }),
+                json!({ "actionIds": [action(1)] }),
             )
             .expect_err("a removal of an absent message is refused while the flush is");
         assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
@@ -2607,7 +2653,7 @@ fn a_message_removed_again_while_the_flush_is_refused_fails_until_it_works() {
     let again = window
         .call(
             "device_channel_message_remove",
-            json!({ "actionId": action(1) }),
+            json!({ "actionIds": [action(1)] }),
         )
         .expect("the removal completes once the flush works");
     assert_eq!(again["removed"], 0, "{again}");

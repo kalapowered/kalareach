@@ -24,7 +24,15 @@ import { useChannelMessages, useChannelShelf } from '../app/channel-messages'
 import { useBook, useDraftBook } from '../app/drafts'
 import { useApp, useSubmissions } from '../app/state'
 import { Banner, Button, CommitButton, TwoPressButton } from '../components/ui'
-import { failureCode, failureMessage, watch, type StoredChannelMessage, type StoredHold, type Watch } from '../host/port'
+import {
+  failureCode,
+  failureMessage,
+  watch,
+  type ChannelMessageRemoval,
+  type StoredChannelMessage,
+  type StoredHold,
+  type Watch
+} from '../host/port'
 import { ask } from '../mobile/model/call'
 import { MANY_HOLDS, nearlyFull, type ShelfSnapshot } from '../model/channel-messages'
 import type { KeptDraft, KeptWhy } from '../model/draft-book'
@@ -295,13 +303,13 @@ export function KeptDrafts({
         shelf={shelf}
         sessions={sessions}
         busy={busy}
-        onRemove={(id, removal) => {
+        onRemove={(id, removal, all) => {
           run(
             id,
             () => channels.remove(removal).then(() => undefined),
-            'actionId' in removal
-              ? 'This device could not remove this message now. It is still in place.'
-              : 'This device could not remove all of these messages now. Some of them may still be in place.'
+            all
+              ? 'This device could not remove all of these messages now. Some of them may still be in place.'
+              : 'This device could not remove this message now. It is still in place.'
           )
         }}
         onClearHold={(holdId, sessionId) => {
@@ -555,7 +563,8 @@ function ChannelGroup({
   readonly shelf: ShelfSnapshot
   readonly sessions: readonly Session[] | null
   readonly busy: string | null
-  readonly onRemove: (id: string, removal: { readonly actionId: string } | { readonly sessionId: string }) => void
+  /** `all` is true for "Remove all" of a session: the removal names the identities the group shows. */
+  readonly onRemove: (id: string, removal: ChannelMessageRemoval, all: boolean) => void
   /** `sessionId` is the session the record was written for, or null for one that cannot be read. */
   readonly onClearHold: (holdId: string, sessionId: string | null) => void
 }): ReactNode {
@@ -588,12 +597,14 @@ function ChannelGroup({
                   <div className="row wrap">
                     <p className="eyebrow">{homeLine(sessions, sessionId)}</p>
                     <TwoPressButton
+                      // Keyed by the identities it removes: a change of the list ends the armed state.
+                      key={messages.map((each) => each.actionId).join(',')}
                       tone="quiet"
                       data-testid="channel-session-remove-all"
                       armedLabel="Press again to remove all"
                       disabled={busy === `session-${sessionId}`}
                       onCommit={() => {
-                        onRemove(`session-${sessionId}`, { sessionId })
+                        onRemove(`session-${sessionId}`, { actionIds: messages.map((each) => each.actionId) }, true)
                       }}
                     >
                       Remove all
@@ -609,7 +620,7 @@ function ChannelGroup({
                       readFailed={shelf.stale}
                       busy={busy === message.actionId}
                       onRemove={() => {
-                        onRemove(message.actionId, { actionId: message.actionId })
+                        onRemove(message.actionId, { actionIds: [message.actionId] }, false)
                       }}
                     />
                   ))}
