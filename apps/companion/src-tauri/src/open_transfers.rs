@@ -410,6 +410,8 @@ pub struct OpenView {
     pub key: String,
     /// Where it stands.
     pub state: OpenState,
+    /// The session the file is for, when it is for one.
+    pub session_id: Option<String>,
     /// The file's name.
     pub file_name: String,
     /// Its size.
@@ -1027,6 +1029,7 @@ fn view_of(
     OpenView {
         key: key.to_string(),
         state,
+        session_id: file.session_id.map(|session| session.to_string()),
         file_name: file.file_name.clone(),
         byte_len: file.byte_len,
         acknowledged_chunks: progress.acknowledged_chunks,

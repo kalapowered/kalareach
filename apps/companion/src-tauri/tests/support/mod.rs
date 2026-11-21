@@ -864,6 +864,7 @@ impl Companion {
                 companion_tauri::commands::uploads_open,
                 companion_tauri::commands::upload_cancel,
                 companion_tauri::commands::draft_end,
+                companion_tauri::commands::draft_set_text,
                 companion_tauri::commands::host_info,
                 companion_tauri::commands::attention_read,
                 companion_tauri::commands::session_numbers,
