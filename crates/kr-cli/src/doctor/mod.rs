@@ -1165,10 +1165,10 @@ pub fn configurable_lines(effective: &EffectiveConfiguration) -> Vec<Line> {
 /// One line for each package the document names reduced ownership for, saying that no launch reads
 /// it.
 ///
-/// Section 7 allows the profile only where it is explicitly selected. A launch takes its ownership
-/// from the profile it is given, and every profile this host writes records full, so a person who
-/// wrote the entry is told that nothing acts on it. The packages are names the person wrote in
-/// their own document, which they asked this command to show.
+/// Section 7 allows the profile only where it is explicitly selected. No launch reads the entry or
+/// a profile's `ownership`, and every profile this host writes records full, so a person who wrote
+/// the entry is told that nothing acts on it. The packages are names the person wrote in their own
+/// document, which they asked this command to show.
 fn reduced_agent_lines(value: &kr_protocol::hostinfo::EffectiveValue) -> Vec<Line> {
     if value.key != kr_protocol::hostinfo::configuration::AGENTS_OWNERSHIP_KEY
         || value.class() != kr_protocol::hostinfo::export::ContentClass::Name
