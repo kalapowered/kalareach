@@ -517,16 +517,6 @@ impl BackupService {
         self.store().privacy_status()
     }
 
-    /// Returns one privacy request, if this host accepted it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn privacy_request(&self, privacy_generation: u64) -> Result<Option<PrivacyRequest>> {
-        self.store().privacy_request(privacy_generation)
-    }
-
     /// Returns the directory this service's staged ciphertext lives in, and owns exclusively.
     #[must_use]
     pub fn staging_root(&self) -> PathBuf {

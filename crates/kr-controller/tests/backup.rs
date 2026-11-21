@@ -1485,7 +1485,11 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
         refused.reason().contains("could not be raised"),
         "{refused}"
     );
-    assert!(service.privacy_request(1).expect("a read").is_none());
+    assert_eq!(
+        service.privacy_status().expect("a read").pending_activation,
+        None
+    );
+    assert!(service.fenced_at().expect("a read").is_none());
     assert!(service.obligations().expect("a read").is_empty());
 
     // And the subsystem says it cannot say, with the store's own reason, to any hook built
@@ -1508,7 +1512,10 @@ fn a_store_that_will_not_take_the_request_reports_work_outstanding_rather_than_c
     // Production is stopped by that guard, and the gates are where it is enforced. The store holds
     // no row for this: the request it would not take left nothing behind.
     service.set_query_only(false).expect("query_only pragma");
-    assert!(service.privacy_request(1).expect("a read").is_none());
+    assert_eq!(
+        service.privacy_status().expect("a read").pending_activation,
+        None
+    );
     assert!(service.fenced_at().expect("a read").is_none());
     let producer = Producer::generate();
     service
@@ -1665,11 +1672,14 @@ fn an_activation_that_fails_leaves_the_request_and_its_obligation_behind() {
     reopened
         .reconcile(TimestampMs::new(4_000))
         .expect("the startup reconciliation a service opens unready without");
-    let request = reopened
-        .privacy_request(4)
-        .expect("a read")
-        .expect("the accepted request");
-    assert!(!request.is_applied());
+    assert_eq!(
+        reopened
+            .privacy_status()
+            .expect("a read")
+            .pending_activation,
+        Some(4),
+        "the accepted request waits for its activation"
+    );
     let owed = reopened.obligations().expect("a read");
     assert_eq!(owed.len(), 1);
     assert_eq!(owed[0].kind, ObligationKind::ActivateFence);
@@ -1692,12 +1702,11 @@ fn an_activation_that_fails_leaves_the_request_and_its_obligation_behind() {
             .all(|obligation| obligation.kind != ObligationKind::ActivateFence),
         "the activation is done, and what is left is the scope it wrote: {owed:?}"
     );
-    assert!(
-        reopened
-            .privacy_request(4)
-            .expect("a read")
-            .expect("the request")
-            .is_applied()
+    let status = reopened.privacy_status().expect("a read");
+    assert_eq!(
+        (status.pending_activation, status.unreleased_fence),
+        (None, Some(4)),
+        "the request is applied and its fence is raised and not yet released"
     );
 }
 
