@@ -2440,11 +2440,15 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
         ..paired.clone()
     };
 
-    // An upload that is still sent as the earlier principal, held in its content.
+    // An upload that is still sent as the earlier principal, held in its content. The stop of a
+    // sender waits for the sender to end, and a read of the content cannot be interrupted, so the
+    // content is let go once the desk has asked the sender to stop, and not before.
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
+    let upload_key = kr_ipc::new_uuid();
+    let stop_asked = testing::hold_at(upload_key, testing::Point::CancelWaiting);
     let running = {
-        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let sent = request(&adopted, &bytes, content, upload_key);
         let (desk, earlier) = (Arc::clone(&desk), earlier.clone());
         tokio::spawn(async move { desk.send(earlier, sent).await })
     };
@@ -2487,6 +2491,12 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
     old.transport().close();
     on_another_connection(companion, &old).await;
     connected(companion).await;
+    until(
+        "the desk asks the sender of the earlier principal to stop",
+        || stop_asked.passed() >= 1,
+    )
+    .await;
+    gate.release();
 
     let stopped = tokio::time::timeout(WATCHDOG, running)
         .await
@@ -2508,7 +2518,6 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
         status_reads,
         "nothing of the earlier principal is read from the host or resumed"
     );
-    gate.release();
     adopted.stop().await;
 }
 
