@@ -532,7 +532,9 @@ impl RemoteConnection {
         // the result that privacy mode removes from a session's receipts. The answer is released
         // only under the privacy state it was read under, which is taken before the worker is
         // asked. It waits behind a change of privacy mode, so it is taken before the lease and the
-        // deadline are, and the wait costs the mutation none of its time.
+        // deadline are. The wait still spends the action's own deadline, but the worker is never
+        // sent a lease or a deadline that the wait used up, and a deadline that passes during the
+        // wait refuses the mutation here.
         let read_under =
             super::output::ReadUnder::now_settled(&self.controller, Some(session_id)).await?;
         let envelope = self.envelope(acting.grant.grant_id, validated);
