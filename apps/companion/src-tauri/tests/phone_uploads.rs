@@ -13,6 +13,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use companion_tauri::open_transfers::{Desk, Keeping, Paired, Request, kept_in, testing};
@@ -62,17 +63,51 @@ async fn phone_for(adopted: &Adopted) -> (Phone, Arc<LinkControl>) {
     (phone, control)
 }
 
-fn paired_of(companion: &Companion) -> Paired {
-    let (device_id, environment_id, session) = companion
-        .app
-        .state::<companion_tauri::AppState>()
-        .paired_snapshot()
-        .expect("a paired host");
-    Paired {
-        device_id,
-        environment_id,
-        account: None,
-        session,
+/// How long a case waits for a connection that is being taken up again.
+const CONNECTION_WAIT: Duration = Duration::from_secs(20);
+
+/// The paired host of `companion`, as soon as its connection is held, and the words of the last
+/// refusal when `wait` ends first. Each look that found no connection is counted in `missed`.
+async fn paired_within(
+    companion: &Companion,
+    wait: Duration,
+    missed: &AtomicUsize,
+) -> Result<Paired, String> {
+    let mut last = String::new();
+    let found = tokio::time::timeout(wait, async {
+        loop {
+            match companion
+                .app
+                .state::<companion_tauri::AppState>()
+                .paired_snapshot()
+            {
+                Ok(held) => return held,
+                Err(error) => {
+                    missed.fetch_add(1, Ordering::SeqCst);
+                    last = error.message;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    })
+    .await;
+    match found {
+        Ok((device_id, environment_id, session)) => Ok(Paired {
+            device_id,
+            environment_id,
+            account: None,
+            session,
+        }),
+        Err(_) => Err(last),
+    }
+}
+
+/// The paired host of `companion`. A connection that is being taken up again is waited for, so a
+/// case does not fail for a moment in which none is held.
+async fn paired_of(companion: &Companion) -> Paired {
+    match paired_within(companion, CONNECTION_WAIT, &AtomicUsize::new(0)).await {
+        Ok(paired) => paired,
+        Err(last) => panic!("no held connection within 20 s: {last}"),
     }
 }
 
@@ -303,15 +338,13 @@ async fn kr_req_13_12_a_third_open_upload_is_refused_in_words() {
     let bytes = pattern(5);
     let (first, first_gate, _release_first) = gated(&bytes);
     let (second, second_gate, _release_second) = gated(&bytes);
-    let sending: Vec<_> = [first, second]
-        .into_iter()
-        .map(|content| {
-            let desk = Arc::clone(&desk);
-            let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
-            let paired = paired_of(companion);
-            tokio::spawn(async move { desk.send(paired, sent).await })
-        })
-        .collect();
+    let mut sending = Vec::new();
+    for content in [first, second] {
+        let desk = Arc::clone(&desk);
+        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let paired = paired_of(companion).await;
+        sending.push(tokio::spawn(async move { desk.send(paired, sent).await }));
+    }
     first_gate.reached().await;
     second_gate.reached().await;
 
@@ -352,7 +385,7 @@ async fn kr_req_13_12_a_cancel_shows_the_released_bytes_from_the_answer() {
     let key = kr_ipc::new_uuid();
     let sending = {
         let sent = request(&adopted, &bytes, content, key);
-        let (desk, paired) = (Arc::clone(&desk), paired_of(companion));
+        let (desk, paired) = (Arc::clone(&desk), paired_of(companion).await);
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
     gate.reached().await;
@@ -360,7 +393,7 @@ async fn kr_req_13_12_a_cancel_shows_the_released_bytes_from_the_answer() {
     // The cancel stops the sender first: the content is let go only once the cancel is under way, so
     // that the upload cannot publish before it.
     let cancelling = {
-        let (desk, paired) = (Arc::clone(&desk), paired_of(companion));
+        let (desk, paired) = (Arc::clone(&desk), paired_of(companion).await);
         tokio::spawn(async move { desk.cancel(paired, key).await })
     };
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -403,7 +436,7 @@ async fn kr_req_13_12_the_open_view_names_the_session_the_file_is_for() {
         target: net_support::on_the_session(&adopted.host, session),
         ..request(&adopted, &bytes, content, key)
     };
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let sending = tokio::spawn(async move { desk.send(paired, sent).await });
     gate.reached().await;
 
@@ -435,7 +468,7 @@ async fn kr_req_13_12_a_reconnect_resumes_the_upload_the_connection_interrupted(
         .transfers();
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let session = Arc::clone(&paired.session);
     let sending = {
         let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
@@ -471,7 +504,7 @@ async fn left_by_a_first_process(
     let key = kr_ipc::new_uuid();
     let mut sent = request(adopted, bytes, content, key);
     sent.keeping = keeping;
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let session = Arc::clone(&paired.session);
     // The task is the first process: nothing ever resumes it, and it ends with the case.
     let first_process = tokio::spawn(async move { first.send(paired, sent).await });
@@ -619,7 +652,7 @@ async fn published_with_a_lost_answer(adopted: &Adopted, phone: &Phone) -> (Uuid
     use kr_client::chunks::ChunkRoute;
     use kr_client::uploads::{self, Progress, Subject, Upload};
 
-    let paired = paired_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
     let bytes = pattern(9);
     let route = ChunkRoute::network(&paired.session, adopted.host.environment_id)
         .await
@@ -675,7 +708,7 @@ async fn kr_req_13_12_a_restart_keeps_the_handle_of_a_published_upload_and_never
         .app
         .state::<companion_tauri::AppState>()
         .transfers();
-    desk.restart(paired_of(&phone.companion)).await;
+    desk.restart(paired_of(&phone.companion).await).await;
 
     let listed = open(&phone.companion);
     assert_eq!(listed.len(), 1, "{listed:?}");
@@ -702,7 +735,7 @@ async fn kr_req_13_12_a_restart_keeps_the_handle_of_a_published_upload_and_never
 async fn kr_req_13_12_a_reservation_whose_answer_never_came_is_said_to_be_unrecoverable() {
     let adopted = Adopted::start(1).await;
     let (phone, _control) = phone_for(&adopted).await;
-    let paired = paired_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
     let key = kr_ipc::new_uuid();
     testing::keep(
         &folder(&phone),
@@ -737,7 +770,7 @@ async fn kr_req_13_12_a_reservation_whose_answer_never_came_is_said_to_be_unreco
 async fn kr_req_13_12_a_restart_drops_an_entry_the_host_does_not_know_and_its_copy() {
     let adopted = Adopted::start(1).await;
     let (phone, _control) = phone_for(&adopted).await;
-    let paired = paired_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
     let key = kr_ipc::new_uuid();
     let bytes = vec![1_u8; 32];
     testing::keep(
@@ -817,14 +850,14 @@ fn bind(
     )
 }
 
-fn kept(companion: &Companion, session: kr_protocol::ids::SessionId) -> Value {
+async fn kept(companion: &Companion, session: kr_protocol::ids::SessionId) -> Value {
     let answer = companion
         .call(
             "draft_create",
             json!({
                 "subject": on_session(session),
                 "params": {
-                    "environment_id": paired_of(companion).environment_id.to_string(),
+                    "environment_id": paired_of(companion).await.environment_id.to_string(),
                     "device_id": null,
                     "session_id": session.to_string(),
                     "application_instance_id": null,
@@ -846,7 +879,7 @@ async fn kr_req_23_41_the_draft_is_made_at_the_first_bind_and_used_again() {
     let session = adopted.workers[0].session_id;
 
     assert_eq!(
-        kept(companion, session)["made"],
+        kept(companion, session).await["made"],
         false,
         "no draft before a bind"
     );
@@ -861,7 +894,7 @@ async fn kr_req_23_41_the_draft_is_made_at_the_first_bind_and_used_again() {
     assert_eq!(again["value"]["revision"], "3");
 
     // A new window reads the same draft, with the files this device bound.
-    let reread = kept(companion, session);
+    let reread = kept(companion, session).await;
     assert_eq!(reread["made"], true);
     assert_eq!(reread["draftId"], made["draftId"]);
     assert_eq!(
@@ -895,7 +928,7 @@ async fn kr_req_23_41_the_reader_takes_the_revision_from_the_real_conflict_messa
 
     let adopted = Adopted::start(1).await;
     let (phone, _control) = phone_for(&adopted).await;
-    let paired = paired_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
     let session_id = adopted.workers[0].session_id;
     let target = net_support::on_the_session(&adopted.host, session_id);
     let created: DraftCreateResult = paired
@@ -990,7 +1023,7 @@ async fn kr_req_23_41_a_stale_revision_is_taken_from_the_message_and_the_bind_go
         .parse()
         .expect("an identifier");
     // Another writer moves the draft on, from 2 to 3.
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let _: DraftUpdateResult = paired
         .session
         .mutate(
@@ -1016,7 +1049,7 @@ async fn kr_req_23_41_a_stale_revision_is_taken_from_the_message_and_the_bind_go
         "{next}"
     );
     assert_eq!(next["value"]["revision"], "4", "{next}");
-    assert_eq!(kept(companion, session)["revision"], "4");
+    assert_eq!(kept(companion, session).await["revision"], "4");
     adopted.stop().await;
 }
 
@@ -1038,7 +1071,7 @@ async fn kr_req_23_41_a_draft_the_composer_drops_is_ended_on_the_host() {
             json!({ "subject": on_session(session), "sessionId": session.to_string() }),
         )
         .expect("the draft is ended");
-    assert_eq!(kept(companion, session)["made"], false);
+    assert_eq!(kept(companion, session).await["made"], false);
     let next = bind(companion, session, &handed(companion)).expect("a new draft is made");
     assert_ne!(
         next["value"]["draftId"], first["value"]["draftId"],
@@ -1056,7 +1089,7 @@ async fn kr_req_23_41_a_start_ends_the_drafts_of_sessions_the_host_no_longer_lis
     let adopted = Adopted::start(1).await;
     let (phone, _control) = phone_for(&adopted).await;
     let companion = &phone.companion;
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let gone = SessionId::new(kr_ipc::new_uuid());
     let drafts = companion
         .app
@@ -1069,9 +1102,9 @@ async fn kr_req_23_41_a_start_ends_the_drafts_of_sessions_the_host_no_longer_lis
         Some(DraftId::new(kr_ipc::new_uuid())),
         Some(DraftRevision::new(1)),
     );
-    assert_eq!(kept(companion, gone)["made"], true);
+    assert_eq!(kept(companion, gone).await["made"], true);
     drafts.sweep_after_reach(paired).await;
-    assert_eq!(kept(companion, gone)["made"], false);
+    assert_eq!(kept(companion, gone).await["made"], false);
     adopted.stop().await;
 }
 
@@ -1110,7 +1143,7 @@ async fn kr_req_23_41_the_text_reaches_the_draft_at_the_kept_revision() {
     let two = set_text(companion, session, "other words").expect("the text is set again");
     assert_eq!(two["text"], "other words", "{two}");
     assert_eq!(two["revision"], "4", "{two}");
-    assert_eq!(kept(companion, session)["revision"], "4");
+    assert_eq!(kept(companion, session).await["revision"], "4");
     adopted.stop().await;
 }
 
@@ -1132,7 +1165,7 @@ async fn kr_req_23_41_a_stale_revision_of_a_text_update_is_taken_from_the_messag
         .expect("a draft")
         .parse()
         .expect("an identifier");
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let _: DraftUpdateResult = paired
         .session
         .mutate(
@@ -1156,7 +1189,7 @@ async fn kr_req_23_41_a_stale_revision_of_a_text_update_is_taken_from_the_messag
     assert_eq!(set["draftId"], first["value"]["draftId"], "{set}");
     assert_eq!(set["revision"], "4", "{set}");
     assert_eq!(set["text"], "mine", "{set}");
-    assert_eq!(kept(companion, session)["revision"], "4");
+    assert_eq!(kept(companion, session).await["revision"], "4");
     adopted.stop().await;
 }
 
@@ -1175,7 +1208,7 @@ async fn kr_req_23_41_a_text_with_no_kept_draft_is_refused_in_words() {
         companion_tauri::paired_drafts::NO_DRAFT,
         "{refused}"
     );
-    assert_eq!(kept(companion, session)["made"], false);
+    assert_eq!(kept(companion, session).await["made"], false);
     adopted.stop().await;
 }
 
@@ -1241,14 +1274,14 @@ async fn kr_req_13_12_a_transfer_key_in_use_is_refused_and_the_first_upload_is_u
     let key = kr_ipc::new_uuid();
     let first = {
         let sent = request(&adopted, &bytes, content, key);
-        let (desk, paired) = (Arc::clone(&desk), paired_of(companion));
+        let (desk, paired) = (Arc::clone(&desk), paired_of(companion).await);
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
     gate.reached().await;
 
     let refused = desk
         .send(
-            paired_of(companion),
+            paired_of(companion).await,
             request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key),
         )
         .await
@@ -1274,14 +1307,12 @@ async fn kr_req_13_12_three_sends_at_once_admit_two() {
     let desk = desk_of(companion);
     let bytes = pattern(5);
     let held: Vec<_> = (0..3).map(|_| gated(&bytes)).collect();
-    let sending: Vec<_> = held
-        .iter()
-        .map(|(content, _, _)| {
-            let sent = request(&adopted, &bytes, Arc::clone(content), kr_ipc::new_uuid());
-            let (desk, paired) = (Arc::clone(&desk), paired_of(companion));
-            tokio::spawn(async move { desk.send(paired, sent).await })
-        })
-        .collect();
+    let mut sending = Vec::new();
+    for (content, _, _) in &held {
+        let sent = request(&adopted, &bytes, Arc::clone(content), kr_ipc::new_uuid());
+        let (desk, paired) = (Arc::clone(&desk), paired_of(companion).await);
+        sending.push(tokio::spawn(async move { desk.send(paired, sent).await }));
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(
         sending.iter().filter(|task| task.is_finished()).count(),
@@ -1320,7 +1351,7 @@ async fn kr_req_13_12_a_cancel_the_host_cannot_be_asked_is_finished_when_it_is_r
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
     let key = kr_ipc::new_uuid();
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let session = Arc::clone(&paired.session);
     let sending = {
         let sent = request(&adopted, &bytes, content, key);
@@ -1368,7 +1399,7 @@ async fn kr_req_13_12_a_dropped_file_changed_during_a_pause_is_not_sent_on() {
     let path = directory.path().join("dropped.bin");
     std::fs::write(&path, &bytes).expect("the file");
     let (content, gate, _release) = gated(&bytes);
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let session = Arc::clone(&paired.session);
     let sending = {
         let mut sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
@@ -1416,7 +1447,7 @@ async fn kr_req_13_12_an_entry_of_another_version_is_left_with_its_copy() {
     std::fs::write(&copy, b"the person's file").expect("the copy");
 
     let desk = desk_of(&phone.companion);
-    desk.restart(paired_of(&phone.companion)).await;
+    desk.restart(paired_of(&phone.companion).await).await;
     assert_eq!(
         std::fs::read(&entry).expect("the entry stands"),
         br#"{"version":2,"kept":"by a later release"}"#
@@ -1429,7 +1460,7 @@ async fn kr_req_13_12_an_entry_of_another_version_is_left_with_its_copy() {
     let bytes = pattern(5);
     let refused = desk
         .send(
-            paired_of(&phone.companion),
+            paired_of(&phone.companion).await,
             request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key),
         )
         .await
@@ -1448,7 +1479,7 @@ async fn kr_req_13_12_an_entry_of_another_version_is_left_with_its_copy() {
 async fn kr_req_13_12_a_copy_that_no_upload_needs_is_removed_at_the_next_reach() {
     let adopted = Adopted::start(1).await;
     let (phone, _control) = phone_for(&adopted).await;
-    let paired = paired_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
     let desk = desk_of(&phone.companion);
     let root = folder(&phone);
 
@@ -1501,7 +1532,7 @@ async fn kr_req_13_12_an_entry_of_another_principal_is_dropped_with_its_copy_and
     let adopted = Adopted::start(1).await;
     let (phone, _control) = phone_for(&adopted).await;
     let companion = &phone.companion;
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let other = Paired {
         device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
         ..paired.clone()
@@ -1568,7 +1599,7 @@ async fn kr_req_13_12_forgetting_a_host_removes_its_uploads_copies_and_drafts() 
     let desk = desk_of(companion);
     let sending = {
         let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
-        let paired = paired_of(companion);
+        let paired = paired_of(companion).await;
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
     gate.reached().await;
@@ -1635,7 +1666,7 @@ async fn kr_req_23_41_a_bind_refused_for_another_reason_than_gone_keeps_the_draf
         companion_tauri::paired_drafts::GONE,
         "the draft is not gone: {refused}"
     );
-    let reread = kept(companion, session);
+    let reread = kept(companion, session).await;
     assert_eq!(reread["made"], true, "the draft stands: {reread}");
     assert_eq!(reread["draftId"], last["value"]["draftId"]);
     assert_eq!(reread["attachments"].as_array().map(Vec::len), Some(4));
@@ -1652,7 +1683,7 @@ async fn kr_req_23_41_a_bind_that_never_left_keeps_the_draft_and_its_files() {
     let session = adopted.workers[0].session_id;
     let first = bind(companion, session, &handed(companion)).expect("the first bind");
     let second = handed(companion);
-    let old = paired_of(companion).session;
+    let old = paired_of(companion).await.session;
     control.hold();
     old.transport().close();
     bind(companion, session, &second).expect_err("the connection has ended");
@@ -1667,7 +1698,7 @@ async fn kr_req_23_41_a_bind_that_never_left_keeps_the_draft_and_its_files() {
         "the files stay on one draft: {again}"
     );
     assert_eq!(
-        kept(companion, session)["attachments"]
+        kept(companion, session).await["attachments"]
             .as_array()
             .map(Vec::len),
         Some(2)
@@ -1711,7 +1742,7 @@ async fn kr_req_23_41_two_binds_at_once_make_one_draft_and_keep_both_files() {
         .app
         .state::<companion_tauri::AppState>()
         .paired_drafts();
-    let binding = |handle: &Value| {
+    let binding = |handle: &Value, paired: Paired| {
         let bind = companion_tauri::paired_drafts::Bind {
             session_id: session,
             application_instance_id: None,
@@ -1719,15 +1750,18 @@ async fn kr_req_23_41_two_binds_at_once_make_one_draft_and_keep_both_files() {
             transfer_id: serde_json::from_value(handle["transfer_id"].clone()).expect("an id"),
             contribution: serde_json::from_value(contribution()).expect("a contribution"),
         };
-        let (drafts, paired) = (Arc::clone(&drafts), paired_of(companion));
+        let drafts = Arc::clone(&drafts);
         let target = net_support::on_the_session(&adopted.host, session);
         tokio::spawn(async move { drafts.bind(paired, target, bind).await })
     };
-    let (first, second) = (binding(&one), binding(&two));
+    let (first, second) = (
+        binding(&one, paired_of(companion).await),
+        binding(&two, paired_of(companion).await),
+    );
     let first = first.await.expect("ran").expect("one bind");
     let second = second.await.expect("ran").expect("the other bind");
     assert_eq!(first.draft_id, second.draft_id);
-    let reread = kept(companion, session);
+    let reread = kept(companion, session).await;
     assert_eq!(
         reread["attachments"].as_array().map(Vec::len),
         Some(2),
@@ -1749,14 +1783,14 @@ async fn kr_req_23_41_the_sweep_ends_a_real_draft_on_its_own_target() {
     let first = bind(companion, session, &handed(companion)).expect("the first bind");
     let draft_id: kr_protocol::ids::DraftId =
         serde_json::from_value(first["value"]["draftId"].clone()).expect("a draft id");
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let drafts = companion
         .app
         .state::<companion_tauri::AppState>()
         .paired_drafts();
 
     drafts.sweep(paired.clone(), &[]).await;
-    assert_eq!(kept(companion, session)["made"], false);
+    assert_eq!(kept(companion, session).await["made"], false);
     let again = paired
         .session
         .mutate(
@@ -1785,7 +1819,7 @@ async fn kr_req_23_41_a_lost_create_is_answered_by_the_hosts_record_and_not_made
     let (phone, _control) = phone_for(&adopted).await;
     let companion = &phone.companion;
     let session = adopted.workers[0].session_id;
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let target = net_support::on_the_session(&adopted.host, session);
     let composed = paired
         .session
@@ -1844,7 +1878,7 @@ async fn kr_req_23_41_a_create_not_known_to_have_failed_is_kept_and_said() {
     let (phone, _control) = phone_for(&adopted).await;
     let companion = &phone.companion;
     let session = adopted.workers[0].session_id;
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let target = net_support::on_the_session(&adopted.host, session);
     let composed = paired
         .session
@@ -1881,7 +1915,7 @@ async fn kr_req_23_41_a_create_not_known_to_have_failed_is_kept_and_said() {
         companion_tauri::paired_drafts::CREATE_PENDING,
         "{refused}"
     );
-    assert_eq!(kept(companion, session)["made"], false);
+    assert_eq!(kept(companion, session).await["made"], false);
     let (_, bytes) = draft_file(&phone);
     assert!(
         String::from_utf8_lossy(&bytes).contains("\"create\":{"),
@@ -1907,7 +1941,7 @@ async fn kr_req_23_41_a_lost_discard_is_answered_by_the_hosts_record() {
         serde_json::from_value(first["value"]["draftId"].clone()).expect("a draft id");
     let revision: kr_protocol::ids::DraftRevision =
         serde_json::from_value(first["value"]["revision"].clone()).expect("a revision");
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let target = net_support::on_the_session(&adopted.host, session);
     let composed = paired
         .session
@@ -1942,7 +1976,7 @@ async fn kr_req_23_41_a_lost_discard_is_answered_by_the_hosts_record() {
             json!({ "subject": on_session(session), "sessionId": session.to_string() }),
         )
         .expect("the host's record ends it");
-    assert_eq!(kept(companion, session)["made"], false);
+    assert_eq!(kept(companion, session).await["made"], false);
     let next = bind(companion, session, &handed(companion)).expect("a new draft is made");
     assert_ne!(
         next["value"]["draftId"], first["value"]["draftId"],
@@ -1964,7 +1998,7 @@ async fn kr_req_23_41_a_stop_during_a_bind_leaves_no_falsely_known_revision() {
     let session = adopted.workers[0].session_id;
     let first = bind(companion, session, &handed(companion)).expect("the first bind");
     assert_eq!(
-        kept(companion, session)["revision"],
+        kept(companion, session).await["revision"],
         first["value"]["revision"],
         "the revision is known between binds"
     );
@@ -1983,7 +2017,7 @@ async fn kr_req_23_41_a_stop_during_a_bind_leaves_no_falsely_known_revision() {
 
     control.hold_next_request(Method::AgentDraftAddAttachment);
     let binding = {
-        let (drafts, paired) = (Arc::clone(&drafts), paired_of(companion));
+        let (drafts, paired) = (Arc::clone(&drafts), paired_of(companion).await);
         let target = net_support::on_the_session(&adopted.host, session);
         tokio::spawn(async move { drafts.bind(paired, target, bind_of).await })
     };
@@ -2001,7 +2035,7 @@ async fn kr_req_23_41_a_stop_during_a_bind_leaves_no_falsely_known_revision() {
         entry["revision"].is_null(),
         "the revision is not known while the call is out: {entry}"
     );
-    let shown = kept(companion, session);
+    let shown = kept(companion, session).await;
     assert_eq!(shown["made"], true, "{shown}");
     assert!(shown["revision"].is_null(), "{shown}");
 
@@ -2012,7 +2046,7 @@ async fn kr_req_23_41_a_stop_during_a_bind_leaves_no_falsely_known_revision() {
         next["value"]["draftId"], first["value"]["draftId"],
         "a draft of an unknown revision is ended and not added to: {next}"
     );
-    let reread = kept(companion, session);
+    let reread = kept(companion, session).await;
     assert_eq!(
         reread["attachments"].as_array().map(Vec::len),
         Some(1),
@@ -2036,7 +2070,7 @@ async fn kr_req_23_41_the_wait_for_a_lost_create_runs_out_and_the_draft_is_made_
     let (phone, _control) = phone_for(&adopted).await;
     let companion = &phone.companion;
     let session = adopted.workers[0].session_id;
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let target = net_support::on_the_session(&adopted.host, session);
     // The request was composed and kept, and the host never got it.
     let composed = paired
@@ -2087,7 +2121,7 @@ async fn kr_req_23_41_the_wait_for_a_lost_create_runs_out_and_the_draft_is_made_
     drafts.armed_ago_for_test(composed.action_id(), window + Duration::from_secs(31));
     let made = bind(companion, session, &handed(companion)).expect("the wait ran out");
     assert!(made["value"]["draftId"].is_string(), "{made}");
-    let shown = kept(companion, session);
+    let shown = kept(companion, session).await;
     assert_eq!(shown["made"], true, "{shown}");
     assert_eq!(shown["draftId"], made["value"]["draftId"]);
     let (_, bytes) = draft_file(&phone);
@@ -2166,7 +2200,7 @@ async fn kr_req_23_41_a_draft_prompt_to_a_live_agent_ends_the_kept_draft_only_wh
     let unknown = made_draft(&bind(companion, sessions[0], &handed(companion)).expect("a bind"));
     let answer = prompt_for(0, unknown).expect("an outcome nobody can establish is an answer");
     assert!(answer["value"].is_null(), "{answer}");
-    let stays = kept(companion, sessions[0]);
+    let stays = kept(companion, sessions[0]).await;
     assert_eq!(stays["made"], true, "the draft stays: {stays}");
     assert_eq!(stays["draftId"], unknown.to_string());
 
@@ -2175,7 +2209,7 @@ async fn kr_req_23_41_a_draft_prompt_to_a_live_agent_ends_the_kept_draft_only_wh
     prompt_for(1, used).expect("the prompt is applied");
     assert_eq!(taken[0].prompts().len(), 1, "the agent has the prompt");
     assert_eq!(
-        kept(companion, sessions[1])["made"],
+        kept(companion, sessions[1]).await["made"],
         false,
         "the entry of a draft that was sent ends"
     );
@@ -2189,7 +2223,7 @@ async fn kr_req_23_41_a_draft_prompt_to_a_live_agent_ends_the_kept_draft_only_wh
         .state::<companion_tauri::AppState>()
         .paired_drafts()
         .keep_for_test(
-            &paired_of(companion),
+            &paired_of(companion).await,
             sessions[2],
             &net_support::on_the_session(&adopted.host, sessions[2]),
             Some(later),
@@ -2197,7 +2231,7 @@ async fn kr_req_23_41_a_draft_prompt_to_a_live_agent_ends_the_kept_draft_only_wh
         );
     prompt_for(2, named).expect("the prompt is applied");
     assert_eq!(taken[1].prompts().len(), 1);
-    let entry = kept(companion, sessions[2]);
+    let entry = kept(companion, sessions[2]).await;
     assert_eq!(entry["draftId"], later.to_string(), "{entry}");
     held.release();
     adopted.stop().await;
@@ -2215,7 +2249,7 @@ async fn kr_req_13_12_a_reconnect_before_the_driver_fails_resumes_the_upload_on_
     let desk = desk_of(companion);
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let old = Arc::clone(&paired.session);
     let sending = {
         let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
@@ -2291,13 +2325,13 @@ async fn kr_req_23_41_an_answered_draft_action_leaves_the_clients_book() {
 
     // A creation and a discard answered at once.
     bind(companion, session, &handed(companion)).expect("the draft is made");
-    let connection = paired_of(companion).session;
+    let connection = paired_of(companion).await.session;
     assert_eq!(draft_actions_in_the_book(&connection).await, 0, "creation");
     end();
     assert_eq!(draft_actions_in_the_book(&connection).await, 0, "discard");
 
     // A creation whose answer was lost, answered from the host's record on the next connection.
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let composed = paired
         .session
         .compose(
@@ -2393,7 +2427,7 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
     let (phone, control) = phone_for(&adopted).await;
     let companion = &phone.companion;
     let desk = desk_of(companion);
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let session = adopted.workers[0].session_id;
     let earlier = Paired {
         device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
@@ -2487,7 +2521,7 @@ async fn kr_req_13_12_a_new_sign_in_on_the_same_pairing_drops_what_the_earlier_a
     let (phone, control) = phone_for(&adopted).await;
     let companion = &phone.companion;
     let desk = desk_of(companion);
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let session = adopted.workers[0].session_id;
     // The same device on the same host: only the sign-in differs.
     let earlier = Paired {
@@ -2590,7 +2624,7 @@ async fn kr_req_13_12_a_paused_upload_is_read_while_the_host_is_out_of_reach() {
     let desk = desk_of(companion);
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
-    let paired = paired_of(companion);
+    let paired = paired_of(companion).await;
     let (who, session) = (paired.who(), Arc::clone(&paired.session));
     let sending = {
         let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
@@ -2653,9 +2687,12 @@ async fn kr_req_13_12_a_cancel_while_the_copy_is_written_stops_the_upload_from_s
     let gate = desk.hold_after_copy_for_test();
     let bytes = pattern(5);
     let key = kr_ipc::new_uuid();
+    // One connection for the send and for the cancel: a second look at a connection that is being
+    // taken up again is no part of what the case asks.
+    let paired = paired_of(companion).await;
     let sending = {
         let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
-        let (desk, paired) = (Arc::clone(&desk), paired_of(companion));
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
     tokio::time::timeout(WATCHDOG, async {
@@ -2665,7 +2702,7 @@ async fn kr_req_13_12_a_cancel_while_the_copy_is_written_stops_the_upload_from_s
     })
     .await
     .expect("the copy is written");
-    desk.cancel(paired_of(companion), key)
+    desk.cancel(paired, key)
         .await
         .expect("the cancel is answered");
     gate.add_permits(1);
@@ -2683,13 +2720,67 @@ async fn kr_req_13_12_a_cancel_while_the_copy_is_written_stops_the_upload_from_s
     );
     assert_eq!(copies_in(&folder(&phone)), 0, "the copy is gone");
     assert_eq!(entries_in(&folder(&phone)), 0, "the entry is gone");
-    // Nothing starts late either.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Nothing starts late either: what the desk started for itself is over before the host and the
+    // folder are read again.
+    desk.idle().await;
     assert_eq!(
         control.sent(Method::UploadBegin),
         0,
         "nothing reaches the host late"
     );
+    assert_eq!(copies_in(&folder(&phone)), 0, "no copy is written late");
     assert_eq!(entries_in(&folder(&phone)), 0, "no entry is written late");
+    adopted.stop().await;
+}
+
+/// A connection that is being taken up again is waited for: the helper that names the paired host
+/// finds none held while the dials are held, counts that look, and returns the new connection once
+/// contact is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn paired_of_waits_for_a_connection_that_is_being_taken_up_again() {
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let old = paired_of(companion).await.session;
+    // The host cannot be reached again while the dials are held.
+    control.hold();
+    old.transport().close();
+    tokio::time::timeout(WATCHDOG, async {
+        while companion
+            .call("connection_state", json!({}))
+            .is_ok_and(|state| state["connected"] == true)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the connection ends");
+
+    let missed = AtomicUsize::new(0);
+    // Contact returns only after the helper has looked once and found no connection.
+    let returning = async {
+        while missed.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        control.stop_holding();
+        control.release_all();
+    };
+    let (found, ()) = tokio::time::timeout(WATCHDOG, async {
+        tokio::join!(
+            paired_within(companion, CONNECTION_WAIT, &missed),
+            returning
+        )
+    })
+    .await
+    .expect("the helper ends");
+    let paired = found.expect("the helper waits for the connection that is taken up again");
+    assert!(
+        missed.load(Ordering::SeqCst) >= 1,
+        "the helper looked while no connection was held"
+    );
+    assert!(
+        !Arc::ptr_eq(&paired.session, &old),
+        "the connection it returns is the new one"
+    );
     adopted.stop().await;
 }

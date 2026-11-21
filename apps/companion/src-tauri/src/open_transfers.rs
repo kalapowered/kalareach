@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kr_client::chunks::ChunkRoute;
@@ -588,10 +588,41 @@ pub struct Cancelled {
     pub handle: Option<AttachmentHandle>,
 }
 
+/// The tasks the desk starts for itself, counted so that a suite can wait until none is left.
+#[derive(Default)]
+struct Work {
+    running: AtomicUsize,
+    over: tokio::sync::Notify,
+}
+
+/// One task of the desk while it lives: it is counted out when it ends, however it ends.
+struct Counted(Arc<Work>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        if self.0.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.over.notify_waiters();
+        }
+    }
+}
+
+impl Work {
+    fn spawn(self: &Arc<Self>, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.running.fetch_add(1, Ordering::AcqRel);
+        let counted = Counted(Arc::clone(self));
+        tauri::async_runtime::spawn(async move {
+            let _counted = counted;
+            task.await;
+        });
+    }
+}
+
 /// The state of every upload this device sends to a paired host.
 #[derive(Default)]
 pub struct Desk {
     root: Mutex<Option<PathBuf>>,
+    /// The tasks the desk started for itself and has not seen end.
+    work: Arc<Work>,
     live: Mutex<HashMap<Uuid, Arc<Live>>>,
     /// What a restart or a failure found of entries it could not resume.
     verdicts: Mutex<HashMap<Uuid, Verdict>>,
@@ -1017,7 +1048,7 @@ impl Desk {
             if live.file().cancel_asked {
                 let desk = Arc::clone(self);
                 let (live, paired) = (Arc::clone(live), paired.clone());
-                tauri::async_runtime::spawn(async move {
+                self.work.spawn(async move {
                     if let Ok(store) = desk.store() {
                         let file = live.file();
                         let _ = desk.finish_cancel(&store, &paired, Some(live), file).await;
@@ -1031,7 +1062,7 @@ impl Desk {
             return;
         }
         let desk = Arc::clone(self);
-        tauri::async_runtime::spawn(async move {
+        self.work.spawn(async move {
             desk.restart(paired).await;
         });
     }
@@ -1461,6 +1492,20 @@ fn view_of(
 
 #[cfg(feature = "testing")]
 impl Desk {
+    /// Resolves once none of the tasks the desk started for itself is running, so that a suite reads
+    /// what they left only when they are over.
+    pub async fn idle(&self) {
+        loop {
+            let over = self.work.over.notified();
+            tokio::pin!(over);
+            over.as_mut().enable();
+            if self.work.running.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            over.await;
+        }
+    }
+
     /// Holds every send after its copy is written until the returned gate is given a permit.
     pub fn hold_after_copy_for_test(&self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
