@@ -293,6 +293,60 @@ describe('what the host in use shows is stored and shown under the owner’s key
     expect(screen.getByTestId('attention-list')).toBeInTheDocument()
   })
 
+  // A numbers read that fails leaves the inbox and clears the numbers the rows were drawn with, so
+  // they say "A session" and never the number of an earlier read.
+  it('a_desktop_failed_numbers_read_after_a_successful_one_clears_the_numbers', async () => {
+    const { controls } = start((host) => {
+      host.setHostInUse(STUDIO)
+    })
+    await waitFor(() => {
+      expect(itemRows()[0]).toHaveTextContent(/Session \d/)
+    })
+    controls.failNextSessionList('the host could not list its sessions')
+    readNow()
+    await waitFor(() => {
+      expect(itemRows()[0]).toHaveTextContent('A session')
+    })
+    expect(itemRows()[0]).not.toHaveTextContent(/Session \d/)
+    expect(screen.queryByText(NOT_READ)).toBeNull()
+  })
+
+  // A numbers read that is dropped, under another key than the connection's, is a drop like the
+  // inbox's: one new read follows and a second drop waits for the cadence.
+  it('a_desktop_numbers_only_drop_makes_one_new_read_and_then_waits_for_the_cadence', async () => {
+    const { controls } = start((host) => {
+      host.setHostInUse(STUDIO)
+    })
+    await screen.findByTestId('attention-list')
+    const numbers = controls.hold('sessionNumbers')
+    const first = numbers.count
+    readNow()
+    await settle()
+    expect(numbers.count).toBe(first + 1)
+    // The epoch moves with no trigger, so the answer the read makes is under a key that is gone.
+    act(() => {
+      controls.setInboxEpoch(2)
+    })
+    await settle()
+    act(() => {
+      numbers.answer(first)
+    })
+    await settle()
+    expect(numbers.count).toBe(first + 2)
+    act(() => {
+      controls.setInboxEpoch(3)
+    })
+    await settle()
+    act(() => {
+      numbers.answer(first + 1)
+    })
+    await settle()
+    expect(numbers.count).toBe(first + 2)
+    readNow()
+    await settle()
+    expect(numbers.count).toBe(first + 3)
+  })
+
   it('a_desktop_superseded_reply_makes_one_new_read', async () => {
     const { controls } = start((host) => {
       host.setHostInUse(STUDIO)

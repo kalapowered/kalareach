@@ -139,22 +139,34 @@ export function Attention({ latest }: { readonly latest: ConnectionState | null 
           return false
         }
       )
-      // Only for the words: an inbox read without them names a session by nothing but the item.
+      // Only for the words: an inbox read without them names a session by nothing but the item. A read
+      // of them that fails, or is dropped, clears the numbers that were kept, so the rows say "A
+      // session" and never a number from an earlier read; a drop is a drop like the inbox's.
       const numbersRead = ask(() => port.sessionNumbers()).then(
         (answer) => {
-          if (!current()) return
+          if (!current()) return false
           const now = port.connectionLatest()
-          if (now === null || !sameKey(answer.key, keyOfState(now))) return
+          if (now === null || !sameKey(answer.key, keyOfState(now))) {
+            setNumbers(null)
+            return true
+          }
           setNumbers({
             key: answer.key,
             named: new Map(
               answer.value.sessions.map((session) => [session.session_id, session.display_number])
             )
           })
+          return false
         },
-        () => undefined
+        (error: unknown) => {
+          if (!current()) return false
+          setNumbers(null)
+          return failureCode(error) === READ_SUPERSEDED
+        }
       )
-      return Promise.all([inboxRead, numbersRead]).then(([dropped]) => dropped)
+      return Promise.all([inboxRead, numbersRead]).then(
+        ([inboxDropped, numbersDropped]) => inboxDropped || numbersDropped
+      )
     },
     [port]
   )
