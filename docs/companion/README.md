@@ -987,7 +987,10 @@ is expanded: a leading `~`, a `$VARIABLE`, a zsh global alias at an argument pos
 builtin named like it runs in its place in bash and zsh, an alias and a reserved word never do, and
 in fish an alias is a function, so it runs. A program that cannot be found is the shell's own
 "command not found". PowerShell resolves the program to an application or an external script and
-types its full path, so a shadowing alias or function is bypassed; a program that names no
+types its full path, so a shadowing alias or function is bypassed (the module keeps a name that
+already resolves to an application or script as it was supplied); a program word that begins with
+`~` is looked for under the home folder, and the Settings section says so where the session runs
+PowerShell; a program that names no
 application has no line, and a `.cmd` or `.bat` program has none either when an argument is empty,
 holds white space and ends in a backslash, or holds a character that `cmd.exe` reads again, or when
 the program's own path holds `%` or `!`. Nothing changes the directory: the line is typed at the
@@ -1009,10 +1012,11 @@ limits are 32 commands, a label of 1 to 48 characters, a program of 1 to 512 byt
 at most 512 bytes each, and 3,072 bytes in all.
 
 **Saving.** The form keeps the revision of the list the person saw when they began to edit, and a
-read that answers while they edit does not change it. A save or a remove names that revision. A
-host whose list has moved on changes nothing and answers with the list as it stands: the form says
-the commands changed while the person was editing and shows the list, and the next save names it,
-so a change made elsewhere is never overwritten unseen. An answer that is lost or unconfirmed is
+read that answers while they edit does not change it. A save names that revision; a remove names the
+revision of the list on the screen. A host whose list has moved on changes nothing and answers with
+the list as it stands: the form says the commands changed while the person was editing, or for a
+remove since the list was shown, and shows the list, and the next save names it, so a change made
+elsewhere is never overwritten unseen. An answer that is lost or unconfirmed is
 told as that, and the list is read again.
 
 **Who may change the list.** The two changes are made through the application's own commands

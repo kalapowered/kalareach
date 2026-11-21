@@ -872,7 +872,7 @@ delete a recreated one. A save replaces the command with the same label, compare
 keeps its place and takes the new spelling; a new label goes last.
 
 The host is the only authority on what a command may hold, in one check of its own, and refuses
-(`INVALID_ARGUMENT`) a command that breaks it, in these words:
+(`INVALID_ARGUMENT`) a command that breaks it. The rules are:
 
 - A label has 1 to 48 characters once trimmed, a program 1 to 512 bytes, and at most 16 arguments of at
   most 512 bytes each; an argument may be empty; a command uses at most 3,072 bytes across all three;
