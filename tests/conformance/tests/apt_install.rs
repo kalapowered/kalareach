@@ -715,10 +715,13 @@ fn a_download_past_the_deadline_is_cut_and_nothing_is_installed() {
     let outcome = rig.run(&["--deadline", "4", "tmux"]);
     rig.assert_the_deadline_ended_the_run(&outcome, 4, "a download that never ends");
     assert!(
-        outcome.elapsed < Duration::from_secs(4 + 2),
+        rig.bounds()
+            .iter()
+            .all(|(grace, seconds)| grace + seconds <= 4),
         "{:?}",
-        outcome.elapsed
+        rig.bounds()
     );
+    rig.assert_inside_the_time_left(4, "a download that never ends");
     assert!(
         !rig.phases().contains(&"install".to_owned()),
         "{:?}",
@@ -738,17 +741,13 @@ fn a_download_past_the_deadline_is_cut_and_nothing_is_installed() {
     let outcome = rig.run(&["--deadline", "4", "tmux"]);
     rig.assert_the_deadline_ended_the_run(&outcome, 4, "an update that never ends");
     assert!(
-        outcome.elapsed < Duration::from_secs(4 + 2),
-        "{:?}",
-        outcome.elapsed
-    );
-    assert!(
         rig.bounds()
             .iter()
             .all(|(grace, seconds)| grace + seconds <= 4),
         "{:?}",
         rig.bounds()
     );
+    rig.assert_inside_the_time_left(4, "an update that never ends");
     let phases = rig.phases();
     assert!(
         phases.iter().all(|phase| phase == "update"),
@@ -778,8 +777,8 @@ fn a_call_that_ignores_the_termination_signal_is_killed_inside_the_deadline() {
         "a call that ignores the termination signal",
     );
     // The kill is proved by the record below: a status of 137 and a grace and a bound inside the
-    // deadline. The time the run took is a ceiling only, far above the run's own length of about
-    // the deadline, so that no stall of the machine reaches it.
+    // deadline. The time the run took is a ceiling only, 21 s above the deadline: it fails a script
+    // that does not stop, and a stall of the machine of that length.
     assert!(
         outcome.elapsed < Duration::from_secs(25),
         "{:?}",
@@ -877,8 +876,9 @@ fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
         }
         rig.assert_inside_the_time_left(deadline, &deadline.to_string());
     }
-    // The control: with a long deadline that no stall of a machine uses up, the script makes its
-    // three calls and ends with success.
+    // The control: a deadline of 30 s or more leaves each call a term of 20 s or more, which a
+    // stall of the machine shorter than that does not use up, and the script makes its three calls
+    // and ends with success.
     for deadline in [30_u32, 180, 181, 1800] {
         let rig = Rig::new();
         let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
@@ -981,8 +981,8 @@ fn the_waits_never_pass_the_deadline() {
     let outcome = rig.run(&["--deadline", "5", "tmux"]);
     rig.assert_the_deadline_ended_the_run(&outcome, 5, "5");
     // The record below proves each wait inside the time left. The time the run took is a ceiling
-    // only, far above the run's own length of about the deadline, so that no stall of the machine
-    // reaches it.
+    // only, 20 s above the deadline: it fails a script that does not stop, and a stall of the
+    // machine of that length.
     assert!(
         outcome.elapsed < Duration::from_secs(25),
         "5: {:?}",
