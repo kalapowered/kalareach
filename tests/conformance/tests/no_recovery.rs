@@ -27,7 +27,10 @@ const PROGRAMS: [&str; 11] = [
 /// type that names a signal, wherever they are written: called, taken as a value, given type
 /// arguments, imported or renamed. So is every name that begins with `kill`, which covers `kill`,
 /// `killpg` and `kill_process_group`.
-const NAMES: [&str; 8] = [
+const NAMES: [&str; 11] = [
+    "waitpid",
+    "waitid",
+    "wait4",
     "remove_dir_all",
     "remove_dir",
     "remove_file",
@@ -766,6 +769,9 @@ fn the_check_finds_what_it_is_there_for() {
         "(std::fs::remove_file)(path)",
         "use std::fs::remove_dir_all as clean;",
         "let signal_it = Child::kill;",
+        "rustix::process::waitpid(Some(pid), options)",
+        "let reaped = rustix::process::waitid(id, options);",
+        "libc::wait4(pid, status, 0, usage)",
         "m! { #[cfg(test)] fn f() { std::fs::remove_file(x); } }",
         "macro_rules! m { () => { #[cfg(test)] fn f() { child.kill(); } } }",
         "let rename = 1;",
@@ -876,14 +882,26 @@ const SIGNALLERS: [&str; 4] = ["kill", "pkill", "killall", "taskkill"];
 /// The names of the calls that reap a process by its number.
 const REAPS: [&str; 3] = ["waitpid", "waitid", "wait4"];
 
-/// Whether `text`, taken as shell text, sends a signal: a part that starts one of the programs of
+/// The words that lead a shell command without being the program it runs: the keywords of a
+/// condition or a loop, the words that run what follows, and (by their `=`) an assignment.
+const LEADING: [&str; 15] = [
+    "if", "then", "else", "elif", "do", "while", "until", "!", "exec", "command", "builtin",
+    "nohup", "env", "time", "xargs",
+];
+
+/// Whether `text`, taken as shell text, sends a signal: a part that runs one of the programs of
 /// [`SIGNALLERS`], but for `kill -0`, which asks whether a process exists and sends nothing. The
-/// parts are cut as in [`runs_one`].
+/// text is cut at `;`, `|`, `&`, a new line, a back tick, a bracket, a brace and a quote, and in
+/// each part the leading words of [`LEADING`] and the assignments are passed over, so that
+/// `if kill -0 "$p"; then kill -9 "$p"; fi`, `(kill -9 1)`, `exec kill -9 1` and `trap 'kill -9 $c'
+/// TERM` are read.
 fn signals_by_text(text: &str) -> bool {
     text.replace("$(", ";")
-        .split([';', '|', '&', '\n', '`'])
+        .split([';', '|', '&', '\n', '`', '(', ')', '{', '}', '\'', '"'])
         .any(|part| {
-            let mut words = part.split_whitespace();
+            let mut words = part
+                .split_whitespace()
+                .skip_while(|word| LEADING.contains(word) || word.contains('='));
             let Some(first) = words.next() else {
                 return false;
             };
@@ -898,10 +916,21 @@ fn signals_by_text(text: &str) -> bool {
         })
 }
 
+/// Whether the `wait` at `at` is the wait of a `Child`: after a `.`, or after `Child::`.
+fn waits_for_a_child(tokens: &[Token], at: usize) -> bool {
+    (at >= 1 && tokens[at - 1].is_punct('.'))
+        || (at >= 3
+            && tokens[at - 1].is_punct(':')
+            && tokens[at - 2].is_punct(':')
+            && tokens[at - 3].ident() == Some("Child"))
+}
+
 /// What in the Rust source of a case file sends a signal or reaps a process by its number, each with
 /// its line: a text that runs a program of [`SIGNALLERS`] (but for `kill -0`), the type `Signal`,
 /// every name of a signal and every name that begins `kill` (which covers `Child::kill` and
-/// `kill_process_group`), and a call of [`REAPS`], which no case makes.
+/// `kill_process_group`), `start_kill`, and a call of [`REAPS`] or of a bare `wait`, which reaps any
+/// child, none of which a case makes: the wait of a `Child` (`child.wait()`, `Child::wait`) is
+/// let through.
 fn case_refused(source: &str) -> Result<Vec<String>, String> {
     let tokens: Vec<Token> = lex(source)
         .map_err(|error| format!("line {}: {}", error.line, error.what))?
@@ -909,7 +938,7 @@ fn case_refused(source: &str) -> Result<Vec<String>, String> {
         .filter(|token| !token.is_comment())
         .collect();
     let mut found = Vec::new();
-    for token in &tokens {
+    for (at, token) in tokens.iter().enumerate() {
         let what = match &token.tok {
             Tok::Str(text, _) if signals_by_text(text) => format!("the text {text:?}"),
             Tok::Ident(name)
@@ -917,7 +946,9 @@ fn case_refused(source: &str) -> Result<Vec<String>, String> {
                     || name.starts_with("kill")
                     || (name.starts_with("SIG")
                         && name.chars().nth(3).is_some_and(char::is_uppercase))
-                    || REAPS.contains(&name.as_str()) =>
+                    || name == "start_kill"
+                    || REAPS.contains(&name.as_str())
+                    || (name == "wait" && !waits_for_a_child(&tokens, at)) =>
             {
                 format!("`{name}`")
             }
@@ -1032,6 +1063,37 @@ fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_l
             "fn f() { run(\"killall sleep\"); }",
         ),
         (
+            "a kill after a look, in an if",
+            "fn f() { run(\"if kill -0 \\\"$p\\\"; then kill -9 \\\"$p\\\"; fi\"); }",
+        ),
+        ("a kill in parentheses", "fn f() { run(\"(kill -9 1)\"); }"),
+        ("a kill in braces", "fn f() { run(\"{ kill -9 1; }\"); }"),
+        ("a kill after exec", "fn f() { run(\"exec kill -9 1\"); }"),
+        (
+            "a kill after command",
+            "fn f() { run(\"command kill -9 1\"); }",
+        ),
+        (
+            "a kill in a trap",
+            "fn f() { run(\"trap 'kill -9 $c' TERM\"); }",
+        ),
+        (
+            "a kill after an assignment",
+            "fn f() { run(\"PATH=/bin kill -9 1\"); }",
+        ),
+        (
+            "a kill by tokio",
+            "fn f(child: &mut Child) { child.start_kill(); }",
+        ),
+        (
+            "a reap of any child",
+            "fn f() { rustix::process::wait(WaitOptions::empty()); }",
+        ),
+        (
+            "an import of a reap of any child",
+            "use rustix::process::{wait, Pid};",
+        ),
+        (
             "a reap by number",
             "fn another() { waitpid(None, WaitOptions::empty()); }",
         ),
@@ -1048,17 +1110,38 @@ fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_l
         ),
         ("a look, written alone", "fn f() { run(\"kill -0 123\"); }"),
         (
+            "a look in an if",
+            "fn f() { run(\"if kill -0 \\\"$p\\\"; then :; fi\"); }",
+        ),
+        (
+            "the wait of a child",
+            "fn f(child: &mut Child) { child.wait(); }",
+        ),
+        (
+            "the wait of Child, as a value",
+            "fn f() { g(Child::wait); }",
+        ),
+        (
             "an ignored signal",
             "fn f() { run(\"trap '' TERM; sleep 61\"); }",
         ),
     ];
     let refused_script = [
         ("a script that kills a pid", "sleep 61 &\nkill -9 $!\n"),
+        (
+            "a script that looks and then kills",
+            "if kill -0 \"$p\"; then kill -9 \"$p\"; fi\n",
+        ),
+        ("a script that kills in a trap", "trap 'kill -9 $c' TERM\n"),
         ("a script that kills after a pipe", "ps | kill -9 1\n"),
     ];
     let let_through_script = [
         ("a script that waits", "trap '' TERM\nsleep 61 &\nwait\n"),
         ("a script that looks", "kill -0 $! 2>/dev/null\n"),
+        (
+            "a script that looks in an if",
+            "if kill -0 \"$p\"; then :; fi\n",
+        ),
     ];
     let mut wrong = Vec::new();
     for (what, code) in refused_rust {
