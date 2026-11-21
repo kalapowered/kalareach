@@ -578,12 +578,14 @@ mod unix {
         let endpoint = endpoint_in(&folder, "child.sock");
         let path = endpoint.as_path();
         let mut listener = start_a_listener_program(&endpoint, true);
+        // The program the listener started ends when this input closes, and `wait` closes the
+        // handle's own, so the case keeps it apart until the lock has been read.
+        let input = listener.stdin.take();
         assert!(lock_is_held(path), "a live listener holds the lock");
         listener.kill().expect("SIGKILL");
         listener.wait().expect("the listener is gone");
         let held = lock_is_held(path);
-        // The program the listener started ends with the input it waits on.
-        drop(listener.stdin.take());
+        drop(input);
         assert!(!held, "the child inherited the lock");
     }
 
