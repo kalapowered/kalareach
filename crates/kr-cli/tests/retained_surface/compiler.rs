@@ -2070,6 +2070,30 @@ pub fn inputs_short(
     problems
 }
 
+/// Fetches the crates that the lock file of the tree at `root` names, with the network, before the
+/// reading that is offline: Cargo's metadata needs the manifest of every package of the lock, those
+/// of other platforms too, and a machine's cache holds only the ones it has needed. The exit is
+/// printed. A fetch that fails is the cause that the tree is refused with.
+pub fn fetch(root: &Path) -> Result<(), String> {
+    let output = cargo_command()
+        .args(["fetch", "--locked"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("{}: cargo fetch: {error}", root.display()))?;
+    let exit = output.status.code().unwrap_or(-1);
+    println!("cargo fetch --locked in {}: exit {exit}", root.display());
+    if output.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&output.stderr);
+    let tail: Vec<&str> = said.lines().rev().take(3).collect();
+    Err(format!(
+        "cargo fetch --locked failed (exit {exit}): {}",
+        tail.into_iter().rev().collect::<Vec<_>>().join(" ")
+    ))
+}
+
 /// Copies the files that Git tracks in the checkout `repository`, as they are now, into `dest`.
 pub fn copy_checkout(repository: &Path, dest: &Path) -> Result<(), String> {
     let output = Command::new("git")

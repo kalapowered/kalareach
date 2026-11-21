@@ -992,6 +992,35 @@ fn the_windows_check_leaves_out_the_members_that_depend_directly_on_the_model_ru
     );
 }
 
+#[test]
+fn a_fetch_of_a_tree_with_no_lock_file_fails_with_its_exit_and_one_with_a_lock_file_passes() {
+    let root = tempfile::tempdir().expect("a folder");
+    write(
+        root.path(),
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+    );
+    write(
+        root.path(),
+        "crates/kr-user/Cargo.toml",
+        &manifest("kr-user", ""),
+    );
+    write(root.path(), "crates/kr-user/src/lib.rs", "");
+    let error = compiler::fetch(root.path()).expect_err("no lock file");
+    assert!(
+        error.starts_with("cargo fetch --locked failed (exit 101): "),
+        "{error}"
+    );
+    assert!(error.contains("lock file"), "{error}");
+    let lock = compiler::cargo_command()
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(root.path())
+        .output()
+        .expect("cargo runs");
+    assert!(lock.status.success());
+    assert_eq!(compiler::fetch(root.path()), Ok(()));
+}
+
 fn releases_named(names: &[&str]) -> Vec<(String, String)> {
     names
         .iter()
@@ -1255,7 +1284,9 @@ fn a_platform_reads_each_release_tag_and_writes_its_report() {
     for (tag, commit) in &releases {
         let started = std::time::Instant::now();
         let folder = tempfile::tempdir().expect("a folder");
-        let read = match compiler::unpack_commit(&repository, commit, folder.path()) {
+        let unpacked = compiler::unpack_commit(&repository, commit, folder.path())
+            .and_then(|()| compiler::fetch(folder.path()));
+        let read = match unpacked {
             Ok(()) => compiler::read_platform(folder.path(), &builds, &platform, tag, commit),
             Err(error) => {
                 let mut read = Platform::default();
