@@ -377,21 +377,29 @@ function SessionSettings({
   )
   const [followOutput, setFollowOutput] = useState(true)
   // The shell this session runs, as its launch surface says, for the words of the launch commands
-  // section: PowerShell finds a program that begins with ~ where the other shells do not.
-  const [shell, setShell] = useState<LaunchShell | null>(null)
+  // section: PowerShell finds a program that begins with ~ where the other shells do not. It is
+  // taken only from an answer for this session, and asked again each time Settings is opened, so a
+  // read that failed is not the last word.
+  const [answered, setAnswered] = useState<{
+    readonly sessionId: string
+    readonly shell: LaunchShell | null
+  } | null>(null)
+  const shell = answered?.sessionId === sessionId ? answered.shell : null
   useEffect(() => {
-    if (tab !== 'launch') return
+    if (!open || tab !== 'launch') return
     let current = true
     ask(() => port.launchSurface({ session_id: sessionId })).then(
       (reading) => {
-        if (current && reading.state === 'served') setShell(reading.surface.shell)
+        if (current && reading.state === 'served') {
+          setAnswered({ sessionId, shell: reading.surface.shell })
+        }
       },
       () => undefined
     )
     return () => {
       current = false
     }
-  }, [port, sessionId, tab])
+  }, [port, sessionId, open, tab])
 
   return (
     <Sheet
