@@ -45,6 +45,12 @@ const LOOK: Duration = Duration::from_millis(50);
 /// missing: the library asks a name when the lookup starts and again at 0.2, 0.3, 0.6, 1, 2 and 3
 /// seconds after it. A lookup that a dial starts goes on in the background after the dial has
 /// returned, so a case that counts questions waits for this many from each lookup.
+///
+/// The seven follows iroh's `DNS_STAGGERING_MS`, the six delays after the first ask: a change to
+/// that list leaves this count wrong with no error. The count also assumes one datagram for each
+/// ask. The name server records every datagram, and the resolver sends a query again after 300 ms
+/// when it has had no answer, so a name server that is slow to answer can have one ask counted
+/// twice and the count reach seven before the lookup has asked its last.
 const QUESTIONS_OF_A_LOOKUP: usize = 7;
 
 fn loopback() -> Option<std::net::SocketAddr> {
