@@ -188,6 +188,12 @@ jobs:
       - name: Install the component target
         run: rustup target add wasm32-wasip2
 
+      # `kr-cli`'s retained_surface suite reads each release tree with the compiler for the host, for
+      # its tests and for x86_64-pc-windows-gnu, which a cross check needs the standard library of, and
+      # the workspace's test step below runs it.
+      - name: Install the Windows check target
+        run: rustup target add x86_64-pc-windows-gnu
+
       - name: Restore the cargo cache
         id: cargo-cache
         uses: ./.github/actions/cargo-cache-restore
@@ -3065,6 +3071,13 @@ jobs:
       - name: Install the component target
         timeout-minutes: 5
         run: rustup target add wasm32-wasip2
+
+      # `kr-cli`'s retained_surface suite reads each release tree with the compiler for the host, for
+      # its tests and for x86_64-pc-windows-gnu, which a cross check needs the standard library of, and
+      # the workspace's test step below runs it.
+      - name: Install the Windows check target
+        timeout-minutes: 5
+        run: rustup target add x86_64-pc-windows-gnu
 
       # The worker's pseudo-terminal suite starts each shell section 3 names as a session's root
       # shell. The runner has Bash and Zsh; Fish is installed here, and the test step names all
