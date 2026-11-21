@@ -3609,7 +3609,11 @@ mod tests {
         let first = test.store.try_lock_update().expect("locks").expect("free");
         assert!(test.store.try_lock_update().expect("asks").is_none());
         drop(first);
-        assert!(test.store.try_lock_update().expect("asks").is_some());
+        assert_released(
+            &test.store.root().join("update.lock"),
+            "the update lock goes with its holder",
+            || test.store.try_lock_update().expect("asks").is_some(),
+        );
     }
 
     /// The roots a daemon records are read back whole, a path of any bytes included.

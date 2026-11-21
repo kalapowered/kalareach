@@ -110,10 +110,32 @@ mod unix {
         PathBuf::from(name)
     }
 
+    /// How long a case waits for a program that another case started to let go of what it holds a
+    /// copy of.
+    ///
+    /// Such a program keeps a copy of every descriptor this case has open, a listening socket
+    /// among them, from its start until its own program takes over. A wait ends when the copy is
+    /// closed, so this bounds only a failure.
+    const EXEC_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// Leaves a socket at `path` that refuses every connect: what a listener that ended without
     /// removing it leaves.
+    ///
+    /// The socket answers until every copy of its descriptor is closed, so this returns once a
+    /// connect is refused.
     fn leave_a_refusing_socket(path: &Path) {
         drop(StdListener::bind(path).expect("a socket"));
+        let begun = std::time::Instant::now();
+        loop {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return,
+                Err(error) => panic!("a connect to a left socket is refused, not {error:?}"),
+                Ok(_answered) if begun.elapsed() >= EXEC_WAIT => {
+                    panic!("a program another case started keeps the left socket listening");
+                }
+                Ok(_answered) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
     }
 
     /// Makes the lock file of a leftover socket and writes in it the record a listener of this
