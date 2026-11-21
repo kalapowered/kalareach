@@ -3202,12 +3202,12 @@ async fn the_token_of_a_command_at_a_question_refuses_the_opens_that_change_what
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    println!("kr-case: {completed} later thread(s) completed both opens while live");
     assert!(
         completed >= 1,
         "this case could not make its condition: no thread made after the tries stayed live \
-         through both opens"
+         through both opens ({completed} completed)"
     );
+    println!("kr-case: {completed} later thread(s) completed both opens while live");
 }
 
 /// The thread that ran the protection refuses the opens that take a thread over; a plain
@@ -3301,10 +3301,10 @@ async fn a_thread_made_after_the_protection_refuses_the_opens_that_take_it_over(
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    println!("kr-case: {completed} later thread(s) completed every open while live");
     assert!(
         completed >= 1,
         "this case could not make its condition: no thread made after the first answer stayed \
-         live through every open"
+         live through every open ({completed} completed)"
     );
+    println!("kr-case: {completed} later thread(s) completed every open while live");
 }
