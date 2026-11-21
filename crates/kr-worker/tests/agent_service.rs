@@ -7563,6 +7563,101 @@ async fn kr_req_12_26_a_prompt_is_marked_as_a_channels_when_its_dispatch_marker_
     );
 }
 
+/// KR-REQ-09.16, KR-REQ-12.26: the accepted deadline is asked again inside the marker's own step
+/// for a message carried on a channel as for any other action. A window that ends in that step,
+/// between the read of the receipt and the first write, leaves the receipt as it was and rejects
+/// the message as expired: no marker, no channel mark, and nothing is written to the channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_16_a_prompt_whose_window_ended_before_the_marker_is_rejected_as_expired() {
+    let clock = kr_transport::clock::ManualClock::new();
+    let host = host_on(Some(Arc::new(clock.clone()))).await;
+    let mut channel = ServedChannel::open(&host).await;
+    channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+    let (reached, release) = {
+        let mut session = host.service.runtime().session();
+        let journal = session.journal_mut().expect("this session keeps a journal");
+        journal.stall_next_marker_before_its_write()
+    };
+    let window = client.action_window().action_window_id.clone();
+    let mutation = queue_mutation(&host, 61, window, "held before the marker");
+    let action_id = mutation.action_id;
+    let sending = tokio::spawn(async move { send(&mut client, mutation).await });
+    tokio::time::timeout(LIVENESS_DEADLINE, reached)
+        .await
+        .expect("the dispatch reaches the stop in time")
+        .expect("the stop is armed");
+    // The message's window is a minute: it ends while the marker's step stands before its write.
+    clock.advance(std::time::Duration::from_secs(61));
+    release.send(()).expect("the dispatch is waiting to go on");
+    let outcome = sending.await.expect("the prompt is answered");
+
+    // What landed is read before what was answered, so that a marker written after the window
+    // ended is what this case reports.
+    assert_eq!(
+        stored_provenance(&host, action_id),
+        None,
+        "the channel's mark was written after the window ended"
+    );
+    let mut watcher = cli(&host).await;
+    let receipt = receipt(&mut watcher, action_id).await;
+    assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
+    assert_eq!(
+        receipt.reason.as_ref(),
+        Some(&kr_protocol::receipt::RejectionReason::Expired)
+    );
+    let Outcome::Error(error) = &outcome else {
+        panic!("a window that ended before the marker's write did not refuse: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    let written = tokio::time::timeout(std::time::Duration::from_millis(300), channel.next()).await;
+    assert!(
+        written.is_err(),
+        "a message whose window ended was written to the channel: {written:?}"
+    );
+}
+
+/// KR-REQ-09.16, KR-REQ-12.26: the same step, for a message inside its window, marks the receipt
+/// as a channel's with the marker itself. The worker is stopped once the marker has committed and
+/// before anything follows it, so the mark read there is the marker's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_26_a_prompt_inside_its_window_is_marked_as_a_channels_by_its_marker() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+    let (committed, release) = {
+        let mut session = host.service.runtime().session();
+        let journal = session.journal_mut().expect("this session keeps a journal");
+        journal.stall_after_next_marker()
+    };
+    let window = client.action_window().action_window_id.clone();
+    let mutation = queue_mutation(&host, 62, window, "held after the marker");
+    let action_id = mutation.action_id;
+    let sending = tokio::spawn(async move { send(&mut client, mutation).await });
+    tokio::time::timeout(LIVENESS_DEADLINE, committed)
+        .await
+        .expect("the marker commits in time")
+        .expect("the stop is armed");
+    assert_eq!(
+        stored_provenance(&host, action_id).as_deref(),
+        Some("authenticated_hook_response"),
+        "the marker's own step marks the receipt as a channel's"
+    );
+
+    release.send(()).expect("the dispatch is waiting to go on");
+    let outcome = sending.await.expect("the prompt is answered");
+    // A channel confirms nothing, so a message it carried ends as an outcome nobody can establish.
+    let Outcome::Error(error) = &outcome else {
+        panic!("a message carried on a channel did not end unknown: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
+    assert_eq!(
+        channel.next().await["params"]["content"],
+        "held after the marker"
+    );
+}
+
 /// KR-REQ-12.26: a prompt to a typed upstream needs no sender identity: a caller that entered as a
 /// workflow, with no device and no grant, is admitted and carried by the typed transport as it
 /// was, and the admission keeps the typed transport's provenance.
