@@ -316,16 +316,16 @@ struct Maker;
 impl Maker { via_impl!(Method::AgentPromptQueue); }
 macro_rules! own { () => { Method::AgentTurnCancel }; }
 macro_rules! forwards { () => { via_body!(Method::AgentTurnSteer) }; }
-macro_rules! check { (idle!(Method::AgentTurnCancel)) => {}; }
+macro_rules! check { (quiet_m!(Method::AgentTurnCancel)) => {}; }
 wrapper!(outer_made, inner_call!(Method::AgentPromptQueue));
-fn mixed() { let _ = Method::AgentTurnCancel; idle!(); }
+fn mixed() { let _ = Method::AgentTurnCancel; quiet_m!(); }
 impl Sends for [u8] {
     const X: Method = Method::AgentTurnSteer;
     fn m(&self) { let _ = Method::AgentTurnCancel; }
     via_slice!(Method::AgentPromptQueue);
 }
 fn local() {
-    macro_rules! check_local { (idle!(Method::AgentTurnCancel)) => {}; }
+    macro_rules! check_local { (quiet_m!(Method::AgentTurnCancel)) => {}; }
     macro_rules! check_paren ( (idle_p!(Method::AgentTurnCancel)) => {} );
     macro_rules! check_brack [ (idle_b!(Method::AgentTurnCancel)) => {} ];
 }
@@ -423,7 +423,7 @@ fn sender_tree() -> tempfile::TempDir {
         ),
         (
             "mac.rs",
-            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! via_body { ($m:expr) => { $m }; }\nmacro_rules! wrapper { ($($t:tt)*) => {}; }\nmacro_rules! inner_call { ($m:expr) => { $m }; }\nmacro_rules! via_slice { ($m:expr) => { const Y: u8 = 0; }; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\nmacro_rules! inner_fwd { ($m:expr) => { $m }; }\nmacro_rules! via_paren { () => {}; }\nmacro_rules! via_brack { () => {}; }\nmacro_rules! idle_p { () => {}; }\nmacro_rules! idle_b { () => {}; }\n",
+            "macro_rules! sends { ($name:ident, $method:expr) => { fn $name() { let _ = $method; } }; }\nmacro_rules! via_fn { ($m:expr) => { $m }; }\nmacro_rules! via_impl { ($m:expr) => { const X: u8 = 0; }; }\nmacro_rules! idle { () => {}; }\nmacro_rules! quiet_m { () => {}; }\nmacro_rules! via_body { ($m:expr) => { $m }; }\nmacro_rules! wrapper { ($($t:tt)*) => {}; }\nmacro_rules! inner_call { ($m:expr) => { $m }; }\nmacro_rules! via_slice { ($m:expr) => { const Y: u8 = 0; }; }\nmacro_rules! unnamed { ($($t:tt)*) => {}; }\nmacro_rules! inner_fwd { ($m:expr) => { $m }; }\nmacro_rules! via_paren { () => {}; }\nmacro_rules! via_brack { () => {}; }\nmacro_rules! idle_p { () => {}; }\nmacro_rules! idle_b { () => {}; }\n",
         ),
     ] {
         write(folder.path(), &format!("{src}/{path}"), text);

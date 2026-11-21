@@ -533,9 +533,10 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
     let link = tempfile::tempdir().expect("a folder");
     let through = link.path().join("through");
     std::os::unix::fs::symlink(folder.path(), &through).expect("a link");
-    let direct = sender_names(&tree_at(folder.path()).expect("the tree"));
-    assert_eq!(direct, Ok(vec!["sends".to_owned()]));
-    assert_eq!(sender_names(&tree_at(&through).expect("the tree")), direct);
+    // The temporary folder may stand behind a link itself: the tree is made from either path.
+    let direct = tree_at(folder.path()).map(|tree| sender_names(&tree));
+    assert_eq!(direct, Ok(Ok(vec!["sends".to_owned()])));
+    assert_eq!(tree_at(&through).map(|tree| sender_names(&tree)), direct);
     // A declared file that is a link, and a `#[path]` that leaves the checkout.
     let folder = small_tree("mod linked;\n");
     write(folder.path(), "crates/kr-sender/src/real.rs", SENDS);
@@ -575,6 +576,34 @@ fn a_root_through_a_link_reads_what_the_root_itself_does_and_a_link_in_the_tree_
     assert_eq!(
         sender_names(&tree),
         Err("crates/kr-sender/src/lib.rs: the scan does not read a path through a link, with .. or from the root of the file system (it is ../../../../escape.rs)".to_owned())
+    );
+    // A library target that a manifest places outside the checkout is refused with the same words,
+    // where its file is read as a root.
+    let outer = tempfile::tempdir().expect("a folder");
+    let inner = outer.path().join("inner");
+    for (name, text) in [
+        ("kr-worker", "pub fn worker() {}\n"),
+        ("kr-sender", "pub fn quiet() {}\n"),
+        ("kr-protocol", "pub enum Method {}\n"),
+    ] {
+        let target = if name == "kr-sender" {
+            "[lib]\npath = \"../../../escape.rs\"\n"
+        } else {
+            ""
+        };
+        write(
+            &inner,
+            &format!("crates/{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\n{target}"),
+        );
+        write(&inner, &format!("crates/{name}/src/lib.rs"), text);
+    }
+    write(outer.path(), "escape.rs", SENDS);
+    let scan = tree_at(&inner).map(|tree| sender_names(&tree));
+    assert!(
+        matches!(&scan, Ok(Err(text)) if text.contains("escape.rs: ")
+            && text.contains("the scan does not read a path through a link, with .. or from the root of the file system (it is ")),
+        "{scan:?}"
     );
 }
 
