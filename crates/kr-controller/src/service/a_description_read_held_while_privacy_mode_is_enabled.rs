@@ -64,7 +64,7 @@ async fn an_answer_held_while_privacy_mode_is_enabled_carries_no_description() {
     let released = controller.read_released(&actor, &request).await;
     controller
         .attention()
-        .write_released(&mut writer, StreamKind::Control, released)
+        .write_released_held(&mut writer, StreamKind::Control, released, None)
         .await
         .expect("the answer is written");
     let shown = described_by(&mut reader).await;
@@ -81,7 +81,7 @@ async fn an_answer_held_while_privacy_mode_is_enabled_carries_no_description() {
     });
     controller
         .attention()
-        .write_released(&mut writer, StreamKind::Control, held)
+        .write_released_held(&mut writer, StreamKind::Control, held, None)
         .await
         .expect("the answer without the description is written");
     let withheld = described_by(&mut reader).await;

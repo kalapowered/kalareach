@@ -1221,7 +1221,7 @@ impl AttentionModule {
     }
 
     /// Serves one read of this group for a reader's connection: the answer, and what
-    /// [`Self::write_released`] needs to release the session text it carries.
+    /// [`Self::write_released_held`] needs to release the session text it carries.
     pub async fn read_released(
         &self,
         reach: &dyn Reach,
@@ -1236,7 +1236,8 @@ impl AttentionModule {
     }
 
     /// Writes a read's answer to the reader's connection, releasing its session text only while
-    /// its ticket holds.
+    /// its ticket holds, and, for an answer that is also held to a lease, only while `lease`
+    /// holds.
     ///
     /// Each write attempt, the first and every continuation, is one checked write made under the
     /// release lock held shared: the ticket is checked against the clock before every transport
@@ -1245,22 +1246,9 @@ impl AttentionModule {
     /// withheld is written instead; one the reader has part of is not finished, and the caller
     /// ends the connection so the reader asks again.
     ///
-    /// # Errors
-    ///
-    /// Returns the connection's failure, or a refusal to finish an answer the reader has part of.
-    pub async fn write_released(
-        &self,
-        writer: &mut kr_ipc::framed::FrameWriter,
-        kind: kr_protocol::frame::StreamKind,
-        released: Released,
-    ) -> kr_ipc::Result<()> {
-        self.write_released_held(writer, kind, released, None).await
-    }
-
-    /// As [`Self::write_released`], for an answer that is also held to a lease: `lease` is asked
-    /// before every transport write, and before the ticket's clock is compared, because the
-    /// lease's question can wait for a lock. When it stops holding, an answer none of which has
-    /// gone is taken back and its refusal is written instead.
+    /// `lease` is asked before every transport write, and before the ticket's clock is compared,
+    /// because the lease's question can wait for a lock. When it stops holding, an answer none of
+    /// which has gone is taken back and its refusal is written instead.
     ///
     /// # Errors
     ///
@@ -6345,7 +6333,7 @@ pub(crate) mod tests {
         let unchanged = read().await;
         world
             .module
-            .write_released(&mut writer, StreamKind::Control, unchanged)
+            .write_released_held(&mut writer, StreamKind::Control, unchanged, None)
             .await
             .expect("the answer is written");
         let written = reader.read_message::<ControlFrame>().await.expect("read");
@@ -6358,7 +6346,7 @@ pub(crate) mod tests {
         });
         world
             .module
-            .write_released(&mut writer, StreamKind::Control, held)
+            .write_released_held(&mut writer, StreamKind::Control, held, None)
             .await
             .expect("the answer without the summary is written");
         let written = reader.read_message::<ControlFrame>().await.expect("read");
@@ -7116,7 +7104,7 @@ pub(crate) mod tests {
             let ticket = ticket(&[closing], 0, u64::MAX);
             tokio::spawn(async move {
                 let written = module
-                    .write_released(
+                    .write_released_held(
                         &mut partway,
                         StreamKind::Control,
                         Released {
@@ -7124,6 +7112,7 @@ pub(crate) mod tests {
                             withheld: Some(withheld()),
                             ticket,
                         },
+                        None,
                     )
                     .await;
                 drop(partway);
@@ -7153,7 +7142,7 @@ pub(crate) mod tests {
         assert_eq!(module.release_delivery(&delivery, || 1).await, None);
         let (mut whole, mut whole_reader) = owner_connection(&temp, 3).await;
         module
-            .write_released(&mut whole, StreamKind::Control, assembled)
+            .write_released_held(&mut whole, StreamKind::Control, assembled, None)
             .await
             .expect("the withheld answer is written");
         let read = whole_reader
@@ -7217,7 +7206,7 @@ pub(crate) mod tests {
             let module = Arc::clone(&module);
             tokio::spawn(async move {
                 let written = module
-                    .write_released(&mut writer, StreamKind::Control, released)
+                    .write_released_held(&mut writer, StreamKind::Control, released, None)
                     .await;
                 drop(writer);
                 written
@@ -7276,7 +7265,7 @@ pub(crate) mod tests {
         fence_raised(&module, moving).await;
         let (mut writer, mut reader) = owner_connection(&temp, 1).await;
         module
-            .write_released(
+            .write_released_held(
                 &mut writer,
                 StreamKind::Control,
                 Released {
@@ -7284,6 +7273,7 @@ pub(crate) mod tests {
                     withheld: Some(withheld()),
                     ticket: ticket(&[quiet, moving], 0, lease_from_now().get()),
                 },
+                None,
             )
             .await
             .expect("the withheld answer is written");
@@ -7320,7 +7310,7 @@ pub(crate) mod tests {
             let module = Arc::clone(&module);
             tokio::spawn(async move {
                 let written = module
-                    .write_released(
+                    .write_released_held(
                         &mut writer,
                         StreamKind::Control,
                         Released {
@@ -7328,6 +7318,7 @@ pub(crate) mod tests {
                             withheld: Some(withheld()),
                             ticket: ticket(&[session_id], 0, until),
                         },
+                        None,
                     )
                     .await;
                 drop(writer);
@@ -7770,7 +7761,7 @@ pub(crate) mod tests {
         assert_eq!(fence.recorded, Some(0));
         let (mut owner_writer, mut owner_reader) = owner_connection(&temp, 2).await;
         module
-            .write_released(&mut owner_writer, StreamKind::Control, released)
+            .write_released_held(&mut owner_writer, StreamKind::Control, released, None)
             .await
             .expect("an answer is written");
         let ControlFrame::Response(response) = owner_reader

@@ -1133,7 +1133,7 @@ impl crate::service::Controller {
     /// What a model wrote is released only while the privacy state it was read under holds: an
     /// answer that is held while privacy mode is enabled is written without it
     /// ([`crate::attention::AttentionModule::settled`] and
-    /// [`crate::attention::AttentionModule::write_released`]).
+    /// [`crate::attention::AttentionModule::write_released_held`]).
     ///
     /// # Errors
     ///

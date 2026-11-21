@@ -3209,10 +3209,11 @@ async fn released_to_the_reader(
 ) -> AttentionReadResult {
     let (mut writer, mut reader) = owner_connection(temp).await;
     module
-        .write_released(
+        .write_released_held(
             &mut writer,
             kr_protocol::frame::StreamKind::Control,
             released,
+            None,
         )
         .await
         .expect("an answer is written");

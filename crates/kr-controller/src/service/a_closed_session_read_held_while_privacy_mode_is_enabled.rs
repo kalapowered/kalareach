@@ -73,7 +73,7 @@ async fn a_page_held_while_privacy_mode_is_enabled_carries_no_output() {
     let released = controller.read_released(&actor, &request).await;
     controller
         .attention()
-        .write_released(&mut writer, StreamKind::Control, released)
+        .write_released_held(&mut writer, StreamKind::Control, released, None)
         .await
         .expect("the page is written");
     let shown = paged_by(&mut reader).await;
@@ -89,7 +89,7 @@ async fn a_page_held_while_privacy_mode_is_enabled_carries_no_output() {
     });
     controller
         .attention()
-        .write_released(&mut writer, StreamKind::Control, held)
+        .write_released_held(&mut writer, StreamKind::Control, held, None)
         .await
         .expect("the page without its bytes is written");
     let withheld = paged_by(&mut reader).await;
