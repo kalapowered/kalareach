@@ -553,6 +553,45 @@ mod tests {
         }
     }
 
+    /// KR-REQ-12.26: a sender's identifier follows the verified actor and nothing else. One actor
+    /// keeps one identifier whichever device or grant it came under and whichever way it entered
+    /// the host, and the kind of sender changes with those facts while the identifier does not; two
+    /// actors under the same device and grant differ.
+    #[test]
+    fn a_sender_id_follows_the_verified_actor_and_nothing_else() {
+        let from = |actor: &str, ingress, device: Option<u8>, grant: Option<u8>| PromptSender {
+            actor_id: ActorId::new(actor).expect("an actor"),
+            ingress,
+            device_id: device.map(|byte| DeviceId::new(Uuid::from_bytes([byte; 16]))),
+            grant_id: grant.map(|byte| GrantId::new(Uuid::from_bytes([byte; 16]))),
+        };
+        let paired = |actor: &str, device, grant| {
+            from(actor, ActorIngress::PairedDevice, Some(device), Some(grant))
+        };
+        let first = paired("device-1", 9, 8);
+        for (device, grant) in [(9, 7), (4, 8), (4, 7)] {
+            let other = paired("device-1", device, grant);
+            assert_eq!(
+                other.sender_id(),
+                first.sender_id(),
+                "the same actor under device {device} and grant {grant}"
+            );
+            assert_eq!(other.kind(), first.kind());
+        }
+        let local = from("device-1", ActorIngress::LocalIpc, None, None);
+        assert_eq!(
+            local.sender_id(),
+            first.sender_id(),
+            "the same actor entering as a local caller"
+        );
+        assert_ne!(local.kind(), first.kind());
+        assert_ne!(
+            paired("device-2", 9, 8).sender_id(),
+            first.sender_id(),
+            "another actor under the same device and grant"
+        );
+    }
+
     /// KR-REQ-12.26: text shaped like an answer to an approval is recognised by its shape alone,
     /// whatever else is true: a decision word in any case, white space, and four to six ASCII
     /// letters, with nothing else. The last two rows are the cost: ordinary replies of that shape.
