@@ -406,8 +406,10 @@ The worker refuses a message when `prefix name boundary` occurs anywhere in it. 
 dropped when it is a format character (category Cf), a control character that is not white space
 (Cc), a combining mark (Mn, Mc or Me) or a default ignorable code point. The decomposition and the
 marks follow Unicode 17.0.0, and the format characters and default ignorable code points follow
-Unicode 16.0.0. A mark that a later Unicode version adds passes until the worker is built with newer
-tables. `<channel_id>`, `<channels>` and `Arc<channel::Sender<T>>` pass. `<channel>` in any case,
+Unicode 16.0.0. A format character, default ignorable code point or mark that a later Unicode
+version adds passes until the code is updated. A tag word followed by any other character, such as a
+quotation mark, an underscore or a private-use code point, passes, and so does such a character
+inside the word. `<channel_id>`, `<channels>` and `Arc<channel::Sender<T>>` pass. `<channel>` in any case,
 `Vec<Channel>`, `bitrate < channel capacity` and `<channel` followed directly by a dropped character
 are refused.
 

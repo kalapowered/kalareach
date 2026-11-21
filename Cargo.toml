@@ -283,8 +283,8 @@ tokio-util = "=0.7.18"
 tokio-websockets = { version = "=0.13.3", default-features = false, features = ["client", "getrandom", "ring"] }
 tokio = { version = "=1.53.3", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
-# A message's text is folded to its compatibility form, and its invisible format characters
-# are dropped, before it is checked for text shaped like a channel tag.
+# The text of a message into a channel is decomposed, and the characters that the channel tag
+# filter names are marked, before the text is matched against the filter.
 unicode-general-category = "=1.1.0"
 unicode-normalization = "=0.1.25"
 # Where a text can be cut without cutting a character a person sees: the end of a generated
