@@ -98,6 +98,11 @@ export interface KeptDraft {
   readonly updatedAtMs: number
   /** True when a composer holds it and waits for the person to retarget it. */
   readonly inComposer: boolean
+  /**
+   * True while a place that can say a draft was sent could not be read and no composer shows this
+   * draft: whatever else `why` says, it can be a message that was sent.
+   */
+  readonly unread: boolean
 }
 
 /** The text of a prompt the host did not take, or could not say it took, that the store will not keep for its size. */
@@ -2336,7 +2341,8 @@ export class DraftBook {
       files: stored.attachments.length,
       why: why(stored),
       updatedAtMs: Number(stored.updatedAtMs),
-      inComposer: false
+      inComposer: false,
+      unread: this.#sources === 'unknown'
     }))
     const waiting = this.#drafts.flatMap<KeptDraft>((draft) =>
       draft.stored !== null && (draft.state === 'conflicted' || draft.state === 'orphaned')
@@ -2349,7 +2355,8 @@ export class DraftBook {
               files: storable(draft).length,
               why: draft.state,
               updatedAtMs: draft.updatedAtMs,
-              inComposer: true
+              inComposer: true,
+              unread: false
             }
           ]
         : []
