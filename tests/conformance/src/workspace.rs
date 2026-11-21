@@ -339,47 +339,39 @@ struct TableKeys {
 }
 
 /// The tables of a manifest that declare a target, each with the keys above, by the kind of table
-/// and its name. A `[lib]` table without a name is the package's library.
+/// and its name, read as TOML: a table is found whatever its quoting, spacing and key spelling, as
+/// Cargo finds it. A `[lib]` table without a name is the package's library.
 fn table_keys(manifest: &str, package: &str) -> Vec<TableKeys> {
+    let Ok(document) = manifest.parse::<toml::Table>() else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
-    let mut open: Option<TableKeys> = None;
-    for line in manifest.lines() {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        if line.starts_with('[') {
-            found.extend(open.take());
-            open = match line {
-                "[lib]" => Some(TargetKind::Lib),
-                "[[bin]]" => Some(TargetKind::Bin),
-                "[[test]]" => Some(TargetKind::Test),
-                "[[bench]]" => Some(TargetKind::Bench),
-                "[[example]]" => Some(TargetKind::Example),
-                _ => None,
+    for (key, kind) in [
+        ("lib", TargetKind::Lib),
+        ("bin", TargetKind::Bin),
+        ("test", TargetKind::Test),
+        ("example", TargetKind::Example),
+        ("bench", TargetKind::Bench),
+    ] {
+        let tables: Vec<&toml::Table> = match document.get(key) {
+            Some(toml::Value::Table(table)) if kind == TargetKind::Lib => vec![table],
+            Some(toml::Value::Array(tables)) if kind != TargetKind::Lib => {
+                tables.iter().filter_map(toml::Value::as_table).collect()
             }
-            .map(|kind| TableKeys {
-                kind,
-                name: String::new(),
-                own_harness: false,
-                bench: None,
-            });
-            continue;
-        }
-        let Some(table) = open.as_mut() else {
-            continue;
+            _ => Vec::new(),
         };
-        if let Some((key, value)) = line.split_once('=') {
-            match (key.trim(), value.trim()) {
-                ("name", value) => table.name = value.trim_matches('"').to_owned(),
-                ("harness", "false") => table.own_harness = true,
-                ("bench", "true") => table.bench = Some(true),
-                ("bench", "false") => table.bench = Some(false),
-                _ => {}
-            }
-        }
-    }
-    found.extend(open);
-    for table in &mut found {
-        if table.name.is_empty() {
-            table.name = package.replace('-', "_");
+        for table in tables {
+            let name = match table.get("name").and_then(toml::Value::as_str) {
+                Some(name) => name.to_owned(),
+                None if kind == TargetKind::Lib => package.replace('-', "_"),
+                None => String::new(),
+            };
+            found.push(TableKeys {
+                kind,
+                name,
+                own_harness: table.get("harness").and_then(toml::Value::as_bool) == Some(false),
+                bench: table.get("bench").and_then(toml::Value::as_bool),
+            });
         }
     }
     found
@@ -729,6 +721,49 @@ bench = false
                 (TargetKind::Test, "flow".to_owned(), Some(true)),
                 (TargetKind::Example, "demo".to_owned(), Some(true)),
                 (TargetKind::Bench, "speed".to_owned(), Some(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_manifest_is_read_as_toml_whatever_its_quoting_its_spacing_and_its_key_spelling() {
+        let manifest = "\
+[package]
+name = 'a-crate'
+
+[[test]]
+name = 'single'
+bench = true
+
+[[ test ]]
+name = \"spaced\"
+bench = true
+
+[[test]]
+name = \"quoted\"
+\"bench\" = true
+
+[[bench]]
+'name' = \"own\"
+harness = false
+bench = false
+
+[lib]
+bench = false # the library is not benchmarked
+";
+        let keys = |keys: Vec<TableKeys>| -> Vec<(TargetKind, String, bool, Option<bool>)> {
+            keys.into_iter()
+                .map(|table| (table.kind, table.name, table.own_harness, table.bench))
+                .collect()
+        };
+        assert_eq!(
+            keys(table_keys(manifest, "a-crate")),
+            [
+                (TargetKind::Lib, "a_crate".to_owned(), false, Some(false)),
+                (TargetKind::Test, "single".to_owned(), false, Some(true)),
+                (TargetKind::Test, "spaced".to_owned(), false, Some(true)),
+                (TargetKind::Test, "quoted".to_owned(), false, Some(true)),
+                (TargetKind::Bench, "own".to_owned(), true, Some(false)),
             ]
         );
     }
