@@ -3496,7 +3496,7 @@ async fn a_refresh_of_an_environment_no_bridge_reaches_is_given_as_a_copy_of_its
         .environment_record(&actor, false, &enrol, Method::EnvironmentEnrol, rig.carried)
         .await;
     assert!(
-        !enrolled.is_copied() && !enrolled.is_withheld(),
+        !enrolled.is_copied() && enrolled.origin() != crate::given::Origin::Withheld,
         "an enrolment is what this request did"
     );
     enrolled.into_answer_for_test().expect("enrolled");
@@ -3585,7 +3585,7 @@ async fn an_installation_answered_from_its_record_is_given_as_a_copy() {
 
     let first = install().await;
     assert!(
-        !first.is_copied() && !first.is_withheld(),
+        !first.is_copied() && first.origin() != crate::given::Origin::Withheld,
         "the first attempt is what this request did"
     );
     first
@@ -3835,7 +3835,7 @@ async fn a_file_of_the_agents_this_host_cannot_read_is_the_requests_own_refusal(
         )
         .await;
     assert!(
-        !refused.is_copied() && !refused.is_withheld(),
+        !refused.is_copied() && refused.origin() != crate::given::Origin::Withheld,
         "nothing about the request's own files names a record"
     );
     assert!(matches!(
