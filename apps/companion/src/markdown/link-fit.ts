@@ -13,20 +13,26 @@
  * The room is one packing of a row of links (`packRooms`). The boxes of a row are intervals that hold their
  * links' words, stay in the message's column (or in the box that clips the link, where one does: a scroller
  * inside a message keeps the box in its own scrolled content), and keep off one another and off the controls
- * beside them. A row is a line, or two neighbouring lines whose links stand apart (their heights reach one
- * another, and no link lies over another's words). The packing completes as many of a row's short links as any
- * assignment of such boxes can (the proof is a case that compares it with an exhaustive search over many
- * small random rows of one and of two lines). A completed link has exactly the least size, plus up to
- * `SLACK` on a side from room that nothing else uses; it has what it lacks centred on its words where the
- * neighbours allow it, and takes it from the side whose neighbour cannot be completed last. A link that
- * cannot be completed has all the room that the completed links leave it, shared in halves with a short
- * neighbour that cannot be completed either.
+ * beside them. A row is a line, or neighbouring lines whose links stand apart (their heights reach one
+ * another and no link lies over another's words). A group that is not a row (a link over another, or lines
+ * that do not all reach one another) is packed line by line, twice: first against the middle of the gap to
+ * another line's short link (or the edge of its wide link), then again, in the order of the lines' tops,
+ * against the other lines' current boxes; a short link there can stay short where a joint packing of the
+ * group would complete it, and is never narrower than the line-by-line packing gives it.
  *
- * A link left under the least size is therefore one that no assignment completes together with the links
- * that the packing completes; it is as wide as the room beside it allows. The exception is a group of links
- * that stand over one another (a table's cells) or on lines three apart: each of its lines is packed alone,
- * with the middle of the gap to a short link of another line, or the edge of another line's wide link, as the
- * wall, so a short link there can stay short where a joint packing would complete it.
+ * In a row the packing completes as many short links as any assignment of such boxes can (the proof is a
+ * case that compares it with an exhaustive search over many small random rows of one and of two lines). A
+ * completed link has the least size, plus up to `SLACK` on a side from room that nothing else uses; it has
+ * what it lacks centred on its words where the neighbours allow it. A completed link takes the least from
+ * the side whose neighbour is a short link that cannot be completed, and the rest from the other side, so
+ * that the neighbour keeps the gap. A link that cannot be completed has all the room that the completed
+ * links leave it, shared in halves with a short neighbour that cannot be completed either.
+ *
+ * In a row, a link left narrower than the least size is one that no assignment of non-overlapping boxes
+ * completes together with the links the packing completes; it has all the room that those leave it, shared
+ * in halves with a short neighbour that cannot be completed either. In any other group each line is packed
+ * against the other lines' current boxes in the order of their tops, so a link there can stay short where
+ * a joint packing of the group would complete it.
  *
  * Which link opens is not decided here. The padding is measured from the words' own box, which the
  * padding does not move, so a measure of a measured link gives the same answer and a change that adds
@@ -95,9 +101,10 @@ interface Slot {
  * The links whose heights reach one another are one group. Where every two links of a group reach one another and
  * none lies over another's words (a line, or two neighbouring lines whose links stand apart), the group is one
  * row, packed as one: each box holds its words and the packing completes as many short links as any assignment
- * does. Any other group (links over one another, lines three apart) is packed line by line (connected groups of
- * `sameLine`), with the middle of the gap to a short link of another line, or the edge of another line's wide link,
- * as the wall: a short link there can stay short where a joint packing would complete it. A control is a wall
+ * does. Any other group (a link over another, or lines that do not all reach one another) is packed line by line
+ * (connected groups of `sameLine`), twice: against the middle of the gap to a short link of another line, or the
+ * edge of its wide link, and then, in the order of the lines' tops, against the other lines' current boxes: a short
+ * link there can stay short where a joint packing would complete it. A control is a wall
  * of every link whose height it reaches.
  */
 export function packRooms(items: readonly Item[], least: number, slack: number = SLACK): Beside[] {
@@ -132,9 +139,9 @@ export function packRooms(items: readonly Item[], least: number, slack: number =
           at,
           left: item.box.left,
           right: item.box.right,
-          lack: short(at) ? least - width(item) : 0,
-          leftRoom: wall === undefined ? 0 : Math.max(0, item.box.left - wall.left),
-          rightRoom: wall === undefined ? 0 : Math.max(0, wall.right - item.box.right)
+          lack: short(at) ? Math.ceil((least - width(item)) * GRID) / GRID : 0,
+          leftRoom: wall === undefined ? 0 : held(item.box.left - wall.left),
+          rightRoom: wall === undefined ? 0 : held(wall.right - item.box.right)
         }
       })
       .sort((a, b) => a.left - b.left)
@@ -197,7 +204,7 @@ const EPSILON = 1e-9
  */
 function packLine(slots: readonly Slot[], slack: number): Beside[] {
   const count = slots.length
-  const gap = (k: number): number => Math.max(0, (slots[k + 1]).left - (slots[k]).right)
+  const gap = (k: number): number => held(slots[k + 1].left - slots[k].right)
   interface State {
     readonly right: number
     readonly took: boolean
@@ -241,8 +248,8 @@ function packLine(slots: readonly Slot[], slack: number): Beside[] {
     const room = Math.min(slot.rightRoom, k < count - 1 ? gap(k) - (needs[k + 1] ?? 0) : Infinity)
     needs[k] = Math.max(0, slot.lack - room)
   }
-  // The completed links, from the left. A completed link takes half of what it lacks from each side, or all of it from the side whose
-  // neighbour is a short link that cannot be completed, so that the neighbour keeps the gap; the others leave it what they can.
+  // The completed links, from the left. A completed link takes half of what it lacks from each side, or the least from the side whose
+  // neighbour is a short link that cannot be completed and the rest from the other side, so that the neighbour keeps the gap.
   const open = (k: number): boolean => k >= 0 && k < count && (slots[k]).lack > 0 && !done[k]
   const given: { left: number; right: number }[] = slots.map(() => ({ left: 0, right: 0 }))
   let taken = 0
@@ -378,7 +385,8 @@ export function fitLinks(pane: HTMLElement, messages: readonly Element[]): void 
     if (!link || !mine.has(message)) return
     const room = rooms[index] ?? NONE
     const now = givenTo(element)
-    if (Math.abs(room.left - now.left) > 1 / GRID || Math.abs(room.right - now.right) > 1 / GRID) writes.push({ link: element, room })
+    // The room is on the grid and so is what is written: a change of one step is a change.
+    if (Math.abs(room.left - now.left) > EPSILON || Math.abs(room.right - now.right) > EPSILON) writes.push({ link: element, room })
   })
   for (const { link, room } of writes) {
     give(link, LEFT, room.left)
