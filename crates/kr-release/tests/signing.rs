@@ -705,6 +705,22 @@ fn a_member_with_no_canonical_form_is_refused_as_that() {
         "{error}"
     );
 
+    // Whole numbers the JSON reader keeps as floating-point values all the same: a negative zero
+    // and a whole number past each end of the 64-bit range, in the document's own text.
+    let text = signed_by(&written, &[&signer]);
+    let signed_at = text.find("\"signed\":").expect("the signed members");
+    let open = signed_at + text[signed_at..].find('{').expect("an object") + 1;
+    for number in ["-0", "18446744073709551616", "-9223372036854775809"] {
+        let mut raw = text.clone();
+        raw.insert_str(open, &format!("\"ratio\":{number},"));
+        let error = verify_manifest(&targets_root, raw.as_bytes())
+            .expect_err("a manifest with a number that is kept as a floating-point value");
+        assert!(
+            matches!(error, VerifyError::NoCanonicalForm(_)),
+            "{number}: {error}"
+        );
+    }
+
     let root_signer = pair();
     let mut root = signed_root(
         root_of(&[
