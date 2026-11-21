@@ -177,6 +177,15 @@ pub fn from_argument() -> Method {
     named!(AgentTurnSteer)
 }
 
+pub fn from_local_macro() -> Method {
+    macro_rules! inner {
+        () => {
+            Method::AgentApprovalRespond
+        };
+    }
+    inner!()
+}
+
 pub fn request() -> MutationRequest {
     MutationRequest {
         request_id: 1,
@@ -471,6 +480,7 @@ fn each_way_a_client_names_a_stamped_item_is_read_by_the_compiler_and_the_rest_i
             "kr_forms file:crates/kr-forms/data/wire.json Unread",
             "kr_forms from_argument Names",
             "kr_forms from_data Names+Unread",
+            "kr_forms from_local_macro Names",
             "kr_forms from_macro Names",
             "kr_forms imported Names",
             "kr_forms literal Unread",
