@@ -998,6 +998,18 @@ impl Drop for Locked {
     }
 }
 
+/// What a case runs once a removal holds a manifest's lock, to start a program that keeps a copy
+/// of the file.
+#[cfg(all(test, unix))]
+type AfterRemovalLock = Box<dyn FnMut(&File)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// The case's own step once a removal holds a manifest's lock, if it has one.
+    static AFTER_REMOVAL_LOCK: std::cell::RefCell<Option<AfterRemovalLock>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// A host's store of installed releases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Store {
@@ -1669,6 +1681,14 @@ impl Store {
             }
         }
         let locked = Locked(file);
+        #[cfg(test)]
+        {
+            AFTER_REMOVAL_LOCK.with(|hook| {
+                if let Some(run) = hook.borrow_mut().as_mut() {
+                    run(&locked.0);
+                }
+            });
+        }
         crate::paths::create_private_directory(&self.trash()).map_err(|error| {
             InstallError::io(
                 "create the store directory",
@@ -3630,6 +3650,137 @@ mod tests {
             "the update lock goes with its holder",
             || test.store.try_lock_update().expect("asks").is_some(),
         );
+    }
+
+    /// A running program that holds a copy of an open file and runs no other program, as one does
+    /// that another thread started while a lock on the file was held: the copy shares the open
+    /// file, and so the lock, until the program ends.
+    fn program_with_a_copy_of(file: &File) -> Started {
+        use std::process::Stdio;
+
+        let copy = file.try_clone().expect("a copy of the file");
+        Started(
+            std::process::Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(copy))
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("the program starts"),
+        )
+    }
+
+    /// The update lock ends with its holder, though a program keeps a copy of its file: the next
+    /// ask for it is not refused.
+    #[test]
+    fn the_update_lock_ends_with_its_holder_though_a_program_keeps_a_copy_of_its_file() {
+        let test = test_store();
+        let update = test.store.try_lock_update().expect("locks").expect("free");
+        let _program = program_with_a_copy_of(&update.file);
+        assert!(
+            test.store.try_lock_update().expect("asks").is_none(),
+            "the control: the holder has it"
+        );
+        drop(update);
+        assert!(
+            test.store.try_lock_update().expect("asks").is_some(),
+            "the update lock is free once its holder ended"
+        );
+    }
+
+    /// The install lock ends with its holder, though a program keeps a copy of its file.
+    #[test]
+    fn the_install_lock_ends_with_its_holder_though_a_program_keeps_a_copy_of_its_file() {
+        let test = test_store();
+        let install = test.store.try_lock_install().expect("locks").expect("free");
+        let _program = program_with_a_copy_of(&install.0.file);
+        assert!(
+            test.store.try_lock_install().expect("asks").is_none(),
+            "the control: the holder has it"
+        );
+        drop(install);
+        assert!(
+            test.store.try_lock_install().expect("asks").is_some(),
+            "the install lock is free once its holder ended"
+        );
+    }
+
+    /// The writers' lock ends with its holder, though a program keeps a copy of its file.
+    #[test]
+    fn the_writers_lock_ends_with_its_holder_though_a_program_keeps_a_copy_of_its_file() {
+        let test = test_store();
+        let writers = test.store.try_lock_writers().expect("locks").expect("free");
+        let _program = program_with_a_copy_of(&writers.0.file);
+        assert!(
+            test.store.try_lock_writers().expect("asks").is_none(),
+            "the control: the holder has it"
+        );
+        drop(writers);
+        assert!(
+            test.store.try_lock_writers().expect("asks").is_some(),
+            "the writers' lock is free once its holder ended"
+        );
+    }
+
+    /// Removes a release while a program that another thread started keeps a copy of the lock the
+    /// removal holds on the manifest, with the trash made unusable when `fails`. Says what the
+    /// removal answered and whether the manifest, opened by this case before the removal, reads
+    /// free once the removal ended.
+    fn manifest_after_a_removal_with_a_copy(fails: bool) -> (Result<bool>, bool) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        install(&test.store, &one);
+        let update = test.store.try_lock_update().expect("locks").expect("free");
+        if fails {
+            std::fs::remove_dir(test.store.trash()).expect("the trash goes");
+            std::fs::write(test.store.trash(), b"not a directory").expect("a file in its place");
+        }
+        let reader = Rc::new(File::open(test.store.manifest(&one)).expect("the manifest"));
+        let program = Rc::new(RefCell::new(None));
+        let hook = {
+            let (reader, program) = (Rc::clone(&reader), Rc::clone(&program));
+            move |locked: &File| {
+                assert!(
+                    rustix::fs::flock(&*reader, rustix::fs::FlockOperation::NonBlockingLockShared)
+                        .is_err(),
+                    "the control: the removal holds the manifest"
+                );
+                *program.borrow_mut() = Some(program_with_a_copy_of(locked));
+            }
+        };
+        AFTER_REMOVAL_LOCK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let removed = test.store.retire(&one, &update);
+        AFTER_REMOVAL_LOCK.with(|slot| *slot.borrow_mut() = None);
+        assert!(
+            program.borrow().is_some(),
+            "the program ran while the lock was held"
+        );
+        let free = rustix::fs::flock(
+            &*reader,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .is_ok();
+        (removed, free)
+    }
+
+    /// A removal that is done holds no lock on the manifest it took away, though a program keeps a
+    /// copy of its file.
+    #[test]
+    fn a_removal_that_is_done_leaves_no_lock_though_a_program_keeps_a_copy_of_the_manifest() {
+        let (removed, free) = manifest_after_a_removal_with_a_copy(false);
+        assert!(removed.expect("removes"), "the release went");
+        assert!(free, "the lock is free once the removal ended");
+    }
+
+    /// A removal that fails after it took the lock holds none once it has ended, though a program
+    /// keeps a copy of the manifest's file.
+    #[test]
+    fn a_removal_that_fails_leaves_no_lock_though_a_program_keeps_a_copy_of_the_manifest() {
+        let (removed, free) = manifest_after_a_removal_with_a_copy(true);
+        removed.expect_err("the trash cannot be made");
+        assert!(free, "the lock is free once the removal ended");
     }
 
     /// The roots a daemon records are read back whole, a path of any bytes included.
