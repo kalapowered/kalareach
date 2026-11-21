@@ -11,17 +11,27 @@ two lists from the workflow, asks Cargo for the workspace's members, and fails w
   * a list names a package that is not a member of the workspace, or the one package the landing
     workflow leaves out of the macOS run (`kr-sync-integration`, every test of which is a leg
     against a live deployment, which the rust job runs),
-  * a list has a word that is not `-p` or a package, or the workflow has not both legs.
+  * a list has a word that is not `-p` or a package, or names no package (`cargo test` with no
+    package selects every member of the workspace),
+  * the matrix has a test leg twice, has none, or has a test part besides the two (the Test step
+    runs every part that begins with `tests`, so an extra one would run packages again).
 
 A new crate therefore has to be put in one of the lists before the job passes.
 
+The legs also build with the features of their own packages' dependency graph, and the one step
+that ran the whole workspace built with the features all 47 packages asked for together. The
+`features` command compares the two with `cargo tree` and fails on a package whose features differ
+and that is not named, with its reason, in `FEATURE_DIFFERENCES` below.
+
     python3 scripts/check-macos-test-division.py check [--locked]
+    python3 scripts/check-macos-test-division.py features
     python3 scripts/check-macos-test-division.py self-test
 
 `self-test` puts the check through a workflow and a workspace that are written out here: the
 division that holds, a member left out, a member in both lists, a member twice in one list, a name
-that is no member, the left-out package named, a word that is no package and a leg that is missing.
-Each fault must be refused and named, and the division that holds must pass.
+that is no member, the left-out package named, a word that is no package, a leg that is missing, a
+leg twice, an extra test leg, an empty list, and the comparison of features. Each fault must be
+refused and named, and the division that holds must pass.
 """
 
 import argparse
@@ -53,21 +63,20 @@ def job_text(workflow):
     return lines[start:end]
 
 
-def lists(workflow):
-    """The packages each leg of the matrix names, by `part`, as the words of its `packages` value."""
+def entries(workflow):
+    """The matrix entries of the job, in order, as (part, words of its `packages` value or None)."""
     lines = job_text(workflow)
-    found = {}
-    part = None
+    found = []
     at = 0
     while at < len(lines):
         line = lines[at]
         at += 1
         matched = re.match(r"\s+part:\s*(\S+)\s*$", line)
         if matched:
-            part = matched.group(1)
+            found.append([matched.group(1), None])
             continue
         matched = re.match(r"(\s+)packages:\s*(>-|>|\|-|\||)\s*(.*)$", line)
-        if not matched or part is None:
+        if not matched or not found:
             continue
         indent = len(matched.group(1))
         words = matched.group(3).split()
@@ -76,9 +85,13 @@ def lists(workflow):
         ):
             words.extend(lines[at].split())
             at += 1
-        found.setdefault(part, []).extend(words)
-        part = None
-    return found
+        found[-1][1] = words
+    return [(part, words) for part, words in found]
+
+
+def lists(workflow):
+    """The words of the `packages` value of each test leg named in LEGS, by `part`."""
+    return {part: words for part, words in entries(workflow) if part in LEGS and words is not None}
 
 
 def packages_of(words):
@@ -98,16 +111,26 @@ def packages_of(words):
 
 def problems(workflow, members):
     """What is wrong with the division of `members` in `workflow`, one sentence for each fault."""
-    found = lists(workflow)
     faults = []
+    parts = [part for part, _ in entries(workflow)]
+    for part in sorted({part for part in parts if part.startswith("tests") and part not in LEGS}):
+        faults.append(f"the matrix has a test leg {part}, which the check does not hold to the workspace")
     for leg in LEGS:
-        if leg not in found:
-            faults.append(f"the {JOB} job's matrix has no {leg} leg with a packages list")
+        if parts.count(leg) == 0:
+            faults.append(f"the {JOB} job's matrix has no {leg} leg")
+        elif parts.count(leg) > 1:
+            faults.append(f"the {JOB} job's matrix has the {leg} leg {parts.count(leg)} times")
+    found = lists(workflow)
+    for leg in LEGS:
+        if parts.count(leg) == 1 and leg not in found:
+            faults.append(f"{leg} has no packages list")
     if faults:
         return faults
     named = {}
     for leg in LEGS:
         names, odd = packages_of(found[leg])
+        if not names:
+            faults.append(f"{leg} names no package, and `cargo test` with none selects every member")
         for word in odd:
             faults.append(f"{leg}: `{word}` is not `-p` or the name of a package after it")
         for name in sorted({name for name in names if names.count(name) > 1}):
@@ -160,7 +183,111 @@ def check(locked):
     return 0
 
 
-def fixture(first, second):
+# The packages a leg's build gives other features than the one step that ran the whole workspace
+# gave them, each with the reason, keyed by package and leg. A leg builds with the features its own
+# packages ask for: a feature only a package of the other leg asks for is left out of the build, as
+# it is of the product's own programs. A package of the leg that relied on a feature it does not ask
+# for would not build, so a difference below changes what a case does only where the feature gates
+# code that a case turns on, and the first-party ones are read for that.
+FEATURE_DIFFERENCES = {
+    ("kr-crypto", "tests-2"): "`testing` is asked for by kr-controller's tests only; it adds a stand-in that acts only where a case installs it",
+    ("kr-protocol", "tests-2"): "`testing` is asked for by kr-controller's and kr-ipc's tests only; it adds two items in retained.rs that only those tests call",
+    ("kr-transfer", "tests-2"): "`testing` is turned on by kr-transfer's own tests, which are `tests-1`'s; it adds seams that act only where a case sets them",
+    ("kr-changeset", "tests-2"): "`fault-injection` is turned on by kr-changeset's own tests and kr-controller's, both `tests-1`'s; its hooks act only where a case arms them",
+    ("kr-client", "tests-2"): "`default` (`terminal`) is asked for by kr-controller only; a `tests-2` package that uses the terminal projection asks for `terminal` itself",
+    ("kr-plugin-sdk", "tests-1"): "`testing` is turned on by kr-plugin-sdk's own tests, which are `tests-2`'s; it adds one item in validate.rs that only those tests call",
+    ("kr-shell-integration", "tests-1"): "`testing` is asked for by kr-cli's tests only; it adds seams in the terminal profile code that act only where a case sets them",
+}
+_THIRD_PARTY = (
+    "a third-party crate whose extra features only packages of the other leg ask for; no package "
+    "of this leg's own graph asks for them"
+)
+for _leg, _packages in {
+    "tests-1": """bindgen bit-set bitflags block2 bumpalo dispatch2 foldhash hashbrown icu_properties
+        num-rational objc2 objc2-core-foundation object proc-macro2 regex regex-syntax rgb rmcp rustix
+        serde_json simdutf8 smallvec stable_deref_trait ureq uuid zlib-rs""",
+    "tests-2": """chrono displaydoc form_urlencoded hyper-util iroh iroh-metrics iroh-relay nom noq
+        noq-proto rcgen reqwest ring simdutf8 tower""",
+}.items():
+    for _package in _packages.split():
+        FEATURE_DIFFERENCES[(_package, _leg)] = _THIRD_PARTY
+
+TARGET = "aarch64-apple-darwin"
+TREE = ["cargo", "tree", "--locked", "-e", "normal,build,dev", "--target", TARGET, "--prefix", "none", "-f", "{p} {f}"]
+NODE = re.compile(r"^(\S+) v(\S+)(?: \(([^)]*)\))?(?: (\S+))?$")
+
+
+def unified_features(tree):
+    """The features each package of a `cargo tree` listing has, as {(name, version): {features}}."""
+    found = {}
+    for line in tree.splitlines():
+        line = line.strip()
+        while line.endswith(" (*)") or line.endswith(" (proc-macro)"):
+            line = line.rsplit(" (", 1)[0]
+        matched = NODE.match(line)
+        if not matched:
+            continue
+        name, version, source, features = matched.groups()
+        found.setdefault((name, version), set()).update(features.split(",") if features else [])
+        found[(name, version)].discard("")
+    return found
+
+
+def feature_differences(whole, leg):
+    """What the leg's packages have less or more than the whole workspace's, as sorted tuples of
+    (package, `less` or `more`, feature)."""
+    differences = set()
+    for key, features in leg.items():
+        if key not in whole:
+            continue
+        for feature in whole[key] - features:
+            differences.add((key[0], "less", feature))
+        for feature in features - whole[key]:
+            differences.add((key[0], "more", feature))
+    return sorted(differences)
+
+
+def unlisted(differences, leg, allowed):
+    """The differences of `leg` whose package `allowed` does not name for that leg."""
+    return [d for d in differences if (d[0], leg) not in allowed]
+
+
+def tree(arguments):
+    answer = subprocess.run(TREE + arguments, capture_output=True, text=True, check=False)
+    if answer.returncode != 0:
+        sys.stderr.write(answer.stderr)
+        raise SystemExit("cargo tree failed")
+    return answer.stdout
+
+
+def features():
+    with open(WORKFLOW, encoding="utf-8") as file:
+        workflow = file.read()
+    found = lists(workflow)
+    whole = unified_features(tree(["--workspace", "--exclude", LEFT_OUT]))
+    failed = False
+    seen = set()
+    for leg in LEGS:
+        names, _ = packages_of(found[leg])
+        arguments = [word for name in names for word in ("-p", name)]
+        differences = feature_differences(whole, unified_features(tree(arguments)))
+        for package, _, _ in differences:
+            seen.add((package, leg))
+        for package, direction, feature in unlisted(differences, leg, FEATURE_DIFFERENCES):
+            failed = True
+            print(
+                f"check-macos-test-division: {leg} builds {package} with {feature} {direction} than the whole "
+                f"workspace's one step, and FEATURE_DIFFERENCES names no reason for it for {leg}",
+                file=sys.stderr,
+            )
+    for entry in sorted(set(FEATURE_DIFFERENCES) - seen):
+        print(f"note: FEATURE_DIFFERENCES names {entry}, which no longer differs; remove it")
+    if not failed:
+        print(f"every feature the legs build with differently is named, {len(FEATURE_DIFFERENCES)} in all")
+    return 1 if failed else 0
+
+
+def fixture(first, second, extra=()):
     """A workflow with a `macos` job whose two legs name these packages, and a job before and after it."""
 
     def entry(part, names):
@@ -188,6 +315,7 @@ def fixture(first, second):
         "        include:\n"
         + (entry("tests-1", first) if first is not None else "")
         + (entry("tests-2", second) if second is not None else "")
+        + "".join(entry(part, names) for part, names in extra)
         + "          - name: macos-demonstrations\n"
         "            part: demonstrations\n"
         "  after:\n"
@@ -236,6 +364,21 @@ def self_test():
             fixture(["alpha", "beta", "gamma", "delta"], None),
             ["has no tests-2 leg"],
         ),
+        (
+            "a leg twice in the matrix",
+            fixture(["alpha", "beta"], ["gamma", "delta"], [("tests-1", ["alpha"])]),
+            ["the tests-1 leg 2 times"],
+        ),
+        (
+            "an extra test leg that would run packages again",
+            fixture(["alpha", "beta"], ["gamma", "delta"], [("tests-3", ["alpha"])]),
+            ["a test leg tests-3"],
+        ),
+        (
+            "an empty list, which `cargo test` takes as every member",
+            fixture([], ["alpha", "beta", "gamma", "delta"]),
+            ["tests-1 names no package"],
+        ),
     ]
     failed = False
     for what, workflow, expected in cases:
@@ -250,6 +393,24 @@ def self_test():
             print(f"self-test: {what}: wanted {expected or 'no fault'}, got {faults}", file=sys.stderr)
         else:
             print(f"self-test: {what}: {'accepted' if not expected else 'refused, ' + '; '.join(faults)}")
+    # The features: a difference is found, and is refused unless its package is named for its leg.
+    whole = unified_features(
+        "alpha v1.0.0 (/w/alpha) testing,extra\nserde v1.0.0 derive,std\n"
+        "serde v1.0.0 derive,std (*)\nmacro v0.1.0 (proc-macro)\nbeta v1.0.0 (/w/beta)\n"
+    )
+    leg = unified_features("alpha v1.0.0 (/w/alpha) extra\nserde v1.0.0 derive,std\nmacro v0.1.0 (proc-macro)\n")
+    found = feature_differences(whole, leg)
+    cases = [
+        ("a feature the leg lacks is found", found == [("alpha", "less", "testing")]),
+        ("it is refused when no reason names it", unlisted(found, "tests-1", {}) == found),
+        ("it is accepted when its package is named for the leg", unlisted(found, "tests-1", {("alpha", "tests-1"): "x"}) == []),
+        ("it is refused for another leg", unlisted(found, "tests-2", {("alpha", "tests-1"): "x"}) == found),
+        ("a package only the whole run has is no difference", feature_differences(whole, {}) == []),
+    ]
+    for what, ok in cases:
+        if not ok:
+            failed = True
+        print(f"self-test: {what}: {'ok' if ok else 'WRONG'}")
     return 1 if failed else 0
 
 
@@ -258,10 +419,13 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     checking = commands.add_parser("check", help="the workflow's lists against the workspace")
     checking.add_argument("--locked", action="store_true")
+    commands.add_parser("features", help="the legs' unified features against the whole workspace's")
     commands.add_parser("self-test", help="the check against faults it must refuse")
     arguments = parser.parse_args()
     if arguments.command == "check":
         return check(arguments.locked)
+    if arguments.command == "features":
+        return features()
     return self_test()
 
 
