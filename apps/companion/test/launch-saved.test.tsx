@@ -601,6 +601,95 @@ describe('the Settings form for the saved commands', () => {
     expect(controls.launchCommands.writes).toEqual([])
   })
 
+  /** A running session on the scripted host, and its identifier. */
+  async function createdSession(port: HostPort): Promise<string> {
+    const created = await port.sessionCreate(
+      {
+        environment_id: ENVIRONMENT,
+        presentation: 'invisible',
+        shell: null,
+        shell_mode: 'native_compat',
+        cwd: '/Users/rs/work/notes',
+        dimensions: null,
+        worker_profile: 'desktop_bound',
+        environment_snapshot: [],
+        palette: null,
+        launch_profile: { startup: 'host_default', fenced_launch: false, command_integrations: [] },
+        terminal: null
+      },
+      {}
+    )
+    return created.value?.session.session_id ?? ''
+  }
+
+  const PASSED_IN_POWERSHELL = 'A program that begins with ~ is looked for under the home folder.'
+  const PASSED_BY_DEFAULT = 'a leading ~ or a $VARIABLE is not expanded'
+
+  it('asks for the session\'s shell again when Settings is opened again after a read that named none', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost({ stockShell: 'powershell' })
+    controls.launchScenario('not_served')
+    open(port, 'semantic', await createdSession(port))
+    await person.click(await screen.findByRole('button', { name: 'Settings' }))
+    await person.click(await screen.findByRole('button', { name: 'Launch commands' }))
+    expect(await screen.findByTestId('launch-commands-passed')).toHaveTextContent(PASSED_BY_DEFAULT)
+
+    // The host serves the surface now, and the person opens Settings again.
+    controls.launchScenario('follow')
+    await person.click(screen.getByRole('button', { name: 'Close settings' }))
+    await person.click(await screen.findByRole('button', { name: 'Settings' }))
+    await waitFor(() => {
+      expect(screen.getByTestId('launch-commands-passed')).toHaveTextContent(PASSED_IN_POWERSHELL)
+    })
+  })
+
+  it('takes the form of the shell from the answer of the session Settings is opened over, and not from another session\'s', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost({ stockShell: 'powershell' })
+    const first = await createdSession(port)
+    const second = await createdSession(port)
+    function Switch(): ReactNode {
+      const { go } = useApp()
+      return (
+        <button
+          type="button"
+          onClick={() => {
+            go({ view: 'session', sessionId: second, pane: 'semantic' })
+          }}
+        >
+          Show the second session
+        </button>
+      )
+    }
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: first, pane: 'semantic' }}>
+        <App />
+        <Switch />
+      </AppProvider>
+    )
+    await person.click(await screen.findByRole('button', { name: 'Settings' }))
+    await person.click(await screen.findByRole('button', { name: 'Launch commands' }))
+    await waitFor(() => {
+      expect(screen.getByTestId('launch-commands-passed')).toHaveTextContent(PASSED_IN_POWERSHELL)
+    })
+
+    // The second session's read is on its way: until it answers, nothing says this session runs
+    // PowerShell, so the form is the one for the other shells.
+    const reads = controls.hold('launchSurface')
+    await person.click(screen.getByRole('button', { name: 'Show the second session' }))
+    await waitFor(() => {
+      expect(reads.count).toBeGreaterThan(0)
+    })
+    expect(screen.getByTestId('launch-commands-passed')).toHaveTextContent(PASSED_BY_DEFAULT)
+    await act(async () => {
+      reads.release()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('launch-commands-passed')).toHaveTextContent(PASSED_IN_POWERSHELL)
+    })
+  })
+
   it.each([
     ['powershell', 'a ~ at the start of an argument', 'A program that begins with ~ is looked for under the home folder.'],
     ['zsh', 'a leading ~', null]
