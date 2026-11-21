@@ -1636,7 +1636,8 @@ fn a_raw_identifier_is_the_name_it_stands_for_in_every_rule_that_reads_a_name() 
 }
 
 #[test]
-fn a_place_no_configuration_without_test_builds_is_not_read_by_the_inventory_at_any_depth() {
+fn a_place_no_configuration_without_test_builds_is_not_read_in_an_impl_an_enum_a_variant_or_a_field()
+ {
     let at = "crates/kr-sender/src/lib.rs";
     // The children of a disabled impl, enum, variant or field raise no refusal.
     for lib in [
