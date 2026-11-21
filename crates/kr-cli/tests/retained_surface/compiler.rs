@@ -433,6 +433,8 @@ pub struct Meta {
     /// The procedural-macro crates each client crate depends on, by any kind of dependency: the
     /// package, and whether it is a member of the workspace.
     pub proc_macros: BTreeMap<String, BTreeSet<(String, bool)>>,
+    /// The members (by package name) that depend directly on `llama-cpp-2`, the model runtime.
+    pub model_runtime: BTreeSet<String>,
 }
 
 pub fn is_client(krate: &str) -> bool {
@@ -517,6 +519,15 @@ pub fn metadata(root: &Path) -> Result<Meta, String> {
         }
         meta.members.insert(folder.clone(), name.clone());
         meta.folders.insert(name.clone(), folder);
+        if package["dependencies"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|dependency| dependency["name"] == "llama-cpp-2")
+        {
+            meta.model_runtime
+                .insert(package["name"].as_str().unwrap_or_default().to_owned());
+        }
         crate_of.insert(id, name);
     }
     let nodes: BTreeMap<&str, &Value> = value["resolve"]["nodes"]
@@ -582,10 +593,27 @@ pub struct Config {
     pub name: &'static str,
     pub target: Option<&'static str>,
     pub tests: bool,
-    /// The members this configuration does not build, besides the receivers: a crate that needs a C++
-    /// toolchain for the target (the model that describes a session builds `llama.cpp`) is read by
-    /// the configurations of the host.
-    pub exclude: &'static [&'static str],
+    /// Whether this configuration leaves out the members that depend directly on `llama-cpp-2` (the
+    /// model runtime, found from `cargo metadata`): the build script of `llama-cpp-sys-2` builds
+    /// `llama.cpp`, which needs a C++ toolchain for the target, so the configurations of the host
+    /// read such a member and the Windows one does not. The rule holds because no client names a
+    /// stamped item in the model runtime; a token of a stamped name in its Windows-only code is an
+    /// `Unread` sighting, and a member that a client depends on still builds with it, and a build
+    /// that fails is refused.
+    pub without_model_runtime: bool,
+}
+
+/// The members a configuration does not build: the receivers, and the model runtime where the
+/// configuration leaves it out.
+pub fn excluded(config: Config, meta: &Meta) -> Vec<String> {
+    let mut members: Vec<String> = ["kr-controller", "kr-worker"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if config.without_model_runtime {
+        members.extend(meta.model_runtime.iter().cloned());
+    }
+    members
 }
 
 /// The one target besides the host that every platform checks.
@@ -599,19 +627,19 @@ pub const PLAN: [Config; 3] = [
         name: "host",
         target: None,
         tests: false,
-        exclude: &[],
+        without_model_runtime: false,
     },
     Config {
         name: "host-tests",
         target: None,
         tests: true,
-        exclude: &[],
+        without_model_runtime: false,
     },
     Config {
         name: "windows",
         target: Some(WINDOWS_GNU),
         tests: false,
-        exclude: &["kr-describe-model"],
+        without_model_runtime: true,
     },
 ];
 
@@ -719,11 +747,8 @@ fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<
         "--lib",
         "--bins",
     ]);
-    for member in ["kr-controller", "kr-worker"]
-        .into_iter()
-        .chain(config.exclude.iter().copied())
-    {
-        command.args(["--exclude", member]);
+    for member in excluded(config, meta) {
+        command.args(["--exclude", &member]);
     }
     if config.tests {
         command.arg("--tests");
