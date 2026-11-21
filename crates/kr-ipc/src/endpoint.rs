@@ -497,7 +497,8 @@ mod platform {
             Err(rustix::io::Errno::INPROGRESS) => Ok(Probe::Listening { pid: None }),
             // A full backlog is a live listener that is busy, never an abandoned address.
             Err(rustix::io::Errno::AGAIN) => Ok(Probe::Listening { pid: None }),
-            // Refused means the socket file outlived the process that bound it.
+            // Refused means that no socket answers at the path. Where a full queue is refused too
+            // (macOS), that does not show that the listener ended: the caller reads the lock.
             Err(rustix::io::Errno::CONNREFUSED) => Ok(Probe::Abandoned),
             // Anything else proves nothing, and unlinking on it would let one process delete
             // another's live endpoint.
