@@ -108,6 +108,8 @@ export function emptySessionState(): SessionState {
   }
 }
 
+const NO_SUBMISSIONS: readonly Submission[] = []
+
 /** The sessions this window is holding state for. */
 export class SessionStates {
   #states = new Map<string, SessionState>()
@@ -120,6 +122,19 @@ export class SessionStates {
     const fresh = emptySessionState()
     this.#states.set(sessionId, fresh)
     return fresh
+  }
+
+  /** What this device has sent to a session, which is nothing for one this window holds no state for; it makes no state. */
+  submissionsOf(sessionId: string): readonly Submission[] {
+    return this.#states.get(sessionId)?.submissions ?? NO_SUBMISSIONS
+  }
+
+  /** Takes away the row that the record `holdId` was written for, once the person removed the record. */
+  dropHoldRow(sessionId: string, holdId: string): void {
+    const held = this.#states.get(sessionId)
+    if (held === undefined || !held.submissions.some((each) => each.holdId === holdId)) return
+    this.#states.set(sessionId, { ...held, submissions: held.submissions.filter((each) => each.holdId !== holdId) })
+    for (const listener of this.#listeners) listener()
   }
 
   /**

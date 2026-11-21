@@ -82,6 +82,8 @@ export interface Submission {
   readonly error: { readonly code: string; readonly message: string } | null
   /** Set once the text is handed over to the channel store: no text of the row returns to a composer. Memory only. */
   readonly channel?: ChannelMark
+  /** The record of the send that this row's press wrote, which holds the next message to its session. Memory only. */
+  readonly holdId?: string
 }
 
 /** Whether the row's text is, or is being, handed over: no text of it ever returns to a composer, and no later receipt acts on one. */
@@ -104,6 +106,17 @@ export function awaitsHost(submission: Submission): boolean {
     (submission.state === 'queued' || submission.state === 'sent' || submission.state === 'unknown') &&
     !isOutOfCounts(submission)
   )
+}
+
+/**
+ * Whether a person may remove the record `holdId`: not while the row of this window that the record
+ * was written for waits on the host's answer. Only a row whose outcome nobody could establish
+ * (`unknown`) lets its record go, and so does a record that no row of this window belongs to, such as
+ * one left by an earlier run.
+ */
+export function holdRemovable(submissions: readonly Submission[], holdId: string): boolean {
+  const row = submissions.find((each) => each.holdId === holdId)
+  return row === undefined || row.state === 'unknown'
 }
 
 /**
