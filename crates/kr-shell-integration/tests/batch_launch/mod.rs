@@ -341,13 +341,28 @@ pub fn assert_every_word_cmd_exe_reads_as_itself_arrives_as_named(
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// The program word of a line the module built: what follows the call operator, in quotes.
-fn program_word(launch: &Launched) -> Option<&str> {
-    launch
-        .line
-        .strip_prefix("& '")?
-        .split_once('\'')
-        .map(|(word, _)| word)
+/// The program word of a line the module built: what follows the call operator, in quotes, as the
+/// word it stands for. PowerShell writes an apostrophe inside a quoted word doubled, so a doubled
+/// apostrophe is one character of the word and a single one ends it.
+fn program_word(launch: &Launched) -> Option<String> {
+    let mut rest = launch.line.strip_prefix("& '")?.chars().peekable();
+    let mut word = String::new();
+    while let Some(character) = rest.next() {
+        if character != '\'' {
+            word.push(character);
+        } else if rest.peek() == Some(&'\'') {
+            rest.next();
+            word.push('\'');
+        } else {
+            return Some(word);
+        }
+    }
+    None
+}
+
+/// `text` as the inside of a PowerShell word in single quotes: an apostrophe is written doubled.
+fn single_quoted(text: &str) -> String {
+    text.replace('\'', "''")
 }
 
 /// KR-REQ-13.11: a function or an alias of the program's name, which the shell would find before
@@ -367,7 +382,7 @@ pub fn assert_a_shadowing_function_or_alias_is_bypassed_and_the_full_path_is_typ
         plain.describe()
     );
     assert_eq!(
-        program_word(plain),
+        program_word(plain).as_deref(),
         Some(name),
         "nothing stood in front of the program, so the name is typed as it was given: {}",
         plain.describe()
@@ -395,8 +410,10 @@ pub fn assert_a_shadowing_function_or_alias_is_bypassed_and_the_full_path_is_typ
         );
         let word = program_word(launch).unwrap_or_default();
         assert!(
-            Path::new(word).is_absolute()
-                && Path::new(word).file_stem().is_some_and(|stem| stem == name),
+            Path::new(&word).is_absolute()
+                && Path::new(&word)
+                    .file_stem()
+                    .is_some_and(|stem| stem == name),
             "{what} of the program's name stood in front of it, and the line does not hold the \
              program's full path: {}",
             launch.describe()
@@ -457,7 +474,7 @@ pub fn assert_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_
         .to_owned();
     let setup = format!(
         "(Get-PSProvider FileSystem).Home = '{}'\n",
-        directory.display()
+        single_quoted(&directory.display().to_string())
     );
     let forms = [format!("~/{name}"), format!("~\\{name}")];
     let mut cases: Vec<(String, Vec<&str>)> =
@@ -473,7 +490,7 @@ pub fn assert_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_
         launched[0].describe()
     );
     assert_eq!(
-        program_word(&launched[0]),
+        program_word(&launched[0]).as_deref(),
         Some(programs.in_syntax_directory.as_str()),
         "the path is typed as it was written: {}",
         launched[0].describe()
@@ -494,7 +511,7 @@ pub fn assert_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_
             "the program word {form} is not found under the provider's home: {detail}"
         );
         assert_eq!(
-            program_word(launch),
+            program_word(launch).as_deref(),
             Some(form.as_str()),
             "the program word is typed as it was written: {detail}"
         );

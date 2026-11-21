@@ -1282,6 +1282,41 @@ fn a_windows_path_is_typed_as_written_a_tilde_program_word_is_found_under_the_ho
     );
 }
 
+/// A temporary root whose name holds an apostrophe, as the home folder of a person called O'Brien
+/// does. PowerShell writes the apostrophe doubled inside a quoted word.
+fn root_with_an_apostrophe() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("kr O'Brien ")
+        .tempdir()
+        .expect("a temporary directory")
+}
+
+/// KR-REQ-13.11: a program in a folder whose name holds an apostrophe is typed as its full path with
+/// the apostrophe doubled, which reads back as the path, and the program runs.
+#[test]
+fn a_folder_with_an_apostrophe_is_typed_doubled_and_read_back_as_the_path() {
+    let directory = root_with_an_apostrophe();
+    let programs = write_programs(directory.path());
+    batch_launch::assert_a_shadowing_function_or_alias_is_bypassed_and_the_full_path_is_typed(
+        directory.path(),
+        &programs,
+        false,
+    );
+}
+
+/// KR-REQ-13.11: a home folder whose name holds an apostrophe is given to the shell as the text of
+/// one quoted word, and a program word with a leading `~` is still found under it.
+#[test]
+fn a_home_folder_with_an_apostrophe_is_given_to_the_shell_quoted() {
+    let directory = root_with_an_apostrophe();
+    let programs = write_programs(directory.path());
+    batch_launch::assert_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_is_not_expanded(
+        directory.path(),
+        &programs,
+        false,
+    );
+}
+
 /// KR-REQ-13.11: a program that names no application or script has no line, and the refusal the
 /// reader gives for a command it has no line for is a draft conflict, which the page reads with
 /// the surface's shell to say that PowerShell cannot run the command.
