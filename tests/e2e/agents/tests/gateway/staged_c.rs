@@ -408,23 +408,23 @@ impl<'a> Typing<'a> {
         .unwrap_or_else(|why| panic!("{why}"));
     }
 
-    /// Where an approval dialog of the agent's is on the screen, a typed digit or the key that
-    /// submits would be taken as a choice, which may approve a command: the dialog is refused with
-    /// the agent's own key and the case stops.
+    /// Where a dialog of the agent's is on the screen, the command's or any other it asks (network
+    /// access, edits, permissions, input), a typed letter or the key that submits would be taken as
+    /// a choice, which may approve it: the dialog is refused with its own key and the case stops.
     fn no_dialog(&mut self, real: &Real, when: &str) {
-        let shows = &real.account.approval.shows;
-        if self
-            .at
-            .person
-            .window
-            .screen()
-            .iter()
-            .any(|row| row.contains(shows))
-        {
-            let deny = real.account.approval.deny.clone();
-            self.types(&deny);
+        let approval = &real.account.approval;
+        let rows = self.at.person.window.screen();
+        if let Some((shown, key)) = dialog_on(
+            &rows,
+            &approval.shows,
+            &approval.others,
+            &approval.deny,
+            approval.refusal(),
+        ) {
+            let (shown, key) = (shown.to_owned(), key.to_owned());
+            self.types(&key);
             panic!(
-                "a dialog showing {shows:?} was on the screen {when}, so no prompt or key that \
+                "a dialog showing {shown:?} was on the screen {when}, so no prompt or key that \
                  submits was sent"
             );
         }
@@ -475,6 +475,43 @@ impl<'a> Turns<'a> {
             submitted: 0,
         }
     }
+}
+
+/// The dialog of the agent's that `rows` show, with the key that refuses it: the command dialog
+/// (`shows`) with the agent's own key (`deny`), and each of the other requests the agent asks
+/// (`others`; none is ever allowed) with the key that refuses any request (`refusal`).
+fn dialog_on<'a>(
+    rows: &[String],
+    shows: &'a str,
+    others: &'a [String],
+    deny: &'a str,
+    refusal: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    std::iter::once((shows, deny))
+        .chain(others.iter().map(|other| (other.as_str(), refusal)))
+        .find(|(text, _)| !text.is_empty() && rows.iter().any(|row| row.contains(text)))
+}
+
+/// A dialog is found whether it is the command's or any other the entry names, and each is refused
+/// with its own key; a screen with none shows none.
+#[test]
+fn a_dialog_the_entry_names_is_found_and_refused_with_its_own_key() {
+    let rows = |text: &str| vec!["a row".to_owned(), text.to_owned()];
+    let others = ["Allow network access".to_owned(), "Allow edits".to_owned()];
+    let found = |screen: &[String]| dialog_on(screen, "Allow command", &others, "d", "n");
+    assert_eq!(
+        found(&rows("Allow command? (y/n)")),
+        Some(("Allow command", "d"))
+    );
+    assert_eq!(
+        found(&rows("Allow network access?")),
+        Some(("Allow network access", "n"))
+    );
+    assert_eq!(
+        found(&rows("Allow edits to a.txt")),
+        Some(("Allow edits", "n"))
+    );
+    assert_eq!(found(&rows("ask me anything")), None);
 }
 
 // ---------------------------------------------------------------------------------------------
