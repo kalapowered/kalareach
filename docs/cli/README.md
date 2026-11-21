@@ -2069,18 +2069,27 @@ again by itself:
   `The saved launch commands changed before this request could apply. Run the command again.`,
   with the list as it now stands, and exits 8. Nothing was applied. Running the command again
   applies it against the new list.
-- A write whose outcome the host could not confirm prints
+- A write whose outcome the host could not confirm, or whose reply was lost after `kr` sent the
+  request, prints
   `The host could not confirm the change. Run kr launch list to check the current list.` and exits
-  8. It says nothing of what the list holds now.
+  8. It says nothing of what the list holds now: the host may have saved the change. A failure
+  before the request was sent keeps its own answer, a host that is not running, exit 3.
+- A save or a removal that the host answers with `STORAGE_UNAVAILABLE`, after `kr` read the list,
+  prints `The host could not save the change. Run kr launch list to check the current list.` and
+  exits 8. The host could not write the file, and the earlier file stands. The sentence says
+  nothing of the file and advises no removal.
 - A rule the host refuses, a refusal of the host, and the refusal inside a session exit 8. A
   usage mistake exits 2, and a host that is not running exits 3.
-- A file the host cannot read stops all three commands, never replaces the file, and names it:
+- A file the host cannot read stops all three commands at the read, never replaces the file, and
+  names it:
   `The saved launch commands could not be read: <path>. Move that file away, then add the commands
   again.`
 
 `kr launch list` prints a line for each command, `label: "program" "argument 1" ...`, each word in
-double quotes with `\` and `"` escaped. `--json` prints `{ "ok": true, "revision": <number>,
-"commands": [ { "label", "program", "arguments" } ] }`. For `add` and `remove` it prints the answer
+double quotes with `\` and `"` escaped. `--json` prints `{ "ok": true, "revision": "<decimal
+string>", "commands": [ { "label", "program", "arguments" } ] }`. The revision is a decimal string,
+as the protocol writes a 64-bit counter, because a JSON reader that holds a number as a double
+rounds one above 2^53. For `add` and `remove` it prints the answer
 as the host wrote it: `applied`, `changed` and `replaced` for `add`, `applied` and `removed` for
 `remove`, then `revision` and `commands`. A stale or unconfirmed write also carries `ok: false`,
 `code` (`RESYNC_REQUIRED` or `OUTCOME_UNKNOWN`), `message` and `exit_code`.
