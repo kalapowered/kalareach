@@ -896,8 +896,8 @@ mod tests {
     }
 
     /// The front's bounds: a full set of tunnels answers the next with 503 and the opener is not
-    /// called, a head of one byte more than the limit is 431, a head that stalls closes at the
-    /// shortened deadline, and the oldest waiting head is dropped for a new one.
+    /// called, a head of one byte more than the limit is 431, and a head that stalls closes at the
+    /// shortened deadline.
     ///
     /// Covers KR-REQ-10.02.
     #[tokio::test]
@@ -906,7 +906,6 @@ mod tests {
             Mode::Open,
             FrontBounds {
                 max_tunnels: 2,
-                max_pending_heads: 2,
                 max_head_bytes: 256,
                 head_deadline: Duration::from_millis(300),
                 ..FrontBounds::default()
@@ -940,8 +939,27 @@ mod tests {
             .await
             .expect("write");
         assert!(read_status(&mut stalled).await.contains(" 400 "));
+        drop(held);
+        rig.front.shutdown().await;
+    }
 
-        // Past the pending limit the oldest waiting head is closed with nothing said.
+    /// Past the pending limit the oldest waiting head is closed with nothing said. The head
+    /// deadline is far beyond anything the case waits for, so that no head ends by its deadline
+    /// and the one that ends is the one the limit closed, however late the third connection
+    /// reaches the front.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test]
+    async fn the_front_closes_the_oldest_waiting_head_past_the_pending_limit() {
+        let rig = rig_with(
+            Mode::Open,
+            FrontBounds {
+                max_pending_heads: 2,
+                head_deadline: Duration::from_secs(3600),
+                ..FrontBounds::default()
+            },
+        )
+        .await;
         let mut first = TcpStream::connect(rig.front.address())
             .await
             .expect("connect");
@@ -952,8 +970,10 @@ mod tests {
             .await
             .expect("connect");
         let mut byte = [0_u8; 1];
-        assert!(matches!(first.read(&mut byte).await, Ok(0) | Err(_)));
-        drop(held);
+        let read = tokio::time::timeout(Duration::from_secs(20), first.read(&mut byte))
+            .await
+            .expect("the oldest waiting head was closed once the limit was passed");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
         rig.front.shutdown().await;
     }
 
