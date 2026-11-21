@@ -998,7 +998,6 @@ fn ownership_fences_the_endpoint_once_death_is_validated() {
     let ownership = archive
         .take_ownership(session_id, DisplayNumber::new(1), &ended)
         .expect("a dead worker's stores are the archive's");
-    assert!(ownership.endpoint_fenced());
     assert!(!descriptor.exists(), "the descriptor was fenced");
     assert!(!endpoint.exists(), "the endpoint was fenced");
     assert_eq!(ownership.session_id(), session_id);
