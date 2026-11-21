@@ -3102,14 +3102,16 @@ fn refusal_frame(why: &str) -> Vec<u8> {
 fn gateway_failure_said(error: &BrokerError) -> String {
     let text = match error {
         // The folder this backend made goes when its session closes, with what stands at the
-        // address, and the next command gets a folder of its own: so no instruction to move the
-        // thing away is given, and no claim that kr leaves it for good.
+        // address, and a command line after this one gets a folder of its own (a second run of the
+        // same program in this line gets this backend again): so no instruction to move the thing
+        // away is given, and no claim that kr leaves it for good.
         BrokerError::Listen {
             endpoint,
             refusal: kr_ipc::listen::ListenRefusal::NotASocket { object },
         } => format!(
-            "the gateway could not listen on {endpoint}: it holds {}, which kr did not make; the \
-             next command you run gets a new folder for its gateway, so run the command again",
+            "the gateway could not listen on {endpoint}: it holds {}, which kr did not make; a \
+             command line you run after this one gets a new folder for its gateway, so run the \
+             command again",
             object.phrase()
         ),
         BrokerError::Listen { endpoint, refusal } => format!(
@@ -3576,8 +3578,8 @@ mod tests {
         assert_eq!(
             gateway_failure_said(&bind),
             "the gateway could not listen on /run/kr/gw.sock: it holds a file, which kr did not \
-             make; the next command you run gets a new folder for its gateway, so run the command \
-             again"
+             make; a command line you run after this one gets a new folder for its gateway, so \
+             run the command again"
         );
         let held = BrokerError::Listen {
             endpoint: "/run/kr/gw.sock".to_owned(),

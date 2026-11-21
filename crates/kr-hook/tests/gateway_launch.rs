@@ -1092,8 +1092,9 @@ fn kr_req_12_07_a_gateway_that_cannot_bind_tells_the_launcher_why() {
     );
     assert!(
         said.contains(
-            "gw.sock: it holds a file, which kr did not make; the next command you run gets a new \
-             folder for its gateway, so run the command again), so the program runs as typed"
+            "gw.sock: it holds a file, which kr did not make; a command line you run after this \
+             one gets a new folder for its gateway, so run the command again), so the program \
+             runs as typed"
         ),
         "{said}"
     );
