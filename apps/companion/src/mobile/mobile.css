@@ -1299,3 +1299,107 @@
   white-space: normal;
   max-inline-size: 100%;
 }
+
+/* ---- A file sent to a paired host ------------------------------------------------------------ */
+
+/*
+ * The state is in the sentence; the border and the bar say it a second way. The border is the
+ * tone, as a row's is, and the bar is how much of the file the host holds. A file's card is full
+ * width, because a sentence that says what to do needs the room a pill does not give it.
+ */
+.m-upload {
+  display: grid;
+  gap: var(--gap-2);
+  inline-size: 100%;
+  min-inline-size: 0;
+  padding: var(--gap-3) var(--gap-4);
+  border: 1px solid var(--line);
+  border-inline-start-width: 3px;
+  border-radius: 12px;
+  background: var(--surface);
+  font-size: 0.8125rem;
+  transition:
+    opacity var(--surface-in) var(--ease-out),
+    transform var(--surface-in) var(--ease-out),
+    border-color var(--state) var(--ease-out);
+}
+
+/* A file arrives from just under where the picker was, and does not come from nowhere. */
+@starting-style {
+  .m-upload {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+.m-upload[data-tone='warning'] {
+  border-inline-start-color: var(--warning);
+}
+.m-upload[data-tone='danger'] {
+  border-inline-start-color: var(--danger);
+}
+.m-upload[data-tone='done'] {
+  border-inline-start-color: var(--success);
+}
+
+.m-upload-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+  min-inline-size: 0;
+}
+
+.m-upload-line {
+  margin: 0;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.m-upload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+}
+
+.m-upload-actions:empty {
+  display: none;
+}
+
+/* The bar is how much of the file the host holds, drawn with a transform so that it moves on the
+   compositor. It moves at the rate it is asked about, so it reads as one motion and not as steps. */
+.m-progress {
+  block-size: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.m-progress-fill {
+  display: block;
+  block-size: 100%;
+  background: var(--accent);
+  transform-origin: 0 50%;
+  transition: transform 400ms linear;
+}
+
+[dir='rtl'] .m-progress-fill {
+  transform-origin: 100% 50%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .m-upload {
+    transition-property: border-color;
+  }
+
+  @starting-style {
+    .m-upload {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  .m-progress-fill {
+    transition: none;
+  }
+}
