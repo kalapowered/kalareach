@@ -696,13 +696,12 @@ mod tests {
                 {"label": "bad\u{200b}", "program": "p", "arguments": []}]}),
         ];
         for file in files {
-            std::fs::write(file_in(dir.path()), file.to_string()).expect("written");
+            put(dir.path(), file.to_string().as_bytes());
             assert!(read(dir.path()).is_err(), "{file} is refused");
         }
-        std::fs::write(file_in(dir.path()), b"{\"version\": 1, \"revi").expect("written");
+        put(dir.path(), b"{\"version\": 1, \"revi");
         assert!(read(dir.path()).is_err(), "a torn file is refused");
-        std::fs::write(file_in(dir.path()), vec![b' '; MAX_RECORD_LEN as usize + 1])
-            .expect("written");
+        put(dir.path(), &vec![b' '; MAX_RECORD_LEN as usize + 1]);
         assert!(read(dir.path()).is_err(), "a file over 256 KiB is refused");
     }
 
@@ -938,7 +937,7 @@ mod tests {
     fn a_save_never_replaces_a_file_it_could_not_read() {
         let dir = directory();
         let damaged = b"not json at all";
-        std::fs::write(file_in(dir.path()), damaged).expect("written");
+        put(dir.path(), damaged);
         assert!(save(dir.path(), 0, &command("one", "p", &[])).is_err());
         assert!(remove(dir.path(), 0, "one").is_err());
         assert_eq!(std::fs::read(file_in(dir.path())).expect("read"), damaged);
@@ -949,7 +948,7 @@ mod tests {
     #[test]
     fn a_damaged_file_does_not_stop_the_host_and_list_answers_storage_unavailable() {
         let dir = directory();
-        std::fs::write(file_in(dir.path()), b"{").expect("written");
+        put(dir.path(), b"{");
         let failed = read(dir.path()).expect_err("damaged");
         assert_eq!(
             failed.code(),
@@ -958,3 +957,31 @@ mod tests {
         assert!(failed.to_string().contains(FILE_NAME), "{failed}");
     }
 }
+
+    /// Puts `bytes` where the host keeps its file, as the host writes it: owner only, whatever the
+    /// umask. A row that wrote with `std::fs::write` would be refused for its mode under a umask of
+    /// 022 before its bytes were read, and so would pass whatever the rules check.
+    fn put(state_dir: &Path, bytes: &[u8]) {
+        kr_ipc::paths::write_owner_only_file(&file_in(state_dir), bytes).expect("written");
+    }
+
+    /// KR-REQ-13.11: a file that others can read is refused for its mode before its bytes are read,
+    /// under any umask: it is the mode that is named, and the same bytes are read once the mode is
+    /// the owner's again.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_others_can_read_is_refused_for_its_mode_and_not_for_its_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = directory();
+        save(dir.path(), 0, &command("one", "p", &[])).expect("saved");
+        let path = file_in(dir.path());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("a mode");
+        let refused = read(dir.path()).expect_err("others can read it");
+        assert!(
+            refused.to_string().contains("0644"),
+            "the refusal names the mode: {refused}"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        assert_eq!(labels(&read(dir.path()).expect("reads")), ["one"]);
+    }
