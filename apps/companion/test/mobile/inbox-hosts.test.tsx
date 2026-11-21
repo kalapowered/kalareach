@@ -208,7 +208,10 @@ describe('the inbox of a phone paired with two hosts', () => {
     })
     find(controls, [lostLaptop(Date.now() - 5 * 60_000)])
     readNow()
-    const contact = await screen.findByTestId('inbox-contact')
+    await waitFor(() => {
+      expect(screen.queryByTestId('inbox-contact')).not.toBeNull()
+    })
+    const contact = screen.getByTestId('inbox-contact')
     expect(contact).toHaveAttribute('data-kind', 'disconnected')
     expect(contact).toHaveAttribute('data-host', 'laptop')
     expect(contact).toHaveTextContent('laptop is out of contact')

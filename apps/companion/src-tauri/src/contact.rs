@@ -3607,6 +3607,11 @@ pub mod tests {
         assert!(a > b, "the later read of A is newer than B's: {a} and {b}");
         assert_ne!(a, 0);
         assert_ne!(b, 0);
+        // A read of B after both reads of A is newer than both: a counter kept per record would
+        // number B's second read below A's second.
+        read_of(&owner, &paired(7, 8), 13);
+        let (a, b) = (serial(5), serial(7));
+        assert!(b > a, "the later read of B is newer than A's: {a} and {b}");
     }
 
     #[tokio::test]

@@ -3527,9 +3527,18 @@ async fn a_visitor_queued_across_a_forget_takes_no_connection_and_makes_no_recor
     let queued = v.pass();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let asked = v.control.asked_of(&endpoint);
+    let device = v.companion().device();
+    let listed = device.host_by_reference(&v.a_ref).expect("A is listed");
     v.companion()
         .call("hosts_forget", json!({ "reference": v.a_ref }))
         .expect("A is forgotten");
+    // The pairing is listed again as it was, so the visit that holds the turn passes its second
+    // check: only the owner's record, which the forget removed, rejects its commit.
+    device
+        .pairing()
+        .hosts
+        .record(listed)
+        .expect("A is listed again");
     hold.release();
     drop(visits);
     first.await.expect("ran").expect("answered");
