@@ -1065,6 +1065,21 @@ fn a_name_that_ends_a_call_with_a_sighting_expands_the_macros_of_that_name_in_ev
             "{call}"
         );
     }
+    // A raw identifier names the same macro: a raw call marks the definition, and a raw definition is
+    // marked by a plain call.
+    let raw_worker = "#[macro_export]\nmacro_rules! r#shared { ($m:expr) => { $m }; }\n";
+    for (call, definition) in [
+        ("r#shared!(Method::AgentTurnCancel)", worker),
+        ("kr_worker::r#shared!(Method::AgentTurnCancel)", worker),
+        ("shared!(Method::AgentTurnCancel)", raw_worker),
+    ] {
+        let lib = format!("fn f() {{ {call}; }}\n");
+        assert_eq!(
+            sightings(&lib, definition, &|_| true).map(|by| by["kr_worker"].clone()),
+            Ok(BTreeMap::from([("macro:shared".to_owned(), vec![Expands])])),
+            "{call}"
+        );
+    }
     // A scope without the crate that holds the definition has nothing to mark, and a scope without the
     // crate that makes the call marks nothing.
     let lib = "fn f() { shared!(Method::AgentTurnCancel); }\n";
@@ -1459,4 +1474,72 @@ fn a_macro_use_on_an_extern_crate_is_refused_where_a_configuration_without_test_
             "{lib}"
         );
     }
+}
+
+#[test]
+fn a_raw_identifier_is_the_name_it_stands_for_in_every_rule_that_reads_a_name() {
+    let at = "crates/kr-sender/src/lib.rs";
+    // R1: a rename of a name the scan reads, written raw on either side.
+    for import in [
+        "use kr_protocol::r#MutationRequest as Request;",
+        "use kr_protocol::MutationRequest as r#Request;",
+        "use kr_protocol::r#Method as M;",
+        "extern crate r#kr_protocol as r#Method;",
+    ] {
+        let (scan, _) = scanned(&format!("{import}\n"), &[]);
+        assert!(
+            matches!(&scan, Err(text) if text.starts_with(&format!("{at}: the scan does not read "))
+                && text.contains(" under another name (as ")),
+            "{import}: {scan:?}"
+        );
+    }
+    // R2: a type alias of either type, written raw.
+    assert_eq!(
+        read_names("type Request = r#MutationRequest;\n", &[]),
+        Err(format!(
+            "{at}: the scan does not read a type alias of MutationRequest (Request)"
+        ))
+    );
+    assert_eq!(
+        read_names("type r#Request = kr_protocol::r#ActionTarget;\n", &[]),
+        Err(format!(
+            "{at}: the scan does not read a type alias of ActionTarget (Request)"
+        ))
+    );
+    // R2: a type in parentheses is the same type.
+    for alias in [
+        "type Request = (MutationRequest);",
+        "type Request = ((kr_protocol::ActionTarget));",
+    ] {
+        let (scan, _) = scanned(&format!("{alias}\n"), &[]);
+        assert!(
+            matches!(&scan, Err(text) if text.starts_with(&format!("{at}: the scan does not read a type alias of "))),
+            "{alias}: {scan:?}"
+        );
+    }
+    // X4 and the form checks: `include!` and `macro_rules!` written raw are the same macros.
+    for lib in [
+        "fn f() { r#include!(\"x.rs\"); }",
+        "macro_rules! m { () => { r#include!(\"x.rs\"); }; }",
+    ] {
+        let (scan, _) = scanned(&format!("{lib}\n"), &[]);
+        assert_eq!(
+            scan,
+            Err(format!("{at}: the scan does not read include!")),
+            "{lib}"
+        );
+    }
+    let (scan, _) = scanned("m!{ macro_rules! r#inner { () => {}; } }\n", &[]);
+    assert!(
+        matches!(&scan, Err(text) if text.contains("macro_rules! inner in the tokens of m!")),
+        "{scan:?}"
+    );
+    // R3: a raw call of a macro the crate defines is the crate's own.
+    assert_eq!(
+        read_names(
+            "macro_rules! mine { () => {}; }\nr#mine!();\nmod x { r#mine!(); }\n",
+            &[]
+        ),
+        Ok(Vec::<String>::new())
+    );
 }
