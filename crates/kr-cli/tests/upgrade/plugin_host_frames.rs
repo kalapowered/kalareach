@@ -290,15 +290,32 @@ fn hosts_running(program: &std::path::Path) -> usize {
         .count()
 }
 
+/// Whether a job's diagnostics file in `jobs` holds what this build's plugin host writes as it ends
+/// for an endpoint named `socket_name`.
+fn a_host_said_why_it_could_not_start(jobs: &std::path::Path, socket_name: &str) -> bool {
+    std::fs::read_dir(jobs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "diagnostics")
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .any(|text| text.contains("kr-plugin-host: ") && text.contains(socket_name))
+}
+
 /// A plugin host of this build, started by the daemon of the release before in a layout that has no
 /// store, whose endpoint has a file on it, does not hang the daemon: the host sends the frame that
 /// says why it could not start, the launcher of the release before keeps a frame it does not know
 /// as a refusal, and the pair ends as it did before the frame existed. No host is published, the
 /// daemon goes on serving, and the session's worker is the one it was.
 ///
-/// The case shows that the scenario happened: the plugin host of this build is seen running, as the
-/// release before's launcher started it, and is then seen to have ended by itself, before the daemon
-/// is watched. It does not read the binding's own report (`ComponentState::Unavailable`): nothing
+/// The case shows that the scenario happened: the plugin host of this build is seen to have been
+/// started by the release before's launcher (it leaves its reason in a job's diagnostics), and is
+/// seen to have ended by itself, while the daemon is watched. It does not read the binding's own report (`ComponentState::Unavailable`): nothing
 /// in this suite reads a worker's bindings.
 ///
 /// The daemon is the release before's real one, started with `--worker` naming a folder that holds
@@ -306,7 +323,7 @@ fn hosts_running(program: &std::path::Path) -> usize {
 /// the worker; a daemon of an installed release refuses `--worker`, so the layout has no store. No
 /// service manager is reachable: run by name on Linux as
 /// `env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test
-/// upgrade -- --nocapture --ignored --exact
+/// upgrade --features upgrade-suite -- --nocapture --ignored --exact
 /// plugin_host_frames::a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_it_serving`,
 /// after `cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host`.
 #[cfg(target_os = "linux")]
@@ -381,14 +398,23 @@ async fn a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_
     let program = start_agent(&host, &terminal, &agent).await;
 
     // The worker asks for the plugin runtime, and the release before's launcher starts this
-    // build's host: it is seen running, and then seen ended, which is the host's own end after it
-    // told a launcher that did not close the connection. The daemon is watched from the moment the
-    // host was first seen, for longer than the launcher's whole wait.
+    // build's host. The release before's launcher closes the connection when it cannot read the
+    // frame, so the host ends at once and lives for milliseconds: it is seen by what it leaves, the
+    // job's diagnostics file, where it writes why it could not start (the service manager's own
+    // record of a job's standard error stays after the job). The daemon is watched from the first
+    // sight, for longer than the launcher's whole wait.
     let host_program = programs.join("kr-plugin-host");
+    let jobs = environment.jobs_dir();
+    let socket_name = endpoint
+        .as_path()
+        .file_name()
+        .expect("the endpoint's name")
+        .to_string_lossy()
+        .into_owned();
     let mut began = None;
     let seen = std::time::Instant::now();
     while began.is_none() && seen.elapsed() < Duration::from_secs(120) {
-        if hosts_running(&host_program) > 0 {
+        if a_host_said_why_it_could_not_start(&jobs, &socket_name) {
             began = Some(std::time::Instant::now());
         } else {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -396,23 +422,16 @@ async fn a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_
     }
     assert!(
         began.is_some(),
-        "the release before's launcher started this build's plugin host"
+        "the release before's launcher started this build's plugin host, which said why it could \
+         not start in a job's diagnostics under {}",
+        jobs.display()
     );
     let began = began.unwrap_or(seen);
+    // One loop from the first sight to the end of the watch: the host is seen to have ended, no
+    // host is published, and the daemon serves a status request, at every step.
     let mut ended = false;
-    while !ended && began.elapsed() < Duration::from_secs(60) {
-        ended = hosts_running(&host_program) == 0;
-        if !ended {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-    assert!(
-        ended,
-        "the host ended by itself and did not hold the daemon"
-    );
-    // The daemon keeps serving through the launcher's whole wait, no host is published, and the
-    // worker is the process it was.
     while began.elapsed() < WATCH {
+        ended = ended || hosts_running(&host_program) == 0;
         assert_eq!(
             host.plugin_host(),
             None,
@@ -425,6 +444,20 @@ async fn a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_
         );
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    assert!(
+        ended,
+        "the host ended by itself and did not hold the daemon"
+    );
+    assert_eq!(
+        host.plugin_host(),
+        None,
+        "at the end of the watch no plugin host is published"
+    );
+    assert_eq!(
+        host_info_of(&host).await.environment_id,
+        host.tree.environment_id(),
+        "at the end of the watch the daemon serves a status request"
+    );
     assert_eq!(
         host.worker_process(session_id),
         worker,
