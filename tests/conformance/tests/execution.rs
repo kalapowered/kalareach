@@ -1118,11 +1118,16 @@ fn the_time_of_a_step_is_one_time_for_its_build_its_listing_and_its_run_together
     let ran = run(&root, &cargo_plan(target.path(), "timeout = 16", &env))
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 1);
+    let step = &ran.document.steps[0];
+    assert_eq!(
+        (step.exit, step.error.as_deref()),
+        (None, Some("ran out of its time limit: 16 s")),
+        "{step:?}"
+    );
     assert_ended_at_its_limit(&ran, 16, &started);
     // The step ran out of time in its listing: the log says the listing did not end, before the
     // words of the limit.
-    let log = std::fs::read_to_string(ran.evidence.path().join(&ran.document.steps[0].log))
-        .expect("the log");
+    let log = std::fs::read_to_string(ran.evidence.path().join(&step.log)).expect("the log");
     let kept = log.find("== the listing failed: ").expect(&log);
     let said = log.find("== ran out of its time limit: 16 s").expect(&log);
     assert!(kept < said, "{log}");
