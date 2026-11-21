@@ -5,9 +5,12 @@
 
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { ARMED_FOR_MS, TwoPressButton } from '../src/components/ui'
+import { ARMED_FOR_MS, SECOND_PRESS_AFTER_MS, TwoPressButton } from '../src/components/ui'
+import { afterTheGuard, holdTheClock } from './two-press'
+
+beforeEach(holdTheClock)
 
 afterEach(() => {
   cleanup()
@@ -36,6 +39,7 @@ describe('a control that commits on its second press', () => {
     expect(commits).not.toHaveBeenCalled()
     expect(screen.getByTestId('control')).toHaveTextContent('Press again to remove')
     expect(screen.getByTestId('control')).toHaveAttribute('data-armed', 'true')
+    afterTheGuard()
     await person.click(screen.getByTestId('control'))
     expect(commits).toHaveBeenCalledTimes(1)
     expect(screen.getByTestId('control')).toHaveTextContent('Remove')
@@ -50,6 +54,7 @@ describe('a control that commits on its second press', () => {
     await person.keyboard('{Enter}')
     expect(commits).not.toHaveBeenCalled()
     expect(screen.getByRole('status')).toHaveTextContent('Press again to remove')
+    afterTheGuard()
     await person.keyboard('{Enter}')
     expect(commits).toHaveBeenCalledTimes(1)
     expect(screen.getByRole('status')).toHaveTextContent('')
@@ -105,5 +110,34 @@ describe('a control that commits on its second press', () => {
     fireEvent.keyDown(document.body, { key: 'Escape' })
     expect(control).not.toHaveAttribute('data-armed')
     expect(commits).not.toHaveBeenCalled()
+  })
+
+  it('takes no second press within the guard after the first: a double click arms it and commits nothing, a press after the guard commits', async () => {
+    const commits = vi.fn()
+    shown(commits)
+    const person = userEvent.setup()
+    await person.click(screen.getByTestId('control'))
+    expect(screen.getByTestId('control')).toHaveAttribute('data-armed', 'true')
+    vi.setSystemTime(Date.now() + 100)
+    await person.click(screen.getByTestId('control'))
+    expect(commits).not.toHaveBeenCalled()
+    expect(screen.getByTestId('control')).toHaveAttribute('data-armed', 'true')
+    vi.setSystemTime(Date.now() + SECOND_PRESS_AFTER_MS - 101)
+    await person.click(screen.getByTestId('control'))
+    expect(commits).not.toHaveBeenCalled()
+    vi.setSystemTime(Date.now() + 101)
+    await person.click(screen.getByTestId('control'))
+    expect(commits).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId('control')).not.toHaveAttribute('data-armed')
+  })
+
+  it('keeps the room of its longer label in both states: the sizing copy is the armed label whichever label shows', async () => {
+    shown(vi.fn())
+    const person = userEvent.setup()
+    const room = () => screen.getByTestId('control').querySelector('.two-press-label')?.getAttribute('data-sizer')
+    expect(room()).toBe('Press again to remove')
+    await person.click(screen.getByTestId('control'))
+    expect(screen.getByTestId('control')).toHaveTextContent('Press again to remove')
+    expect(room()).toBe('Press again to remove')
   })
 })
