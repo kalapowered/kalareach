@@ -24,6 +24,7 @@ import { answeredState, outcomeMessage, outcomeTone } from '../model/receipts'
 import { readSemanticArchive } from '../model/exports'
 import { recorded, recordingExport } from '../model/recording'
 import { Conversation } from './Conversation'
+import { LaunchCommands } from './LaunchCommands'
 import { RetainedOutput } from './Output'
 import { Sharing } from './Sharing'
 import { RawTerminal } from '../terminal/RawTerminal'
@@ -371,7 +372,9 @@ function SessionSettings({
   readonly onClose: () => void
 }): ReactNode {
   const { port } = useApp()
-  const [tab, setTab] = useState<'appearance' | 'session' | 'sharing' | 'export'>('appearance')
+  const [tab, setTab] = useState<'appearance' | 'session' | 'launch' | 'sharing' | 'export'>(
+    'appearance'
+  )
   const [followOutput, setFollowOutput] = useState(true)
 
   return (
@@ -388,6 +391,7 @@ function SessionSettings({
             [
               ['appearance', 'Appearance'],
               ['session', 'This session'],
+              ['launch', 'Launch commands'],
               ['sharing', 'Sharing'],
               ['export', 'Export']
             ] as const
@@ -461,6 +465,8 @@ function SessionSettings({
               </div>
             </>
           ) : null}
+
+          {tab === 'launch' ? <LaunchCommands place="desktop" /> : null}
 
           {tab === 'sharing' ? <Sharing sessionId={sessionId} subject={subject} /> : null}
 

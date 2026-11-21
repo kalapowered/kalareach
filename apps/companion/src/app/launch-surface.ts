@@ -20,7 +20,9 @@
  * leave a button for a command removed elsewhere on the page for as long as output streamed.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+
+import type { ActionRight, ShellLaunchCommandsListResult } from '@kalareach/protocol'
 
 import { readOnCadence } from './cadence'
 import { ask } from '../mobile/model/call'
@@ -83,6 +85,12 @@ export interface LaunchSurfaceReads {
   readonly listUnread: string | null
   /** Reads the saved launch commands now, or as soon as the read on its way has answered. */
   readonly listAgain: () => void
+  /**
+   * The newest list the host answered, as of this moment and before the page has drawn it: a press
+   * is checked against what the host said last, not against what was drawn a frame ago. Null
+   * before the first answer on this connection.
+   */
+  readonly listNow: () => ShellLaunchCommandsListResult | null
 }
 
 /** What the hook is given besides the read of the surface. */
@@ -133,6 +141,16 @@ export function useLaunchSurface(
   const again = useRef<() => void>(() => undefined)
   const soon = useRef<() => void>(() => undefined)
   const listAgain = useRef<() => void>(() => undefined)
+  // The newest answer and the reader it answers, so that the answer of another reader (another host,
+  // environment or connection) is never taken for this one's.
+  const newestList = useRef<{
+    readonly readList: () => Promise<LaunchCommandsReading>
+    readonly list: ShellLaunchCommandsListResult
+  } | null>(null)
+  const readListNow = useRef(readList)
+  useEffect(() => {
+    readListNow.current = readList
+  })
   const started = useRef(0)
   const inputsNow = useRef(inputs?.now)
   useEffect(() => {
@@ -166,6 +184,7 @@ export function useLaunchSurface(
     // serve them, or a connection that may not read them, is asked no more until the connection
     // changes.
     let remembered = false
+    newestList.current = null
     const listCadence =
       readList === null
         ? null
@@ -175,8 +194,10 @@ export function useLaunchSurface(
             return ask(readList).then(
               (reading) => {
                 if (!current()) return
-                if (reading.state === 'served') setList({ readList, reading, unread: null })
-                else remembered = true
+                if (reading.state === 'served') {
+                  newestList.current = { readList, list: reading.list }
+                  setList({ readList, reading, unread: null })
+                } else remembered = true
               },
               (failure: unknown) => {
                 // The list as it was stays, and the failure is told beside it.
@@ -243,6 +264,13 @@ export function useLaunchSurface(
     listAgain.current()
   }, [])
   const newest = useCallback(() => started.current, [])
+  const listNow = useCallback(
+    () =>
+      newestList.current !== null && newestList.current.readList === readListNow.current
+        ? newestList.current.list
+        : null,
+    []
+  )
 
   const own = read !== null && held?.read === read ? held : null
   const ownList = readList !== null && list?.readList === readList ? list : null
@@ -261,6 +289,21 @@ export function useLaunchSurface(
     dark,
     list: ownList?.reading ?? null,
     listUnread: ownList?.unread ?? null,
-    listAgain: refreshList
+    listAgain: refreshList,
+    listNow
   }
+}
+
+/**
+ * The read of the host's saved launch commands for a connection that holds `rights`, or null where
+ * it may not read them: a connection without `host.manage` is refused the list, so it never asks.
+ * The read is the same function for as long as the answer to that question is the same, so a watch
+ * that depends on it is not started over by a change of the rights' array.
+ */
+export function useSavedCommandsRead(
+  port: HostPort,
+  rights: readonly ActionRight[] | null
+): (() => Promise<LaunchCommandsReading>) | null {
+  const mayRead = rights?.includes('host.manage') === true
+  return useMemo(() => (mayRead ? () => port.launchCommands() : null), [port, mayRead])
 }
