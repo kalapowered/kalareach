@@ -795,8 +795,11 @@ export function MobileSession({
             end('refused')
             return
           }
-          // The files that went with the prompt are the session's now, and no longer this composer's.
-          if (pairedDraft) uploads.forgetSent(sessionId)
+          // The files that went with the prompt are the session's now, and no longer this composer's,
+          // once the host performed it: the application ends its draft only then, so a prompt it
+          // has only accepted, or whose outcome nobody knows, leaves the files bound to the draft.
+          const performed = pairedDraft && state === 'applied'
+          if (performed) uploads.forgetSent(sessionId)
           // The composer is cleared only when it still holds what was submitted. A person who
           // typed the next thing while this one was in flight keeps what they typed, whichever
           // opening they typed it under.
@@ -806,7 +809,7 @@ export function MobileSession({
                 ? {
                     ...edit(each, '', Date.now()),
                     // The files that went with the prompt are the session's now.
-                    attachments: pairedDraft
+                    attachments: performed
                       ? each.attachments.filter((file) => !wentWith.has(file.localId))
                       : each.attachments
                   }
