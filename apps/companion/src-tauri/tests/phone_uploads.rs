@@ -1943,3 +1943,74 @@ async fn kr_req_23_41_a_lost_discard_is_answered_by_the_hosts_record() {
     );
     adopted.stop().await;
 }
+
+/// KR-REQ-23.41: a stop in the middle of a bind leaves no falsely known revision. The entry says the
+/// revision is unknown while the call is out, so the next bind ends that draft and makes a new one,
+/// and does not add to a draft at a revision the host may have moved past.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_stop_during_a_bind_leaves_no_falsely_known_revision() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let session = adopted.workers[0].session_id;
+    let first = bind(companion, session, &handed(companion)).expect("the first bind");
+    assert_eq!(
+        kept(companion, session)["revision"],
+        first["value"]["revision"],
+        "the revision is known between binds"
+    );
+    let second = handed(companion);
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let bind_of = companion_tauri::paired_drafts::Bind {
+        session_id: session,
+        application_instance_id: None,
+        text: "see the file".to_owned(),
+        transfer_id: serde_json::from_value(second["transfer_id"].clone()).expect("an id"),
+        contribution: serde_json::from_value(contribution()).expect("a contribution"),
+    };
+
+    control.hold_next_request(Method::AgentDraftAddAttachment);
+    let binding = {
+        let (drafts, paired) = (Arc::clone(&drafts), paired_of(companion));
+        let target = net_support::on_the_session(&adopted.host, session);
+        tokio::spawn(async move { drafts.bind(paired, target, bind_of).await })
+    };
+    control.until_request_held().await;
+    // The process stops here: the call is out and its answer is never read.
+    binding.abort();
+    assert!(binding.await.is_err(), "the bind was stopped");
+    let (path, bytes) = draft_file(&phone);
+    let entry: Value = serde_json::from_slice(&bytes).expect("the entry reads");
+    assert_eq!(
+        entry["draftId"], first["value"]["draftId"],
+        "the draft is the one that was made: {entry}"
+    );
+    assert!(
+        entry["revision"].is_null(),
+        "the revision is not known while the call is out: {entry}"
+    );
+    let shown = kept(companion, session);
+    assert_eq!(shown["made"], true, "{shown}");
+    assert!(shown["revision"].is_null(), "{shown}");
+
+    // The stopped process may or may not have moved the host's draft: the entry does not guess.
+    control.release_request();
+    let next = bind(companion, session, &second).expect("the next bind makes a new draft");
+    assert_ne!(
+        next["value"]["draftId"], first["value"]["draftId"],
+        "a draft of an unknown revision is ended and not added to: {next}"
+    );
+    let reread = kept(companion, session);
+    assert_eq!(
+        reread["attachments"].as_array().map(Vec::len),
+        Some(1),
+        "{reread}"
+    );
+    assert!(path.exists(), "the new draft is kept");
+    adopted.stop().await;
+}
