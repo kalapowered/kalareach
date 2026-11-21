@@ -1688,6 +1688,16 @@ impl Context {
         }
     }
 
+    /// The environment the second person's shell is created with: the newer build's in a case that
+    /// upgrades, and the first shell's otherwise, so that a second session that resumes the first
+    /// one's conversation has the login and the configuration directory that conversation is in.
+    fn second_variables(&self, host: &Host<'_>) -> Vec<(String, String)> {
+        match second_list(self.upgrade) {
+            SecondList::Newer => self.newer_variables(host),
+            SecondList::First => self.variables(host),
+        }
+    }
+
     /// The environment the second person's shell is created with in a case that upgrades: no login,
     /// and on a real route the newer build's own configuration directory.
     fn newer_variables(&self, host: &Host<'_>) -> Vec<(String, String)> {
@@ -2268,6 +2278,34 @@ fn generation_entry(directory: &Path) -> GenerationEntry {
     }
 }
 
+/// Which list of variables a second person's shell is created with.
+#[derive(Debug, PartialEq, Eq)]
+enum SecondList {
+    /// The newer build's: its own configuration directory and no login.
+    Newer,
+    /// The first shell's: the login and the configuration directory the run prepared, where the
+    /// case has them.
+    First,
+}
+
+/// The newer build's list is prepared only in a case that upgrades, and it holds no login, so the
+/// second session of any other case takes the first shell's.
+fn second_list(upgrade: bool) -> SecondList {
+    if upgrade {
+        SecondList::Newer
+    } else {
+        SecondList::First
+    }
+}
+
+/// A second session of a case that does not upgrade is given the first shell's list, which a real
+/// route has prepared, and not the newer build's, which it has not.
+#[test]
+fn a_second_session_of_a_case_that_does_not_upgrade_takes_the_first_shells_variables() {
+    assert_eq!(second_list(false), SecondList::First);
+    assert_eq!(second_list(true), SecondList::Newer);
+}
+
 /// A person at a terminal in a managed session.
 struct Person {
     window: Window,
@@ -2289,9 +2327,7 @@ impl Person {
         let mut variables = if known.is_empty() {
             ctx.prepare_variables(host)
         } else {
-            // A second person's shell is given no login: the first person's is the agent's
-            // session's alone.
-            ctx.newer_variables(host)
+            ctx.second_variables(host)
         };
         variables.extend(given.iter().cloned());
         let expected = ctx.expects(host, &variables);
