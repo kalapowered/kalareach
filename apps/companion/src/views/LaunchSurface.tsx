@@ -200,7 +200,7 @@ export function LaunchSurface({
                     () => {
                       setPressing(false)
                       setSettled({ after: newest(), ended: 'installed' })
-                      say(`${offer.label} started.`, 'success')
+                      say(`Submitted the command for "${offer.label}" at the prompt.`, 'success')
                       again()
                     },
                     (failure: unknown) => {
@@ -213,7 +213,7 @@ export function LaunchSurface({
                         retry: failureRetry(failure)
                       })
                       setSettled({ after: newest(), ended: unknown ? 'unconfirmed' : 'refused' })
-                      say(pressRefusal(code, failureWords(failure), unknown), 'danger')
+                      say(pressRefusal(code, failureWords(failure), unknown, drawn.shell), 'danger')
                       again()
                     }
                   )

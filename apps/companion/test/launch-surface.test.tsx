@@ -132,7 +132,7 @@ describe('the rows of the table that are words', () => {
     const instructions = await screen.findByTestId('launch-instructions')
     await person.click(within(instructions).getByRole('button', { name: 'Claude Code' }))
     expect(within(instructions).getByTestId('launch-instruction')).toHaveTextContent(
-      'Type this at the prompt: claude'
+      "Type this at the prompt: 'claude'"
     )
   })
 })
@@ -170,7 +170,7 @@ describe('the buttons that start something', () => {
     for (const each of within(surface).getAllByRole('button')) expect(each).toBeEnabled()
 
     await person.click(within(surface).getByRole('button', { name: 'Claude Code' }))
-    expect(await screen.findByText('Claude Code started.')).toBeInTheDocument()
+    expect(await screen.findByText('Submitted the command for "Claude Code" at the prompt.')).toBeInTheDocument()
     expect(controls.launches).toEqual([
       expect.objectContaining({ sessionId: SESSION_MAIN, command: { arguments: ['claude'] } })
     ])
@@ -198,7 +198,7 @@ describe('the buttons that start something', () => {
     await waitFor(() => {
       expect(reads.count).toBeGreaterThan(0)
     })
-    expect(screen.queryByText('Claude Code started.')).toBeNull()
+    expect(screen.queryByText('Submitted the command for "Claude Code" at the prompt.')).toBeNull()
     expect(controls.launches).toEqual([])
     expect(await screen.findByText(/The prompt changed before the launch was installed/)).toBeInTheDocument()
     allDisabled()
@@ -240,7 +240,7 @@ describe('the buttons that start something', () => {
     await person.click(screen.getByTestId('launch-refresh'))
     expect(within(screen.getByTestId('launch-surface')).getByRole('button', { name: 'Claude Code' })).toBeEnabled()
     await person.click(within(screen.getByTestId('launch-surface')).getByRole('button', { name: 'Claude Code' }))
-    expect(await screen.findByText('Claude Code started.')).toBeInTheDocument()
+    expect(await screen.findByText('Submitted the command for "Claude Code" at the prompt.')).toBeInTheDocument()
   })
 
   // An editor that could not say what became of the launch is not "nothing was typed": the command
@@ -262,7 +262,7 @@ describe('the buttons that start something', () => {
     const said = await screen.findByText(/could not confirm whether the launch was installed/)
     expect(said).toBeInTheDocument()
     expect(said.textContent).not.toMatch(/Nothing was typed/)
-    expect(screen.queryByText('Claude Code started.')).toBeNull()
+    expect(screen.queryByText('Submitted the command for "Claude Code" at the prompt.')).toBeNull()
     const line = screen.getByTestId('launch-stale')
     expect(line).toHaveTextContent('could not confirm the last launch')
     expect(line.textContent).not.toMatch(/refused/)
@@ -302,7 +302,7 @@ describe('the buttons that start something', () => {
     await person.click(within(surface).getByRole('button', { name: 'Claude Code' }))
     const said = await screen.findByText(/could not confirm whether the launch was installed/)
     expect(said.textContent).not.toMatch(/Nothing was typed/)
-    expect(screen.queryByText('Claude Code started.')).toBeNull()
+    expect(screen.queryByText('Submitted the command for "Claude Code" at the prompt.')).toBeNull()
     const line = screen.getByTestId('launch-stale')
     expect(line).toHaveTextContent('could not confirm the last launch')
     expect(line.textContent).not.toMatch(/refused/)
