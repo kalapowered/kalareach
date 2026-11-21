@@ -1236,12 +1236,29 @@ pub mod testing {
         }
     }
 
+    /// An active read that has its answer in hand, held before the owner is told of it, until it
+    /// is released.
+    #[derive(Debug)]
+    pub struct ReadHold {
+        /// The command that made the read.
+        pub command: &'static str,
+        release: oneshot::Sender<()>,
+    }
+
+    impl ReadHold {
+        /// Lets the read go on.
+        pub fn release(self) {
+            let _ = self.release.send(());
+        }
+    }
+
     /// Every place a task of the owner can be paused at.
     #[derive(Debug, Default)]
     pub(super) struct Pauses {
         publisher: Place,
         adoption: Place,
         stops: Mutex<Option<mpsc::UnboundedSender<Stop>>>,
+        reads: Mutex<Option<mpsc::UnboundedSender<ReadHold>>>,
         state_wait: Mutex<Option<Duration>>,
         lose_emits: AtomicUsize,
     }
@@ -1302,6 +1319,35 @@ pub mod testing {
                     release,
                 });
                 if sent.is_ok() {
+                    let _ = released.await;
+                }
+            }
+        }
+
+        /// Hands every active read that has its answer in hand to the returned receiver, held
+        /// after the read was answered and before the owner is told of it, until it is released.
+        /// Reads are held in the order they reach the place and may be released in any order.
+        #[must_use]
+        pub fn watch_reads(&self) -> mpsc::UnboundedReceiver<ReadHold> {
+            let (watching, reads) = mpsc::unbounded_channel();
+            *self
+                .pauses
+                .reads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(watching);
+            reads
+        }
+
+        pub(crate) async fn at_the_read(&self, command: &'static str) {
+            let watching = self
+                .pauses
+                .reads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(watching) = watching {
+                let (release, released) = oneshot::channel();
+                if watching.send(ReadHold { command, release }).is_ok() {
                     let _ = released.await;
                 }
             }

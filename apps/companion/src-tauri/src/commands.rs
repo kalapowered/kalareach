@@ -1921,11 +1921,19 @@ pub async fn session_agents(
     links.agents(&state, session_id, opening.as_deref()).await
 }
 
-read_command!(
-    /// Reads the attention inbox this computer's owner sees.
-    attention_read, Method::AttentionRead,
-    kr_protocol::attention::AttentionReadParams => kr_protocol::attention::AttentionReadResult
-);
+/// Reads the attention inbox this computer's owner sees.
+///
+/// The parameters are decoded before a host is asked for.
+#[tauri::command]
+pub async fn attention_read(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: kr_protocol::attention::AttentionReadParams = decode(params)?;
+    let session = state.session()?;
+    let answer: std::result::Result<kr_protocol::attention::AttentionReadResult, _> =
+        session.read(Method::AttentionRead, &typed).await;
+    #[cfg(feature = "testing")]
+    state.contact_owner().at_the_read("attention_read").await;
+    encode(&answer?)
+}
 mutate_command!(
     /// Records that this computer's owner has seen attention items, each at the revision shown.
     attention_acknowledge, Method::AttentionAcknowledge,

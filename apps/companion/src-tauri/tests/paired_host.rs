@@ -2119,3 +2119,50 @@ async fn a_lost_final_emit_is_found_by_the_tail() {
     );
     host.stop().await;
 }
+
+/// The parameters of a read of the whole inbox's first page, as the page sends them.
+fn inbox_read() -> serde_json::Value {
+    json!({ "params": {
+        "session_id": null,
+        "include_acknowledged": false,
+        "max_items": "200",
+        "after": null
+    } })
+}
+
+/// KR-REQ-13.01: an active read that has its answer in hand waits at the hold until it is released,
+/// and then answers what the host sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hold_releases_a_read_after_its_answer_is_in_hand() {
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&host, &control);
+    pair(&phone, &host, &owner, &[ActionRight::SessionView]).await;
+    let companion = &phone.companion;
+    connection(companion, true).await;
+    let mut holds = contact_owner(companion).watch_reads();
+
+    let read = companion.start_call("attention_read", inbox_read());
+    let held = tokio::time::timeout(WATCHDOG, holds.recv())
+        .await
+        .expect("the read reaches the hold")
+        .expect("a hold");
+    assert_eq!(held.command, "attention_read");
+    assert_eq!(
+        control.sent(Method::AttentionRead),
+        1,
+        "the host was asked once, and its answer is in hand"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!read.is_finished(), "a held read is not answered");
+
+    held.release();
+    let answer = tokio::time::timeout(WATCHDOG, read)
+        .await
+        .expect("the read answers once released")
+        .expect("the call's task")
+        .expect("the host's inbox");
+    assert!(answer["items"].is_array(), "{answer}");
+    host.stop().await;
+}
