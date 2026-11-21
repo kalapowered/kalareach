@@ -1253,17 +1253,17 @@ async fn send_prompt(
         let settled = send_draft_prompt(state, method, &typed, &expected).await?;
         // A prompt that names the draft records the send on the host, which frees the draft's place:
         // the draft is the session's now, and what this device kept of it ends.
-        if !settled.answer_lost {
-            if let Ok((device_id, environment_id, session)) = state.paired_snapshot() {
-                state.paired_drafts().sent(
-                    &crate::open_transfers::Paired {
-                        device_id,
-                        environment_id,
-                        session,
-                    },
-                    typed.target.subject.session_id,
-                );
-            }
+        if !settled.answer_lost
+            && let Ok((device_id, environment_id, session)) = state.paired_snapshot()
+        {
+            state.paired_drafts().sent(
+                &crate::open_transfers::Paired {
+                    device_id,
+                    environment_id,
+                    session,
+                },
+                typed.target.subject.session_id,
+            );
         }
         return Ok(settled);
     }

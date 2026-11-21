@@ -967,7 +967,7 @@ async fn kr_req_23_41_a_stale_revision_is_taken_from_the_message_and_the_bind_go
 
 /// KR-REQ-23.41: a `draft.create` whose answer was lost is not made again: the host's record of the
 /// action answers it, and the draft it made is the one that is kept.
-#[ignore = "unresolved: the host refuses the repeat and the receipt read gives no result"]
+#[ignore = "waiting for a ruling: the host answers only an exact repeat of the first request, and the receipt read of a host-level action is refused; see the hand-over"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_41_a_lost_create_is_answered_by_the_hosts_record_and_not_made_again() {
     use kr_protocol::ids::ActionId;

@@ -241,7 +241,8 @@ async fn a_paired_device_sends_two_full_chunks_and_a_short_one_and_the_host_publ
         &on_the_host(&host),
         &mut upload,
         TTL,
-        &progress, &kr_client::uploads::NoJournal,
+        &progress,
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect("the upload is published");
@@ -293,7 +294,8 @@ async fn a_stream_that_ends_after_the_first_chunk_is_replaced_and_the_host_publi
         &on_the_host(&host),
         &mut upload,
         TTL,
-        &progress, &kr_client::uploads::NoJournal,
+        &progress,
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect("the upload is published");
@@ -332,7 +334,8 @@ async fn an_upload_resumed_on_a_replacement_connection_after_its_publication_sen
         &on_the_host(&host),
         &mut upload,
         TTL,
-        &progress, &kr_client::uploads::NoJournal,
+        &progress,
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect("the upload is published");
@@ -361,7 +364,8 @@ async fn an_upload_resumed_on_a_replacement_connection_after_its_publication_sen
         &on_the_host(&host),
         &mut again,
         TTL,
-        &progress, &kr_client::uploads::NoJournal,
+        &progress,
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect("the status says it is published");
@@ -559,7 +563,8 @@ async fn a_device_that_may_not_view_a_session_is_not_told_its_finish_and_reads_i
         &target,
         &mut upload,
         TTL,
-        &progress, &kr_client::uploads::NoJournal,
+        &progress,
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect("the status says the upload is published, and the send returns its handle");
@@ -619,7 +624,15 @@ async fn an_upload_the_caller_gives_up_is_cancelled_by_its_transfer_and_its_byte
     {
         // The send is dropped while the host holds the first chunk: the chunk is written and its
         // answer is awaited, so the lane is part way through its call.
-        let sending = uploads::send(&session, &route, &target, &mut upload, TTL, &progress, &kr_client::uploads::NoJournal);
+        let sending = uploads::send(
+            &session,
+            &route,
+            &target,
+            &mut upload,
+            TTL,
+            &progress,
+            &kr_client::uploads::NoJournal,
+        );
         tokio::pin!(sending);
         tokio::select! {
             sent = &mut sending => panic!("the upload ended before it was given up: {sent:?}"),
