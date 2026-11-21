@@ -337,6 +337,25 @@ impl Tree {
         self
     }
 
+    /// The folder of each crate of the workspace and the product files its inventory reaches, by
+    /// canonical path, for the crates that `include` accepts. A crate the inventory refuses is an
+    /// error.
+    pub fn product_files(
+        &self,
+        include: &dyn Fn(&str) -> bool,
+    ) -> Result<BTreeMap<String, (PathBuf, BTreeSet<PathBuf>)>, String> {
+        let mut all = BTreeMap::new();
+        for (krate, folder) in self
+            .crates
+            .iter()
+            .filter(|(krate, _)| include(krate) && !self.manifests[*krate].proc_macro)
+        {
+            let files = self.inventory(krate)?.files.iter().cloned().collect();
+            all.insert(krate.clone(), (folder.clone(), files));
+        }
+        Ok(all)
+    }
+
     /// The files product code of `krate` is made of: read once, for the index and the scan.
     fn inventory(&self, krate: &str) -> Result<Rc<Inventory>, String> {
         if let Some(found) = self.inventories.borrow().get(krate) {
