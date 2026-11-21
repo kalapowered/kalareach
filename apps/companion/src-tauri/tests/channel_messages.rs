@@ -16,6 +16,12 @@ use kr_ipc::testing::PrivateTempDir;
 use serde_json::{Value, json};
 use tauri::test::MockRuntime;
 
+/// Where the bundle's pages are served from, which is where the page's calls come from. On Windows
+/// that is not the address the other platforms use, and a call from any other address is a call from
+/// a remote origin, which the application's capabilities do not grant its commands.
+#[cfg(windows)]
+const BUNDLE: &str = "http://tauri.localhost";
+#[cfg(not(windows))]
 const BUNDLE: &str = "tauri://localhost";
 const SESSION: &str = "8a7b6c50-22bb-4c3d-8e4f-000000000101";
 const OTHER_SESSION: &str = "8a7b6c50-22bb-4c3d-8e4f-000000000102";
