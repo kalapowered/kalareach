@@ -3162,6 +3162,31 @@ async fn slow_visit(
         .expect("the hold is given")
 }
 
+/// Waits until the owner holds a read of `host` that is newer than `after`, and gives its serial.
+async fn read_newer_than(
+    owner: &companion_tauri::contact::ContactOwner,
+    host: kr_protocol::ids::DeviceId,
+    after: Option<u64>,
+) -> u64 {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let serial = owner
+                .records(&[host])
+                .rows
+                .first()
+                .and_then(|row| row.read.as_ref().map(|read| read.serial()));
+            if let Some(serial) = serial
+                && Some(serial) > after
+            {
+                return serial;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the owner holds a newer read of the host")
+}
+
 /// A row of a pass's answer, by the reference of its host.
 fn row_of<'a>(reply: &'a serde_json::Value, reference: &str) -> Option<&'a serde_json::Value> {
     hosts_of(reply)
@@ -3329,28 +3354,20 @@ async fn a_refusal_clears_the_hosts_read_in_the_same_revision() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pass_answers_with_the_records_not_its_own_results() {
     let v = visiting().await;
-    let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
+    // C's visit is held after its read, outside the ten seconds a visit is bound to, so no time
+    // the case takes ends it.
+    let slow = hold_visit_of(v.companion().inbox().watch_visits(), v.id_of(&v.c_ref));
+    let a = v.id_of(&v.a_ref);
+    let state = v.companion().app.state::<companion_tauri::AppState>();
+    let owner = state.contact_owner();
     let older = v.pass();
-    // A is read by the older pass, which C holds: wait for the read, and for the visit to end.
-    tokio::time::timeout(WATCHDOG, async {
-        while v.control.sent(Method::AttentionRead) < 1 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("A is read by the older pass");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A is read by the older pass, which C holds: wait until the owner holds that read.
+    let first = read_newer_than(owner, a, None).await;
     let newer = v.pass();
-    // A is read twice: by the older pass, and by the newer one, which does not wait for C to read A.
-    tokio::time::timeout(WATCHDOG, async {
-        while v.control.sent(Method::AttentionRead) < 2 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("A is read by both passes");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    v.control.release_dialled();
+    // A is read again by the newer pass, which does not wait for C: wait until the owner holds the
+    // newer read.
+    read_newer_than(owner, a, Some(first)).await;
+    slow_visit(slow).await.release();
     let older = older.await.expect("ran").expect("answered");
     let newer = newer.await.expect("ran").expect("answered");
     let (old_row, new_row) = (
@@ -3563,8 +3580,15 @@ async fn a_visitor_queued_across_a_forget_takes_no_connection_and_makes_no_recor
     let a = v.id_of(&v.a_ref);
     let hold = visit_held(&mut visits, a).await;
     let endpoint = v.a.network().endpoint_id();
+    // The first visit to A is past its admission: the visitors that reach theirs from here are the
+    // queued pass's.
+    let mut admissions = v.companion().inbox().watch_admissions();
     let queued = v.pass();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::timeout(WATCHDOG, async {
+        while admissions.recv().await.expect("a visit is admitted") != a {}
+    })
+    .await
+    .expect("the queued visitor to A is admitted and waits for its turn");
     let asked = v.control.asked_of(&endpoint);
     let device = v.companion().device();
     let listed = device.host_by_reference(&v.a_ref).expect("A is listed");

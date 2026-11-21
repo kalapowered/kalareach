@@ -360,6 +360,8 @@ impl InboxDesk {
                 }
             }
         };
+        #[cfg(feature = "testing")]
+        self.at_the_admission(host.host_device_id);
         let _turn = gate.lock().await;
         let retained = match self.owner.begin_visit(&ticket).value {
             Begin::Go(retained) => retained,
@@ -716,6 +718,7 @@ pub mod testing {
         visits: Mutex<Option<mpsc::UnboundedSender<VisitHold>>>,
         checks: Mutex<Option<mpsc::UnboundedSender<CheckHold>>>,
         replaces: Mutex<Option<mpsc::UnboundedSender<ReplaceHold>>>,
+        admissions: Mutex<Option<mpsc::UnboundedSender<DeviceId>>>,
     }
 
     impl InboxDesk {
@@ -771,6 +774,32 @@ pub mod testing {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(watching);
             replaces
+        }
+
+        /// Tells the returned receiver the host of each visit that has been admitted and now waits
+        /// for its turn, so that a case knows a visitor stands behind the visit that holds it. Nothing
+        /// is held.
+        #[must_use]
+        pub fn watch_admissions(&self) -> mpsc::UnboundedReceiver<DeviceId> {
+            let (watching, admissions) = mpsc::unbounded_channel();
+            *self
+                .pauses
+                .admissions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(watching);
+            admissions
+        }
+
+        pub(super) fn at_the_admission(&self, host: DeviceId) {
+            let watching = self
+                .pauses
+                .admissions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(watching) = watching {
+                let _ = watching.send(host);
+            }
         }
 
         pub(super) async fn at_the_check(&self) {
