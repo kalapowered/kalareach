@@ -4375,17 +4375,20 @@ fn a_cancelled_receive_that_does_not_end_gives_the_call_back_at_the_deadline_and
 fn the_proof_cycle_is_counted_from_before_the_service_starts() {
     use std::time::{Duration, Instant};
     let bound = Duration::from_secs(300);
-    let before = Instant::now();
+    let mut inside = None;
     let cycle = install::ProofCycle::begin(bound, Duration::from_secs(10), || {
+        // The broker takes its own instant after its service has started, so the instant taken
+        // here, as the start begins, is no later than the broker's.
+        inside = Some(Instant::now());
         std::thread::sleep(Duration::from_millis(700));
         Ok(())
     })
     .unwrap();
-    // The broker takes its own instant after its service has started, so the installation's
-    // deadline must come before the broker's: it is counted from before the start, whatever the
-    // start took.
+    // The installation's deadline must come no later than the broker's: it is counted from before
+    // the start, whatever the start took. An instant taken after the start would come 700 ms after
+    // the one inside it, and the order tells the two apart with no allowance for the scheduler.
     assert!(
-        cycle.deadline() < before + bound + Duration::from_millis(300),
+        cycle.deadline() <= inside.expect("the start ran") + bound,
         "the deadline is counted from before the start"
     );
     // A start that fails is the error of the cycle.
