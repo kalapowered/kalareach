@@ -386,7 +386,7 @@ fn names_plain_daemon(value: &str) -> bool {
 /// why none of them starts the plain daemon: the held build is placed under the installed name, and
 /// a fixture or a message holds the name without running anything. A string in any other function,
 /// or beyond a listed count, is refused.
-const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 16] = [
+const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 17] = [
     (
         "crates/kr-cli/tests/bridged_session.rs",
         &[
@@ -517,6 +517,11 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 16] = [
                 "the held daemon, or the script that hands over to it, placed under the installed name; nothing starts the plain build",
             ),
             (
+                "stub_installation",
+                1,
+                "a stub daemon written under a name nothing runs and placed under the installed name; nothing starts the plain build",
+            ),
+            (
                 "the_allow_list_refuses_every_mutating_or_privileged_call",
                 7,
                 "a path or a name in a fixture, compared and never run",
@@ -597,6 +602,14 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 16] = [
                 "the package of the release before, built plain behind `Previous::built`'s guard",
             ),
         ],
+    ),
+    (
+        "crates/kr-cli/tests/upgrade/plugin_host_frames.rs",
+        &[(
+            "a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_it_serving",
+            1,
+            "the daemon of the release before, placed from the programs `Previous::built` builds plain behind its guard; the case starts that release's own daemon by design, on Linux",
+        )],
     ),
     (
         "crates/kr-ipc/tests/account_launchd.rs",
