@@ -794,6 +794,40 @@ describe('the desktop port and a host that changed', () => {
     expect(heard).toEqual(['2'])
   })
 
+  // The newest revision waits in the buffer, a replay is out, and a choice begins before it answers
+  // with the whole state at the revision the page holds: that state is the old host's, and a choice
+  // that is out takes no equal state back.
+  it('does not put the old host back on a resync at the revision it holds while a choice is out', async () => {
+    const { port, heard } = await following(published('env-a', 3))
+    let answerSince: (since: unknown) => void = () => undefined
+    shell.answers.set(
+      'connection_since',
+      new Promise((resolve) => {
+        answerSince = resolve
+      })
+    )
+    const missed = port.connectionSince(3)
+    await settle()
+    let answerUse: (state: unknown) => void = () => undefined
+    shell.answers.set(
+      'hosts_use',
+      new Promise((resolve) => {
+        answerUse = resolve
+      })
+    )
+    const choosing = port.hostsUse('host-b')
+    await settle()
+    answerSince({ revision: 3, resync: true, states: [published('env-a', 3)] })
+    await missed
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-a', '1', 3))
+    expect(heard).toEqual([])
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-b', 4) })
+    answerUse(published('env-b', 4))
+    await choosing
+    shell.handlers.get(HOST_EVENT)?.(hostEvent('env-b', '2', 4))
+    expect(heard).toEqual(['2'])
+  })
+
   it('tells the views no failure when a replay of what they missed cannot be read', async () => {
     const port = tauriPort()
     const shown: number[] = []

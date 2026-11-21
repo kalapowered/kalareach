@@ -295,10 +295,12 @@ export function tauriPort(): HostPort {
     const was = seen
     return invoking<NativeSince>('connection_since', { after }).then((since) => {
       const states = since.states.map(receivedPublication)
-      // The page was ahead of native code, or far behind it: what it held before says nothing now.
-      // Unless a state was taken in while the request was out: the whole state is then older than
-      // the page, and takes nothing back.
-      if (since.resync && seen === was) seen = 0
+      // The page was ahead of native code: native code started over, and what the page held before
+      // says nothing now. Only a whole state below the one the page held needs that. One at or above
+      // it is taken by the rule of `observe`, which an equal state does not pass while a choice is
+      // out; and unless a state was taken in while the request was out, the whole state is older
+      // than the page and takes nothing back.
+      if (since.resync && seen === was && states.every((state) => state.revision < was)) seen = 0
       for (const state of states) observe(state)
       return { revision: since.revision, states, resync: since.resync }
     })
