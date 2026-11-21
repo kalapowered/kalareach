@@ -341,12 +341,6 @@ impl AgentJob {
         self.job.kills_on_close()
     }
 
-    /// Reads the process holding `pid` as a member of this job, or says it is not one.
-    #[must_use]
-    pub fn member(&self, pid: u32) -> MemberReading {
-        self.job.member(pid)
-    }
-
     /// Returns the identifiers of every process the job currently holds: the agent while it runs,
     /// and every process it started that is still running.
     ///
