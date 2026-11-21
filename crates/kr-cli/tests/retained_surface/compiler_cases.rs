@@ -262,6 +262,12 @@ fn forms(root: &Path) {
         "crates/kr-forms/src/orphan.rs",
         "use kr_protocol::method::Method;\n\npub fn orphan() -> Method {\n    Method::AgentTurnCancel\n}\n",
     );
+    // The build script of the crate: no report covers a wire name in it, and no dep-info file lists it.
+    write(
+        root,
+        "crates/kr-forms/build.rs",
+        "fn main() {\n    let _ = \"agent.turn.cancel\";\n}\n",
+    );
 }
 
 /// The fixture workspace, stamped and built once for every case, with its report.
@@ -451,6 +457,7 @@ fn each_way_a_client_names_a_stamped_item_is_read_by_the_compiler_and_the_rest_i
             "kr_forms imported Names",
             "kr_forms literal Unread",
             "kr_forms macro:cancel Expands",
+            "kr_forms main Unread",
             "kr_forms mobile_only Unread",
             "kr_forms orphan Unread",
             "kr_forms pattern Names",
