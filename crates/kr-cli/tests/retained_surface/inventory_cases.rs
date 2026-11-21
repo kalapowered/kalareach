@@ -1543,3 +1543,48 @@ fn a_raw_identifier_is_the_name_it_stands_for_in_every_rule_that_reads_a_name() 
         Ok(Vec::<String>::new())
     );
 }
+
+#[test]
+fn a_place_no_configuration_without_test_builds_is_not_read_by_the_inventory_at_any_depth() {
+    let at = "crates/kr-sender/src/lib.rs";
+    // The children of a disabled impl, enum, variant or field raise no refusal.
+    for lib in [
+        "#[cfg(test)]\nimpl S { foreign::generate!(); }",
+        "#[cfg(test)]\nenum E { A([u8; include!(\"n.rs\")]) }",
+        "enum E { #[cfg(test)] A([u8; include!(\"n.rs\")]), B }",
+        "struct S { #[cfg(test)] f: [u8; include!(\"n.rs\")] }",
+        "#[cfg(test)]\nimpl S { type A = kr_protocol::MutationRequest; }",
+        "enum E { #[cfg(test)] A = include!(\"n.rs\"), B }",
+    ] {
+        assert_eq!(
+            read_names(&format!("{lib}\n"), &[]),
+            Ok(Vec::<String>::new()),
+            "{lib}"
+        );
+    }
+    // The same places, enabled, are refused.
+    for (lib, text) in [
+        (
+            "impl S { foreign::generate!(); }",
+            "generate! is called at item position",
+        ),
+        (
+            "enum E { A([u8; include!(\"n.rs\")]) }",
+            "the scan does not read include!",
+        ),
+        (
+            "enum E { #[cfg(unix)] A([u8; include!(\"n.rs\")]) }",
+            "the scan does not read include!",
+        ),
+        (
+            "struct S { f: [u8; include!(\"n.rs\")] }",
+            "the scan does not read include!",
+        ),
+    ] {
+        let (scan, _) = scanned(&format!("{lib}\n"), &[]);
+        assert!(
+            matches!(&scan, Err(error) if error.starts_with(&format!("{at}: ")) && error.contains(text)),
+            "{lib}: {scan:?}"
+        );
+    }
+}
