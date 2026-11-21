@@ -1569,10 +1569,18 @@ fn a_start_whose_process_ended_is_an_end_whatever_the_screen_shows_of_the_typed_
     );
 }
 
+/// The agent's process below the worker of `session_id` now: one read of the process table.
+fn agent_now(ctx: &Context, session_id: SessionId) -> Option<ProcessStartIdentity> {
+    let worker =
+        u32::try_from(ctx.run.worker_of(&session_id.to_string()).pid.get()).expect("a pid");
+    process_mapping_once(worker, inode_of(&ctx.executable), None)
+        .unwrap_or_else(|why| panic!("the agent's process was not looked for: {why}"))
+}
+
 /// Waits for the second start of the agent in `at` to end one way or the other, and says how, by
-/// [`second_screen`], with the agent's process: the process below the session's worker that maps
-/// the agent's file is looked for until it is seen, and its end is read before each read of the
-/// screen, so that the screen it is judged with is the last the agent drew.
+/// [`second_screen`], with the agent's process where it was seen: the process below the session's
+/// worker that maps the agent's file is looked for until it is seen, and its end is read before
+/// each read of the screen, so that the screen it is judged with is the last the agent drew.
 fn second_start(
     ctx: &Context,
     at: &Seated<'_>,
@@ -1580,21 +1588,17 @@ fn second_start(
     composer: &str,
     refusals: &[String],
     draft: &[String],
-) -> (Started, Option<String>) {
-    let worker =
-        u32::try_from(ctx.run.worker_of(&at.session_id.to_string()).pid.get()).expect("a pid");
-    let inode = inode_of(&ctx.executable);
+) -> (Started, Option<String>, Option<ProcessStartIdentity>) {
     let mut agent: Option<ProcessStartIdentity> = None;
     let started = Instant::now();
     loop {
         if agent.is_none() {
-            agent = process_mapping_once(worker, inode, None)
-                .unwrap_or_else(|why| panic!("the agent's process was not looked for: {why}"));
+            agent = agent_now(ctx, at.session_id);
         }
         let ended = agent.as_ref().is_some_and(|identity| !running(identity));
         let rows = at.person.window.screen();
-        if let Some(answer) = second_screen(&rows, typed, composer, refusals, draft, ended) {
-            return answer;
+        if let Some((how, shown)) = second_screen(&rows, typed, composer, refusals, draft, ended) {
+            return (how, shown, agent);
         }
         assert!(
             started.elapsed() < LIVENESS,
@@ -1609,6 +1613,39 @@ fn second_start(
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// What became of the agent's process after it refused the second start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// It went on running with the conversation open read-only and a notice in place of the
+    /// composer, as Codex does.
+    ReadOnly,
+    /// It ended after the refusal, or was not found once the refusal showed.
+    Ended,
+}
+
+/// How a refused start stands, from whether the agent's process runs now (`None` where none was
+/// found below the session's worker).
+fn refusal_standing(runs: Option<bool>) -> Standing {
+    if runs.unwrap_or(false) {
+        Standing::ReadOnly
+    } else {
+        Standing::Ended
+    }
+}
+
+/// A refusal after which the agent's process ended, or was not found, is an ended refusal and no
+/// failure of the part; one after which it runs is a read-only conversation. The part passes on a
+/// refusal either way.
+#[test]
+fn a_refusal_that_ended_the_agent_is_an_ended_refusal_and_a_card_that_runs_is_read_only() {
+    assert_eq!(refusal_standing(Some(true)), Standing::ReadOnly);
+    assert_eq!(refusal_standing(Some(false)), Standing::Ended);
+    assert_eq!(refusal_standing(None), Standing::Ended);
+    let refused = taken(Started::Refused, None, None).expect("a refusal is an outcome");
+    assert_eq!(refused, Taken::Refused);
+    assert!(check_taken(false, refused).is_ok());
 }
 
 /// Every file of the agent's record with its content, in the order of their places.
@@ -1794,7 +1831,7 @@ fn second_process(
     real.checks_the_route(&ctx.run);
     let line = real.typed(&extra);
     b.person.types(&line);
-    let (started, refusal) = second_start(
+    let (started, refusal, agent_seen) = second_start(
         ctx,
         &b,
         &line,
@@ -1815,14 +1852,22 @@ fn second_process(
     });
     if started != Started::Running {
         if started == Started::Refused {
-            // The agent may refuse and go on running, with the conversation open read-only and a
-            // notice in place of the composer: the process is recorded, and session A's
-            // conversation is as it was, since a read-only view writes nothing.
-            let agent_b = HandAgent::found(ctx, b.session_id);
+            // The agent may refuse and end, or go on running with the conversation open read-only
+            // and a notice in place of the composer: a refusal is an outcome either way, and the
+            // process is recorded as it stands. Session A's conversation is as it was, since a
+            // read-only view writes nothing.
+            let standing = refusal_standing(
+                agent_seen
+                    .or_else(|| agent_now(ctx, b.session_id))
+                    .as_ref()
+                    .map(running),
+            );
             record_unchanged(&record_before, &record_files(ctx, real))
                 .unwrap_or_else(|why| panic!("session A's conversation is as it was: {why}"));
             evidence["session_b"]["still_running_read_only"] =
-                serde_json::json!(agent_b.runs().is_ok());
+                serde_json::json!(standing == Standing::ReadOnly);
+            evidence["session_b"]["ended_after_the_refusal"] =
+                serde_json::json!(standing == Standing::Ended);
         } else {
             // The agent's start ended: the host shows no instance for it.
             check_unchanged(None, &shown_now(ctx, &b)).unwrap_or_else(|why| {
@@ -1999,8 +2044,9 @@ fn second_process_by_hand(
 /// is about and fails this part. Where the agent runs a second process on the conversation, the host
 /// keeps the two apart as two live executions: it detects each launch as its own instance, marked
 /// input to one never reaches the other, and A's binding revision stays as it was; where the agent
-/// refuses, the host shows no instance for the refused start and A as it was. The control breaks the
-/// property: B's marker typed into A's session, and the isolation check fails on it.
+/// refuses, whether it ended or went on running read-only with a notice in place of the composer,
+/// A's conversation and binding are as they were. The control breaks the property: B's marker typed
+/// into A's session, and the isolation check fails on it.
 #[test]
 fn gateway_a_second_process_on_the_same_saved_conversation_is_another_execution_not_merged() {
     const TEST: &str =
