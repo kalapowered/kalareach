@@ -426,7 +426,7 @@ say("a second question answered at the host while the person had chosen Yes and 
 say("and the host's answer is the one the worker keeps (09.21)", report.get("host_answer_kept") is True)
 if platform == "android":
     expired = report.get("expired_step") or ""
-    say("a question that expired while its notification was on the phone was ended as expired by the worker, and the person who tapped the notification is told so and is offered nothing to answer it with (KR-ACC-013)",
+    say("a question that expired while its notification was on the phone was ended as expired by the worker, and the person who tapped the notification is offered nothing to answer it with (KR-ACC-013)",
         report.get("expiring_delivered") is True and report.get("expiring_shown") is True
         and report.get("expiring_ended_as_expired") is True and "PUSH-EXPIRED" in expired and "Send answer" not in expired,
         expired[:300].replace("\n", " "))

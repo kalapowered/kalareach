@@ -24,8 +24,9 @@ Commands, each given the adb program, the emulator's serial and a screenshot dir
       had chosen, and offers nothing to send. Prints `PUSH-ENDED <what the screen shows>`.
 
   expired
-      After `tap` on the notification of a question that expired, waits until the page says that it
-      expired and offers nothing to answer it with. Prints `PUSH-EXPIRED <what the screen shows>`.
+      After `tap` on the notification of a question that expired, waits until the page offers nothing to
+      answer it with: it says that the question expired, or its Attention screen lists no question and
+      says that nothing needs the person. Prints `PUSH-EXPIRED <what the screen shows>`.
 
 `blind` is for a sheet the application opens over the Attention screen, which the web view does not
 always hand over to `uiautomator`: when the choice or the button is not on the screen, it is pressed
@@ -182,13 +183,15 @@ def observe(phone: Phone) -> None:
 
 
 def expired(phone: Phone) -> None:
-    """Waits for the page, opened from the notification of a question that has expired, to say that it
-    expired and to offer nothing to answer it with."""
+    """Waits for the page, opened from the notification of a question that has expired, to offer nothing
+    to answer it with: it says the question expired, or its Attention screen lists no question and says
+    that nothing needs the person."""
     def said(nodes: list[dict]) -> bool:
         labels = [each["label"] for each in nodes]
-        return any("expired" in label.lower() for label in labels) and not any(label in {"Send answer", "Yes"} for label in labels)
+        ended = any("expired" in label.lower() for label in labels) or "Nothing needs you right now." in labels
+        return ended and not any(label in {"Send answer", "Yes"} for label in labels)
 
-    phone.wait_screen(said, "the page to say the question expired and to offer nothing to answer it with", 60, nudging=True)
+    phone.wait_screen(said, "the page to offer nothing to answer the expired question with", 60, nudging=True)
     phone.shot("expired")
     print(f"PUSH-EXPIRED {texts(phone)}", flush=True)
 
