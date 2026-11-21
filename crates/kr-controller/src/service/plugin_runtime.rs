@@ -310,7 +310,7 @@ impl PluginRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_owned());
     }
 
-    /// Forgets the kept reason: a start succeeded.
+    /// Forgets the kept reason: a start succeeded, or an attempt ended without saying why.
     fn forget_failure(&self) {
         *self
             .last_start_failure
@@ -422,6 +422,9 @@ impl PluginRuntime {
                                 if started.await.is_err() {
                                     let mut state = runtime.state.lock().await;
                                     if matches!(&*state, State::Starting(_)) {
+                                        // No start said why: an earlier attempt's reason is
+                                        // not the last start's.
+                                        runtime.forget_failure();
                                         *state = State::Failed {
                                             reason: "the attempt to start the plugin runtime \
                                                      ended abnormally"
@@ -851,9 +854,11 @@ mod tests {
         assert_eq!(supervisor.asked.load(Ordering::SeqCst), 1);
     }
 
-    /// A supervisor that panics when it is asked to start a service.
-    #[derive(Debug)]
-    struct Panicking;
+    /// A supervisor whose first start fails and whose later starts panic.
+    #[derive(Debug, Default)]
+    struct Panicking {
+        starts: AtomicUsize,
+    }
 
     impl WorkerSupervisor for Panicking {
         fn start(&self, _launch: &crate::supervision::WorkerLaunch) -> LaunchOutcome {
@@ -863,11 +868,16 @@ mod tests {
         }
 
         fn start_service(&self, _launch: &ServiceLaunch) -> LaunchOutcome {
+            if self.starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return LaunchOutcome::NotStarted {
+                    detail: "the first start fails".to_owned(),
+                };
+            }
             panic!("the platform's service manager failed in a way nobody planned for");
         }
 
         fn describe(&self) -> &'static str {
-            "a supervisor that panics"
+            "a supervisor whose first start fails and whose later starts panic"
         }
     }
 
@@ -880,12 +890,25 @@ mod tests {
         let runtime = Arc::new(
             PluginRuntime::new(
                 host.environment(),
-                Arc::new(Panicking),
+                Arc::new(Panicking::default()),
                 host.root().join("kr-plugin-host"),
                 host.root().join("repositories"),
             )
             .remembering_for(Duration::from_secs(3600)),
         );
+
+        // A start that fails keeps its reason; the attempt after it ends abnormally, and no start
+        // said why that one failed, so the reason of the one before is not said as the last start's.
+        let failed = runtime.request().await;
+        assert!(
+            matches!(&failed, PluginRuntimeState::Unavailable(told) if told.reason.contains("the first start fails")),
+            "{failed:?}"
+        );
+        assert!(
+            runtime.kept_failure().is_some(),
+            "the failed start's reason is kept"
+        );
+        *runtime.state.lock().await = State::Idle;
 
         // The first request is told the attempt was lost; the ones after are told the failure
         // the watcher left. Without the watcher the state stays `Starting` and no request is ever
@@ -916,6 +939,11 @@ mod tests {
             again.reason.contains("ended abnormally"),
             "{}",
             again.reason
+        );
+        assert_eq!(
+            runtime.kept_failure(),
+            None,
+            "no start said why the attempt that ended abnormally did"
         );
     }
 
@@ -1084,10 +1112,27 @@ mod tests {
     }
 
     /// A supervisor that plays the plugin host of the start: it reports why it could not start, on
-    /// the rendezvous connection it is given, as the host does.
+    /// the rendezvous connection it is given, as the host does. From the start numbered
+    /// `reports_from` on, it plays a host that reports in with a claim for `endpoint` instead.
     struct FailingHost {
         reason: &'static str,
         handle: tokio::runtime::Handle,
+        reports_from: usize,
+        endpoint: String,
+        starts: AtomicUsize,
+    }
+
+    impl FailingHost {
+        /// A host that never reports in.
+        fn failing(reason: &'static str) -> Self {
+            Self {
+                reason,
+                handle: tokio::runtime::Handle::current(),
+                reports_from: usize::MAX,
+                endpoint: String::new(),
+                starts: AtomicUsize::new(0),
+            }
+        }
     }
 
     impl std::fmt::Debug for FailingHost {
@@ -1114,21 +1159,36 @@ mod tests {
             };
             let rendezvous = kr_ipc::paths::Endpoint::from_path(value("--rendezvous"))
                 .expect("a rendezvous endpoint");
+            let reservation_id = kr_protocol::worker::ReservationId::new(
+                value("--reservation").parse().expect("a reservation"),
+            );
+            let environment_id = kr_protocol::ids::EnvironmentId::new(
+                value("--environment").parse().expect("an environment"),
+            );
             let failure = kr_plugin_service::protocol::HostStartFailure {
-                reservation_id: kr_protocol::worker::ReservationId::new(
-                    value("--reservation").parse().expect("a reservation"),
-                ),
-                environment_id: kr_protocol::ids::EnvironmentId::new(
-                    value("--environment").parse().expect("an environment"),
-                ),
+                reservation_id,
+                environment_id,
                 reason: self.reason.to_owned(),
             };
+            let reports = self.starts.fetch_add(1, Ordering::SeqCst) >= self.reports_from;
+            let claim = reports.then(|| {
+                kr_plugin_service::launcher::HostIdentity::generate(environment_id)
+                    .expect("an identity")
+                    .rendezvous(reservation_id, &self.endpoint)
+                    .expect("a claim")
+            });
             self.handle.spawn(async move {
                 let connection = kr_ipc::endpoint::Connection::connect(&rendezvous)
                     .await
                     .expect("the host connects");
                 let (mut reader, mut writer) =
                     kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                if let Some(claim) = claim {
+                    writer.write_message(&claim).await.expect("the claim");
+                    // The launcher answers a claim it accepts.
+                    let _ = reader.read_payload().await;
+                    return;
+                }
                 writer
                     .write_message(&failure)
                     .await
@@ -1154,10 +1214,9 @@ mod tests {
         let runtime = Arc::new(
             PluginRuntime::new(
                 host.environment(),
-                Arc::new(FailingHost {
-                    reason: "the plugin host could not listen on /run/p3.sock: it holds a file",
-                    handle: tokio::runtime::Handle::current(),
-                }),
+                Arc::new(FailingHost::failing(
+                    "the plugin host could not listen on /run/p3.sock: it holds a file",
+                )),
                 host.root().join("kr-plugin-host"),
                 host.root().join("repositories"),
             )
@@ -1258,25 +1317,55 @@ mod tests {
         assert_eq!(supervisor.asked.load(Ordering::SeqCst), START_ATTEMPTS);
     }
 
-    /// The reason a start gave is kept until a start succeeds, and then it is not said.
-    #[tokio::test]
+    /// The reason a start gave is kept until a start succeeds, and then it is not said: a start
+    /// that fails and a start that succeeds after it, each through a request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_start_that_succeeds_clears_the_kept_reason() {
         let host = kr_ipc::testing::TempHost::create();
-        let supervisor = Arc::new(Gated::default());
-        let runtime = runtime_over(&host, &supervisor);
+        let environment = host.environment();
+        let endpoint =
+            kr_plugin_service::launcher::host_endpoint(&environment, &HostProtocol::THIS)
+                .expect("an endpoint")
+                .as_text();
+        let reason = "the plugin host could not listen on /run/p3.sock: it holds a file";
+        let supervisor = Arc::new(FailingHost {
+            reports_from: 1,
+            endpoint,
+            ..FailingHost::failing(reason)
+        });
+        let runtime = Arc::new(
+            PluginRuntime::new(
+                environment,
+                Arc::clone(&supervisor) as Arc<dyn WorkerSupervisor>,
+                host.root().join("kr-plugin-host"),
+                host.root().join("repositories"),
+            )
+            .remembering_for(Duration::from_millis(50)),
+        );
         assert_eq!(runtime.kept_failure(), None);
-        runtime.keep_failure("the last start's reason");
-        assert_eq!(
-            budget_words(runtime.kept_failure().as_deref(), Duration::from_secs(60)),
-            "the plugin runtime has been started 5 times in the last 10 minutes, so it is not \
-             started again for about 1 minute; the last start said: the last start's reason; kr \
-             can start it again after that wait, when a worker asks"
+        let failed = runtime.request().await;
+        assert!(
+            matches!(&failed, PluginRuntimeState::Unavailable(told) if told.reason.starts_with(reason)),
+            "{failed:?}"
         );
-        runtime.forget_failure();
-        assert_eq!(
-            budget_words(runtime.kept_failure().as_deref(), Duration::from_secs(60)),
-            "the plugin runtime has been started 5 times in the last 10 minutes, so it is not \
-             started again for about 1 minute"
+        assert!(
+            runtime
+                .kept_failure()
+                .is_some_and(|kept| kept.contains(reason)),
+            "the failed start's reason is kept"
         );
+        // The failure is answered from memory for a moment; the next start is made after it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = runtime.request().await;
+        assert!(
+            matches!(started, PluginRuntimeState::Running),
+            "{started:?}"
+        );
+        assert_eq!(
+            runtime.kept_failure(),
+            None,
+            "a start that succeeded says nothing of the one before"
+        );
+        assert_eq!(supervisor.starts.load(Ordering::SeqCst), 2);
     }
 }
