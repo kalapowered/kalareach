@@ -2892,8 +2892,10 @@ jobs:
       # companion-tauri 20 and kr-worker 18, and the other 43 packages 28 between them. `tests-1`
       # has kr-controller, the four packages that hold the cases that need another filesystem
       # (kr-changeset, kr-ipc, kr-project and kr-transfer) and five more, 85 minutes of those
-      # programs; `tests-2` has the other 37 packages, 72 minutes. Move a package between the lists
-      # by its minutes, and keep those four packages in `tests-1`.
+      # programs; `tests-2` has the other 37 packages, 72 minutes, and kr-boundary-windows, which
+      # that run did not have: its 455 cases ran in 29 seconds on a Mac, half a minute more for
+      # `tests-2`. Move a package between the lists by its minutes, and keep those four packages in
+      # `tests-1`.
       matrix:
         include:
           - name: macos-tests-1
@@ -2909,7 +2911,7 @@ jobs:
             minutes: 158
             packages: >-
               -p companion-platform -p companion-preview -p companion-tauri -p kr-attention
-              -p kr-automation -p kr-backup-integration -p kr-cbor -p kr-cli -p kr-codex-stand-in
+              -p kr-automation -p kr-backup-integration -p kr-boundary-windows -p kr-cbor -p kr-cli -p kr-codex-stand-in
               -p kr-crypto -p kr-delivery -p kr-describe -p kr-describe-model -p kr-e2e-agents
               -p kr-e2e-m1b -p kr-faults -p kr-flush -p kr-keys -p kr-loopback -p kr-pairing
               -p kr-perf -p kr-plugin-catalogue -p kr-plugin-host -p kr-plugin-runtime
