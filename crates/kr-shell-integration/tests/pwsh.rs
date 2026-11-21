@@ -2222,7 +2222,7 @@ fn a_launch_of_a_name_only_the_get_fallback_answers_is_refused() {
         let program = directory.path().join(name);
         kr_ipc::testing::place_script(&program, "#!/bin/sh\necho fallback-ran\n");
     }
-    let here = shellpkg::told(directory.path());
+    let here = batch_launch::single_quoted(&shellpkg::told(directory.path()));
     let output = in_the_package_host(&format!(
         "$env:PATH = '{here}' + [System.IO.Path]::PathSeparator + $env:PATH; \
          Set-Location '{here}'; \
@@ -2288,7 +2288,7 @@ fn a_launch_installs_the_line_the_table_lists_for_its_vector() {
     let path = listed.path().join("powershell-launch-lines.json");
     std::fs::write(&path, POWERSHELL_LAUNCH_LINES).expect("the table");
 
-    let here = shellpkg::told(programs.path());
+    let here = batch_launch::single_quoted(&shellpkg::told(programs.path()));
     let output = in_the_package_host(&format!(
         "$env:PATH = '{here}' + [System.IO.Path]::PathSeparator + $env:PATH; \
          Set-Location '{here}'; \
@@ -2300,7 +2300,7 @@ fn a_launch_installs_the_line_the_table_lists_for_its_vector() {
              else {{ Write-Output \"kr-key[$index]=[$line]\" }}; \
              $index++ \
          }}",
-        table = shellpkg::told(&path)
+        table = batch_launch::single_quoted(&shellpkg::told(&path))
     ));
     for (index, case) in cases.iter().enumerate() {
         let name = case["name"].as_str().expect("the case's name");
