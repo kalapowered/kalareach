@@ -448,6 +448,9 @@ fn the_probe_of_a_lock_file_leaves_no_lock_though_a_program_keeps_a_copy_of_the_
         Ok(())
     });
     assert_eq!(evidence.lock, Lock::Free);
+    // The case's own handle closes first, as the probe's does in a bind: what is left is the
+    // program's copy.
+    drop(file);
     let next = File::open(folder.path().join("lock")).expect("the lock file");
     assert!(
         rustix::fs::flock(&next, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok(),
@@ -468,6 +471,9 @@ fn the_self_test_of_a_lock_leaves_no_lock_though_a_program_keeps_a_copy_of_the_f
         Ok(())
     });
     assert!(!enforced, "nobody else holds the file");
+    // The case's own handle closes first, as the self-test's does in a publish: what is left is
+    // the program's copy.
+    drop(file);
     let next = File::open(folder.path().join("lock")).expect("the lock file");
     assert!(
         rustix::fs::flock(&next, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok(),
