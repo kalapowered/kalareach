@@ -368,7 +368,8 @@ fn entry_of(repo: &Repo) -> Narrower {
 /// Reads the repository with its entry.
 fn read(repo: &Repo) -> Read {
     let entry = entry_of(repo);
-    let (expected, snapshots) = read_history(repo.work.path(), &entry).expect("the history");
+    let (expected, snapshots) =
+        read_history(repo.work.path(), &entry, &|_| {}).expect("the history");
     Read {
         expected,
         snapshots,
@@ -679,7 +680,8 @@ fn a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_t
     );
     // A tree with a manifest that names no package, read by the production reader and audited.
     let odd = repo(Some(2), None);
-    let (expected, snapshots) = read_history(odd.work.path(), &read.entry).expect("history");
+    let (expected, snapshots) =
+        read_history(odd.work.path(), &read.entry, &|_| {}).expect("history");
     let report = audit_tags(&read.entry, &expected, &snapshots);
     let failed: Vec<&Snapshot> = snapshots
         .iter()
@@ -722,7 +724,8 @@ fn a_source_that_cannot_be_read_at_a_tag_is_a_text_of_its_own() {
     // scan and the account's text both stop on it, each with a text of its own.
     let broken = repo(None, Some(2));
     let read = read(&repo(None, None));
-    let (expected, snapshots) = read_history(broken.work.path(), &read.entry).expect("history");
+    let (expected, snapshots) =
+        read_history(broken.work.path(), &read.entry, &|_| {}).expect("history");
     let report = audit_tags(&read.entry, &expected, &snapshots);
     let at = &snapshots[2];
     let key = ("kr_other".to_owned(), "other_one".to_owned());
@@ -910,7 +913,7 @@ fn a_daemon_item_and_a_daemon_account_cause_no_reading_and_no_text() {
         why: "x",
     });
     entry.accounts = leak(accounts);
-    let (expected, snapshots) = read_history(repo.work.path(), &entry).expect("history");
+    let (expected, snapshots) = read_history(repo.work.path(), &entry, &|_| {}).expect("history");
     assert!(snapshots.iter().all(|snapshot| {
         snapshot.items.keys().all(|key| key.0 != "kr_controller")
             && snapshot.records.keys().all(|key| key.0 != "kr_controller")
@@ -963,7 +966,7 @@ fn an_origin_with_a_tag_the_checkout_lacks_is_refused_before_any_snapshot() {
         ],
         None,
     );
-    let error = read_history(repo.work.path(), &read.entry)
+    let error = read_history(repo.work.path(), &read.entry, &|_| {})
         .err()
         .expect("an error before any snapshot");
     assert!(error.contains("packages/v0.3.5"), "{error}");
@@ -1026,7 +1029,7 @@ fn each_tag_is_read_in_a_thread_of_its_own_so_the_source_map_that_the_files_fill
     let repo = repo(None, None);
     let entry = entry_of(&repo);
     let (_, entry_end) = offsets_of_a_parse_in_this_thread();
-    let (_, snapshots) = read_history(repo.work.path(), &entry).expect("the history");
+    let (_, snapshots) = read_history(repo.work.path(), &entry, &|_| {}).expect("the history");
     assert!(snapshots.len() > 1, "the fixture has several tags");
     let (third_start, _) = offsets_of_a_parse_in_this_thread();
     assert_eq!(
@@ -1038,14 +1041,28 @@ fn each_tag_is_read_in_a_thread_of_its_own_so_the_source_map_that_the_files_fill
 
 #[test]
 fn the_tags_are_read_a_few_at_once_each_in_a_thread_that_no_other_tag_uses_and_in_order() {
+    use std::sync::atomic::Ordering::SeqCst;
     let ran = std::sync::Mutex::new(Vec::new());
     let live = std::sync::atomic::AtomicUsize::new(0);
     let most = std::sync::atomic::AtomicUsize::new(0);
     let caller = std::thread::current().id();
     let results = in_threads_of_their_own((0..12).collect(), 3, |item: usize| {
-        let now = live.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        most.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let now = live.fetch_add(1, SeqCst) + 1;
+        most.fetch_max(now, SeqCst);
+        // The first three readings wait until three are live, so that the overlap is made by the
+        // helper and not by the scheduler: the wait ends when the count is reached and only a helper
+        // that never runs three at once reaches the limit, after ten seconds each. The first of them
+        // then keeps its place for a moment, in which a fourth reading would show.
+        if item < 3 {
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while live.load(SeqCst) < 3 && std::time::Instant::now() < limit {
+                std::thread::yield_now();
+            }
+            if item == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            most.fetch_max(live.load(SeqCst), SeqCst);
+        }
         ran.lock()
             .expect("a lock")
             .push(std::thread::current().id());
@@ -1064,9 +1081,9 @@ fn the_tags_are_read_a_few_at_once_each_in_a_thread_that_no_other_tag_uses_and_i
         !ids.contains(&caller),
         "a tag was read in the caller's thread"
     );
-    // At most three ran at once, and more than one did.
-    let most = most.load(std::sync::atomic::Ordering::SeqCst);
-    assert!((2..=3).contains(&most), "{most} ran at once");
+    // Three ran at once, and no more.
+    let most = most.load(SeqCst);
+    assert_eq!(most, 3, "{most} ran at once");
     // A panic of a reading is the panic of the call.
     let panicked = std::panic::catch_unwind(|| {
         in_threads_of_their_own(vec![1, 2, 3], 2, |item: usize| {
@@ -1075,6 +1092,34 @@ fn the_tags_are_read_a_few_at_once_each_in_a_thread_that_no_other_tag_uses_and_i
         })
     });
     assert!(panicked.is_err());
+}
+
+#[test]
+fn each_snapshot_is_given_to_the_caller_as_its_tag_finishes_and_the_result_stays_in_release_order()
+{
+    let repo = repo(None, None);
+    let entry = entry_of(&repo);
+    let given = std::sync::Mutex::new(Vec::new());
+    let (_, snapshots) = read_history(repo.work.path(), &entry, &|snapshot| {
+        given.lock().expect("a lock").push(snapshot.at.tag.clone());
+    })
+    .expect("the history");
+    // One call for each tag, with that tag's own snapshot, in the order the tags finish.
+    let mut given = given.into_inner().expect("a lock");
+    given.sort();
+    let mut read: Vec<String> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.at.tag.clone())
+        .collect();
+    read.sort();
+    assert_eq!(given.len(), 7);
+    assert_eq!(given, read);
+    // What comes back is in release order whatever the order of the calls.
+    assert!(
+        snapshots
+            .windows(2)
+            .all(|pair| pair[0].at.order() < pair[1].at.order())
+    );
 }
 
 /// The tags `git` lists below level 0.11, which the fixture's entry is made for.

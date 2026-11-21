@@ -447,7 +447,7 @@ fn the_senders_of_each_entry_at_each_release() {
     for entry in narrower_table::NARROWER {
         print_this_checkouts_sightings();
         let started = std::time::Instant::now();
-        let (expected, snapshots) = history::read_history(&repository(), entry)
+        let (expected, snapshots) = history::read_history(&repository(), entry, &|_| {})
             .unwrap_or_else(|error| panic!("{}: {error}", entry.root));
         println!(
             "read {} releases for {} in {:?}",
