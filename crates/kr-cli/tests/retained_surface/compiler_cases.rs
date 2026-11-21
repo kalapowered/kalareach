@@ -1021,6 +1021,39 @@ fn a_fetch_of_a_tree_with_no_lock_file_fails_with_its_exit_and_one_with_a_lock_f
     assert_eq!(compiler::fetch(root.path()), Ok(()));
 }
 
+#[test]
+fn a_release_that_was_not_read_is_a_line_with_its_cause_and_gives_the_text_with_it() {
+    let text = format!(
+        "packages/v1\t\t\tRead\npackages/v1\tkr_cli\tsend\tNames\n{}\n",
+        compiler::not_read_line("packages/v2", "cargo fetch --locked failed (exit 101)")
+    );
+    let record = compiler::Record::parse(&text).expect("the record");
+    assert_eq!(record.sightings("packages/v1").expect("read").len(), 1);
+    assert_eq!(
+        record.sightings("packages/v2").expect_err("not read"),
+        "the release was not read: cargo fetch --locked failed (exit 101)"
+    );
+    assert_eq!(
+        record.sightings("packages/v3").expect_err("no line"),
+        "the record of the compiler's readings has no line for packages/v3"
+    );
+    assert_eq!(
+        compiler::not_read_line("t", "a\tb\nc"),
+        "t\t\ta b c\tNotRead"
+    );
+    // A release that is read and not read, a not-read line with a crate, and a sighting of a release
+    // that was not read are refused.
+    for bad in [
+        "t\t\t\tRead\nt\t\tx\tNotRead\n",
+        "t\t\tx\tNotRead\nt\t\t\tRead\n",
+        "t\tkr\tx\tNotRead\n",
+        "t\t\tx\tNotRead\nt\tkr_cli\tsend\tNames\n",
+        "t\t\tx\tNotRead\nt\t\ty\tNotRead\n",
+    ] {
+        assert!(compiler::Record::parse(bad).is_err(), "{bad}");
+    }
+}
+
 fn releases_named(names: &[&str]) -> Vec<(String, String)> {
     names
         .iter()
@@ -1400,6 +1433,7 @@ fn the_reports_of_the_platforms_give_the_record_of_each_release_tag() {
             Err(problems) => {
                 refused += 1;
                 println!("{tag}: REFUSED\n    {}", problems.join("\n    "));
+                record.push(compiler::not_read_line(tag, &problems.join("; ")));
             }
         }
     }
@@ -1443,5 +1477,5 @@ fn the_reports_of_the_platforms_give_the_record_of_each_release_tag() {
             .count(),
         differences.len()
     );
-    assert_eq!(refused, 0, "a tag is refused");
+    assert_eq!(refused, 0, "{refused} release tags are not read");
 }

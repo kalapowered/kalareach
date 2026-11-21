@@ -1907,6 +1907,13 @@ pub fn record_lines(tag: &str, sightings: &[Sighting]) -> Vec<String> {
 #[derive(Debug, Default)]
 pub struct Record {
     tags: BTreeMap<String, Vec<Sighting>>,
+    /// The releases that stayed unread, with the cause: a line of their own, never no sightings.
+    not_read: BTreeMap<String, String>,
+}
+
+/// The line of a release that stayed unread, with its cause.
+pub fn not_read_line(tag: &str, cause: &str) -> String {
+    format!("{tag}\t\t{}\tNotRead", cause.replace(['\t', '\n'], " "))
 }
 
 impl Record {
@@ -1918,7 +1925,21 @@ impl Record {
             let [tag, krate, name, kind] = line.split('\t').collect::<Vec<_>>()[..] else {
                 return Err(bad());
             };
+            if kind == "NotRead" && krate.is_empty() {
+                if record.tags.contains_key(tag)
+                    || record
+                        .not_read
+                        .insert(tag.to_owned(), name.to_owned())
+                        .is_some()
+                {
+                    return Err(bad());
+                }
+                continue;
+            }
             if kind == "Read" && krate.is_empty() && name.is_empty() {
+                if record.not_read.contains_key(tag) {
+                    return Err(bad());
+                }
                 record.tags.entry(tag.to_owned()).or_default();
                 continue;
             }
@@ -1950,6 +1971,9 @@ impl Record {
 
     /// The sightings of a release, or the text that says the record never read it.
     pub fn sightings(&self, tag: &str) -> Result<Vec<Sighting>, String> {
+        if let Some(cause) = self.not_read.get(tag) {
+            return Err(format!("the release was not read: {cause}"));
+        }
         self.tags
             .get(tag)
             .cloned()
