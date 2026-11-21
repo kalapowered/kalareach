@@ -528,6 +528,13 @@ impl RemoteConnection {
         if let Err(refusal) = self.claim_route(mutation, Some(session_id), validated, own_claim) {
             return Err(refusal.into_error());
         }
+        // A repeat of this mutation can be answered from the receipt the worker kept, which carries
+        // the result that privacy mode removes from a session's receipts. The answer is released
+        // only under the privacy state it was read under, which is taken before the worker is
+        // asked. It waits behind a change of privacy mode, so it is taken before the lease and the
+        // deadline are, and the wait costs the mutation none of its time.
+        let read_under =
+            super::output::ReadUnder::now_settled(&self.controller, Some(session_id)).await?;
         let envelope = self.envelope(acting.grant.grant_id, validated);
         let bound = match self
             .controller
@@ -580,12 +587,6 @@ impl RemoteConnection {
         {
             return Err(error);
         }
-        // A repeat of this mutation can be answered from the receipt the worker kept, which carries
-        // the result that privacy mode removes from a session's receipts. The answer is released
-        // only under the privacy state it was read under, which is taken before the worker is
-        // asked.
-        let read_under =
-            super::output::ReadUnder::now_settled(&self.controller, Some(session_id)).await?;
         // The effect runs on a task that outlives this connection, for the same reason the
         // daemon's own effects do: the worker commits the intent before it answers, and a
         // cancellation here must not be what decides whether the outcome is recorded.
