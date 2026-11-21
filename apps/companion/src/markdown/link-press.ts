@@ -352,8 +352,9 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
  * Whether a release now would open the link that the press names. It asks two things:
  *
  * - the press's own element: the browser sends its click to the link's element, for every pointer type,
- *   while the point lies in the part of that element that its view leaves (`liesInView`: the element's
- *   rectangle held to every box that clips it, not the raw rectangle). The point is the press's first
+ *   while the point lies in the part of its words that its view leaves (`liesInView`: the words'
+ *   rectangles held to every box that clips them, not the raw rectangles; the element's padded box takes
+ *   no hit). The point is the press's first
  *   one for a touch or a pen, whose click comes from where it went down, and the pointer's current one
  *   for a mouse or a trackpad, whose click comes from where the button is released;
  * - the nearest-words rule at the press's first point, for a pointer that `opensByRule` (a touch or a
@@ -387,16 +388,21 @@ function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
   return keepsPress(press, (point) => layoutNear(pane, point.x, point.y))
 }
 
-/** Whether `point` lies in the part of `link`'s own element that every box clipping it leaves in view. */
+/**
+ * Whether `point` lies in the part of the words of `link` that every box clipping it leaves in view. The
+ * words are what takes a tap: the button's own box is padded to the least size and takes none (see
+ * `.m-node .md-link` in the stylesheet), so the point in that room is on plain text.
+ */
 function liesInView(pane: HTMLElement, link: HTMLElement, point: { x: number; y: number }): boolean {
   const view = viewOf(link, ancestorsOf(pane), screenOf())
   if (view === null) return false
-  const box = link.getBoundingClientRect()
-  const left = Math.max(box.left, view.left)
-  const right = Math.min(box.right, view.right)
-  const top = Math.max(box.top, view.top)
-  const bottom = Math.min(box.bottom, view.bottom)
-  return left < right && top < bottom && point.x >= left && point.x <= right && point.y >= top && point.y <= bottom
+  return wordsOf(link).some((box) => {
+    const left = Math.max(box.left, view.left)
+    const right = Math.min(box.right, view.right)
+    const top = Math.max(box.top, view.top)
+    const bottom = Math.min(box.bottom, view.bottom)
+    return left < right && top < bottom && point.x >= left && point.x <= right && point.y >= top && point.y <= bottom
+  })
 }
 
 /** What a click's target is: a link, another control of the message, or neither (plain text). */
@@ -471,7 +477,7 @@ const OPEN: Rect = { left: -Infinity, top: -Infinity, right: Infinity, bottom: I
  * the pane with `closest`: a walk of the tree, not a layout read. While a press that lit a link lives, each
  * scroll event of any box in the page and each scroll or resize of the visual viewport asks `releaseOpens`,
  * and so does each move of a mouse or a trackpad. A press on a link's own element reads that element's view
- * and its box (`liesInView`), and returns with no further read where the point lies in it. For a mouse or
+ * and its words' rectangles (`liesInView`), and returns with no further read where the point lies in them. For a mouse or
  * a trackpad that is all: the rest of the answer is no, with no hit test. For a touch or a pen the answer
  * goes on to the page's hit test at the press's point (no layout read) and returns where the hit lies in
  * the named link's own element; otherwise a hit on plain text of the pane reads this layout again there. A

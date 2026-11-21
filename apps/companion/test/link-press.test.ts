@@ -1328,6 +1328,23 @@ describe('a scroll under a held press', () => {
     expect(isLit(links[3]?.[0]), 'the look after a scroll of 200 px more').toBe(false)
   })
 
+  it('ends the look of a mouse press on a link’s own element when only the padded room of its button lies under the point', () => {
+    // The button's box is its words grown to the least size by padding, and that room takes no hit: the
+    // point that a scroll leaves in the room is on plain text, so the link is not under it.
+    const { pane, links } = conversation(6, 3)
+    const link = links[3]?.[0]
+    if (link === undefined) throw new Error('the made page has no link')
+    boxes.set(link, { left: -12, top: 305, right: 48, bottom: 352 })
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(link.querySelector('.md-link-label') ?? link, { clientX: 18, clientY: 328, pointerType: 'mouse' }))
+    expect(isLit(link), 'the look of the press on the words').toBe(true)
+    scrolled(20)
+    fire('scroll', {} as Event)
+    expect(boxes.get(link)?.bottom, 'the padded box of the button after the scroll').toBe(332)
+    expect(isLit(link), 'the look after a scroll that leaves the padded room, not the words, under the point').toBe(false)
+  })
+
   it('ends the look of a mouse press on a link’s own element at a sideways scroll of 15 px, though the nearest-words rule still holds the point', () => {
     // The words at x 100 to 140, the press 2 px inside their right end. After the scroll the element ends
     // 13 px before the point, inside the 22 px that the rule reaches beside the words, but a mouse's click
