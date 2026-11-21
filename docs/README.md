@@ -130,10 +130,14 @@ stops, so a limit that a part has is written in that part's own document.
   the evidence for what it can do, and the approvals. Typed requests to submit or queue a prompt,
   steer or cancel a turn and answer an approval act only where a binding has evidence for them, so
   what an agent offers depends on its package and its build. A bundled agent always runs in its own
-  terminal, as the agent draws it. Its command starts as typed unless its package declares a
-  command integration and the session's list of integrations names the package. The host keeps
-  that list. `kr plugin integration enable` adds a package to it, and so can a hand edit of the
-  configuration document. A profile that names a list of its own replaces the host's. Of the
+  terminal, as the agent draws it. Its command starts as typed unless all of the following criteria
+  are met: its package declares a command integration, its installation holds the
+  `command_integration.launch` grant that the owner confirms when installing it, and the package has
+  been included in the session's list of command integrations. The host keeps that list, and a
+  package can be added to it either with the command `kr plugin integration enable` or by directly
+  modifying the configuration document. Note that neither of these methods gives a grant, and that
+  each bundled package is seeded with an empty grant. A profile that names a list of its own
+  replaces the host's. Of the
   bundled packages, Claude Code, Gemini CLI and Qoder CLI declare a command integration. Codex,
   OpenCode and Kimi do not. On macOS and Linux, a program started another way is adopted as a
   native terminal, with no gateway afterwards, only where the session's own shell started it, it
