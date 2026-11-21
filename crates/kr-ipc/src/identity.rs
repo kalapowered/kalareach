@@ -4010,21 +4010,27 @@ mod tests {
     /// process, however many others the host is running.
     ///
     /// The process read is a shell this test starts, which has one thread and one child and holds
-    /// still while it is read. The child waits on a pipe that the test keeps open through the
-    /// reading, so that nothing but the test ends it, however long the reading is put off. The
-    /// test's own process is not one: its harness starts and ends a
-    /// thread for each case, and other cases make and end threads and children of it as this one
-    /// reads, so no two readings of it need agree.
+    /// still while it is read. The child reads a copy of the shell's input, a pipe that the test
+    /// keeps open through the reading, so that nothing but the test ends it, however long the
+    /// reading is put off. The test's own process is not one: its harness starts and ends a thread
+    /// for each case, and other cases make and end threads and children of it as this one reads, so
+    /// no two readings of it need agree.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_process_s_children_are_read_from_that_process_alone() {
         use std::io::BufRead;
         use std::process::Stdio;
 
-        // The shell starts a child that reads the shell's own input, says its number, and waits for
-        // the child. The child ends when the input closes, and the shell leaves with it.
+        // The shell keeps its input on descriptor 3 before it starts the child, because a shell can
+        // give a background command /dev/null for its input before it applies the command's own
+        // redirections (dash does), and a child that read descriptor 0 would end at once. The child
+        // reads the copy on descriptor 3 and closes that descriptor, the shell says the child's
+        // number and waits for it, and the child ends when the input closes, and the shell with it.
         let mut shell = std::process::Command::new("/bin/sh")
-            .args(["-c", "cat <&0 >/dev/null & echo $!; wait $!"])
+            .args([
+                "-c",
+                "exec 3<&0; cat <&3 3<&- >/dev/null & child=$!; exec 3<&-; echo \"$child\"; wait \"$child\"",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
