@@ -150,6 +150,10 @@ use kr_worker::broker::connectors::fixture;
 #[path = "../../../../crates/kr-plugin-catalogue/tests/support/mod.rs"]
 mod generations;
 
+/// The parts of the qualification that start no model turn and need no login, on this driver.
+#[path = "gateway/staged_a.rs"]
+mod staged_a;
+
 /// The variable naming the build list entry of a real agent; without it the agent is the stand-in.
 const BUILD_VARIABLE: &str = "KR_AGENTS_GATEWAY_BUILD";
 
@@ -1356,6 +1360,8 @@ struct Context {
     /// Whether the launcher the worker gives the shell is the forging launcher, with the real one
     /// beside it.
     forge: bool,
+    /// Whether the agent is started by hand, with the host's command integration off.
+    manual: bool,
     /// The installation the upgrade case switches.
     installation: Option<Installation>,
     /// The newer build's file and version, where the run placed one.
@@ -1392,6 +1398,7 @@ impl Context {
             polls: Polls::new(),
             upgrade: false,
             forge: false,
+            manual: false,
             installation: None,
             newer: None,
             newer_placed: None,
@@ -1615,7 +1622,11 @@ impl Context {
                 shell_packages: Some(self.shell.prefix.clone()),
             },
             &Preparation {
-                command_integrations: vec![codex().to_string()],
+                command_integrations: if self.manual {
+                    Vec::new()
+                } else {
+                    vec![codex().to_string()]
+                },
                 stable_address: true,
             },
             |environment| {
@@ -3247,10 +3258,16 @@ impl<'a> Session<'a> {
                     }
                 }
                 // The shell finds the agent by its name on a search path that starts in the run, which
-                // an earlier start may have changed: the route is checked before each typing.
+                // an earlier start may have changed: the route is checked before each typing. An
+                // agent started by hand with no login shows the build's first screen and no
+                // composer.
                 let _ = self.person.types_until_it_shows(
                     &real.typed(extra),
-                    &real.account.composer,
+                    if self.ctx.manual {
+                        &real.build.ready
+                    } else {
+                        &real.account.composer
+                    },
                     "the agent reaches its composer",
                     &|| {
                         self.ctx.checks_the_placed_files();
@@ -3274,8 +3291,12 @@ impl<'a> Session<'a> {
             .map(|instance| instance.application_instance_id)
             .find(|id| Some(*id) != not)
             .expect("an instance");
-        self.gateway_serves(instance);
-        if let Route::Real(real) = &self.ctx.route {
+        if !self.ctx.manual {
+            self.gateway_serves(instance);
+        }
+        if let Route::Real(real) = &self.ctx.route
+            && !self.ctx.manual
+        {
             if !commands.is_empty() {
                 self.person.waits_for_the_composer(
                     &real.account.composer,
@@ -3842,6 +3863,12 @@ struct Setup {
     forge: bool,
     /// The case runs with no login: no login descriptor is read and no turn is charged (8b).
     no_login: bool,
+    /// The agent is started by hand: the host's command integration is not turned on, so nothing
+    /// serves the launch through a gateway and the host sees the agent as a native terminal.
+    manual: bool,
+    /// A second person's session is opened beside the first before anything starts, with no newer
+    /// build behind it (the forging session of 8a).
+    second: bool,
 }
 
 /// Whether the run is the probe-only run: asked for by [`PROBE_ONLY_VARIABLE`], which only the
@@ -3878,6 +3905,11 @@ fn run_case_in(
     variants: &str,
     body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
 ) {
+    // A host's workers are jobs of the account's own launchd on a Mac, which a run loads only
+    // where it asks (`KR_ALLOW_ACCOUNT_LAUNCHD=1`): the case stands down otherwise.
+    if kr_ipc::testing::account_launchd::stands_down("the host start") {
+        return;
+    }
     let real_asked = std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty());
     let shell = match shells::managed_zsh() {
         Ok(shell) => shell,
@@ -3917,9 +3949,10 @@ fn run_case_in(
     let mut ctx = Context::new(shell, route, run, runtime);
     ctx.upgrade = setup.upgrade;
     ctx.forge = setup.forge;
+    ctx.manual = setup.manual;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.place();
-        let session = if setup.upgrade {
+        let session = if setup.upgrade || setup.second {
             Session::open_two(&ctx, variants)
         } else if setup.forge {
             // The root every path the forging launcher reads must lie below, given in the
