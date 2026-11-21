@@ -2,7 +2,7 @@
 //!
 //! A step with a `timeout` or a `budget` runs each command it starts (its build, the listing of its
 //! tests and its run) as the leader of a process group of its own. When the step's time is spent,
-//! the report asks the group to end, waits [`GRACE`], and then ends what is left of the group by
+//! the report asks the group to end, waits `GRACE`, and then ends what is left of the group by
 //! force: the command and every process it started that is still in the group. A process that
 //! left the group by starting a session or a group of its own is not reached.
 //!
