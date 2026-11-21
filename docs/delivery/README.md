@@ -92,9 +92,9 @@ the device the connection authenticated as.
 The host does not take the device's word for the credential. Before it keeps anything it checks
 that the credential names the KalaReach push gateway or one the host's configuration lists (see
 "Gateways the host delivers through"), lasts no longer than thirty days, has not
-expired, was not issued in the future, and is for the device's own installation: an installation is
-named by the hash of the key it authenticates with, and the host recorded that key when it paired
-the device. It refuses an authorisation or an installation that another destination names, in
+expired, was not issued more than five minutes ahead of the host's clock, and is for the device's
+own installation: an installation is named by the hash of the key it authenticates with, and the
+host recorded that key when it paired the device. It refuses an authorisation or an installation that another destination names, in
 service or kept out of service as the name of what was sent to it, and an authorisation it is
 revoking.
 
