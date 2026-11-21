@@ -2323,28 +2323,40 @@ mod tests {
         let claim = identity
             .rendezvous(reservation.reservation_id(), &endpoint)
             .expect("a claim");
+        // The first peer connects and holds its frame back. The launcher accepts it while a second
+        // peer connects and queues the claim behind it (a pipe makes its next instance as the
+        // accept runs, so the second connection needs the accept to be running), and then the
+        // failure is sent.
         let (_failing_reader, mut failing_writer) = the_hosts_side(&reservation).await;
-        failing_writer
-            .write_message(&HostStartFailure {
-                reservation_id: reservation.reservation_id(),
-                environment_id: environment.environment_id(),
-                reason: "the plugin host could not listen on /x: a file stands there".to_owned(),
-            })
-            .await
-            .expect("the failure is written");
-        let (_claiming_reader, mut claiming_writer) = the_hosts_side(&reservation).await;
-        claiming_writer
-            .write_message(&claim)
-            .await
-            .expect("the claim is written");
-        let error = reservation
-            .accept(
-                &environment,
-                &this_process(),
-                core::time::Duration::from_secs(10),
-            )
-            .await
-            .expect_err("the failure ends the wait, and the claim behind it is not taken");
+        let rendezvous = reservation.endpoint().clone();
+        let (reservation_id, environment_id) =
+            (reservation.reservation_id(), environment.environment_id());
+        let process = this_process();
+        let accepted =
+            reservation.accept(&environment, &process, core::time::Duration::from_secs(10));
+        let queued_behind = async {
+            let connection = Connection::connect(&rendezvous)
+                .await
+                .expect("the second peer connects");
+            let (claiming_reader, mut claiming_writer) = split(connection, StreamKind::Control);
+            claiming_writer
+                .write_message(&claim)
+                .await
+                .expect("the claim is written");
+            failing_writer
+                .write_message(&HostStartFailure {
+                    reservation_id,
+                    environment_id,
+                    reason: "the plugin host could not listen on /x: a file stands there"
+                        .to_owned(),
+                })
+                .await
+                .expect("the failure is written");
+            (claiming_reader, claiming_writer)
+        };
+        let (accepted, _held_open) = tokio::join!(accepted, queued_behind);
+        let error =
+            accepted.expect_err("the failure ends the wait, and the claim behind it is not taken");
         assert!(
             matches!(&error, LaunchError::HostFailed { reason } if reason == "the plugin host could not listen on /x: a file stands there"),
             "{error:?}"
