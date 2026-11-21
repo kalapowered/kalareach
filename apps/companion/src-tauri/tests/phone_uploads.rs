@@ -2195,3 +2195,51 @@ async fn kr_req_23_41_a_draft_prompt_to_a_live_agent_ends_the_kept_draft_only_wh
     held.release();
     adopted.stop().await;
 }
+
+/// KR-REQ-13.12: a connection that comes up before the driver of an upload has failed on its own is
+/// the one the upload goes on, at once. The host was reached while the upload still ran, so nothing
+/// else would resume it when its connection's failure is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reconnect_before_the_driver_fails_resumes_the_upload_on_the_new_connection()
+{
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let paired = paired_of(companion);
+    let old = Arc::clone(&paired.session);
+    let sending = {
+        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    gate.reached().await;
+    // The connection ends and the phone makes another while the content still holds the driver.
+    old.transport().close();
+    let newer = on_another_connection(companion, &old).await;
+    tokio::time::timeout(WATCHDOG, async {
+        while !desk.holds_newest_for_test(&newer) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the desk is told the host was reached on the new connection");
+    assert!(!sending.is_finished(), "the upload has not ended");
+
+    // The driver fails only now, on the connection that has ended.
+    gate.release();
+    let handle = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the upload goes on at once on the new connection")
+        .expect("the task ran")
+        .expect("the upload is published");
+    assert_eq!(handle.byte_len.get(), bytes.len() as u64);
+    assert_eq!(
+        copies_in(&folder(&phone)),
+        0,
+        "the copy ends with the upload"
+    );
+    adopted.stop().await;
+}
