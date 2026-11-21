@@ -63,6 +63,7 @@ import {
   answeredState,
   describeState,
   queued,
+  awaitsHost,
   reconnectBanner,
   applyReceipt,
   SEND_ANYWAY_WORDS,
@@ -932,7 +933,7 @@ export function MobileSession({
       : reconnectBanner(connected, mine)
   // A submission whose outcome nobody knows is the one case where sending again could run the
   // same thing twice. Until a receipt settles it, this session sends nothing more.
-  const waiting = unresolved(mine)
+  const waiting = unresolved(mine).filter(awaitsHost)
   const blocked = over
     ? 'Nothing more can be sent to this session from here.'
     : waiting.length > 0
