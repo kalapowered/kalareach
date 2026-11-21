@@ -163,10 +163,26 @@ pub fn launch_all(
     cases: &[(String, Vec<&str>)],
     as_batch: bool,
 ) -> Vec<Launched> {
+    launch_all_after(directory, "", cases, as_batch)
+}
+
+/// As [`launch_all`], with `setup` run first in the helper's own scope: an alias or a function a
+/// case needs, or a changed home directory.
+pub fn launch_all_after(
+    directory: &Path,
+    setup: &str,
+    cases: &[(String, Vec<&str>)],
+    as_batch: bool,
+) -> Vec<Launched> {
     let list: Vec<serde_json::Value> = cases
         .iter()
         .map(|(program, words)| serde_json::json!({ "program": program, "words": words }))
         .collect();
+    // What an earlier launch in this directory left would be read as this one's.
+    let _ = std::fs::remove_file(directory.join("report.txt"));
+    for number in 1..=cases.len() {
+        let _ = std::fs::remove_file(directory.join(format!("case-{number}.txt")));
+    }
     let cases_file = directory.join("cases.json");
     std::fs::write(&cases_file, serde_json::to_vec(&list).expect("cases")).expect("cases file");
     let errors = directory.join("helper-errors.txt");
@@ -187,6 +203,11 @@ pub fn launch_all(
         .arg(directory);
     if as_batch {
         command.arg("-AsBatch");
+    }
+    if !setup.is_empty() {
+        let setup_file = directory.join("setup.ps1");
+        std::fs::write(&setup_file, setup).expect("setup file");
+        command.arg("-Setup").arg(&setup_file);
     }
     let mut child = command
         .current_dir(directory)
@@ -318,4 +339,197 @@ pub fn assert_every_word_cmd_exe_reads_as_itself_arrives_as_named(
         })
         .collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The program word of a line the module built: what follows the call operator, in quotes.
+fn program_word(launch: &Launched) -> Option<&str> {
+    launch
+        .line
+        .strip_prefix("& '")?
+        .split_once('\'')
+        .map(|(word, _)| word)
+}
+
+/// KR-REQ-13.11: a function or an alias of the program's name, which the shell would find before
+/// the program, does not stand in its place: the line holds the program's full path, and the
+/// program runs. Where nothing is in front of the program the line holds the name as it was given.
+pub fn assert_a_shadowing_function_or_alias_is_bypassed_and_the_full_path_is_typed(
+    directory: &Path,
+    programs: &Programs,
+    as_batch: bool,
+) {
+    let name = programs.by_name;
+    let case = || vec![(name.to_owned(), vec!["x"])];
+    let plain = &launch_all(directory, &case(), as_batch)[0];
+    assert!(
+        !plain.refused && plain.received() == vec!["x"],
+        "{}",
+        plain.describe()
+    );
+    assert_eq!(
+        program_word(plain),
+        Some(name),
+        "nothing stood in front of the program, so the name is typed as it was given: {}",
+        plain.describe()
+    );
+    let write_out =
+        |text: &str| format!("[System.IO.File]::WriteAllText($env:KR_CASE_OUT, \"1=[{text}]`n\")");
+    for (what, setup) in [
+        (
+            "a function",
+            format!("function {name} {{ {} }}\n", write_out("function-ran")),
+        ),
+        (
+            "an alias",
+            format!(
+                "function kr-alias-target {{ {} }}\nSet-Alias -Name {name} -Value kr-alias-target\n",
+                write_out("alias-ran")
+            ),
+        ),
+    ] {
+        let launch = &launch_all_after(directory, &setup, &case(), as_batch)[0];
+        assert!(
+            !launch.refused && launch.received() == vec!["x"],
+            "{what} of the program's name stood in front of it, and the program did not run: {}",
+            launch.describe()
+        );
+        let word = program_word(launch).unwrap_or_default();
+        assert!(
+            Path::new(word).is_absolute()
+                && Path::new(word).file_stem().is_some_and(|stem| stem == name),
+            "{what} of the program's name stood in front of it, and the line does not hold the \
+             program's full path: {}",
+            launch.describe()
+        );
+    }
+}
+
+/// KR-REQ-13.11: a batch program runs with plain arguments, and is refused an empty argument, an
+/// argument with white space and a final backslash, an argument that holds one of the characters
+/// `"`, `%`, `!`, `^`, `&`, `|`, `<`, `>`, `(` and `)`, and a program whose path holds `%` or `!`.
+pub fn assert_a_batch_program_runs_with_plain_arguments_and_is_refused_what_cmd_exe_would_change(
+    directory: &Path,
+    programs: &Programs,
+    as_batch: bool,
+) {
+    let mut cases: Vec<(String, Vec<&str>)> =
+        vec![(programs.each.clone(), vec!["plain", "two words"])];
+    for word in [
+        "", "a b\\", "a\"b", "a%b", "a!b", "a^b", "a&b", "a|b", "a<b", "a>b", "a(b", "a)b",
+    ] {
+        cases.push((programs.each.clone(), vec![word]));
+    }
+    cases.push((programs.in_percent_directory.clone(), vec!["plain"]));
+    cases.push((programs.in_bang_directory.clone(), vec!["plain"]));
+    let launched = launch_all(directory, &cases, as_batch);
+    assert!(
+        !launched[0].refused && launched[0].received() == vec!["plain", "two words"],
+        "{}",
+        launched[0].describe()
+    );
+    for ((program, words), launch) in cases.iter().zip(&launched).skip(1) {
+        assert!(
+            launch.refused && !launch.started(),
+            "{program} was given {words:?} and was started: {}",
+            launch.describe()
+        );
+    }
+}
+
+/// KR-REQ-13.11: a program written as a path is typed as it was written; a program word with a
+/// leading `~` is found under the provider's home directory, in both spellings of the separator,
+/// as PowerShell does; and an argument that begins with `~` reaches the program as written.
+///
+/// The home directory the shell is given is `directory`, which holds the program, so a program
+/// word of `~/<its name>` runs only because PowerShell expands the `~` in a program word even when
+/// it is quoted. An argument is a quoted word of the line and is not expanded. bash, zsh and fish
+/// are given the program word quoted and do not expand it: the words about a leading `~` have a
+/// PowerShell form. Both results are printed (`kr-tilde-result`, read with `--nocapture`).
+pub fn assert_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_is_not_expanded(
+    directory: &Path,
+    programs: &Programs,
+    as_batch: bool,
+) {
+    let name = Path::new(&programs.each)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the program's file name")
+        .to_owned();
+    let setup = format!(
+        "(Get-PSProvider FileSystem).Home = '{}'\n",
+        directory.display()
+    );
+    let forms = [format!("~/{name}"), format!("~\\{name}")];
+    let mut cases: Vec<(String, Vec<&str>)> =
+        vec![(programs.in_syntax_directory.clone(), vec!["a b"])];
+    for form in &forms {
+        cases.push((form.clone(), vec!["x"]));
+    }
+    cases.push((programs.each.clone(), vec!["~/y", "~", "a~"]));
+    let launched = launch_all_after(directory, &setup, &cases, as_batch);
+    assert!(
+        !launched[0].refused && launched[0].received() == vec!["a b"],
+        "a path to a program does not run: {}",
+        launched[0].describe()
+    );
+    assert_eq!(
+        program_word(&launched[0]),
+        Some(programs.in_syntax_directory.as_str()),
+        "the path is typed as it was written: {}",
+        launched[0].describe()
+    );
+    let details: Vec<String> = forms
+        .iter()
+        .zip(&launched[1..])
+        .map(|(form, launch)| format!("{form}: {}", launch.describe()))
+        .collect();
+    println!(
+        "kr-tilde-result: the program word {}\nkr-tilde-result: the arguments {}",
+        details.join("\n"),
+        launched[3].describe()
+    );
+    for ((form, launch), detail) in forms.iter().zip(&launched[1..]).zip(&details) {
+        assert!(
+            !launch.refused && launch.received() == vec!["x"],
+            "the program word {form} is not found under the provider's home: {detail}"
+        );
+        assert_eq!(
+            program_word(launch),
+            Some(form.as_str()),
+            "the program word is typed as it was written: {detail}"
+        );
+    }
+    assert!(
+        !launched[3].refused && launched[3].received() == vec!["~/y", "~", "a~"],
+        "an argument that begins with ~ does not reach the program as written: {}",
+        launched[3].describe()
+    );
+}
+
+/// KR-REQ-13.11: a program that names no application or script has no line in PowerShell, whether
+/// no such name exists, a function of the name is all there is, or the path does not exist; and the
+/// refusal the reader gives for a command it has no line for is a draft conflict.
+pub fn assert_a_program_that_names_no_application_has_no_line_and_the_refusal_is_a_draft_conflict(
+    directory: &Path,
+    as_batch: bool,
+) {
+    let setup = "function kr-only-function { }\n";
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        ("kr-no-such-program".to_owned(), vec!["x"]),
+        ("kr-only-function".to_owned(), vec!["x"]),
+        ("C:\\tools\\kr-no-such-agent.exe".to_owned(), vec!["x"]),
+    ];
+    let launched = launch_all_after(directory, setup, &cases, as_batch);
+    for ((program, _), launch) in cases.iter().zip(&launched) {
+        assert!(
+            launch.refused && !launch.started(),
+            "{program} names no application, and it was given a line: {}",
+            launch.describe()
+        );
+    }
+    assert_eq!(
+        kr_shell_integration::contract::requests::LaunchRejectionReason::BufferNotEmpty.code(),
+        kr_protocol::error::ErrorCode::DraftConflict,
+        "the reason the reader gives for a command it has no line for"
+    );
 }

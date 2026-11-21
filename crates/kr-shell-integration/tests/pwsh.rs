@@ -2368,3 +2368,61 @@ fn a_vector_for_a_batch_program_has_a_line_only_when_cmd_exe_would_read_every_wo
         .collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// KR-REQ-13.11: the line the module builds for a program that an alias or a function of the same
+/// name would stand in front of holds the program's full path, and the program runs.
+#[test]
+#[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+fn a_shadowing_alias_or_function_is_bypassed_in_the_line_the_module_builds() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_show_each(directory.path());
+    batch_launch::assert_a_shadowing_function_or_alias_is_bypassed_and_the_full_path_is_typed(
+        directory.path(),
+        &programs,
+        true,
+    );
+}
+
+/// KR-REQ-13.11: a batch program runs with plain arguments, and is refused an empty or batch
+/// character argument or a path with a percent sign or an exclamation mark; the decision is the
+/// module's own, so it runs here with the programs treated as batch files.
+#[test]
+#[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+fn a_batch_program_runs_with_plain_arguments_and_is_refused_an_empty_or_batch_character_argument_or_a_path_with_percent_or_bang()
+ {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_show_each(directory.path());
+    batch_launch::assert_a_batch_program_runs_with_plain_arguments_and_is_refused_what_cmd_exe_would_change(
+        directory.path(),
+        &programs,
+        true,
+    );
+}
+
+/// KR-REQ-13.11: a path is typed as it was written; a program word with a leading `~` is found
+/// under the provider's home, as PowerShell does; an argument that begins with `~` reaches the
+/// program as written. Both results are printed (read them with `--nocapture`).
+#[test]
+#[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+fn a_path_is_typed_as_written_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_is_not_expanded()
+ {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let programs = write_show_each(directory.path());
+    batch_launch::assert_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_is_not_expanded(
+        directory.path(),
+        &programs,
+        true,
+    );
+}
+
+/// KR-REQ-13.11: a program that names no application or script has no line, and the refusal the
+/// reader gives for it is a draft conflict.
+#[test]
+#[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
+fn a_program_that_names_no_application_has_no_line_in_the_modules_decision() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    batch_launch::assert_a_program_that_names_no_application_has_no_line_and_the_refusal_is_a_draft_conflict(
+        directory.path(),
+        true,
+    );
+}
