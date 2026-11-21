@@ -106,9 +106,13 @@ describe('what output and a silent change do to the launch buttons', () => {
       const { controls, view } = await lit()
       const reads = controls.hold('launchSurface')
       // The page is set up and settled. From here the clock moves only where the test moves it, so
-      // that no stall of real time can start the surface's own cadence read ahead of a step.
+      // that no stall of real time can start the surface's own cadence read ahead of a step. The
+      // new clock starts at the old clock's time: the cadence took the start of its last read from
+      // the old clock, and a clock that started at real time would put that start ahead of it or
+      // behind it by however far the old clock had run from real time.
+      const settled = Date.now()
       vi.useRealTimers()
-      vi.useFakeTimers()
+      vi.useFakeTimers({ now: settled })
 
       // Output streams. Each state the view publishes wakes a read of the surface, at most one in
       // each wake gap. The gap has passed when the state is published, so the read starts in the
