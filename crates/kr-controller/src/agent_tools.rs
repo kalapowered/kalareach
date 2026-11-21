@@ -1869,9 +1869,13 @@ impl Installer {
         }
         // Several agents share one project `.mcp.json`. Removing one installation must not take
         // the server another installation is still using, so the entry goes only when no *other*
-        // record claims it. This record is excluded by name rather than by counting, because a
-        // count cannot tell this record from somebody else's when its own file has already gone.
-        let others = self.holders(path, key, &digest, Some(&self.record_path(params)))?;
+        // record claims it. This record is excluded by the file it is read from, which an earlier
+        // build may have named otherwise, and not by counting, because a count cannot tell this
+        // record from somebody else's when its own file has already gone.
+        let own = self
+            .record_source(params)?
+            .unwrap_or_else(|| self.record_path(params));
+        let others = self.holders(path, key, &digest, Some(&own))?;
         if !others.is_empty() {
             return Ok(EntryPlan::Keep(format!(
                 "{} other installation(s) on this host still use it; {} at {} scope was removed \
@@ -8958,9 +8962,25 @@ mod tests {
         );
 
         // A removal is a mutation, so it carries the record onto the name this build gives one.
-        installer.remove(&params).expect("removes");
+        let removed = installer.remove(&params).expect("removes");
         assert!(!legacy.exists(), "the earlier name is gone");
         assert!(!modern.exists(), "and so is the record it became");
+        // The record under the earlier name is this installation's own record, not another
+        // installation's claim on the entry: the entry goes with the record, and nothing is left
+        // in the document that no record names.
+        assert!(
+            removed.removed.iter().any(|operation| matches!(
+                operation,
+                ChangeOperation::AddConfigurationEntry { .. }
+            )),
+            "the entry is among what was removed: {removed:?}"
+        );
+        let text =
+            std::fs::read_to_string(tree.home().join(".codex/config.toml")).expect("the file");
+        assert!(
+            !text.contains("mcp_servers.kalareach"),
+            "no entry stays behind with no record to name it: {text}"
+        );
     }
 
     #[test]
