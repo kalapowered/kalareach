@@ -1299,20 +1299,35 @@ impl Taken {
     }
 }
 
-/// What the agent did, from how its start went and, where it ran, whether the second process's
-/// question is in the file the first one wrote.
+/// What the agent did, from how its start went and, where it ran, where the second process's
+/// question was recorded: in the file the first process wrote or not, and under the first
+/// process's conversation identifier or not. The two must agree: a question in another file that
+/// carries the first conversation's identifier is a copy of it, and a question in the first file
+/// under another identifier is not a continuation.
 ///
 /// # Errors
 ///
-/// Returns that a running second process left no answer to where its question was recorded.
-fn taken(started: Started, same_file: Option<bool>) -> Result<Taken, String> {
-    match (started, same_file) {
-        (Started::Refused, _) => Ok(Taken::Refused),
-        (Started::Ended, _) => Ok(Taken::Ended),
-        (Started::Running, Some(true)) => Ok(Taken::Merged),
-        (Started::Running, Some(false)) => Ok(Taken::Forked),
-        (Started::Running, None) => Err(
-            "the second process ran, and its question is in no file of the agent's record"
+/// Returns that a running second process left no answer to where its question was recorded, or
+/// that the file and the identifier disagree.
+fn taken(
+    started: Started,
+    same_file: Option<bool>,
+    same_identifier: Option<bool>,
+) -> Result<Taken, String> {
+    match (started, same_file, same_identifier) {
+        (Started::Refused, _, _) => Ok(Taken::Refused),
+        (Started::Ended, _, _) => Ok(Taken::Ended),
+        (Started::Running, Some(true), Some(true)) => Ok(Taken::Merged),
+        (Started::Running, Some(false), Some(false)) => Ok(Taken::Forked),
+        (Started::Running, Some(file), Some(identifier)) => Err(format!(
+            "the second process's question is {} the first conversation's file and {} its \
+             identifier, which do not say the same thing",
+            if file { "in" } else { "not in" },
+            if identifier { "under" } else { "not under" }
+        )),
+        (Started::Running, _, _) => Err(
+            "the second process ran, and its question is in no file of the agent's record, or in \
+             more than one"
                 .to_owned(),
         ),
     }
@@ -1393,9 +1408,21 @@ fn second_start(person: &Person, composer: &str, refusals: &[String]) -> (Starte
     }
 }
 
+/// The conversation identifier of the file `place` holding `content`: the member of its first line
+/// the entry names, else what its place says.
+fn identifier_of(account: &Account, place: &Path, content: &str) -> String {
+    account
+        .conversation_id_member
+        .as_deref()
+        .and_then(|member| {
+            let first: serde_json::Value = serde_json::from_str(content.lines().next()?).ok()?;
+            first[member].as_str().map(str::to_owned)
+        })
+        .unwrap_or_else(|| conversation_id(place))
+}
+
 /// The conversation the one file of the record that holds `mark` in a prompt line is: its
-/// identifier (the member of its first line the entry names, else what its place says), how many
-/// files the record holds, and the file's place.
+/// identifier, how many files the record holds, and the file's place.
 fn saved_conversation(ctx: &Context, real: &Real, mark: &str) -> (String, usize, PathBuf) {
     let started = Instant::now();
     loop {
@@ -1419,17 +1446,8 @@ fn saved_conversation(ctx: &Context, real: &Real, mark: &str) -> (String, usize,
             })
             .collect();
         if let [(place, content)] = holding.as_slice() {
-            let member = real
-                .account
-                .conversation_id_member
-                .as_deref()
-                .and_then(|member| {
-                    let first: serde_json::Value =
-                        serde_json::from_str(content.lines().next()?).ok()?;
-                    first[member].as_str().map(str::to_owned)
-                });
             return (
-                member.unwrap_or_else(|| conversation_id(place)),
+                identifier_of(&real.account, place, content),
                 files.len(),
                 place.clone(),
             );
@@ -1444,11 +1462,11 @@ fn saved_conversation(ctx: &Context, real: &Real, mark: &str) -> (String, usize,
     }
 }
 
-/// Whether the one file of the record that holds `needle` in a prompt line is the file at
-/// `first`, the one session A's conversation was written to: the second process's question is
-/// then in the file the first one wrote. `None` where no file or more than one holds it.
-fn same_file(ctx: &Context, real: &Real, first: &Path, needle: &str) -> Option<bool> {
-    let mut holding: Vec<PathBuf> = Vec::new();
+/// Where the second process's question was recorded: the place and the conversation identifier of
+/// the one file of the record that holds `needle` in a prompt line, or `None` where no file or
+/// more than one holds it.
+fn recorded_question(ctx: &Context, real: &Real, needle: &str) -> Option<(PathBuf, String)> {
+    let mut holding: Vec<(PathBuf, String)> = Vec::new();
     read_record(
         ctx.run.root(),
         ctx.run.pin(),
@@ -1456,13 +1474,15 @@ fn same_file(ctx: &Context, real: &Real, first: &Path, needle: &str) -> Option<b
         &mut |place, content| {
             let content = String::from_utf8_lossy(content);
             if first_line_with(&content, None, &[needle, &real.account.prompt_line]).is_some() {
-                holding.push(PathBuf::from(String::from_utf8_lossy(place).into_owned()));
+                let place = PathBuf::from(String::from_utf8_lossy(place).into_owned());
+                let identifier = identifier_of(&real.account, &place, &content);
+                holding.push((place, identifier));
             }
         },
     )
     .unwrap_or_else(|why| panic!("the agent's record is not whole: {why}"));
     match holding.as_slice() {
-        [place] => Some(place == first),
+        [found] => Some(found.clone()),
         _ => None,
     }
 }
@@ -1536,7 +1556,7 @@ fn second_process(
         check_unchanged(None, &shown_now(ctx, &b)).unwrap_or_else(|why| {
             panic!("the refused start announces no instance of its own: {why}")
         });
-        let what = taken(started, None).unwrap_or_else(|why| panic!("{why}"));
+        let what = taken(started, None, None).unwrap_or_else(|why| panic!("{why}"));
         evidence["resume"] = serde_json::json!({ "outcome": what.word(), "shown": refusal });
         evidence["control"] = serde_json::json!({ "what": "session B's marker typed into session A", "breaks_property": false, "why_not": "no second execution ran, so there was no second session to type a marker from" });
         check_taken(forks, what).unwrap_or_else(|why| panic!("{why}"));
@@ -1553,24 +1573,43 @@ fn second_process(
         "the two launches are two instances"
     );
     let mut typing_b = Typing::attach(ctx, session, Seat::Second);
-    let (question_b, sum_b) = fresh_question(&[&mark, &sum]);
-    let mark_b = format!("{mark}-b");
+    // The second process is asked for what only session A's saved history holds: the code session A
+    // was told to remember, which the question does not repeat and the mark of the question does
+    // not contain. A process that has no such history cannot answer it.
+    let mark_b = crate::mark();
+    let recalled = mark.to_uppercase();
     typing_b.submits(
         &mut turns,
         "the second process's question",
-        &format!("({mark_b}) {question_b}"),
+        &format!(
+            "({mark_b}) What code did I ask you to remember earlier? Reply with that code in \
+             upper case and nothing else."
+        ),
         &format!("({mark_b})"),
         &account.submit,
     );
-    let _ = b.person.sees(&sum_b, "session B is answered");
+    let _ = b.person.sees(
+        &recalled,
+        "session B recalls the code that only session A's saved history holds",
+    );
     b.person.waits_for_the_composer(
         &account.composer,
         &account.busy,
         "session B is back at its composer",
     );
     settles(ctx, real, &[&mark_b, &account.prompt_line]);
-    let what = taken(started, same_file(ctx, real, &first_place, &mark_b))
-        .unwrap_or_else(|why| panic!("{why}"));
+    let (place_b, identifier_b) = recorded_question(ctx, real, &mark_b)
+        .map_or((None, None), |(place, identifier)| {
+            (Some(place), Some(identifier))
+        });
+    let what = taken(
+        started,
+        place_b.as_ref().map(|place| *place == first_place),
+        identifier_b
+            .as_ref()
+            .map(|identifier| *identifier == conversation),
+    )
+    .unwrap_or_else(|why| panic!("{why}"));
     // Each session shows only its own marker, and A's binding is as it was.
     isolated(
         &a.person.window.screen(),
@@ -1600,7 +1639,7 @@ fn second_process(
         .runs()
         .and(agent_b.runs())
         .unwrap_or_else(|why| panic!("both executions go on: {why}"));
-    evidence["resume"] = serde_json::json!({ "outcome": what.word() });
+    evidence["resume"] = serde_json::json!({ "outcome": what.word(), "recalled": recalled, "conversation_of_b": identifier_b, "conversation_of_a": conversation });
     evidence["session_b"]["detection"] = shown_b.detection.evidence();
     evidence["turns_charged"] = turns.charged.into();
     evidence["control"] = serde_json::json!({ "what": "session B's marker typed into session A", "breaks_property": true, "check": control.err() });
@@ -1761,18 +1800,28 @@ fn a_marker_that_two_sessions_show_fails_the_isolation_check_of_7() {
 /// says why, fail part 7; a start that ran and left no record of its question is no answer.
 #[test]
 fn an_ordinary_resume_that_forked_or_ended_with_no_reason_fails_the_check_of_7() {
-    assert!(check_taken(false, taken(Started::Refused, None).unwrap()).is_ok());
-    assert!(check_taken(false, taken(Started::Running, Some(true)).unwrap()).is_ok());
+    assert!(check_taken(false, taken(Started::Refused, None, None).unwrap()).is_ok());
     assert!(
-        check_taken(false, taken(Started::Running, Some(false)).unwrap()).is_err(),
+        check_taken(
+            false,
+            taken(Started::Running, Some(true), Some(true)).unwrap()
+        )
+        .is_ok()
+    );
+    assert!(
+        check_taken(
+            false,
+            taken(Started::Running, Some(false), Some(false)).unwrap()
+        )
+        .is_err(),
         "a conversation of its own is part 7f's"
     );
     assert!(
-        check_taken(false, taken(Started::Ended, None).unwrap()).is_err(),
+        check_taken(false, taken(Started::Ended, None, None).unwrap()).is_err(),
         "an end with no reason shows nothing"
     );
     assert!(
-        taken(Started::Running, None).is_err(),
+        taken(Started::Running, None, None).is_err(),
         "a question recorded in no file is no answer"
     );
 }
@@ -1781,17 +1830,46 @@ fn an_ordinary_resume_that_forked_or_ended_with_no_reason_fails_the_check_of_7()
 /// 7f.
 #[test]
 fn a_fork_that_the_agent_refused_or_merged_fails_the_check_of_7f() {
-    assert!(check_taken(true, taken(Started::Running, Some(false)).unwrap()).is_ok());
     assert!(
-        check_taken(true, taken(Started::Refused, None).unwrap()).is_err(),
+        check_taken(
+            true,
+            taken(Started::Running, Some(false), Some(false)).unwrap()
+        )
+        .is_ok()
+    );
+    assert!(
+        check_taken(true, taken(Started::Refused, None, None).unwrap()).is_err(),
         "a refused fork shows no second history"
     );
     assert!(
-        check_taken(true, taken(Started::Running, Some(true)).unwrap()).is_err(),
+        check_taken(
+            true,
+            taken(Started::Running, Some(true), Some(true)).unwrap()
+        )
+        .is_err(),
         "a merged fork is not a conversation of its own"
     );
     assert!(
-        check_taken(true, taken(Started::Ended, None).unwrap()).is_err(),
+        check_taken(true, taken(Started::Ended, None, None).unwrap()).is_err(),
         "an end with no reason shows nothing"
+    );
+}
+
+/// A second file is a fork only under another conversation identifier, and the first file is a
+/// continuation only under the first one: a file that copies the first conversation's identifier
+/// is not a fork, and another identifier in the first file is not a continuation.
+#[test]
+fn a_question_whose_file_and_conversation_identifier_disagree_is_neither_a_fork_nor_a_merge() {
+    assert!(taken(Started::Running, Some(false), Some(true)).is_err());
+    assert!(taken(Started::Running, Some(true), Some(false)).is_err());
+    assert!(taken(Started::Running, Some(true), None).is_err());
+    assert!(taken(Started::Running, None, Some(true)).is_err());
+    assert_eq!(
+        taken(Started::Running, Some(false), Some(false)),
+        Ok(Taken::Forked)
+    );
+    assert_eq!(
+        taken(Started::Running, Some(true), Some(true)),
+        Ok(Taken::Merged)
     );
 }
