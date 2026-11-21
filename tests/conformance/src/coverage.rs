@@ -335,8 +335,8 @@ enum Part {
     Other,
 }
 
-/// One flag with its value, or one test name: the words `first` to `last` of the command, by their
-/// index in it.
+/// One flag with its value, one group of short flags, or one test name: the words `first` to `last`
+/// of the command, by their index in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Span {
     first: usize,

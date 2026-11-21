@@ -447,12 +447,12 @@ starts runs too. A test name that the command keeps from the step is one more ex
 tests run as well. A program with a harness of its own (`harness = false`) reads its own arguments:
 it can ignore `--exact` and the name, and run everything it holds.
 
-The command does not give what the report gives the step: `KR_TEST_ARTIFACTS_DIR`, the runner, and
-the option that makes each test program write its record. A word whose value holds a placeholder is
-left out, because the run gives a placeholder its value, and each variable whose value holds one is
-named in the test's `needs`; such a command can build or run differently. The command is for the
-platform of the result: another host builds other programs. The command of a TypeScript test is not
-changed.
+The command does not give what the report gives the step: `KR_TEST_ARTIFACTS_DIR`,
+`CARGO_TERM_COLOR=never`, the runner, and the option that makes each test program write its record.
+A word whose value holds a placeholder is left out, because the run gives a placeholder its value,
+and each variable whose value holds one is named in the test's `needs`; such a command can build or
+run differently. The command is for the platform of the result: another host builds other programs.
+The command of a TypeScript test is not changed.
 
 ## How a test names what it proves
 

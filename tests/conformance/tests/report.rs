@@ -3188,12 +3188,12 @@ fn a_reproduced_command_runs_for_each_package_of_a_workspace_that_a_step_gave_fe
     }
 }
 
-/// The workspaces in which another package turns a feature on in the test's package: through a
-/// feature that a second package has by the same name (`shared`), through that package's default
-/// feature (`default`), through a feature of a package that the test's package does not depend on
-/// (`optional`), through a dependency that asks for a feature (`reached`), and through the
-/// dev-dependency of a package that the test's package does not depend on (`dev`). Each has the
-/// integration test `ta` in the package `a`.
+/// The workspaces in which another package turns a feature on, in the test's package or in a
+/// dependency of it: through a feature that a second package has by the same name (`shared`),
+/// through that package's default feature (`default`), through a feature of a package that the
+/// test's package does not depend on (`optional`), through a dependency that asks for a feature
+/// (`reached`), and through the dev-dependency of a package that the test's package does not depend
+/// on (`dev`). Each has the integration test `ta` in the package `a`.
 #[cfg(unix)]
 fn feature_fixtures() -> Vec<(&'static str, OnDisk)> {
     let on =
@@ -3605,9 +3605,9 @@ fn a_command_for_a_step_with_a_feature_in_each_package_runs_in_the_steps_build()
     assert!(ran.command.contains(" --lib "), "{}", ran.command);
 }
 
-/// Another package of the step turns a feature on in the test's package, or the test's package
-/// leaves one off, in each workspace of `feature_fixtures`. A command for the test's package alone
-/// builds it again with other features.
+/// Another package of the step turns a feature on in the test's package or in a dependency of it, or
+/// the test's package leaves one off, in each workspace of `feature_fixtures`. A command for the
+/// test's package alone builds it again with other features.
 #[cfg(unix)]
 #[test]
 fn a_command_runs_in_the_steps_build_where_another_package_turns_a_feature_on() {
