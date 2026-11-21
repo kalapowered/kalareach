@@ -7,13 +7,16 @@
 //! together.
 //!
 //! * The tags, their commits and dates come from `git for-each-ref`, parsed and ordered here.
-//! * The files of a tag come from `git archive`, the workspace members from the root manifest, and
-//!   the client crates are the members that are neither the protocol, the worker nor the controller.
+//! * The files of a tag come from `git archive` of the whole commit, the workspace members and their
+//!   library and binary targets from `cargo metadata`, and the client crates are the members that are
+//!   neither the protocol, the worker nor the controller (the head's search leaves out the protocol
+//!   and the worker only).
 //! * The oracle lexes each product file itself and finds the sender names the plan lists (the six
 //!   variant names, the six wire names, `MutationRequest {` and `ActionTarget {`), in the files that a
-//!   module walk with rustc's two file rules and `#[path]` strings reaches, outside the places whose
-//!   `cfg` is false with `test` false and every other atom unknown. Each hit must lie inside the lines
-//!   of a reported sighting.
+//!   module walk with rustc's two file rules and `#[path]` strings reaches from each target, outside
+//!   the places whose `cfg` is false with `test` false and every other atom unknown. It reads the
+//!   attributes that are not documentation, and leaves out `ActionRight ::` before a name and the
+//!   header of an `impl`. Each hit must lie inside the lines of a listed sighting.
 //! * The sightings of every tag are kept in `retained_history_record.txt` beside this file: a change
 //!   to the result at an old tag fails until the record changes with it.
 
@@ -40,6 +43,9 @@ const WIRE_NAMES: [&str; 6] = [
 /// The crates that receive a mutation and the daemon that relays one: the gate's own copy of the
 /// rule that makes every other member a client.
 const NOT_CLIENTS: [&str; 3] = ["kr_protocol", "kr_worker", "kr_controller"];
+/// The crates that receive a mutation: the head's search leaves out these only, and reads the daemon
+/// too.
+const RECEIVERS: [&str; 2] = ["kr_protocol", "kr_worker"];
 
 // ---------------------------------------------------------------------------------------------
 // The tags
@@ -687,9 +693,12 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
         join(&dir_of(file), stem)
     };
     let mut read = FileRead::default();
+    // The open inline modules: the depth of each one's group and the folder that holds its modules.
     let mut inline: Vec<(usize, String)> = Vec::new();
     let mut depth = 0usize;
     let mut pending: Vec<Attr> = Vec::new();
+    // Where the hits of the pending attributes begin: a place a false `cfg` leaves out takes them away.
+    let mut mark = 0usize;
     let mut at = 0;
     while at < tokens.len() {
         let token = &tokens[at];
@@ -707,17 +716,23 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                         }
                         continue;
                     }
+                    if pending.is_empty() {
+                        mark = read.hits.len();
+                    }
+                    attribute_hits(file, &tokens, open + 1, close, &mut read.hits);
                     pending.push(attr);
                     // The attributes that follow are the item's too.
                     while matches!(tokens.get(at).map(|t| &t.tok), Some(Tok::Punct('#')))
                         && matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Open('[')))
                     {
                         let close = closing(&tokens, at + 1).map_err(|e| format!("{file}: {e}"))?;
+                        attribute_hits(file, &tokens, at + 2, close, &mut read.hits);
                         pending.push(attribute(&tokens[at + 2..close]));
                         at = close + 1;
                     }
                     if pending.contains(&Attr::Cfg(Value::False)) {
                         at = skip_item(&tokens, at);
+                        read.hits.truncate(mark);
                         pending.clear();
                     }
                     continue;
@@ -732,25 +747,19 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                         Attr::Path(text) => Some(text.clone()),
                         _ => None,
                     });
-                    let comps: Vec<&str> = inline.iter().map(|(_, c)| c.as_str()).collect();
-                    let folder = if comps.is_empty() {
-                        base.clone()
-                    } else {
-                        join(&base, &comps.join("/"))
-                    };
+                    // The folder of the modules declared here: that of the inline module that holds
+                    // the declaration, else the file's own. A `#[path]` is relative to the folder of the
+                    // file, and inside an inline module to the folder of that module.
+                    let folder = inline
+                        .last()
+                        .map_or_else(|| base.clone(), |(_, folder)| folder.clone());
+                    let from = inline
+                        .last()
+                        .map_or_else(|| dir_of(file), |(_, folder)| folder.clone());
                     match after {
                         Tok::Punct(';') => {
                             let (candidates, explicit) = match path {
-                                Some(path) => {
-                                    // A path is relative to the file's folder, and inside an inline
-                                    // module to the folder of that module.
-                                    let from = if comps.is_empty() {
-                                        dir_of(file)
-                                    } else {
-                                        folder
-                                    };
-                                    (vec![normal(&join(&from, &path))?], true)
-                                }
+                                Some(path) => (vec![normal(&join(&from, &path))?], true),
                                 None => (
                                     vec![
                                         join(&folder, &format!("{name}.rs")),
@@ -769,7 +778,11 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                             continue;
                         }
                         Tok::Open('{') => {
-                            inline.push((depth + 1, path.unwrap_or_else(|| name.clone())));
+                            let inside = match path {
+                                Some(path) => normal(&join(&from, &path))?,
+                                None => join(&folder, name),
+                            };
+                            inline.push((depth + 1, inside));
                             pending.clear();
                             at += 2;
                             continue;
@@ -777,6 +790,14 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                         _ => {}
                     }
                 }
+            }
+            // The group of `pub(crate)` or `pub(in path)` is part of the item's visibility.
+            Tok::Ident(word)
+                if word == "pub"
+                    && matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Open('('))) =>
+            {
+                at = closing(&tokens, at + 1).map_err(|e| format!("{file}: {e}"))? + 1;
+                continue;
             }
             Tok::Open(_) => {
                 depth += 1;
@@ -791,14 +812,7 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
             }
             Tok::Punct(';') => pending.clear(),
             Tok::Ident(word) => {
-                if VARIANTS.contains(&word.as_str()) && !after_action_right(&tokens, at) {
-                    read.hits.push(hit(file, token.line, word));
-                }
-                if matches!(word.as_str(), "MutationRequest" | "ActionTarget")
-                    && matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Open('{')))
-                {
-                    read.hits.push(hit(file, token.line, &format!("{word} {{")));
-                }
+                read.hits.extend(hits_at(file, &tokens, at));
                 if matches!(
                     word.as_str(),
                     "fn" | "struct"
@@ -814,16 +828,52 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                     pending.clear();
                 }
             }
-            Tok::Str(text) => {
-                if let Some(name) = WIRE_NAMES.iter().find(|name| text.contains(*name)) {
-                    read.hits.push(hit(file, token.line, name));
-                }
-            }
+            Tok::Str(_) => read.hits.extend(hits_at(file, &tokens, at)),
             _ => {}
         }
         at += 1;
     }
     Ok(Some(read))
+}
+
+/// The hits of the token at `at`: a variant name that does not follow `ActionRight ::`, `MutationRequest`
+/// or `ActionTarget` before a brace group where no `impl` or `for` precedes it (an impl header names
+/// the type, it builds none), and a string that holds a wire name once decoded.
+fn hits_at(file: &str, tokens: &[Token], at: usize) -> Vec<Hit> {
+    let token = &tokens[at];
+    let mut found = Vec::new();
+    match &token.tok {
+        Tok::Ident(word) => {
+            if VARIANTS.contains(&word.as_str()) && !after_action_right(tokens, at) {
+                found.push(hit(file, token.line, word));
+            }
+            if matches!(word.as_str(), "MutationRequest" | "ActionTarget")
+                && matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Open('{')))
+                && !(at > 0
+                    && matches!(&tokens[at - 1].tok, Tok::Ident(before) if before == "for" || before == "impl"))
+            {
+                found.push(hit(file, token.line, &format!("{word} {{")));
+            }
+        }
+        Tok::Str(text) => {
+            if let Some(name) = WIRE_NAMES.iter().find(|name| text.contains(*name)) {
+                found.push(hit(file, token.line, name));
+            }
+        }
+        _ => {}
+    }
+    found
+}
+
+/// The hits inside the attribute whose tokens are `tokens[from..to]`: any attribute but a
+/// documentation one, which the reader leaves out.
+fn attribute_hits(file: &str, tokens: &[Token], from: usize, to: usize, out: &mut Vec<Hit>) {
+    if matches!(tokens.get(from).map(|t| &t.tok), Some(Tok::Ident(word)) if word == "doc") {
+        return;
+    }
+    for at in from..to {
+        out.extend(hits_at(file, tokens, at));
+    }
 }
 
 fn hit(file: &str, line: usize, what: &str) -> Hit {
@@ -849,7 +899,7 @@ fn walk(folder: &Path, roots: &[String]) -> Result<Vec<Hit>, String> {
     let mut seen = BTreeSet::new();
     let mut hits = Vec::new();
     while let Some((file, beside)) = todo.pop() {
-        if !seen.insert(file.clone()) {
+        if !seen.insert((file.clone(), beside)) {
             continue;
         }
         let text =
@@ -886,85 +936,132 @@ fn walk(folder: &Path, roots: &[String]) -> Result<Vec<Hit>, String> {
     Ok(hits)
 }
 
-/// The names the members of a workspace manifest list: the quoted strings between `members = [` and
-/// its `]`.
-fn members_of(manifest: &str) -> Vec<String> {
-    let Some(start) = manifest.find("members") else {
-        return Vec::new();
-    };
-    let rest = &manifest[start..];
-    let Some(open) = rest.find('[') else {
-        return Vec::new();
-    };
-    let Some(close) = rest[open..].find(']') else {
-        return Vec::new();
-    };
-    rest[open + 1..open + close]
-        .split('"')
-        .skip(1)
-        .step_by(2)
-        .map(str::to_owned)
-        .collect()
+/// The kinds of target that are product code: a library of any crate type, and a binary.
+const PRODUCT_KINDS: [&str; 7] = [
+    "lib",
+    "rlib",
+    "dylib",
+    "cdylib",
+    "staticlib",
+    "proc-macro",
+    "bin",
+];
+
+/// A workspace member outside `tests/`, as Cargo reports it.
+#[derive(Debug, PartialEq)]
+struct Member {
+    /// The package name, with `-` as `_`.
+    name: String,
+    /// The source file of each library and binary target, relative to the workspace.
+    roots: Vec<String>,
 }
 
-/// The package name a member's manifest gives, with `-` as `_`.
-fn crate_name(manifest: &str) -> Option<String> {
-    manifest.lines().find_map(|line| {
-        let line = line.trim();
-        let rest = line.strip_prefix("name")?.trim_start().strip_prefix('=')?;
-        Some(rest.trim().trim_matches('"').replace('-', "_"))
-    })
+/// The cargo that runs this program, by its own path, so that no toolchain file of a checked-out
+/// release starts an install.
+fn cargo() -> PathBuf {
+    std::env::var_os("CARGO").map_or_else(|| PathBuf::from(env!("CARGO")), PathBuf::from)
 }
 
-/// The roots Cargo finds in a member's `src`: `lib.rs`, `main.rs`, `bin/*.rs` and `bin/*/main.rs`.
-fn roots_of(folder: &Path, member: &str) -> Vec<String> {
-    let mut roots = Vec::new();
-    for root in ["lib.rs", "main.rs"] {
-        let path = format!("{member}/src/{root}");
-        if folder.join(&path).is_file() {
-            roots.push(path);
-        }
+/// The members of the workspace at `folder` outside `tests/` and their library and binary targets, as
+/// `cargo metadata` reports them. A workspace that Cargo cannot read, with no member or with a member
+/// that has no such target, is an error, never an empty result.
+fn members(folder: &Path) -> Result<Vec<Member>, String> {
+    let root = std::fs::canonicalize(folder).map_err(|error| format!("the tree: {error}"))?;
+    let output = Command::new(cargo())
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("cargo metadata: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let first = stderr
+            .lines()
+            .find(|line| line.starts_with("error"))
+            .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
+            .unwrap_or("it failed");
+        return Err(format!("cargo metadata: {}", first.trim()));
     }
-    if let Ok(entries) = std::fs::read_dir(folder.join(member).join("src/bin")) {
-        let mut names: Vec<String> = entries
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        for name in names {
-            let path = format!("{member}/src/bin/{name}");
-            if name.ends_with(".rs") {
-                roots.push(path);
-            } else if folder.join(&path).join("main.rs").is_file() {
-                roots.push(format!("{path}/main.rs"));
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cargo metadata: {error}"))?;
+    let listed: BTreeSet<&str> = metadata["workspace_members"]
+        .as_array()
+        .ok_or("cargo metadata: no workspace members")?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let under = |path: &str| -> Result<String, String> {
+        Path::new(path)
+            .strip_prefix(&root)
+            .map(|rest| rest.display().to_string())
+            .map_err(|_| format!("{path} is not under the tree"))
+    };
+    let mut found = Vec::new();
+    for package in metadata["packages"]
+        .as_array()
+        .ok_or("cargo metadata: no packages")?
+    {
+        if !package["id"].as_str().is_some_and(|id| listed.contains(id)) {
+            continue;
+        }
+        let name = package["name"].as_str().ok_or("a package with no name")?;
+        let manifest = under(
+            package["manifest_path"]
+                .as_str()
+                .ok_or("a package with no manifest")?,
+        )?;
+        if manifest.starts_with("tests/") {
+            continue;
+        }
+        let mut roots = Vec::new();
+        for target in package["targets"].as_array().into_iter().flatten() {
+            let kinds: Vec<&str> = target["kind"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect();
+            if kinds.iter().any(|kind| PRODUCT_KINDS.contains(kind)) {
+                roots.push(under(
+                    target["src_path"]
+                        .as_str()
+                        .ok_or("a target with no source path")?,
+                )?);
             }
         }
+        if roots.is_empty() {
+            return Err(format!("{name}: no library or binary target"));
+        }
+        found.push(Member {
+            name: name.replace('-', "_"),
+            roots,
+        });
     }
-    roots
+    if found.is_empty() {
+        return Err("cargo metadata: no member outside tests".to_owned());
+    }
+    Ok(found)
 }
 
-/// The hits of the client crates of the workspace under `folder`.
-fn oracle(folder: &Path) -> Result<Vec<Hit>, String> {
-    let manifest = std::fs::read_to_string(folder.join("Cargo.toml"))
-        .map_err(|error| format!("the root manifest: {error}"))?;
+/// The hits of the crates of the workspace under `folder` that are not in `receivers`.
+fn oracle(folder: &Path, receivers: &[&str]) -> Result<Vec<Hit>, String> {
     let mut hits = Vec::new();
-    for member in members_of(&manifest) {
-        if member.starts_with("tests") {
+    let mut searched = 0;
+    for member in members(folder)? {
+        if receivers.contains(&member.name.as_str()) {
             continue;
         }
-        let text = std::fs::read_to_string(folder.join(&member).join("Cargo.toml"))
-            .map_err(|error| format!("{member}: {error}"))?;
-        let name = crate_name(&text).ok_or_else(|| format!("{member}: no package name"))?;
-        if NOT_CLIENTS.contains(&name.as_str()) {
-            continue;
-        }
-        let roots = roots_of(folder, &member);
-        if roots.is_empty() {
-            return Err(format!(
-                "{member}: no library or binary target the gate finds"
-            ));
-        }
-        hits.extend(walk(folder, &roots)?);
+        searched += 1;
+        hits.extend(walk(folder, &member.roots)?);
+    }
+    if searched == 0 {
+        return Err("no crate to search".to_owned());
     }
     hits.sort();
     Ok(hits)
@@ -1008,6 +1105,12 @@ fn tag_problems(tag: &str, reported: &Tag, hits: &[Hit]) -> Vec<String> {
         }
     }
     for ((krate, name), extents) in &reported.extents {
+        if !reported
+            .sightings
+            .contains_key(&(krate.clone(), name.clone()))
+        {
+            problems.push(format!("{tag}: {krate}::{name} has lines and no sighting"));
+        }
         for (file, first, last) in extents {
             if *first == 0 || first > last {
                 problems.push(format!(
@@ -1016,8 +1119,13 @@ fn tag_problems(tag: &str, reported: &Tag, hits: &[Hit]) -> Vec<String> {
             }
         }
     }
-    let all: BTreeSet<(String, usize, usize)> =
-        reported.extents.values().flatten().cloned().collect();
+    // Only the lines of a listed sighting cover a hit.
+    let all: BTreeSet<(String, usize, usize)> = reported
+        .extents
+        .iter()
+        .filter(|(key, _)| reported.sightings.contains_key(*key))
+        .flat_map(|(_, extents)| extents.iter().cloned())
+        .collect();
     for hit in uncovered(hits, &all) {
         problems.push(format!(
             "{tag}: {} line {} ({}) is no part of a sighting",
@@ -1091,17 +1199,10 @@ fn repository() -> PathBuf {
         .expect("the repository")
 }
 
-/// The `crates` and `apps` folders of a commit, extracted into `folder`.
+/// The files of a commit, extracted into `folder`.
 fn extract(repository: &Path, commit: &str, folder: &Path) -> Result<(), String> {
-    let top = git(repository, &["ls-tree", "--name-only", commit])?;
-    let mut args = vec!["archive", "--format=tar", commit];
-    for name in ["Cargo.toml", "crates", "apps"] {
-        if top.lines().any(|line| line == name) {
-            args.push(name);
-        }
-    }
     let mut archive = Command::new("git")
-        .args(&args)
+        .args(["archive", "--format=tar", commit])
         .current_dir(repository)
         .stdout(Stdio::piped())
         .spawn()
@@ -1131,14 +1232,16 @@ fn the_report_of_the_reader_holds_to_what_the_gate_finds_in_every_release() {
     let repository = repository();
     let listed = listed_releases(&repository).expect("the release tags");
     let mut problems = release_problems(&listed, &report);
+    let mut judged = 0;
     for release in &listed {
         let Some(reported) = report.tags.get(&release.tag) else {
             continue;
         };
+        judged += 1;
         let folder = tempfile::tempdir().expect("a folder");
         extract(&repository, &release.commit, folder.path())
             .unwrap_or_else(|error| panic!("{}: {error}", release.tag));
-        match oracle(folder.path()) {
+        match oracle(folder.path(), &NOT_CLIENTS) {
             Ok(hits) => {
                 println!("{}: {} hits", release.tag, hits.len());
                 problems.extend(tag_problems(&release.tag, reported, &hits));
@@ -1153,11 +1256,7 @@ fn the_report_of_the_reader_holds_to_what_the_gate_finds_in_every_release() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/retained_history_record.txt");
     let record = std::fs::read_to_string(&record_path).unwrap_or_default();
     problems.extend(record_problems(&record, &record_of(&report), 40));
-    println!(
-        "gate read {} releases of {} tags",
-        report.order.len(),
-        listed.len()
-    );
+    println!("gate read {judged} releases of {} tags", listed.len());
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
@@ -1175,7 +1274,7 @@ fn the_report_of_the_reader_holds_to_what_the_gate_finds_in_this_checkout() {
         ["HEAD"],
         "the report is of this checkout alone"
     );
-    let hits = oracle(&repository()).expect("the oracle reads this checkout");
+    let hits = oracle(&repository(), &RECEIVERS).expect("the oracle reads this checkout");
     let reported = &report.tags["HEAD"];
     println!(
         "HEAD: {} hits, {} sightings, {} scan line(s)",
@@ -1298,7 +1397,7 @@ mod cases {
                    /* \"agent.turn.cancel\" /* nested */ AgentTurnSteer */\n\
                    fn j() { let _ = 'a'; let _: &'static str = \"plain\"; }\n";
         let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
-        let hits = oracle(folder.path()).expect("hits");
+        let hits = oracle(folder.path(), &NOT_CLIENTS).expect("hits");
         let at = "crates/kr-a/src/lib.rs";
         assert_eq!(
             lines(&hits),
@@ -1321,7 +1420,7 @@ mod cases {
                    #[cfg(test)]\n#[inline]\nstruct S;\nfn kept_e() { Method::AgentTurnCancel; }\n\
                    fn nested() {\n    #[cfg(test)]\n    let _ = Method::AgentTurnSteer;\n    let _ = Method::AgentTurnCancel;\n}\n";
         let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
-        let hits = oracle(folder.path()).expect("hits");
+        let hits = oracle(folder.path(), &NOT_CLIENTS).expect("hits");
         let found: Vec<usize> = hits.iter().map(|hit| hit.line).collect();
         assert_eq!(found, [8, 10, 12, 15, 19, 23], "{hits:?}");
         // A file whose own inner attribute is false is not read, nor is anything it declares.
@@ -1332,7 +1431,7 @@ mod cases {
                 "#![cfg(test)]\nmod deeper;\nfn t() { Method::AgentTurnCancel; }\n",
             ),
         ]);
-        assert_eq!(oracle(folder.path()), Ok(Vec::new()));
+        assert_eq!(oracle(folder.path(), &NOT_CLIENTS), Ok(Vec::new()));
     }
 
     #[test]
@@ -1374,8 +1473,8 @@ mod cases {
                 "fn u() { Method::AgentTurnCancel; }\n",
             ),
         ]);
-        let files: Result<BTreeSet<String>, String> =
-            oracle(folder.path()).map(|hits| hits.iter().map(|hit| hit.file.clone()).collect());
+        let files: Result<BTreeSet<String>, String> = oracle(folder.path(), &NOT_CLIENTS)
+            .map(|hits| hits.iter().map(|hit| hit.file.clone()).collect());
         assert_eq!(
             files,
             Ok(BTreeSet::from(
@@ -1391,21 +1490,21 @@ mod cases {
             ))
         );
         let missing = tree(&[("crates/kr-a/src/lib.rs", "mod nowhere;\n")]);
-        assert!(oracle(missing.path()).is_err_and(|e| e.contains("at no file")));
+        assert!(oracle(missing.path(), &NOT_CLIENTS).is_err_and(|e| e.contains("at no file")));
         let both = tree(&[
             ("crates/kr-a/src/lib.rs", "mod both;\n"),
             ("crates/kr-a/src/both.rs", "\n"),
             ("crates/kr-a/src/both/mod.rs", "\n"),
         ]);
-        assert!(oracle(both.path()).is_err_and(|e| e.contains("at two files")));
+        assert!(oracle(both.path(), &NOT_CLIENTS).is_err_and(|e| e.contains("at two files")));
         // A crate with no root the gate finds is an error, never an empty result.
         let none = tree(&[]);
         std::fs::remove_file(none.path().join("crates/kr-worker/src/lib.rs")).expect("a file");
         write(none.path(), "crates/kr-a/src/other.rs", "\n");
-        assert!(oracle(none.path()).is_err_and(|e| e.contains("no library or binary target")));
+        assert!(oracle(none.path(), &NOT_CLIENTS).is_err_and(|e| e.contains("cargo metadata")));
         // The worker is no client: its names are not looked for.
         let only_worker = tree(&[("crates/kr-a/src/lib.rs", "fn quiet() {}\n")]);
-        assert_eq!(oracle(only_worker.path()), Ok(Vec::new()));
+        assert_eq!(oracle(only_worker.path(), &NOT_CLIENTS), Ok(Vec::new()));
     }
 
     #[test]
@@ -1505,6 +1604,16 @@ mod cases {
             tag_problems("t", &backwards, &covered),
             ["t: kr_a::f covers lines 9 to 5 of crates/kr-a/src/lib.rs"]
         );
+        // Lines whose sighting is not listed cover nothing, and are a problem of their own.
+        let mut orphan = reported(Some(Ok(0)), 1);
+        orphan.sightings.clear();
+        assert_eq!(
+            tag_problems("t", &orphan, &covered),
+            [
+                "t: kr_a::f has lines and no sighting",
+                "t: crates/kr-a/src/lib.rs line 2 (x) is no part of a sighting"
+            ]
+        );
         // A sighting that only a mark gives covers no line, and needs none.
         let mut marked = Tag {
             commit: "c".to_owned(),
@@ -1554,32 +1663,180 @@ mod cases {
     }
 
     #[test]
-    fn the_members_names_and_roots_come_from_the_manifests_and_the_folders() {
-        assert_eq!(
-            members_of(
-                "[workspace]\nresolver = \"3\"\nmembers = [\n  \"crates/kr-a\",\n  \"apps/x/src-tauri\",\n]\n[dependencies]\n"
-            ),
-            ["crates/kr-a", "apps/x/src-tauri"]
-        );
-        assert_eq!(
-            crate_name("[package]\nname = \"kr-a-b\"\nversion = \"1\"\n"),
-            Some("kr_a_b".to_owned())
-        );
+    fn the_members_and_their_targets_come_from_cargo_and_an_empty_inventory_is_an_error() {
+        // A binary that a manifest places outside `src/`, next to a quiet library, is searched.
         let folder = tree(&[
-            ("crates/kr-a/src/lib.rs", "\n"),
-            ("crates/kr-a/src/main.rs", "\n"),
-            ("crates/kr-a/src/bin/one.rs", "\n"),
-            ("crates/kr-a/src/bin/two/main.rs", "\n"),
-            ("crates/kr-a/src/bin/three/other.rs", "\n"),
+            ("crates/kr-a/src/lib.rs", "fn quiet() {}\n"),
+            (
+                "crates/kr-a/Cargo.toml",
+                "[package]\nname = \"kr-a\"\n[[bin]]\nname = \"send\"\npath = \"tools/send.rs\"\n",
+            ),
+            (
+                "crates/kr-a/tools/send.rs",
+                "fn main() { Method::AgentTurnCancel; }\n",
+            ),
+        ]);
+        let found = members(folder.path()).expect("the members");
+        let kr_a = found
+            .iter()
+            .find(|member| member.name == "kr_a")
+            .expect("kr_a");
+        assert_eq!(
+            kr_a.roots,
+            ["crates/kr-a/src/lib.rs", "crates/kr-a/tools/send.rs"]
+        );
+        assert_eq!(
+            oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok(vec![("crates/kr-a/tools/send.rs".to_owned(), 1)])
+        );
+        // A workspace whose members are all test crates, or that Cargo cannot read, is an error.
+        let none = tempfile::tempdir().expect("a folder");
+        write(
+            none.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"tests/x\"]\n",
+        );
+        write(
+            none.path(),
+            "tests/x/Cargo.toml",
+            "[package]\nname = \"x\"\n",
+        );
+        write(none.path(), "tests/x/src/lib.rs", "\n");
+        assert!(members(none.path()).is_err_and(|e| e.contains("no member outside tests")));
+        let broken = tempfile::tempdir().expect("a folder");
+        write(broken.path(), "Cargo.toml", "[workspace\n");
+        assert!(oracle(broken.path(), &NOT_CLIENTS).is_err_and(|e| e.contains("cargo metadata")));
+        // Where every member is a receiver there is nothing to search: an error.
+        let quiet = tree(&[("crates/kr-a/src/lib.rs", "\n")]);
+        assert!(
+            oracle(quiet.path(), &["kr_a", "kr_worker"])
+                .is_err_and(|e| e.contains("no crate to search"))
+        );
+    }
+
+    #[test]
+    fn the_oracle_reads_the_attributes_that_are_not_documentation() {
+        let lib = "#[serde(rename = \"agent.turn.cancel\")]\nstruct A;\n\
+                   #[derive(Debug)]\n#[serde(rename = \"agent.prompt.\\\n   queue\")]\nstruct B;\n\
+                   #[doc = \"agent.turn.steer\"]\nstruct C;\n\
+                   /// agent.prompt.submit\nstruct D;\n\
+                   #[cfg(test)]\n#[serde(rename = \"agent.turn.steer\")]\nstruct E;\n\
+                   #[cfg_attr(feature = \"x\", serde(rename = AgentTurnSteer))]\nstruct F;\n\
+                   #[cfg(unix)]\n#[serde(rename = \"plugin.action.invoke\")]\nstruct G;\n\
+                   #[serde(default = ActionRight::AgentTurnCancel)]\nstruct H;\n";
+        let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
+        assert_eq!(
+            oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok([1, 4, 14, 17]
+                .iter()
+                .map(|line| ("crates/kr-a/src/lib.rs".to_owned(), *line))
+                .collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn a_file_is_walked_for_each_side_it_is_reached_from_and_an_inline_path_is_taken_from_the_file()
+    {
+        // `a.rs` is reached by `mod a;` (its modules in `a/`) and by a `#[path]` (its modules beside
+        // it): both sides are walked.
+        let folder = tree(&[
+            (
+                "crates/kr-a/src/lib.rs",
+                "mod a;\n#[path = \"a.rs\"]\nmod b;\n",
+            ),
+            ("crates/kr-a/src/a.rs", "mod child;\n"),
+            (
+                "crates/kr-a/src/a/child.rs",
+                "fn c() { Method::AgentTurnCancel; }\n",
+            ),
+            (
+                "crates/kr-a/src/child.rs",
+                "fn d() { Method::AgentTurnSteer; }\n",
+            ),
         ]);
         assert_eq!(
-            roots_of(folder.path(), "crates/kr-a"),
-            [
+            oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok(vec![
+                ("crates/kr-a/src/a/child.rs".to_owned(), 1),
+                ("crates/kr-a/src/child.rs".to_owned(), 1),
+            ])
+        );
+        // An inline module with a `#[path]` in a file that is no `mod.rs` takes its folder from the
+        // file's folder, not from the folder of the file's own name.
+        let inline = tree(&[
+            ("crates/kr-a/src/lib.rs", "mod plain;\n"),
+            (
+                "crates/kr-a/src/plain.rs",
+                "#[path = \"d\"]\nmod p { mod inner; }\n",
+            ),
+            (
+                "crates/kr-a/src/d/inner.rs",
+                "fn i() { Method::AgentTurnCancel; }\n",
+            ),
+            (
+                "crates/kr-a/src/plain/d/inner.rs",
+                "fn j() { Method::AgentTurnSteer; }\n",
+            ),
+        ]);
+        assert_eq!(
+            oracle(inline.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok(vec![("crates/kr-a/src/d/inner.rs".to_owned(), 1)])
+        );
+        // A `#[path]` before `pub(crate)` still names the module.
+        let visible = tree(&[
+            (
                 "crates/kr-a/src/lib.rs",
-                "crates/kr-a/src/main.rs",
-                "crates/kr-a/src/bin/one.rs",
-                "crates/kr-a/src/bin/two/main.rs",
-            ]
+                "#[path = \"x/y.rs\"]\npub(crate) mod e;\n",
+            ),
+            (
+                "crates/kr-a/src/x/y.rs",
+                "fn y() { Method::AgentApprovalRespond; }\n",
+            ),
+        ]);
+        assert_eq!(
+            oracle(visible.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok(vec![("crates/kr-a/src/x/y.rs".to_owned(), 1)])
+        );
+    }
+
+    #[test]
+    fn an_impl_header_is_no_hit_and_a_brace_form_after_a_name_is() {
+        let lib = "impl Make for MutationRequest {}\n\
+                   impl ActionTarget { fn f() {} }\n\
+                   fn g() { let _ = MutationRequest { a: 1 }; }\n\
+                   fn h() { let _ = ActionTarget { a: 1 }; }\n";
+        let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
+        assert_eq!(
+            oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok([3, 4]
+                .iter()
+                .map(|line| ("crates/kr-a/src/lib.rs".to_owned(), *line))
+                .collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn the_head_leaves_out_the_receivers_only_and_a_tag_the_daemon_too() {
+        let folder = tree(&[
+            ("crates/kr-a/src/lib.rs", "fn quiet() {}\n"),
+            (
+                "crates/kr-controller/Cargo.toml",
+                "[package]\nname = \"kr-controller\"\n",
+            ),
+            (
+                "crates/kr-controller/src/lib.rs",
+                "fn r() { Method::AgentTurnCancel; }\n",
+            ),
+        ]);
+        write(
+            folder.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/kr-a\", \"crates/kr-worker\", \"crates/kr-controller\"]\n",
+        );
+        assert_eq!(oracle(folder.path(), &NOT_CLIENTS), Ok(Vec::new()));
+        assert_eq!(
+            oracle(folder.path(), &RECEIVERS).map(|hits| lines(&hits)),
+            Ok(vec![("crates/kr-controller/src/lib.rs".to_owned(), 1)])
         );
     }
 
@@ -1603,7 +1860,7 @@ mod cases {
             "fn h() { let _ = '\"'; Method::AgentTurnSteer; }\n",
         );
         let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
-        let found = oracle(folder.path()).map(|hits| lines(&hits));
+        let found = oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits));
         let at = "crates/kr-a/src/lib.rs";
         assert_eq!(
             found,
