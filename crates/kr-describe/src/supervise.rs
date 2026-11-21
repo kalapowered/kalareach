@@ -492,6 +492,7 @@ impl Driver {
 
     /// Returns whether the job in the process has been asked to stop for passing its deadline, and
     /// if so whether the control thread has said it has read the request.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn stopping_at_its_deadline(&self) -> Option<bool> {
         self.process

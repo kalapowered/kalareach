@@ -307,6 +307,7 @@ impl DescriptionStore {
     /// # Errors
     ///
     /// Returns [`DescribeError::Store`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn pin_count(&self) -> Result<u64> {
         let count: i64 = self
             .connection
@@ -573,6 +574,7 @@ impl DescriptionStore {
     /// # Errors
     ///
     /// Returns [`DescribeError::Store`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn summary_count(&self) -> Result<u64> {
         let count: i64 = self
             .connection
@@ -588,6 +590,7 @@ impl DescriptionStore {
     /// # Errors
     ///
     /// Returns [`DescribeError::Store`] when the read fails.
+    #[cfg(any(test, feature = "testing"))]
     pub fn generated_count(&self) -> Result<u64> {
         let count: i64 = self
             .connection

@@ -103,6 +103,7 @@ impl Feature {
 
     /// Returns the llama.cpp build option that compiles its CPU code for this instruction set, or
     /// none when the compilers add the set themselves and llama.cpp has no option for it.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub const fn build_option(self) -> Option<&'static str> {
         match self {
