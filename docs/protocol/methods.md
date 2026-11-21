@@ -186,6 +186,9 @@ document.
 | --- | --- | --- | --- | --- |
 | `shell.launch` | write | `local_ipc`, `paired_device` | Install and submit an argument vector or correctly quoted command through the trusted root editor. An intervening local edit returns DRAFT_CONFLICT. | [Protocol: The root integration](README.md) |
 | `shell.launch.surface` | read | `local_ipc`, `paired_device` | Whether the root editor is at an empty prompt a launch can be installed in, how the asking connection stands to the session's input, the shell's name, and the agents the host has a package for. | [Protocol: The root integration](README.md) |
+| `shell.launch.commands.list` | read | `local_ipc`, `paired_device` | The launch commands saved on this host, in the order they were first saved, and the revision of the list. A paired device that may manage the host reads the exact command lines, which can hold a secret. | [Protocol: Saved launch commands](README.md) |
+| `shell.launch.commands.save` | write | `local_ipc` | Save a launch command, or put it in place of the command with the same label. A request decided against a revision the list has left writes nothing and is answered with the list as it stands. The host refuses a command that breaks its rules. Only the local caller saves. | [Protocol: Saved launch commands](README.md) |
+| `shell.launch.commands.remove` | write | `local_ipc` | Remove the launch command with a label. A request decided against a revision the list has left writes nothing and is answered with the list as it stands. Only the local caller removes. | [Protocol: Saved launch commands](README.md) |
 
 ## Agent state
 

@@ -196,6 +196,7 @@ fn read_only_metadata_is_reachable_only_from_read_results() {
             "HostInfoResult",
             "HostPrivacyState",
             "LaunchOffer",
+            "ShellLaunchCommandsListResult",
             "ShellLaunchSurfaceResult"
         ],
         "the read-only metadata types"

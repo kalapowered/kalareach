@@ -131,6 +131,9 @@ pub fn initialise() -> Result<()> {
 /// a client comes from here, so those have one generator to qualify. It is not the only randomness
 /// in the tree, and the rest is named so that it is not taken for this:
 ///
+/// * The revision of a host's saved launch commands is eight bytes from here: it is not secret, but
+///   it must differ from every revision the list has had, which a clock or a counter cannot promise
+///   across a file a person moves away.
 /// * Identifiers and file names that must be unique and that nothing treats as secret are
 ///   version-four UUIDs, which the `uuid` crate fills from the operating system.
 /// * The worker's detach token, which one accepted line presents (as `KR_DETACH_TOKEN`) to detach

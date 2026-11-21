@@ -57,6 +57,7 @@ pub mod directory;
 pub mod error;
 pub mod given;
 pub mod grants;
+pub mod launch_commands;
 pub mod local_endpoints;
 pub mod machine;
 pub mod mailbox_reader;

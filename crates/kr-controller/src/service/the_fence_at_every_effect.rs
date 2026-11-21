@@ -4160,3 +4160,334 @@ async fn a_sign_out_answered_from_its_claim_is_not_shown_when_a_fence_lands_at_t
     let after = attempt().await;
     assert_eq!(after, first, "once the fence is gone it is answered again");
 }
+
+// ----- The saved launch commands: where each write asks the registration and the deadline again.
+
+fn launch_save(label: &str, expected: u64) -> ParamsValue {
+    ParamsValue::from_typed(
+        &kr_protocol::launch_commands::ShellLaunchCommandsSaveParams {
+            expected_revision: kr_protocol::scalars::U64::new(expected),
+            command: kr_protocol::launch_commands::NamedLaunch {
+                label: label.to_owned(),
+                program: "claude".to_owned(),
+                arguments: vec!["--resume".to_owned()],
+            },
+        },
+    )
+    .expect("encodes")
+}
+
+fn launch_remove(label: &str, expected: u64) -> ParamsValue {
+    ParamsValue::from_typed(
+        &kr_protocol::launch_commands::ShellLaunchCommandsRemoveParams {
+            expected_revision: kr_protocol::scalars::U64::new(expected),
+            label: label.to_owned(),
+        },
+    )
+    .expect("encodes")
+}
+
+/// The list the host holds, read as a client reads it.
+fn launch_list(
+    controller: &Controller,
+) -> kr_protocol::launch_commands::ShellLaunchCommandsListResult {
+    controller
+        .launch_commands_list()
+        .expect("the list is read")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// One write of the saved launch commands under `carried`, as the local door makes it.
+async fn launch_write(
+    controller: &Arc<Controller>,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    method: Method,
+    params: ParamsValue,
+    carried: crate::authority::AdmittedMutation,
+) -> crate::error::Result<ParamsValue> {
+    let mutation = MutationRequest {
+        request_id: RequestId::new(1),
+        method: method.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget::environment(environment_id),
+        expected: ParamsValue::empty(),
+        action_window_id: ActionWindowId::new("local:test").expect("a window"),
+        requested_ttl_ms: DurationMs::new(30_000),
+        params,
+    };
+    controller
+        .launch_commands_write(&mutation, method, carried)
+        .await
+}
+
+/// KR-REQ-13.11: a fence this host owes, which is a withdrawal of the authority a write was
+/// admitted under, prevents the publication of a save and of a removal when it stands before the
+/// commit: the registration is asked again immediately before the file is renamed into place. The
+/// control: with nothing owed, the same writes are made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_before_the_hold_prevents_publication() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, _actor) = admitted(&controller).await;
+    let write = |method: Method, params: ParamsValue| {
+        launch_write(
+            &controller,
+            temp.environment_id(),
+            method,
+            params,
+            carried(&controller, connection_id),
+        )
+    };
+    write(Method::ShellLaunchCommandsSave, launch_save("one", 0))
+        .await
+        .expect("saved once nothing is owed");
+    let kept = launch_list(&controller);
+    assert_eq!(kept.commands.len(), 1);
+
+    controller.hold_fence(true);
+    for (method, params) in [
+        (
+            Method::ShellLaunchCommandsSave,
+            launch_save("two", kept.revision.get()),
+        ),
+        (
+            Method::ShellLaunchCommandsRemove,
+            launch_remove("one", kept.revision.get()),
+        ),
+    ] {
+        let refused = write(method, params)
+            .await
+            .expect_err("a write is stopped while a fence is owed");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        assert!(refused.to_string().contains("fence"), "{refused}");
+        assert_eq!(launch_list(&controller), kept, "nothing was published");
+    }
+    controller.hold_fence(false);
+    write(
+        Method::ShellLaunchCommandsRemove,
+        launch_remove("one", kept.revision.get()),
+    )
+    .await
+    .expect("removed once nothing is owed");
+    assert!(launch_list(&controller).commands.is_empty());
+}
+
+/// KR-REQ-13.11: a deadline that passed before the registration is held prevents the publication of
+/// a save and of a removal, which the host answers as an expired window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deadline_that_passed_before_the_hold_prevents_publication() {
+    let (temp, controller, clock) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, _actor) = admitted(&controller).await;
+    launch_write(
+        &controller,
+        environment_id,
+        Method::ShellLaunchCommandsSave,
+        launch_save("one", 0),
+        carried(&controller, connection_id),
+    )
+    .await
+    .expect("saved");
+    let kept = launch_list(&controller);
+    let expiring = crate::authority::AdmittedMutation {
+        deadline: Some(controller.clock.now()),
+        ..carried(&controller, connection_id)
+    };
+    clock.advance(Duration::from_secs(1));
+    for (method, params) in [
+        (
+            Method::ShellLaunchCommandsSave,
+            launch_save("two", kept.revision.get()),
+        ),
+        (
+            Method::ShellLaunchCommandsRemove,
+            launch_remove("one", kept.revision.get()),
+        ),
+    ] {
+        let refused = launch_write(&controller, environment_id, method, params, expiring)
+            .await
+            .expect_err("the deadline has passed");
+        assert!(
+            matches!(refused, crate::error::ControllerError::WindowExpired { .. }),
+            "{refused}"
+        );
+        assert_eq!(launch_list(&controller), kept, "nothing was published");
+    }
+}
+
+/// KR-REQ-13.11: a fence that lands while a save holds the store's lock, before it asks the
+/// registration again, stops the save and writes nothing; the control passes once nothing is owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_that_lands_once_a_launch_command_change_holds_the_stores_lock_stops_it() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, _actor) = admitted(&controller).await;
+    let (arrived, release) = controller.pause_after_the_launch_commands_are_locked();
+    let waiting = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let environment_id = temp.environment_id();
+        let carried = carried(&controller, connection_id);
+        async move {
+            launch_write(
+                &controller,
+                environment_id,
+                Method::ShellLaunchCommandsSave,
+                launch_save("one", 0),
+                carried,
+            )
+            .await
+        }
+    });
+    arrival(arrived).await;
+    controller.hold_fence(true);
+    release.send(()).expect("the save goes on");
+    let refused = waiting
+        .await
+        .expect("the save finishes")
+        .expect_err("the save is stopped");
+    controller.hold_fence(false);
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(refused.to_string().contains("fence"), "{refused}");
+    assert_eq!(
+        launch_list(&controller).revision.get(),
+        0,
+        "nothing was written"
+    );
+}
+
+/// KR-REQ-13.11: a withdrawal that is attempted while a save is inside its commit does not
+/// complete until the publication has ended: the registrations are held against it, it has arrived
+/// at the lock before the save goes on, and what it reads afterwards is the published list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_attempted_during_publication_cannot_complete_before_the_publication_ends() {
+    use std::sync::atomic::Ordering;
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, _actor) = admitted(&controller).await;
+    let (arrived, release) = controller.pause_inside_the_launch_commands_commit();
+    let saving = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let environment_id = temp.environment_id();
+        let carried = carried(&controller, connection_id);
+        async move {
+            launch_write(
+                &controller,
+                environment_id,
+                Method::ShellLaunchCommandsSave,
+                launch_save("one", 0),
+                carried,
+            )
+            .await
+        }
+    });
+    arrival(arrived).await;
+    assert_eq!(
+        launch_list(&controller).revision.get(),
+        0,
+        "nothing is published yet"
+    );
+
+    let withdrawal = {
+        let controller = Arc::clone(&controller);
+        std::thread::spawn(move || {
+            drop(controller.admitted_withdraw());
+            launch_list(&controller).revision.get()
+        })
+    };
+    while controller.withdrawals_waiting.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        controller.commit_hold.try_write().is_err(),
+        "the registrations are held against a withdrawal while the save commits"
+    );
+    assert!(
+        !withdrawal.is_finished(),
+        "the withdrawal has not completed inside the commit"
+    );
+    release.send(()).expect("the save commits");
+    let saved = saving
+        .await
+        .expect("the save finishes")
+        .expect("the save is made");
+    let answer: kr_protocol::launch_commands::ShellLaunchCommandsSaveResult =
+        saved.to_typed().expect("decodes");
+    assert!(answer.applied && answer.changed);
+    assert_eq!(
+        withdrawal.join().expect("the withdrawal ends"),
+        answer.revision.get(),
+        "the withdrawal completed after the publication and found the new list"
+    );
+}
+
+/// KR-REQ-13.11: saves and removals made together, each retrying on a stale answer, leave one
+/// consistent list: every label once, in the order the file was published, and the file is the
+/// list the host answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_concurrent_save_and_remove_leave_a_consistent_list() {
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, _actor) = admitted(&controller).await;
+    let one = |method: Method, label: &'static str| {
+        let controller = Arc::clone(&controller);
+        let environment_id = temp.environment_id();
+        let carried = carried(&controller, connection_id);
+        tokio::spawn(async move {
+            loop {
+                let seen = launch_list(&controller).revision.get();
+                let params = if method == Method::ShellLaunchCommandsSave {
+                    launch_save(label, seen)
+                } else {
+                    launch_remove(label, seen)
+                };
+                let answer = launch_write(&controller, environment_id, method, params, carried)
+                    .await
+                    .expect("the write is made");
+                let applied = if method == Method::ShellLaunchCommandsSave {
+                    answer
+                        .to_typed::<kr_protocol::launch_commands::ShellLaunchCommandsSaveResult>()
+                        .expect("decodes")
+                        .applied
+                } else {
+                    answer
+                        .to_typed::<kr_protocol::launch_commands::ShellLaunchCommandsRemoveResult>()
+                        .expect("decodes")
+                        .applied
+                };
+                if applied {
+                    return;
+                }
+            }
+        })
+    };
+    let labels = ["a", "b", "c", "d", "e", "f"];
+    let saves: Vec<_> = labels
+        .iter()
+        .map(|label| one(Method::ShellLaunchCommandsSave, label))
+        .collect();
+    for save in saves {
+        save.await.expect("the save ends");
+    }
+    let removals: Vec<_> = ["b", "d", "f"]
+        .iter()
+        .map(|label| one(Method::ShellLaunchCommandsRemove, label))
+        .collect();
+    for removal in removals {
+        removal.await.expect("the removal ends");
+    }
+    let listed = launch_list(&controller);
+    let mut kept: Vec<&str> = listed
+        .commands
+        .iter()
+        .map(|command| command.label.as_str())
+        .collect();
+    kept.sort_unstable();
+    assert_eq!(kept, ["a", "c", "e"]);
+    assert_eq!(
+        crate::launch_commands::read(controller.paths.state_dir())
+            .expect("the file reads")
+            .revision,
+        listed.revision.get(),
+        "the file is the list the host answers"
+    );
+}

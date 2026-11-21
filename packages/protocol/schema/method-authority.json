@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 201,
+  "method_count": 204,
   "methods": [
     {
       "capability": "none",
@@ -3221,6 +3221,102 @@
         "session"
       ],
       "summary": "Whether the root editor is at an empty prompt a launch can be installed in, how the asking connection stands to the session's input, the shell's name, and the agents the host has a package for.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "shell_launch",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "shell.launch.commands.list",
+      "name": "shell.launch.commands.list",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host"
+      ],
+      "summary": "The launch commands saved on this host, in the order they were first saved, and the revision of the list. A paired device that may manage the host reads the exact command lines, which can hold a secret.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "shell_launch",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "compare_and_swap": {
+          "against": "the revision of the saved launch commands the request was decided from"
+        }
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "shell.launch.commands.save",
+      "name": "shell.launch.commands.save",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host"
+      ],
+      "summary": "Save a launch command, or put it in place of the command with the same label. A request decided against a revision the list has left writes nothing and is answered with the list as it stands. The host refuses a command that breaks its rules. Only the local caller saves.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "shell_launch",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "compare_and_swap": {
+          "against": "the revision of the saved launch commands the request was decided from"
+        }
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "shell.launch.commands.remove",
+      "name": "shell.launch.commands.remove",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host"
+      ],
+      "summary": "Remove the launch command with a label. A request decided against a revision the list has left writes nothing and is answered with the list as it stands. Only the local caller removes.",
       "version": 1
     },
     {

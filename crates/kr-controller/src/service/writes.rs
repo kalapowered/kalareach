@@ -120,6 +120,13 @@ impl LocalWrite {
                 "asked again it answers that it lifted nothing, and it reads no record of the \
                  action",
             ),
+            Method::ShellLaunchCommandsSave | Method::ShellLaunchCommandsRemove => {
+                Self::Unrecorded(
+                    "a save or a removal names the revision it was made from and a stale one \
+                     writes nothing, so a repeat answers from the list and reads no record of the \
+                     action",
+                )
+            }
             Method::HostStop => Self::Unrecorded(
                 "asked again it finds the stop under way and is taken the same, and it reads no \
                  record of the action",

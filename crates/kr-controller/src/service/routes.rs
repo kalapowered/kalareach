@@ -22,16 +22,18 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// The local write methods this daemon performs itself that take no admission into a service:
 /// the environment record, the update handover, the setting up of backups, the person's deletion of
 /// a copy privacy mode lists, the person's confirmation of a policy the host found restored and the
-/// host's own sign-in and sign-out. Each asks the registration and the deadline again where its
-/// effect lands, after the waits that come first: the environment record in each write of it, the
-/// update handover immediately before it closes the gate, stops or resumes, the setting up of
-/// backups before each request that changes the storage service and in the transaction that records
-/// the setup, the deletion in the write that records it, the confirmation where it removes the
-/// record of the wait under that record's lock, and the sign-in and the sign-out before each change
-/// of the account, the sign-out's last ask under the account's hold. The sign-in's keep is another
-/// ask: it runs after the request has answered and its connection has ended, so it asks the fence
-/// this host owes and the local owner's membership lease, under the account's hold, immediately
-/// before it writes its grant.
+/// host's own sign-in and sign-out, and the owner's saving and removal of a launch command. Each
+/// asks the registration and the deadline again where its effect lands, after the waits that come
+/// first: the environment record in each write of it, the update handover immediately before it
+/// closes the gate, stops or resumes, the setting up of backups before each request that changes
+/// the storage service and in the transaction that records the setup, the deletion in the write
+/// that records it, the confirmation where it removes the record of the wait under that record's
+/// lock, the sign-in and the sign-out before each change of the account, the sign-out's last ask
+/// under the account's hold, and a launch command's saving and removal under the store's lock,
+/// immediately before the file is renamed into place. The sign-in's keep is another ask: it runs
+/// after the request has answered and its connection has ended, so it asks the fence this host
+/// owes and the local owner's membership lease, under the account's hold, immediately before it
+/// writes its grant.
 ///
 /// The fence check and the registration check run for each of them before it does anything. A
 /// method that takes an admission asks both inside the service that performs it, so this list is
@@ -39,7 +41,7 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// missing runs while the fence is owed. `every_local_write_in_the_method_table_has_one_route`
 /// walks the registry and fails for a local write that has no route, and for a method here that
 /// has none.
-pub(super) const NO_ADMISSION: [Method; 12] = [
+pub(super) const NO_ADMISSION: [Method; 14] = [
     Method::HostPolicyConfirm,
     Method::EnvironmentEnrol,
     Method::EnvironmentForget,
@@ -52,6 +54,8 @@ pub(super) const NO_ADMISSION: [Method; 12] = [
     Method::AccountSignOut,
     Method::AccountStorageSignIn,
     Method::AccountStorageSignOut,
+    Method::ShellLaunchCommandsSave,
+    Method::ShellLaunchCommandsRemove,
 ];
 
 impl Controller {
@@ -353,6 +357,7 @@ impl Controller {
             Method::DeviceList => self.device_list(&request.params).await,
             Method::DeliveryDestinationList => self.delivery_destination_list(&request.params),
             Method::OrganisationList => self.organisation_list().await,
+            Method::ShellLaunchCommandsList => self.launch_commands_list(),
             Method::PrivacyStatus => self.privacy_status().await,
             Method::AccountStatus => self.account_status(&request.params),
             Method::AccountStorageStatus => self.account_storage_status(&request.params),
@@ -1014,6 +1019,22 @@ impl Controller {
                     None => refused(window_passed()),
                 }
             }
+            // The owner at this machine saves or removes a launch command. The change names the
+            // revision of the list it was decided from: one against a revision the list has left
+            // writes nothing and is answered with the list as it stands, so a repeat can neither
+            // restore an earlier command nor delete a recreated one, and the daemon keeps no
+            // record of the action. The registration and the deadline are asked again under the
+            // store's lock, immediately before the file is renamed into place.
+            (
+                LocalWrite::Unrecorded(_),
+                Method::ShellLaunchCommandsSave | Method::ShellLaunchCommandsRemove,
+            ) => match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
+                Some(_) => unrecorded_write(
+                    request_id,
+                    self.launch_commands_write(mutation, method, carried).await,
+                ),
+                None => refused(window_passed()),
+            },
             // The person at this machine confirms the policy this host found restored, which ends
             // the wait that refuses every other grant. It changes no policy and no grant, so it
             // takes no admission, and the daemon keeps no record of the action: asked again it

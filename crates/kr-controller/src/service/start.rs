@@ -1329,6 +1329,10 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_the_environment_record_is_taken: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
+            after_the_launch_commands_are_locked: crate::attention::Pause::default(),
+            #[cfg(feature = "testing")]
+            inside_the_launch_commands_commit: crate::attention::Pause::default(),
+            #[cfg(feature = "testing")]
             after_the_environment_is_recorded: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
             environment_observer: std::sync::Mutex::new(None),

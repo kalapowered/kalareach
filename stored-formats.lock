@@ -383,6 +383,24 @@
     },
     {
       "entry": {
+        "store": "launch-commands",
+        "scope": "environment",
+        "path": "launch-commands.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "8e62469046e15a95a6d329c42e171daacdc2547d1d7f410570246d8deb1e13e0",
+      "kept": [
+        "Record, StoredLaunchCommand (crates/kr-controller/src/launch_commands.rs)"
+      ]
+    },
+    {
+      "entry": {
         "store": "machine-group",
         "scope": "environment",
         "path": "machine-group",

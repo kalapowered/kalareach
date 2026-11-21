@@ -234,6 +234,10 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::ShellLaunch
         | Method::ShellLaunchSurface => at(PROTOCOL, "The root integration"),
 
+        Method::ShellLaunchCommandsList
+        | Method::ShellLaunchCommandsSave
+        | Method::ShellLaunchCommandsRemove => at(PROTOCOL, "Saved launch commands"),
+
         Method::AgentCapabilities
         | Method::AgentSnapshot
         | Method::AgentCommands
