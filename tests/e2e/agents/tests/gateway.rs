@@ -2788,6 +2788,16 @@ fn new_rows<'a>(before: &[String], after: &'a [String]) -> Vec<&'a str> {
         .collect()
 }
 
+/// The first of the entry's start draft texts that `rows` show, where the agent's start is still a
+/// draft whose composer is not yet the one a prompt is typed at. `None` where the entry names no
+/// text or none shows.
+fn draft_showing<'t>(rows: &[String], draft: &'t [String]) -> Option<&'t str> {
+    draft
+        .iter()
+        .map(String::as_str)
+        .find(|text| rows.iter().any(|row| row.contains(text)))
+}
+
 /// Whether `row` is the composer's own row holding the typed `command`: the command with
 /// something of the composer's before it, its mark, once the frame and the spaces beside the row
 /// are taken off. A row of the list begins with the command.

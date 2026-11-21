@@ -1421,16 +1421,13 @@ fn the_old_shell_prompt_is_no_end_of_the_second_start_and_the_prompt_below_the_e
     );
 }
 
-/// The provisional line an agent draws beside its startup composer while a resume runs (Codex
-/// 0.155.1's `  Resuming session…`): a composer that shows beside it is the startup draft, which
-/// is drawn for a resume that ends read-only as it is for one that continues.
-const RESUMING: &str = "Resuming session…";
-
 /// How the second start stands on `rows`, or `None` while it stands nowhere yet. One of the texts
 /// the entry names for a refusal is a refusal, whether the process went on running or not (Codex
 /// shows a card, "This conversation is open in another app", in place of the composer and keeps
-/// the conversation read-only). The composer with the resume done is a running continuation; the
-/// composer beside [`RESUMING`] is the startup draft and says nothing yet. The shell's prompt
+/// the conversation read-only). The composer with the start done is a running continuation or
+/// fork; the composer beside one of the entry's draft texts (Codex's `Resuming session…` and
+/// `Forking session…`) is the startup draft, which is drawn for a start that ends read-only as
+/// for one that goes on, and says nothing yet. The shell's prompt
 /// below the typed line's echo is an end, and so is the end of the agent's own process, which
 /// needs no echo of the typed line: the echo wraps, scrolls off or is cleared, and the start is
 /// still over. The process's end comes after the card's words, which an agent that printed them
@@ -1440,6 +1437,7 @@ fn second_screen(
     typed: &str,
     composer: &str,
     refusals: &[String],
+    draft: &[String],
     agent_ended: bool,
 ) -> Option<(Started, Option<String>)> {
     if let Some(text) = refusals
@@ -1452,7 +1450,7 @@ fn second_screen(
         return Some((Started::Ended, None));
     }
     if rows.iter().any(|row| row.contains(composer)) {
-        return if rows.iter().any(|row| row.contains(RESUMING)) {
+        return if draft_showing(rows, draft).is_some() {
             None
         } else {
             Some((Started::Running, None))
@@ -1462,8 +1460,8 @@ fn second_screen(
 }
 
 /// The card that says the conversation is open in another app is a refusal where the entry names
-/// its words, the startup composer beside "Resuming session…" is no answer yet, and the composer
-/// with the resume done is a continuation.
+/// its words, the startup composer beside "Resuming session…" or "Forking session…" is no answer
+/// yet, and the composer with the start done is a continuation.
 #[test]
 fn a_card_is_a_refusal_the_startup_composer_is_no_answer_and_a_resumed_composer_is_a_continuation()
 {
@@ -1474,6 +1472,10 @@ fn a_card_is_a_refusal_the_startup_composer_is_no_answer_and_a_resumed_composer_
         "This conversation is open in another app".to_owned(),
         "Close it there and press R to continue here.".to_owned(),
     ];
+    let draft = [
+        "Resuming session…".to_owned(),
+        "Forking session…".to_owned(),
+    ];
     let card = screen(&[
         "kr-session$ codex resume 0123-4567",
         "> (kr1) Remember the code kr1.",
@@ -1481,20 +1483,30 @@ fn a_card_is_a_refusal_the_startup_composer_is_no_answer_and_a_resumed_composer_
         "  Close it there and press R to continue here.",
     ]);
     assert_eq!(
-        second_screen(&card, typed, composer, &refusals, false),
+        second_screen(&card, typed, composer, &refusals, &draft, false),
         Some((
             Started::Refused,
             Some("This conversation is open in another app".to_owned())
         ))
     );
-    let draft = screen(&[
+    let resume_draft = screen(&[
         "kr-session$ codex resume 0123-4567",
         "  Resuming session…",
         "> Ask Codex to do anything",
     ]);
     assert_eq!(
-        second_screen(&draft, typed, composer, &refusals, false),
+        second_screen(&resume_draft, typed, composer, &refusals, &draft, false),
         None
+    );
+    let fork_draft = screen(&[
+        "kr-session$ codex fork 0123-4567",
+        "  Forking session…",
+        "> Ask Codex to do anything",
+    ]);
+    assert_eq!(
+        second_screen(&fork_draft, typed, composer, &refusals, &draft, false),
+        None,
+        "the fork's startup composer, beside Forking session…, is no running fork"
     );
     let resumed = screen(&[
         "kr-session$ codex resume 0123-4567",
@@ -1502,7 +1514,7 @@ fn a_card_is_a_refusal_the_startup_composer_is_no_answer_and_a_resumed_composer_
         "> Ask Codex to do anything",
     ]);
     assert_eq!(
-        second_screen(&resumed, typed, composer, &refusals, false),
+        second_screen(&resumed, typed, composer, &refusals, &draft, false),
         Some((Started::Running, None))
     );
 }
@@ -1518,7 +1530,7 @@ fn a_start_whose_process_ended_is_an_end_whatever_the_screen_shows_of_the_typed_
     let composer = "Ask Codex to do anything";
     let refusals = ["This conversation is open in another app".to_owned()];
     let read =
-        |rows: &[String], ended: bool| second_screen(rows, typed, composer, &refusals, ended);
+        |rows: &[String], ended: bool| second_screen(rows, typed, composer, &refusals, &[], ended);
     let wrapped = screen(&[
         "kr-session$ codex resume 0123-",
         "4567",
@@ -1567,6 +1579,7 @@ fn second_start(
     typed: &str,
     composer: &str,
     refusals: &[String],
+    draft: &[String],
 ) -> (Started, Option<String>) {
     let worker =
         u32::try_from(ctx.run.worker_of(&at.session_id.to_string()).pid.get()).expect("a pid");
@@ -1580,7 +1593,7 @@ fn second_start(
         }
         let ended = agent.as_ref().is_some_and(|identity| !running(identity));
         let rows = at.person.window.screen();
-        if let Some(answer) = second_screen(&rows, typed, composer, refusals, ended) {
+        if let Some(answer) = second_screen(&rows, typed, composer, refusals, draft, ended) {
             return answer;
         }
         assert!(
@@ -1781,8 +1794,14 @@ fn second_process(
     real.checks_the_route(&ctx.run);
     let line = real.typed(&extra);
     b.person.types(&line);
-    let (started, refusal) =
-        second_start(ctx, &b, &line, &account.composer, &account.resume_refused);
+    let (started, refusal) = second_start(
+        ctx,
+        &b,
+        &line,
+        &account.composer,
+        &account.resume_refused,
+        &account.draft,
+    );
     let first_after = shown_now(ctx, &a);
     check_unchanged(Held::of(&shown_a), &first_after)
         .unwrap_or_else(|why| panic!("session A's instance and revision are as they were: {why}"));
