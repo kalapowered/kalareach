@@ -2019,7 +2019,7 @@ async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_is
                 .call("attention_read", well_formed_inbox_read())
                 .await
                 .expect("the owner's inbox is read");
-            if inbox["items"]
+            if support::inbox_of(&inbox)["items"]
                 .as_array()
                 .is_some_and(|items| !items.is_empty())
             {
@@ -2035,7 +2035,7 @@ async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_is
         .await
         .expect("a guest's inbox is read");
     assert_eq!(
-        inbox["items"],
+        support::inbox_of(&inbox)["items"],
         json!([]),
         "the host answers a guest with an inbox that has nothing in it: {inbox}"
     );

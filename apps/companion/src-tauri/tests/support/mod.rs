@@ -687,6 +687,16 @@ pub struct Companion {
     pub channels: Arc<Mutex<std::collections::BTreeMap<u32, Vec<serde_json::Value>>>>,
 }
 
+/// The inbox an `attention_read` answer carries: the answer is the owner's key and the host's result,
+/// and a superseded answer carries no result.
+pub fn inbox_of(reply: &serde_json::Value) -> &serde_json::Value {
+    assert!(
+        reply.get("key").is_some(),
+        "an answer carries its key: {reply}"
+    );
+    &reply["result"]
+}
+
 impl Companion {
     /// Starts the backend on `parts`, with its records under `data`, answering confirmations
     /// through `ceremony` and pasting through `paste`.
@@ -830,6 +840,7 @@ impl Companion {
                 companion_tauri::commands::attachment_upload_bytes,
                 companion_tauri::commands::host_info,
                 companion_tauri::commands::attention_read,
+                companion_tauri::commands::session_numbers,
                 companion_tauri::commands::review_read,
                 companion_tauri::commands::changeset_read,
                 companion_tauri::commands::device_list,

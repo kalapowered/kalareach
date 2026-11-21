@@ -414,7 +414,6 @@ fn system_clock() -> Clock {
 
 struct Record {
     /// Taken from the owner's counter: a new pairing with the same host is a new record.
-    #[allow(dead_code, reason = "the active reads and the visits check it")]
     generation: u64,
     pairing: Option<DeviceId>,
     reference: Option<String>,
@@ -425,6 +424,10 @@ struct Record {
     read: Option<Arc<StoredRead>>,
     /// The connection the last visit kept.
     visit: Option<Held<Arc<Connection>>>,
+    /// The order the reads that write contact began in.
+    active_serial: u64,
+    /// The serial of the newest of those reads whose outcome was applied.
+    active_applied: u64,
 }
 
 struct State {
@@ -506,6 +509,8 @@ impl State {
             inbox_epoch: epoch,
             read: None,
             visit: None,
+            active_serial: 0,
+            active_applied: 0,
         }
     }
 
@@ -652,6 +657,92 @@ impl State {
 // ---------------------------------------------------------------------------------------------
 // The owner.
 // ---------------------------------------------------------------------------------------------
+
+/// What an active read is, to the owner: one that writes what it learns of contact, or one that
+/// writes none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadKind {
+    /// The host's attention inbox: what it answers says how contact with the host stands.
+    Contact,
+    /// A read whose answer says nothing of contact.
+    Neutral,
+}
+
+/// The host in use when a read began, as the key names it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum KeyHost {
+    /// The host on this machine.
+    Local,
+    /// A host this device is paired with.
+    Paired {
+        /// What the page names the host by.
+        reference: String,
+    },
+}
+
+/// What the owner says an answer is valid under: the host in use when the read began (none when no
+/// host was in use), that host's epoch and the number of the connection the read went over. The page
+/// compares it with what it applied before it keeps the answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReadKey {
+    /// The host in use when the read began.
+    pub host: Option<KeyHost>,
+    /// That host's `inbox_epoch`, 0 when no host was in use.
+    pub epoch: u64,
+    /// The number of the connection the read went over.
+    pub link: u64,
+}
+
+/// What a read holds from the moment it began, to be checked when its outcome is applied. It holds
+/// the session the read went over, so the caller drops it after the call and not under the owner.
+pub struct Ticket {
+    choice: u64,
+    session: Arc<Session>,
+    generation: u64,
+    serial: u64,
+    kind: ReadKind,
+    key: ReadKey,
+}
+
+impl Ticket {
+    /// The session the read goes over.
+    #[must_use]
+    pub const fn session(&self) -> &Arc<Session> {
+        &self.session
+    }
+
+    /// What the read's answer is valid under.
+    #[must_use]
+    pub const fn key(&self) -> &ReadKey {
+        &self.key
+    }
+}
+
+/// What an active read came to, as the owner is told it.
+pub enum ReadOutcome {
+    /// The host answered the read, or answered it with a conflict that is itself an answer.
+    Answered,
+    /// The host refused the read, or the connection it went over.
+    Refused {
+        /// What the host said.
+        refusal: CommandError,
+        /// What it refused.
+        request: Asked,
+    },
+    /// The read says nothing of contact: a read that does not write it, or one that did not reach
+    /// the host, which a real end of the connection tells in its own way.
+    Nothing,
+}
+
+/// What the owner says of a read that has its answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Finish {
+    /// The read's authority held: the answer is valid under its key.
+    Finished,
+    /// The choice, the connection or the host's record the read began under has changed.
+    Superseded,
+}
 
 /// What an attempt that reached a host came to.
 pub enum Reach {
@@ -948,6 +1039,16 @@ impl ContactOwner {
                 if let Some(record) = state.hosts.get_mut(&key) {
                     record.inbox_epoch = epoch;
                     disposal.reads.extend(record.read.take());
+                    // A refusal of a read on the withdrawn connection is not one of the new.
+                    if matches!(
+                        record.contact,
+                        HostContact::Refused {
+                            request: Asked::AttentionRead,
+                            ..
+                        }
+                    ) {
+                        record.contact = HostContact::InContact;
+                    }
                 }
             }
             // This change is published as the next revision: link and the count both moved.
@@ -982,6 +1083,108 @@ impl ContactOwner {
             events: adoption.events.into_inner(),
             revision: adoption.revision,
         }
+    }
+
+    /// An active read begins. A contact read takes the next serial of the host in use.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HOST_NOT_CONFIGURED` when no connection is held.
+    pub fn read_started(&self, kind: ReadKind) -> Result<Ticket, CommandError> {
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        let session = state
+            .slot
+            .as_ref()
+            .map(|held| held.get().session())
+            .ok_or_else(CommandError::not_connected)?;
+        let in_use = state.in_use;
+        let (host, epoch, generation, serial) =
+            match in_use.and_then(|key| state.hosts.get_mut(&key).map(|record| (key, record))) {
+                Some((key, record)) => {
+                    let serial = if kind == ReadKind::Contact {
+                        record.active_serial += 1;
+                        record.active_serial
+                    } else {
+                        0
+                    };
+                    let host = match key {
+                        HostKey::Local => KeyHost::Local,
+                        HostKey::Paired(_) => KeyHost::Paired {
+                            reference: record.reference.clone().unwrap_or_default(),
+                        },
+                    };
+                    (Some(host), record.inbox_epoch, record.generation, serial)
+                }
+                None => (None, 0, 0, 0),
+            };
+        Ok(Ticket {
+            choice: state.choice,
+            session,
+            generation,
+            serial,
+            kind,
+            key: ReadKey {
+                host,
+                epoch,
+                link: state.link,
+            },
+        })
+    }
+
+    /// An active read has its answer. When the choice, the connection or the record it began under
+    /// has changed the read is superseded and writes nothing. Otherwise a contact read whose serial
+    /// is above every serial applied writes what it learned of contact, and an older one writes none
+    /// and is still answered; a neutral read writes none.
+    pub fn read_finished(&self, ticket: &Ticket, outcome: ReadOutcome) -> Applied<Finish> {
+        self.commit(|state, disposal| {
+            let key = state.in_use;
+            let generation = key
+                .and_then(|key| state.hosts.get(&key))
+                .map_or(0, |record| record.generation);
+            if state.choice != ticket.choice
+                || !state.holds(&ticket.session)
+                || generation != ticket.generation
+            {
+                return Finish::Superseded;
+            }
+            let Some(key) = key else {
+                return Finish::Finished;
+            };
+            let newest = ticket.kind == ReadKind::Contact
+                && state
+                    .hosts
+                    .get(&key)
+                    .is_some_and(|record| ticket.serial > record.active_applied);
+            if newest {
+                if let Some(record) = state.hosts.get_mut(&key) {
+                    record.active_applied = ticket.serial;
+                }
+                match outcome {
+                    ReadOutcome::Refused { refusal, request } => {
+                        state.apply(Outcome::Refused { refusal, request });
+                        if let Some(record) = state.hosts.get_mut(&key) {
+                            disposal.reads.extend(record.read.take());
+                        }
+                    }
+                    ReadOutcome::Answered => {
+                        if let Some(record) = state.hosts.get_mut(&key)
+                            && matches!(
+                                record.contact,
+                                HostContact::Refused {
+                                    request: Asked::AttentionRead,
+                                    ..
+                                }
+                            )
+                        {
+                            record.contact = HostContact::InContact;
+                        }
+                    }
+                    ReadOutcome::Nothing => {}
+                }
+            }
+            Finish::Finished
+        })
     }
 
     // The readers of the slot.
@@ -2364,5 +2567,133 @@ mod tests {
             drop(adopted);
         });
         assert_eq!(counted, 0, "E7b");
+    }
+
+    /// A paired host chosen and reached: its choice, its session and the flag that says it closed.
+    fn reaching_paired(owner: &ContactOwner, byte: u8) -> (u64, Arc<Session>) {
+        let choice = owner.choose(&paired(byte, byte + 1), "reaching").value;
+        let (held, _) = connection(byte);
+        let session = held.session();
+        assert!(matches!(
+            owner.reached(choice, None, held).value,
+            Reach::Reached
+        ));
+        (choice, session)
+    }
+
+    fn refused_read() -> ReadOutcome {
+        ReadOutcome::Refused {
+            refusal: CommandError::refused("the host will not show its inbox"),
+            request: Asked::AttentionRead,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_started_answers_not_connected_when_the_slot_is_empty() {
+        let owner = ContactOwner::new();
+        match owner.read_started(ReadKind::Contact) {
+            Err(error) => assert_eq!(error.code, kr_protocol::error::ErrorCode::HostNotConfigured),
+            Ok(_) => panic!("a read began with no connection held"),
+        }
+        let (_choice, _session, _) = reaching(&owner, 1);
+        assert!(owner.read_started(ReadKind::Neutral).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_read_finishes_only_with_its_choice_session_and_generation() {
+        let owner = ContactOwner::new();
+        let (_choice, first) = reaching_paired(&owner, 1);
+        let ticket = owner.read_started(ReadKind::Contact).expect("held");
+        assert_eq!(
+            ticket.key().host,
+            Some(KeyHost::Paired {
+                reference: "reference-1".to_owned()
+            })
+        );
+        assert_eq!(
+            owner.read_finished(&ticket, ReadOutcome::Answered).value,
+            Finish::Finished,
+            "nothing moved"
+        );
+
+        // The connection moved: a replacement holds the slot under the same choice and record.
+        let ticket = owner.read_started(ReadKind::Contact).expect("held");
+        let (second, _) = connection(2);
+        let events = second.session().events();
+        drop(owner.replaced(&first, second, events));
+        assert_eq!(
+            owner.read_finished(&ticket, ReadOutcome::Answered).value,
+            Finish::Superseded,
+            "the session moved"
+        );
+
+        // The choice moved, and with it the record's generation: the host is chosen again under
+        // another pairing.
+        let ticket = owner.read_started(ReadKind::Contact).expect("held");
+        let choice = owner.choose(&paired(1, 7), "again").value;
+        let (third, _) = connection(3);
+        assert!(matches!(
+            owner.reached(choice, None, third).value,
+            Reach::Reached
+        ));
+        assert_eq!(
+            owner.read_finished(&ticket, refused_read()).value,
+            Finish::Superseded,
+            "the choice and the generation moved"
+        );
+        assert_eq!(
+            owner.snapshot().contact,
+            HostContact::InContact,
+            "a superseded read writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_contact_read_writes_no_contact_and_answers_its_key() {
+        let owner = ContactOwner::new();
+        let (_choice, _session) = reaching_paired(&owner, 1);
+        let older = owner.read_started(ReadKind::Contact).expect("held");
+        let newer = owner.read_started(ReadKind::Contact).expect("held");
+        assert_eq!(
+            owner.read_finished(&newer, refused_read()).value,
+            Finish::Finished
+        );
+        let refused = owner.snapshot();
+        assert!(matches!(refused.contact, HostContact::Refused { .. }));
+        // The older read is answered with the key it began under, and it does not clear the
+        // refusal the newer one wrote.
+        assert_eq!(
+            owner.read_finished(&older, ReadOutcome::Answered).value,
+            Finish::Finished
+        );
+        assert_eq!(owner.snapshot().contact, refused.contact);
+        assert_ne!(
+            older.key().epoch,
+            refused.inbox_epoch,
+            "the refusal moved the epoch its older read began under"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_neutral_read_takes_no_serial() {
+        let owner = ContactOwner::new();
+        let (_choice, _session) = reaching_paired(&owner, 1);
+        let contact = owner.read_started(ReadKind::Contact).expect("held");
+        let neutral = owner.read_started(ReadKind::Neutral).expect("held");
+        // The neutral read answers first, as a list of the sessions does while the inbox is read.
+        assert_eq!(
+            owner.read_finished(&neutral, ReadOutcome::Nothing).value,
+            Finish::Finished
+        );
+        let before = owner.revision();
+        assert_eq!(owner.revision(), before, "a neutral read makes no event");
+        assert_eq!(
+            owner.read_finished(&contact, refused_read()).value,
+            Finish::Finished
+        );
+        assert!(
+            matches!(owner.snapshot().contact, HostContact::Refused { .. }),
+            "the contact read that began first still writes its refusal"
+        );
     }
 }

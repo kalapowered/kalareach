@@ -375,6 +375,15 @@ impl Host {
     }
 }
 
+/// The result an `attention_read` answer carries under the owner's key.
+fn inbox_of(reply: Value) -> Value {
+    assert!(
+        reply.get("key").is_some(),
+        "an answer carries its key: {reply}"
+    );
+    reply["result"].clone()
+}
+
 /// Reads an answer back into the method's own result type, which is what says the page was given a
 /// shape the protocol defines.
 fn typed<T: serde::de::DeserializeOwned>(answer: Value) -> T {
@@ -408,7 +417,7 @@ fn refused_by_the_host(refusal: &Value) -> bool {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_inbox_is_read_and_acknowledged_on_the_host() {
     let host = Host::start().await;
-    let inbox: kr_protocol::attention::AttentionReadResult = typed(
+    let inbox: kr_protocol::attention::AttentionReadResult = typed(inbox_of(
         host.call(
             "attention_read",
             json!({ "params": {
@@ -420,7 +429,7 @@ async fn the_inbox_is_read_and_acknowledged_on_the_host() {
         )
         .await
         .expect("the inbox"),
-    );
+    ));
     assert!(inbox.items.is_empty(), "a new host has nothing waiting");
     assert!(!inbox.more);
 

@@ -162,7 +162,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 70] = [
+const EXCEPTIONS: [Exception; 71] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -302,6 +302,13 @@ const EXCEPTIONS: [Exception; 70] = [
         needle: "Asked::Connection",
         lines: 2,
         reason: "the one classification of a connection that was not opened: the host's bound and this computer's budget are refusals of the connection in their own words; it reads no code",
+    },
+    Exception {
+        file: "commands.rs",
+        function: "is_a_conflict",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the conflict a host answers an inbox page with that continues after an item it no longer holds, answered on a connection that is open; it decides nothing about a connection that was not opened",
     },
     Exception {
         file: "inbox.rs",

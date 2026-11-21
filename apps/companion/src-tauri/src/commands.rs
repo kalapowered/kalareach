@@ -51,6 +51,9 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("setup_open_settings", None),
     // Sessions.
     ("session_list", Some(Method::SessionList)),
+    // The numbers of the host's sessions, which the page reads beside the inbox, under the key of the
+    // owner it answers under.
+    ("session_numbers", Some(Method::SessionList)),
     ("session_read", Some(Method::SessionRead)),
     ("session_create", Some(Method::SessionCreate)),
     ("session_close", Some(Method::SessionClose)),
@@ -629,6 +632,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         setup_identity,
         setup_open_settings,
         session_list,
+        session_numbers,
         session_read,
         session_create,
         session_close,
@@ -1921,18 +1925,96 @@ pub async fn session_agents(
     links.agents(&state, session_id, opening.as_deref()).await
 }
 
-/// Reads the attention inbox this computer's owner sees.
+/// Reads the attention inbox this computer's owner sees, under the key of the owner it answers
+/// under: `{ key, result }`, or `{ key, superseded: true }` when the choice, the connection or the
+/// host's record changed while the host was asked, which carries no data.
 ///
 /// The parameters are decoded before a host is asked for.
 #[tauri::command]
 pub async fn attention_read(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    use crate::connection::{Asked, Unopened};
+    use crate::contact::{ReadKind, ReadOutcome};
+
     let typed: kr_protocol::attention::AttentionReadParams = decode(params)?;
-    let session = state.session()?;
-    let answer: std::result::Result<kr_protocol::attention::AttentionReadResult, _> =
-        session.read(Method::AttentionRead, &typed).await;
+    let owner = state.contact_owner();
+    let ticket = owner.read_started(ReadKind::Contact)?;
+    let asked: std::result::Result<kr_protocol::attention::AttentionReadResult, _> =
+        ticket.session().read(Method::AttentionRead, &typed).await;
+    // A conflict of the host's is its answer to a page that is not the first, and the page reads
+    // again from the start: it is not a refusal.
+    let (outcome, answer) = match asked {
+        Ok(read) => (ReadOutcome::Answered, Ok(read)),
+        Err(error @ kr_client::ClientError::Host(_)) if is_a_conflict(&error) => {
+            (ReadOutcome::Answered, Err(CommandError::from(error)))
+        }
+        Err(error) => {
+            let unopened = Unopened::of_call(ticket.session(), Asked::AttentionRead, error);
+            let outcome = match &unopened {
+                Unopened::Refused(request, refusal) => ReadOutcome::Refused {
+                    refusal: refusal.clone(),
+                    request: *request,
+                },
+                _ => ReadOutcome::Nothing,
+            };
+            (outcome, Err(unopened.into_error()))
+        }
+    };
     #[cfg(feature = "testing")]
-    state.contact_owner().at_the_read("attention_read").await;
-    encode(&answer?)
+    owner.at_the_read("attention_read").await;
+    keyed(owner.read_finished(&ticket, outcome), &ticket, answer)
+}
+
+/// Whether a host's error is the conflict that answers a page the host does not hold.
+fn is_a_conflict(error: &kr_client::ClientError) -> bool {
+    matches!(
+        error,
+        kr_client::ClientError::Host(refusal)
+            if refusal.code == kr_protocol::error::ErrorCode::DraftConflict
+    )
+}
+
+/// Reads the numbers of the host's sessions, which the page names them by, under the key of the
+/// owner it answers under, as [`attention_read`] does. It takes no parameters and writes nothing of
+/// contact.
+#[tauri::command]
+pub async fn session_numbers(state: State<'_, AppState>) -> Result<Value> {
+    use crate::contact::{ReadKind, ReadOutcome};
+
+    let params: kr_protocol::session::SessionListParams =
+        decode(serde_json::json!({ "environment_id": null, "include_closed": false }))?;
+    let owner = state.contact_owner();
+    let ticket = owner.read_started(ReadKind::Neutral)?;
+    let answer: std::result::Result<kr_protocol::session::SessionListResult, _> =
+        ticket.session().read(Method::SessionList, &params).await;
+    #[cfg(feature = "testing")]
+    owner.at_the_read("session_numbers").await;
+    keyed(
+        owner.read_finished(&ticket, ReadOutcome::Nothing),
+        &ticket,
+        answer.map_err(CommandError::from),
+    )
+}
+
+/// What a read that was finished is answered with: its answer under its key, its error as it is, or
+/// that it was superseded. The owner's disposal is released here, outside its mutex, before the
+/// answer is built.
+fn keyed<T: Serialize>(
+    finished: crate::contact::Applied<crate::contact::Finish>,
+    ticket: &crate::contact::Ticket,
+    answer: Result<T>,
+) -> Result<Value> {
+    let crate::contact::Applied {
+        value, disposal, ..
+    } = finished;
+    drop(disposal);
+    match value {
+        crate::contact::Finish::Superseded => {
+            Ok(serde_json::json!({ "key": ticket.key(), "superseded": true }))
+        }
+        crate::contact::Finish::Finished => {
+            Ok(serde_json::json!({ "key": ticket.key(), "result": encode(&answer?)? }))
+        }
+    }
 }
 mutate_command!(
     /// Records that this computer's owner has seen attention items, each at the revision shown.
@@ -4088,6 +4170,7 @@ mod tests {
         "setup_identity",
         "setup_open_settings",
         "session_list",
+        "session_numbers",
         "session_read",
         "session_create",
         "session_describe",
@@ -4675,6 +4758,7 @@ mod tests {
             environment_capabilities,
             environment_capabilities_check,
             session_list,
+            session_numbers,
             session_read,
             session_create,
             session_close,
@@ -4747,9 +4831,8 @@ mod tests {
             }
             let expected = match *command {
                 // What a device holds takes no parameters, and the application is not connected.
-                "host_info" | "environment_list" | "description_setup" | "grant_held" => {
-                    "HOST_NOT_CONFIGURED"
-                }
+                "host_info" | "environment_list" | "description_setup" | "grant_held"
+                | "session_numbers" => "HOST_NOT_CONFIGURED",
                 "attachment_upload" => "PERMISSION_DENIED",
                 _ => "INVALID_ARGUMENT",
             };
