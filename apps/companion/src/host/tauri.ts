@@ -357,6 +357,7 @@ export function tauriPort(): HostPort {
   type KeyedReply<T> = { readonly key: ReadKey; readonly result: T } | { readonly key: ReadKey; readonly superseded: true }
   const keyed = async <T,>(reply: Promise<KeyedReply<T>>): Promise<Keyed<T>> => {
     const answered = await reply
+    // eslint-disable-next-line @typescript-eslint/only-throw-error -- a superseded read fails as data, as a command's failure does
     if ('superseded' in answered) throw supersededRead()
     return { key: answered.key, value: answered.result }
   }

@@ -67,6 +67,7 @@ async function followPages(
     if (last === undefined) break
     const next = await read(last.key)
     // A page read under another authority is not a page of this inbox.
+    // eslint-disable-next-line @typescript-eslint/only-throw-error -- a superseded read fails as data, as a command's failure does
     if (!sameKey(next.key, first.key)) throw supersededRead()
     page = next.value
     items.push(...page.items)
