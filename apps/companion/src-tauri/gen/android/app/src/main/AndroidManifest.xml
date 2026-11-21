@@ -26,11 +26,11 @@
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <!--
-      Package visibility, from Android 11 on: an application sees only the apps its own manifest
-      names, and some system apps. "Take a photo" is a file input with a capture hint, and the
-      WebView's file chooser (wry's RustWebChromeClient) opens the camera only after it finds an app
-      that answers this action. Without the entry, from Android 11 on, package visibility can hide
-      camera apps and make "Take a photo" open the photo picker.
+      Package visibility, from Android 11 on: an application sees the apps its own manifest names
+      and only a few others, such as some system apps. "Take a photo" is a file input with a capture
+      hint, and the WebView's file chooser (wry's RustWebChromeClient) opens the camera only after it
+      finds an app that answers this action. Without the entry, from Android 11 on, package
+      visibility can hide camera apps and make "Take a photo" open the photo picker.
     -->
     <queries>
         <intent>

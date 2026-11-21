@@ -196,10 +196,10 @@ export function problemsInAndroidManifest(facts, want) {
   if (!declaresSignInLink(facts.root)) {
     problems.push('the manifest does not declare the verified sign-in link https://reach.kala.to/app/oauth/callback in one intent filter')
   }
-  // Android 11 and later show an application only the apps its manifest names and some system apps,
-  // and the WebView's file chooser opens the camera only when it finds one that answers this action;
-  // without the entry, from Android 11 on, package visibility can hide camera apps and make
-  // 'Take a photo' open the photo picker.
+  // Android 11 and later show an application the apps its manifest names and only a few others, such
+  // as some system apps, and the WebView's file chooser opens the camera only when it finds one that
+  // answers this action; without the entry, from Android 11 on, package visibility can hide camera
+  // apps and make 'Take a photo' open the photo picker.
   if (!queriesAction(facts.root, IMAGE_CAPTURE_ACTION)) {
     problems.push(`the manifest does not query ${IMAGE_CAPTURE_ACTION} in a <queries> intent, so, from Android 11 on, package visibility can hide camera apps and make 'Take a photo' open the photo picker`)
   }
