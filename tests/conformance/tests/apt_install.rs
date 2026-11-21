@@ -440,56 +440,30 @@ impl Rig {
             .any(|call| call.split(' ').any(|word| word == argument))
     }
 
-    /// Whether the script's last call to `timeout` has `argument` among its words and `timeout`
-    /// cut it, with TERM or KILL.
-    fn last_call_was_cut(&self, argument: &str) -> bool {
-        let cut = self
-            .events()
-            .iter()
-            .rev()
-            .take_while(|event| !matches!(event, Event::Bound { .. }))
-            .any(|event| matches!(event, Event::Ended { cut: true, .. }));
-        cut && self
-            .lines("timeout.log")
-            .last()
-            .is_some_and(|call| call.split(' ').any(|word| word == argument))
-    }
-
     /// A run that the deadline ended, as a script on a machine that stalls ends it: with status 1,
-    /// and either its expiry message, after more than the deadline less 2 s (it stops when under 2
-    /// s are left, and counts whole seconds), or its refusal to plan the install after a plan that
-    /// `timeout` cut, which ends it at once. A stop sooner than that, or for any other reason, is
-    /// a script that did not use its time.
+    /// its expiry message, and after more than the deadline less 2 s (it stops when under 2 s are
+    /// left, and counts whole seconds). A stop sooner than that, or for any other reason, is a
+    /// script that did not use its time.
     fn assert_the_deadline_ended_the_run(&self, outcome: &Outcome, deadline: u32, context: &str) {
         let said = format!("{context}: {}{}", outcome.stdout, outcome.stderr);
         assert_eq!(outcome.status, 1, "{said}");
-        if outcome
-            .stderr
-            .contains("apt-install: apt cannot plan the install of: ")
-        {
-            assert!(
-                self.last_call_was_cut("--simulate"),
-                "the script could not plan, and its last call was not a plan that `timeout` cut: {said}"
-            );
-        } else {
-            assert!(
-                outcome.stderr.contains(&format!(
-                    "apt-install: failed: deadline={deadline}s attempts="
-                )),
-                "{said}"
-            );
-            assert!(
-                outcome.elapsed.as_secs_f64() > f64::from(deadline) - 2.0,
-                "the script stopped after {:?}, with time left: {said}",
-                outcome.elapsed
-            );
-        }
+        assert!(
+            outcome.stderr.contains(&format!(
+                "apt-install: failed: deadline={deadline}s attempts="
+            )),
+            "{said}"
+        );
+        assert!(
+            outcome.elapsed.as_secs_f64() > f64::from(deadline) - 2.0,
+            "the script stopped after {:?}, with time left: {said}",
+            outcome.elapsed
+        );
     }
 
-    /// A run that ended in success after `timeout` cut some of its calls: it ran the cut update or
-    /// download again, and the phases of the attempt that went through are the last ones. A cut
-    /// plan ends the script, so none was cut, and each attempt that failed is one that a cut call
-    /// ended. A run that cut nothing made its three bounded calls.
+    /// A run that ended in success after `timeout` cut some of its calls: it ran the cut update,
+    /// plan or download again, and the phases of the attempt that went through are the last ones.
+    /// Each attempt that failed is one that a cut call ended. A run that cut nothing made its three
+    /// bounded calls.
     fn assert_the_run_got_past_every_cut(&self, outcome: &Outcome, context: &str) {
         let said = format!("{context}: {}{}", outcome.stdout, outcome.stderr);
         assert_eq!(outcome.status, 0, "{said}");
@@ -834,6 +808,43 @@ fn a_long_deadline_kills_a_call_that_ignores_the_termination_signal() {
     assert!(!rig.phases().contains(&"install".to_owned()));
 }
 
+/// A plan that `timeout` cut is run again like a cut update or download: the update before it
+/// printed no warning, but a call that was cut says nothing about the packages, so the script does
+/// not take it for their fault and stop. The first plan hangs, `timeout` ends it at its term of 4
+/// or 5 s, and the retry starts again from the update.
+#[test]
+fn a_plan_that_timeout_cut_is_tried_again() {
+    let rig = Rig::new();
+    rig.plan("simulate", &["slow", "ok"]);
+    let outcome = rig.run(&["--deadline", "15", "tmux"]);
+    let said = format!("{}{}", outcome.stdout, outcome.stderr);
+    assert!(rig.called("--simulate"), "the script made no plan: {said}");
+    assert!(
+        !outcome.stderr.contains("apt cannot plan"),
+        "a plan that `timeout` cut ended the script: {said}"
+    );
+    assert_eq!(
+        failed_attempts(&outcome).first(),
+        Some(&124),
+        "the first attempt did not fail with the status of a cut: {said}"
+    );
+    let phases = rig.phases();
+    let first_plan = phases
+        .iter()
+        .position(|phase| phase == "simulate")
+        .expect("the first plan");
+    assert!(
+        phases[first_plan..].iter().any(|phase| phase == "update"),
+        "no update ran again after the plan that was cut: {phases:?}"
+    );
+    if outcome.status == 0 {
+        rig.assert_the_run_got_past_every_cut(&outcome, "a plan that was cut");
+    } else {
+        rig.assert_the_deadline_ended_the_run(&outcome, 15, "a plan that was cut");
+    }
+    rig.assert_inside_the_time_left(15, "a plan that was cut");
+}
+
 /// No call is bounded by less than 2 s (a bound of 0 is no limit to `timeout`) or by more than the
 /// time left, for every deadline the script accepts, and for a run in which an earlier phase has
 /// spent time, which leaves the later calls less than the whole deadline.
@@ -841,13 +852,11 @@ fn a_long_deadline_kills_a_call_that_ignores_the_termination_signal() {
 fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
     // On a machine that stalls, a call can be held past its term and cut by `timeout` (the term of
     // each call here is 1 s, or 2 s for a deadline of 12), and a deadline can run out before the
-    // script's last call, or before its first. The script then ends in one of three ways, each
+    // script's last call, or before its first. The script then ends in one of two ways, each
     // valid at every deadline of this sweep:
-    // - it runs the cut update or download again and ends in success, each attempt it reports
+    // - it runs the cut update, plan or download again and ends in success, each attempt it reports
     //   failed with the status 124 or 137 that a cut gives, and its last phases the update, the
     //   plan, the download and the install;
-    // - a plan that `timeout` cut ends it at once, with its refusal to plan the install: a plan
-    //   that fails after an update with no warning is taken for a fault of the packages;
     // - its deadline runs down, with its failure status and its expiry message, after more than the
     //   deadline less 2 s.
     // A stop sooner than that, or for another reason, is a script that did not use its time. The
