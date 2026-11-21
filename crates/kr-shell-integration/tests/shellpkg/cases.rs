@@ -260,6 +260,11 @@ impl Session {
         // this publishes a fence for, or asks about, a reader that has gone.
         entry.prompt_generation = acknowledgement.prompt_generation;
         entry.reader_revision = acknowledgement.reader_revision;
+        // The entry is the oldest the session has not yet taken, which is an earlier prompt's when
+        // a case has run lines of its own since. The directory and the buffer are the running
+        // reader's too, or a launch quoted from this entry is refused for the revisions it holds.
+        entry.cwd_revision = acknowledgement.cwd_revision;
+        entry.editor = acknowledgement.editor;
         let fence = fence_for(&entry, fence_id(index), attachment_id(1), epoch(4));
         self.publish(&fence);
         (entry, fence)
@@ -4130,6 +4135,24 @@ fn launch_vector_prints(
     prompt_seed: u8,
     transaction_seed: u8,
 ) {
+    assert!(
+        launch_vector_drew(session, vector, expected, prompt_seed, transaction_seed),
+        "the arguments that ran are not the arguments the caller named; wanted {expected}:\n{}",
+        session.terminal_output()
+    );
+}
+
+/// Installs `vector` through a launch, and says whether the terminal then showed `expected`.
+///
+/// A launch the reader refuses is a fault of the case, which is stopped there; whether the shell
+/// then drew what the vector should make it draw is left to the case to assert.
+fn launch_vector_drew(
+    session: &mut Session,
+    vector: Vec<String>,
+    expected: &str,
+    prompt_seed: u8,
+    transaction_seed: u8,
+) -> bool {
     let (enter, fence) = session.fenced_prompt(prompt_seed);
     let before_install = session.written();
     let decision = session.launched(LaunchMailboxRequest {
@@ -4153,13 +4176,9 @@ fn launch_vector_prints(
     session.expect_event("editor_leave", |event| {
         matches!(event, BridgeEvent::EditorLeave(_))
     });
-    assert!(
-        session
-            .drew_after(before_install, expected, REPLY)
-            .was_drawn(),
-        "the arguments that ran are not the arguments the caller named; wanted {expected}:\n{}",
-        session.terminal_output()
-    );
+    session
+        .drew_after(before_install, expected, REPLY)
+        .was_drawn()
 }
 
 /// KR-REQ-23.54: a launch is quoted for the shell that reads it and is never evaluated.
@@ -7139,12 +7158,17 @@ pub fn a_named_command_runs_in_the_shells_directory_and_is_found_on_the_shells_p
             let package = Package::built(kind);
             let (mut session, work) = session_with_a_probe_on_the_path(kind, &package);
             let expected = format!("kr-probe-dir=<{}> first=<two words>", told(&work));
-            launch_vector_prints(
-                &mut session,
-                vec!["kr-probe".to_owned(), "two words".to_owned()],
-                &expected,
-                22,
-                0x77,
+            assert!(
+                launch_vector_drew(
+                    &mut session,
+                    vec!["kr-probe".to_owned(), "two words".to_owned()],
+                    &expected,
+                    22,
+                    0x77,
+                ),
+                "the probe did not run in the shell's directory with its argument whole; wanted \
+                 {expected}:\n{}",
+                session.terminal_output()
             );
         },
     );
@@ -7174,12 +7198,16 @@ pub fn a_function_shadowing_the_program_runs_in_bash_zsh_and_fish(kind: ShellKin
                 "{}",
                 session.terminal_output()
             );
-            launch_vector_prints(
-                &mut session,
-                vec!["kr-probe".to_owned(), "x".to_owned()],
-                "function-ran",
-                23,
-                0x78,
+            assert!(
+                launch_vector_drew(
+                    &mut session,
+                    vec!["kr-probe".to_owned(), "x".to_owned()],
+                    "function-ran",
+                    23,
+                    0x78,
+                ),
+                "the function of the program's name did not run in its place:\n{}",
+                session.terminal_output()
             );
         },
     );
@@ -7205,12 +7233,16 @@ pub fn an_alias_never_stands_in_for_the_program_in_bash_and_zsh(kind: ShellKind)
                 session.terminal_output()
             );
             let expected = format!("kr-probe-dir=<{}> first=<x>", told(&work));
-            launch_vector_prints(
-                &mut session,
-                vec!["kr-probe".to_owned(), "x".to_owned()],
-                &expected,
-                24,
-                0x79,
+            assert!(
+                launch_vector_drew(
+                    &mut session,
+                    vec!["kr-probe".to_owned(), "x".to_owned()],
+                    &expected,
+                    24,
+                    0x79,
+                ),
+                "the probe on the path did not run in place of the alias; wanted {expected}:\n{}",
+                session.terminal_output()
             );
             assert!(
                 !session.terminal_output().contains("alias-ran"),
@@ -7236,12 +7268,16 @@ pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and
                 ShellKind::Fish => "Unknown command",
                 _ => "not found",
             };
-            launch_vector_prints(
-                &mut session,
-                vec!["kr-no-such-program".to_owned()],
-                message,
-                25,
-                0x7a,
+            assert!(
+                launch_vector_drew(
+                    &mut session,
+                    vec!["kr-no-such-program".to_owned()],
+                    message,
+                    25,
+                    0x7a,
+                ),
+                "the shell did not say {message:?} for a program it cannot find:\n{}",
+                session.terminal_output()
             );
             assert!(
                 session.answered("kr-still-here"),
