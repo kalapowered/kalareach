@@ -410,6 +410,29 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(screen.getByTestId('channel-message')).toBeVisible()
   })
 
+  it('K16 asks the host for no listing while the page is open until the first read of the drafts has answered', async () => {
+    const of = world()
+    keepMessage(of, { text: 'read after the drafts' })
+    let answer: () => void = () => undefined
+    const held = new Promise<void>((resolve) => {
+      answer = resolve
+    })
+    startOver(of, KEPT_PAGE, (port) => ({
+      ...port,
+      deviceDrafts: async () => {
+        await held
+        return port.deviceDrafts()
+      }
+    }))
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    })
+    expect(asked(of, 'list')).toBe(0)
+    answer()
+    expect(await screen.findByTestId('channel-message-text')).toHaveTextContent('read after the drafts')
+    expect(asked(of, 'list')).toBeGreaterThan(0)
+  })
+
   it('K6 reads every mix of drafts, messages, records and what could not be read (pure)', () => {
     const none = { ...NO_BOOK }
     const forms: readonly [string, ReturnType<typeof keptEntry>][] = [
@@ -568,6 +591,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     const of = world()
     const { port } = fakeHost({ drafts: of.drafts, channelMessages: of.messages })
     const store = new ChannelShelf(port)
+    store.after(Promise.resolve())
     of.messages.refuseListings({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
     const request = {
       actionId: '6a7b6c50-22bb-4c3d-8e4f-0000000000aa',

@@ -46,6 +46,19 @@ describe('the shelf of channel messages is read after the book’s first read of
     expect(of.messages.calls.filter((call) => call.kind === 'list' && call.withText === true)).toHaveLength(1)
   })
 
+  it('is made with the gate closed: a read asked for before any first read is named waits for it', async () => {
+    const of = world()
+    const shelf = new ChannelShelf(of.port)
+    void shelf.opened()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(listings(of.messages)).toBe(0)
+    shelf.after(Promise.resolve())
+    await vi.waitFor(() => {
+      expect(shelf.snapshot().status).toBe('ready')
+    })
+    expect(listings(of.messages)).toBe(1)
+  })
+
   it('reads once the first read has ended without success too', async () => {
     const of = world()
     const shelf = new ChannelShelf(of.port)
