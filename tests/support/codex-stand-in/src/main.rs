@@ -67,7 +67,11 @@ async fn main() {
         [] if variants.by_hand && !newer() => by_hand(None),
         // The pinned build, started by hand on a saved conversation: its own `resume` or `fork` and
         // the conversation's identifier. The stand-in saves none, so it only says what it was asked.
-        [word @ ("resume" | "fork"), id] if !newer() => by_hand(Some(format!("{word} {id}"))),
+        // As with a start by hand on nothing, the case says so in `STAND_IN`: a start that does not
+        // is one no gateway served, and ends on the last arm.
+        [word @ ("resume" | "fork"), id] if variants.by_hand && !newer() => {
+            by_hand(Some(format!("{word} {id}")))
+        }
         // The newer build, started as typed (a build outside the package's range is served no
         // gateway, so the shell runs it with nothing after its name): it says so and stays until
         // it is ended, which keeps its image and its place in the process table for a case to look
