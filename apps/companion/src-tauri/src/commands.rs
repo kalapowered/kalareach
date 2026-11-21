@@ -1923,7 +1923,7 @@ pub async fn draft_create(
                 "a draft on a paired host needs a session: open one first",
             ));
         };
-        let kept = state.paired_drafts().kept(&paired, session_id);
+        let kept = state.paired_drafts().kept(&paired, session_id)?;
         return Ok(Settled {
             receipt: None,
             action_id: None,

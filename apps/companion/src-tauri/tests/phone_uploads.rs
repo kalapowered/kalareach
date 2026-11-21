@@ -851,22 +851,95 @@ fn bind(
 }
 
 async fn kept(companion: &Companion, session: kr_protocol::ids::SessionId) -> Value {
-    let answer = companion
-        .call(
-            "draft_create",
-            json!({
-                "subject": on_session(session),
-                "params": {
-                    "environment_id": paired_of(companion).await.environment_id.to_string(),
-                    "device_id": null,
-                    "session_id": session.to_string(),
-                    "application_instance_id": null,
-                    "text": "",
-                },
-            }),
-        )
+    let answer = try_kept(companion, session)
+        .await
         .expect("the kept draft is read");
     answer["value"].clone()
+}
+
+/// The page's read of the draft kept for the session, or the refusal it gets.
+async fn try_kept(
+    companion: &Companion,
+    session: kr_protocol::ids::SessionId,
+) -> Result<Value, Value> {
+    companion.call(
+        "draft_create",
+        json!({
+            "subject": on_session(session),
+            "params": {
+                "environment_id": paired_of(companion).await.environment_id.to_string(),
+                "device_id": null,
+                "session_id": session.to_string(),
+                "application_instance_id": null,
+                "text": "",
+            },
+        }),
+    )
+}
+
+/// KR-REQ-23.41: a draft entry this device cannot read is a failed read the page receives, never no
+/// draft: a draft that may exist is not made again over, and an entry that is not there is no draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_stored_draft_that_cannot_be_read_is_a_failed_read_and_an_absent_one_is_no_draft()
+ {
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let paired = paired_of(companion).await;
+    let session = adopted.workers[0].session_id;
+
+    let none = try_kept(companion, session).await;
+    assert_eq!(
+        none.as_ref()
+            .ok()
+            .map(|answer| answer["value"]["made"].clone()),
+        Some(json!(false)),
+        "an entry that is not there is no draft: {none:?}"
+    );
+
+    drafts.keep_for_test(
+        &paired,
+        session,
+        &net_support::on_the_session(&adopted.host, session),
+        Some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid())),
+        Some(kr_protocol::ids::DraftRevision::new(1)),
+    );
+    let made = try_kept(companion, session).await;
+    assert_eq!(
+        made.as_ref()
+            .ok()
+            .map(|answer| answer["value"]["made"].clone()),
+        Some(json!(true)),
+        "the draft is read: {made:?}"
+    );
+
+    // The entry is damaged, as a write that was cut short leaves it.
+    let entries: Vec<_> = std::fs::read_dir(folder(&phone))
+        .expect("the folder")
+        .flatten()
+        .map(|item| item.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "draft"))
+        .collect();
+    assert_eq!(entries.len(), 1);
+    std::fs::write(&entries[0], b"{ not a draft").expect("the entry is damaged");
+    let failed = try_kept(companion, session).await;
+    assert_eq!(
+        failed
+            .as_ref()
+            .err()
+            .map(|refusal| refusal["message"].clone()),
+        Some(json!(companion_tauri::paired_drafts::NEWER_DRAFT)),
+        "an entry that cannot be read is a failed read: {failed:?}"
+    );
+    assert!(
+        drafts.kept(&paired, session).is_err(),
+        "the same for the native read"
+    );
+    adopted.stop().await;
 }
 
 /// KR-REQ-23.41: a device makes its draft at the first bind and never before, one for each session,
@@ -2682,7 +2755,10 @@ async fn kr_req_13_12_another_accounts_entries_are_neither_shown_nor_acted_on() 
         desk.open(&left.newer.who()).is_empty(),
         "an organisation host with no account signed in shows nothing"
     );
-    assert!(!drafts.kept(&now, session).made, "no draft is read");
+    assert!(
+        !drafts.kept(&now, session).expect("the draft is read").made,
+        "no draft is read"
+    );
     // A cancel finds no upload and records no key, for a held upload and for a kept entry.
     for key in [left.live_key, left.entry_key] {
         let refused = desk
@@ -2714,7 +2790,10 @@ async fn kr_req_13_12_another_accounts_entries_are_neither_shown_nor_acted_on() 
         "the paused upload was not ended"
     );
     assert!(
-        drafts.kept(&earlier, session).made,
+        drafts
+            .kept(&earlier, session)
+            .expect("the draft is read")
+            .made,
         "the earlier account's draft is still its own"
     );
     adopted.stop().await;
@@ -2764,7 +2843,13 @@ async fn kr_req_13_12_an_account_sees_its_own_entries_and_drafts_again_when_it_s
         .expect("the task ran")
         .expect("the upload is published");
     assert_eq!(handle.byte_len.get(), pattern(5).len() as u64);
-    assert!(drafts.kept(&again, session).made, "the draft is read again");
+    assert!(
+        drafts
+            .kept(&again, session)
+            .expect("the draft is read")
+            .made,
+        "the draft is read again"
+    );
     assert!(
         desk.open(&again.who())
             .iter()
@@ -3087,12 +3172,18 @@ async fn kr_req_23_41_a_draft_creation_refused_for_the_devices_count_discards_th
     );
     for session in &sessions {
         assert!(
-            !drafts.kept(&earlier, *session).made,
+            !drafts
+                .kept(&earlier, *session)
+                .expect("the draft is read")
+                .made,
             "the earlier account's entry went with the host's answer"
         );
     }
     assert!(
-        drafts.kept(&now, sessions[0]).made,
+        drafts
+            .kept(&now, sessions[0])
+            .expect("the draft is read")
+            .made,
         "the new account's draft is its own"
     );
     assert_eq!(

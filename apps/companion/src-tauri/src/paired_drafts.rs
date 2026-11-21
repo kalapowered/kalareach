@@ -511,22 +511,28 @@ impl Drafts {
         }
     }
 
-    /// The draft kept for `session_id`.
-    #[must_use]
-    pub fn kept(&self, paired: &Paired, session_id: SessionId) -> KeptView {
-        match self.read(paired, session_id) {
-            Ok(Read::Entry(file)) if file.draft_id.is_some() => KeptView {
+    /// The draft kept for `session_id`: none when this device keeps none for the session.
+    ///
+    /// # Errors
+    ///
+    /// The refusal [`NEWER_DRAFT`] when the entry is there and cannot be read, because it was
+    /// written by another release or is damaged: a draft this device may hold is never taken for
+    /// none, so the page does not make a second one over it.
+    pub fn kept(&self, paired: &Paired, session_id: SessionId) -> Result<KeptView> {
+        let none = KeptView {
+            made: false,
+            draft_id: None,
+            revision: None,
+            attachments: Vec::new(),
+        };
+        match self.entry(paired, session_id)? {
+            Some(file) if file.draft_id.is_some() => Ok(KeptView {
                 made: true,
                 draft_id: file.draft_id,
                 revision: file.revision,
                 attachments: file.attachments,
-            },
-            _ => KeptView {
-                made: false,
-                draft_id: None,
-                revision: None,
-                attachments: Vec::new(),
-            },
+            }),
+            _ => Ok(none),
         }
     }
 
