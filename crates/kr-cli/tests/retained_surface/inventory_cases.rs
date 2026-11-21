@@ -1534,6 +1534,7 @@ fn a_raw_identifier_is_the_name_it_stands_for_in_every_rule_that_reads_a_name() 
     for import in [
         "use kr_protocol::r#MutationRequest as Request;",
         "use kr_protocol::MutationRequest as r#Request;",
+        "use kr_protocol::something as r#Method;",
         "use kr_protocol::r#Method as M;",
         "extern crate r#kr_protocol as r#Method;",
     ] {
@@ -1585,14 +1586,15 @@ fn a_raw_identifier_is_the_name_it_stands_for_in_every_rule_that_reads_a_name() 
         matches!(&scan, Err(text) if text.contains("macro_rules! inner in the tokens of m!")),
         "{scan:?}"
     );
-    // R3: a raw call of a macro the crate defines is the crate's own.
-    assert_eq!(
-        read_names(
-            "macro_rules! mine { () => {}; }\nr#mine!();\nmod x { r#mine!(); }\n",
-            &[]
-        ),
-        Ok(Vec::<String>::new())
-    );
+    // R3: a raw call of a macro the crate defines is the crate's own, a raw definition is called by its
+    // plain name, and so is one called in a transcriber.
+    for lib in [
+        "macro_rules! mine { () => {}; }\nr#mine!();\nmod x { r#mine!(); }\n",
+        "macro_rules! r#mine { () => {}; }\nmine!();\n",
+        "macro_rules! mine { () => {}; }\nmacro_rules! other { () => { r#mine!(); }; }\n",
+    ] {
+        assert_eq!(read_names(lib, &[]), Ok(Vec::<String>::new()), "{lib}");
+    }
 }
 
 #[test]
