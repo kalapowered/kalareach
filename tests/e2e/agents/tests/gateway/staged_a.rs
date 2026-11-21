@@ -635,3 +635,93 @@ fn a_presentation_action_that_is_refused_or_an_upstream_one_that_is_admitted_fai
     assert!(all_refused(&refused).is_ok());
     assert!(all_refused(&admitted).is_err());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Part 5a: a daemon's crash leaves the agent and its terminal running (stand-in arm only).
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-12.32, case 5, part 5a (KR-REQ-12.10): killing the control daemon leaves the agent's
+/// execution and its local terminal running, the local terminal still drives the agent, and a
+/// daemon started again on the same host serves the session to the device, which sees the same
+/// instance at the same revision. The control ends the agent, and the same check then fails.
+///
+/// The stand-in route only: a live agent can write the state a restarted daemon reads, which this
+/// harness does not guard, so the part's result names its arm (`"arm": "stand-in only"`).
+#[test]
+fn gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running() {
+    const TEST: &str =
+        "gateway_a_control_daemon_crash_leaves_the_agent_and_its_local_terminal_running";
+    by_hand_case("5a", TEST, Setup::default(), |ctx, session| {
+        assert!(
+            matches!(ctx.route, Route::StandIn),
+            "the daemon-crash part runs on the stand-in route only"
+        );
+        let session_id = session.session_id();
+        let agent = HandAgent::starts(ctx, session);
+        let shown = detects(ctx, &session.remote, session_id);
+        let held = Held::of(&shown).expect("the agent is detected with a binding");
+        let survives = |what: &str| {
+            agent.runs().unwrap_or_else(|why| panic!("{what}: {why}"));
+        };
+        // Only the daemon is killed. The agent and its terminal go on, and the local terminal
+        // drives the agent with no daemon to carry what it writes.
+        session.host.kill_daemon();
+        survives("the daemon's crash left the rest");
+        let (input, shows) = harmless(ctx);
+        session.person.window.type_text(input.as_bytes());
+        let _ = session.person.sees(
+            &shows,
+            "the local terminal drives the agent without a daemon",
+        );
+        // A daemon is started again, and the device connects to it; nothing runs `kr`.
+        let remote = restarts_the_daemon(ctx, session);
+        let served = ctx.instances_within(
+            &remote,
+            session_id,
+            "the restarted daemon serves the instance",
+            |read| !read.agent_instances.instances.is_empty(),
+        );
+        assert!(served.is_ok(), "the restarted daemon serves: {served:?}");
+        survives("after the restart");
+        // The worker's view of the agent outlives the daemon: the same instance at the same
+        // revision, and still only observation and the terminal.
+        let restarted = shown_now(ctx, &remote, session_id);
+        check_unchanged(Some(held), &restarted)
+            .unwrap_or_else(|why| panic!("across the daemon's crash and restart: {why}"));
+        let (offered, _) = surface(ctx, session, &remote, session_id, &restarted);
+        check_observation_only(&offered)
+            .unwrap_or_else(|why| panic!("after the restart, only observation: {why}"));
+        // The control: the property broken on purpose. The agent is ended, and the same check has
+        // to say so.
+        agent.ends();
+        let control = agent.runs();
+        assert!(
+            control.is_err(),
+            "the survival check fails once the agent has ended"
+        );
+        serde_json::json!({
+            "arm": "stand-in only",
+            "route": arm(ctx),
+            "agent_processes": ["the worker", "the agent"],
+            "local_terminal_input": shows,
+            "detection": shown.detection.evidence(),
+            "after_restart": { "detection": restarted.detection.evidence(), "surface": offered.evidence() },
+            "control": { "what": "the agent ended by its recorded identity", "breaks_property": true, "check": control.err() },
+        })
+    });
+}
+
+/// The check that the agent survived fails for a process that ended, and holds for one that runs.
+#[test]
+fn the_survival_check_of_5a_fails_for_a_process_that_ended() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("a process to watch");
+    let identity = kr_ipc::identity::process_start_identity(child.id()).expect("its identity");
+    assert!(all_run(&[("the sleeper", &identity)]).is_ok());
+    child.kill().expect("the process is killed");
+    child.wait().expect("the process is reaped");
+    let failed = all_run(&[("the sleeper", &identity)]);
+    assert!(failed.is_err_and(|why| why.contains("the sleeper")));
+}
