@@ -74,11 +74,7 @@ impl Drop for Host {
 /// Carries one connection between `kr` and the daemon in both directions, and cuts it, both ways,
 /// at the first thing the daemon sends after the file of saved commands changed: the change is on
 /// disk, and its reply never reaches `kr`.
-async fn carry(
-    client: tokio::net::UnixStream,
-    daemon: &Path,
-    file: &Path,
-) -> std::io::Result<()> {
+async fn carry(client: tokio::net::UnixStream, daemon: &Path, file: &Path) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let server = tokio::net::UnixStream::connect(daemon).await?;
@@ -165,7 +161,8 @@ impl Host {
 
             let daemon = Endpoint::from_path(endpoint.as_path().with_file_name("daemon.sock"))
                 .expect("an endpoint");
-            let front = tokio::net::UnixListener::bind(endpoint.as_path()).expect("the relay binds");
+            let front =
+                tokio::net::UnixListener::bind(endpoint.as_path()).expect("the relay binds");
             std::fs::set_permissions(endpoint.as_path(), std::fs::Permissions::from_mode(0o600))
                 .expect("an owner-only relay");
             let relay = tokio::spawn(relay(front, daemon.as_path().to_path_buf(), file));
@@ -721,7 +718,9 @@ async fn a_change_the_host_could_not_write_is_not_told_as_an_unreadable_file_and
     for (status, text, said) in [adds, removes] {
         assert_eq!(status, Some(8), "{text}{said}");
         assert!(
-            said.contains("The host could not save the change. Run kr launch list to check the current list."),
+            said.contains(
+                "The host could not save the change. Run kr launch list to check the current list."
+            ),
             "{said}"
         );
         assert!(
@@ -760,7 +759,11 @@ async fn a_revision_is_written_as_the_protocols_decimal_string_in_every_document
     assert_eq!(listed["revision"], revision_in_the_file(&host), "{listed}");
     let (status, removed) = host.json(&["launch", "remove", "Claude"]);
     assert_eq!(status, Some(0), "{removed}");
-    assert_eq!(removed["revision"], revision_in_the_file(&host), "{removed}");
+    assert_eq!(
+        removed["revision"],
+        revision_in_the_file(&host),
+        "{removed}"
+    );
     assert!(removed["revision"].is_string(), "{removed}");
 }
 
@@ -792,5 +795,9 @@ async fn a_reply_lost_after_the_host_saved_the_change_is_an_unconfirmed_outcome_
             .is_some_and(|message| message.ends_with(unconfirmed)),
         "{document}"
     );
-    assert_eq!(labels(&host.listed()), Vec::<String>::new(), "the removal was saved");
+    assert_eq!(
+        labels(&host.listed()),
+        Vec::<String>::new(),
+        "the removal was saved"
+    );
 }
