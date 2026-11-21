@@ -447,6 +447,43 @@ describe('the Settings form for the saved commands', () => {
     expect(screen.queryByTestId('launch-commands-conflict')).toBeNull()
   })
 
+  it('holds the form still while a save waits, so an edit made in the meantime is not lost', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    let answer: () => void = () => undefined
+    const slow: HostPort = {
+      ...port,
+      launchCommandSave: (params) =>
+        new Promise((resolve) => {
+          answer = () => {
+            void port.launchCommandSave(params).then(resolve)
+          }
+        })
+    }
+    settings(slow)
+    await person.type(await screen.findByTestId('launch-commands-name'), 'New')
+    await person.type(screen.getByTestId('launch-commands-program'), 'new')
+    await person.click(screen.getByTestId('launch-commands-add-argument'))
+    await person.click(screen.getByTestId('launch-commands-save'))
+
+    // While the save waits nothing in the form can be edited, so the draft that is cleared when the
+    // host answers is the draft that was sent.
+    expect(screen.getByTestId('launch-commands-name')).toBeDisabled()
+    expect(screen.getByTestId('launch-commands-program')).toBeDisabled()
+    expect(screen.getByTestId('launch-commands-argument')).toBeDisabled()
+    expect(screen.getByTestId('launch-commands-add-argument')).toBeDisabled()
+    expect(screen.getByTestId('launch-commands-remove-argument')).toBeDisabled()
+
+    await act(async () => {
+      answer()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('launch-commands-name')).toBeEnabled()
+    })
+    expect(screen.getByTestId('launch-commands-name')).toHaveValue('')
+  })
+
   it('says so when the host cannot confirm a save, and reads the list again', async () => {
     const person = userEvent.setup()
     const { port, controls } = fakeHost()

@@ -279,6 +279,7 @@ export function LaunchCommands({
             id={nameId}
             data-testid="launch-commands-name"
             value={draft.label}
+            disabled={busy}
             autoCapitalize="off"
             autoCorrect="off"
             spellCheck={false}
@@ -291,6 +292,7 @@ export function LaunchCommands({
             id={programId}
             data-testid="launch-commands-program"
             value={draft.program}
+            disabled={busy}
             autoCapitalize="off"
             autoCorrect="off"
             spellCheck={false}
@@ -307,6 +309,7 @@ export function LaunchCommands({
                   data-index={index}
                   aria-label={`Argument ${index + 1}`}
                   value={argument}
+                  disabled={busy}
                   autoCapitalize="off"
                   autoCorrect="off"
                   spellCheck={false}
@@ -322,6 +325,7 @@ export function LaunchCommands({
                 <Button
                   data-testid="launch-commands-remove-argument"
                   aria-label={`Remove argument ${index + 1}`}
+                  disabled={busy}
                   onClick={() => {
                     edit({
                       ...draft,
@@ -335,6 +339,7 @@ export function LaunchCommands({
             ))}
             <Button
               data-testid="launch-commands-add-argument"
+              disabled={busy}
               onClick={() => {
                 edit({ ...draft, arguments: [...draft.arguments, ''] })
               }}
