@@ -32,6 +32,8 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::scalars::Nonce256;
 
 use super::{Host, Setup, Updated, previous, start_agent, terminal_for};
+#[cfg(target_os = "linux")]
+use super::{end_program, host_info_of, install_plugin, teardown};
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -267,6 +269,109 @@ async fn the_frames_of_the_plugin_host_of_the_release_before_are_read_and_writte
             serde_json::to_string_pretty(&record).expect("a record")
         );
     }
+}
+
+/// The longest this case watches the daemon after the worker has asked for the plugin runtime: past
+/// the thirty seconds the launcher of the release before waits for a host to report itself.
+#[cfg(target_os = "linux")]
+const WATCH: Duration = Duration::from_secs(45);
+
+/// A plugin host of this build, started by the daemon of the release before in a layout that has no
+/// store, whose endpoint has a file on it, does not hang the daemon: the host sends the frame that
+/// says why it could not start, the launcher of the release before keeps a frame it does not know
+/// as a refusal, and the pair ends as it did before the frame existed. No host is published, the
+/// daemon goes on serving, and the session's worker is the one it was.
+///
+/// The daemon is the release before's real one, started with `--worker` naming a folder that holds
+/// the release before's worker and this build's `kr-plugin-host`, which the daemon takes from beside
+/// the worker; a daemon of an installed release refuses `--worker`, so the layout has no store. No
+/// service manager is reachable: run by name on Linux as
+/// `env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test
+/// upgrade -- --nocapture --ignored --exact
+/// plugin_host_frames::a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_it_serving`,
+/// after `cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "run by name on Linux with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS removed from the environment"]
+async fn a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_it_serving() {
+    for variable in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        assert!(
+            std::env::var_os(variable).is_none(),
+            "{variable} is set: run this case by name with \
+             `env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS`"
+        );
+    }
+    let before = previous();
+    let mut host = Host::bare_in(teardown::Tree::create().without_service_manager());
+    let environment = host.tree.environment();
+    environment.create().expect("the environment's directories");
+    install_plugin(&host).await;
+
+    // The release before's programs, with this build's plugin host beside its worker.
+    let programs = host.scratch("the-release-before");
+    for (name, path, ..) in before.programs {
+        if *name != "kr-plugin-host" {
+            kr_ipc::testing::place_program(path, &programs.join(name));
+        }
+    }
+    let this_builds_host = std::env::current_exe()
+        .expect("this test's path")
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("the directory the programs are built in")
+        .join("kr-plugin-host");
+    assert!(
+        this_builds_host.is_file(),
+        "{} is not built; run `cargo build --locked -p kr-plugin-host` first",
+        this_builds_host.display()
+    );
+    kr_ipc::testing::place_program(&this_builds_host, &programs.join("kr-plugin-host"));
+
+    // A file where the plugin host binds.
+    let endpoint = launcher::host_endpoint(&environment, &HostProtocol::THIS).expect("an endpoint");
+    std::fs::write(endpoint.as_path(), b"").expect("a file where the plugin host binds");
+
+    let mut arguments = host.daemon_arguments();
+    arguments.push("--worker".to_owned());
+    arguments.push(programs.join("kr-worker").display().to_string());
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let command = host.command(&programs.join("kr-controller"), &arguments);
+    host.start_daemon_as(command).await;
+
+    let kr = programs.join("kr");
+    let (display, session_id) = host.new_session(&kr);
+    let worker = host.worker_process(session_id);
+    let agent = host.plugin_agent();
+    let terminal = terminal_for(&host, &kr, &["attach", &display]);
+    terminal.ready().await;
+    let program = start_agent(&host, &terminal, &agent).await;
+
+    // The worker has asked for the plugin runtime by now. The daemon keeps serving through the
+    // launcher's whole wait, no host is published, and the worker is the process it was.
+    let began = std::time::Instant::now();
+    while began.elapsed() < WATCH {
+        assert_eq!(
+            host.plugin_host(),
+            None,
+            "no plugin host is published beside a file at its endpoint"
+        );
+        assert_eq!(
+            host_info_of(&host).await.environment_id,
+            host.tree.environment_id(),
+            "the daemon still serves a status request"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        host.worker_process(session_id),
+        worker,
+        "the session's worker is the process it was"
+    );
+    assert!(
+        endpoint.as_path().is_file(),
+        "and the file kr did not make is where it was"
+    );
+    end_program(&program);
 }
 
 /// The nil identifier's text.
