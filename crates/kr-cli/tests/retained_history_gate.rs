@@ -12,11 +12,15 @@
 //!   neither the protocol, the worker nor the controller (the head's search leaves out the protocol
 //!   and the worker only).
 //! * The oracle lexes each product file itself and finds the sender names the plan lists (the six
-//!   variant names, the six wire names, `MutationRequest {` and `ActionTarget {`), in the files that a
-//!   module walk with rustc's two file rules and `#[path]` strings reaches from each target, outside
-//!   the places whose `cfg` is false with `test` false and every other atom unknown. It reads the
-//!   attributes that are not documentation, and leaves out `ActionRight ::` before a name and the
-//!   header of an `impl`. Each hit must lie inside the lines of a listed sighting.
+//!   variant names, the six wire names, `MutationRequest {` and `ActionTarget {`, and either type
+//!   name anywhere in the group of a macro call), in the files that a module walk with rustc's two
+//!   file rules and `#[path]` strings reaches from each target, outside the places whose `cfg` is
+//!   false with `test` false and every other atom unknown. It reads the attributes that are not
+//!   documentation, inner ones too, and leaves out `ActionRight ::` before a name and the brace form
+//!   in an `impl` header (from `impl` to its `{`). It is a token search of its own: the forms it
+//!   reads by their tokens are the attributes, the place an attribute with a false `cfg` ends
+//!   (an item, a list element, an arm), the `impl` header, the macro call and the module
+//!   declaration with its `#[path]`. Each hit must lie inside the lines of a listed sighting.
 //! * The sightings of every tag are kept in `retained_history_record.txt` beside this file: a change
 //!   to the result at an old tag fails until the record changes with it.
 
@@ -651,6 +655,99 @@ fn normal(path: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
+/// The words that begin an item (after its visibility) rather than a field, a variant, a match arm or
+/// an expression: `unsafe`, `extern` and the block-like keywords end at their first group, as an item
+/// does.
+const ITEM_WORDS: [&str; 19] = [
+    "fn",
+    "struct",
+    "enum",
+    "union",
+    "trait",
+    "impl",
+    "use",
+    "static",
+    "type",
+    "mod",
+    "const",
+    "unsafe",
+    "extern",
+    "macro_rules",
+    "if",
+    "match",
+    "for",
+    "while",
+    "loop",
+];
+
+/// Whether the group that opens at `at` is the `(crate)`, `(self)`, `(super)` or `(in path)` of a
+/// visibility, and not the type of a tuple field after `pub`.
+fn visibility_group(tokens: &[Token], at: usize) -> bool {
+    matches!(tokens.get(at).map(|t| &t.tok), Some(Tok::Open('(')))
+        && matches!(
+            tokens.get(at + 1).map(|t| &t.tok),
+            Some(Tok::Ident(word)) if matches!(word.as_str(), "crate" | "self" | "super" | "in")
+        )
+}
+
+/// Whether the place that the attributes before `start` sit on is an item: a visibility and then one
+/// of [`ITEM_WORDS`] that no `:` follows (a field may be named `union`). Otherwise it is an element of
+/// a list (a field, a variant, a match arm) or a statement.
+fn begins_item(tokens: &[Token], start: usize) -> bool {
+    let mut at = start;
+    if matches!(tokens.get(at).map(|t| &t.tok), Some(Tok::Ident(word)) if word == "pub") {
+        at += 1;
+        if visibility_group(tokens, at) {
+            at = closing(tokens, at).map_or(tokens.len(), |close| close + 1);
+        }
+    }
+    match tokens.get(at).map(|t| &t.tok) {
+        Some(Tok::Open('{')) => true,
+        Some(Tok::Ident(word)) if ITEM_WORDS.contains(&word.as_str()) => {
+            !matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Punct(':')))
+        }
+        _ => false,
+    }
+}
+
+/// The end of the place that begins at `start`, after attributes whose `cfg` is false: an item ends at
+/// its `;` or its first `{..}` group; any other element of a list ends after its `,` or `;` at its own
+/// level, after the block that follows a `=>`, or where the group that holds it closes.
+fn skip_place(tokens: &[Token], start: usize) -> usize {
+    if begins_item(tokens, start) {
+        return skip_item(tokens, start);
+    }
+    let mut depth = 0usize;
+    let mut at = start;
+    while at < tokens.len() {
+        match tokens[at].tok {
+            Tok::Open(_) => depth += 1,
+            Tok::Close(_) => {
+                if depth == 0 {
+                    return at;
+                }
+                depth -= 1;
+            }
+            Tok::Punct(',' | ';') if depth == 0 => return at + 1,
+            Tok::Punct('=')
+                if depth == 0
+                    && matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Punct('>')))
+                    && matches!(tokens.get(at + 2).map(|t| &t.tok), Some(Tok::Open('{'))) =>
+            {
+                // An arm whose body is a block ends with the block, comma or none.
+                let end = closing(tokens, at + 2).map_or(tokens.len(), |close| close + 1);
+                return match tokens.get(end).map(|t| &t.tok) {
+                    Some(Tok::Punct(',')) => end + 1,
+                    _ => end,
+                };
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    tokens.len()
+}
+
 /// The end of the item that begins at `start`: after its `;`, after the first `{..}` group at its own
 /// level, or before the group that holds it closes.
 fn skip_item(tokens: &[Token], start: usize) -> usize {
@@ -697,8 +794,10 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
     let mut inline: Vec<(usize, String)> = Vec::new();
     let mut depth = 0usize;
     let mut pending: Vec<Attr> = Vec::new();
-    // Where the hits of the pending attributes begin: a place a false `cfg` leaves out takes them away.
-    let mut mark = 0usize;
+    // The depth at which an `impl` header is read: it ends at its `{` or `;`, or where its group closes.
+    let mut header: Option<usize> = None;
+    // The depth of the group of the macro call that is read: a type name inside it is a hit.
+    let mut call: Option<usize> = None;
     let mut at = 0;
     while at < tokens.len() {
         let token = &tokens[at];
@@ -714,11 +813,14 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                         if attr == Attr::Cfg(Value::False) && depth == 0 {
                             return Ok(None);
                         }
+                        attribute_hits(file, &tokens, open + 1, close, &mut read.hits);
                         continue;
                     }
-                    if pending.is_empty() {
-                        mark = read.hits.len();
-                    }
+                    // Each run of outer attributes is one unit: no mark or attribute of an earlier
+                    // run, written on a field or an arm that no item follows, carries over.
+                    // The hits of the run begin here: a place a false `cfg` leaves out takes them away.
+                    let mark = read.hits.len();
+                    pending.clear();
                     attribute_hits(file, &tokens, open + 1, close, &mut read.hits);
                     pending.push(attr);
                     // The attributes that follow are the item's too.
@@ -731,7 +833,7 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                         at = close + 1;
                     }
                     if pending.contains(&Attr::Cfg(Value::False)) {
-                        at = skip_item(&tokens, at);
+                        at = skip_place(&tokens, at);
                         read.hits.truncate(mark);
                         pending.clear();
                     }
@@ -792,14 +894,14 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                 }
             }
             // The group of `pub(crate)` or `pub(in path)` is part of the item's visibility.
-            Tok::Ident(word)
-                if word == "pub"
-                    && matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Open('('))) =>
-            {
+            Tok::Ident(word) if word == "pub" && visibility_group(&tokens, at + 1) => {
                 at = closing(&tokens, at + 1).map_err(|e| format!("{file}: {e}"))? + 1;
                 continue;
             }
-            Tok::Open(_) => {
+            Tok::Open(open) => {
+                if *open == '{' && header == Some(depth) {
+                    header = None;
+                }
                 depth += 1;
                 pending.clear();
             }
@@ -807,12 +909,35 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                 if inline.last().is_some_and(|(open, _)| *open == depth) {
                     inline.pop();
                 }
+                if header == Some(depth) {
+                    header = None;
+                }
+                if call == Some(depth) {
+                    call = None;
+                }
                 depth = depth.saturating_sub(1);
                 pending.clear();
             }
-            Tok::Punct(';') => pending.clear(),
+            Tok::Punct(';') => {
+                if header == Some(depth) {
+                    header = None;
+                }
+                pending.clear();
+            }
             Tok::Ident(word) => {
-                read.hits.extend(hits_at(file, &tokens, at));
+                // `name !` and a group: a macro call, whose arguments name the two types anywhere.
+                if call.is_none()
+                    && !NOT_MACROS.contains(&word.as_str())
+                    && matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Punct('!')))
+                    && matches!(tokens.get(at + 2).map(|t| &t.tok), Some(Tok::Open(_)))
+                {
+                    call = Some(depth + 1);
+                }
+                if word == "impl" {
+                    header = Some(depth);
+                }
+                read.hits
+                    .extend(hits_at(file, &tokens, at, header.is_some(), call.is_some()));
                 if matches!(
                     word.as_str(),
                     "fn" | "struct"
@@ -828,7 +953,7 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
                     pending.clear();
                 }
             }
-            Tok::Str(_) => read.hits.extend(hits_at(file, &tokens, at)),
+            Tok::Str(_) => read.hits.extend(hits_at(file, &tokens, at, false, false)),
             _ => {}
         }
         at += 1;
@@ -836,10 +961,15 @@ fn read_file(file: &str, text: &str, beside: bool) -> Result<Option<FileRead>, S
     Ok(Some(read))
 }
 
+/// The words that stand before a `!` and are no macro: `if !(..)` negates.
+const NOT_MACROS: [&str; 9] = [
+    "if", "while", "match", "return", "break", "in", "else", "yield", "let",
+];
+
 /// The hits of the token at `at`: a variant name that does not follow `ActionRight ::`, `MutationRequest`
-/// or `ActionTarget` before a brace group where no `impl` or `for` precedes it (an impl header names
-/// the type, it builds none), and a string that holds a wire name once decoded.
-fn hits_at(file: &str, tokens: &[Token], at: usize) -> Vec<Hit> {
+/// or `ActionTarget` before a brace group outside an `impl` header (a header names the type, it builds
+/// none) or anywhere in the group of a macro call, and a string that holds a wire name once decoded.
+fn hits_at(file: &str, tokens: &[Token], at: usize, in_header: bool, in_call: bool) -> Vec<Hit> {
     let token = &tokens[at];
     let mut found = Vec::new();
     match &token.tok {
@@ -847,12 +977,13 @@ fn hits_at(file: &str, tokens: &[Token], at: usize) -> Vec<Hit> {
             if VARIANTS.contains(&word.as_str()) && !after_action_right(tokens, at) {
                 found.push(hit(file, token.line, word));
             }
-            if matches!(word.as_str(), "MutationRequest" | "ActionTarget")
-                && matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Open('{')))
-                && !(at > 0
-                    && matches!(&tokens[at - 1].tok, Tok::Ident(before) if before == "for" || before == "impl"))
-            {
-                found.push(hit(file, token.line, &format!("{word} {{")));
+            if matches!(word.as_str(), "MutationRequest" | "ActionTarget") {
+                if matches!(tokens.get(at + 1).map(|t| &t.tok), Some(Tok::Open('{'))) && !in_header
+                {
+                    found.push(hit(file, token.line, &format!("{word} {{")));
+                } else if in_call {
+                    found.push(hit(file, token.line, &format!("{word} in a macro call")));
+                }
             }
         }
         Tok::Str(text) => {
@@ -872,7 +1003,7 @@ fn attribute_hits(file: &str, tokens: &[Token], from: usize, to: usize, out: &mu
         return;
     }
     for at in from..to {
-        out.extend(hits_at(file, tokens, at));
+        out.extend(hits_at(file, tokens, at, false, false));
     }
 }
 
@@ -1423,6 +1554,44 @@ mod cases {
         let hits = oracle(folder.path(), &NOT_CLIENTS).expect("hits");
         let found: Vec<usize> = hits.iter().map(|hit| hit.line).collect();
         assert_eq!(found, [8, 10, 12, 15, 19, 23], "{hits:?}");
+        // An attribute run that no item follows (on an arm, a field or a variant) leaves no mark behind
+        // for a later `cfg(test)`, and a false `cfg` on one element of a list ends at that element.
+        let lib = "pub fn f(m: Method) -> u8 {\n\
+                   match m {\n\
+                   #[allow(unreachable_patterns)]\n\
+                   Method::AgentTurnCancel => 1,\n\
+                   #[cfg(test)]\n\
+                   Method::AgentTurnSteer => 2,\n\
+                   _ => 0,\n\
+                   }\n\
+                   }\n\
+                   enum Wire {\n\
+                   #[serde(rename = \"agent.turn.cancel\")]\n\
+                   Cancel,\n\
+                   #[cfg(test)]\n\
+                   Probe,\n\
+                   #[cfg(test)]\n\
+                   Dead(Method::AgentPromptQueue),\n\
+                   Live([u8; Method::AgentApprovalRespond as usize]),\n\
+                   }\n\
+                   struct S {\n\
+                   #[cfg(test)]\n\
+                   pub dead: u8,\n\
+                   #[serde(rename = \"plugin.action.invoke\")]\n\
+                   pub live: u8,\n\
+                   }\n\
+                   fn g(m: Method) -> u8 {\n\
+                   match m {\n\
+                   #[cfg(test)]\n\
+                   Method::AgentTurnSteer => { 2 }\n\
+                   Method::AgentPromptSubmit => 3,\n\
+                   _ => 0,\n\
+                   }\n\
+                   }\n";
+        let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
+        let hits = oracle(folder.path(), &NOT_CLIENTS).expect("hits");
+        let found: Vec<usize> = hits.iter().map(|hit| hit.line).collect();
+        assert_eq!(found, [4, 11, 17, 22, 29], "{hits:?}");
         // A file whose own inner attribute is false is not read, nor is anything it declares.
         let folder = tree(&[
             ("crates/kr-a/src/lib.rs", "mod inner;\n"),
@@ -1804,11 +1973,67 @@ mod cases {
         let lib = "impl Make for MutationRequest {}\n\
                    impl ActionTarget { fn f() {} }\n\
                    fn g() { let _ = MutationRequest { a: 1 }; }\n\
-                   fn h() { let _ = ActionTarget { a: 1 }; }\n";
+                   fn h() { let _ = ActionTarget { a: 1 }; }\n\
+                   impl Make for kr_protocol::MutationRequest {}\n\
+                   impl Describe for &MutationRequest {}\n\
+                   impl<T: Into<u8>> Make for ActionTarget where T: Copy {}\n\
+                   fn k(x: impl Into<u8>) -> impl Into<u8> { MutationRequest { a: 1 } }\n";
         let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
         assert_eq!(
             oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
-            Ok([3, 4]
+            Ok([3, 4, 8]
+                .iter()
+                .map(|line| ("crates/kr-a/src/lib.rs".to_owned(), *line))
+                .collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn an_inner_attribute_is_searched_where_it_stands_and_a_documentation_one_is_not() {
+        let lib = "mod m {\n\
+                   #![cfg_attr(feature = \"agent.turn.cancel\", allow(dead_code))]\n\
+                   #![doc = \"agent.turn.steer\"]\n\
+                   fn f() {}\n\
+                   }\n\
+                   #![serde(rename = \"plugin.action.invoke\")]\n";
+        let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
+        assert_eq!(
+            oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok([2, 6]
+                .iter()
+                .map(|line| ("crates/kr-a/src/lib.rs".to_owned(), *line))
+                .collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn a_type_name_in_the_group_of_a_macro_call_is_a_hit_and_a_negation_is_no_call() {
+        let lib = "fn f(r: u8) {\n\
+                   make!(MutationRequest);\n\
+                   let _ = vec![ActionTarget::new()];\n\
+                   if !(MutationRequest::is_valid(&r)) {}\n\
+                   let _ = r != 0 && !ActionTarget::ok();\n\
+                   g(MutationRequest::A);\n\
+                   }\n";
+        let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
+        assert_eq!(
+            oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok([2, 3]
+                .iter()
+                .map(|line| ("crates/kr-a/src/lib.rs".to_owned(), *line))
+                .collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
+    fn a_group_after_pub_is_a_visibility_only_where_a_path_word_opens_it() {
+        let lib = "struct S(pub ([u8; Method::AgentTurnCancel as usize]));\n\
+                   pub(crate) fn f() { Method::AgentTurnSteer; }\n\
+                   pub(in crate::a) fn g() { Method::AgentPromptSubmit; }\n";
+        let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
+        assert_eq!(
+            oracle(folder.path(), &NOT_CLIENTS).map(|hits| lines(&hits)),
+            Ok([1, 2, 3]
                 .iter()
                 .map(|line| ("crates/kr-a/src/lib.rs".to_owned(), *line))
                 .collect::<Vec<_>>())
