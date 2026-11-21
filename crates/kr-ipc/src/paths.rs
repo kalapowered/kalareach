@@ -2408,10 +2408,7 @@ mod windows {
 
         #[cfg(test)]
         let at_open = tests::at_open();
-        let keeps = volume_keeps_lists(file)?;
-        #[cfg(test)]
-        let keeps = keeps && !at_open.keeps_no_lists;
-        if !keeps {
+        if !volume_keeps_lists(file)? {
             return Err(no_lists_refusal());
         }
         let held = query_descriptor(file.as_handle(), OWNER_SECURITY_INFORMATION)
@@ -2477,6 +2474,12 @@ mod windows {
                 std::io::Error::last_os_error()
             )));
         }
+        // A case that makes the volume keep none clears the flag the test below reads, so that the
+        // test itself is the one the case runs.
+        #[cfg(test)]
+        if tests::volume_keeps_no_lists() {
+            flags &= !FILE_PERSISTENT_ACLS;
+        }
         Ok(flags & FILE_PERSISTENT_ACLS != 0)
     }
 
@@ -2504,10 +2507,7 @@ mod windows {
 
         #[cfg(test)]
         let seen = tests::seen();
-        let keeps = volume_keeps_lists(file)?;
-        #[cfg(test)]
-        let keeps = keeps && !matches!(seen, Some(tests::Seen::NoLists));
-        if !keeps {
+        if !volume_keeps_lists(file)? {
             return Err(no_lists_refusal());
         }
         let read = query_descriptor(
@@ -2668,6 +2668,12 @@ mod windows {
         /// What the case of this thread makes the opening of an existing file see.
         pub(super) fn at_open() -> AtOpen {
             AT_OPEN.with(std::cell::Cell::get)
+        }
+
+        /// Whether a case makes the volume of the file being checked report that it keeps no access
+        /// lists, as the opening of an existing file or the check of a new file sees it.
+        pub(super) fn volume_keeps_no_lists() -> bool {
+            at_open().keeps_no_lists || matches!(seen(), Some(Seen::NoLists))
         }
 
         /// What the opening of an existing file sees, put back to the file system's answer when this
