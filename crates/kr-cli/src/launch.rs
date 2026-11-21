@@ -364,7 +364,7 @@ fn list_document(value: &ShellLaunchCommandsListResult) -> Document {
     Document::new()
         .with("commands", commands_document(&value.commands))
         .with("ok", true)
-        .with("revision", value.revision)
+        .with("revision", output::closed(&value.revision))
 }
 
 /// `ShellLaunchCommandsSaveResult`, in the shape the protocol answers it.
@@ -375,7 +375,7 @@ fn save_document(value: &ShellLaunchCommandsSaveResult) -> Document {
         .with("commands", commands_document(&value.commands))
         .with("ok", true)
         .with("replaced", value.replaced)
-        .with("revision", value.revision)
+        .with("revision", output::closed(&value.revision))
 }
 
 /// `ShellLaunchCommandsRemoveResult`, in the shape the protocol answers it.
@@ -385,7 +385,7 @@ fn remove_document(value: &ShellLaunchCommandsRemoveResult) -> Document {
         .with("commands", commands_document(&value.commands))
         .with("ok", true)
         .with("removed", value.removed)
-        .with("revision", value.revision)
+        .with("revision", output::closed(&value.revision))
 }
 
 #[cfg(test)]
