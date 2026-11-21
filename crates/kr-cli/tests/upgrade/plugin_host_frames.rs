@@ -354,10 +354,22 @@ async fn a_host_that_cannot_bind_beside_the_daemon_of_the_release_before_leaves_
     arguments.push("--worker".to_owned());
     arguments.push(programs.join("kr-worker").display().to_string());
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
-    let mut command = host.command(&programs.join("kr-controller"), &arguments);
-    // The daemon is given a folder of its own with nothing in it for its `PATH`, so it finds no
-    // program of the system by name; every program it runs is named by its whole path.
-    command.env("PATH", host.scratch("no-tools"));
+    // The daemon is given the home and working folder of this tree and nothing of this test's
+    // environment, and a folder of its own with nothing in it for its `PATH`, so it finds no
+    // program of the system by name: every program it runs is named by its whole path.
+    let mut command = std::process::Command::new(programs.join("kr-controller"));
+    command.args(&arguments);
+    kr_ipc::testing::started_environment::StartedEnvironment::within(host.tree.root())
+        .apply(&mut command)
+        .env("PATH", host.scratch("no-tools"))
+        .env(
+            "KR_RUNTIME_DIR",
+            host.tree.paths().runtime_root().display().to_string(),
+        )
+        .env(
+            "KR_STATE_DIR",
+            host.tree.paths().state_root().display().to_string(),
+        );
     host.start_daemon_as(command).await;
 
     let kr = programs.join("kr");
