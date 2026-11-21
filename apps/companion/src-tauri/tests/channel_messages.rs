@@ -374,13 +374,28 @@ fn a_file_of_another_layout_is_counted_and_left_and_never_replaced() {
     window.keep(message(1, "first", &[])).expect("kept");
     let folder = dir(data.path());
     let other = folder.join(format!("{}.message", action(2)));
-    let newer = br#"{"version":2,"action_id":"x","text":"from a later release"}"#.to_vec();
+    // A valid file of this name in every member but its version, so that only the version can make it
+    // another layout.
+    let mut later: Value = serde_json::from_slice(
+        &std::fs::read(folder.join(format!("{}.message", action(1)))).expect("the first entry"),
+    )
+    .expect("a valid entry");
+    later["version"] = json!(2);
+    later["action_id"] = json!(action(2));
+    let newer = serde_json::to_vec(&later).expect("a later release's file");
     std::fs::write(&other, &newer).expect("a later release's file");
     let extra = folder.join(format!("{}.message", action(3)));
-    let with_extra = br#"{"version":1,"unknown_member":true}"#.to_vec();
+    let mut more = later.clone();
+    more["version"] = json!(1);
+    more["action_id"] = json!(action(3));
+    more["unknown_member"] = json!(true);
+    let with_extra = serde_json::to_vec(&more).expect("a file with a member more");
     std::fs::write(&extra, &with_extra).expect("a file with a member more");
+    // A valid file under a name that is no action's.
     let misnamed = folder.join("not-a-message.message");
-    std::fs::write(&misnamed, b"{}").expect("a misnamed file");
+    std::fs::copy(folder.join(format!("{}.message", action(1))), &misnamed)
+        .expect("a misnamed file");
+    let misnamed_bytes = std::fs::read(&misnamed).expect("the misnamed file's bytes");
     let list = window.list();
     assert_eq!(messages(&list).len(), 1, "{list}");
     assert_eq!(list["unreadableMessages"]["layout"], 3, "{list}");
@@ -413,7 +428,7 @@ fn a_file_of_another_layout_is_counted_and_left_and_never_replaced() {
         .expect("an unreadable one is not removed");
     assert_eq!(std::fs::read(&other).ok(), Some(newer));
     assert_eq!(std::fs::read(&extra).ok(), Some(with_extra));
-    assert_eq!(std::fs::read(&misnamed).ok(), Some(b"{}".to_vec()));
+    assert_eq!(std::fs::read(&misnamed).ok(), Some(misnamed_bytes));
 }
 
 /// KR-REQ-12.26: a keep under an identity that holds a different message is refused, and a repeat
@@ -444,7 +459,13 @@ fn a_file_that_cannot_be_read_now_is_counted_apart_and_makes_the_sources_unknown
     let window = Window::over(data.path());
     window.keep(message(1, "kept", &[])).expect("kept");
     let folder = dir(data.path());
-    std::fs::write(folder.join(format!("{}.message", action(2))), b"{}").expect("another layout");
+    // The first entry's bytes under another name: valid in every member but that its action is not
+    // the name's, so that only the name can make it another layout.
+    std::fs::copy(
+        folder.join(format!("{}.message", action(1))),
+        folder.join(format!("{}.message", action(2))),
+    )
+    .expect("another entry's name");
     let read = window.drafts().expect("the drafts are read");
     assert_eq!(read["sources"], "known", "{read}");
     std::fs::create_dir(folder.join(format!("{}.message", action(3)))).expect("a directory");
