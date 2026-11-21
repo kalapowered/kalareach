@@ -386,7 +386,31 @@ written, so they never take the room an answer needs.
 
 Claude Code acknowledges no message, so a message ends as an outcome nobody can establish and is
 never recorded as applied. This message's unknown outcome does not hold back the next message.
-Text shaped like an answer to an approval, or like the channel's own tag, is refused.
+
+The worker refuses text shaped like an approval answer. It also checks a Unicode-normalised copy of
+each message against the channel tag grammar. A dropped character can disappear inside the tag name
+or count as a space after it. Accepted text stays unchanged. This filter can reject code such as
+`Vec<Channel>`, comparisons and accented text. It does not cover every look-alike or prevent false
+claims about the sender.
+
+The filter reads the NFKD form of the text, in lower case. In the grammar, `D` is a dropped
+character and `W` is white space as Rust's `char::is_whitespace` defines it:
+
+```text
+prefix   = "<" (W | D)* ("/" (W | D)*)?
+name     = "c" D* "h" D* "a" D* "n" D* "n" D* "e" D* "l"
+boundary = D | W | ">" | "/" | end of the text
+```
+
+The worker refuses a message when `prefix name boundary` occurs anywhere in it. A character is
+dropped when it is a format character (category Cf), a control character that is not white space
+(Cc), a combining mark (Mn, Mc or Me) or a default ignorable code point. The decomposition and the
+marks follow Unicode 17.0.0, and the format characters and default ignorable code points follow
+Unicode 16.0.0. A mark that a later Unicode version adds passes until the worker is built with newer
+tables. `<channel_id>`, `<channels>` and `Arc<channel::Sender<T>>` pass. `<channel>` in any case,
+`Vec<Channel>`, `bitrate < channel capacity` and `<channel` followed directly by a dropped character
+are refused.
+
 `agent.prompt` has no evidence, and a submit, a steer, a cancellation and any other action of the
 package are refused with their reasons. A frame the table does not route towards the worker closes
 the channel, since the forwarder relays nothing else.
