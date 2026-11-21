@@ -714,6 +714,24 @@ impl Work {
     }
 }
 
+/// A connection to a host, with the account it was made for. An upload goes on a connection only
+/// when the connection's account is the upload's, so a connection a newer sign-in brought up is
+/// never used to resume what an earlier sign-in left.
+#[derive(Clone)]
+struct Connection {
+    account: Option<String>,
+    session: Arc<Session>,
+}
+
+impl Connection {
+    fn of(paired: &Paired) -> Self {
+        Self {
+            account: paired.account_id(),
+            session: Arc::clone(&paired.session),
+        }
+    }
+}
+
 /// What the gate guards: the uploads this process holds, the keys the person cancelled, and the
 /// turns of the keys.
 #[derive(Default)]
@@ -812,9 +830,9 @@ pub struct Desk {
     registry: Mutex<Registry>,
     /// What a restart or a failure found of entries it could not resume.
     verdicts: Mutex<HashMap<Uuid, Verdict>>,
-    /// The newest connection of each host's device, so that an upload whose connection ended while
-    /// a newer one was coming up goes on at once.
-    sessions: Mutex<HashMap<(EnvironmentId, DeviceId), Arc<Session>>>,
+    /// The newest connection of each host's device, with its account, so that an upload whose
+    /// connection ended while a newer one of the same account was coming up goes on at once.
+    sessions: Mutex<HashMap<(EnvironmentId, DeviceId), Connection>>,
     /// What a suite holds a send at, before it is admitted.
     #[cfg(feature = "testing")]
     before_admission: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -1021,9 +1039,9 @@ impl Desk {
             let registry = locked(&self.registry);
             locked(&self.sessions).insert(
                 (paired.environment_id, paired.device_id),
-                Arc::clone(&paired.session),
+                Connection::of(&paired),
             );
-            self.start_under(&registry, &live, paired.session, false)
+            self.start_under(&registry, &live, Connection::of(&paired), false)
         };
         if !started {
             let _ = store.remove_copy(key);
@@ -1052,23 +1070,28 @@ impl Desk {
     /// the one declared.
     ///
     /// It starts only an upload that this desk holds (by identity), whose key the person did not
-    /// cancel, and that has no sender: a second caller that holds a stale list finds the upload
-    /// sending and is refused, so an upload has one task. The task and its handle are made here, in
-    /// one step under the gate, so a stop finds the handle.
+    /// cancel, that has no sender, and whose account is the connection's: a second caller that holds
+    /// a stale list finds the upload sending and is refused, so an upload has one task, and a
+    /// connection of another sign-in never carries the upload. The task and its handle are made
+    /// here, in one step under the gate, so a stop finds the handle.
     fn start_under(
         self: &Arc<Self>,
         registry: &Registry,
         live: &Arc<Live>,
-        session: Arc<Session>,
+        connection: Connection,
         verify: bool,
     ) -> bool {
         let current = registry
             .held
             .get(&live.key)
             .is_some_and(|held| Arc::ptr_eq(held, live));
-        if !current || registry.cancelled.contains(&live.key) {
+        if !current
+            || registry.cancelled.contains(&live.key)
+            || live.owner.account != connection.account
+        {
             return false;
         }
+        let session = connection.session;
         {
             let mut phase = locked(&live.phase);
             if !matches!(*phase, Phase::Admitted | Phase::Paused) {
@@ -1198,7 +1221,12 @@ impl Desk {
             }
             Err(error) => error,
         };
-        if by_this_device {
+        // An upload with an account that this device's own end of the connection interrupted (a
+        // sign-out, or a sign-in of another account) is paused as if the connection had ended: the
+        // entry and the copy stay hidden from the other account and go on when the upload's account
+        // reaches the host again.
+        let account_paused = by_this_device && file.account.is_some();
+        if by_this_device && !account_paused {
             // The sign-in this upload was sent under is not the one in force: it stops for good, and
             // the copy of the person's file goes with it.
             if let Ok(store) = self.store() {
@@ -1226,11 +1254,12 @@ impl Desk {
         }
         // A request that never left is asked again; a finish or a chunk that did leave is read from
         // the host's own record when the connection comes back.
-        let resumable = match error {
-            ClientError::ConnectionEnded => true,
-            ClientError::SubmissionUncertain { .. } => transfer.is_some(),
-            _ => false,
-        };
+        let resumable = account_paused
+            || match error {
+                ClientError::ConnectionEnded => true,
+                ClientError::SubmissionUncertain { .. } => transfer.is_some(),
+                _ => false,
+            };
         if resumable {
             let newest = locked(&self.sessions)
                 .get(&(file.environment_id, file.device_id))
@@ -1241,9 +1270,10 @@ impl Desk {
             }
             *locked(&live.phase) = Phase::Paused;
             if let (Some(newest), Some(failed)) = (newest, session)
-                && !Arc::ptr_eq(&newest, failed)
+                && !Arc::ptr_eq(&newest.session, failed)
             {
-                // The connection that came up first is the one this upload goes on, at once.
+                // The connection that came up first is the one this upload goes on, at once, when it
+                // was made for the upload's own account.
                 self.start_under(&registry, live, newest, true);
             }
             return;
@@ -1300,13 +1330,15 @@ impl Desk {
         true
     }
 
-    /// The host was reached on `paired`'s connection: paused uploads resume on it, and entries kept
-    /// from before are read against the host's own record and resumed or dropped. What belongs to
-    /// another principal or to another account of this host is stopped and dropped, never resumed.
+    /// The host was reached on `paired`'s connection: the paused uploads of its account resume on
+    /// it, and the account's entries kept from before are read against the host's own record and
+    /// resumed or dropped. What belongs to another principal on this host is stopped and dropped,
+    /// never resumed. What belongs to another account of the same principal is left as it is: hidden
+    /// from this account, and resumed when its own account reaches the host.
     pub fn host_reached(self: &Arc<Self>, paired: Paired) {
         let (device_id, environment_id) = (paired.device_id, paired.environment_id);
-        let session = Arc::clone(&paired.session);
-        locked(&self.sessions).insert((environment_id, device_id), Arc::clone(&session));
+        let connection = Connection::of(&paired);
+        locked(&self.sessions).insert((environment_id, device_id), connection.clone());
         let who = paired.who();
         let (paused, other) = {
             let registry = locked(&self.registry);
@@ -1316,6 +1348,10 @@ impl Desk {
                 .filter(|live| live.owner.environment_id == environment_id)
                 .cloned()
                 .partition(|live| live.owner.is_whose(&who));
+            let other: Vec<_> = other
+                .into_iter()
+                .filter(|live| live.owner.device_id != device_id)
+                .collect();
             let paused: Vec<(Arc<Live>, bool)> = mine
                 .into_iter()
                 .filter(|live| *locked(&live.phase) == Phase::Paused)
@@ -1326,8 +1362,8 @@ impl Desk {
                 .collect();
             (paused, other)
         };
-        // An upload of another principal or another account on this host belongs to a sign-in that is
-        // not in force: it stops, and its entry goes, in its key's turn.
+        // An upload of another principal on this host belongs to a pairing that is not in force: it
+        // stops, and its entry goes, in its key's turn.
         for live in other {
             let desk = Arc::clone(self);
             self.work.spawn(async move {
@@ -1350,7 +1386,7 @@ impl Desk {
                 #[cfg(feature = "testing")]
                 testing::pause(live.key, testing::Point::Claiming);
                 let registry = locked(&self.registry);
-                self.start_under(&registry, &live, Arc::clone(&session), true);
+                self.start_under(&registry, &live, connection.clone(), true);
             }
         }
         if locked(&self.root).is_none() {
@@ -1389,10 +1425,12 @@ impl Desk {
             {
                 continue;
             }
-            if file.device_id != paired.device_id || file.account != paired.account_id() {
-                // Another principal's, or another account's: the sign-in it was kept under is not
-                // the one in force.
+            if file.device_id != paired.device_id {
+                // Another principal's: the pairing it was kept under is not the one in force.
                 let _ = store.remove(file.key);
+            } else if file.account != paired.account_id() {
+                // Another account's: hidden, left as it is, and found again when its account reaches
+                // the host. Its copy is named by its entry, so the orphan pass keeps it.
             } else if file.target.environment_id == paired.environment_id {
                 mine.push(file);
             }
@@ -1471,12 +1509,7 @@ impl Desk {
                             let live = Live::new(file, content, true);
                             let mut registry = locked(&self.registry);
                             if registry.admit_restarted(&live) {
-                                self.start_under(
-                                    &registry,
-                                    &live,
-                                    Arc::clone(&paired.session),
-                                    false,
-                                );
+                                self.start_under(&registry, &live, Connection::of(paired), false);
                             }
                         }
                         // A publication in progress needs no content: the entry stays, and the host is
@@ -1841,12 +1874,27 @@ impl Desk {
         }
     }
 
-    /// The handle of the published upload `transfer_id` was bound to a draft: its entry ends.
-    pub fn bound(&self, transfer_id: TransferId) {
+    /// The handle of the published upload `transfer_id` was bound to a draft by `who`: that
+    /// account's entry for it ends, in its key's turn, and read again under the turn. Another
+    /// account's entry is never removed here.
+    pub async fn bound(&self, who: &Who, transfer_id: TransferId) {
         let Ok(store) = self.store() else { return };
-        for file in store.all().entries {
-            if file.transfer_id == Some(transfer_id) && file.reached == Reached::Published {
-                let _ = store.remove(file.key);
+        let is_it = |file: &UploadFile| {
+            file.transfer_id == Some(transfer_id)
+                && file.reached == Reached::Published
+                && file.is_whose(who)
+        };
+        let keys: Vec<Uuid> = store
+            .all()
+            .entries
+            .iter()
+            .filter(|file| is_it(file))
+            .map(|file| file.key)
+            .collect();
+        for key in keys {
+            let _turn = self.turn(key).await;
+            if store.entry(key).is_some_and(|file| is_it(&file)) {
+                let _ = store.remove(key);
             }
         }
     }
@@ -1951,7 +1999,7 @@ impl Desk {
     pub fn holds_newest_for_test(&self, paired: &Paired) -> bool {
         locked(&self.sessions)
             .get(&(paired.environment_id, paired.device_id))
-            .is_some_and(|newest| Arc::ptr_eq(newest, &paired.session))
+            .is_some_and(|newest| Arc::ptr_eq(&newest.session, &paired.session))
     }
 }
 
@@ -2203,6 +2251,15 @@ mod tests {
         transfer: Option<TransferId>,
         reached: Reached,
     ) -> (tempfile::TempDir, Arc<Desk>, Arc<Live>, Store) {
+        held_for(None, transfer, reached)
+    }
+
+    /// As [`held`], for the upload of `account`.
+    fn held_for(
+        account: Option<String>,
+        transfer: Option<TransferId>,
+        reached: Reached,
+    ) -> (tempfile::TempDir, Arc<Desk>, Arc<Live>, Store) {
         let dir = tempfile::tempdir().expect("a directory");
         let store = Store {
             root: dir.path().join("open-transfers"),
@@ -2210,7 +2267,10 @@ mod tests {
         let desk = Arc::new(Desk::default());
         desk.keep_at(store.root.clone());
         let key = kr_ipc::new_uuid();
-        let entry = file(key, transfer, reached);
+        let entry = UploadFile {
+            account,
+            ..file(key, transfer, reached)
+        };
         store.write(&entry).expect("the entry");
         store.write_copy(key, b"mine").expect("the copy");
         let live = Live::new(entry, Arc::new(Held::new(vec![1; 4])), true);
@@ -2527,11 +2587,29 @@ mod tests {
         assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
         assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
 
-        // The sign-in it was sent under ended: it stops for good, with its copy.
+        // The sign-in it was sent under ended and it had no account: it stops for good, with its copy.
         let (_dir, desk, live, store) =
             held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
         desk.settle_as(&live, None, 0, true, Err(ClientError::ConnectionEnded));
         assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
         assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
+    }
+
+    /// KR-REQ-13.12: a send of an account that this device ended, by a sign-out or the sign-in of
+    /// another account, is paused with its entry and its copy, as one whose connection ended: it goes
+    /// on when its account reaches the host again.
+    #[test]
+    fn a_send_ended_by_a_sign_in_change_is_paused_and_kept() {
+        let (_dir, desk, live, store) = held_for(
+            Some("ab".repeat(32)),
+            Some(TransferId::new(kr_ipc::new_uuid())),
+            Reached::Begun,
+        );
+        desk.settle_as(&live, None, 0, true, Err(ClientError::ConnectionEnded));
+        let key = live.file().key;
+        assert_eq!(*locked(&live.phase), Phase::Paused);
+        assert!(locked(&desk.registry).held.contains_key(&key));
+        assert!(store.path(key, UPLOAD_EXTENSION).exists());
+        assert!(store.path(key, COPY_EXTENSION).exists());
     }
 }
