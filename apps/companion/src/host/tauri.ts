@@ -37,6 +37,7 @@ import type {
   ExportSaved,
   HostCoverView,
   KitSaved,
+  LaunchCommandsReading,
   RecoveryArchive,
   OpenRequest,
   OtherHost,
@@ -415,6 +416,9 @@ export function tauriPort(): HostPort {
       mutate('environment_capabilities_check', params, {}),
 
     launchSurface: (params) => read('launch_surface', params),
+    launchCommands: () => call<LaunchCommandsReading>('launch_commands_list', {}),
+    launchCommandSave: (params) => mutate('launch_commands_save', params, {}),
+    launchCommandRemove: (params) => mutate('launch_commands_remove', params, {}),
 
     // The agent's calls go to the session's own worker, which native code reaches and which checks
     // this device's rights itself. A mutation names its session, instance and binding revision in

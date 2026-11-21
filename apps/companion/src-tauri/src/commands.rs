@@ -84,6 +84,20 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("launch_surface", Some(Method::ShellLaunchSurface)),
     ("terminal_view_launch_surface", None),
     ("terminal_view_launch", None),
+    // The host's saved launch commands: the list, and the two changes only the local owner makes.
+    // The page names a command or a label and the revision of the list it saw, never a path.
+    (
+        "launch_commands_list",
+        Some(Method::ShellLaunchCommandsList),
+    ),
+    (
+        "launch_commands_save",
+        Some(Method::ShellLaunchCommandsSave),
+    ),
+    (
+        "launch_commands_remove",
+        Some(Method::ShellLaunchCommandsRemove),
+    ),
     // The drafts this device keeps. They are the device's own, in a store of its own: the page
     // names a draft, the version it was shown and what to keep, never a path or a method.
     ("device_drafts", None),
@@ -650,6 +664,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         terminal_view_launch_surface,
         terminal_view_launch,
         launch_surface,
+        launch_commands_list,
+        launch_commands_save,
+        launch_commands_remove,
         device_drafts,
         device_draft_save,
         device_draft_retarget,
@@ -1795,6 +1812,74 @@ pub async fn terminal_view_launch(
 ) -> Result<Value> {
     let press: crate::launch::Press = decode(press)?;
     encode(&views.launch(&view, press).await?)
+}
+
+/// Reads the launch commands saved on the host: the list and its revision, or that the host does
+/// not serve them, or that this connection may not read them.
+///
+/// The read needs `host.manage`, and a paired device that holds it reads the list too.
+#[tauri::command]
+pub async fn launch_commands_list(state: State<'_, AppState>) -> Result<Value> {
+    let session = state.session()?;
+    encode(&crate::launch::LaunchCommandsAnswer::from(
+        session.read_launch_commands().await?,
+    ))
+}
+
+/// Saves a launch command, or replaces the one that has the same label, against the revision of
+/// the list the person saw.
+///
+/// The host takes the change from the local owner's socket alone, so a host this device is paired
+/// with is refused here, before anything is sent.
+#[tauri::command]
+pub async fn launch_commands_save(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<Settled> {
+    not_on_a_paired_host(&state, "a change to the saved launch commands")?;
+    let typed: kr_protocol::launch_commands::ShellLaunchCommandsSaveParams = decode(params)?;
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    submitted_as::<kr_protocol::launch_commands::ShellLaunchCommandsSaveResult>(
+        session
+            .mutate(
+                Method::ShellLaunchCommandsSave,
+                target,
+                None,
+                &NoPreconditions {},
+                &typed,
+                MUTATION_TTL,
+            )
+            .await,
+    )
+}
+
+/// Removes the launch command with a label, against the revision of the list the person saw.
+///
+/// Refused on a host this device is paired with, as a save is.
+#[tauri::command]
+pub async fn launch_commands_remove(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<Settled> {
+    not_on_a_paired_host(&state, "a change to the saved launch commands")?;
+    let typed: kr_protocol::launch_commands::ShellLaunchCommandsRemoveParams = decode(params)?;
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    submitted_as::<kr_protocol::launch_commands::ShellLaunchCommandsRemoveResult>(
+        session
+            .mutate(
+                Method::ShellLaunchCommandsRemove,
+                target,
+                None,
+                &NoPreconditions {},
+                &typed,
+                MUTATION_TTL,
+            )
+            .await,
+    )
 }
 
 /// Creates a draft on the host, which a file is then bound to.
@@ -4185,6 +4270,9 @@ mod tests {
         "terminal_view_close",
         "terminal_view_launch_surface",
         "terminal_view_launch",
+        "launch_commands_list",
+        "launch_commands_save",
+        "launch_commands_remove",
         "device_drafts",
         "device_draft_save",
         "device_draft_retarget",
@@ -4810,6 +4898,9 @@ mod tests {
             voice_stop,
             voice_allow,
             voice_context,
+            launch_commands_list,
+            launch_commands_save,
+            launch_commands_remove,
         ]);
         // One body for every command: each reads the arguments it takes and nothing else. The
         // voice stop and the voice start read their own one by one. The identifiers they parse
@@ -4833,8 +4924,12 @@ mod tests {
             }
             let expected = match *command {
                 // What a device holds takes no parameters, and the application is not connected.
-                "host_info" | "environment_list" | "description_setup" | "grant_held"
-                | "session_numbers" => "HOST_NOT_CONFIGURED",
+                "host_info"
+                | "environment_list"
+                | "description_setup"
+                | "grant_held"
+                | "session_numbers"
+                | "launch_commands_list" => "HOST_NOT_CONFIGURED",
                 "attachment_upload" => "PERMISSION_DENIED",
                 _ => "INVALID_ARGUMENT",
             };

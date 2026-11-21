@@ -98,6 +98,10 @@ import type {
   RevocationResult,
   ShareOffer,
   ShellLaunchCommandsListResult,
+  ShellLaunchCommandsRemoveParams,
+  ShellLaunchCommandsRemoveResult,
+  ShellLaunchCommandsSaveParams,
+  ShellLaunchCommandsSaveResult,
   ShellLaunchResult,
   ShellLaunchSurfaceParams,
   ShellLaunchSurfaceResult,
@@ -2113,6 +2117,25 @@ export interface HostPort {
    * A host that does not serve the read is answered as `not_served`.
    */
   launchSurface(params: ShellLaunchSurfaceParams): Promise<LaunchSurfaceReading>
+  /**
+   * The launch commands saved on the host and the revision of the list, read on the connection for
+   * the host alone. A host of a release that does not serve the list is answered as `not_served`,
+   * and a connection without `host.manage` as `refused`.
+   */
+  launchCommands(): Promise<LaunchCommandsReading>
+  /**
+   * Saves a launch command, or replaces the one with the same label, against the revision of the
+   * list the person saw. Answered with the host's own result: `applied` is false where the list
+   * had moved on, and the result then holds the list as it stands. Refused on a host this device
+   * is paired with, which takes no change to its list from here.
+   */
+  launchCommandSave(
+    params: ShellLaunchCommandsSaveParams
+  ): Promise<Settled<ShellLaunchCommandsSaveResult>>
+  /** Removes the launch command with a label, as a save is made: against the list the person saw. */
+  launchCommandRemove(
+    params: ShellLaunchCommandsRemoveParams
+  ): Promise<Settled<ShellLaunchCommandsRemoveResult>>
 
   /**
    * A session's live agent instances, and every request its agents' broker is still arbitrating.

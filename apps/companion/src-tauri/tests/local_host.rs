@@ -260,6 +260,9 @@ impl Host {
                 companion_tauri::commands::description_download,
                 companion_tauri::commands::environment_capabilities,
                 companion_tauri::commands::environment_capabilities_check,
+                companion_tauri::commands::launch_commands_list,
+                companion_tauri::commands::launch_commands_save,
+                companion_tauri::commands::launch_commands_remove,
                 companion_tauri::commands::question_kept,
                 companion_tauri::commands::question_settle,
             ])
@@ -1491,6 +1494,122 @@ async fn the_disclosed_checks_are_asked_for_by_environment_alone() {
         .expect("the capabilities"),
     );
     assert_eq!(shown.checks.state, CapabilityChecksState::Failed);
+}
+
+/// KR-REQ-13.11: the launch commands are read, saved, replaced and removed through the three
+/// application commands, as the page calls them and with the parameters it writes, against the
+/// host's own store. A save or a remove that names a revision the list has left changes nothing and
+/// is answered with the list as it stands; one that names the current revision lands, and the list
+/// read back after each step is the one the host holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_launch_commands_are_read_saved_and_removed_through_the_application_commands_on_a_local_host()
+ {
+    use kr_protocol::launch_commands::{
+        ShellLaunchCommandsListResult, ShellLaunchCommandsRemoveResult,
+        ShellLaunchCommandsSaveResult,
+    };
+
+    let host = Host::start().await;
+    let list = || async {
+        let read = host
+            .call("launch_commands_list", json!({}))
+            .await
+            .expect("the list is read");
+        assert_eq!(read["state"], "served", "{read}");
+        typed::<ShellLaunchCommandsListResult>(read["list"].clone())
+    };
+    let save = |revision: &str, label: &str, arguments: Value| {
+        host.call(
+            "launch_commands_save",
+            json!({
+                "params": {
+                    "expected_revision": revision,
+                    "command": { "label": label, "program": "claude", "arguments": arguments },
+                },
+                "subject": {},
+            }),
+        )
+    };
+
+    let empty = list().await;
+    assert!(empty.commands.is_empty(), "{empty:?}");
+    assert_eq!(empty.revision.to_string(), "0", "{empty:?}");
+
+    // A save against the revision the page read lands, and the list read back holds it.
+    let first: ShellLaunchCommandsSaveResult = typed(settled_value(
+        save("0", "Claude Code", json!(["--resume", "two words", ""]))
+            .await
+            .expect("the save is answered"),
+    ));
+    assert!(
+        first.applied && first.changed && !first.replaced,
+        "{first:?}"
+    );
+    assert_eq!(first.commands.len(), 1, "{first:?}");
+    assert_eq!(first.commands[0].arguments, ["--resume", "two words", ""]);
+    let held = list().await;
+    assert_eq!(held.commands, first.commands);
+    assert_eq!(held.revision, first.revision);
+    assert_ne!(held.revision.to_string(), "0");
+
+    // A save against the revision the list has left changes nothing: the host answers with the
+    // list as it stands.
+    let stale: ShellLaunchCommandsSaveResult = typed(settled_value(
+        save("0", "Other", json!([]))
+            .await
+            .expect("the stale save is answered"),
+    ));
+    assert!(!stale.applied && !stale.changed, "{stale:?}");
+    assert_eq!(stale.commands, held.commands, "{stale:?}");
+    assert_eq!(list().await, held, "a stale save changed the list");
+
+    // The same label replaces the command and keeps its place.
+    let revision = held.revision.to_string();
+    let replaced: ShellLaunchCommandsSaveResult = typed(settled_value(
+        save(&revision, "claude code", json!(["--continue"]))
+            .await
+            .expect("the replacement is answered"),
+    ));
+    assert!(
+        replaced.applied && replaced.changed && replaced.replaced,
+        "{replaced:?}"
+    );
+    assert_eq!(replaced.commands.len(), 1, "{replaced:?}");
+    assert_eq!(replaced.commands[0].label, "claude code");
+    assert_eq!(replaced.commands[0].arguments, ["--continue"]);
+
+    // A remove against the old revision changes nothing; against the current one it removes.
+    let remove = |revision: &str, label: &str| {
+        host.call(
+            "launch_commands_remove",
+            json!({
+                "params": { "expected_revision": revision, "label": label },
+                "subject": {},
+            }),
+        )
+    };
+    let old_remove: ShellLaunchCommandsRemoveResult = typed(settled_value(
+        remove(&revision, "claude code")
+            .await
+            .expect("the stale remove is answered"),
+    ));
+    assert!(!old_remove.applied && !old_remove.removed, "{old_remove:?}");
+    assert_eq!(old_remove.commands, replaced.commands, "{old_remove:?}");
+    let removed: ShellLaunchCommandsRemoveResult = typed(settled_value(
+        remove(&replaced.revision.to_string(), "Claude Code")
+            .await
+            .expect("the remove is answered"),
+    ));
+    assert!(removed.applied && removed.removed, "{removed:?}");
+    assert!(removed.commands.is_empty(), "{removed:?}");
+    let after = list().await;
+    assert!(after.commands.is_empty(), "{after:?}");
+    assert_ne!(
+        after.revision.to_string(),
+        "0",
+        "an emptied list keeps a fresh revision"
+    );
+    assert_ne!(after.revision, replaced.revision);
 }
 
 /// KR-REQ-22.01: the setup card, through the three commands it calls and with the parameters it
