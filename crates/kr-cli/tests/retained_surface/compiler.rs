@@ -582,6 +582,10 @@ pub struct Config {
     pub name: &'static str,
     pub target: Option<&'static str>,
     pub tests: bool,
+    /// The members this configuration does not build, besides the receivers: a crate that needs a C++
+    /// toolchain for the target (the model that describes a session builds `llama.cpp`) is read by
+    /// the configurations of the host.
+    pub exclude: &'static [&'static str],
 }
 
 /// The one target besides the host that every platform checks.
@@ -595,16 +599,19 @@ pub const PLAN: [Config; 3] = [
         name: "host",
         target: None,
         tests: false,
+        exclude: &[],
     },
     Config {
         name: "host-tests",
         target: None,
         tests: true,
+        exclude: &[],
     },
     Config {
         name: "windows",
         target: Some(WINDOWS_GNU),
         tests: false,
+        exclude: &["kr-describe-model"],
     },
 ];
 
@@ -709,13 +716,15 @@ fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<
         "--locked",
         "--offline",
         "--workspace",
-        "--exclude",
-        "kr-controller",
-        "--exclude",
-        "kr-worker",
         "--lib",
         "--bins",
     ]);
+    for member in ["kr-controller", "kr-worker"]
+        .into_iter()
+        .chain(config.exclude.iter().copied())
+    {
+        command.args(["--exclude", member]);
+    }
     if config.tests {
         command.arg("--tests");
     }
