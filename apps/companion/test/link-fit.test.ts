@@ -370,6 +370,36 @@ describe('the room that the page gives the links of a message', () => {
     }
   })
 
+  it('writes a change of one grid step in the room, so that a link whose words changed by 1/64 px keeps the least size', () => {
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 0, 9)
+      link(message, 47, 56)
+      link(message, 88, 380)
+    })
+    fitLinks(root, messages)
+    const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    if (!first || !second) throw new Error('the made page has no links')
+    expect(given(first).right, 'the room of the first link').toBe(35)
+    // The first link's words are 1/64 px narrower: it lacks 1/64 px more, and the page writes it.
+    words.set(first, { left: 0, top: 20, right: 8.984375, bottom: 64 })
+    fitLinks(root, messages)
+    expect(given(first).right, 'the room after the words changed by one step').toBe(35.015625)
+    expect(boxOf(first).right - boxOf(first).left, 'the box').toBeGreaterThanOrEqual(LEAST)
+    expect(boxOf(first).right, 'the end of the first box').toBeLessThanOrEqual(boxOf(second).left)
+  })
+
+  it('gives a completed link the least size where its box and the gap are held to the grid (a wide link over two short ones, a short one beside it)', () => {
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 40, 52, 0)
+      link(message, 68, 104, 0)
+      link(message, 30, 104, 24)
+      link(message, 113.015625, 140, 24)
+    })
+    fitLinks(root, messages)
+    const boxes = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
+    expect((boxes[1] as { left: number; right: number }).right - (boxes[1] as { left: number }).left, 'the box of the link that the packing completes').toBeGreaterThanOrEqual(LEAST)
+  })
+
   it('leaves a short link that cannot be completed the gap that a completed neighbour does not need of it', () => {
     // [8] has a wide link touching its left and 4 px to [9], which is completed and has the rest of the line on its right.
     const { pane: root, messages } = pane(1, (message) => {
