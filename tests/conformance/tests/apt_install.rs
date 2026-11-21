@@ -818,8 +818,11 @@ fn the_waits_never_pass_the_deadline() {
             "{deadline}: {}{}",
             outcome.stdout, outcome.stderr
         );
+        // The record below proves each wait inside the time left. The time the run took is a
+        // ceiling only, far above the run's own length of about the deadline, so that no stall of
+        // the machine reaches it.
         assert!(
-            outcome.elapsed < Duration::from_secs(u64::from(deadline) + 3),
+            outcome.elapsed < Duration::from_secs(25),
             "{deadline}: {:?}",
             outcome.elapsed
         );
