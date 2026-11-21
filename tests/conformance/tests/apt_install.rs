@@ -132,7 +132,9 @@ exec "$@"
 /// to the command's process group after N seconds and KILL G seconds later, and answers 124 when
 /// TERM ended it and 137 when KILL did. A bound of less than 1 is refused as 125, and the call is
 /// recorded as `<kill-after> <seconds> <command>`, and with the time in the clock log, where the
-/// end of the call is logged too. The rig always uses this one, so that a host without GNU `timeout` runs the same cases.
+/// end of the call is logged too, with the stage that ended it: 0 when the command ended itself, 1
+/// when TERM did and 2 when KILL did. The rig always uses this one, so that a host without GNU
+/// `timeout` runs the same cases.
 const TIMEOUT: &str = r#"#!/usr/bin/perl
 use strict;
 use warnings;
@@ -163,7 +165,7 @@ while (1) {
 alarm(0);
 kill 'KILL', -$pid;
 open(my $ended, '>>', "$ENV{RIG}/clock.log") or die;
-printf $ended "ended %.3f\n", Time::HiRes::time();
+printf $ended "ended %.3f %d\n", Time::HiRes::time(), $stage;
 close $ended;
 if ($stage == 1) { exit 124; }
 if ($stage == 2) { exit 137; }
@@ -364,7 +366,10 @@ impl Rig {
                         at,
                         seconds: words[2].parse().expect("a wait"),
                     },
-                    "ended" => Event::Ended { at },
+                    "ended" => Event::Ended {
+                        at,
+                        cut: words[2].parse::<u32>().expect("a stage") != 0,
+                    },
                     other => panic!("an event of kind {other}"),
                 }
             })
@@ -408,7 +413,7 @@ impl Rig {
                     );
                     before = at;
                 }
-                Event::Ended { at } => before = at,
+                Event::Ended { at, .. } => before = at,
             }
         }
     }
@@ -425,16 +430,119 @@ impl Rig {
             })
             .collect()
     }
+
+    /// Whether the script called `timeout` with a command that has `argument` among its words. The
+    /// stand-in records a call before it runs the command, so a call is seen whether or not the
+    /// `apt-get` inside it started.
+    fn called(&self, argument: &str) -> bool {
+        self.lines("timeout.log")
+            .iter()
+            .any(|call| call.split(' ').any(|word| word == argument))
+    }
+
+    /// Whether the script's last call to `timeout` has `argument` among its words and `timeout`
+    /// cut it, with TERM or KILL.
+    fn last_call_was_cut(&self, argument: &str) -> bool {
+        let cut = self
+            .events()
+            .iter()
+            .rev()
+            .take_while(|event| !matches!(event, Event::Bound { .. }))
+            .any(|event| matches!(event, Event::Ended { cut: true, .. }));
+        cut && self
+            .lines("timeout.log")
+            .last()
+            .is_some_and(|call| call.split(' ').any(|word| word == argument))
+    }
+
+    /// A run that the deadline ended, as a script on a machine that stalls ends it: with status 1,
+    /// and either its expiry message, after more than the deadline less 2 s (it stops when under 2
+    /// s are left, and counts whole seconds), or its refusal to plan the install after a plan that
+    /// `timeout` cut, which ends it at once. A stop sooner than that, or for any other reason, is
+    /// a script that did not use its time.
+    fn assert_the_deadline_ended_the_run(&self, outcome: &Outcome, deadline: u32, context: &str) {
+        let said = format!("{context}: {}{}", outcome.stdout, outcome.stderr);
+        assert_eq!(outcome.status, 1, "{said}");
+        if outcome
+            .stderr
+            .contains("apt-install: apt cannot plan the install of: ")
+        {
+            assert!(
+                self.last_call_was_cut("--simulate"),
+                "the script could not plan, and its last call was not a plan that `timeout` cut: {said}"
+            );
+        } else {
+            assert!(
+                outcome.stderr.contains(&format!(
+                    "apt-install: failed: deadline={deadline}s attempts="
+                )),
+                "{said}"
+            );
+            assert!(
+                outcome.elapsed.as_secs_f64() > f64::from(deadline) - 2.0,
+                "the script stopped after {:?}, with time left: {said}",
+                outcome.elapsed
+            );
+        }
+    }
+
+    /// A run that ended in success after `timeout` cut some of its calls: it ran the cut update or
+    /// download again, and the phases of the attempt that went through are the last ones. A cut
+    /// plan ends the script, so none was cut, and each attempt that failed is one that a cut call
+    /// ended. A run that cut nothing made its three bounded calls.
+    fn assert_the_run_got_past_every_cut(&self, outcome: &Outcome, context: &str) {
+        let said = format!("{context}: {}{}", outcome.stdout, outcome.stderr);
+        assert_eq!(outcome.status, 0, "{said}");
+        let phases = self.phases();
+        let last: Vec<&str> = phases
+            .iter()
+            .rev()
+            .take(4)
+            .rev()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            last,
+            ["update", "simulate", "download", "install"],
+            "{said}"
+        );
+        let failed = failed_attempts(outcome).len();
+        let cut = self
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::Ended { cut: true, .. }))
+            .count();
+        assert_eq!(
+            failed, cut,
+            "each call that `timeout` cut is one attempt that failed, and no other fails: {said}"
+        );
+        if cut == 0 {
+            assert_eq!(self.bounds().len(), 3, "{said}");
+        }
+    }
 }
 
-/// What a stand-in saw of the clock: a bound that `timeout` was given, the end of that call, or a
-/// wait that `sleep` was given, and the seconds since the first thing a stand-in saw when it saw
-/// it.
+/// The status of each attempt that the script reported as failed.
+fn failed_attempts(outcome: &Outcome) -> Vec<i32> {
+    outcome
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("apt-install: attempt ")?;
+            let (_, status) = rest.split_once(" failed, status ")?;
+            Some(status.parse().expect("a status"))
+        })
+        .collect()
+}
+
+/// What a stand-in saw of the clock: a bound that `timeout` was given, the end of that call and
+/// whether `timeout` cut it with TERM or KILL, or a wait that `sleep` was given, and the seconds
+/// since the first thing a stand-in saw when it saw it.
 #[derive(Clone, Copy, Debug)]
 enum Event {
     Bound { at: f64, grace: u32, seconds: u32 },
     Wait { at: f64, seconds: u32 },
-    Ended { at: f64 },
+    Ended { at: f64, cut: bool },
 }
 
 /// Held while a stand-in is written and while a script is started, so that no process is forked
@@ -678,32 +786,34 @@ fn a_call_that_ignores_the_termination_signal_is_killed_inside_the_deadline() {
 /// spent time, which leaves the later calls less than the whole deadline.
 #[test]
 fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
-    // A deadline can run out before the script's last call, or before its first, when the machine
-    // is slow to run it: the script then stops with its failure status and its expiry message,
-    // having run for more than the deadline less 2 s (it stops when under 2 s are left, and counts
-    // whole seconds). That is a valid end for every deadline of this sweep, and a stop sooner than
-    // that is a script that did not use its time. The bounds a run did make are held to the time
-    // left either way.
+    // On a machine that stalls, a call can be held past its term and cut by `timeout` (the term of
+    // each call here is 1 s, or 2 s for a deadline of 12), and a deadline can run out before the
+    // script's last call, or before its first. The script then ends in one of three ways, each
+    // valid at every deadline of this sweep:
+    // - it runs the cut update or download again and ends in success, each attempt it reports
+    //   failed with the status 124 or 137 that a cut gives, and its last phases the update, the
+    //   plan, the download and the install;
+    // - a plan that `timeout` cut ends it at once, with its refusal to plan the install: a plan
+    //   that fails after an update with no warning is taken for a fault of the packages;
+    // - its deadline runs down, with its failure status and its expiry message, after more than the
+    //   deadline less 2 s.
+    // A stop sooner than that, or for another reason, is a script that did not use its time. The
+    // bounds a run did make are held to the time left on every path.
     for deadline in [2_u32, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
         let rig = Rig::new();
         let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
-        let said = format!("{deadline}: {}{}", outcome.stdout, outcome.stderr);
-        match outcome.status {
-            0 => assert_eq!(rig.bounds().len(), 3, "{said}"),
-            1 => {
-                assert!(
-                    outcome.stderr.contains(&format!(
-                        "apt-install: failed: deadline={deadline}s attempts="
-                    )),
-                    "{said}"
-                );
-                assert!(
-                    outcome.elapsed.as_secs_f64() > f64::from(deadline) - 2.0,
-                    "{deadline}: the script stopped after {:?}, with time left: {said}",
-                    outcome.elapsed
-                );
-            }
-            status => panic!("{deadline}: status {status}: {said}"),
+        let context = deadline.to_string();
+        if outcome.status == 0 {
+            rig.assert_the_run_got_past_every_cut(&outcome, &context);
+        } else {
+            rig.assert_the_deadline_ended_the_run(&outcome, deadline, &context);
+        }
+        for status in failed_attempts(&outcome) {
+            assert!(
+                status == 124 || status == 137,
+                "{deadline}: an attempt failed with status {status}, and no call but a cut one fails here: {}",
+                outcome.stdout
+            );
         }
         for (grace, seconds) in rig.bounds() {
             assert!(
