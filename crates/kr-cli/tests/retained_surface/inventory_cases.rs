@@ -312,7 +312,7 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
         "thing! { pub struct S; }\n",
         &[],
         format!(
-            "{at}: thing! is called at item position, is not defined in kr_sender and is not written as one of the macros the scan accepts"
+            "{at}: thing! is called at item position and is not written as one of the macros the scan accepts"
         ),
     );
     // A rename of a name the scan reads hides it: `Method`, the two types, `ActionRight`, a variant, a
@@ -334,7 +334,7 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
     ] {
         let (scan, _) = scanned(&format!("{import}\n"), &[]);
         assert!(
-            matches!(&scan, Err(text) if text.starts_with(&format!("{at}: the scan does not read a use of "))
+            matches!(&scan, Err(text) if text.starts_with(&format!("{at}: the scan does not read "))
                 && text.contains(" under another name (as ")),
             "{import}: {scan:?}"
         );
@@ -342,13 +342,13 @@ fn a_form_the_inventory_does_not_read_is_refused_with_a_text_of_its_own() {
     assert_eq!(
         read_names("use kr_protocol::Method as M;\n", &[]),
         Err(format!(
-            "{at}: the scan does not read a use of Method under another name (as M)"
+            "{at}: the scan does not read Method under another name (as M)"
         ))
     );
     assert_eq!(
         read_names("use kr_protocol::something as Method;\n", &[]),
         Err(format!(
-            "{at}: the scan does not read a use of something under another name (as Method)"
+            "{at}: the scan does not read something under another name (as Method)"
         ))
     );
     // A rename of any other name, and a `use` that renames nothing, are not refused.
@@ -733,7 +733,7 @@ fn a_refused_crate_gives_no_lookup_result_whatever_the_index_holds() {
     for (lib, text) in [
         (
             format!("use kr_protocol::Method as M;\n{existing}"),
-            "crates/kr-sender/src/lib.rs: the scan does not read a use of Method under another name (as M)",
+            "crates/kr-sender/src/lib.rs: the scan does not read Method under another name (as M)",
         ),
         (
             format!("{meta}{existing}"),
@@ -811,7 +811,6 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
         "kr_client::display_as_said!(E);",
         "use tokio::task_local;\ntask_local! { static X: u8; }",
         "use wasmtime::component::bindgen;\nbindgen!({ path: \"x.wit\" });",
-        "use wasmtime::component;\ncomponent::bindgen!({ path: \"x.wit\" });",
         "use schemars::json_schema;\nmacro_rules! schema { () => { json_schema!({}) }; }",
         "macro_rules! schema { () => { schemars::json_schema!({}) }; }",
     ] {
@@ -843,9 +842,15 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
 
 #[test]
 fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
-    let text = |name: &str, position: &str| {
+    // The path the refused call is written with: the one that ends in `name!` in `lib`.
+    let text = |lib: &str, name: &str, position: &str| {
+        let end = lib.find(&format!("{name}!")).expect("the call") + name.len();
+        let start = lib[..end]
+            .rfind(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | ':' | '$')))
+            .map_or(0, |at| at + 1);
         format!(
-            "crates/kr-sender/src/lib.rs: {name}! is called at {position}, is not defined in kr_sender and is not written as one of the macros the scan accepts"
+            "crates/kr-sender/src/lib.rs: {}! is called at {position} and is not written as one of the macros the scan accepts",
+            &lib[start..end]
         )
     };
     for (lib, name, position) in [
@@ -936,6 +941,23 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
             "generate",
             "a transcriber",
         ),
+        // A name that stands for a module gives a qualified call no provider: the path is judged as
+        // written.
+        (
+            "use wasmtime::component;\ncomponent::bindgen!({ path: \"x.wit\" });",
+            "bindgen",
+            "item position",
+        ),
+        (
+            "use wasmtime::component as w;\nw::bindgen!({});",
+            "bindgen",
+            "item position",
+        ),
+        (
+            "use tokio as t;\nt::task_local! { static X: u8; }",
+            "task_local",
+            "item position",
+        ),
         // A macro of the crate's own name behind another crate's path is that crate's macro.
         (
             "macro_rules! mine { () => {}; }\nforeign::mine! {}\n",
@@ -972,8 +994,8 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
         ("trait T { generate!(); }\n", "generate", "item position"),
     ] {
         let (scan, lookup) = scanned(lib, &[]);
-        assert_eq!(scan, Err(text(name, position)), "{lib}");
-        assert_eq!(lookup, Lookup::Failed(text(name, position)), "{lib}");
+        assert_eq!(scan, Err(text(lib, name, position)), "{lib}");
+        assert_eq!(lookup, Lookup::Failed(text(lib, name, position)), "{lib}");
     }
     // A name that another file imports from the accepted provider is not imported here: the call is
     // read as the file that holds it writes it.
@@ -986,7 +1008,7 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
     );
     assert_eq!(
         scan,
-        Err("crates/kr-sender/src/a.rs: json_schema! is called at item position, is not defined in kr_sender and is not written as one of the macros the scan accepts".to_owned())
+        Err("crates/kr-sender/src/a.rs: json_schema! is called at item position and is not written as one of the macros the scan accepts".to_owned())
     );
 }
 
@@ -1141,7 +1163,7 @@ fn a_rename_of_the_name_of_a_macro_that_a_crate_in_scope_defines_is_refused() {
     };
     let renamed = |old: &str, new: &str| {
         Err(format!(
-            "crates/kr-sender/src/lib.rs: the scan does not read a use of {old} under another name (as {new})"
+            "crates/kr-sender/src/lib.rs: the scan does not read {old} under another name (as {new})"
         ))
     };
     // A call through the name a `use` gives the other crate's macro.
@@ -1157,7 +1179,7 @@ fn a_rename_of_the_name_of_a_macro_that_a_crate_in_scope_defines_is_refused() {
     let lib = "use kr_worker::shared as renamed;\nmacro_rules! fwd { ($x:expr) => { renamed!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
     assert_eq!(
         across(lib, "shared"),
-        Err("crates/kr-sender/src/lib.rs: renamed! is called at a transcriber, is not defined in kr_sender and is not written as one of the macros the scan accepts".to_owned())
+        Err("crates/kr-sender/src/lib.rs: renamed! is called at a transcriber and is not written as one of the macros the scan accepts".to_owned())
     );
 }
 
