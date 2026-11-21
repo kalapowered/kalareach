@@ -100,15 +100,32 @@ function run(
 ): {
   readonly result: { readonly current: ReturnType<typeof useLaunchSurface> }
   readonly options: (next: LaunchSurfaceOptions) => void
+  /** Renders again with `next` as the read of the surface, which is null where no view is open. */
+  readonly surface: (
+    next: (() => Promise<LaunchSurfaceReading>) | null,
+    options: LaunchSurfaceOptions
+  ) => void
 } {
+  // Held in an object, so that a read of the surface that becomes null is not narrowed away.
+  const view: { read: (() => Promise<LaunchSurfaceReading>) | null } = { read: surface }
   const { result, rerender } = renderHook(
-    ({ options }: { options: LaunchSurfaceOptions }) => useLaunchSurface(fake, surface, 0, options),
-    { initialProps: { options: first } }
+    ({
+      surface: now,
+      options
+    }: {
+      surface: (() => Promise<LaunchSurfaceReading>) | null
+      options: LaunchSurfaceOptions
+    }) => useLaunchSurface(fake, now, 0, options),
+    { initialProps: { surface: view.read, options: first } }
   )
   return {
     result,
     options: (next) => {
-      rerender({ options: next })
+      rerender({ surface: view.read, options: next })
+    },
+    surface: (next, options) => {
+      view.read = next
+      rerender({ surface: view.read, options })
     }
   }
 }
@@ -408,6 +425,25 @@ describe('when the saved launch commands are read', () => {
     await list.answer(LISTED(['Claude']))
     expect(result.current.list).toEqual(LISTED(['Claude']))
     expect(result.current.listNow()?.commands.map((each) => each.label)).toEqual(['Claude'])
+  })
+
+  it('a_list_kept_while_no_view_is_open_is_not_pressed_against_once_the_list_reader_changes', async () => {
+    const surface = held<LaunchSurfaceReading>()
+    const first = held<LaunchCommandsReading>()
+    const second = held<LaunchCommandsReading>()
+    const { result, surface: withSurface } = run(surface.read, { wake: 0, readList: first.read })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    await surface.answer(SURFACE)
+    await first.answer(LISTED(['Claude']))
+    expect(result.current.listNow()?.commands.map((each) => each.label)).toEqual(['Claude'])
+
+    // The view the surface is read on closes, and the list is read by another reader: with no
+    // surface read, nothing starts the watch over, and what the old reader answered is still held.
+    withSurface(null, { wake: 0, readList: second.read })
+    expect(result.current.list).toBeNull()
+    expect(result.current.listNow()).toBeNull()
   })
 
   it('a_host_that_does_not_serve_the_list_is_asked_no_more_and_nothing_is_said', async () => {
