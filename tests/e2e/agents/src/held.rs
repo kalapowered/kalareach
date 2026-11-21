@@ -2568,10 +2568,13 @@ mod tests {
             executable: executable.map(str::to_owned),
         };
         let rows = [
-            row(70, Some("/private/Users/r/.codex/bin/secret-name/codex")),
-            row(71, Some("/USERS/R/.CODEX/bin/secret-name/codex")),
-            row(72, Some("/Users/r/.codex/bin/secret-name/codex")),
-            row(73, Some("/Users/r/bin/secret-name/codex")),
+            row(
+                70,
+                Some("/private/Users/person/.codex/bin/secret-name/codex"),
+            ),
+            row(71, Some("/USERS/PERSON/.CODEX/bin/secret-name/codex")),
+            row(72, Some("/Users/person/.codex/bin/secret-name/codex")),
+            row(73, Some("/Users/person/bin/secret-name/codex")),
             row(74, None),
         ];
         let found = outside_the_run(&rows, &BTreeSet::new(), 501, "codex");
