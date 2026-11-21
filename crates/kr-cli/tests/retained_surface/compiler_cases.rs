@@ -699,6 +699,36 @@ fn a_token_that_names_a_stamped_item_is_found_in_a_group_a_raw_name_and_a_litera
     );
 }
 
+#[test]
+fn a_return_type_before_a_body_is_no_struct_value_but_a_name_after_a_macros_arrow_is() {
+    let found = tokens(
+        "fn a() -> ActionTarget { build() }\n\
+         fn b() -> p::ActionTarget { build() }\n\
+         fn c() -> ::p::q::ActionTarget { build() }\n\
+         fn d(x: u8) -> &'a mut p::ActionTarget { build() }\n\
+         fn e<T: Into<u8>, F: Fn() -> u8>(x: T) -> p::MutationRequest { build() }\n\
+         fn f() { let _ = || -> p::ActionTarget { build() }; }\n\
+         fn g() { let _ = |x: u8| -> ActionTarget { build() }; }\n\
+         fn h() -> impl Fn(u8) -> p::ActionTarget { build() }\n\
+         fn i() { value!(-> ActionTarget { a: 1 }); }\n\
+         fn j() { value!(-> p::ActionTarget { a: 1 }); }\n\
+         fn k() { value!((x) -> ActionTarget { a: 1 }); }\n\
+         fn l() { value!(a, -> ActionTarget { a: 1 }); }\n\
+         fn m() { value!(| -> ActionTarget { a: 1 }); }\n\
+         fn n() { value!(fn o() -> ActionTarget { build() }); }\n\
+         fn p() { let _ = ActionTarget { a: 1 }; }\n",
+    );
+    // A return type before a body is no struct value, qualified or not, in a function, a closure or a
+    // function type. After an arrow that follows no parameters (the arguments of a macro) the same
+    // tokens are a value, and a function written inside a macro's arguments keeps its return type.
+    assert_eq!(
+        found,
+        [9, 10, 11, 12, 13, 15]
+            .map(|line| ("ActionTarget {".to_owned(), line))
+            .to_vec()
+    );
+}
+
 fn reports_for_refusals() -> (tempfile::TempDir, Meta, Platform) {
     let root = tempfile::tempdir().expect("a folder");
     forms(root.path());

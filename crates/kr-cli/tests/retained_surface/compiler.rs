@@ -1500,8 +1500,49 @@ fn decoded(literal: &proc_macro2::Literal) -> Option<String> {
     }
 }
 
-/// Whether the name at `at` ends the return type of a function (`-> Name`, `-> &Name`, `-> &'a mut Name`):
-/// the brace group after it is the body, not a value of the type.
+/// Whether the group at `group` holds the parameters of a function (`fn name(..)`, `fn name<..>(..)`),
+/// of a function pointer (`fn(..)`) or of an `Fn` bound (`Fn(..)`): the word or the generics before it
+/// say so.
+fn is_parameter_group(trees: &[TokenTree], group: usize) -> bool {
+    let punct = |index: usize, wanted: char| matches!(trees.get(index), Some(TokenTree::Punct(found)) if found.as_char() == wanted);
+    let arrow = |index: usize| punct(index, '>') && index > 0 && punct(index - 1, '-');
+    let word = |index: usize| match trees.get(index) {
+        Some(TokenTree::Ident(word)) => word.to_string(),
+        _ => String::new(),
+    };
+    let Some(mut before) = group.checked_sub(1) else {
+        return false;
+    };
+    if punct(before, '>') && !arrow(before) {
+        // The generics of `fn name<..>(..)`: back to the `<` that opens them.
+        let mut depth = 0_usize;
+        loop {
+            if punct(before, '>') && !arrow(before) {
+                depth += 1;
+            } else if punct(before, '<') {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            let Some(earlier) = before.checked_sub(1) else {
+                return false;
+            };
+            before = earlier;
+        }
+        let Some(name) = before.checked_sub(1) else {
+            return false;
+        };
+        before = name;
+    }
+    matches!(word(before).as_str(), "fn" | "Fn" | "FnMut" | "FnOnce")
+        || (!word(before).is_empty() && before > 0 && word(before - 1) == "fn")
+}
+
+/// Whether the name at `at` ends the return type of a function or a closure (`-> Name`, `-> &'a mut
+/// p::Name`): the brace group after it is the body, not a value of the type. The arrow has to follow
+/// the parameters of a signature or the bars of a closure's parameters; in the arguments of a macro it
+/// is any token, and the group is then a value.
 fn is_return_type(trees: &[TokenTree], at: usize) -> bool {
     let punct = |index: usize, wanted: char| matches!(trees.get(index), Some(TokenTree::Punct(found)) if found.as_char() == wanted);
     let mut back = at;
@@ -1510,10 +1551,34 @@ fn is_return_type(trees: &[TokenTree], at: usize) -> bool {
             TokenTree::Punct(found) if found.as_char() == '&' => back -= 1,
             TokenTree::Ident(word) if word == "mut" => back -= 1,
             TokenTree::Ident(_) if back >= 2 && punct(back - 2, '\'') => back -= 2,
+            TokenTree::Punct(found)
+                if found.as_char() == ':' && back >= 2 && punct(back - 2, ':') =>
+            {
+                // A `::` and the segment before it (a path that starts with `::` has none).
+                back -= 2;
+                if matches!(
+                    back.checked_sub(1).map(|index| &trees[index]),
+                    Some(TokenTree::Ident(_))
+                ) {
+                    back -= 1;
+                }
+            }
             _ => break,
         }
     }
-    back >= 2 && punct(back - 1, '>') && punct(back - 2, '-')
+    let Some(before) = back.checked_sub(3) else {
+        return false;
+    };
+    if !(punct(back - 2, '-') && punct(back - 1, '>')) {
+        return false;
+    }
+    match &trees[before] {
+        TokenTree::Group(parameters) if parameters.delimiter() == Delimiter::Parenthesis => {
+            is_parameter_group(trees, before)
+        }
+        TokenTree::Punct(bar) if bar.as_char() == '|' => (0..before).any(|index| punct(index, '|')),
+        _ => false,
+    }
 }
 
 /// Whether the group at `at` is the brackets of `#[doc = "..."]` or `#![doc = "..."]`, which is what a
