@@ -563,12 +563,6 @@ impl Scheduler {
         }
     }
 
-    /// Returns how many priority jobs have run since an ordinary one did.
-    #[must_use]
-    pub const fn priority_run(&self) -> u32 {
-        self.priority_run
-    }
-
     /// Records that a job finished, however it finished.
     pub const fn record_service(&mut self, duration_ms: u64) {
         self.service_time.record(duration_ms);

@@ -166,7 +166,9 @@ fn a_logical_group_grants_no_transcript_access_and_no_shared_mapping() {
         )
         .expect("the second environment maps");
     assert_eq!(mapping.mapped_environments(), 2);
-    assert!(mapping.accepts_result(first.id(), profile.profile_id(), profile.revision()));
+    assert!(mapping.mapped(first.id()).is_some_and(|mapped| {
+        mapped.profile_id == profile.profile_id() && mapped.revision == profile.revision()
+    }));
     assert!(mapping.unloaded().is_empty());
 }
 
@@ -569,8 +571,12 @@ fn a_replaced_model_is_unloaded_before_another_is_mapped() {
     assert_eq!(mapping.unloaded().len(), 1);
 
     // And a result from the first profile is no longer accepted.
-    assert!(!mapping.accepts_result(environment.id(), first.profile_id(), first.revision()));
-    assert!(mapping.accepts_result(environment.id(), second.profile_id(), second.revision()));
+    assert!(!mapping.mapped(environment.id()).is_some_and(|mapped| {
+        mapped.profile_id == first.profile_id() && mapped.revision == first.revision()
+    }));
+    assert!(mapping.mapped(environment.id()).is_some_and(|mapped| {
+        mapped.profile_id == second.profile_id() && mapped.revision == second.revision()
+    }));
 }
 
 /// KR-REQ-22.10: the defaults are section 22's, and the cost accounted for is not the file size.

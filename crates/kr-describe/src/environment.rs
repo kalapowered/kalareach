@@ -373,23 +373,6 @@ impl ModelMapping {
         }
     }
 
-    /// Returns whether a result produced under a profile revision may still be published.
-    ///
-    /// A result from a revision this environment no longer has mapped is late: the weights that
-    /// produced it are gone, and publishing it would attribute text to a profile this host is not
-    /// running.
-    #[must_use]
-    pub fn accepts_result(
-        &self,
-        environment_id: &EnvironmentId,
-        profile_id: &str,
-        revision: ProfileRevision,
-    ) -> bool {
-        self.mapped
-            .get(environment_id)
-            .is_some_and(|mapped| mapped.profile_id == profile_id && mapped.revision == revision)
-    }
-
     /// Returns every mapping this environment set has unloaded, oldest first.
     #[must_use]
     pub fn unloaded(&self) -> &[MappedModel] {
