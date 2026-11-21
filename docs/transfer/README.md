@@ -721,6 +721,47 @@ destination is refused unless the placement carries the user's explicit overwrit
 exact destination, which is checked again at the publish because a destination can appear while a
 download runs. A writer that is dropped without publishing takes its temporary file with it.
 
+## A phone's uploads to a paired host
+
+The companion application sends a phone's files with `kr-client`'s `uploads::send` on
+`ChunkRoute::network`. Three things are the application's own and are kept in the application's
+data folder, outside any state root.
+
+**The owner of an upload.** An upload outlives the command that starts it. The application's desk
+holds the plan, the progress the driver publishes and the handle that stops it; a command waits on
+the outcome and may be dropped. A connection that ends pauses the upload and the next connection to
+the host resumes it with the same transfer identifier. `uploads_open` reads every open upload (its
+key, state, session, name, size, the chunks acknowledged and the chunks the file has, the driver's
+stage, the handle once published, and the words that say what is wrong); `upload_cancel` reads
+`upload.status` first, never cancels a published upload and answers from the host's answer.
+A device holds at most two open uploads on a host, which is the host's own bound.
+
+**The store of open transfers, version 1.** `open-transfers/<key>.upload` is one JSON entry for each
+upload, with exactly the members it names; `<key>.bytes` is the copy of a file the page handed over.
+The entry is written before the call that needs it: before the reservation is asked for, when the
+transfer identifier is known, and before the finish is sent, so a handle published behind a lost
+answer is still found. A file with another version, a member more or fewer, or a name that is not
+its key is counted and left. A restart reads `upload.status` of each entry before it acts. A
+published upload keeps its handle and is never cancelled; one the host still receives resumes when
+the copy is kept and its digest is the declared one, and otherwise the person is told it cannot
+resume and offers to cancel it; one the host does not know is dropped with its copy. A
+reservation whose answer never came cannot be found again, because the client holds no transfer
+identifier for it: the host keeps the place until its 24-hour sweep, and the person is told so.
+A copy is removed when its upload is published, cancelled or dropped. An older release ignores the
+folder.
+
+**The draft the device keeps.** `<hash>.draft` keeps one draft for each host, principal and session:
+the draft identifier, the last revision and the files bound to it. The draft is made at the first
+bind and never before. Each answer rewrites the kept revision before the next call uses it, and a
+stale revision (`DRAFT_CONFLICT`) is read from the host's own words and the call goes on once. The
+text of the draft is set with `draft.update` at that revision (`draft_set_text`), because the prompt
+that names a draft carries no text of its own, and a prompt that names the draft ends the entry.
+`draft.discard` ends the draft when the composer drops its files unsent (`draft_end`); the host
+cannot take one file off a draft.
+
+The phone's picker hands the application at most 64 MiB (`MAX_HANDED_BYTES`), whatever the host's
+2 GiB bound on one upload.
+
 ## Attachments, drafts and insertion
 
 `upload.finish` returns an `AttachmentHandle`: an opaque, environment-bound identity with the
