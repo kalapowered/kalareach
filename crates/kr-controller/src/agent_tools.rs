@@ -1765,6 +1765,8 @@ impl Installer {
         digest: &Digest256,
         except: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
+        #[cfg(test)]
+        holders_pause::run(path);
         Ok(self
             .claims_on(path, key, except)?
             .into_iter()
@@ -1841,6 +1843,13 @@ impl Installer {
         let Some(text) = self.fs.read_text(path)? else {
             return Ok(None);
         };
+        Self::entry_digest_in(&text, path, key)
+    }
+
+    /// Returns the digest of the server entry under one named key in `text`, the contents of the
+    /// document at `path`: what a removal checks the entry by, from the same read that it takes
+    /// the document's digest and its edit from.
+    fn entry_digest_in(text: &str, path: &Path, key: &str) -> Result<Option<Digest256>> {
         // The format is the one the recorded key names, whatever the document's file name says: a
         // declared document may be called anything.
         if key == Format::CodexToml.key() {
@@ -1853,9 +1862,9 @@ impl Installer {
                 .and_then(|servers| servers.get(SERVER_NAME));
             return Ok(entry.map(|entry| digest_of(entry.to_string().trim().as_bytes())));
         }
-        let document = json::Document::read(&text).map_err(|reason| not_exact(path, &reason))?;
+        let document = json::Document::read(text).map_err(|reason| not_exact(path, &reason))?;
         // A container that is not an object holds no entry of this host's.
-        let Ok(Some(entry)) = document.value_at(&text, &[key, SERVER_NAME]) else {
+        let Ok(Some(entry)) = document.value_at(text, &[key, SERVER_NAME]) else {
             return Ok(None);
         };
         let entry: Value = serde_json::from_str(entry).map_err(|error| {
@@ -1936,7 +1945,12 @@ impl Installer {
         created_document: bool,
         params: &AgentToolsParams,
     ) -> Result<EntryPlan> {
-        let Some(present) = self.entry_digest_under(path, key)? else {
+        // The document is read once: the entry is checked, and the digest and the edit are taken,
+        // from these same bytes, so a change made between two reads is never acted on.
+        let Some(text) = self.fs.read_text(path)? else {
+            return Ok(EntryPlan::Keep("it is already gone".to_owned()));
+        };
+        let Some(present) = Self::entry_digest_in(&text, path, key)? else {
             return Ok(EntryPlan::Keep("it is already gone".to_owned()));
         };
         if present != digest {
@@ -1962,10 +1976,8 @@ impl Installer {
                 params.scope
             )));
         }
+        let replaces = text_digest(Some(text.as_str()));
         Ok(if key == Format::CodexToml.key() {
-            let read = self.fs.read_text(path)?;
-            let replaces = text_digest(read.as_deref());
-            let text = read.unwrap_or_default();
             let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
                 ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
             })?;
@@ -1985,9 +1997,6 @@ impl Installer {
                 replaces,
             }
         } else {
-            let read = self.fs.read_text(path)?;
-            let replaces = text_digest(read.as_deref());
-            let text = read.unwrap_or_default();
             // Only the entry the record names, the one member it spliced in. In a document this
             // host created, whose container it made too, the container goes with the entry when
             // nothing else is left in it; in anybody else's the container stays, as the TOML table
@@ -3250,6 +3259,43 @@ fn entry_command_of(running: Option<&kr_ipc::install::Running>) -> String {
     running
         .and_then(|running| running.stable_if_present(kr_ipc::install::Program::Kr))
         .map_or_else(|| "kr".to_owned(), |path| display(&path))
+}
+
+/// What the unit tests run when a removal asks which records hold an entry, after it has read the
+/// document and before it goes on from that read, to make the change another process could make in
+/// between. `once(skip, then)` runs `then` at the call after `skip` calls have passed.
+#[cfg(test)]
+mod holders_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static AT: RefCell<Option<(usize, Then)>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    pub(super) fn once(skip: usize, then: impl FnOnce(&Path) + 'static) {
+        AT.with(|at| *at.borrow_mut() = Some((skip, Box::new(then))));
+    }
+
+    pub(super) fn run(path: &Path) {
+        let due = AT.with(|at| {
+            let mut at = at.borrow_mut();
+            match at.take() {
+                Some((0, then)) => Some(then),
+                Some((left, then)) => {
+                    *at = Some((left - 1, then));
+                    None
+                }
+                None => None,
+            }
+        });
+        if let Some(then) = due {
+            then(path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7765,6 +7811,35 @@ mod tests {
         assert!(
             !installer.record_path(&params).exists(),
             "and the record goes with the entry"
+        );
+    }
+
+    /// KR-REQ-11.01: the entry a removal checks and the document it edits are one read: an entry that
+    /// another process changes after the check, while the removal asks which records hold it, is not
+    /// removed by the edit, whatever it has become.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_changed_after_it_was_checked_is_not_removed_by_the_edit_made_from_the_same_read() {
+        let tree = Tree::create();
+        let amp_folder = tree.home().join(".amp");
+        std::fs::create_dir_all(amp_folder.join("skills")).expect("the folders are there before");
+        let document = amp_folder.join("mcp.json");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        let recorded = std::fs::read_to_string(&document).expect("the document");
+        let changed = recorded.replace("/opt/kalareach/kr", "/usr/local/bin/kr");
+        let at = document.clone();
+        // The first call is the check before the marker, the second the removal's own read at the
+        // document's turn.
+        holders_pause::once(1, move |_| {
+            std::fs::write(&at, changed).expect("another process changes the entry");
+        });
+        let _ = installer.remove(&params(amp(), InstallScope::User));
+        let text = std::fs::read_to_string(&document).expect("the document stays");
+        assert!(
+            text.contains("/usr/local/bin/kr"),
+            "the entry another process changed is not removed: {text}"
         );
     }
 
