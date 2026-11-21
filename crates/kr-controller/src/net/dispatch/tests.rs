@@ -2441,10 +2441,10 @@ fn voicing_connection(
     (connection, kept)
 }
 
-/// A daemon whose session's worker answers the privacy notice at once and no read, which is the
-/// world of a voice call's context: the context is read from the daemon's own stores and the
-/// worker's session read, and the tick's notice does not hold the worker's one link while a read
-/// waits for it.
+/// A daemon whose session's worker answers the privacy notice at once and the daemon's own
+/// `session.read`, and refuses every forwarded read, which is the world of a voice call's context:
+/// the context is read from the daemon's own stores and the worker's session read, and the tick's
+/// notice does not hold the worker's one link while a read waits for it.
 async fn worker_for_a_voice_call() -> crate::service::a_close_a_worker_never_answers::Silent {
     use crate::service::a_close_a_worker_never_answers as fake;
 
@@ -2808,9 +2808,9 @@ async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes
 }
 
 /// KR-REQ-24.28: a context read while privacy mode is on that is stopped once its state was taken
-/// is not sent when privacy mode goes off and the context is read in that state, and goes on again
-/// before the answer is written: the context holds what the later state produced, which the second
-/// removal takes.
+/// is not sent when privacy mode goes off, the context is read in that state, and privacy mode goes
+/// on again before the answer is written: the successful context comes from the intervening state,
+/// and the writer refuses it because the state it was held to no longer stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_voice_context_read_in_the_state_between_two_changes_is_refused_when_the_mode_is_on_again_before_it_is_sent()
  {
