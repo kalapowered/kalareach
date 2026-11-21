@@ -698,7 +698,7 @@ pub struct ReadKey {
 /// the session the read went over, so the caller drops it after the call and not under the owner.
 pub struct Ticket {
     choice: u64,
-    session: Arc<Session>,
+    session: Held<Arc<Session>>,
     generation: u64,
     serial: u64,
     kind: ReadKind,
@@ -708,8 +708,8 @@ pub struct Ticket {
 impl Ticket {
     /// The session the read goes over.
     #[must_use]
-    pub const fn session(&self) -> &Arc<Session> {
-        &self.session
+    pub fn session(&self) -> &Arc<Session> {
+        self.session.get()
     }
 
     /// What the read's answer is valid under.
@@ -1120,7 +1120,7 @@ impl ContactOwner {
             };
         Ok(Ticket {
             choice: state.choice,
-            session,
+            session: Held::new(session),
             generation,
             serial,
             kind,
@@ -1143,7 +1143,7 @@ impl ContactOwner {
                 .and_then(|key| state.hosts.get(&key))
                 .map_or(0, |record| record.generation);
             if state.choice != ticket.choice
-                || !state.holds(&ticket.session)
+                || !state.holds(ticket.session.get())
                 || generation != ticket.generation
             {
                 return Finish::Superseded;
@@ -2567,6 +2567,23 @@ mod tests {
             drop(adopted);
         });
         assert_eq!(counted, 0, "E7b");
+
+        // E8: a read that clears the host's stored read, and one that is superseded after its
+        // connection was replaced.
+        let counted = dropped_under_the_guard(|| {
+            let owner = ContactOwner::new();
+            let (_choice, first) = reaching_paired(&owner, 1);
+            owner.plant(host(1), connection(10).0, connection(11).0);
+            let ticket = owner.read_started(ReadKind::Contact).expect("held");
+            drop(owner.read_finished(&ticket, refused_read()));
+            let ticket = owner.read_started(ReadKind::Contact).expect("held");
+            let (two, _) = connection(2);
+            let events = two.session().events();
+            drop(owner.replaced(&first, two, events));
+            drop(owner.read_finished(&ticket, ReadOutcome::Answered));
+            drop(ticket);
+        });
+        assert_eq!(counted, 0, "E8");
     }
 
     /// A paired host chosen and reached: its choice, its session and the flag that says it closed.
@@ -2706,5 +2723,31 @@ mod tests {
             matches!(owner.snapshot().contact, HostContact::Refused { .. }),
             "the contact read that began first still writes its refusal"
         );
+    }
+
+    #[tokio::test]
+    async fn read_finished_takes_the_ticket_by_reference_and_the_caller_drops_it_outside_the_guard()
+    {
+        let owner = ContactOwner::new();
+        let (_choice, first) = reaching_paired(&owner, 1);
+        let ticket = owner.read_started(ReadKind::Contact).expect("held");
+        // The connection the read went over is replaced and let go: the ticket holds its session.
+        let (second, _) = connection(2);
+        let events = second.session().events();
+        drop(owner.replaced(&first, second, events));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        let counted = dropped_under_the_guard(|| {
+            let finished = owner.read_finished(&ticket, ReadOutcome::Answered);
+            assert_eq!(finished.value, Finish::Superseded);
+            drop(finished);
+        });
+        assert_eq!(counted, 0, "the finish drops nothing under the guard");
+        assert!(
+            weak.upgrade().is_some(),
+            "the ticket still holds the session its read went over"
+        );
+        let counted = dropped_under_the_guard(|| drop(ticket));
+        assert_eq!(counted, 0, "the caller drops it outside the guard");
     }
 }
