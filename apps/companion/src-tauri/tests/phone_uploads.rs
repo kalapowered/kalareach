@@ -2924,6 +2924,84 @@ async fn kr_req_13_12_a_send_is_not_resumed_on_a_connection_of_another_account()
     adopted.stop().await;
 }
 
+/// Lets the threads held at a point go on when the case ends, so that a case that fails first leaves
+/// no thread held.
+struct LetsGo(Arc<testing::Hold>);
+
+impl Drop for LetsGo {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// KR-REQ-13.12: a cancel by another account of an upload whose sender has not yet kept its entry
+/// marks nothing: the upload is not recorded as cancelled, the cancel is answered as for an upload
+/// the account does not have, and the upload goes on and is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cancel_by_another_account_before_the_entry_is_kept_marks_nothing() {
+    use kr_client::services::AccountMark;
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let now = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..paired
+    };
+    let key = kr_ipc::new_uuid();
+    let first_line = testing::hold_at(key, Point::SenderStarting);
+    let _letting_go = LetsGo(Arc::clone(&first_line));
+    let bytes = pattern(3);
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, earlier) = (Arc::clone(&desk), earlier.clone());
+        tokio::spawn(async move { desk.send(earlier, sent).await })
+    };
+    until("the sender is at its first line", || {
+        first_line.passed() >= 1
+    })
+    .await;
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "the sender has kept no entry yet"
+    );
+
+    let cancelling = {
+        let desk = Arc::clone(&desk);
+        let who = now.who();
+        tokio::spawn(async move { desk.cancel(who, None, key).await })
+    };
+    until("the cancel is answered or has marked the upload", || {
+        cancelling.is_finished() || desk.is_cancelled(key)
+    })
+    .await;
+    assert!(
+        !desk.is_cancelled(key),
+        "a cancel by another account marks nothing"
+    );
+    let answer = cancelling.await.expect("the task ran");
+    assert_eq!(
+        answer.err().map(|error| error.message),
+        Some(companion_tauri::open_transfers::NO_OPEN_UPLOAD.to_owned()),
+        "the cancel is answered as for an upload the account does not have"
+    );
+
+    first_line.release();
+    let published = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the upload ends")
+        .expect("the task ran");
+    assert!(published.is_ok(), "the upload goes on: {published:?}");
+    adopted.stop().await;
+}
+
 /// `count` uploads of `earlier` hold that many of the device's places on the host and are paused, and
 /// the phone has made a connection that is not theirs. Answers that connection.
 async fn places_held_by(
