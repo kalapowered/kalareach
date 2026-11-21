@@ -245,7 +245,7 @@ fn the_description_process_runs_the_real_model() {
         |_, driver| driver.service().in_flight() == 1,
     );
     std::thread::sleep(Duration::from_millis(500));
-    driver.service().cancel_running(&session(2));
+    driver.service().handles().running.cancel(&session(2));
     let asked = Instant::now();
     let reports = run_until(
         &mut driver,
