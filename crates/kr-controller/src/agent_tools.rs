@@ -6744,6 +6744,14 @@ mod tests {
                 .all(|operation| !operation.path().ends_with("SKILL.md")),
             "it is not counted as removed"
         );
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|line| line.ends_with("kalareach-contact is not empty")),
+            "the folder the file is in is kept, in the words of the act: {:?}",
+            result.retained
+        );
     }
 
     /// KR-REQ-11.01: a file another process edits in place after the removal read it is kept, and
@@ -7890,6 +7898,32 @@ mod tests {
                 .any(|note| note.ends_with("kalareach-contact is not empty")),
             "{:?}",
             removed.retained
+        );
+    }
+
+    /// KR-REQ-11.01: a folder that the installation made, whose holder its owner alone can
+    /// change but not write, is emptied and then cannot be removed: the removal says so with an
+    /// error, after the files have gone, and the folder stays.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_whose_holder_does_not_let_its_owner_write_stops_the_removal_with_an_error() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let holder = tree.home().join(".amp/skills");
+        set_mode(&holder, 0o500);
+        let refused = installer.remove(&params(amp(), InstallScope::User));
+        set_mode(&holder, 0o700);
+        assert!(
+            matches!(refused, Err(ControllerError::Storage { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            !tree.home().join(SKILL_FILE).exists(),
+            "the files were taken before the folder was tried"
+        );
+        assert!(
+            holder.join("kalareach-contact").exists(),
+            "and the folder stays"
         );
     }
 
