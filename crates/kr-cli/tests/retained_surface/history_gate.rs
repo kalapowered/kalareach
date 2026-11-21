@@ -583,7 +583,8 @@ fn the_reader_reads_every_release_tag_with_a_scratch_entry() {
 fn the_inventory_holds_each_file_the_compiler_read() {
     let messages = std::env::var_os("KR_BUILD_MESSAGES")
         .expect("KR_BUILD_MESSAGES names the file with the build's messages");
-    let repository = super::repository();
+    // The files are compared by their canonical paths, the checkout's too.
+    let repository = std::fs::canonicalize(super::repository()).expect("this checkout");
     let tree = Tree::at(&repository).expect("this checkout is read");
     let known = tree
         .product_files(&|krate| reads_at_head(krate))
