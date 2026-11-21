@@ -198,16 +198,32 @@ export class ChannelShelf {
     await this.#port.deviceChannelHoldCreate(request)
   }
 
-  /** Removes one message, or every message of a session, and reads the shelf again. */
+  /**
+   * Removes the messages with these identities, and no others, and reads the shelf again, after a
+   * refusal too: a removal can fail after the file went, so the shelf shows what is on disk. That
+   * read is not an answer to the removal: a refused removal is still rejected, and the list that
+   * shows the file gone does not say the removal was made durable.
+   */
   async remove(removal: ChannelMessageRemoval): Promise<number> {
-    const done = await this.#port.deviceChannelMessageRemove(removal)
+    let done: { readonly removed: number }
+    try {
+      done = await this.#port.deviceChannelMessageRemove(removal)
+    } catch (failure) {
+      await this.refresh()
+      throw failure
+    }
     await this.refresh()
     return done.removed
   }
 
-  /** Removes a record of a send, whatever it holds, and reads the shelf again. */
+  /** Removes a record of a send, whatever it holds, and reads the shelf again, after a refusal too (see [`remove`]). */
   async clearHold(holdId: string): Promise<void> {
-    await this.#port.deviceChannelHoldClear({ holdId })
+    try {
+      await this.#port.deviceChannelHoldClear({ holdId })
+    } catch (failure) {
+      await this.refresh()
+      throw failure
+    }
     await this.refresh()
   }
 

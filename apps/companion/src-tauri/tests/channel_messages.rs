@@ -1394,6 +1394,49 @@ fn a_damaged_record_is_listed_by_its_name_and_a_later_one_is_left_alone() {
     );
 }
 
+/// KR-REQ-12.26: a removal or a clear whose flush is refused has already removed the file. The call
+/// fails, the file is gone, and the next listing does not show it: the failure says the removal is
+/// not confirmed, not that nothing changed.
+#[test]
+fn a_removal_or_clear_that_fails_after_the_file_went_leaves_the_file_gone() {
+    let data = data();
+    let window = Window::over(data.path());
+    window.keep(message(1, "one", &[])).expect("kept");
+    window.create_hold("hold-a", &[]).expect("made");
+    let message_file = dir(data.path()).join(format!("{}.message", action(1)));
+    let hold_file = dir(data.path()).join("hold-a.held");
+    assert!(message_file.exists(), "the message is on disk");
+    assert!(hold_file.exists(), "the record is on disk");
+    {
+        let _guard = kr_flush::testing::refuse_flushes_of(dir(data.path()));
+        let refusal = window
+            .call(
+                "device_channel_message_remove",
+                json!({ "actionIds": [action(1)] }),
+            )
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        assert!(
+            !message_file.exists(),
+            "the file went before the flush was refused"
+        );
+        let refusal = window
+            .call("device_channel_hold_clear", json!({ "holdId": "hold-a" }))
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+        assert!(
+            !hold_file.exists(),
+            "the record went before the flush was refused"
+        );
+    }
+    let list = window.list();
+    assert!(
+        messages(&list).is_empty(),
+        "the next listing does not show the message: {list}"
+    );
+    assert_eq!(list["holds"], json!([]), "nor the record: {list}");
+}
+
 /// KR-REQ-12.26: removals and a clear whose folder cannot be flushed fail, and a clear of an absent
 /// record fails until a flush succeeds.
 #[test]

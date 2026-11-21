@@ -100,6 +100,7 @@ export class FakeChannelMessageStore {
   #unavailable = false
   #withoutRepair = false
   #refuseHoldWrites: { code: string; message: string } | null = null
+  #refuseRemovals: { code: string; message: string; afterUnlink: boolean } | null = null
   #ledger: 'ok' | 'unreadable' | 'damaged' = 'ok'
   #refuseListings: { code: string; message: string } | null = null
   #refuseSetAside: { code: string; message: string } | null = null
@@ -173,6 +174,15 @@ export class FakeChannelMessageStore {
   /** Makes every write of a record of a send refuse with `refusal` until it is cleared. */
   refuseHoldWrites(refusal: { code: string; message: string } | null): void {
     this.#refuseHoldWrites = refusal
+  }
+
+  /**
+   * Makes every removal of a message or a record refuse with `refusal` until it is cleared. With
+   * `afterUnlink` the file goes first and the flush of the folder is what fails, as native code can
+   * leave it: the call fails and the file is gone.
+   */
+  refuseRemovals(refusal: { code: string; message: string } | null, afterUnlink = false): void {
+    this.#refuseRemovals = refusal === null ? null : { ...refusal, afterUnlink }
   }
 
   /** Makes the list of removals unreadable now, damaged (the state a person can set aside), or readable again. */
@@ -329,6 +339,8 @@ export class FakeChannelMessageStore {
     if (request.actionIds.length === 0 || request.actionIds.length > this.#limits.entries) {
       refuse('INVALID_ARGUMENT', 'name the messages to remove, and no more than a device keeps')
     }
+    const refusal = this.#refuseRemovals
+    if (refusal !== null && !refusal.afterUnlink) refuse(refusal.code, refusal.message)
     const named = new Set(request.actionIds)
     let removed = 0
     for (const entry of [...this.#entries.values()]) {
@@ -337,6 +349,7 @@ export class FakeChannelMessageStore {
       removed += 1
     }
     this.#write()
+    if (refusal !== null) refuse(refusal.code, refusal.message)
     return { removed }
   }
 
@@ -364,9 +377,12 @@ export class FakeChannelMessageStore {
   clearHold(request: { readonly holdId: string }): void {
     this.calls.push({ kind: 'hold-clear' })
     if (this.#refuseHoldWrites) refuse(this.#refuseHoldWrites.code, this.#refuseHoldWrites.message)
+    const refusal = this.#refuseRemovals
+    if (refusal !== null && !refusal.afterUnlink) refuse(refusal.code, refusal.message)
     this.#holds.delete(request.holdId)
     this.#damagedHolds = this.#damagedHolds.filter((name) => name !== request.holdId)
     this.#write()
+    if (refusal !== null) refuse(refusal.code, refusal.message)
   }
 
   /**

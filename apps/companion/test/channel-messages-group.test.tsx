@@ -749,7 +749,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     of.messages.refuseHoldWrites({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
     await person.click(within(record).getByTestId('channel-hold-remove'))
     await person.click(within(record).getByTestId('channel-hold-remove'))
-    expect(await screen.findByText(/This device could not remove this record now\. It is still in place\. /)).toBeVisible()
+    expect(await screen.findByText(/This device could not remove this record now\. It may still be in place\. /)).toBeVisible()
     expect(of.messages.allHolds().map((each) => each.holdId)).toEqual(['hold-stays'])
     expect(screen.getByTestId('channel-hold')).toBeVisible()
   })
@@ -769,7 +769,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     const first = (await screen.findAllByTestId('channel-message'))[0]
     await person.click(within(first).getByTestId('channel-message-remove'))
     await person.click(within(first).getByTestId('channel-message-remove'))
-    expect(await screen.findByText(/This device could not remove this message now\. It is still in place\. /)).toBeVisible()
+    expect(await screen.findByText(/This device could not remove this message now\. It may still be in place\. /)).toBeVisible()
     const all = screen.getByTestId('channel-session-remove-all')
     await person.click(all)
     await person.click(all)
@@ -777,6 +777,61 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
       await screen.findByText(/This device could not remove all of these messages now\. Some of them may still be in place\. /)
     ).toBeVisible()
     expect(of.messages.all()).toHaveLength(2)
+  })
+
+  it('K10f says a removal that failed after the file went may still be in place, and reads the list again', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    keepMessage(of, { text: 'gone before the flush failed' })
+    startOver(of)
+    const message = await screen.findByTestId('channel-message')
+    of.messages.refuseRemovals({ code: 'RESOURCE_UNAVAILABLE', message: 'the folder could not be flushed' }, true)
+    const listed = asked(of, 'list')
+    await person.click(within(message).getByTestId('channel-message-remove'))
+    await person.click(within(message).getByTestId('channel-message-remove'))
+    await waitFor(() => {
+      expect(
+        screen.queryByText(
+          'This device could not remove this message now. It may still be in place. the folder could not be flushed'
+        )
+      ).not.toBeNull()
+    })
+    // The file went before the flush failed: nothing is left, and the page read the list again and shows that.
+    expect(of.messages.all()).toHaveLength(0)
+    await waitFor(() => {
+      expect(screen.queryByTestId('channel-message')).toBeNull()
+    })
+    expect(asked(of, 'list')).toBeGreaterThan(listed)
+    expect(asked(of, 'remove')).toBe(1)
+  })
+
+  it('K10g says a record removed before its flush failed may still be in place, keeps the row, and reads the list again', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    keepHold(of, MAIN, 'hold-unknown')
+    const { states } = startOver(of)
+    const record = await screen.findByTestId('channel-hold')
+    act(() => {
+      states().update(MAIN, (current) => ({ ...current, submissions: [rowFor('hold-unknown', 'unknown')] }))
+    })
+    of.messages.refuseRemovals({ code: 'RESOURCE_UNAVAILABLE', message: 'the folder could not be flushed' }, true)
+    const listed = asked(of, 'list')
+    await person.click(within(record).getByTestId('channel-hold-remove'))
+    await person.click(within(record).getByTestId('channel-hold-remove'))
+    await waitFor(() => {
+      expect(
+        screen.queryByText(
+          'This device could not remove this record now. It may still be in place. the folder could not be flushed'
+        )
+      ).not.toBeNull()
+    })
+    expect(of.messages.allHolds()).toHaveLength(0)
+    await waitFor(() => {
+      expect(screen.queryByTestId('channel-hold')).toBeNull()
+    })
+    expect(asked(of, 'list')).toBeGreaterThan(listed)
+    // A list that no longer shows the record is not the answer of a removal that was refused: the row stays.
+    expect(states().submissionsOf(MAIN).map((row) => row.holdId)).toEqual(['hold-unknown'])
   })
 
   it('K10c shows the warning from 900 records and not at 899', async () => {
