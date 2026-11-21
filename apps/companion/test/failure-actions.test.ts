@@ -270,36 +270,54 @@ describe('a refusal that says its own wait, and every stop of the lease', () => 
     }
   })
 
-  it('is read the same inside the inbox’s answer, where a host’s refusal is a failure in a result', async () => {
+  it('keeps the action text of the refusal of another host, as native code sent it', async () => {
     const rows = sent.filter((one) => one.surface === 'inbox')
     expect(rows.length).toBeGreaterThanOrEqual(5)
+    const stated = (others: readonly unknown[]) => ({
+      rejects: false,
+      value: {
+        connected: true,
+        environment_id: null,
+        reason: null,
+        rights: null,
+        paired: true,
+        replaced: 0,
+        revision: 5,
+        link: 1,
+        host: { kind: 'paired', reference: 'studio', name: 'studio' },
+        contact: { state: 'in_contact' },
+        inbox_epoch: 1,
+        others
+      }
+    })
     for (const one of rows) {
-      bridge.answers.set('inbox_hosts', {
-        rejects: false,
-        value: [
+      bridge.answers.set(
+        'connection_state',
+        stated([
           {
+            reference: 'laptop',
             name: 'laptop',
-            state: 'refused',
-            read_at_ms: null,
-            lost_since_ms: null,
-            refusal: native(one.code, one.message, one.user_action),
-            refused_request: null,
-            result: null,
-            sessions: []
+            contact: {
+              state: 'refused',
+              refusal: native(one.code, one.message, one.user_action),
+              request: 'attention_read'
+            },
+            inbox_epoch: 3
           }
-        ]
-      })
-      const [host] = await tauriPort().inboxHosts()
-      expect(host?.name, one.name).toBe('laptop')
-      expect(failureMessage(host?.refusal), one.name).toBe(one.page)
-      expect(Object.keys(host?.refusal ?? {}).sort(), one.name).toEqual(['code', 'line', 'message', 'retry'])
+        ])
+      )
+      const contact = (await tauriPort().connectionState()).others[0]?.contact
+      expect(contact?.state, one.name).toBe('refused')
+      const refusal = contact?.state === 'refused' ? contact.refusal : undefined
+      expect(failureMessage(refusal), one.name).toBe(one.page)
+      expect(Object.keys(refusal ?? {}).sort(), one.name).toEqual(['code', 'line', 'message', 'retry'])
     }
     // A host that did not refuse has no failure to convert.
-    bridge.answers.set('inbox_hosts', {
-      rejects: false,
-      value: [{ name: 'laptop', state: 'read', refusal: null, sessions: [] }]
-    })
-    expect((await tauriPort().inboxHosts())[0]?.refusal).toBeNull()
+    bridge.answers.set(
+      'connection_state',
+      stated([{ reference: 'laptop', name: 'laptop', contact: { state: 'in_contact' }, inbox_epoch: 3 }])
+    )
+    expect((await tauriPort().connectionState()).others[0]?.contact.state).toBe('in_contact')
   })
 
   it('is read the same inside a call’s closure, where the host’s failure to take the stop is a result', async () => {

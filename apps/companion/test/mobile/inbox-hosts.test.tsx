@@ -17,7 +17,7 @@ import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
-import type { HostError, HostInbox, HostPort, HostRow, RefusedRequest } from '../../src/host/port'
+import type { HostError, HostInbox, HostPort, HostRow, OtherHost, RefusedRequest } from '../../src/host/port'
 import { receivedFailure } from '../../src/host/tauri'
 import { MobileApp } from '../../src/mobile/MobileApp'
 import capacityRefusals from '../fixtures/capacity-refusals.json'
@@ -75,16 +75,26 @@ function inboxOf(items: AttentionItem[]): AttentionReadResult {
   }
 }
 
-/** What a visit finds of the laptop when it answers, holding one thing to review and one decision. */
-function laptopRead(): HostInbox {
+/** What a pass answers for the laptop, and how the connection's state says contact with it stands. */
+interface Found {
+  readonly row: HostInbox
+  readonly other: OtherHost
+}
+
+/** Tells the scripted host what a pass finds and what the connection's state says of each host. */
+function find(controls: FakeHostControls, founds: readonly Found[]): void {
+  controls.setInboxHosts(founds.map((each) => each.row))
+  controls.setOtherHosts(founds.map((each) => each.other))
+}
+
+/** The inbox native code holds of the laptop: one thing to review and one decision. */
+function laptopRows(): HostInbox {
   return {
     reference: LAPTOP.reference,
     name: 'laptop',
-    state: 'read',
+    inbox_epoch: 3,
+    read_serial: 7,
     read_at_ms: Date.now(),
-    lost_since_ms: null,
-    refusal: null,
-    refused_request: null,
     result: inboxOf([
       item({
         key: 'attention.pending_approval|~laptop-1',
@@ -103,45 +113,58 @@ function laptopRead(): HostInbox {
   }
 }
 
-function lostLaptop(sinceMs: number): HostInbox {
+/** What a visit finds of the laptop when it answers. */
+function laptopRead(): Found {
   return {
-    reference: LAPTOP.reference,
-    name: 'laptop',
-    state: 'out_of_contact',
-    read_at_ms: null,
-    lost_since_ms: sinceMs,
-    refusal: null,
-    refused_request: null,
-    result: null,
-    sessions: []
+    row: laptopRows(),
+    other: { reference: LAPTOP.reference, name: 'laptop', contact: { state: 'in_contact' }, inbox_epoch: 3 }
+  }
+}
+
+/** The laptop out of contact since `sinceMs`: what it last held is kept, dated, as native code keeps it. */
+function lostLaptop(sinceMs: number): Found {
+  return {
+    row: { ...laptopRows(), read_at_ms: sinceMs - 60_000 },
+    other: {
+      reference: LAPTOP.reference,
+      name: 'laptop',
+      contact: { state: 'out_of_contact', since_ms: sinceMs, escalates_at_ms: sinceMs + 3_600_000 },
+      inbox_epoch: 3
+    }
   }
 }
 
 /**
- * What a visit finds of the laptop when it answers and refuses: the host is in contact. The request
- * it refused is the inbox's unless the case says another.
+ * What a visit finds of the laptop when it answers and refuses: the host is in contact, and native
+ * code holds no inbox of it. The request it refused is the inbox's unless the case says another.
  */
 function refusingLaptop(
   refusal: HostError,
   request: RefusedRequest = 'attention_read'
-): HostInbox {
+): Found {
   return {
-    reference: LAPTOP.reference,
-    name: 'laptop',
-    state: 'refused',
-    read_at_ms: null,
-    lost_since_ms: null,
-    refusal,
-    refused_request: request,
-    result: null,
-    sessions: []
+    row: {
+      reference: LAPTOP.reference,
+      name: 'laptop',
+      inbox_epoch: 4,
+      read_serial: null,
+      read_at_ms: null,
+      result: null,
+      sessions: []
+    },
+    other: {
+      reference: LAPTOP.reference,
+      name: 'laptop',
+      contact: { state: 'refused', refusal, request },
+      inbox_epoch: 4
+    }
   }
 }
 
 function start(): { controls: FakeHostControls } {
   const { port, controls } = fakeHost()
   controls.setPairing({ hosts: [STUDIO, LAPTOP] })
-  controls.setInboxHosts([laptopRead()])
+  find(controls, [laptopRead()])
   render(
     <AppProvider port={port}>
       <MobileApp surface="ios" storage={null} />
@@ -183,7 +206,7 @@ describe('the inbox of a phone paired with two hosts', () => {
     await waitFor(() => {
       expect(rowsOf('laptop')).toHaveLength(2)
     })
-    controls.setInboxHosts([lostLaptop(Date.now() - 5 * 60_000)])
+    find(controls, [lostLaptop(Date.now() - 5 * 60_000)])
     readNow()
     const contact = await screen.findByTestId('inbox-contact')
     expect(contact).toHaveAttribute('data-kind', 'disconnected')
@@ -209,7 +232,7 @@ describe('the inbox of a phone paired with two hosts', () => {
     // The count of hosts out of contact, as it stands while the laptop answers: the host in use
     // lists one of its own.
     const outBefore = screen.getByRole('button', { name: /^Out of contact \(/ }).textContent
-    controls.setInboxHosts([
+    find(controls, [
       refusingLaptop(
         receivedFailure({
           code: 'PERMISSION_DENIED',
@@ -261,7 +284,7 @@ describe('the inbox of a phone paired with two hosts', () => {
       ['attention_read', 'laptop refused to show its inbox']
     ]
     for (const [request, title] of cases) {
-      controls.setInboxHosts([refusingLaptop(lapsed, request)])
+      find(controls, [refusingLaptop(lapsed, request)])
       readNow()
       await waitFor(() => {
         expect(screen.getByTestId('inbox-refusal')).toHaveAttribute('data-refused', request)
@@ -287,7 +310,7 @@ describe('the inbox of a phone paired with two hosts', () => {
       await waitFor(() => {
         expect(rowsOf('laptop')).toHaveLength(2)
       })
-      controls.setInboxHosts([
+      find(controls, [
         refusingLaptop(
           receivedFailure({
             code: sent.code,
@@ -313,7 +336,7 @@ describe('the inbox of a phone paired with two hosts', () => {
     await waitFor(() => {
       expect(rowsOf('laptop')).toHaveLength(2)
     })
-    controls.setInboxHosts([
+    find(controls, [
       refusingLaptop(
         receivedFailure({
           code: 'RESOURCE_UNAVAILABLE',
@@ -339,7 +362,7 @@ describe('the inbox of a phone paired with two hosts', () => {
     await waitFor(() => {
       expect(rowsOf('laptop')).toHaveLength(2)
     })
-    controls.setInboxHosts([
+    find(controls, [
       refusingLaptop(
         receivedFailure({
           code: 'PERMISSION_DENIED',
@@ -352,7 +375,7 @@ describe('the inbox of a phone paired with two hosts', () => {
     readNow()
     // The host's words run into the next sentence only after a full stop.
     expect(await screen.findByTestId('inbox-refusal')).toHaveTextContent('not for this device. It answered')
-    controls.setInboxHosts([laptopRead()])
+    find(controls, [laptopRead()])
     readNow()
     await waitFor(() => {
       expect(screen.queryByTestId('inbox-refusal')).toBeNull()
@@ -451,7 +474,7 @@ describe('the inbox of a phone paired with two hosts', () => {
       ),
       laptopRead()
     ]) {
-      controls.setInboxHosts([stale])
+      find(controls, [stale])
       readNow()
       await waitFor(() => {
         expect(rowsOf('studio').length).toBeGreaterThan(0)
@@ -467,7 +490,7 @@ describe('the inbox of a phone paired with two hosts', () => {
   it('starts the first pass of the other hosts when the registration completes, not before', async () => {
     const { port, controls } = fakeHost()
     controls.setPairing({ hosts: [STUDIO, LAPTOP] })
-    controls.setInboxHosts([laptopRead()])
+    find(controls, [laptopRead()])
     let passes = 0
     const counting: HostPort = {
       ...port,
@@ -497,7 +520,7 @@ describe('the inbox of a phone paired with two hosts', () => {
   it('says it is reading until the host in use has answered, though another host has', async () => {
     const { port, controls } = fakeHost()
     controls.setPairing({ hosts: [STUDIO, LAPTOP] })
-    controls.setInboxHosts([laptopRead()])
+    find(controls, [laptopRead()])
     // The host in use has not answered: its inbox read is held.
     const held = controls.hold('attentionRead')
     render(
@@ -510,7 +533,7 @@ describe('the inbox of a phone paired with two hosts', () => {
     })
     // The laptop's rows are listed, so the list is not empty; with them gone it would not say it is
     // empty either, since the host in use has not been heard.
-    controls.setInboxHosts([{ ...laptopRead(), result: inboxOf([]), sessions: [] }])
+    find(controls, [{ ...laptopRead(), row: { ...laptopRows(), result: inboxOf([]), sessions: [] } }])
     readNow()
     await waitFor(() => {
       expect(rowsOf('laptop')).toHaveLength(0)

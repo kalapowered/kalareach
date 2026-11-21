@@ -841,29 +841,34 @@ export interface NumberedSession {
  */
 export type RefusedRequest = 'connection' | 'host_info' | 'session_open' | 'attention_read'
 
-/** What one visit to a paired host that is not the one in use found of its inbox. */
+/**
+ * The inbox native code holds of a paired host that is not the one in use. How contact with the
+ * host stands, and what it refused with, is the connection's `others`; a host that refused, or whose
+ * account has left, holds no inbox here.
+ */
 export interface HostInbox {
   /** The host, by the reference the pairing screen lists it under. */
   readonly reference: string
   /** The name the host gives people. */
   readonly name: string
-  /**
-   * `read` when the host answered with its inbox; `refused` when it answered and refused, which is
-   * contact and not its loss; `out_of_contact` when it could not be reached or did not answer.
-   */
-  readonly state: 'read' | 'refused' | 'out_of_contact'
-  /** When the inbox was read, by this device's clock. */
+  /** What the page shows of this host's inbox is valid only under this epoch. */
+  readonly inbox_epoch: number
+  /** The order the inbox was read in, among every read of every host; null when none is held. */
+  readonly read_serial: number | null
+  /** When the inbox was read, by this device's clock; null when none is held. */
   readonly read_at_ms: number | null
-  /** Since when this device has not been in contact with the host, by its own clock. */
-  readonly lost_since_ms: number | null
-  /** What the host refused with, when it did: the shape of any host failure. */
-  readonly refusal: HostError | null
-  /** What the visit asked when the host refused, when it did. */
-  readonly refused_request: RefusedRequest | null
-  /** The host's inbox, when it was read. */
+  /** The host's inbox, when native code holds one. */
   readonly result: AttentionReadResult | null
-  /** The host's sessions by number, when its inbox was read. */
+  /** The host's sessions by number, when native code holds its inbox. */
   readonly sessions: readonly NumberedSession[]
+}
+
+/** What a pass of the inbox answers. */
+export interface InboxHosts {
+  /** The revision of the connection's state native code stood at when the rows were read. */
+  readonly revision: number
+  /** One row for each host visited that is still one of the others. */
+  readonly hosts: readonly HostInbox[]
 }
 
 /** A registration the host may or may not have taken: its answer was lost or it could not say. */
@@ -2481,11 +2486,11 @@ export interface HostPort {
   hostsForget(reference: string): Promise<ConnectionState>
   /**
    * The inbox of each paired host that is not the one in use, each read over a connection of its
-   * own, all at once: the inbox is one across hosts. A host that cannot be reached is listed as
-   * out of contact with the moment this device lost it, and holds up no other. A host that answers
-   * and refuses is listed as having refused, with its refusal: it is in contact.
+   * own, all at once: the inbox is one across hosts. A host that cannot be reached holds up no
+   * other. How contact with each stands, out of contact since when or refused with the host's words,
+   * is told in the connection's state as each visit ends, not in this answer.
    */
-  inboxHosts(): Promise<readonly HostInbox[]>
+  inboxHosts(): Promise<InboxHosts>
 
   /** Where each paired host's notifications stand. */
   pushView(): Promise<PushView>

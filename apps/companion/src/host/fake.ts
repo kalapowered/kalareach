@@ -77,6 +77,7 @@ import type {
   KitSaved,
   RecoveryArchive,
   OpenRequest,
+  OtherHost,
   OwnerView,
   PairingUnavailable,
   PairingSources,
@@ -884,6 +885,11 @@ export interface FakeHostControls {
    * would tell it. A host the pairing screen lists as in use is not visited, whatever is set.
    */
   setInboxHosts(hosts: readonly HostInbox[]): void
+  /**
+   * Sets how contact with each of the other hosts stands, as native code's state tells it, and
+   * tells the page when that changes the state. A host not listed here holds no outcome.
+   */
+  setOtherHosts(others: readonly OtherHost[]): void
   /** The references the page asked to use as the host its commands go to, in order. */
   readonly usedHosts: string[]
   /** The references the person forgot, in order. */
@@ -1443,6 +1449,7 @@ export function fakeHost(
   const forgottenHosts: string[] = []
   /** What a visit to each other paired host finds of its inbox, until a test sets another. */
   let inboxHosts: readonly HostInbox[] = []
+  let otherHosts: readonly OtherHost[] = []
   let holdingInboxHosts: Promise<void> = Promise.resolve()
   /** The words the host refuses a preparation with while no voice grant stands, or none. */
   let voiceGrantMissing: string | null = null
@@ -1653,7 +1660,7 @@ export function fakeHost(
         ? { state: 'in_contact' }
         : { state: 'out_of_contact', since_ms: 0, escalates_at_ms: 0 }),
     inbox_epoch: pairedDevice ? 1 : 0,
-    others: []
+    others: otherHosts
   })
   const connectionNow = (): ConnectionState =>
     receivedConnection({ ...connectionBody(), revision: connectionRevision })
@@ -2787,11 +2794,12 @@ export function fakeHost(
       return Promise.resolve(connectionNow())
     },
     inboxHosts: () =>
-      holdingInboxHosts.then(() =>
-        inboxHosts.filter(
+      holdingInboxHosts.then(() => ({
+        revision: connectionRevision,
+        hosts: inboxHosts.filter(
           (each) => !pairing.hosts.some((host) => host.reference === each.reference && host.in_use)
         )
-      ),
+      })),
     hostsForget: (reference) => {
       const forgotten = pairing.hosts.find((host) => host.reference === reference)
       if (forgotten === undefined) {
@@ -3773,6 +3781,10 @@ export function fakeHost(
     },
     setInboxHosts(hosts) {
       inboxHosts = hosts
+    },
+    setOtherHosts(others) {
+      otherHosts = others
+      publishConnection()
     },
     usedHosts,
     forgottenHosts,

@@ -47,7 +47,7 @@ import type {
   PushView,
   HostContact,
   HostError,
-  HostInbox,
+  InboxHosts,
   IntakeView,
   RecoveryView,
   RevocationView,
@@ -162,9 +162,6 @@ export function receivedFailure(native: {
 
 /** The shape native code sends a failure in. It is not exported: only this file holds it. */
 type NativeFailure = Parameters<typeof receivedFailure>[0]
-
-/** A host's inbox as native code answers with it, before its refusal is made the page's failure. */
-type NativeInbox = Omit<HostInbox, 'refusal'> & { readonly refusal: NativeFailure | null }
 
 /** A call's closure as native code answers with it, before its host failure is made the page's. */
 type NativeClosure = Omit<VoiceClosure, 'host_failure'> & { readonly host_failure: NativeFailure | null }
@@ -577,16 +574,13 @@ export function tauriPort(): HostPort {
 
     hostsUse: (reference) => choose('hosts_use', reference),
     hostsForget: (reference) => choose('hosts_forget', reference),
-    // A host's refusal is a native failure inside the answer: it is the page's before it leaves here.
+    // A pass read its rows at a revision of the connection's state: when the feed has not reached
+    // it, the feed is asked for what it is missing, so the contact the rows go with is not left.
     inboxHosts: () =>
-      call<readonly NativeInbox[]>('inbox_hosts', {}).then((hosts) =>
-        hosts.map(
-          (host): HostInbox => ({
-            ...host,
-            refusal: host.refusal === null ? null : receivedFailure(host.refusal)
-          })
-        )
-      ),
+      call<InboxHosts>('inbox_hosts', {}).then((answer) => {
+        if (answer.revision > feed.appliedThrough()) feed.catchUp()
+        return answer
+      }),
     pushView: () => call<PushView>('push_view', {}),
     pushEnable: (reference, afterUnknown) =>
       call<PushView>('push_enable', { reference, afterUnknown }),

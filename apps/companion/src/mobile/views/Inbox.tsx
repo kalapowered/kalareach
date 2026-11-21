@@ -234,16 +234,15 @@ export function Inbox({
       for (const row of order(here.result, here.atMs)) rows.push({ row, host: inUse, numbers })
     }
     for (const visit of others.hosts ?? []) {
-      const read = visit.state === 'read' ? visit : others.lastRead.get(visit.reference)
-      if (read === undefined || read.result === null) continue
-      const named = new Map(read.sessions.map((each) => [each.session_id, each.display_number]))
+      if (visit.result === null) continue
+      const named = new Map(visit.sessions.map((each) => [each.session_id, each.display_number]))
       const host: HostTag = { reference: visit.reference, name: visit.name }
-      for (const row of order(read.result, read.read_at_ms ?? nowMs)) {
+      for (const row of order(visit.result, visit.read_at_ms ?? nowMs)) {
         rows.push({ row, host, numbers: named })
       }
     }
     return orderAcrossHosts(rows)
-  }, [here, inUse, numbers, others.hosts, others.lastRead, nowMs])
+  }, [here, inUse, numbers, others.hosts, nowMs])
 
   // The hosts that do not answer: the host in use, by what the shell heard, and the others, by
   // what their visits found.
@@ -256,39 +255,43 @@ export function Inbox({
         rowsReadAtMs: here?.atMs ?? null
       })
     }
-    for (const visit of others.hosts ?? []) {
-      if (visit.state !== 'out_of_contact') continue
+    for (const other of others.contacts) {
+      if (other.contact.state !== 'out_of_contact') continue
       lost.push({
-        host: { reference: visit.reference, name: visit.name },
-        sinceMs: visit.lost_since_ms,
-        rowsReadAtMs: others.lastRead.get(visit.reference)?.read_at_ms ?? null
+        host: { reference: other.reference, name: other.name },
+        sinceMs: other.contact.since_ms,
+        rowsReadAtMs:
+          others.hosts?.find((visit) => visit.reference === other.reference)?.read_at_ms ?? null
       })
     }
     return lost
-  }, [connection, inUseName, inUse, here, others.hosts, others.lastRead])
+  }, [connection, inUseName, inUse, here, others.hosts, others.contacts])
 
   // The hosts that answered and refused: they are in contact, so they are not among the hosts out
   // of contact, and nothing of what they held before is listed.
   const refusals = useMemo<readonly Refusal[]>(
     () =>
-      (others.hosts ?? [])
-        .filter((visit) => visit.state === 'refused')
-        .map((visit) => ({
-          host: { reference: visit.reference, name: visit.name },
-          request: visit.refused_request,
-          refusal: visit.refusal
-        })),
-    [others.hosts]
+      others.contacts.flatMap((other) =>
+        other.contact.state === 'refused'
+          ? [
+              {
+                host: { reference: other.reference, name: other.name },
+                request: other.contact.request,
+                refusal: other.contact.refusal
+              }
+            ]
+          : []
+      ),
+    [others.contacts]
   )
 
   const counts = useMemo(() => {
     let total = here === null ? NOTHING : count(here.result)
     for (const visit of others.hosts ?? []) {
-      const read = visit.state === 'read' ? visit : others.lastRead.get(visit.reference)
-      if (read !== undefined && read.result !== null) total = addCounts(total, count(read.result))
+      if (visit.result !== null) total = addCounts(total, count(visit.result))
     }
     return { ...total, disconnected: total.disconnected + contacts.length }
-  }, [here, others.hosts, others.lastRead, contacts])
+  }, [here, others.hosts, contacts])
 
   useEffect(() => {
     if (onCounts) onCounts(counts.actionable)
