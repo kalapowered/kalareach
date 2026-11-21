@@ -82,6 +82,24 @@ impl Daemon {
             .map_err(|error| in_the_hosts_words(method, error))
     }
 
+    /// Calls a mutation on this environment as [`Self::mutate`] does, for a command that reports
+    /// an outcome it cannot confirm: a failure of the link after the request was composed is the
+    /// host's own `OUTCOME_UNKNOWN`, since the host may have carried the request out.
+    ///
+    /// # Errors
+    ///
+    /// Returns the daemon's refusal, a failure before the request was sent, or the unknown outcome.
+    pub async fn mutate_unconfirmable<P, T>(&mut self, method: Method, params: &P) -> Result<T>
+    where
+        P: serde::Serialize + ?Sized,
+        T: kr_protocol::wire::WireMessage,
+    {
+        let target = ActionTarget::environment(self.environment_id);
+        crate::bind::mutate_unconfirmable(&mut self.client, method, target, params)
+            .await
+            .map_err(|error| in_the_hosts_words(method, error))
+    }
+
     /// Calls a mutation on this environment that asks for a lifetime of `ttl`, for a call whose
     /// work can outlast the default one.
     ///
