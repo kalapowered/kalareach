@@ -2540,13 +2540,7 @@ async fn a_line_typed_before_the_question_is_shown_does_not_answer_it() {
     // queue back: a console that did not take it fails the case here, in words, and never lets the
     // case pass with nothing typed ahead.
     #[cfg(windows)]
-    {
-        let shown = window.wait_for_either(&["kr-observer: typed ahead", "panicked"]);
-        assert!(
-            shown.contains("kr-observer: typed ahead"),
-            "this case could not make its condition: the line was not queued before kr ran: {shown}"
-        );
-    }
+    window.wait_until_the_line_is_queued("the line was not queued before kr ran");
     window.wait_for("Type yes to go on");
     window.type_line("no");
     // A command that took the line typed ahead for the answer shows the kit and asks for the end of
@@ -2646,11 +2640,7 @@ async fn a_line_queued_behind_the_seeds_end_does_not_answer_the_stored_kit_quest
     let staged = rig.work.join("type-ahead.staged");
     std::fs::write(&staged, format!("{}\nyes\n", kit.end_as_typed())).expect("stages the line");
     std::fs::rename(&staged, &ask).expect("asks the observer to queue the line");
-    let shown = window.wait_for_either(&["kr-observer: typed ahead", "panicked"]);
-    assert!(
-        shown.contains("kr-observer: typed ahead"),
-        "this case could not make its condition: the yes was not queued behind the answer: {shown}"
-    );
+    window.wait_until_the_line_is_queued("the yes was not queued behind the answer");
     window.wait_for("Type yes when the kit is stored");
     window.type_line("no");
     let shown = window.wait_for("kr ended");
@@ -2771,6 +2761,19 @@ impl Window {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Waits until the observer says that it queued the typed-ahead line and read it back, and
+    /// fails with `what` when it panicked instead. The assertion is here and not in the case that
+    /// asks: a console that did not hold the line is a fault of the case's condition, and a case
+    /// that stopped there never reached its outcome assertion, so the failure reads as a set-up
+    /// fault and never as the kill of the mutation the case is named for.
+    fn wait_until_the_line_is_queued(&self, what: &str) {
+        let shown = self.wait_for_either(&["kr-observer: typed ahead", "panicked"]);
+        assert!(
+            shown.contains("kr-observer: typed ahead"),
+            "this case could not make its condition: {what}: {shown}"
+        );
     }
 
     /// Sends Ctrl-Break to the program on the console, the way that reaches it here, or fails with
