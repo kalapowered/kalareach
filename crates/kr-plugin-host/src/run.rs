@@ -179,13 +179,39 @@ fn prepare(options: &Options) -> Result<Prepared, Box<StartFailure>> {
     })
 }
 
-/// How long the launcher is given to take a failure, and then to close the connection it took it
-/// on.
+/// How long the launcher is given to take a failure and then to close the connection it took it
+/// on, the two together.
 ///
 /// A host that exited as soon as it had written would be gone before a launcher that was slow to
 /// accept had read, and the launcher would hear nothing; one that waited for ever would hold a
 /// process that has nothing to serve.
 const FAILURE_HANDOFF: Duration = Duration::from_secs(5);
+
+/// How a failure's handoff ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Handoff {
+    /// The launcher took the failure and closed the connection.
+    Closed,
+    /// The write or the close did not happen within the bound, or the write failed.
+    GaveUp,
+}
+
+/// Runs `write` and then `close` inside one bound that starts now: a write that takes part of the
+/// bound leaves the close what is left of it, so the two never hold the host for more than `bound`.
+async fn hand_off<E>(
+    bound: Duration,
+    write: impl std::future::Future<Output = Result<(), E>>,
+    close: impl std::future::Future,
+) -> Handoff {
+    let deadline = tokio::time::Instant::now() + bound;
+    if !matches!(tokio::time::timeout_at(deadline, write).await, Ok(Ok(()))) {
+        return Handoff::GaveUp;
+    }
+    match tokio::time::timeout_at(deadline, close).await {
+        Ok(_) => Handoff::Closed,
+        Err(_elapsed) => Handoff::GaveUp,
+    }
+}
 
 /// Tells the launcher why this host could not start, and waits for it to close the connection.
 ///
@@ -202,13 +228,12 @@ async fn tell_the_launcher(
         environment_id: options.environment_id(),
         reason: failure.reason.clone(),
     };
-    if !matches!(
-        tokio::time::timeout(FAILURE_HANDOFF, writer.write_message(&frame)).await,
-        Ok(Ok(()))
-    ) {
-        return;
-    }
-    let _closed = tokio::time::timeout(FAILURE_HANDOFF, reader.read_payload()).await;
+    let _ended = hand_off(
+        FAILURE_HANDOFF,
+        writer.write_message(&frame),
+        reader.read_payload(),
+    )
+    .await;
 }
 
 /// How long the daemon is given to accept this host's claim.
@@ -341,6 +366,45 @@ mod tests {
                 assert!(failure.reason.len() <= MAX_FAILURE_REASON_BYTES);
             }
         }
+    }
+
+    /// The write and the close of a failure's handoff share one bound: a write that takes most of
+    /// it leaves the close too little, and each that fits alone ends the handoff when together
+    /// they do not.
+    #[tokio::test]
+    async fn the_write_and_the_close_of_a_failure_share_one_bound() {
+        let bound = Duration::from_millis(400);
+        let after = |wait: u64| tokio::time::sleep(Duration::from_millis(wait));
+        let together = hand_off(
+            bound,
+            async {
+                after(250).await;
+                Ok::<(), ()>(())
+            },
+            async { after(250).await },
+        )
+        .await;
+        assert_eq!(
+            together,
+            Handoff::GaveUp,
+            "250 ms and 250 ms are over 400 ms"
+        );
+        let inside = hand_off(
+            bound,
+            async {
+                after(100).await;
+                Ok::<(), ()>(())
+            },
+            async { after(100).await },
+        )
+        .await;
+        assert_eq!(inside, Handoff::Closed);
+        let refused = hand_off(bound, async { Err::<(), ()>(()) }, after(0)).await;
+        assert_eq!(
+            refused,
+            Handoff::GaveUp,
+            "a write that failed is not followed by a wait"
+        );
     }
 
     #[tokio::test]
