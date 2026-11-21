@@ -438,3 +438,31 @@ fn the_integration_stays_in_the_root_shell_and_adds_no_global_accept_line_or_mar
 fn a_launch_passes_every_word_it_is_given() {
     shellpkg::a_launch_passes_every_word_it_is_given(BASH);
 }
+
+/// KR-REQ-13.11
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_named_command_runs_in_the_shells_directory_and_is_found_on_the_shells_path() {
+    shellpkg::a_named_command_runs_in_the_shells_directory_and_is_found_on_the_shells_path(BASH);
+}
+
+/// KR-REQ-13.11
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_function_shadowing_the_program_runs_in_bash_zsh_and_fish() {
+    shellpkg::a_function_shadowing_the_program_runs_in_bash_zsh_and_fish(BASH);
+}
+
+/// KR-REQ-13.11
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn an_alias_never_stands_in_for_the_program_in_bash_and_zsh() {
+    shellpkg::an_alias_never_stands_in_for_the_program_in_bash_and_zsh(BASH);
+}
+
+/// KR-REQ-13.11
+#[test]
+#[ignore = "drives this tree's built Bash package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish() {
+    shellpkg::a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish(BASH);
+}

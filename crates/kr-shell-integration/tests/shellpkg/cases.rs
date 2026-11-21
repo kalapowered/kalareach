@@ -4119,6 +4119,17 @@ fn launch_prints_what_was_named(
     let expected: String = words.iter().map(|word| format!("<{word}>")).collect();
     let mut vector = vec![told(program)];
     vector.extend(words.iter().map(|word| (*word).to_owned()));
+    launch_vector_prints(session, vector, &expected, prompt_seed, transaction_seed);
+}
+
+/// Installs `vector` through a launch and says that the terminal then shows `expected`.
+fn launch_vector_prints(
+    session: &mut Session,
+    vector: Vec<String>,
+    expected: &str,
+    prompt_seed: u8,
+    transaction_seed: u8,
+) {
     let (enter, fence) = session.fenced_prompt(prompt_seed);
     let before_install = session.written();
     let decision = session.launched(LaunchMailboxRequest {
@@ -4144,7 +4155,7 @@ fn launch_prints_what_was_named(
     });
     assert!(
         session
-            .drew_after(before_install, &expected, REPLY)
+            .drew_after(before_install, expected, REPLY)
             .was_drawn(),
         "the arguments that ran are not the arguments the caller named; wanted {expected}:\n{}",
         session.terminal_output()
@@ -7074,6 +7085,171 @@ mod pages {
             "a page that is in memory and file-backed or shared"
         );
     }
+}
+/// A session at its first prompt, with a probe script on a directory that the shell's path holds
+/// and a working directory of its own the shell has changed to. The probe prints the directory it
+/// ran in and its first argument.
+fn session_with_a_probe_on_the_path(
+    kind: ShellKind,
+    package: &Package,
+) -> (Session, std::path::PathBuf) {
+    let mut session = Session::start(package);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+
+    let home = std::fs::canonicalize(session.home()).expect("the session's home");
+    let bin = home.join("kr-saved-bin");
+    std::fs::create_dir_all(&bin).expect("a directory for the probe");
+    kr_ipc::testing::place_script(
+        &bin.join("kr-probe"),
+        "#!/bin/sh\nprintf 'kr-probe-dir=<%s> first=<%s>\\n' \"$PWD\" \"$1\"\n",
+    );
+    let work = home.join("kr-saved-work");
+    std::fs::create_dir_all(&work).expect("a working directory");
+    let add = match kind {
+        ShellKind::Fish => format!("set -gx PATH '{}' $PATH", told(&bin)),
+        _ => format!("export PATH='{}':\"$PATH\"", told(&bin)),
+    };
+    let line = format!(
+        "{add}; cd '{}'; {}",
+        told(&work),
+        print_assembled(kind, "kr-set-up")
+    );
+    assert!(
+        session.run(&line, "kr-set-up"),
+        "the line that adds the probe to the path and changes directory did not run:\n{}",
+        session.terminal_output()
+    );
+    (session, work)
+}
+
+/// KR-REQ-13.11: a saved command pressed at a prompt runs in the directory the shell is in, and
+/// its program is found on the shell's own path. The probe is on a directory the shell added to its
+/// path, not one the launch names; the shell then changes directory, and a launch of the probe by
+/// its bare name, with an argument that holds a space, prints the directory the shell is in and the
+/// argument whole.
+pub fn a_named_command_runs_in_the_shells_directory_and_is_found_on_the_shells_path(
+    kind: ShellKind,
+) {
+    in_each_locale(
+        kind,
+        "a_named_command_runs_in_the_shells_directory_and_is_found_on_the_shells_path",
+        || {
+            let package = Package::built(kind);
+            let (mut session, work) = session_with_a_probe_on_the_path(kind, &package);
+            let expected = format!("kr-probe-dir=<{}> first=<two words>", told(&work));
+            launch_vector_prints(
+                &mut session,
+                vec!["kr-probe".to_owned(), "two words".to_owned()],
+                &expected,
+                22,
+                0x77,
+            );
+        },
+    );
+}
+
+/// KR-REQ-13.11: a function that has the program's name runs in its place, in Bash, Zsh and Fish
+/// (where an alias is a function), as quoting a command word does not hide it from the shell's
+/// lookup of functions.
+pub fn a_function_shadowing_the_program_runs_in_bash_zsh_and_fish(kind: ShellKind) {
+    in_each_locale(
+        kind,
+        "a_function_shadowing_the_program_runs_in_bash_zsh_and_fish",
+        || {
+            let package = Package::built(kind);
+            let (mut session, _) = session_with_a_probe_on_the_path(kind, &package);
+            // The function prints its word out of two pieces, so the line that defines it, which the
+            // terminal echoes, never holds the word that proves it ran.
+            let define = match kind {
+                ShellKind::Fish => {
+                    "function kr-probe; printf '%s%s\\n' 'function-' 'ran'; end".to_owned()
+                }
+                _ => "kr-probe() { printf '%s%s\\n' 'function-' 'ran'; }".to_owned(),
+            };
+            let line = format!("{define}; {}", print_assembled(kind, "kr-defined"));
+            assert!(
+                session.run(&line, "kr-defined"),
+                "{}",
+                session.terminal_output()
+            );
+            launch_vector_prints(
+                &mut session,
+                vec!["kr-probe".to_owned(), "x".to_owned()],
+                "function-ran",
+                23,
+                0x78,
+            );
+        },
+    );
+}
+
+/// KR-REQ-13.11: an alias never stands in for the program in Bash and Zsh: the program's word is
+/// quoted, so the shell does not expand it, and the probe on the path runs instead. Fish has no
+/// aliases of this kind (an alias is a function, which the case above covers).
+pub fn an_alias_never_stands_in_for_the_program_in_bash_and_zsh(kind: ShellKind) {
+    in_each_locale(
+        kind,
+        "an_alias_never_stands_in_for_the_program_in_bash_and_zsh",
+        || {
+            let package = Package::built(kind);
+            let (mut session, work) = session_with_a_probe_on_the_path(kind, &package);
+            let define = format!(
+                "alias kr-probe=\"printf '%s%s\\\\n' 'alias-' 'ran'\"; {}",
+                print_assembled(kind, "kr-defined")
+            );
+            assert!(
+                session.run(&define, "kr-defined"),
+                "{}",
+                session.terminal_output()
+            );
+            let expected = format!("kr-probe-dir=<{}> first=<x>", told(&work));
+            launch_vector_prints(
+                &mut session,
+                vec!["kr-probe".to_owned(), "x".to_owned()],
+                &expected,
+                24,
+                0x79,
+            );
+            assert!(
+                !session.terminal_output().contains("alias-ran"),
+                "the alias ran in place of the program:\n{}",
+                session.terminal_output()
+            );
+        },
+    );
+}
+
+/// KR-REQ-13.11: a program the shell cannot find is the shell's own message at the prompt, in Bash,
+/// Zsh and Fish, and the shell is at a prompt after it.
+pub fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish(
+    kind: ShellKind,
+) {
+    in_each_locale(
+        kind,
+        "a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish",
+        || {
+            let package = Package::built(kind);
+            let (mut session, _) = session_with_a_probe_on_the_path(kind, &package);
+            let message = match kind {
+                ShellKind::Fish => "Unknown command",
+                _ => "not found",
+            };
+            launch_vector_prints(
+                &mut session,
+                vec!["kr-no-such-program".to_owned()],
+                message,
+                25,
+                0x7a,
+            );
+            assert!(
+                session.answered("kr-still-here"),
+                "{}",
+                session.terminal_output()
+            );
+        },
+    );
 }
 
 #[cfg(test)]
