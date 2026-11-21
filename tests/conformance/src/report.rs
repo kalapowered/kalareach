@@ -407,8 +407,9 @@ pub enum Stopped {
     /// The plan cannot be cut into the parts the run is asked for: a budget's steps fall in more than
     /// one. No step has run.
     Plan(String),
-    /// A step has a time limit, and this process cannot wait for a command it started, so the limit
-    /// cannot be kept. No step has run.
+    /// A step has a time limit, and this process could not start a command to find whether it can
+    /// wait for one, or cannot wait for a command it started, so the limit cannot be kept. No step
+    /// has run.
     Host(String),
 }
 
