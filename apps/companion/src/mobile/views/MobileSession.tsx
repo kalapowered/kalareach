@@ -69,6 +69,7 @@ import {
   answeredState,
   describeState,
   queued,
+  awaitsHost,
   reconnectBanner,
   applyReceipt,
   SEND_ANYWAY_WORDS,
@@ -942,7 +943,7 @@ export function MobileSession({
       : reconnectBanner(connected, mine)
   // A submission whose outcome nobody knows is the one case where sending again could run the
   // same thing twice. Until a receipt settles it, this session sends nothing more.
-  const waiting = unresolved(mine)
+  const waiting = unresolved(mine).filter(awaitsHost)
   // The composer is its line, the field with Send beside it, while the terminal shows and on a
   // session too short for the whole composer under the conversation's floor.
   const asLine = pane === 'terminal' || short

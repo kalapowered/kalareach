@@ -311,9 +311,17 @@ function sentence(reason: string): string {
   return reason.charAt(0).toUpperCase() + reason.slice(1)
 }
 
-/** The submissions that are not finished, which is what the reconnect banner lists. */
+/**
+ * The submissions that are not finished. A submission that a host's answer no longer concerns
+ * (`awaitsHost` is false for it) is among them until its release; what counts only the ones the host
+ * still has to answer filters with `awaitsHost`: the reconnect banner, what a restart keeps, and
+ * the phone's count and its list of what waits.
+ */
 export function unresolved(submissions: readonly Submission[]): readonly Submission[] {
-  return submissions.filter(awaitsHost)
+  return submissions.filter(
+    (submission) =>
+      submission.state === 'queued' || submission.state === 'sent' || submission.state === 'unknown'
+  )
 }
 
 /**
@@ -334,7 +342,7 @@ export function reconnectBanner(
   noRoom: string | null = null
 ): { readonly tone: 'warning' | 'accent'; readonly title: string; readonly detail: string } | null {
   if (connected === null) return null
-  const pending = unresolved(submissions)
+  const pending = unresolved(submissions).filter(awaitsHost)
   if (!connected) {
     return {
       tone: 'warning',

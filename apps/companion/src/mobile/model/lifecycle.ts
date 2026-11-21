@@ -22,7 +22,7 @@
  */
 
 import { rebind, type Draft, type DraftTarget } from '../../model/drafts'
-import { unresolved, type Submission } from '../../model/receipts'
+import { awaitsHost, unresolved, type Submission } from '../../model/receipts'
 import { SUBMISSIONS_KEY, readRecord, writeRecord, type DurableStore } from './store'
 
 /** What put the application back in front of the person. */
@@ -65,7 +65,7 @@ export const EMPTY_DURABLE_STATE: DurableState = { submissions: [] }
  * rather than having lost anything: what is in memory is still exactly what the person typed.
  */
 export function persist(store: DurableStore, state: DurableState): boolean {
-  const submissions = writeRecord(store, SUBMISSIONS_KEY, unresolved(state.submissions))
+  const submissions = writeRecord(store, SUBMISSIONS_KEY, unresolved(state.submissions).filter(awaitsHost))
   return submissions && store.isDurable(SUBMISSIONS_KEY)
 }
 
@@ -183,7 +183,7 @@ export function summarise(state: DurableState, drafts: readonly Draft[]): Recove
     kept: drafts.filter((draft) => draft.state === 'detached').length,
     conflicted: drafts.filter((draft) => draft.state === 'conflicted').length,
     orphaned: drafts.filter((draft) => draft.state === 'orphaned').length,
-    unresolvedActions: unresolved(state.submissions).length
+    unresolvedActions: unresolved(state.submissions).filter(awaitsHost).length
   }
 }
 

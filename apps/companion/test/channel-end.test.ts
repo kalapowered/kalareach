@@ -63,7 +63,7 @@ describe('what a mark takes out of the counts', () => {
         out: isOutOfCounts(submission),
         awaits: awaitsHost(submission),
         reason: unconfirmedReason(submissions) !== null,
-        waiting: unresolved(submissions).length,
+        waiting: unresolved(submissions).filter(awaitsHost).length,
         banner: reconnectBanner(true, submissions) !== null
       }
     })
@@ -81,7 +81,10 @@ describe('what a mark takes out of the counts', () => {
       row({ localId: 'b' }),
       row({ localId: 'c', state: 'sent' })
     ]
-    expect(unresolved(submissions).map((each) => each.localId)).toEqual(['b', 'c'])
+    // `unresolved` is the plan's: the ended row stays in it until its release. What waits for the host is
+    // `awaitsHost` of it.
+    expect(unresolved(submissions).map((each) => each.localId)).toEqual(['a', 'b', 'c'])
+    expect(unresolved(submissions).filter(awaitsHost).map((each) => each.localId)).toEqual(['b', 'c'])
     expect(unconfirmedReason(submissions)).toMatch(/^One action has no confirmed outcome yet\./)
   })
 })
