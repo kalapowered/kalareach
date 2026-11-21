@@ -269,6 +269,7 @@ describe('when the saved launch commands are read', () => {
     expect(surface.started()).toBe(8)
     expect(list.started()).toBe(1)
     expect(result.current.list).toEqual(LISTED(['Claude', 'Codex']))
+    expect(result.current.listNow()?.commands.map((each) => each.label)).toEqual(['Claude', 'Codex'])
 
     // The list's deadline is its last read and a cadence, and the wakes did not move it.
     await act(async () => {
@@ -277,6 +278,8 @@ describe('when the saved launch commands are read', () => {
     expect(list.started()).toBe(2)
     await list.answer(LISTED(['Claude']))
     expect(result.current.list).toEqual(LISTED(['Claude']))
+    // The press check reads the newest list through `listNow`, so it is that which must follow.
+    expect(result.current.listNow()?.commands.map((each) => each.label)).toEqual(['Claude'])
   })
 
   it('a_list_read_in_flight_is_answered_after_a_wake_started_a_surface_read', async () => {
