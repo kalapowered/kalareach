@@ -4330,7 +4330,11 @@ async fn a_device_sees_an_automation_item_only_under_its_grant() {
     exhaust_unread(&journal, chain);
     let nobodys = CausalRootId::new(kr_ipc::new_uuid());
     journal
-        .get_or_create_budget(nobodys, kr_ipc::now_ms().get())
+        .save_budget(&kr_automation::CausalBudget::new(
+            nobodys,
+            kr_ipc::now_ms().get(),
+            kr_automation::Inherited::DEFAULTS,
+        ))
         .expect("a chain with no run of its own");
     exhaust_unread(&journal, nobodys);
 
