@@ -315,6 +315,24 @@ main {
   border-color: var(--danger-line);
 }
 
+/* The label has the room of the armed label in both states: arming changes the colours and the
+   words, not the size of the control. The hidden copy is generated content, so it is not read. */
+.two-press-label {
+  display: inline-grid;
+  justify-items: center;
+}
+
+.two-press-label > span,
+.two-press-label::after {
+  grid-area: 1 / 1;
+}
+
+.two-press-label::after {
+  content: attr(data-sizer);
+  visibility: hidden;
+  pointer-events: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .btn[data-armed] {
     transition: none;

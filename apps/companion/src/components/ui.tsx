@@ -207,16 +207,25 @@ export function CommitButton({
 export const ARMED_FOR_MS = 6_000
 
 /**
+ * How soon after the press that armed it a control takes no second press, in milliseconds. A double
+ * click is two presses about a fifth of a second apart; it must not be one decision.
+ */
+export const SECOND_PRESS_AFTER_MS = 500
+
+/**
  * A control that commits on its second press. A removal that cannot be taken back is not made by
  * one press, whatever the press was: the first arms the control, in the danger colours, with a
  * label that says what the second press does, and the second commits. It disarms by itself when
  * focus leaves it, when Escape is pressed in it, and after [`ARMED_FOR_MS`], so a press that was
- * made and forgotten is not a decision made later.
+ * made and forgotten is not a decision made later. A press that begins less than
+ * [`SECOND_PRESS_AFTER_MS`] after the one that armed it is not the second press: the control stays
+ * armed and commits nothing, so a double click arms it and does no more.
  *
  * Each press is a [`CommitButton`]'s, so each is still decided on release inside the control. The
  * armed label is the button's own text, so its accessible name changes with it, and a polite status
  * says it too for a screen reader that does not announce a change of name. The change is a colour
- * change, with no movement, so a person who asks for less motion sees the same states.
+ * change and the words, with no movement, and the control keeps the room of its longer label in both
+ * states, so it never changes size and nothing around it moves.
  */
 export function TwoPressButton({
   onCommit,
@@ -234,6 +243,7 @@ export function TwoPressButton({
 }): ReactNode {
   const [armed, setArmed] = useState(false)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const armedAt = useRef(0)
   const wrapper = useRef<HTMLSpanElement>(null)
 
   const disarm = useCallback(() => {
@@ -293,15 +303,19 @@ export function TwoPressButton({
         onCommit={() => {
           if (!armed) {
             setArmed(true)
+            armedAt.current = Date.now()
             timer.current = setTimeout(disarm, ARMED_FOR_MS)
             return
           }
+          if (Date.now() - armedAt.current < SECOND_PRESS_AFTER_MS) return
           disarm()
           onCommit()
         }}
         {...rest}
       >
-        {armed ? armedLabel : children}
+        <span className="two-press-label" data-sizer={armedLabel}>
+          <span>{armed ? armedLabel : children}</span>
+        </span>
       </CommitButton>
       <span className="visually-hidden" role="status">
         {armed ? armedLabel : ''}

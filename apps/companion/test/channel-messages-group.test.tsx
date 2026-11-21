@@ -11,7 +11,7 @@
 import { useEffect } from 'react'
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { App } from '../src/App'
 import { AppProvider, useApp, type Place } from '../src/app/state'
@@ -23,6 +23,7 @@ import { ChannelShelf, EMPTY_SHELF, MANY_HOLDS, type ShelfSnapshot } from '../sr
 import { keptEntry } from '../src/model/draft-book'
 import type { InputState, Submission } from '../src/model/receipts'
 import type { SessionStates } from '../src/model/sessions'
+import { afterTheGuard, holdTheClock } from './two-press'
 
 const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
@@ -30,7 +31,12 @@ const GONE = '8a7b6c50-22bb-4c3d-8e4f-0000000009ff'
 const KEPT_PAGE: Place = { view: 'drafts' }
 const SENT_AT = '1700000000000'
 
-afterEach(cleanup)
+beforeEach(holdTheClock)
+
+afterEach(() => {
+  cleanup()
+  vi.useRealTimers()
+})
 
 interface World {
   readonly drafts: FakeDraftStore
@@ -271,6 +277,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(asked(of, 'remove')).toBe(0)
     expect(of.messages.all()).toHaveLength(3)
     expect(within(first).getByTestId('channel-message-remove')).toHaveTextContent('Press again to remove')
+    afterTheGuard()
     await person.click(within(first).getByTestId('channel-message-remove'))
     await waitFor(() => {
       expect(of.messages.all().map((each) => each.text)).toEqual(['two', 'other session'])
@@ -290,6 +297,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(asked(of, 'remove')).toBe(1)
     expect(of.messages.all()).toHaveLength(3)
     expect(all).toHaveTextContent('Press again to remove all')
+    afterTheGuard()
     await person.click(all)
     await waitFor(() => {
       expect(of.messages.all().map((each) => each.text)).toEqual(['other session'])
@@ -309,6 +317,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     keepMessage(of, { text: 'third, never shown' })
     await person.click(all)
     expect(asked(of, 'remove')).toBe(0)
+    afterTheGuard()
     await person.click(all)
     await waitFor(() => {
       expect(of.messages.all().map((each) => each.text)).toEqual(['third, never shown'])
@@ -707,6 +716,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(asked(of, 'hold-clear')).toBe(0)
     expect(of.messages.allHolds()).toHaveLength(2)
     expect(remove).toHaveTextContent('Press again to remove')
+    afterTheGuard()
     await person.click(remove)
     await waitFor(() => {
       expect(of.messages.allHolds().map((each) => each.holdId)).toEqual(['hold-main'])
@@ -748,6 +758,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     await person.click(remove)
     expect(asked(of, 'hold-clear')).toBe(0)
     expect(states().submissionsOf(MAIN).map((row) => row.holdId)).toEqual(['hold-waits', 'hold-unknown'])
+    afterTheGuard()
     await person.click(remove)
     await waitFor(() => {
       expect(of.messages.allHolds().map((each) => each.holdId)).toEqual(['hold-waits', 'hold-no-row'])
@@ -769,6 +780,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     const record = await screen.findByTestId('channel-hold')
     of.messages.refuseHoldWrites({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
     await person.click(within(record).getByTestId('channel-hold-remove'))
+    afterTheGuard()
     await person.click(within(record).getByTestId('channel-hold-remove'))
     expect(await screen.findByText(/This device could not remove this record now\. It may still be in place\. /)).toBeVisible()
     expect(of.messages.allHolds().map((each) => each.holdId)).toEqual(['hold-stays'])
@@ -789,10 +801,12 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(await screen.findByText(/A message to a session on studio, which this device cannot reach now, pressed at /)).toBeVisible()
     const first = (await screen.findAllByTestId('channel-message'))[0]
     await person.click(within(first).getByTestId('channel-message-remove'))
+    afterTheGuard()
     await person.click(within(first).getByTestId('channel-message-remove'))
     expect(await screen.findByText(/This device could not remove this message now\. It may still be in place\. /)).toBeVisible()
     const all = screen.getByTestId('channel-session-remove-all')
     await person.click(all)
+    afterTheGuard()
     await person.click(all)
     expect(
       await screen.findByText(/This device could not remove all of these messages now\. Some of them may still be in place\. /)
@@ -809,6 +823,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     of.messages.refuseRemovals({ code: 'RESOURCE_UNAVAILABLE', message: 'the folder could not be flushed' }, true)
     const listed = asked(of, 'list')
     await person.click(within(message).getByTestId('channel-message-remove'))
+    afterTheGuard()
     await person.click(within(message).getByTestId('channel-message-remove'))
     await waitFor(() => {
       expect(
@@ -838,6 +853,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     of.messages.refuseRemovals({ code: 'RESOURCE_UNAVAILABLE', message: 'the folder could not be flushed' }, true)
     const listed = asked(of, 'list')
     await person.click(within(record).getByTestId('channel-hold-remove'))
+    afterTheGuard()
     await person.click(within(record).getByTestId('channel-hold-remove'))
     await waitFor(() => {
       expect(
@@ -949,6 +965,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(asked(of, 'hold-clear')).toBe(0)
     expect(screen.getByTestId('channel-hold-damaged')).toBeVisible()
     expect(within(record).getByTestId('channel-hold-damaged-remove')).toHaveTextContent('Press again to remove')
+    afterTheGuard()
     await person.click(within(record).getByTestId('channel-hold-damaged-remove'))
     await waitFor(() => {
       expect(screen.queryByTestId('channel-hold-damaged')).toBeNull()
@@ -970,6 +987,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     await person.click(within(control).getByTestId('ledger-set-aside-button'))
     expect(asked(of, 'set-aside')).toBe(0)
     expect(within(control).getByTestId('ledger-set-aside-button')).toHaveTextContent('Press again to set the list aside')
+    afterTheGuard()
     await person.click(within(control).getByTestId('ledger-set-aside-button'))
     await waitFor(() => {
       expect(of.messages.calls.filter((call) => call.kind === 'set-aside')).toHaveLength(1)
@@ -992,6 +1010,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     const control = await screen.findByTestId('ledger-set-aside')
     of.messages.damageLedger('ok')
     await person.click(within(control).getByTestId('ledger-set-aside-button'))
+    afterTheGuard()
     await person.click(within(control).getByTestId('ledger-set-aside-button'))
     expect(await screen.findByText('The list of removals is not damaged, so it was not set aside.')).toBeVisible()
     await waitFor(() => {
@@ -1012,6 +1031,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     failing.messages.refuseSetAside({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
     startOver(failing)
     await person.click(await screen.findByTestId('ledger-set-aside-button'))
+    afterTheGuard()
     await person.click(await screen.findByTestId('ledger-set-aside-button'))
     expect(await screen.findByTestId('ledger-set-aside-note')).toHaveTextContent(
       'This device could not set the list aside. The original list is still in place.'
@@ -1021,7 +1041,9 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     unconfirmed.messages.damageLedger('damaged')
     unconfirmed.messages.leaveSetAsideUnconfirmed()
     startOver(unconfirmed)
+    afterTheGuard()
     await person.click(await screen.findByTestId('ledger-set-aside-button'))
+    afterTheGuard()
     await person.click(await screen.findByTestId('ledger-set-aside-button'))
     expect(await screen.findByTestId('ledger-set-aside-note')).toHaveTextContent(
       'The list was set aside, but this device could not yet confirm that on disk. It will try again.'
