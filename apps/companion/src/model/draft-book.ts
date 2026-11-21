@@ -366,9 +366,9 @@ function sameFiles(a: Draft, b: Draft): boolean {
   return JSON.stringify(ids(a)) === JSON.stringify(ids(b))
 }
 
-/** Whether a file on a composer is one this window's uploads made: it carries a handle or is going up. */
-function isUpload(file: DraftAttachment): boolean {
-  return file.handle !== null || file.upload === 'uploading'
+/** Whether a file on a composer is one this window's uploads made to the host in `environmentId`: it carries that host's handle or is going up. */
+function isUploadTo(file: DraftAttachment, environmentId: string): boolean {
+  return file.handle === null ? file.upload === 'uploading' : file.handle.environment_id === environmentId
 }
 
 /** Whether the store has anything to keep of a draft. */
@@ -539,8 +539,8 @@ export class DraftBook {
   #moves = 0
   #settling = false
   #sends = 0
-  /** How many times `dropUploads` ran: a prompt sent before one does not take its files back. */
-  #uploadEpoch = 0
+  /** The host of each `dropUploads`, in order: a prompt sent before one does not take that host's files back. */
+  readonly #cleared: string[] = []
   readonly #listeners = new Set<() => void>()
   readonly #notices = new Set<(words: string) => void>()
   #cached: BookSnapshot | null = null
@@ -749,18 +749,19 @@ export class DraftBook {
   }
 
   /**
-   * Takes off every composer the files that came from this window's uploads: the ones with a handle
-   * and the ones still going up. The text is left exactly as it is and nothing is discarded in the
-   * store of kept drafts; what is changed goes through `setDrafts`, so the stored drafts lose the
-   * handles too. A prompt sent before this and refused afterwards does not put those files back.
-   * Answers how many files were taken off.
+   * Takes off every composer the files that came from this window's uploads to the host in
+   * `environmentId`: the ones whose handle is that host's and the ones still going up. A file of any
+   * other host stays. The text is left exactly as it is and nothing is discarded in the store of kept
+   * drafts; what is changed goes through `setDrafts`, so the stored drafts lose the handles too. A
+   * prompt sent before this and refused afterwards does not put those files back. Answers how many
+   * files were taken off.
    */
-  dropUploads(): number {
+  dropUploads(environmentId: string): number {
     let dropped = 0
-    this.#uploadEpoch += 1
+    this.#cleared.push(environmentId)
     this.setDrafts((drafts) =>
       drafts.map((draft) => {
-        const kept = draft.attachments.filter((file) => !isUpload(file))
+        const kept = draft.attachments.filter((file) => !isUploadTo(file, environmentId))
         if (kept.length === draft.attachments.length) return draft
         dropped += draft.attachments.length - kept.length
         return { ...draft, attachments: kept, updatedAtMs: Date.now() }
@@ -835,7 +836,7 @@ export class DraftBook {
     const token = `send-${String(this.#sends)}`
     const flight: Flight = {
       id: token,
-      epoch: this.#uploadEpoch,
+      epoch: this.#cleared.length,
       composer: key,
       order: this.#sends,
       sent,
@@ -1554,10 +1555,16 @@ export class DraftBook {
   async #giveBack(flight: Flight): Promise<boolean> {
     const key = flight.composer
     // A prompt that was sent before the files of the composers were cleared does not put them back.
+    const clearedSince = flight.epoch === undefined ? [] : this.#cleared.slice(flight.epoch)
     const sent =
-      flight.epoch === undefined || flight.epoch === this.#uploadEpoch
+      clearedSince.length === 0
         ? flight.sent
-        : { ...flight.sent, attachments: flight.sent.attachments.filter((file) => !isUpload(file)) }
+        : {
+            ...flight.sent,
+            attachments: flight.sent.attachments.filter(
+              (file) => !clearedSince.some((environmentId) => isUploadTo(file, environmentId))
+            )
+          }
     let record = flight.record
     if (record === null && this.#status === 'ready' && !holdsNothing(sent)) {
       // The first write failed, or the draft was never stored: try again now that the text matters.
