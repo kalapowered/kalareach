@@ -154,7 +154,8 @@ export function LaunchCommands({ place }: { readonly place: LaunchCommandsPlace 
           if (result.applied) {
             say(changed(result.removed ? 'removed' : 'absent', label), 'success')
             adopt(after)
-          } else if (!result.commands.some((held) => held.label === label)) {
+          } else if (replaced(label, result.commands) === null) {
+            // The host compares labels in lower case, as `replaced` does.
             say(changed('absent', label), 'success')
             adopt(after)
           } else {
