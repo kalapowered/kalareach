@@ -1,24 +1,39 @@
 //! The draft a device keeps on a host it is paired with: one for each host, principal and session.
 //!
 //! The device makes the draft at the first bind and never before, keeps its identifier and its last
-//! known revision in the folder of open transfers (`<key>.draft`, JSON, version 1, written before the
-//! call that uses it), and uses it again for a new window and after a restart. A `draft.create`
-//! whose answer is lost is asked again under its own action identifier, which is kept until the host
-//! answers. A refusal for a stale revision names the revision the draft is at; it is taken from the
-//! message and the call goes on. A draft the device will not use is ended with `draft.discard`.
+//! known revision in the folder of open transfers (`<hash>.draft`, JSON, version 1, written before
+//! the call that uses it), and uses it again for a new window and after a restart.
+//!
+//! * **A lost answer is asked again exactly.** A `draft.create` or `draft.discard` is composed once;
+//!   the whole request, window included, is kept in the entry before it is sent, and a later attempt
+//!   sends that request again with `Session::repeat` on the next connection, so the host answers
+//!   from its record. A request the host has no record of is refused for its window; only once that
+//!   window and a margin have passed, on a clock that cannot be stepped, is the action known not to
+//!   have happened, and a new one is made. Until then the entry keeps it and says so.
+//! * **One operation at a time for a draft.** Binds, texts, ends, the start's sweep and the prompt
+//!   that uses the draft take a turn for the host, principal and session until their last write.
+//! * **The revision is known or it is not.** It is written as unknown before a bind goes out and as
+//!   the host's answer after it, so a stop in between leaves a draft that is ended and not guessed
+//!   at. A refusal for a stale revision names the revision the draft is at; it is taken from the
+//!   message and the call goes on.
+//! * **Another layout is left alone.** An entry of another version is never read or overwritten; the
+//!   operations that would need it say so.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use kr_client::ClientError;
-use kr_protocol::envelope::ActionTarget;
+use kr_client::session::ComposedMutation;
+use kr_client::transport::Reach;
+use kr_client::{ClientError, Settled as Answered};
+use kr_protocol::envelope::{ActionTarget, MutationRequest};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
     ActionId, ApplicationInstanceId, DeviceId, DraftId, DraftRevision, EnvironmentId, SessionId,
     TransferId,
 };
 use kr_protocol::method::Method;
-use kr_protocol::receipt::ActionReadParams;
 use kr_protocol::scalars::{Nullable, Uuid};
 use kr_protocol::transfer::{
     AgentDraftAddAttachmentParams, AgentDraftAddAttachmentResult, AttachmentContribution,
@@ -29,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::error::{CommandError, Result};
-use crate::open_transfers::Paired;
+use crate::open_transfers::{Paired, host_words};
 
 /// The format of a draft entry this build writes, recorded in it as `version`.
 pub const DRAFT_VERSION: u32 = 1;
@@ -38,7 +53,7 @@ pub const DRAFT_VERSION: u32 = 1;
 pub const UPDATE_THE_HOST: &str =
     "update the host: it cannot end a draft this device no longer needs";
 
-/// What a bind is told when the session or the draft is gone on the host.
+/// What a bind is told when the session or the draft this file was for is gone on the host.
 pub const GONE: &str =
     "the session or the draft this file was for is gone on the host: the file was not added to it";
 
@@ -49,7 +64,24 @@ pub const GONE_FOR_TEXT: &str =
 /// What a text is told when this device keeps no draft for the session.
 pub const NO_DRAFT: &str = "this device keeps no draft for this session: add a file to it first";
 
+/// What a bind is told when the draft changed twice while the file was being added.
+pub const CHANGED_AGAIN: &str =
+    "the draft changed again while the file was being added: the file was not added";
+
+/// What an operation is told when the draft kept for the session is of a later release.
+pub const NEWER_DRAFT: &str = "this device keeps a draft for this session in a format this release does not read: update the application to use it";
+
+/// What an operation is told when the host's answer to the creation of the draft has not been
+/// received and the creation is not known to have failed.
+pub const CREATE_PENDING: &str = "the host was asked to make a draft for this session and its answer has not been received: try again later";
+
+/// What an operation is told when the host's answer to the end of the draft has not been received.
+pub const DISCARD_PENDING: &str = "the host was asked to end the draft for this session and its answer has not been received: try again later";
+
 const EXTENSION: &str = "draft";
+
+/// The time after a window has ended that an absent record is waited out, as the grant attempts do.
+const MARGIN_MS: u64 = 30_000;
 
 /// The revision a stale-revision refusal says the draft is at.
 ///
@@ -72,6 +104,78 @@ pub fn revision_in(message: &str) -> Option<DraftRevision> {
     digits(current).map(DraftRevision::new)
 }
 
+/// A request kept whole, to be sent again exactly: canonical CBOR as hex, with the window and the
+/// host and actor it was composed for.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct KeptRequest {
+    action_id: ActionId,
+    request: String,
+    window_issued_at_ms: u64,
+    window_valid_for_ms: u64,
+    host: String,
+    actor: String,
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+fn bytes_of(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok())
+        .collect()
+}
+
+impl KeptRequest {
+    fn of(composed: &ComposedMutation) -> Result<Self> {
+        let request = kr_cbor::to_canonical_vec(composed.request())
+            .map_err(|error| CommandError::local_failure(error.to_string()))?;
+        let (host, actor) = composed.reach().map_or_else(Default::default, |reach| {
+            (reach.host.clone(), reach.actor.clone())
+        });
+        Ok(Self {
+            action_id: composed.action_id(),
+            request: hex_of(&request),
+            window_issued_at_ms: composed.window_issued_at_ms(),
+            window_valid_for_ms: composed.window_valid_for_ms(),
+            host,
+            actor,
+        })
+    }
+
+    fn composed(&self) -> Result<ComposedMutation> {
+        let unread = || CommandError::local_failure("the request this device kept cannot be read");
+        let bytes = bytes_of(&self.request).ok_or_else(unread)?;
+        let request: MutationRequest =
+            kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                .map_err(|_| unread())?;
+        let reach = (!self.host.is_empty() && !self.actor.is_empty()).then(|| Reach {
+            host: self.host.clone(),
+            actor: self.actor.clone(),
+        });
+        Ok(ComposedMutation::restored(
+            request,
+            self.window_issued_at_ms,
+            self.window_valid_for_ms,
+            reach,
+        ))
+    }
+
+    /// How long an absent record is waited out, from the first time this process sent the request.
+    fn bound(&self) -> Duration {
+        Duration::from_millis(self.window_valid_for_ms.saturating_add(MARGIN_MS))
+    }
+}
+
 /// One draft, as the folder keeps it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -80,12 +184,15 @@ struct DraftFile {
     environment_id: EnvironmentId,
     device_id: DeviceId,
     session_id: SessionId,
+    /// What the draft's calls are made on, as the creation named it.
+    target: ActionTarget,
     draft_id: Option<DraftId>,
+    /// The revision the host last gave, or none while it is not known.
     revision: Option<DraftRevision>,
-    /// The action a `draft.create` went out under, kept until the host answers it.
-    create_action: Option<ActionId>,
-    /// The action a `draft.discard` went out under, kept until the host answers it.
-    discard_action: Option<ActionId>,
+    /// The `draft.create` that went out, kept until the host answers it.
+    create: Option<KeptRequest>,
+    /// The `draft.discard` that went out, kept until the host answers it.
+    discard: Option<KeptRequest>,
     attachments: Vec<DraftAttachment>,
 }
 
@@ -145,12 +252,45 @@ pub struct KeptView {
     pub attachments: Vec<DraftAttachment>,
 }
 
+/// What a read of a draft entry found.
+enum Read {
+    Absent,
+    Entry(Box<DraftFile>),
+    /// A file is there that this release does not read: another version, or unreadable.
+    Other,
+}
+
+/// How the host answered a request that was sent or sent again.
+enum Sent {
+    /// The method's own result.
+    Done(Answered),
+    /// A refusal the host decided or a client refusal that proves the request did not take effect.
+    Refused(ClientError),
+    /// The request never left this client.
+    NeverLeft(ClientError),
+    /// The answer was lost or the host could not say.
+    Uncertain(ClientError),
+    /// Nothing is known and nothing was asked: this client is still accounting for the action, or the
+    /// request is not for this connection.
+    Unresolved,
+}
+
+/// What a discard step came to.
+enum Step {
+    Ended,
+    Anew,
+}
+
 /// The drafts this device keeps on the hosts it is paired with.
 #[derive(Default)]
 pub struct Drafts {
     root: Mutex<Option<PathBuf>>,
-    /// A host of an earlier build refused `draft.discard` by name.
-    discard_refused: std::sync::atomic::AtomicBool,
+    /// The hosts, by environment and this device's principal, that refused `draft.discard` by name.
+    discard_refused: Mutex<HashSet<(EnvironmentId, DeviceId)>>,
+    /// The turn each draft's operations take.
+    turns: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    /// When this process first sent or repeated each kept request.
+    armed: Mutex<HashMap<String, Instant>>,
 }
 
 impl std::fmt::Debug for Drafts {
@@ -182,7 +322,7 @@ pub(crate) enum Ended {
 }
 
 fn discard_outcome(error: &ClientError) -> Ended {
-    if unknown_draft(error) || error.code() == ErrorCode::DraftConflict {
+    if gone(error) || error.code() == ErrorCode::DraftConflict {
         Ended::Done
     } else if host_cannot_discard(error) {
         Ended::OlderHost
@@ -198,14 +338,35 @@ fn at_the_bound(discard_refused: bool, error: &ClientError) -> Option<CommandErr
         .then(|| CommandError::unsupported(UPDATE_THE_HOST))
 }
 
-/// Whether the host answered that it has no such draft.
-fn unknown_draft(error: &ClientError) -> bool {
-    error.code() == ErrorCode::InvalidArgument
+/// Whether the host answered that the draft or its session is gone: its own words for no such
+/// draft or no such session, and the code for a session that ended. No other refusal says so.
+fn gone(error: &ClientError) -> bool {
+    error.code() == ErrorCode::SessionClosed
+        || (error.code() == ErrorCode::InvalidArgument
+            && host_words(error).is_some_and(|words| {
+                words.starts_with("no draft ") || words.starts_with("no session ")
+            }))
 }
 
 fn host_cannot_discard(error: &ClientError) -> bool {
     matches!(error, ClientError::Host(refused)
         if refused.message == kr_transport::actor::METHOD_NOT_AVAILABLE)
+}
+
+/// What a send or a repeat came to.
+fn sent_as(answered: kr_client::Result<Answered>, repeating: bool) -> Sent {
+    match answered {
+        Ok(settled @ Answered::Result(_)) => Sent::Done(settled),
+        Ok(Answered::Receipt(_)) => Sent::Unresolved,
+        Err(error @ ClientError::SubmissionUncertain { .. }) => Sent::Uncertain(error),
+        Err(error @ ClientError::ConnectionEnded) if repeating => Sent::Uncertain(error),
+        Err(error @ ClientError::ConnectionEnded) => Sent::NeverLeft(error),
+        Err(error) if error.code() == ErrorCode::OutcomeUnknown => Sent::Uncertain(error),
+        Err(
+            ClientError::StillAccounting | ClientError::Misdirected { .. } | ClientError::OtherHost,
+        ) => Sent::Unresolved,
+        Err(error) => Sent::Refused(error),
+    }
 }
 
 impl Drafts {
@@ -214,26 +375,58 @@ impl Drafts {
         *self.root.lock().unwrap_or_else(PoisonError::into_inner) = Some(root);
     }
 
-    fn path(&self, key: Uuid) -> Result<PathBuf> {
-        let root = self
-            .root
+    fn root(&self) -> Result<PathBuf> {
+        self.root
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .ok_or_else(|| {
                 CommandError::unavailable("this application has no place to keep a draft")
-            })?;
-        Ok(root.join(format!("{key}.{EXTENSION}")))
+            })
     }
 
-    fn read(&self, paired: &Paired, session_id: SessionId) -> Result<Option<DraftFile>> {
-        let path = self.path(key_of(paired, session_id))?;
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Ok(None);
+    fn path(&self, key: Uuid) -> Result<PathBuf> {
+        Ok(self.root()?.join(format!("{key}.{EXTENSION}")))
+    }
+
+    /// The turn of the operations on one draft: held until the last write of the operation.
+    async fn turn(
+        &self,
+        paired: &Paired,
+        session_id: SessionId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(turns.entry(key_of(paired, session_id)).or_default())
         };
-        Ok(serde_json::from_slice::<DraftFile>(&bytes)
-            .ok()
-            .filter(|file| file.version == DRAFT_VERSION && file.session_id == session_id))
+        lock.lock_owned().await
+    }
+
+    fn read(&self, paired: &Paired, session_id: SessionId) -> Result<Read> {
+        let path = self.path(key_of(paired, session_id))?;
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Read::Absent),
+            Err(_) => return Ok(Read::Other),
+        };
+        Ok(
+            match serde_json::from_slice::<DraftFile>(&bytes)
+                .ok()
+                .filter(|file| file.version == DRAFT_VERSION && file.session_id == session_id)
+            {
+                Some(file) => Read::Entry(Box::new(file)),
+                None => Read::Other,
+            },
+        )
+    }
+
+    /// The entry kept for the session, none when there is none; a file of another layout is refused.
+    fn entry(&self, paired: &Paired, session_id: SessionId) -> Result<Option<DraftFile>> {
+        match self.read(paired, session_id)? {
+            Read::Absent => Ok(None),
+            Read::Entry(file) => Ok(Some(*file)),
+            Read::Other => Err(CommandError::refused(NEWER_DRAFT)),
+        }
     }
 
     fn write(&self, paired: &Paired, file: &DraftFile) -> Result<()> {
@@ -252,11 +445,43 @@ impl Drafts {
         }
     }
 
+    fn refused_discard(&self, paired: &Paired) -> bool {
+        self.discard_refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&(paired.environment_id, paired.device_id))
+    }
+
+    /// When this process first sent or repeated `action`.
+    fn arm(&self, action: ActionId) -> Instant {
+        *self
+            .armed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(action.to_string())
+            .or_insert_with(Instant::now)
+    }
+
+    fn fresh(&self, paired: &Paired, session_id: SessionId, target: &ActionTarget) -> DraftFile {
+        DraftFile {
+            version: DRAFT_VERSION,
+            environment_id: paired.environment_id,
+            device_id: paired.device_id,
+            session_id,
+            target: target.clone(),
+            draft_id: None,
+            revision: None,
+            create: None,
+            discard: None,
+            attachments: Vec::new(),
+        }
+    }
+
     /// The draft kept for `session_id`.
     #[must_use]
     pub fn kept(&self, paired: &Paired, session_id: SessionId) -> KeptView {
         match self.read(paired, session_id) {
-            Ok(Some(file)) if file.draft_id.is_some() => KeptView {
+            Ok(Read::Entry(file)) if file.draft_id.is_some() => KeptView {
                 made: true,
                 draft_id: file.draft_id,
                 revision: file.revision,
@@ -271,10 +496,15 @@ impl Drafts {
         }
     }
 
-    /// The prompt that named the draft was answered: the draft is the session's now, and the entry
-    /// ends with nothing asked of the host.
-    pub fn sent(&self, paired: &Paired, session_id: SessionId) {
-        self.remove(paired, session_id);
+    /// The prompt that named `draft_id` was answered with a result: the draft is the session's now,
+    /// and the entry ends with nothing asked of the host. An entry kept for another draft stays.
+    pub async fn sent(&self, paired: &Paired, session_id: SessionId, draft_id: DraftId) {
+        let _turn = self.turn(paired, session_id).await;
+        if let Ok(Read::Entry(file)) = self.read(paired, session_id)
+            && file.draft_id == Some(draft_id)
+        {
+            self.remove(paired, session_id);
+        }
     }
 
     /// Binds a published upload to the draft kept for the session, making the draft at the first
@@ -284,33 +514,32 @@ impl Drafts {
     ///
     /// Returns the host's refusal, and [`GONE`] when the host has no such session or draft.
     pub async fn bind(&self, paired: Paired, target: ActionTarget, bind: Bind) -> Result<Bound> {
-        let mut file = match self.read(&paired, bind.session_id)? {
+        let _turn = self.turn(&paired, bind.session_id).await;
+        let mut file = match self.entry(&paired, bind.session_id)? {
             Some(file) => file,
-            None => DraftFile {
-                version: DRAFT_VERSION,
-                environment_id: paired.environment_id,
-                device_id: paired.device_id,
-                session_id: bind.session_id,
-                draft_id: None,
-                revision: None,
-                create_action: None,
-                discard_action: None,
-                attachments: Vec::new(),
-            },
+            None => self.fresh(&paired, bind.session_id, &target),
         };
-        if file.discard_action.is_some() || (file.draft_id.is_some() && file.revision.is_none()) {
+        if file.create.is_some() {
+            self.resolve_create(&paired, &mut file).await?;
+        }
+        if file.discard.is_some() || (file.draft_id.is_some() && file.revision.is_none()) {
             // A draft whose end was begun, or whose revision is not known, is ended first.
-            self.finish_ending(&paired, &target, &mut file).await?;
-            file = self.fresh(&paired, bind.session_id);
+            self.finish_ending(&paired, &mut file).await?;
+            file = self.fresh(&paired, bind.session_id, &target);
         }
         if file.draft_id.is_none() {
             self.make(&paired, &target, &bind, &mut file).await?;
         }
         // One stale revision is read from the host's own words and the bind goes on; a second ends.
+        let mut expected = file.revision;
         for attempt in 0..2 {
-            let (Some(draft_id), Some(expected_revision)) = (file.draft_id, file.revision) else {
+            let (Some(draft_id), Some(expected_revision)) = (file.draft_id, expected) else {
                 break;
             };
+            // The revision is not known while the call is out: a stop here leaves a draft that is
+            // ended, and not one whose revision is guessed.
+            file.revision = None;
+            self.write(&paired, &file)?;
             let asked = paired
                 .session
                 .mutate(
@@ -339,46 +568,42 @@ impl Drafts {
                         attachment: result.attachment,
                     });
                 }
-                Err(error) if error.code() == ErrorCode::DraftConflict && attempt == 0 => {
-                    let message = match &error {
-                        ClientError::Host(refused) => refused.message.clone(),
-                        ClientError::Refused { error, .. } => error.message.clone(),
-                        other => other.to_string(),
+                Err(error) if error.code() == ErrorCode::DraftConflict => {
+                    let said = host_words(&error).map_or_else(|| error.to_string(), str::to_owned);
+                    let Some(revision) = revision_in(&said) else {
+                        // The host's words do not carry the revision: the draft is ended.
+                        let _ = self.finish_ending(&paired, &mut file).await;
+                        return Err(error.into());
                     };
-                    match revision_in(&message) {
-                        Some(revision) => {
-                            file.revision = Some(revision);
-                            self.write(&paired, &file)?;
-                        }
-                        None => {
-                            // The host's words do not carry the revision: the draft is ended.
-                            file.revision = None;
-                            self.write(&paired, &file)?;
-                            let _ = self.finish_ending(&paired, &target, &mut file).await;
-                            return Err(error.into());
-                        }
+                    file.revision = Some(revision);
+                    if attempt == 0 {
+                        expected = Some(revision);
+                    } else {
+                        self.write(&paired, &file)?;
+                        return Err(CommandError::unavailable(CHANGED_AGAIN));
                     }
                 }
-                Err(error) if unknown_draft(&error) => {
+                Err(error) if gone(&error) => {
                     self.remove(&paired, bind.session_id);
                     return Err(CommandError::refused(GONE));
                 }
                 Err(
-                    error
-                    @ (ClientError::SubmissionUncertain { .. } | ClientError::ConnectionEnded),
+                    error @ (ClientError::SubmissionUncertain { .. }
+                    | ClientError::OutcomeUnknown { .. }),
                 ) => {
-                    // The answer is lost: the revision is not known, so the draft is ended.
-                    file.revision = None;
-                    self.write(&paired, &file)?;
-                    let _ = self.finish_ending(&paired, &target, &mut file).await;
+                    // The answer is lost: the revision stays unknown, so the draft is ended.
+                    let _ = self.finish_ending(&paired, &mut file).await;
                     return Err(error.into());
                 }
-                Err(error) => return Err(error.into()),
+                // Anything else did not change the draft: its revision is the one it was.
+                Err(error) => {
+                    file.revision = Some(expected_revision);
+                    self.write(&paired, &file)?;
+                    return Err(error.into());
+                }
             }
         }
-        Err(CommandError::unavailable(
-            "the draft changed again while the file was being added: the file was not added",
-        ))
+        Err(CommandError::unavailable(CHANGED_AGAIN))
     }
 
     /// Sets the text of the draft kept for the session, with `draft.update` at the kept revision.
@@ -398,10 +623,11 @@ impl Drafts {
         session_id: SessionId,
         text: String,
     ) -> Result<Updated> {
-        let Some(mut file) = self.read(&paired, session_id)? else {
+        let _turn = self.turn(&paired, session_id).await;
+        let Some(mut file) = self.entry(&paired, session_id)? else {
             return Err(CommandError::refused(NO_DRAFT));
         };
-        if file.discard_action.is_some() || file.draft_id.is_none() {
+        if file.discard.is_some() || file.draft_id.is_none() {
             return Err(CommandError::refused(NO_DRAFT));
         }
         for attempt in 0..2 {
@@ -435,34 +661,30 @@ impl Drafts {
                     });
                 }
                 Err(error) if error.code() == ErrorCode::DraftConflict && attempt == 0 => {
-                    let message = match &error {
-                        ClientError::Host(refused) => refused.message.clone(),
-                        ClientError::Refused { error, .. } => error.message.clone(),
-                        other => other.to_string(),
-                    };
-                    if let Some(revision) = revision_in(&message) {
+                    let said = host_words(&error).map_or_else(|| error.to_string(), str::to_owned);
+                    if let Some(revision) = revision_in(&said) {
                         file.revision = Some(revision);
                         self.write(&paired, &file)?;
                     } else {
                         // The host's words do not carry the revision: the draft is ended.
                         file.revision = None;
                         self.write(&paired, &file)?;
-                        let _ = self.finish_ending(&paired, &target, &mut file).await;
+                        let _ = self.finish_ending(&paired, &mut file).await;
                         return Err(error.into());
                     }
                 }
-                Err(error) if unknown_draft(&error) => {
+                Err(error) if gone(&error) => {
                     self.remove(&paired, session_id);
                     return Err(CommandError::refused(GONE_FOR_TEXT));
                 }
                 Err(
-                    error
-                    @ (ClientError::SubmissionUncertain { .. } | ClientError::ConnectionEnded),
+                    error @ (ClientError::SubmissionUncertain { .. }
+                    | ClientError::OutcomeUnknown { .. }),
                 ) => {
                     // The answer is lost: the revision is not known, so the draft is ended.
                     file.revision = None;
                     self.write(&paired, &file)?;
-                    let _ = self.finish_ending(&paired, &target, &mut file).await;
+                    let _ = self.finish_ending(&paired, &mut file).await;
                     return Err(error.into());
                 }
                 Err(error) => return Err(error.into()),
@@ -473,22 +695,9 @@ impl Drafts {
         ))
     }
 
-    fn fresh(&self, paired: &Paired, session_id: SessionId) -> DraftFile {
-        DraftFile {
-            version: DRAFT_VERSION,
-            environment_id: paired.environment_id,
-            device_id: paired.device_id,
-            session_id,
-            draft_id: None,
-            revision: None,
-            create_action: None,
-            discard_action: None,
-            attachments: Vec::new(),
-        }
-    }
-
-    /// Makes the draft: under an action identifier that is kept first, and kept until the host
-    /// answers it, so that a lost answer is asked again and the host's record answers it.
+    /// Makes the draft: the request is composed once and kept whole before it is sent, and kept until
+    /// the host answers it, so that a lost answer is asked again exactly and the host's record
+    /// answers it.
     async fn make(
         &self,
         paired: &Paired,
@@ -496,71 +705,105 @@ impl Drafts {
         bind: &Bind,
         file: &mut DraftFile,
     ) -> Result<()> {
-        let action_id = match file.create_action {
-            Some(action_id) => action_id,
-            None => {
-                let action_id = ActionId::new(kr_ipc::new_uuid());
-                file.create_action = Some(action_id);
-                self.write(paired, file)?;
-                action_id
-            }
-        };
-        // A create that went out earlier is read from the host's record before it is sent again.
-        let recorded = paired
+        let composed = paired
             .session
-            .read_receipt(&ActionReadParams {
-                action_id,
-                session_id: None,
-            })
-            .await
-            .ok()
-            .and_then(|read| read.result.as_ref().cloned());
-        let created: DraftCreateResult = match recorded {
-            Some(value) => value
-                .to_typed()
-                .map_err(|error| CommandError::local_failure(error.to_string()))?,
-            None => {
-                let composed = paired
-                    .session
-                    .compose(
-                        Method::DraftCreate,
-                        action_id,
-                        target.clone(),
-                        None,
-                        &NoPreconditions {},
-                        &DraftCreateParams {
-                            environment_id: paired.environment_id,
-                            device_id: Nullable::null(),
-                            session_id: Nullable::some(bind.session_id),
-                            application_instance_id: bind
-                                .application_instance_id
-                                .map_or_else(Nullable::null, Nullable::some),
-                            text: bind.text.clone(),
-                        },
-                        MUTATION_TTL,
-                    )
-                    .await?;
-                match paired.session.send(&composed).await {
-                    Ok(settled) => settled.to_typed()?,
-                    Err(error) if unknown_draft(&error) => {
-                        file.create_action = None;
-                        self.remove(paired, bind.session_id);
-                        return Err(CommandError::refused(GONE));
-                    }
-                    // Not answered: the action is kept, and the next bind asks about it.
-                    Err(error) => {
-                        let flag = self
-                            .discard_refused
-                            .load(std::sync::atomic::Ordering::Acquire);
-                        return Err(at_the_bound(flag, &error).unwrap_or_else(|| error.into()));
-                    }
+            .compose(
+                Method::DraftCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                None,
+                &NoPreconditions {},
+                &DraftCreateParams {
+                    environment_id: paired.environment_id,
+                    device_id: Nullable::null(),
+                    session_id: Nullable::some(bind.session_id),
+                    application_instance_id: bind
+                        .application_instance_id
+                        .map_or_else(Nullable::null, Nullable::some),
+                    text: bind.text.clone(),
+                },
+                MUTATION_TTL,
+            )
+            .await?;
+        file.target = target.clone();
+        file.create = Some(KeptRequest::of(&composed)?);
+        self.write(paired, file)?;
+        let action = composed.action_id();
+        self.arm(action);
+        match sent_as(paired.session.send(&composed).await, false) {
+            Sent::Done(settled) => self.made(paired, file, action, &settled).await,
+            Sent::Refused(error) => {
+                // The host decided, so nothing was made.
+                file.create = None;
+                paired.session.settle(action).await;
+                if gone(&error) {
+                    self.remove(paired, bind.session_id);
+                    return Err(CommandError::refused(GONE));
                 }
+                self.write(paired, file)?;
+                let flag = self.refused_discard(paired);
+                Err(at_the_bound(flag, &error).unwrap_or_else(|| error.into()))
             }
-        };
+            Sent::NeverLeft(error) => {
+                file.create = None;
+                paired.session.settle(action).await;
+                self.write(paired, file)?;
+                Err(error.into())
+            }
+            Sent::Uncertain(error) => Err(error.into()),
+            Sent::Unresolved => Err(CommandError::unavailable(CREATE_PENDING)),
+        }
+    }
+
+    /// The host's answer to the creation is kept, and the action leaves the client's book.
+    async fn made(
+        &self,
+        paired: &Paired,
+        file: &mut DraftFile,
+        action: ActionId,
+        settled: &Answered,
+    ) -> Result<()> {
+        let created: DraftCreateResult = settled.to_typed()?;
         file.draft_id = Some(created.draft.draft_id);
         file.revision = Some(created.draft.revision);
-        file.create_action = None;
-        self.write(paired, file)
+        file.create = None;
+        self.write(paired, file)?;
+        paired.session.settle(action).await;
+        Ok(())
+    }
+
+    /// Asks the host again, exactly, about the creation whose answer was lost. It ends with the
+    /// draft made, or with the creation known not to have happened, or with an error that leaves it
+    /// kept.
+    async fn resolve_create(&self, paired: &Paired, file: &mut DraftFile) -> Result<()> {
+        let Some(kept) = file.create.clone() else {
+            return Ok(());
+        };
+        let composed = kept.composed()?;
+        let action = kept.action_id;
+        let armed = self.arm(action);
+        let began = Instant::now();
+        match sent_as(paired.session.repeat(&composed).await, true) {
+            Sent::Done(settled) => self.made(paired, file, action, &settled).await,
+            // A refusal for the window of another connection is the host having no record; it
+            // counts only once the window and a margin have passed since this process first asked.
+            Sent::Refused(error)
+                if error.code() == ErrorCode::PermissionDenied
+                    && began.duration_since(armed) >= kept.bound() =>
+            {
+                file.create = None;
+                self.write(paired, file)?;
+                paired.session.settle(action).await;
+                Ok(())
+            }
+            Sent::Refused(_) => {
+                paired.session.settle(action).await;
+                Err(CommandError::unavailable(CREATE_PENDING))
+            }
+            Sent::NeverLeft(_) | Sent::Uncertain(_) | Sent::Unresolved => {
+                Err(CommandError::unavailable(CREATE_PENDING))
+            }
+        }
     }
 
     /// Ends the draft of the session by `draft.discard`, because the composer dropped its files
@@ -573,66 +816,118 @@ impl Drafts {
     pub async fn end(
         &self,
         paired: Paired,
-        target: ActionTarget,
+        _target: ActionTarget,
         session_id: SessionId,
     ) -> Result<()> {
-        let Some(mut file) = self.read(&paired, session_id)? else {
+        let _turn = self.turn(&paired, session_id).await;
+        let Some(mut file) = self.entry(&paired, session_id)? else {
             return Ok(());
         };
-        self.finish_ending(&paired, &target, &mut file).await
+        self.finish_ending(&paired, &mut file).await
     }
 
-    /// Asks the host to discard the draft, under an action identifier kept until it answers.
-    async fn finish_ending(
-        &self,
-        paired: &Paired,
-        target: &ActionTarget,
-        file: &mut DraftFile,
-    ) -> Result<()> {
-        let Some(draft_id) = file.draft_id else {
-            self.remove(paired, file.session_id);
-            return Ok(());
-        };
-        let action_id = match file.discard_action {
-            Some(action_id) => action_id,
-            None => {
-                let action_id = ActionId::new(kr_ipc::new_uuid());
-                file.discard_action = Some(action_id);
-                self.write(paired, file)?;
-                action_id
-            }
-        };
-        let composed = paired
-            .session
-            .compose(
-                Method::DraftDiscard,
-                action_id,
-                target.clone(),
-                None,
-                &NoPreconditions {},
-                &DraftDiscardParams { draft_id },
-                MUTATION_TTL,
-            )
-            .await?;
-        match paired.session.send(&composed).await {
-            Ok(_) => {
+    /// Asks the host to discard the draft, on the target the draft was made on, with a request kept
+    /// whole until the host answers it. A creation whose answer is not known is resolved first.
+    async fn finish_ending(&self, paired: &Paired, file: &mut DraftFile) -> Result<()> {
+        if file.create.is_some() {
+            self.resolve_create(paired, file).await?;
+        }
+        for _ in 0..2 {
+            if file.draft_id.is_none() {
                 self.remove(paired, file.session_id);
-                Ok(())
+                return Ok(());
             }
-            Err(error) => match discard_outcome(&error) {
-                Ended::Done => {
-                    self.remove(paired, file.session_id);
-                    Ok(())
+            if let Step::Ended = self.discard_once(paired, file).await? {
+                return Ok(());
+            }
+        }
+        Err(CommandError::unavailable(DISCARD_PENDING))
+    }
+
+    async fn discard_once(&self, paired: &Paired, file: &mut DraftFile) -> Result<Step> {
+        let Some(draft_id) = file.draft_id else {
+            return Ok(Step::Ended);
+        };
+        let (composed, kept) = match file.discard.clone() {
+            Some(kept) => (kept.composed()?, Some(kept)),
+            None => {
+                let composed = paired
+                    .session
+                    .compose(
+                        Method::DraftDiscard,
+                        ActionId::new(kr_ipc::new_uuid()),
+                        file.target.clone(),
+                        None,
+                        &NoPreconditions {},
+                        &DraftDiscardParams { draft_id },
+                        MUTATION_TTL,
+                    )
+                    .await?;
+                file.discard = Some(KeptRequest::of(&composed)?);
+                self.write(paired, file)?;
+                (composed, None)
+            }
+        };
+        let action = composed.action_id();
+        let armed = self.arm(action);
+        let began = Instant::now();
+        let repeating = kept.is_some();
+        let answered = if repeating {
+            paired.session.repeat(&composed).await
+        } else {
+            paired.session.send(&composed).await
+        };
+        match sent_as(answered, repeating) {
+            Sent::Done(_) => {
+                self.remove(paired, file.session_id);
+                paired.session.settle(action).await;
+                Ok(Step::Ended)
+            }
+            Sent::Refused(error) => {
+                paired.session.settle(action).await;
+                match discard_outcome(&error) {
+                    Ended::Done => {
+                        self.remove(paired, file.session_id);
+                        Ok(Step::Ended)
+                    }
+                    // The client goes on without ending drafts, and says so only at the bound.
+                    Ended::OlderHost => {
+                        self.discard_refused
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert((paired.environment_id, paired.device_id));
+                        self.remove(paired, file.session_id);
+                        Ok(Step::Ended)
+                    }
+                    Ended::Failed => match kept {
+                        Some(kept)
+                            if error.code() == ErrorCode::PermissionDenied
+                                && began.duration_since(armed) >= kept.bound() =>
+                        {
+                            file.discard = None;
+                            self.write(paired, file)?;
+                            Ok(Step::Anew)
+                        }
+                        Some(_) => Err(CommandError::unavailable(DISCARD_PENDING)),
+                        None => {
+                            // The host decided not to end it: the draft stands, and so does the file.
+                            file.discard = None;
+                            self.write(paired, file)?;
+                            Err(error.into())
+                        }
+                    },
                 }
-                // The client goes on without ending drafts, and says so only at the bound.
-                Ended::OlderHost => {
-                    self.discard_refused
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    self.remove(paired, file.session_id);
-                    Ok(())
-                }
-                Ended::Failed => Err(error.into()),
-            },
+            }
+            Sent::NeverLeft(error) => {
+                file.discard = None;
+                paired.session.settle(action).await;
+                self.write(paired, file)?;
+                Err(error.into())
+            }
+            Sent::Uncertain(error) if !repeating => Err(error.into()),
+            Sent::Uncertain(_) | Sent::Unresolved => {
+                Err(CommandError::unavailable(DISCARD_PENDING))
+            }
         }
     }
 
@@ -657,18 +952,15 @@ impl Drafts {
             .iter()
             .map(|summary| summary.session_id)
             .collect();
-        let target = ActionTarget::environment(paired.environment_id);
-        self.sweep(paired, target, &ids).await;
+        self.sweep(paired, &ids).await;
     }
 
-    /// At each start: the drafts whose session the host no longer lists are ended. A draft the host
+    /// At each reach: the drafts of another principal on this host are dropped, and the drafts whose
+    /// session the host no longer lists are ended on the target they were made on. A draft the host
     /// has already ended is harmless to end again.
-    pub async fn sweep(&self, paired: Paired, target: ActionTarget, listed: &[SessionId]) {
-        let Ok(path) = self.path(Uuid::from_bytes([0; 16])) else {
-            return;
-        };
-        let Some(root) = path.parent() else { return };
-        let Ok(listing) = std::fs::read_dir(root) else {
+    pub async fn sweep(&self, paired: Paired, listed: &[SessionId]) {
+        let Ok(root) = self.root() else { return };
+        let Ok(listing) = std::fs::read_dir(&root) else {
             return;
         };
         for item in listing.flatten() {
@@ -679,17 +971,47 @@ impl Drafts {
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            let Ok(mut file) = serde_json::from_slice::<DraftFile>(&bytes) else {
+            let Ok(file) = serde_json::from_slice::<DraftFile>(&bytes) else {
                 continue;
             };
-            if file.version != DRAFT_VERSION
-                || file.environment_id != paired.environment_id
-                || file.device_id != paired.device_id
-                || listed.contains(&file.session_id)
-            {
+            if file.version != DRAFT_VERSION || file.environment_id != paired.environment_id {
                 continue;
             }
-            let _ = self.finish_ending(&paired, &target, &mut file).await;
+            if file.device_id != paired.device_id {
+                // Kept under a sign-in that is not the one in force.
+                let _ = crate::drafts::remove_durably(&path);
+                continue;
+            }
+            if listed.contains(&file.session_id) {
+                continue;
+            }
+            let _turn = self.turn(&paired, file.session_id).await;
+            // Read again under the turn: another operation may have changed it meanwhile.
+            if let Ok(Some(mut file)) = self.entry(&paired, file.session_id) {
+                let _ = self.finish_ending(&paired, &mut file).await;
+            }
+        }
+    }
+
+    /// The host this device knows as `device_id` was forgotten: every draft kept for it goes.
+    pub fn forgotten(&self, device_id: DeviceId) {
+        let Ok(root) = self.root() else { return };
+        let Ok(listing) = std::fs::read_dir(&root) else {
+            return;
+        };
+        for item in listing.flatten() {
+            let path = item.path();
+            if path.extension().is_none_or(|ext| ext != EXTENSION) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if serde_json::from_slice::<DraftFile>(&bytes)
+                .is_ok_and(|file| file.device_id == device_id)
+            {
+                let _ = crate::drafts::remove_durably(&path);
+            }
         }
     }
 }
@@ -710,14 +1032,52 @@ impl Drafts {
         &self,
         paired: &Paired,
         session_id: SessionId,
+        target: &ActionTarget,
         draft_id: Option<DraftId>,
         revision: Option<DraftRevision>,
-        create_action: Option<ActionId>,
     ) {
-        let mut file = self.fresh(paired, session_id);
+        let mut file = self.fresh(paired, session_id, target);
         file.draft_id = draft_id;
         file.revision = revision;
-        file.create_action = create_action;
+        self.write(paired, &file).expect("the entry is kept");
+    }
+
+    /// Keeps an entry whose `draft.create` went out as `composed` and whose answer was lost.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the entry cannot be written.
+    pub fn keep_create_for_test(
+        &self,
+        paired: &Paired,
+        session_id: SessionId,
+        target: &ActionTarget,
+        composed: &ComposedMutation,
+    ) {
+        let mut file = self.fresh(paired, session_id, target);
+        file.create = Some(KeptRequest::of(composed).expect("the request encodes"));
+        self.write(paired, &file).expect("the entry is kept");
+    }
+
+    /// Keeps the entry of a made draft whose `draft.discard` went out as `composed` and whose answer
+    /// was lost.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the entry cannot be written.
+    pub fn keep_discard_for_test(
+        &self,
+        paired: &Paired,
+        session_id: SessionId,
+        target: &ActionTarget,
+        draft_id: DraftId,
+        revision: DraftRevision,
+        composed: &ComposedMutation,
+    ) {
+        let mut file = self.fresh(paired, session_id, target);
+        file.draft_id = Some(draft_id);
+        file.revision = Some(revision);
+        file.discard = Some(KeptRequest::of(composed).expect("the request encodes"));
         self.write(paired, &file).expect("the entry is kept");
     }
 }
@@ -741,7 +1101,7 @@ mod tests {
         );
         assert_eq!(discard_outcome(&older), Ended::OlderHost);
         assert_eq!(
-            discard_outcome(&refused(ErrorCode::InvalidArgument, "no such draft")),
+            discard_outcome(&refused(ErrorCode::InvalidArgument, "no draft 7")),
             Ended::Done
         );
         assert_eq!(

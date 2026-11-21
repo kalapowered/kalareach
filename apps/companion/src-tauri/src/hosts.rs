@@ -138,6 +138,10 @@ pub async fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> R
     if let Some(desk) = state.push() {
         desk.forgotten(host.host_device_id);
     }
+    // What is being sent to the host, and every entry, copy and draft kept for this pairing, goes with
+    // it: a host paired again gives this device another identity, so nothing would act on them.
+    state.transfers().forgotten(host.device_id);
+    state.paired_drafts().forgotten(host.device_id);
     let (link, forgotten) = (Arc::clone(&device.pairing().link), host.clone());
     // A task that panics has left nothing to wait for, and the person's forgetting has been done.
     let _ = tauri::async_runtime::spawn(async move { link.forget_host(&forgotten).await }).await;

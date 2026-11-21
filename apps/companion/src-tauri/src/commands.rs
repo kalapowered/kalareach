@@ -1257,18 +1257,30 @@ async fn send_prompt(
     if typed.draft_id.is_present() {
         let settled = send_draft_prompt(state, method, &typed, &expected).await?;
         // A prompt that names the draft records the send on the host, which frees the draft's place:
-        // the draft is the session's now, and what this device kept of it ends.
-        if !settled.answer_lost
-            && let Ok((device_id, environment_id, session)) = state.paired_snapshot()
+        // the draft is the session's now, and what this device kept of it ends. Only a result, or a
+        // receipt that says the prompt was applied, says so; a refusal or an answer that cannot be
+        // established leaves the draft where it is.
+        let applied = settled.value.is_some()
+            || settled.receipt.as_ref().is_some_and(|receipt| {
+                receipt.state == kr_protocol::receipt::ReceiptState::Applied
+            });
+        if applied
+            && !settled.answer_lost
+            && let (Some(draft_id), Ok((device_id, environment_id, session))) =
+                (typed.draft_id.0, state.paired_snapshot())
         {
-            state.paired_drafts().sent(
-                &crate::open_transfers::Paired {
-                    device_id,
-                    environment_id,
-                    session,
-                },
-                typed.target.subject.session_id,
-            );
+            state
+                .paired_drafts()
+                .sent(
+                    &crate::open_transfers::Paired {
+                        device_id,
+                        environment_id,
+                        session,
+                    },
+                    typed.target.subject.session_id,
+                    draft_id,
+                )
+                .await;
         }
         return Ok(settled);
     }

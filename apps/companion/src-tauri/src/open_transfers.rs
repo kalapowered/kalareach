@@ -5,26 +5,35 @@
 //! plan's subject, the content, the progress the driver publishes, and the handle that stops it.
 //! A command waits on the upload's outcome and may be dropped; the upload goes on. A connection
 //! that ends pauses it, and the next connection to the host, through [`Desk::host_reached`],
-//! resumes it with [`Upload::resuming`] under the same transfer identifier and the content the
-//! process still holds.
+//! resumes it with [`Upload::resuming`] under the same transfer identifier, after the content it
+//! describes has been read again and found to be the one declared.
 //!
 //! * **One layout, version 1.** `open-transfers/` holds `<key>.upload` (what the entry is for, the
 //!   transfer identifier once the host gave one, how far the transfer got and the handle once it is
-//!   published) and `<key>.bytes` (a copy of a file the page handed over as bytes). Every file of
-//!   an entry is JSON with exactly the members it names: a file with another `version`, a member
-//!   more or fewer, or a name that is not its key is counted and left, never read or changed,
-//!   because a later release may own it.
+//!   published) and `<key>.bytes` (a copy of a file the page handed over as bytes, raw). Every
+//!   entry file is JSON with exactly the members it names. An entry file with another `version`, a
+//!   member more or fewer, or a name that is not its key is counted and left, never read or changed,
+//!   and neither is the copy that goes with it, because a later release may own both.
+//! * **A key and a place are reserved before anything is sent.** The desk holds one lock from the
+//!   check of the count and the key to the insert of the upload, so no key is used twice and no
+//!   third upload is admitted.
 //! * **Written before the call that needs it.** The driver tells the [`Kept`] journal that it is
 //!   about to ask for a reservation, what the transfer identifier is, and that it is about to send
-//!   the finish, each before the call; a write that fails stops the send before the call.
+//!   the finish, each before the call; a write that fails stops the send before the call, and a
+//!   transfer identifier the host gave is held in memory until it is kept.
 //! * **A restart reads before it acts.** The host is asked for the state of every entry first.
 //!   A published upload keeps its handle and is never cancelled; one the host still receives
 //!   resumes with exactly what the host lacks when the content is still here and its digest is the
-//!   one declared; one the host does not know, or has ended, is dropped; and a reservation whose
-//!   answer never came cannot be found again, which the entry says.
+//!   one declared; one the host does not know (and only that answer), or has ended, is dropped; and
+//!   a reservation whose answer never came cannot be found again, which the entry says.
+//! * **A copy ends with its entry.** It is removed when the upload is published, cancelled or
+//!   dropped, when it is found unrecoverable, when the host is forgotten, when no entry of any
+//!   layout names it, and a copy that a stopped process left half written is removed at the next
+//!   reach.
 //! * **Missing, stale and rolled back.** An application that finds no folder has no entry to
 //!   resume, which is how a release before this one behaves. An entry names the host, the device
-//!   and the content's digest it describes, and is acted on only against that host. A release
+//!   and the content's digest it describes, and is acted on only against that host and that
+//!   device; an entry of another device of the same host is dropped with its copy. A release
 //!   before this one leaves the folder alone; the host ends what it holds after its own
 //!   twenty-four hours.
 
@@ -63,13 +72,16 @@ const COPY_EXTENSION: &str = "bytes";
 
 /// What a third open upload is refused with.
 pub const TOO_MANY_OPEN: &str =
-    "two files are being sent to this host already: wait for one to finish, or cancel one";
+    "two files are open on this host already: wait for one to finish, or cancel one";
+
+/// What a transfer key that an open upload holds is refused with.
+pub const KEY_IN_USE: &str = "an upload with that transfer key is open already";
 
 /// What an entry says when the content to send on is gone or is not what was declared.
 pub const CANNOT_RESUME: &str = "this file cannot be resumed from where it stopped, because the copy this device kept is gone or has changed: cancel it and send the file again";
 
 /// What an entry says when the host was asked for a reservation and its answer never came.
-pub const UNRECOVERABLE: &str = "the host was asked to take this file and did not answer before this application stopped: it keeps the place for up to 24 hours and then releases it";
+pub const UNRECOVERABLE: &str = "this device asked the host to take this file and did not get its answer: if the host agreed, it keeps the place for up to 24 hours and then releases it";
 
 /// What the command that waited for an upload is told when the person cancelled it.
 pub const CANCELLED: &str = "this file was cancelled before it was sent in full";
@@ -125,6 +137,9 @@ struct UploadFile {
     reached: Reached,
     transfer_id: Option<TransferId>,
     handle: Option<AttachmentHandle>,
+    /// The person cancelled it and the host's answer is not yet known: the next reach finishes
+    /// the cancel and never resumes the upload.
+    cancel_asked: bool,
 }
 
 /// The folder of entries and what is done to it.
@@ -136,10 +151,26 @@ struct Store {
 /// What a read of the folder found.
 struct Found {
     entries: Vec<UploadFile>,
-    /// Files of another layout, left alone.
+    /// Keys of `<key>.upload` files of another layout, left alone with their copies.
+    unreadable: Vec<Uuid>,
+    /// Files that are not this layout's and are not named by a key, left alone.
     left: usize,
-    /// Copies whose entry is not there.
+    /// Copies that no entry file names, of any layout.
     orphans: Vec<Uuid>,
+    /// Copies of entries that are over or cannot be resumed: published, or never given an identifier.
+    spent: Vec<Uuid>,
+    /// Files a process that stopped was writing.
+    staged: Vec<PathBuf>,
+    /// Keys that have a copy.
+    copies: Vec<Uuid>,
+}
+
+impl Found {
+    fn holds(&self, key: Uuid) -> bool {
+        self.entries.iter().any(|file| file.key == key)
+            || self.unreadable.contains(&key)
+            || self.copies.contains(&key)
+    }
 }
 
 impl Store {
@@ -178,15 +209,29 @@ impl Store {
     fn all(&self) -> Found {
         let mut found = Found {
             entries: Vec::new(),
+            unreadable: Vec::new(),
             left: 0,
             orphans: Vec::new(),
+            spent: Vec::new(),
+            staged: Vec::new(),
+            copies: Vec::new(),
         };
         let Ok(listing) = std::fs::read_dir(&self.root) else {
             return found;
         };
-        let mut copies = Vec::new();
         for item in listing.flatten() {
             let path = item.path();
+            let name = item.file_name().to_string_lossy().into_owned();
+            if let Some((_, staged)) = name.rsplit_once(".staged-") {
+                // Written by a process that is not this one and never renamed.
+                let by = staged.split('-').next().unwrap_or_default();
+                if by != std::process::id().to_string() {
+                    found.staged.push(path);
+                } else {
+                    found.left += 1;
+                }
+                continue;
+            }
             let (Some(stem), Some(extension)) = (
                 path.file_stem().and_then(|stem| stem.to_str()),
                 path.extension().and_then(|extension| extension.to_str()),
@@ -199,21 +244,32 @@ impl Store {
                 continue;
             };
             match extension {
-                COPY_EXTENSION => copies.push(key),
+                COPY_EXTENSION => found.copies.push(key),
                 // The drafts kept beside the uploads are another module's.
                 "draft" => {}
                 UPLOAD_EXTENSION => match read_entry(&path, key) {
                     Some(file) => found.entries.push(file),
-                    None => found.left += 1,
+                    None => {
+                        found.left += 1;
+                        found.unreadable.push(key);
+                    }
                 },
                 _ => found.left += 1,
             }
         }
         found.entries.sort_by_key(|file| file.key);
-        found.orphans = copies
-            .into_iter()
-            .filter(|key| found.entries.iter().all(|file| file.key != *key))
-            .collect();
+        for key in &found.copies {
+            match found.entries.iter().find(|file| file.key == *key) {
+                None if !found.unreadable.contains(key) => found.orphans.push(*key),
+                Some(file)
+                    if file.reached == Reached::Published
+                        || (file.reached == Reached::Beginning && file.transfer_id.is_none()) =>
+                {
+                    found.spent.push(*key);
+                }
+                _ => {}
+            }
+        }
         found
     }
 }
@@ -264,13 +320,17 @@ enum Phase {
 /// One upload this process holds.
 struct Live {
     file: Mutex<UploadFile>,
-    content: Arc<dyn Content>,
+    content: Mutex<Arc<dyn Content>>,
     progress: watch::Sender<Progress>,
     outcome: watch::Sender<Option<Outcome>>,
-    task: Mutex<Option<tokio::task::AbortHandle>>,
+    task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     phase: Mutex<Phase>,
     /// The reservation was kept as asked for: whatever the answer, a new plan may not ask again.
     beginning_kept: AtomicBool,
+    /// The transfer identifier the host gave, held here until the entry has kept it.
+    issued: Mutex<Option<TransferId>>,
+    /// A write of the entry failed: the failure is this device's, never the host's.
+    journal_failed: AtomicBool,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -278,8 +338,27 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Live {
+    fn new(file: UploadFile, content: Arc<dyn Content>, beginning_kept: bool) -> Arc<Self> {
+        Arc::new(Self {
+            file: Mutex::new(file),
+            content: Mutex::new(content),
+            progress: watch::channel(Progress::default()).0,
+            outcome: watch::channel(None).0,
+            task: Mutex::new(None),
+            phase: Mutex::new(Phase::Sending),
+            beginning_kept: AtomicBool::new(beginning_kept),
+            issued: Mutex::new(None),
+            journal_failed: AtomicBool::new(false),
+        })
+    }
+
     fn file(&self) -> UploadFile {
         locked(&self.file).clone()
+    }
+
+    /// The transfer the host gave, whether or not the entry could keep it.
+    fn transfer(&self) -> Option<TransferId> {
+        locked(&self.file).transfer_id.or(*locked(&self.issued))
     }
 
     fn change(&self, store: &Store, change: impl FnOnce(&mut UploadFile)) -> std::io::Result<()> {
@@ -305,45 +384,48 @@ fn not_kept(error: &std::io::Error) -> ClientError {
     ))
 }
 
+impl Kept {
+    fn kept(&self, change: impl FnOnce(&mut UploadFile)) -> kr_client::Result<()> {
+        self.live.change(&self.store, change).map_err(|error| {
+            self.live.journal_failed.store(true, Ordering::Release);
+            not_kept(&error)
+        })
+    }
+}
+
 impl Journal for Kept {
     fn beginning(&self) -> kr_client::Result<()> {
-        self.live
-            .change(&self.store, |file| file.reached = Reached::Beginning)
-            .map_err(|error| not_kept(&error))?;
+        self.kept(|file| file.reached = Reached::Beginning)?;
         self.live.beginning_kept.store(true, Ordering::Release);
         Ok(())
     }
 
     fn begun(&self, transfer_id: TransferId) -> kr_client::Result<()> {
-        self.live
-            .change(&self.store, |file| {
-                file.transfer_id = Some(transfer_id);
-                file.reached = Reached::Begun;
-            })
-            .map_err(|error| not_kept(&error))
+        // The host's answer is held first: a write that fails loses nothing the host holds.
+        *locked(&self.live.issued) = Some(transfer_id);
+        self.kept(|file| {
+            file.transfer_id = Some(transfer_id);
+            file.reached = Reached::Begun;
+        })
     }
 
     fn finishing(&self, transfer_id: TransferId) -> kr_client::Result<()> {
-        self.live
-            .change(&self.store, |file| {
-                file.transfer_id = Some(transfer_id);
-                file.reached = Reached::Finishing;
-            })
-            .map_err(|error| not_kept(&error))
+        self.kept(|file| {
+            file.transfer_id = Some(transfer_id);
+            file.reached = Reached::Finishing;
+        })
     }
 
     fn published(&self, handle: &AttachmentHandle) -> kr_client::Result<()> {
         let handle = handle.clone();
-        self.live
-            .change(&self.store, |file| {
-                file.handle = Some(handle);
-                file.reached = Reached::Published;
-            })
-            .map_err(|error| not_kept(&error))?;
-        // The bytes are the host's now; the handle is what this entry keeps.
-        self.store
-            .remove_copy(locked(&self.live.file).key)
-            .map_err(|error| not_kept(&error))
+        self.kept(|file| {
+            file.handle = Some(handle);
+            file.reached = Reached::Published;
+        })?;
+        // The bytes are the host's now; the handle is what this entry keeps. A copy that cannot be
+        // removed now is removed at the next reach, and is no reason to fail a published upload.
+        let _ = self.store.remove_copy(locked(&self.live.file).key);
+        Ok(())
     }
 }
 
@@ -400,6 +482,8 @@ pub enum OpenState {
     CannotResume,
     /// The reservation's answer never came.
     Unrecoverable,
+    /// The host refused it for good and still holds the reservation until it is cancelled.
+    Failed,
 }
 
 /// One open upload, as `transfers_open` answers.
@@ -425,7 +509,7 @@ pub struct OpenView {
     /// The handle, once it is published.
     pub handle: Option<AttachmentHandle>,
     /// The words that say what is wrong, when something is.
-    pub said: Option<&'static str>,
+    pub said: Option<String>,
 }
 
 /// What a cancel did, from the host's answer.
@@ -448,8 +532,11 @@ pub struct Cancelled {
 pub struct Desk {
     root: Mutex<Option<PathBuf>>,
     live: Mutex<HashMap<Uuid, Arc<Live>>>,
-    /// What a restart found of entries it could not resume.
+    /// What a restart or a failure found of entries it could not resume.
     verdicts: Mutex<HashMap<Uuid, Verdict>>,
+    /// The newest connection of each host's device, so that an upload whose connection ended while
+    /// a newer one was coming up goes on at once.
+    sessions: Mutex<HashMap<(EnvironmentId, DeviceId), Arc<Session>>>,
 }
 
 impl std::fmt::Debug for Desk {
@@ -461,9 +548,11 @@ impl std::fmt::Debug for Desk {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Verdict {
     CannotResume,
+    /// The host refused it for good; what it said.
+    Failed(String),
 }
 
 fn stage_word(stage: Stage) -> &'static str {
@@ -476,12 +565,37 @@ fn stage_word(stage: Stage) -> &'static str {
     }
 }
 
+/// The words of a refusal the host decided.
+pub(crate) fn host_words(error: &ClientError) -> Option<&str> {
+    match error {
+        ClientError::Host(refused) => Some(&refused.message),
+        ClientError::Refused { error, .. } => Some(&error.message),
+        _ => None,
+    }
+}
+
 /// Whether the host's answer to a status read says it does not know the transfer.
+///
+/// A refusal of a right is not that: the host may hold the upload, and the right may come back.
 fn host_does_not_know(error: &ClientError) -> bool {
-    matches!(
-        error.code(),
-        ErrorCode::InvalidArgument | ErrorCode::PermissionDenied
-    )
+    error.code() == ErrorCode::InvalidArgument
+        && host_words(error).is_some_and(|words| words.starts_with("no transfer "))
+}
+
+/// Removes the entry of `key` and its copy when the host's answer says it knows nothing of the
+/// upload, and says whether it did. Any other answer, a refused right included, leaves both.
+fn drop_if_unknown(store: &Store, key: Uuid, error: &ClientError) -> bool {
+    let unknown = host_does_not_know(error);
+    if unknown {
+        let _ = store.remove(key);
+    }
+    unknown
+}
+
+fn record_not_kept(error: &std::io::Error) -> CommandError {
+    CommandError::local_failure(format!(
+        "this device could not keep a record of the upload: {error}"
+    ))
 }
 
 impl Desk {
@@ -506,8 +620,8 @@ impl Desk {
     ///
     /// # Errors
     ///
-    /// Refuses a third open upload, and returns the host's refusal or the reason this device ended
-    /// the connection.
+    /// Refuses a key that is in use and a third open upload, and returns the host's refusal or the
+    /// reason this device ended the connection.
     pub async fn send(
         self: &Arc<Self>,
         paired: Paired,
@@ -515,11 +629,6 @@ impl Desk {
     ) -> Result<AttachmentHandle> {
         let store = self.store()?;
         let key = request.key;
-        // Counted here and not in the host's refusal, so that the page is told in words before a
-        // reservation is asked for.
-        if self.open_count(&paired, &store) >= MOST_OPEN {
-            return Err(CommandError::refused(TOO_MANY_OPEN));
-        }
         let source = match &request.keeping {
             Keeping::Copy(_) => Source::Copy,
             Keeping::Path(path) => Source::Path { path: path.clone() },
@@ -539,29 +648,46 @@ impl Desk {
             reached: Reached::Beginning,
             transfer_id: None,
             handle: None,
+            cancel_asked: false,
         };
+        let live = Live::new(file, request.content, false);
+        // The place and the key are taken together, here and before any await: no other send can
+        // pass the count or use the key until this one is in the map.
+        {
+            let mut held = locked(&self.live);
+            let found = store.all();
+            if held.contains_key(&key) || found.holds(key) {
+                return Err(CommandError::refused(KEY_IN_USE));
+            }
+            if Self::open_count(&held, &found, &paired) >= MOST_OPEN {
+                return Err(CommandError::refused(TOO_MANY_OPEN));
+            }
+            held.insert(key, Arc::clone(&live));
+        }
         if let Keeping::Copy(bytes) = request.keeping {
             let copied = store.clone();
-            tauri::async_runtime::spawn_blocking(move || copied.write_copy(key, &bytes))
-                .await
-                .map_err(|error| CommandError::local_failure(error.to_string()))?
-                .map_err(|error| {
-                    CommandError::local_failure(format!(
-                        "this device could not keep a copy of the file: {error}"
-                    ))
-                })?;
+            let written =
+                tauri::async_runtime::spawn_blocking(move || copied.write_copy(key, &bytes))
+                    .await
+                    .map_err(|error| CommandError::local_failure(error.to_string()))
+                    .and_then(|written| {
+                        written.map_err(|error| {
+                            CommandError::local_failure(format!(
+                                "this device could not keep a copy of the file: {error}"
+                            ))
+                        })
+                    });
+            if let Err(error) = written {
+                locked(&self.live).remove(&key);
+                let _ = store.remove_copy(key);
+                return Err(error);
+            }
         }
-        let live = Arc::new(Live {
-            file: Mutex::new(file),
-            content: request.content,
-            progress: watch::channel(Progress::default()).0,
-            outcome: watch::channel(None).0,
-            task: Mutex::new(None),
-            phase: Mutex::new(Phase::Sending),
-            beginning_kept: AtomicBool::new(false),
-        });
-        locked(&self.live).insert(key, Arc::clone(&live));
-        self.start(&live, paired.session);
+        locked(&self.sessions).insert(
+            (paired.environment_id, paired.device_id),
+            Arc::clone(&paired.session),
+        );
+        self.start(&live, paired.session, false);
         Self::outcome_of(&live).await
     }
 
@@ -582,8 +708,8 @@ impl Desk {
 
     /// The open uploads of this device on this host: the ones this process holds and the ones kept
     /// from before whose upload is not published.
-    fn open_count(&self, paired: &Paired, store: &Store) -> usize {
-        let mut keys: Vec<Uuid> = locked(&self.live)
+    fn open_count(held: &HashMap<Uuid, Arc<Live>>, found: &Found, paired: &Paired) -> usize {
+        let mut keys: Vec<Uuid> = held
             .iter()
             .filter(|(_, live)| {
                 let file = locked(&live.file);
@@ -593,7 +719,7 @@ impl Desk {
             })
             .map(|(key, _)| *key)
             .collect();
-        for file in store.all().entries {
+        for file in &found.entries {
             if file.environment_id == paired.environment_id
                 && file.device_id == paired.device_id
                 && file.reached != Reached::Published
@@ -605,16 +731,39 @@ impl Desk {
         keys.len()
     }
 
-    /// Starts the send of `live` on `session`.
-    fn start(self: &Arc<Self>, live: &Arc<Live>, session: Arc<Session>) {
+    /// Starts the send of `live` on `session`. A resume of a file read from where it is reads it
+    /// again first, and sends nothing when it is not the one declared.
+    fn start(self: &Arc<Self>, live: &Arc<Live>, session: Arc<Session>, verify: bool) {
         *locked(&live.phase) = Phase::Sending;
         let desk = Arc::clone(self);
         let running = Arc::clone(live);
         let task = tauri::async_runtime::spawn(async move {
+            if verify && !desk.is_the_content(&running).await {
+                return;
+            }
             let result = desk.send_once(&running, &session).await;
             desk.settle(&running, &session, result);
         });
-        *locked(&live.task) = Some(task.inner().abort_handle());
+        *locked(&live.task) = Some(task);
+    }
+
+    /// Whether the content of an upload that resumes is the one declared; when it is not, the upload
+    /// ends and its entry says it cannot resume.
+    async fn is_the_content(&self, live: &Arc<Live>) -> bool {
+        let file = live.file();
+        if live.transfer().is_none() || file.source == Source::Copy {
+            return true;
+        }
+        let Ok(store) = self.store() else {
+            return true;
+        };
+        if let Some(content) = self.source_of(&store, &file).await {
+            *locked(&live.content) = content;
+            return true;
+        }
+        locked(&self.verdicts).insert(file.key, Verdict::CannotResume);
+        self.end(live, Outcome::Failed(CommandError::refused(CANNOT_RESUME)));
+        false
     }
 
     async fn send_once(
@@ -628,7 +777,18 @@ impl Desk {
                 error.message,
             ))
         })?;
+        let journal = Kept {
+            live: Arc::clone(live),
+            store,
+        };
         let file = live.file();
+        let transfer = live.transfer();
+        if file.transfer_id.is_none()
+            && let Some(transfer_id) = transfer
+        {
+            // The host's identifier was not kept: nothing is sent for it until it is.
+            journal.begun(transfer_id)?;
+        }
         let route = ChunkRoute::network(session, file.environment_id).await?;
         let subject = Subject {
             environment_id: file.environment_id,
@@ -637,14 +797,10 @@ impl Desk {
             declared_media_type: file.media_type.clone(),
             original_file_name: file.file_name.clone(),
         };
-        let content: Box<dyn Content> = Box::new(Shared(Arc::clone(&live.content)));
-        let mut plan = match file.transfer_id {
+        let content: Box<dyn Content> = Box::new(Shared(Arc::clone(&locked(&live.content))));
+        let mut plan = match transfer {
             Some(transfer_id) => Upload::resuming(subject, content, transfer_id),
             None => Upload::new(subject, content),
-        };
-        let journal = Kept {
-            live: Arc::clone(live),
-            store,
         };
         uploads::send(
             session,
@@ -660,44 +816,88 @@ impl Desk {
 
     /// Takes what a send ended with: the handle, a pause for a connection that ended, or a failure.
     fn settle(
-        &self,
+        self: &Arc<Self>,
         live: &Arc<Live>,
-        session: &Session,
+        session: &Arc<Session>,
+        result: kr_client::Result<AttachmentHandle>,
+    ) {
+        // A sign-out gives the transport's reason, which the driver returns in place of the plain
+        // end; what this device ended is never waited out.
+        let by_this_device = session.transport().ended_by_this_device().is_some();
+        self.settle_as(live, Some(session), by_this_device, result);
+    }
+
+    fn settle_as(
+        self: &Arc<Self>,
+        live: &Arc<Live>,
+        session: Option<&Arc<Session>>,
+        by_this_device: bool,
         result: kr_client::Result<AttachmentHandle>,
     ) {
         let file = live.file();
-        match result {
-            Ok(handle) => self.end(live, Outcome::Published(Box::new(handle))),
-            Err(error) => {
-                // A sign-out gives the transport's reason, which the driver returns in place of
-                // the plain end; what this device ended is never waited out.
-                let by_this_device = session.transport().ended_by_this_device().is_some();
-                let ended = matches!(
-                    error,
-                    ClientError::ConnectionEnded | ClientError::SubmissionUncertain { .. }
-                );
-                let resumable = !by_this_device
-                    && ended
-                    && (file.transfer_id.is_some() || !live.beginning_kept.load(Ordering::Acquire));
-                if resumable {
-                    *locked(&live.phase) = Phase::Paused;
-                    return;
-                }
-                // A reservation the host refused leaves nothing behind. One whose answer is not
-                // known stays, and says so.
-                let uncertain = matches!(
-                    error,
-                    ClientError::SubmissionUncertain { .. } | ClientError::ConnectionEnded
-                ) || error.code() == ErrorCode::OutcomeUnknown;
-                if file.transfer_id.is_none()
-                    && !uncertain
-                    && let Ok(store) = self.store()
-                {
+        let error = match result {
+            Ok(handle) => return self.end(live, Outcome::Published(Box::new(handle))),
+            Err(error) => error,
+        };
+        if by_this_device {
+            // The sign-in this upload was sent under is not the one in force: it stops for good, and
+            // the copy of the person's file goes with it.
+            if let Ok(store) = self.store() {
+                let _ = store.remove(file.key);
+            }
+            return self.end(live, Outcome::Failed(CommandError::from(error)));
+        }
+        let transfer = live.transfer();
+        if live.journal_failed.load(Ordering::Acquire) {
+            if transfer.is_some() {
+                // The host holds what this device could not write down: it stays here, paused, and
+                // the next send keeps the identifier before anything else.
+                *locked(&live.phase) = Phase::Paused;
+                live.outcome
+                    .send_replace(Some(Outcome::Failed(CommandError::from(error))));
+            } else {
+                // Nothing was asked of the host.
+                if let Ok(store) = self.store() {
                     let _ = store.remove(file.key);
                 }
                 self.end(live, Outcome::Failed(CommandError::from(error)));
             }
+            return;
         }
+        // A request that never left is asked again; a finish or a chunk that did leave is read from
+        // the host's own record when the connection comes back.
+        let resumable = match error {
+            ClientError::ConnectionEnded => true,
+            ClientError::SubmissionUncertain { .. } => transfer.is_some(),
+            _ => false,
+        };
+        if resumable {
+            *locked(&live.phase) = Phase::Paused;
+            let newest = locked(&self.sessions)
+                .get(&(file.environment_id, file.device_id))
+                .cloned();
+            if let (Some(newest), Some(failed)) = (newest, session)
+                && !Arc::ptr_eq(&newest, failed)
+            {
+                // The connection that came up first is the one this upload goes on, at once.
+                self.start(live, newest, true);
+            }
+            return;
+        }
+        let uncertain = matches!(error, ClientError::SubmissionUncertain { .. })
+            || error.code() == ErrorCode::OutcomeUnknown;
+        let words = host_words(&error).map_or_else(|| error.to_string(), str::to_owned);
+        let failure = CommandError::from(error);
+        if let Ok(store) = self.store() {
+            if transfer.is_none() && !uncertain {
+                // A reservation the host refused leaves nothing behind.
+                let _ = store.remove(file.key);
+            } else if transfer.is_some() && !uncertain {
+                // Refused for good while the host holds the reservation: the entry stays, and says so.
+                locked(&self.verdicts).insert(file.key, Verdict::Failed(words));
+            }
+        }
+        self.end(live, Outcome::Failed(failure));
     }
 
     /// Ends the hold on `live` and tells whoever waits.
@@ -715,18 +915,50 @@ impl Desk {
         environment_id: EnvironmentId,
         session: Arc<Session>,
     ) {
-        let paused: Vec<Arc<Live>> = locked(&self.live)
-            .values()
-            .filter(|live| {
-                let file = locked(&live.file);
-                file.environment_id == environment_id
-                    && file.device_id == device_id
-                    && *locked(&live.phase) == Phase::Paused
-            })
-            .cloned()
-            .collect();
+        locked(&self.sessions).insert((environment_id, device_id), Arc::clone(&session));
+        let (paused, other): (Vec<Arc<Live>>, Vec<Arc<Live>>) = {
+            let held = locked(&self.live);
+            let in_host = held
+                .values()
+                .filter(|live| locked(&live.file).environment_id == environment_id);
+            let (mine, other): (Vec<_>, Vec<_>) = in_host
+                .cloned()
+                .partition(|live| locked(&live.file).device_id == device_id);
+            (
+                mine.into_iter()
+                    .filter(|live| *locked(&live.phase) == Phase::Paused)
+                    .collect(),
+                other,
+            )
+        };
+        // An upload of another principal on this host belongs to a sign-in that is not in force.
+        for live in &other {
+            if let Some(task) = locked(&live.task).take() {
+                task.abort();
+            }
+            if let Ok(store) = self.store() {
+                let _ = store.remove(locked(&live.file).key);
+            }
+            self.end(live, Outcome::Cancelled);
+        }
         for live in &paused {
-            self.start(live, Arc::clone(&session));
+            if live.file().cancel_asked {
+                let desk = Arc::clone(self);
+                let (live, session) = (Arc::clone(live), Arc::clone(&session));
+                tauri::async_runtime::spawn(async move {
+                    let paired = Paired {
+                        device_id,
+                        environment_id,
+                        session,
+                    };
+                    if let Ok(store) = desk.store() {
+                        let file = live.file();
+                        let _ = desk.finish_cancel(&store, &paired, Some(live), file).await;
+                    }
+                });
+            } else {
+                self.start(live, Arc::clone(&session), true);
+            }
         }
         if locked(&self.root).is_none() {
             return;
@@ -749,23 +981,39 @@ impl Desk {
         let Ok(found) = tauri::async_runtime::spawn_blocking(move || read.all()).await else {
             return;
         };
-        for key in &found.orphans {
-            let _ = store.remove_copy(*key);
+        {
+            // Copies that no entry names, that are over, or that a stopped process left half
+            // written. A copy a send has just made is its key's in the map and is left.
+            let held = locked(&self.live);
+            for key in found.orphans.iter().chain(&found.spent) {
+                if !held.contains_key(key) {
+                    let _ = store.remove_copy(*key);
+                }
+            }
+            for staged in &found.staged {
+                let _ = crate::drafts::remove_durably(staged);
+            }
         }
-        let mine: Vec<UploadFile> = found
-            .entries
-            .into_iter()
-            .filter(|file| {
-                file.environment_id == paired.environment_id
-                    && file.device_id == paired.device_id
-                    && !locked(&self.live).contains_key(&file.key)
-            })
-            .collect();
+        let mut mine = Vec::new();
+        for file in found.entries {
+            if file.environment_id != paired.environment_id
+                || locked(&self.live).contains_key(&file.key)
+            {
+                continue;
+            }
+            if file.device_id != paired.device_id {
+                // Another principal's: the sign-in it was kept under is not the one in force.
+                let _ = store.remove(file.key);
+            } else if file.target.environment_id == paired.environment_id {
+                mine.push(file);
+            }
+        }
         // Every read comes before any action: a published upload is never cancelled for a state read
-        // after it, and nothing here cancels at all.
+        // after it, and nothing is cancelled here but what the person asked to cancel.
         let mut reads = Vec::new();
         for file in mine {
             let status = match (file.reached, file.transfer_id) {
+                _ if file.cancel_asked => None,
                 (Reached::Published, _) | (Reached::Beginning, None) => None,
                 (_, Some(transfer_id)) => Some(
                     paired
@@ -793,13 +1041,17 @@ impl Desk {
         status: Option<kr_client::Result<UploadStatusResult>>,
     ) {
         let key = file.key;
+        if file.cancel_asked {
+            let _ = self.finish_cancel(store, paired, None, file).await;
+            return;
+        }
         let Some(status) = status else { return };
         match status {
-            Err(error) if host_does_not_know(&error) => {
-                let _ = store.remove(key);
+            // The connection failed or a right is refused: the host may hold the upload, and the next
+            // time it is reached asks again.
+            Err(error) => {
+                drop_if_unknown(store, key, &error);
             }
-            // The connection failed: the next time the host is reached asks again.
-            Err(_) => {}
             Ok(read) => match read.state {
                 UploadState::Published => {
                     let Some(handle) = read.handle.as_ref().cloned() else {
@@ -813,21 +1065,17 @@ impl Desk {
                     }
                 }
                 UploadState::Receiving | UploadState::Publishing => {
+                    let publishing = read.state == UploadState::Publishing;
                     match self.source_of(store, &file).await {
                         Some(content) => {
                             locked(&self.verdicts).remove(&key);
-                            let live = Arc::new(Live {
-                                file: Mutex::new(file),
-                                content,
-                                progress: watch::channel(Progress::default()).0,
-                                outcome: watch::channel(None).0,
-                                task: Mutex::new(None),
-                                phase: Mutex::new(Phase::Sending),
-                                beginning_kept: AtomicBool::new(true),
-                            });
+                            let live = Live::new(file, content, true);
                             locked(&self.live).insert(key, Arc::clone(&live));
-                            self.start(&live, Arc::clone(&paired.session));
+                            self.start(&live, Arc::clone(&paired.session), false);
                         }
+                        // A publication in progress needs no content: the entry stays, and the host is
+                        // read again at the next reach.
+                        None if publishing => {}
                         None => {
                             locked(&self.verdicts).insert(key, Verdict::CannotResume);
                         }
@@ -890,10 +1138,16 @@ impl Desk {
             {
                 continue;
             }
-            let (state, said) = match (file.reached, locked(&self.verdicts).get(&file.key)) {
+            let verdict = locked(&self.verdicts).get(&file.key).cloned();
+            let (state, said) = match (file.reached, verdict) {
                 (Reached::Published, _) => (OpenState::Published, None),
-                (Reached::Beginning, _) => (OpenState::Unrecoverable, Some(UNRECOVERABLE)),
-                (_, Some(Verdict::CannotResume)) => (OpenState::CannotResume, Some(CANNOT_RESUME)),
+                (Reached::Beginning, _) => {
+                    (OpenState::Unrecoverable, Some(UNRECOVERABLE.to_owned()))
+                }
+                (_, Some(Verdict::CannotResume)) => {
+                    (OpenState::CannotResume, Some(CANNOT_RESUME.to_owned()))
+                }
+                (_, Some(Verdict::Failed(words))) => (OpenState::Failed, Some(words)),
                 _ => (OpenState::Waiting, None),
             };
             views.push(view_of(
@@ -912,13 +1166,30 @@ impl Desk {
     /// Cancels the upload `key`, after the host's record of it is read, and answers from the host's
     /// own answer. An upload the host has published is never cancelled.
     ///
+    /// The send is stopped and waited for first, so that what it kept is final when it is read. A
+    /// cancel that cannot be finished is recorded in the entry and finished at the next reach, and
+    /// the upload is never sent on.
+    ///
     /// # Errors
     ///
     /// Returns the host's refusal, and the failure when the connection ended before the answer, which
-    /// leaves the upload kept: the host's record says what became of it.
+    /// leaves the cancel to be finished: the host's record says what became of it.
     pub async fn cancel(self: &Arc<Self>, paired: Paired, key: Uuid) -> Result<Cancelled> {
         let store = self.store()?;
         let held = locked(&self.live).get(&key).cloned();
+        let none = || CommandError::invalid("no open upload has that key");
+        if let Some(live) = &held {
+            let file = live.file();
+            if file.environment_id != paired.environment_id || file.device_id != paired.device_id {
+                return Err(none());
+            }
+            let task = locked(&live.task).take();
+            if let Some(task) = task {
+                task.abort();
+                // Whatever the sender was doing is over before the entry is read.
+                let _ = task.await;
+            }
+        }
         let file = match &held {
             Some(live) => live.file(),
             None => store
@@ -926,31 +1197,76 @@ impl Desk {
                 .entries
                 .into_iter()
                 .find(|file| file.key == key)
-                .ok_or_else(|| CommandError::invalid("no open upload has that key"))?,
+                .ok_or_else(none)?,
         };
         if file.environment_id != paired.environment_id || file.device_id != paired.device_id {
-            return Err(CommandError::invalid("no open upload has that key"));
+            return Err(none());
         }
-        let said = |state: &'static str, released: Option<String>, handle| Cancelled {
+        if file.reached == Reached::Published {
+            return Ok(Self::said(key, "published", None, file.handle));
+        }
+        if !file.cancel_asked {
+            // Recorded before the host is asked, so that a cancel that cannot be finished is not lost.
+            let asked = match &held {
+                Some(live) => live.change(&store, |file| file.cancel_asked = true),
+                None => store.write(&UploadFile {
+                    cancel_asked: true,
+                    ..file.clone()
+                }),
+            };
+            if let Err(error) = asked {
+                if let Some(live) = &held {
+                    *locked(&live.phase) = Phase::Paused;
+                }
+                return Err(record_not_kept(&error));
+            }
+        }
+        let file = match &held {
+            Some(live) => live.file(),
+            None => UploadFile {
+                cancel_asked: true,
+                ..file
+            },
+        };
+        self.finish_cancel(&store, &paired, held, file).await
+    }
+
+    fn said(
+        key: Uuid,
+        state: &'static str,
+        released: Option<String>,
+        handle: Option<AttachmentHandle>,
+    ) -> Cancelled {
+        Cancelled {
             key: key.to_string(),
             state,
             released_byte_len: released,
             handle,
+        }
+    }
+
+    /// The host's record is read, and then the upload is cancelled unless it is published.
+    async fn finish_cancel(
+        self: &Arc<Self>,
+        store: &Store,
+        paired: &Paired,
+        held: Option<Arc<Live>>,
+        file: UploadFile,
+    ) -> Result<Cancelled> {
+        let key = file.key;
+        let pause = |held: &Option<Arc<Live>>| {
+            if let Some(live) = held {
+                *locked(&live.phase) = Phase::Paused;
+            }
         };
-        if file.reached == Reached::Published {
-            return Ok(said("published", None, file.handle));
-        }
-        // What the send does between now and the answer is stopped first: the stream is reset and
-        // nothing more is sent for a transfer that is being cancelled.
-        if let Some(live) = &held
-            && let Some(task) = locked(&live.task).take()
-        {
-            task.abort();
-        }
-        let Some(transfer_id) = file.transfer_id else {
+        let transfer = held
+            .as_ref()
+            .and_then(|live| live.transfer())
+            .or(file.transfer_id);
+        let Some(transfer_id) = transfer else {
             // A reservation whose answer never came: nothing this device can name is held.
-            self.forget(&store, &held, key);
-            return Ok(said("forgotten", None, None));
+            self.forget(store, &held, key);
+            return Ok(Self::said(key, "forgotten", None, None));
         };
         // The host's record is read before anything is cancelled.
         let read: UploadStatusResult = match paired
@@ -960,39 +1276,56 @@ impl Desk {
         {
             Ok(read) => read,
             Err(error) if host_does_not_know(&error) => {
-                self.forget(&store, &held, key);
-                return Ok(said("forgotten", None, None));
+                self.forget(store, &held, key);
+                return Ok(Self::said(key, "forgotten", None, None));
             }
-            Err(error) => return Err(error.into()),
+            // Including a refusal of a right: the host may hold it, and the entry stays.
+            Err(error) => {
+                pause(&held);
+                return Err(error.into());
+            }
         };
         if read.state == UploadState::Published {
             let Some(handle) = read.handle.as_ref().cloned() else {
+                pause(&held);
                 return Err(CommandError::unavailable(
                     "the host says the upload is published and gave no handle",
                 ));
             };
-            let mut kept = file;
-            kept.reached = Reached::Published;
-            kept.handle = Some(handle.clone());
-            store
-                .write(&kept)
-                .map_err(|error| CommandError::local_failure(error.to_string()))?;
+            let kept = UploadFile {
+                reached: Reached::Published,
+                handle: Some(handle.clone()),
+                cancel_asked: false,
+                ..file
+            };
+            if let Err(error) = store.write(&kept) {
+                pause(&held);
+                return Err(record_not_kept(&error));
+            }
             let _ = store.remove_copy(key);
             if let Some(live) = &held {
                 *locked(&live.file) = kept;
                 self.end(live, Outcome::Published(Box::new(handle.clone())));
             }
-            return Ok(said("published", None, Some(handle)));
+            return Ok(Self::said(key, "published", None, Some(handle)));
         }
-        let answer: UploadCancelResult = uploads::cancel(
+        let answer: UploadCancelResult = match uploads::cancel(
             &paired.session,
             &file.target,
             transfer_id,
             crate::commands::MUTATION_TTL,
         )
-        .await?;
-        self.forget(&store, &held, key);
-        Ok(said(
+        .await
+        {
+            Ok(answer) => answer,
+            Err(error) => {
+                pause(&held);
+                return Err(error.into());
+            }
+        };
+        self.forget(store, &held, key);
+        Ok(Self::said(
+            key,
             "cancelled",
             Some(answer.released_byte_len.get().to_string()),
             None,
@@ -1001,10 +1334,12 @@ impl Desk {
 
     /// Ends an upload that is over for good, and removes its entry and its copy.
     fn forget(&self, store: &Store, held: &Option<Arc<Live>>, key: Uuid) {
+        locked(&self.verdicts).remove(&key);
+        // The files go first: whoever is told it was cancelled finds nothing kept.
+        let _ = store.remove(key);
         if let Some(live) = held {
             self.end(live, Outcome::Cancelled);
         }
-        let _ = store.remove(key);
     }
 
     /// The handle of the published upload `transfer_id` was bound to a draft: its entry ends.
@@ -1012,6 +1347,29 @@ impl Desk {
         let Ok(store) = self.store() else { return };
         for file in store.all().entries {
             if file.transfer_id == Some(transfer_id) && file.reached == Reached::Published {
+                let _ = store.remove(file.key);
+            }
+        }
+    }
+
+    /// The host this device knows as `device_id` was forgotten: what is sent to it stops, and every
+    /// entry and copy kept for it goes.
+    pub fn forgotten(&self, device_id: DeviceId) {
+        let sending: Vec<Arc<Live>> = locked(&self.live)
+            .values()
+            .filter(|live| locked(&live.file).device_id == device_id)
+            .cloned()
+            .collect();
+        for live in &sending {
+            if let Some(task) = locked(&live.task).take() {
+                task.abort();
+            }
+            self.end(live, Outcome::Cancelled);
+        }
+        let Ok(store) = self.store() else { return };
+        for file in store.all().entries {
+            if file.device_id == device_id {
+                locked(&self.verdicts).remove(&file.key);
                 let _ = store.remove(file.key);
             }
         }
@@ -1024,7 +1382,7 @@ fn view_of(
     state: OpenState,
     progress: Progress,
     stage: Option<Stage>,
-    said: Option<&'static str>,
+    said: Option<String>,
 ) -> OpenView {
     OpenView {
         key: key.to_string(),
@@ -1108,6 +1466,7 @@ pub mod testing {
             },
             transfer_id,
             handle: None,
+            cancel_asked: false,
         };
         Store {
             root: root.to_path_buf(),
@@ -1127,5 +1486,173 @@ pub mod testing {
         }
         .write_copy(key, bytes)
         .expect("the copy is kept");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(key: Uuid, transfer: Option<TransferId>, reached: Reached) -> UploadFile {
+        UploadFile {
+            version: STORE_VERSION,
+            key,
+            environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+            device_id: DeviceId::new(kr_ipc::new_uuid()),
+            target: ActionTarget::environment(EnvironmentId::new(kr_ipc::new_uuid())),
+            session_id: None,
+            media_type: "application/octet-stream".to_owned(),
+            file_name: "kept.bin".to_owned(),
+            byte_len: 4,
+            digest: Digest256::from_bytes([0; 32]),
+            source: Source::Copy,
+            reached,
+            transfer_id: transfer,
+            handle: None,
+            cancel_asked: false,
+        }
+    }
+
+    /// A desk that holds one upload whose entry and copy are written in a folder of its own.
+    fn held(
+        transfer: Option<TransferId>,
+        reached: Reached,
+    ) -> (tempfile::TempDir, Arc<Desk>, Arc<Live>, Store) {
+        let dir = tempfile::tempdir().expect("a directory");
+        let store = Store {
+            root: dir.path().join("open-transfers"),
+        };
+        let desk = Arc::new(Desk::default());
+        desk.keep_at(store.root.clone());
+        let key = kr_ipc::new_uuid();
+        let entry = file(key, transfer, reached);
+        store.write(&entry).expect("the entry");
+        store.write_copy(key, b"mine").expect("the copy");
+        let live = Live::new(entry, Arc::new(Held::new(vec![1; 4])), true);
+        locked(&desk.live).insert(key, Arc::clone(&live));
+        (dir, desk, live, store)
+    }
+
+    fn refused(code: ErrorCode) -> kr_client::Result<AttachmentHandle> {
+        Err(ClientError::Host(ProtocolError::new(
+            code,
+            "the host's words",
+        )))
+    }
+
+    /// KR-REQ-13.12: only the host's own words for an unknown transfer say it knows nothing of the
+    /// upload; a refusal of a right does not.
+    #[test]
+    fn only_an_unknown_transfer_answer_says_the_host_knows_nothing() {
+        let said = |code, words: &str| {
+            host_does_not_know(&ClientError::Host(ProtocolError::new(code, words)))
+        };
+        assert!(said(ErrorCode::InvalidArgument, "no transfer 7"));
+        assert!(!said(ErrorCode::PermissionDenied, "no transfer 7"));
+        assert!(!said(
+            ErrorCode::InvalidArgument,
+            "the contribution does not admit the file"
+        ));
+    }
+
+    /// KR-REQ-13.12: a status read the host refuses for want of a right keeps the entry and the copy of
+    /// an upload the host may hold; only its own words for an unknown transfer drop them.
+    #[test]
+    fn a_status_refused_for_a_right_keeps_the_entry_and_the_copy() {
+        let (_dir, _desk, live, store) = held(
+            Some(TransferId::new(kr_ipc::new_uuid())),
+            Reached::Finishing,
+        );
+        let key = live.file().key;
+        let denied = ClientError::Host(ProtocolError::new(ErrorCode::PermissionDenied, "no right"));
+        assert!(!drop_if_unknown(&store, key, &denied));
+        assert!(store.path(key, UPLOAD_EXTENSION).exists());
+        assert!(store.path(key, COPY_EXTENSION).exists());
+        let unknown = ClientError::Host(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "no transfer 7",
+        ));
+        assert!(drop_if_unknown(&store, key, &unknown));
+        assert!(!store.path(key, UPLOAD_EXTENSION).exists());
+        assert!(!store.path(key, COPY_EXTENSION).exists());
+    }
+
+    /// KR-REQ-13.12: a failed write of the transfer identifier loses nothing the host holds: the
+    /// identifier stays held, the upload stays held and paused, and the write is made again.
+    #[test]
+    fn a_failed_write_of_the_transfer_id_keeps_the_reservation_held() {
+        let (_dir, desk, live, store) = held(None, Reached::Beginning);
+        let journal = Kept {
+            live: Arc::clone(&live),
+            store: store.clone(),
+        };
+        let id = TransferId::new(kr_ipc::new_uuid());
+        // The folder becomes a file, so the next write cannot be made.
+        std::fs::remove_dir_all(&store.root).expect("the folder goes");
+        std::fs::write(&store.root, b"in the way").expect("a file in its place");
+        assert!(journal.begun(id).is_err());
+        assert_eq!(live.transfer(), Some(id), "the host's identifier is held");
+        assert_eq!(live.file().transfer_id, None, "and not yet kept");
+
+        desk.settle_as(
+            &live,
+            None,
+            false,
+            Err(not_kept(&std::io::Error::other("disk full"))),
+        );
+        assert_eq!(*locked(&live.phase), Phase::Paused);
+        assert!(
+            locked(&desk.live).contains_key(&live.file().key),
+            "still held"
+        );
+
+        std::fs::remove_file(&store.root).expect("the way is cleared");
+        journal.begun(id).expect("the write is made again");
+        assert_eq!(live.file().transfer_id, Some(id));
+        assert!(store.path(live.file().key, UPLOAD_EXTENSION).exists());
+    }
+
+    /// KR-REQ-13.12: a request that never left is asked again and is no unrecoverable reservation; one
+    /// whose answer is not known is, and keeps its entry; a refusal for good with a transfer is a failed
+    /// upload that keeps its entry; a refusal of the reservation leaves nothing.
+    #[test]
+    fn a_send_ends_as_what_the_host_and_the_connection_said() {
+        // The connection ended before the reservation left: paused, to ask again.
+        let (_dir, desk, live, _store) = held(None, Reached::Beginning);
+        desk.settle_as(&live, None, false, Err(ClientError::ConnectionEnded));
+        assert_eq!(*locked(&live.phase), Phase::Paused);
+        assert!(locked(&desk.live).contains_key(&live.file().key));
+
+        // The reservation may have been made and its answer is lost: the entry stays.
+        let (_dir, desk, live, store) = held(None, Reached::Beginning);
+        let lost = ClientError::SubmissionUncertain {
+            action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+        };
+        desk.settle_as(&live, None, false, Err(lost));
+        assert!(!locked(&desk.live).contains_key(&live.file().key));
+        assert!(store.path(live.file().key, UPLOAD_EXTENSION).exists());
+
+        // The host refused for good while it holds the reservation: a failed upload, entry kept.
+        let (_dir, desk, live, store) =
+            held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
+        desk.settle_as(&live, None, false, refused(ErrorCode::QuotaExceeded));
+        assert_eq!(
+            locked(&desk.verdicts).get(&live.file().key),
+            Some(&Verdict::Failed("the host's words".to_owned()))
+        );
+        assert!(store.path(live.file().key, UPLOAD_EXTENSION).exists());
+
+        // The host refused the reservation: nothing is left.
+        let (_dir, desk, live, store) = held(None, Reached::Beginning);
+        desk.settle_as(&live, None, false, refused(ErrorCode::QuotaExceeded));
+        assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
+        assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
+
+        // The sign-in it was sent under ended: it stops for good, with its copy.
+        let (_dir, desk, live, store) =
+            held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
+        desk.settle_as(&live, None, true, Err(ClientError::ConnectionEnded));
+        assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
+        assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
     }
 }
