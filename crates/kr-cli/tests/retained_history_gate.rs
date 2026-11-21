@@ -1374,11 +1374,11 @@ mod cases {
                 "fn u() { Method::AgentTurnCancel; }\n",
             ),
         ]);
-        let hits = oracle(folder.path()).expect("hits");
-        let files: BTreeSet<String> = hits.iter().map(|hit| hit.file.clone()).collect();
+        let files: Result<BTreeSet<String>, String> =
+            oracle(folder.path()).map(|hits| hits.iter().map(|hit| hit.file.clone()).collect());
         assert_eq!(
             files,
-            BTreeSet::from(
+            Ok(BTreeSet::from(
                 [
                     "crates/kr-a/src/a.rs",
                     "crates/kr-a/src/a/inner.rs",
@@ -1388,7 +1388,7 @@ mod cases {
                     "crates/kr-a/src/x/z.rs",
                 ]
                 .map(at)
-            )
+            ))
         );
         let missing = tree(&[("crates/kr-a/src/lib.rs", "mod nowhere;\n")]);
         assert!(oracle(missing.path()).is_err_and(|e| e.contains("at no file")));
@@ -1495,6 +1495,16 @@ mod cases {
             tag_problems("t", &odd, &covered),
             ["t: kr_a::f covers lines 0 to 4 of crates/kr-a/src/lib.rs"]
         );
+        let mut backwards = reported(Some(Ok(1)), 1);
+        backwards
+            .extents
+            .get_mut(&("kr_a".to_owned(), "f".to_owned()))
+            .expect("extents")
+            .insert(("crates/kr-a/src/lib.rs".to_owned(), 9, 5));
+        assert_eq!(
+            tag_problems("t", &backwards, &covered),
+            ["t: kr_a::f covers lines 9 to 5 of crates/kr-a/src/lib.rs"]
+        );
         // A sighting that only a mark gives covers no line, and needs none.
         let mut marked = Tag {
             commit: "c".to_owned(),
@@ -1593,14 +1603,14 @@ mod cases {
             "fn h() { let _ = '\"'; Method::AgentTurnSteer; }\n",
         );
         let folder = tree(&[("crates/kr-a/src/lib.rs", lib)]);
-        let hits = oracle(folder.path()).expect("hits");
+        let found = oracle(folder.path()).map(|hits| lines(&hits));
         let at = "crates/kr-a/src/lib.rs";
         assert_eq!(
-            lines(&hits),
-            [1, 3, 5, 7, 9, 11, 12]
+            found,
+            Ok([1, 3, 5, 7, 9, 11, 12]
                 .iter()
                 .map(|line| (at.to_owned(), *line))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>())
         );
     }
 }
