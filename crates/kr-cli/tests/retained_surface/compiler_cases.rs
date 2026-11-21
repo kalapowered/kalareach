@@ -557,6 +557,49 @@ fn the_canary_and_the_count_of_stamped_items_show_that_the_stamp_took() {
             .map(|config| (config.name, 0, true))
             .collect::<Vec<_>>()
     );
+    // A protocol crate whose `methods!` text holds a wire name that its transcriber does not use (the
+    // variant is not in the list, the name is in a constant): nothing reports the name, so the canary
+    // says so.
+    let root = tempfile::tempdir().expect("a folder");
+    write(
+        root.path(),
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+    );
+    protocol(root.path());
+    let without = METHOD.replace("    AgentTurnCancel = \"agent.turn.cancel\";\n", "");
+    assert_ne!(without, METHOD);
+    write(
+        root.path(),
+        "crates/kr-protocol/src/method.rs",
+        &format!("{without}\npub const RETIRED: &str = \"agent.turn.cancel\";\n"),
+    );
+    let lock = compiler::cargo_command()
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(root.path())
+        .output()
+        .expect("cargo runs");
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let target = tempfile::tempdir().expect("a folder");
+    let missing = compiler::read_platform(
+        root.path(),
+        target.path(),
+        compiler::host_name(),
+        "missing",
+        "missing",
+    );
+    assert_eq!(missing.refused, None, "the tree is read");
+    assert_eq!(
+        missing.canary,
+        Err(
+            "kr_protocol reports no use of agent.turn.cancel; its transcriber uses every variant"
+                .to_owned()
+        )
+    );
 }
 
 #[test]
