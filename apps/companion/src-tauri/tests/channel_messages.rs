@@ -284,7 +284,7 @@ fn io_fault(what: &'static str) -> std::io::Error {
 }
 
 /// KR-REQ-12.26: a message is kept whole, listed with its session and time, and removed by the
-/// person: one at a time, or every one of a session. No other call changes it.
+/// person: by the identities the window named. No other call changes it.
 #[test]
 fn a_message_is_kept_whole_listed_and_removed_only_by_a_person() {
     let data = data();
@@ -2229,7 +2229,7 @@ fn a_later_keep_flushes_nothing_more_of_the_path() {
 }
 
 /// KR-REQ-12.26: a keep that has staged the ledger holds the locks, so a repair and a set-aside from
-/// other windows wait for it, and a keep's own lines are the ones in place when they go on.
+/// other windows wait for it, and a keep whose ledger step fails leaves no line of its own.
 #[test]
 fn a_keep_that_has_staged_the_ledger_makes_a_repair_and_a_set_aside_wait() {
     let data = data();
@@ -2321,7 +2321,6 @@ fn a_set_aside_that_holds_every_lock_makes_a_keep_and_a_repair_wait() {
         .recv_timeout(WAIT)
         .expect("the set-aside holds every lock");
     let keep = on_thread(data.path(), |window| window.keep(message(1, "text", &[])));
-    let repair = on_thread(data.path(), |window| window.drafts());
     assert!(
         keep.recv_timeout(SHORT).is_err(),
         "a keep waits for a set-aside that holds the locks"
@@ -2335,6 +2334,9 @@ fn a_set_aside_that_holds_every_lock_makes_a_keep_and_a_repair_wait() {
             .exists(),
         "the keep's entry is not written while the set-aside holds the folder's lock"
     );
+    // The repair starts only now: a repair that took the gate first would hold the keep back by
+    // itself, and the entry check above could not tell the folder's lock from that.
+    let repair = on_thread(data.path(), |window| window.drafts());
     assert!(
         repair.recv_timeout(SHORT).is_err(),
         "a repair waits for a set-aside that holds the locks"

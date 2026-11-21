@@ -2065,7 +2065,7 @@ export interface HostPort {
   deviceChannelMessages(request: { readonly withText: boolean }): Promise<ChannelMessageList>
   /** Keeps a message whole, durably, before the draft that held it is removed. */
   deviceChannelMessageKeep(request: ChannelMessageKeep): Promise<{ readonly resumed: boolean }>
-  /** Removes one message, or every message of a session. Nothing else removes one. */
+  /** Removes the messages named by their identities, and no others. Nothing else removes one. */
   deviceChannelMessageRemove(request: ChannelMessageRemoval): Promise<{ readonly removed: number }>
   /** Records a send before it is made, so that a restart still holds the next message to its session. */
   deviceChannelHoldCreate(request: ChannelHoldCreate): Promise<void>
