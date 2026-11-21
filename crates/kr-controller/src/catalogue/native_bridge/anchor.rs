@@ -294,6 +294,20 @@ impl Anchor {
         ))
     }
 
+    /// The names held in the folder at `path`, listed through a handle opened on it, or none where
+    /// nothing is at `path`. Something at `path` that is not a folder is an error.
+    pub(crate) fn folder_names(&self, path: &Path) -> Result<Option<Vec<String>>> {
+        let place = self.place(path)?;
+        let Some(parent) = self.parent(&place, false)? else {
+            return Ok(None);
+        };
+        match parent.child(place.name).map_err(storage)? {
+            Child::Directory(folder) => Ok(Some(folder.names().map_err(storage)?)),
+            Child::Absent => Ok(None),
+            Child::NotADirectory => Err(storage(std::io::Error::from(ErrorKind::NotADirectory))),
+        }
+    }
+
     /// True when anything is at `path`.
     pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
         if self.is_root(path) {
@@ -562,6 +576,10 @@ impl Anchor {
         };
         #[cfg(test)]
         walked_pause::run(path);
+        // A folder that is not there is not judged: nothing is taken from the folder that held it.
+        if matches!(parent.entry(place.name).map_err(storage)?, Entry::Absent) {
+            return Ok(FolderRemoval::Gone);
+        }
         check_folder(&parent, path, Act::Remove)?;
         match parent.remove_directory(place.name) {
             Ok(()) => {

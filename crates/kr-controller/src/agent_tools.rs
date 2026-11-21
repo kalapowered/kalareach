@@ -1123,10 +1123,11 @@ impl Installer {
                     }
                     Removal::Told(words) => retained.push(words),
                 },
-                Planned::Folder => {
-                    // Only when it is empty. A directory that holds anything else holds somebody
-                    // else's file.
-                    match self.fs.remove_directory(Path::new(path))? {
+                Planned::Folder(plan) => match plan {
+                    FolderPlan::Gone => retained.push(format!("{path} is already gone")),
+                    // A folder that holds anything else holds somebody else's file.
+                    FolderPlan::Retained => retained.push(format!("{path} is not empty")),
+                    FolderPlan::Remove => match self.fs.remove_directory(Path::new(path))? {
                         anchor::FolderRemoval::Removed => removed.push(operation.clone()),
                         anchor::FolderRemoval::Gone => {
                             retained.push(format!("{path} is already gone"));
@@ -1134,8 +1135,8 @@ impl Installer {
                         anchor::FolderRemoval::NotEmpty => {
                             retained.push(format!("{path} is not empty"));
                         }
-                    }
-                }
+                    },
+                },
             }
         }
         let record = self.record_path(params);
@@ -1348,13 +1349,17 @@ impl Installer {
             return Ok(None);
         };
         // What the removal will do to each recorded name is decided here, by the reads it would
-        // make itself, in the order it carries the names out; the removal acts on this plan.
+        // make itself, in the order it carries the names out; the removal acts on this plan. A
+        // folder is decided last, by what stays in it once the names the removal deletes are
+        // gone.
         let operations = &record.manifest.operations;
         let mut order: Vec<usize> = (0..operations.len()).collect();
         order.sort_by_key(|&index| removal_key(&operations[index]));
-        let mut planned: Vec<Option<Planned>> = operations.iter().map(|_| None).collect();
-        for &index in &order {
-            planned[index] = Some(match &operations[index] {
+        let mut deleted: Vec<PathBuf> = Vec::new();
+        let mut planned: Vec<(usize, Step)> = Vec::new();
+        for index in order {
+            let operation = &operations[index];
+            let what = match operation {
                 ChangeOperation::WriteFile { path, digest, .. } => Planned::File {
                     digest: *digest,
                     plan: self.plan_file(Path::new(path), *digest)?,
@@ -1374,9 +1379,23 @@ impl Installer {
                         params,
                     )?,
                 },
-                ChangeOperation::CreateDirectory { .. } => Planned::Folder,
-            });
+                ChangeOperation::CreateDirectory { path } => {
+                    Planned::Folder(self.plan_folder(Path::new(path), &deleted)?)
+                }
+            };
+            if what.takes_the_name() {
+                deleted.push(PathBuf::from(operation.path()));
+            }
+            planned.push((
+                index,
+                Step {
+                    operation: operation.clone(),
+                    what,
+                },
+            ));
         }
+        let mut in_record_order: Vec<&(usize, Step)> = planned.iter().collect();
+        in_record_order.sort_by_key(|(index, _)| *index);
         // The compiled agents' documents are written and removed by paths, outside the walk's
         // checks (D7 of the contact documents), so each of them is guarded here, whatever the
         // removal will do to it: a removal that took the package and then refused the document
@@ -1384,28 +1403,29 @@ impl Installer {
         // the walk the guard is made below, for the documents the removal deletes or rewrites,
         // and not for one it keeps.
         if !matches!(self.fs, Fs::Walk(_)) {
-            for (operation, what) in operations.iter().zip(&planned) {
-                if let Some(Planned::Entry { .. }) = what {
-                    guard_access_controls(Path::new(operation.path()), CONFIGURATION_BY_HAND)?;
+            for (_, step) in &in_record_order {
+                if let Planned::Entry { .. } = step.what {
+                    guard_access_controls(Path::new(step.operation.path()), CONFIGURATION_BY_HAND)?;
                 }
             }
         }
         // The folder and the file of a name the removal deletes are judged as a removal; those of
         // a document it rewrites, as a write, in the write's words; a name it keeps, because it
         // is gone, is not what was written or is held by another installation, is not judged,
-        // since the removal does not touch it. A refusal here comes before the marker and leaves
-        // every file as it was.
+        // since the removal does not touch it. A folder that the installation made is removed
+        // only if it is empty, and the host checks the folder that holds it while the folder
+        // still stands. A refusal here comes before the marker and leaves every file as it was.
         if let Fs::Walk(walk) = &self.fs {
-            for (operation, what) in operations.iter().zip(&planned) {
-                let path = Path::new(operation.path());
-                match what {
-                    Some(Planned::File { plan, .. }) => {
+            for (_, step) in &in_record_order {
+                let path = Path::new(step.operation.path());
+                match &step.what {
+                    Planned::File { plan, .. } => {
                         if matches!(plan, FilePlan::Delete) {
                             walk.refuse_shared_folder(path, anchor::Act::Remove)?;
                             walk.refuse_shared_file(path, anchor::Act::Remove)?;
                         }
                     }
-                    Some(Planned::Entry { plan, .. }) => match plan {
+                    Planned::Entry { plan, .. } => match plan {
                         EntryPlan::Keep(_) => {}
                         EntryPlan::Delete { .. } => {
                             guard_access_controls(path, CONFIGURATION_BY_HAND)?;
@@ -1418,22 +1438,36 @@ impl Installer {
                             walk.refuse_shared_file(path, anchor::Act::Write)?;
                         }
                     },
-                    Some(Planned::Folder) | None => {
-                        walk.refuse_shared_folder(path, anchor::Act::Remove)?;
+                    Planned::Folder(plan) => {
+                        if matches!(plan, FolderPlan::Remove) {
+                            walk.refuse_shared_folder(path, anchor::Act::Remove)?;
+                        }
                     }
                 }
             }
         }
-        let steps = order
-            .into_iter()
-            .filter_map(|index| {
-                planned[index].take().map(|what| Step {
-                    operation: record.manifest.operations[index].clone(),
-                    what,
-                })
-            })
-            .collect();
+        let steps = planned.into_iter().map(|(_, step)| step).collect();
         Ok(Some(RemovalPlan { record, steps }))
+    }
+
+    /// What a removal does to a folder the installation made: it stays where something is left in
+    /// it once the names the removal deletes, `deleted`, are gone; under the walk the folder is
+    /// listed through a handle opened on it. A removal that works by paths tries each folder.
+    fn plan_folder(&self, path: &Path, deleted: &[PathBuf]) -> Result<FolderPlan> {
+        let Fs::Walk(walk) = &self.fs else {
+            return Ok(FolderPlan::Remove);
+        };
+        let Some(names) = walk.folder_names(path)? else {
+            return Ok(FolderPlan::Gone);
+        };
+        let emptied = names
+            .iter()
+            .all(|name| deleted.iter().any(|gone| *gone == path.join(name)));
+        Ok(if emptied {
+            FolderPlan::Remove
+        } else {
+            FolderPlan::Retained
+        })
     }
 
     /// Refuses an installation that would change anything this host did not write.
@@ -2840,7 +2874,30 @@ enum Planned {
     /// A server entry, named `entry`, in a document.
     Entry { entry: String, plan: EntryPlan },
     /// A folder the installation made.
-    Folder,
+    Folder(FolderPlan),
+}
+
+impl Planned {
+    /// True when the removal takes the name out of its folder.
+    fn takes_the_name(&self) -> bool {
+        match self {
+            Self::File { plan, .. } => matches!(plan, FilePlan::Delete),
+            Self::Entry { plan, .. } => matches!(plan, EntryPlan::Delete { .. }),
+            Self::Folder(plan) => matches!(plan, FolderPlan::Remove),
+        }
+    }
+}
+
+/// What a removal does to a folder the installation made, decided from what stands in it once the
+/// names the removal deletes are gone.
+enum FolderPlan {
+    /// No folder stands at the name.
+    Gone,
+    /// Something stays in the folder, a file kept or one nobody recorded, so the folder stays.
+    Retained,
+    /// Nothing stays in the folder: the removal takes it out, after judging the folder that holds
+    /// it.
+    Remove,
 }
 
 /// What a removal does to a file it recorded.
@@ -7273,6 +7330,139 @@ mod tests {
         assert!(
             !tree.home().join(SKILL_FILE).exists(),
             "and the first file was taken"
+        );
+    }
+
+    /// KR-REQ-11.01: a recorded folder is judged only where it stands. The folders the
+    /// installation made are gone, with the document, and the folder that held them is one every
+    /// user can change: nothing needs it, so the removal goes ahead and takes the empty folder
+    /// that is left.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_recorded_folder_that_is_gone_is_not_judged_and_the_removal_goes_ahead() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let amp_folder = tree.home().join(".amp");
+        std::fs::remove_dir_all(amp_folder.join("skills")).expect("the skills folder goes");
+        std::fs::remove_file(amp_folder.join("mcp.json")).expect("the document goes");
+        set_mode(&amp_folder, 0o757);
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around folders that are gone: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.ends_with(".amp/skills/kalareach-contact is already gone")),
+            "the removal says that the folder is gone: {:?}",
+            removed.retained
+        );
+        assert!(
+            !amp_folder.exists(),
+            "and the empty folder it made is taken"
+        );
+    }
+
+    /// KR-REQ-11.01: a recorded folder that another process removes after the check is told as
+    /// gone, and the folder that held it, which that process made changeable, is not judged for a
+    /// removal of nothing.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_another_process_removed_after_the_check_is_told_as_gone_and_not_judged() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let folder = tree.home().join(".amp/skills/kalareach-contact");
+        for entry in std::fs::read_dir(&folder).expect("the folder") {
+            std::fs::remove_file(entry.expect("an entry").path()).expect("a file goes");
+        }
+        std::fs::remove_file(tree.home().join(".amp/mcp.json")).expect("the document goes");
+        let skills = tree.home().join(".amp/skills");
+        let gone = folder.clone();
+        when_walked_to(".amp/skills/kalareach-contact", move || {
+            std::fs::remove_dir(&gone).expect("another process removes the folder");
+            set_mode(&skills, 0o757);
+        });
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around a folder that is gone: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.ends_with(".amp/skills/kalareach-contact is already gone")),
+            "the removal says that the folder is gone: {:?}",
+            removed.retained
+        );
+    }
+
+    /// KR-REQ-11.01: a folder that must stay, because a recorded file in it was changed, is not
+    /// removed, so the folder that holds it is not judged: it can be one every user can change.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_that_must_stay_for_a_changed_file_is_not_judged() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let tools = tree.home().join(TOOLS_FILE);
+        std::fs::write(&tools, "the person's own edit\n").expect("edits the file");
+        set_mode(&tree.home().join(".amp/skills"), 0o757);
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around a folder that stays: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.ends_with(".amp/skills/kalareach-contact is not empty")),
+            "the removal says that the folder is not empty: {:?}",
+            removed.retained
+        );
+        assert_eq!(
+            std::fs::read(&tools).expect("the file stays"),
+            b"the person's own edit\n",
+            "the person's file is untouched"
+        );
+        assert!(
+            !tree.home().join(SKILL_FILE).exists(),
+            "and the file that was not changed is taken"
+        );
+    }
+
+    /// KR-REQ-11.01: the same for a folder that must stay for a file nobody recorded.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_folder_that_must_stay_for_an_unrecorded_file_is_not_judged() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let notes = tree.home().join(".amp/skills/kalareach-contact/notes.txt");
+        std::fs::write(&notes, "the person's own file\n").expect("a file of theirs");
+        set_mode(&tree.home().join(".amp/skills"), 0o757);
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "the removal goes ahead around a folder that stays: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.ends_with(".amp/skills/kalareach-contact is not empty")),
+            "the removal says that the folder is not empty: {:?}",
+            removed.retained
+        );
+        assert!(notes.exists(), "their file stays");
+        assert!(
+            !tree.home().join(SKILL_FILE).exists(),
+            "and the recorded files are taken"
         );
     }
 
