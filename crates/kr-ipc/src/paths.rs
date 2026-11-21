@@ -2848,12 +2848,29 @@ mod windows {
             assert!(set != 0, "{}", std::io::Error::last_os_error());
         }
 
-        /// A check that refuses the new file refuses both writers before any content is written,
-        /// removes the file it made, and touches nothing else: a file already at the destination
-        /// keeps its bytes and its list, and the folder holds nothing new. `act` acts on the
-        /// new file as the check begins, and `seen` is what the check sees in place of the file
-        /// system's answer, if anything.
-        fn refused_before_any_content(act: fn(&Path), seen: Option<Seen>, words: &str) {
+        /// What both writers left after the check of the new file refused them, for the case that
+        /// made them to assert on: the assertions are in the cases' own bodies, where a failure
+        /// reads as the case's own.
+        struct Left {
+            /// Each writer's name and its result.
+            results: Vec<(&'static str, Result<()>)>,
+            /// The length of each writer's new file when its check began, once for each writer.
+            lengths: Vec<u64>,
+            /// The bytes of the file at the destination after both writers.
+            bytes: Vec<u8>,
+            /// Who could reach the file at the destination before the writers.
+            before: FileAccess,
+            /// Who can reach it after.
+            after: FileAccess,
+            /// The names the folder holds after both writers.
+            names: Vec<String>,
+        }
+
+        /// Runs both writers over a destination that already holds a file, with a check that refuses
+        /// the new file: `act` acts on the new file as the check begins, and `seen` is what the check
+        /// sees in place of the file system's answer, if anything. A refusal has to come before any
+        /// content is written, remove the file it made and touch nothing else.
+        fn refuse_both_writers(act: fn(&Path), seen: Option<Seen>) -> Left {
             let folder = Folder::new("refused");
             let destination = folder.0.join("setting");
             crate::paths::write_owner_only_file(&destination, b"kept").expect("a file to keep");
@@ -2869,36 +2886,48 @@ mod windows {
                 seen
             });
 
-            for (writer, write) in WRITERS {
-                let error = write(&destination, b"other").expect_err("the write is refused");
-                assert!(
-                    error.to_string().contains(words),
-                    "{writer} refuses with the words of the check: {error}"
-                );
-            }
-            assert_eq!(
-                *lengths.borrow(),
-                vec![0, 0],
-                "each writer's check ran on an empty file, before any content"
-            );
-            assert_eq!(std::fs::read(&destination).expect("reads"), b"kept");
-            assert_eq!(
-                FileAccess::of(&destination).expect("reads who can reach the file"),
+            let results = WRITERS
+                .iter()
+                .map(|(writer, write)| (*writer, write(&destination, b"other")))
+                .collect();
+            let lengths = lengths.borrow().clone();
+            Left {
+                results,
+                lengths,
+                bytes: std::fs::read(&destination).expect("reads"),
                 before,
-                "the file at the destination keeps its list"
-            );
-            assert_eq!(
-                folder.names(),
-                vec!["setting".to_owned()],
-                "the file each writer made is removed and nothing is new"
-            );
+                after: FileAccess::of(&destination).expect("reads who can reach the file"),
+                names: folder.names(),
+            }
         }
 
         /// A volume that keeps no access lists, such as FAT or exFAT, refuses both writers before
         /// any content is written. The volume's answer is replaced here; no case makes a volume.
         #[test]
         fn a_volume_that_keeps_no_access_lists_refuses_both_writers_before_any_content() {
-            refused_before_any_content(|_| {}, Some(Seen::NoLists), NO_LISTS);
+            let left = refuse_both_writers(|_| {}, Some(Seen::NoLists));
+            for (writer, result) in &left.results {
+                let error = result.as_ref().expect_err("the write is refused");
+                assert!(
+                    error.to_string().contains(NO_LISTS),
+                    "{writer} refuses with the words of the check: {error}"
+                );
+            }
+            assert_eq!(
+                left.lengths,
+                vec![0, 0],
+                "each writer's check ran on an empty file, before any content"
+            );
+            assert_eq!(left.bytes, b"kept");
+            assert_eq!(
+                left.after, left.before,
+                "the file at the destination keeps its list"
+            );
+            assert_eq!(
+                left.names,
+                vec!["setting".to_owned()],
+                "the file each writer made is removed and nothing is new"
+            );
         }
 
         /// A list that reads back other than as set refuses both writers before any content is
@@ -2907,7 +2936,29 @@ mod windows {
         /// itself is the product's.
         #[test]
         fn a_list_that_reads_back_other_than_set_refuses_both_writers_before_any_content() {
-            refused_before_any_content(widen_the_list, None, OTHER_THAN_SET);
+            let left = refuse_both_writers(widen_the_list, None);
+            for (writer, result) in &left.results {
+                let error = result.as_ref().expect_err("the write is refused");
+                assert!(
+                    error.to_string().contains(OTHER_THAN_SET),
+                    "{writer} refuses with the words of the check: {error}"
+                );
+            }
+            assert_eq!(
+                left.lengths,
+                vec![0, 0],
+                "each writer's check ran on an empty file, before any content"
+            );
+            assert_eq!(left.bytes, b"kept");
+            assert_eq!(
+                left.after, left.before,
+                "the file at the destination keeps its list"
+            );
+            assert_eq!(
+                left.names,
+                vec!["setting".to_owned()],
+                "the file each writer made is removed and nothing is new"
+            );
         }
 
         /// A new file whose owner reads back as an account this process could not have created it
@@ -2916,7 +2967,29 @@ mod windows {
         /// makes a share.
         #[test]
         fn an_owner_that_reads_back_as_another_account_refuses_both_writers_before_any_content() {
-            refused_before_any_content(|_| {}, Some(Seen::OtherOwner), OTHER_THAN_SET);
+            let left = refuse_both_writers(|_| {}, Some(Seen::OtherOwner));
+            for (writer, result) in &left.results {
+                let error = result.as_ref().expect_err("the write is refused");
+                assert!(
+                    error.to_string().contains(OTHER_THAN_SET),
+                    "{writer} refuses with the words of the check: {error}"
+                );
+            }
+            assert_eq!(
+                left.lengths,
+                vec![0, 0],
+                "each writer's check ran on an empty file, before any content"
+            );
+            assert_eq!(left.bytes, b"kept");
+            assert_eq!(
+                left.after, left.before,
+                "the file at the destination keeps its list"
+            );
+            assert_eq!(
+                left.names,
+                vec!["setting".to_owned()],
+                "the file each writer made is removed and nothing is new"
+            );
         }
 
         /// A refusal removes the file it made and no other: a file put at the temporary name after
@@ -3038,10 +3111,31 @@ mod windows {
         /// read is replaced here; no volume makes a list that cannot be read.
         #[test]
         fn a_list_that_cannot_be_read_back_refuses_both_writers_before_any_content() {
-            refused_before_any_content(
-                |_| {},
-                Some(Seen::Unreadable),
-                "the access list of the new file could not be read back: a seam made the read fail",
+            let left = refuse_both_writers(|_| {}, Some(Seen::Unreadable));
+            for (writer, result) in &left.results {
+                let error = result.as_ref().expect_err("the write is refused");
+                assert!(
+                    error.to_string().contains(
+                        "the access list of the new file could not be read back: a seam made the \
+                         read fail"
+                    ),
+                    "{writer} refuses with the words of the check: {error}"
+                );
+            }
+            assert_eq!(
+                left.lengths,
+                vec![0, 0],
+                "each writer's check ran on an empty file, before any content"
+            );
+            assert_eq!(left.bytes, b"kept");
+            assert_eq!(
+                left.after, left.before,
+                "the file at the destination keeps its list"
+            );
+            assert_eq!(
+                left.names,
+                vec!["setting".to_owned()],
+                "the file each writer made is removed and nothing is new"
             );
         }
 
