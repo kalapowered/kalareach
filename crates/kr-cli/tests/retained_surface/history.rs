@@ -447,7 +447,8 @@ pub fn expected_below(repository: &Path, level: CompatibilityLevel) -> Result<Ve
 }
 
 /// Reads the history of an entry: origin's agreement with the local tags first, then the
-/// expectation, then one snapshot per local release below the level.
+/// expectation, then one snapshot per local release below the level. `on_read` is given each snapshot
+/// as its tag finishes, in the order the tags finish (the snapshots come back in release order).
 ///
 /// # Errors
 ///
@@ -455,6 +456,7 @@ pub fn expected_below(repository: &Path, level: CompatibilityLevel) -> Result<Ve
 pub fn read_history(
     repository: &Path,
     entry: &Narrower,
+    on_read: &(dyn Fn(&Snapshot) + Sync),
 ) -> Result<(Vec<Tagged>, Vec<Snapshot>), String> {
     let level: CompatibilityLevel = entry
         .level
@@ -480,6 +482,9 @@ pub fn read_history(
         let started = std::time::Instant::now();
         let snapshot = snapshot_at(repository, entry, tagged);
         println!("read {tag} in {:?}", started.elapsed());
+        if let Ok(done) = &snapshot {
+            on_read(done);
+        }
         snapshot
     });
     let mut snapshots = Vec::new();
@@ -490,16 +495,18 @@ pub fn read_history(
     Ok((expected, snapshots))
 }
 
-/// How many tags are read at once: each in a thread of its own, so that the reading of the 124 tags
-/// ends within the hour that the history case is held to, on the box as well as here.
+/// How many tags are read at once: four, so that the reading of every release tag takes about a
+/// third of the time one at a time would (685 s against 2038 s here). The hour that the history case
+/// is held to is its own assertion, and the box script kills the run above it.
 const READ_WIDTH: usize = 4;
 
-/// Runs `read` on each of `items` in a thread of its own, at most `width` of them at once, and gives
-/// back what each returns, in the order of the items. With `span-locations`, proc-macro2 keeps the
-/// text of every file a thread parses behind one 32-bit offset, so a thread that parses about 4 GiB
-/// of source in all overflows it, and the 124 tags hold more than that (each file is parsed about
-/// three times for a tag). A tag read in a thread that no other tag uses gives the thread's source
-/// map back with the thread. A panic of a reading is the panic of this call.
+/// Runs `read` on each of `items` in a thread of its own, at most `width` of them at once (one, for a
+/// `width` of 0), and gives back what each returns, in the order of the items. With
+/// `span-locations`, proc-macro2 keeps the text of every file a thread parses behind one 32-bit
+/// offset, so a thread that parses about 4 GiB of source in all overflows it, and the release tags
+/// hold more than that (each file is parsed about three times for a tag). A tag read in a thread that
+/// no other tag uses gives the thread's source map back with the thread. A panic of a reading is the
+/// panic of this call.
 pub(super) fn in_threads_of_their_own<T: Send, R: Send>(
     items: Vec<T>,
     width: usize,
@@ -542,7 +549,7 @@ pub(super) fn in_threads_of_their_own<T: Send, R: Send>(
 }
 
 /// Whether the crate is read at the head by the reader's check of this checkout: every crate but the
-/// two that receive a mutation, the daemon among them.
+/// two that receive a mutation (the daemon is read there, and not at a tag).
 pub(super) fn reads_at_head(krate: &str) -> bool {
     !RECEIVER_CRATES.contains(&krate)
 }
