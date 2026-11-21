@@ -86,7 +86,7 @@ crates/kr-ipc/src/endpoint.rs | Listener::accept | Socket | 3 | stream | own | -
 crates/kr-ipc/src/endpoint.rs | Listener::bind_with_descriptor | Listen | 2 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | refused | Listen | 1 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | refused_by | Listen | 1 | own | own | - | agrees
-crates/kr-ipc/src/endpoint.rs | replace_stale_socket | Listen | 3 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | replace_stale_socket_with | Listen | 5 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | set_owner_only | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | socket_identity | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/error.rs | IpcError::listen | Listen | 1 | own | own | - | agrees
