@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use kr_protocol::hello::PackageVersion;
 
 use super::history::{
-    Report, Snapshot, Tagged, audit_tags, is_client, print_report, read_history, version_of_tag,
+    Report, Snapshot, Tagged, audit_tags, print_report, read_history, reads_at_head, version_of_tag,
 };
 use super::narrower::{
     ABSENT, DAEMON_CRATES, Evidence, Item, Narrower, RECEIVER_CRATES, Range, Sender,
@@ -479,10 +479,10 @@ fn the_reader_reads_this_checkout_and_writes_its_report() {
     let started = Instant::now();
     let tree = Tree::at(&repository).expect("this checkout is read");
     let all = tree.sightings(&|_| true).expect("the scan of every crate");
-    let tree = tree.scoped(&|krate| is_client(krate));
-    let sightings = tree.sightings(&|krate| is_client(krate));
+    let tree = tree.scoped(&|krate| reads_at_head(krate));
+    let sightings = tree.sightings(&|krate| reads_at_head(krate));
     let extents = tree
-        .sighting_extents(&|krate| is_client(krate))
+        .sighting_extents(&|krate| reads_at_head(krate))
         .expect("the lines of the sightings");
     println!(
         "this checkout: {} sightings in every crate, {} in the client crates, in {:?}",
