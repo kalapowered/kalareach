@@ -2128,6 +2128,42 @@ time the lane is drained it writes at most 4 KiB of replies, and the rest wait f
 within the same two seconds. A session answers at most 256 questions a second. A step of the wall
 clock neither drops a reply early nor holds one longer.
 
+### The saved launch commands
+
+The owner of a host can save launch commands, which the launch buttons offer beside the agents the
+host has a package for (`shell.launch.commands.list`, `.save` and `.remove`, described in the
+[protocol reference](../protocol/README.md#saved-launch-commands)). A command is a label, a program
+and separate arguments; the host never parses a command line, and a press types the vector through
+the session's own integration, which quotes every word for its shell.
+
+The list lives in a store of its own, `launch-commands.json` in the environment's state directory
+beside the registry, at format 1, and not in the registry, the configuration document or the
+companion's settings file: an earlier release reads those and has no place for it. The file holds the
+format number, the revision and the commands in the order they were first saved, and is written in
+one write, owner only. A host that has saved no command has no file; an emptied list stays a file.
+The revision is a random non-zero 64-bit number made for each change and compared for equality only,
+so a request decided against an old revision writes nothing and a revision never stands for two
+lists.
+
+The host alone decides what a command may hold, in one check that runs when a command is saved and
+again when the file is read (`crates/kr-controller/src/launch_commands.rs`). A label is 1 to 48
+characters once trimmed, a program 1 to 512 bytes, a command at most 16 arguments of at most 512
+bytes each (an argument may be empty) and 3,072 bytes in all, and a host holds at most 32 commands, so
+the file stays under 256 KiB and a full list under the 1 MiB control frame. No field holds a control,
+format, invisible or line-break character, which the host looks for before it trims the label.
+
+A damaged file does not stop the host. The list answers `STORAGE_UNAVAILABLE`, and a save or a removal
+refuses and never replaces a file it could not read; the person moves the file away and adds the
+commands again. A write that fails with the earlier file standing says nothing was written. A write
+after which the file holds the new bytes, or cannot be read, answers `OUTCOME_UNKNOWN`, even when a
+later read finds the new bytes.
+
+A release from before the store does not name it, so it leaves the file alone: its launch buttons
+offer the installed agents only, a rollback keeps every byte, and the buttons return after the next
+update. The update check does not refuse such a rollback, since nothing the file holds restricts
+anything. Any program that runs as the host's account can reach the local socket and the file; the
+guard that keeps `kr launch` out of a session stops an accident and is not isolation from it.
+
 ## Windows
 
 The terminal on Windows is a pseudo-console. It is the same session, the same lease and the same

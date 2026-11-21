@@ -1642,6 +1642,21 @@ impl Controller {
                 let _: kr_protocol::organisation::HostPolicyConfirmParams =
                     parse(&mutation.params)?;
             }
+            // The launch commands this host saves belong to the host, not to one session.
+            Method::ShellLaunchCommandsSave | Method::ShellLaunchCommandsRemove => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "the launch commands belong to this host, not to one session".to_owned(),
+                    ));
+                }
+                if method == Method::ShellLaunchCommandsSave {
+                    let _: kr_protocol::launch_commands::ShellLaunchCommandsSaveParams =
+                        parse(&mutation.params)?;
+                } else {
+                    let _: kr_protocol::launch_commands::ShellLaunchCommandsRemoveParams =
+                        parse(&mutation.params)?;
+                }
+            }
             // A stop acts on this environment's daemon, which serves the whole environment, not on
             // a session.
             Method::HostStop => {

@@ -839,6 +839,61 @@ no attachment identifier when the recorded origin is mixed or no longer verifiab
 author implements against: the bridge endpoint, the `kr-shell-bridge/1` handshake, the reader-thread
 rules, the state machine and the cross-shell scenarios.
 
+## Saved launch commands
+
+A host keeps a list of launch commands its owner saved, which the launch buttons offer beside the
+agents the host has a package for. `crates/kr-protocol/src/launch_commands.rs` holds the types, and
+the control daemon answers the three methods itself: no worker serves them. A saved command is a
+label, a program and separate arguments. No command line is parsed: the host keeps the vector, and
+a press sends it through `shell.launch` as an argument vector, so each shell's integration quotes
+every word.
+
+| Method | Parameters | Result |
+| --- | --- | --- |
+| `shell.launch.commands.list` | `ShellLaunchCommandsListParams`: none | `ShellLaunchCommandsListResult`: the revision of the list and the commands in the order they were first saved |
+| `shell.launch.commands.save` | `ShellLaunchCommandsSaveParams`: the revision the save was decided from and the command | `ShellLaunchCommandsSaveResult`: whether it was applied, whether the list changed, whether it replaced a command, and the list after the request |
+| `shell.launch.commands.remove` | `ShellLaunchCommandsRemoveParams`: the revision the removal was decided from and the label | `ShellLaunchCommandsRemoveResult`: whether it was applied, whether a command was removed, and the list after the request |
+
+All three need `host.manage`, with no `session.view` path. The list is read at the local door and by a
+paired device that holds `host.manage`, which receives the exact command lines. That is an exception
+to the export form that the host reads a device takes ("never an account name, a local path"), and a
+command can hold a secret, so the companion's Settings and `kr launch` tell the person so. Save and
+remove list `local_ipc` alone: no paired device, workflow or plugin can change one, whatever it
+holds.
+
+A write names the revision it read, and each change makes a new random non-zero 64-bit revision,
+which is compared for equality only; 0 is the revision of a host that has saved nothing. A request
+decided against a revision the list has left writes nothing and is answered with `applied: false` and
+the list as it stands, with no new error code. A request against the current revision that asks for
+what the list already holds is answered with `applied: true` and `changed: false` for a save, or
+`removed: false` for a removal of a label no command has, and the revision does not move. A repeat
+after a lost answer is therefore stale or a no-change: it can neither restore an earlier command nor
+delete a recreated one. A save replaces the command with the same label, compared in lower case,
+keeps its place and takes the new spelling; a new label goes last.
+
+The host is the only authority on what a command may hold, in one check of its own, and refuses
+(`INVALID_ARGUMENT`) a command that breaks it, in these words:
+
+- A label has 1 to 48 characters once trimmed, a program 1 to 512 bytes, and at most 16 arguments of at
+  most 512 bytes each; an argument may be empty; a command uses at most 3,072 bytes across all three;
+  a host holds at most 32 commands, and labels are unique when compared in lower case.
+- No label, program or argument holds a control character (Cc), a format character (Cf), a line or
+  paragraph separator (Zl, Zp) or a default-ignorable code point. The host looks for these before it
+  trims the label, since a separator is white space. A refusal for a character names the first one by
+  its code point and its position, counted in characters from 1 in the field as written.
+
+The result of the list is the only launch-command type that carries read-only metadata, so a later
+release may add an optional member to it. The requests and the write results are closed: a later
+quoted form is a new method.
+
+The list is kept in the `launch-commands` store, `launch-commands.json` in the environment's state
+directory, at format 1: its own record structures, the revision and the commands. A damaged file does
+not stop the host: the list answers `STORAGE_UNAVAILABLE`, and a save or removal refuses and never
+replaces a file it could not read. A write that fails with the earlier file standing says nothing was
+written; one after which the file holds the new bytes, or cannot be read, answers `OUTCOME_UNKNOWN`.
+A release that does not name the store leaves the file alone, so a rollback keeps every byte and the
+buttons return after the next update.
+
 ## Account authority objects
 
 An organisation states membership and policy with signed objects, so a host can check them while the

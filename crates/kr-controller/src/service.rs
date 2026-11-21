@@ -67,6 +67,7 @@ mod host;
 mod identifiers;
 mod inhibition;
 mod insertion;
+mod launch_commands;
 mod local;
 mod local_access;
 mod machine_group;
@@ -827,6 +828,16 @@ pub struct Controller {
     /// every shipped build.
     #[cfg(feature = "testing")]
     after_the_environment_record_is_taken: crate::attention::Pause,
+    /// Where this host's own tests stop a change to the saved launch commands once it holds the
+    /// store's lock and before it asks the admission again. The pause holds the thread, not the
+    /// task, and the lock with it. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_launch_commands_are_locked: crate::attention::Pause,
+    /// Where this host's own tests stop a change to the saved launch commands inside the commit,
+    /// where the registration is held and nothing of the file has been written yet. The pause holds
+    /// the thread. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    inside_the_launch_commands_commit: crate::attention::Pause,
     /// Where this host's own tests stop an environment refresh once the platform has answered and
     /// the record has taken the answer in, before the admission is asked again to open a bridge,
     /// so that a fence can land in between. The pause holds the thread. Compiled away in every

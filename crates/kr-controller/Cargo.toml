@@ -84,6 +84,8 @@ thiserror.workspace = true
 toml_edit.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls.workspace = true
+# The characters a saved launch command may not hold are found by their general category.
+unicode-general-category.workspace = true
 # A webhook's address is parsed once to find the origin it is delivered through.
 url.workspace = true
 

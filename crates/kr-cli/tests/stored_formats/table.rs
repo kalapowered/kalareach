@@ -1264,6 +1264,26 @@ pub fn table() -> Vec<Store> {
                 &["Record", "StoredAppliedPolicy"],
             )],
         },
+        // The launch commands the owner saved on this host. An earlier release does not name this
+        // store, so it leaves the file alone and its launch buttons offer the installed agents only;
+        // the buttons return at the next update.
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
+                kr_controller::launch_commands::STORE_NAME,
+                StoreScope::Environment,
+                kr_controller::launch_commands::FILE_NAME,
+                member("version", 0),
+                kr_controller::launch_commands::RECORD_VERSION,
+                kr_controller::launch_commands::RECORD_VERSION,
+            ),
+            owned: Vec::new(),
+            kept: vec![Kept::Source(
+                "crates/kr-controller/src/launch_commands.rs",
+                &["Record", "StoredLaunchCommand"],
+            )],
+        },
         // The last policy the host wrote, kept beside the registry so that a registry put back to an
         // earlier state does not bring an older policy back. An earlier release does not name this
         // store; the registry it reads holds the policy and a sequence beside it that it ignores.

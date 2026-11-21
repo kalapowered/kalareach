@@ -57,6 +57,7 @@
 //! | [`digest`] | The mutation payload digest |
 //! | [`project`] | Project repositories, workspaces, inclusion previews and repository operations |
 //! | [`changeset`] | Immutable change-set versions, materialisations and the diff apply contract |
+//! | [`launch_commands`] | The launch commands a host saves, and the three methods that list, save and remove them |
 //! | [`limits`] | Protocol defaults |
 //! | [`ordering`] | Which requests on a connection a keystroke goes ahead of, and the order that reading ahead keeps |
 //! | [`local`] | The local IPC handshake and the control-stream message union |
@@ -151,6 +152,7 @@ pub mod ids;
 pub mod input;
 pub mod insertion;
 pub mod invitation;
+pub mod launch_commands;
 pub mod limits;
 pub mod local;
 pub mod machine;

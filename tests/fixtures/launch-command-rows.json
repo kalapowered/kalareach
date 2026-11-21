@@ -1,0 +1,1190 @@
+{
+ "about": "Rows the launch-command check is held to: the host's check (kr-controller launch_commands) and the page's own feedback read this one file. A refused row names the field, the 1-based position of the first refused character and its code point, or a size. The page's check is feedback only; the host is the authority.",
+ "rows": [
+  {
+   "name": "plain command accepted",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": []
+  },
+  {
+   "name": "a no-break space inside a label is allowed",
+   "label": "a\u00a0b",
+   "program": "claude",
+   "arguments": []
+  },
+  {
+   "name": "a no-break space at the ends of a label is trimmed, not refused",
+   "label": "\u00a0Codex\u00a0",
+   "program": "claude",
+   "arguments": []
+  },
+  {
+   "name": "a non-ASCII label and a Windows path program",
+   "label": "Caf\u00e9 \u2615",
+   "program": "C:\\tools\\agent.exe",
+   "arguments": [
+    "",
+    "two words",
+    "$HOME",
+    "~",
+    "a;b"
+   ]
+  },
+  {
+   "name": "an empty argument is allowed",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    ""
+   ]
+  },
+  {
+   "name": "the label starts with U+202E a bidi override",
+   "label": "\u202eab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+202E"
+   }
+  },
+  {
+   "name": "the label ends with U+202E a bidi override",
+   "label": "ab\u202e",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+202E"
+   }
+  },
+  {
+   "name": "the program holds U+202E a bidi override",
+   "label": "Claude",
+   "program": "cl\u202eaude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+202E"
+   }
+  },
+  {
+   "name": "an argument holds U+202E a bidi override",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u202e"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+202E"
+   }
+  },
+  {
+   "name": "the label starts with U+200B a zero-width space",
+   "label": "\u200bab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+200B"
+   }
+  },
+  {
+   "name": "the label ends with U+200B a zero-width space",
+   "label": "ab\u200b",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+200B"
+   }
+  },
+  {
+   "name": "the program holds U+200B a zero-width space",
+   "label": "Claude",
+   "program": "cl\u200baude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+200B"
+   }
+  },
+  {
+   "name": "an argument holds U+200B a zero-width space",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u200b"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+200B"
+   }
+  },
+  {
+   "name": "the label starts with U+2028 a line separator",
+   "label": "\u2028ab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+2028"
+   }
+  },
+  {
+   "name": "the label ends with U+2028 a line separator",
+   "label": "ab\u2028",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+2028"
+   }
+  },
+  {
+   "name": "the program holds U+2028 a line separator",
+   "label": "Claude",
+   "program": "cl\u2028aude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+2028"
+   }
+  },
+  {
+   "name": "an argument holds U+2028 a line separator",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u2028"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+2028"
+   }
+  },
+  {
+   "name": "the label starts with U+2029 a paragraph separator",
+   "label": "\u2029ab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+2029"
+   }
+  },
+  {
+   "name": "the label ends with U+2029 a paragraph separator",
+   "label": "ab\u2029",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+2029"
+   }
+  },
+  {
+   "name": "the program holds U+2029 a paragraph separator",
+   "label": "Claude",
+   "program": "cl\u2029aude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+2029"
+   }
+  },
+  {
+   "name": "an argument holds U+2029 a paragraph separator",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u2029"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+2029"
+   }
+  },
+  {
+   "name": "the label starts with U+3164 a Hangul filler",
+   "label": "\u3164ab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+3164"
+   }
+  },
+  {
+   "name": "the label ends with U+3164 a Hangul filler",
+   "label": "ab\u3164",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+3164"
+   }
+  },
+  {
+   "name": "the program holds U+3164 a Hangul filler",
+   "label": "Claude",
+   "program": "cl\u3164aude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+3164"
+   }
+  },
+  {
+   "name": "an argument holds U+3164 a Hangul filler",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u3164"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+3164"
+   }
+  },
+  {
+   "name": "the label starts with U+FE0F a variation selector",
+   "label": "\ufe0fab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+FE0F"
+   }
+  },
+  {
+   "name": "the label ends with U+FE0F a variation selector",
+   "label": "ab\ufe0f",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+FE0F"
+   }
+  },
+  {
+   "name": "the program holds U+FE0F a variation selector",
+   "label": "Claude",
+   "program": "cl\ufe0faude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+FE0F"
+   }
+  },
+  {
+   "name": "an argument holds U+FE0F a variation selector",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\ufe0f"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+FE0F"
+   }
+  },
+  {
+   "name": "the label starts with U+200D a zero-width joiner",
+   "label": "\u200dab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+200D"
+   }
+  },
+  {
+   "name": "the label ends with U+200D a zero-width joiner",
+   "label": "ab\u200d",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+200D"
+   }
+  },
+  {
+   "name": "the program holds U+200D a zero-width joiner",
+   "label": "Claude",
+   "program": "cl\u200daude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+200D"
+   }
+  },
+  {
+   "name": "an argument holds U+200D a zero-width joiner",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u200d"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+200D"
+   }
+  },
+  {
+   "name": "the label starts with U+0007 a bell (control)",
+   "label": "\u0007ab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+0007"
+   }
+  },
+  {
+   "name": "the label ends with U+0007 a bell (control)",
+   "label": "ab\u0007",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+0007"
+   }
+  },
+  {
+   "name": "the program holds U+0007 a bell (control)",
+   "label": "Claude",
+   "program": "cl\u0007aude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+0007"
+   }
+  },
+  {
+   "name": "an argument holds U+0007 a bell (control)",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u0007"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+0007"
+   }
+  },
+  {
+   "name": "the label starts with U+000A a line feed (control)",
+   "label": "\nab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+000A"
+   }
+  },
+  {
+   "name": "the label ends with U+000A a line feed (control)",
+   "label": "ab\n",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+000A"
+   }
+  },
+  {
+   "name": "the program holds U+000A a line feed (control)",
+   "label": "Claude",
+   "program": "cl\naude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+000A"
+   }
+  },
+  {
+   "name": "an argument holds U+000A a line feed (control)",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\n"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+000A"
+   }
+  },
+  {
+   "name": "the label starts with U+0000 a NUL (control)",
+   "label": "\u0000ab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+0000"
+   }
+  },
+  {
+   "name": "the label ends with U+0000 a NUL (control)",
+   "label": "ab\u0000",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+0000"
+   }
+  },
+  {
+   "name": "the program holds U+0000 a NUL (control)",
+   "label": "Claude",
+   "program": "cl\u0000aude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+0000"
+   }
+  },
+  {
+   "name": "an argument holds U+0000 a NUL (control)",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u0000"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+0000"
+   }
+  },
+  {
+   "name": "the label starts with U+E0100 a supplementary variation selector (default ignorable)",
+   "label": "\udb40\udd00ab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+E0100"
+   }
+  },
+  {
+   "name": "the label ends with U+E0100 a supplementary variation selector (default ignorable)",
+   "label": "ab\udb40\udd00",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+E0100"
+   }
+  },
+  {
+   "name": "the program holds U+E0100 a supplementary variation selector (default ignorable)",
+   "label": "Claude",
+   "program": "cl\udb40\udd00aude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+E0100"
+   }
+  },
+  {
+   "name": "an argument holds U+E0100 a supplementary variation selector (default ignorable)",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\udb40\udd00"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+E0100"
+   }
+  },
+  {
+   "name": "the label starts with U+FEFF a byte order mark",
+   "label": "\ufeffab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+FEFF"
+   }
+  },
+  {
+   "name": "the label ends with U+FEFF a byte order mark",
+   "label": "ab\ufeff",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+FEFF"
+   }
+  },
+  {
+   "name": "the program holds U+FEFF a byte order mark",
+   "label": "Claude",
+   "program": "cl\ufeffaude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+FEFF"
+   }
+  },
+  {
+   "name": "an argument holds U+FEFF a byte order mark",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\ufeff"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+FEFF"
+   }
+  },
+  {
+   "name": "the label starts with U+00AD a soft hyphen",
+   "label": "\u00adab",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 1,
+    "code_point": "U+00AD"
+   }
+  },
+  {
+   "name": "the label ends with U+00AD a soft hyphen",
+   "label": "ab\u00ad",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+00AD"
+   }
+  },
+  {
+   "name": "the program holds U+00AD a soft hyphen",
+   "label": "Claude",
+   "program": "cl\u00adaude",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 3,
+    "code_point": "U+00AD"
+   }
+  },
+  {
+   "name": "an argument holds U+00AD a soft hyphen",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "ok",
+    "a\u00ad"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 2,
+    "position": 2,
+    "code_point": "U+00AD"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+00AD, is refused in a program",
+   "label": "Claude",
+   "program": "\u00ad",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+00AD"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+034F, is refused in a program",
+   "label": "Claude",
+   "program": "\u034f",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+034F"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+061C, is refused in a program",
+   "label": "Claude",
+   "program": "\u061c",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+061C"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+115F, is refused in a program",
+   "label": "Claude",
+   "program": "\u115f",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+115F"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+1160, is refused in a program",
+   "label": "Claude",
+   "program": "\u1160",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+1160"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+17B4, is refused in a program",
+   "label": "Claude",
+   "program": "\u17b4",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+17B4"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+17B5, is refused in a program",
+   "label": "Claude",
+   "program": "\u17b5",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+17B5"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+180B, is refused in a program",
+   "label": "Claude",
+   "program": "\u180b",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+180B"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+180F, is refused in a program",
+   "label": "Claude",
+   "program": "\u180f",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+180F"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+200B, is refused in a program",
+   "label": "Claude",
+   "program": "\u200b",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+200B"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+200F, is refused in a program",
+   "label": "Claude",
+   "program": "\u200f",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+200F"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+202A, is refused in a program",
+   "label": "Claude",
+   "program": "\u202a",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+202A"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+202E, is refused in a program",
+   "label": "Claude",
+   "program": "\u202e",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+202E"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+2060, is refused in a program",
+   "label": "Claude",
+   "program": "\u2060",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+2060"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+206F, is refused in a program",
+   "label": "Claude",
+   "program": "\u206f",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+206F"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+3164, is refused in a program",
+   "label": "Claude",
+   "program": "\u3164",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+3164"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+FE00, is refused in a program",
+   "label": "Claude",
+   "program": "\ufe00",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+FE00"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+FE0F, is refused in a program",
+   "label": "Claude",
+   "program": "\ufe0f",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+FE0F"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+FEFF, is refused in a program",
+   "label": "Claude",
+   "program": "\ufeff",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+FEFF"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+FFA0, is refused in a program",
+   "label": "Claude",
+   "program": "\uffa0",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+FFA0"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+FFF0, is refused in a program",
+   "label": "Claude",
+   "program": "\ufff0",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+FFF0"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+FFF8, is refused in a program",
+   "label": "Claude",
+   "program": "\ufff8",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+FFF8"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+1BCA0, is refused in a program",
+   "label": "Claude",
+   "program": "\ud82f\udca0",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+1BCA0"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+1BCA3, is refused in a program",
+   "label": "Claude",
+   "program": "\ud82f\udca3",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+1BCA3"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+1D173, is refused in a program",
+   "label": "Claude",
+   "program": "\ud834\udd73",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+1D173"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+1D17A, is refused in a program",
+   "label": "Claude",
+   "program": "\ud834\udd7a",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+1D17A"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+E0000, is refused in a program",
+   "label": "Claude",
+   "program": "\udb40\udc00",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+E0000"
+   }
+  },
+  {
+   "name": "the end of a default-ignorable range, U+E0FFF, is refused in a program",
+   "label": "Claude",
+   "program": "\udb43\udfff",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "position": 1,
+    "code_point": "U+E0FFF"
+   }
+  },
+  {
+   "name": "a character just outside the ranges is accepted (U+00AC)",
+   "label": "Claude",
+   "program": "\u00ac",
+   "arguments": []
+  },
+  {
+   "name": "a character just outside the ranges is accepted (U+00AE)",
+   "label": "Claude",
+   "program": "\u00ae",
+   "arguments": []
+  },
+  {
+   "name": "a character just outside the ranges is accepted (U+3165)",
+   "label": "Claude",
+   "program": "\u3165",
+   "arguments": []
+  },
+  {
+   "name": "a character just outside the ranges is accepted (U+FFA1)",
+   "label": "Claude",
+   "program": "\uffa1",
+   "arguments": []
+  },
+  {
+   "name": "a character just outside the ranges is accepted (U+E1000)",
+   "label": "Claude",
+   "program": "\udb44\udc00",
+   "arguments": []
+  },
+  {
+   "name": "only the first refused character is named",
+   "label": "a\u200bb\u202e",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 2,
+    "code_point": "U+200B"
+   }
+  },
+  {
+   "name": "the position counts the label as typed, spaces included",
+   "label": "  \u200b",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+200B"
+   }
+  },
+  {
+   "name": "the position counts characters and not bytes",
+   "label": "\u00e9\u00e9\u200d",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "position": 3,
+    "code_point": "U+200D"
+   }
+  },
+  {
+   "name": "a label of 48 characters is accepted",
+   "label": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "program": "claude",
+   "arguments": []
+  },
+  {
+   "name": "a label of 49 characters is refused",
+   "label": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "size": true
+   }
+  },
+  {
+   "name": "a label of only spaces is refused",
+   "label": "   ",
+   "program": "claude",
+   "arguments": [],
+   "refused": {
+    "field": "label",
+    "size": true
+   }
+  },
+  {
+   "name": "an empty program is refused",
+   "label": "Claude",
+   "program": "",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "size": true
+   }
+  },
+  {
+   "name": "a program of 512 bytes is accepted",
+   "label": "Claude",
+   "program": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+   "arguments": []
+  },
+  {
+   "name": "a program of 513 bytes is refused",
+   "label": "Claude",
+   "program": "ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+   "arguments": [],
+   "refused": {
+    "field": "program",
+    "size": true
+   }
+  },
+  {
+   "name": "16 arguments are accepted",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a"
+   ]
+  },
+  {
+   "name": "17 arguments are refused",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a",
+    "a"
+   ],
+   "refused": {
+    "field": "arguments",
+    "size": true
+   }
+  },
+  {
+   "name": "an argument of 512 bytes is accepted",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   ]
+  },
+  {
+   "name": "an argument of 513 bytes is refused",
+   "label": "Claude",
+   "program": "claude",
+   "arguments": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   ],
+   "refused": {
+    "field": "argument",
+    "argument": 1,
+    "size": true
+   }
+  },
+  {
+   "name": "a total of 3,073 bytes is refused",
+   "label": "llllllllllllllllllllllllllllllllllllllllllllllll",
+   "program": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+   "arguments": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   ],
+   "refused": {
+    "field": "command",
+    "size": true
+   }
+  },
+  {
+   "name": "a total of 3,072 bytes is accepted",
+   "label": "llllllllllllllllllllllllllllllllllllllllllllllll",
+   "program": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+   "arguments": [
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   ]
+  }
+ ]
+}

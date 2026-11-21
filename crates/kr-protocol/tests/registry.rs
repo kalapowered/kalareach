@@ -1138,6 +1138,53 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         "the launch surface shows what the live screen shows"
     );
 
+    // The launch commands a host saves are listed under host.manage, by the local owner and by a paired
+    // device that may manage the host; they are saved and removed at the local door alone, so no
+    // paired device, workflow or plugin can change one, and each change names the revision it was
+    // decided from.
+    let launch_commands = [
+        "shell.launch.commands.list",
+        "shell.launch.commands.save",
+        "shell.launch.commands.remove",
+    ];
+    for name in launch_commands {
+        let entry = lookup(name).expect("listed");
+        assert_eq!(entry.group, MethodGroup::ShellLaunch, "{name}");
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} is under host.manage and nothing else, with no session.view path"
+        );
+        assert_eq!(entry.history_filter, HistoryFilter::NotApplicable, "{name}");
+    }
+    assert_eq!(
+        lookup("shell.launch.commands.list").expect("listed").effect,
+        EffectClass::Read
+    );
+    assert_eq!(
+        lookup("shell.launch.commands.list")
+            .expect("listed")
+            .ingress,
+        &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+        "the list is read at the local door and by a paired device that may manage the host"
+    );
+    for name in ["shell.launch.commands.save", "shell.launch.commands.remove"] {
+        let entry = lookup(name).expect("listed");
+        assert_eq!(entry.effect, EffectClass::Write, "{name}");
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is made at the local door alone: a paired device, a workflow and a plugin are refused"
+        );
+        assert!(
+            matches!(
+                entry.idempotency,
+                IdempotencyBehaviour::CompareAndSwap { .. }
+            ),
+            "{name} names the revision it was decided from"
+        );
+    }
+
     // Two methods section 23's table does not list: the local owner's read of what the host made
     // of a suite's test reports, and of the processes a session's worker recorded.
     let test_reports = ["changeset.test_reports", "session.processes"];
@@ -1187,6 +1234,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + phone.len()
             + test_reports.len()
             + streams.len()
+            + launch_commands.len()
             + 1,
         "the registry holds the required methods and the named additions"
     );

@@ -3062,6 +3062,7 @@ export interface KalaReachProtocol {
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
   named_approval_preview?: NamedApprovalPreview
+  named_launch?: NamedLaunch
   named_question_preview?: NamedQuestionPreview
   network_proxy_login_clear_params?: NetworkProxyLoginClearParams
   network_proxy_login_result?: NetworkProxyLoginResult
@@ -3285,6 +3286,12 @@ export interface KalaReachProtocol {
   share_key?: ShareKey
   share_offer?: ShareOffer
   shell_command_params?: ShellCommandParams
+  shell_launch_commands_list_params?: ShellLaunchCommandsListParams
+  shell_launch_commands_list_result?: ShellLaunchCommandsListResult
+  shell_launch_commands_remove_params?: ShellLaunchCommandsRemoveParams
+  shell_launch_commands_remove_result?: ShellLaunchCommandsRemoveResult
+  shell_launch_commands_save_params?: ShellLaunchCommandsSaveParams
+  shell_launch_commands_save_result?: ShellLaunchCommandsSaveResult
   shell_launch_params?: ShellLaunchParams
   shell_launch_result?: ShellLaunchResult
   shell_launch_surface_params?: ShellLaunchSurfaceParams
@@ -19472,6 +19479,9 @@ export interface MethodEntry {
     | 'root.command.accepted'
     | 'shell.launch'
     | 'shell.launch.surface'
+    | 'shell.launch.commands.list'
+    | 'shell.launch.commands.save'
+    | 'shell.launch.commands.remove'
     | 'agent.capabilities'
     | 'agent.snapshot'
     | 'agent.commands'
@@ -19651,6 +19661,27 @@ export interface RequiredRight {
     | 'other_actor'
     | 'candidate_endpoint'
     | 'issuing_owner'
+}
+/**
+ * One saved launch command: the label a button shows, the program, and the arguments as the
+ * person wrote them. An argument may be empty. The host refuses a control, format, invisible or
+ * line-break character in any of the three fields.
+ */
+export interface NamedLaunch {
+  /**
+   * The arguments, at most 16 of at most 512 bytes each; the whole command is at most 3,072
+   * bytes.
+   */
+  arguments: string[]
+  /**
+   * What the button shows: 1 to 48 characters once trimmed, unique on this host when compared
+   * in lower case.
+   */
+  label: string
+  /**
+   * The program: 1 to 512 bytes, a full path or a program on the shell's path.
+   */
+  program: string
 }
 /**
  * Parameters of `network.proxy_login.clear`.
@@ -28636,6 +28667,9 @@ export interface ServiceRequestPayload {
     | 'root.command.accepted'
     | 'shell.launch'
     | 'shell.launch.surface'
+    | 'shell.launch.commands.list'
+    | 'shell.launch.commands.save'
+    | 'shell.launch.commands.remove'
     | 'agent.capabilities'
     | 'agent.snapshot'
     | 'agent.commands'
@@ -29877,6 +29911,119 @@ export interface ShellCommandParams {
    * The command line the shell runs: 1 to [`MAX_SHELL_COMMAND_BYTES`] bytes.
    */
   command: string
+}
+/**
+ * The parameters of `shell.launch.commands.list`. There are none.
+ */
+export interface ShellLaunchCommandsListParams {}
+/**
+ * The result of `shell.launch.commands.list`: the commands the host holds, in the order they
+ * were first saved, and the revision of the list.
+ *
+ * This is the only launch-command type that carries read-only metadata, so a later release may
+ * add an optional member to it without a change of level.
+ */
+export interface ShellLaunchCommandsListResult {
+  /**
+   * The saved commands.
+   */
+  commands: NamedLaunch[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
+ * The parameters of `shell.launch.commands.remove`.
+ */
+export interface ShellLaunchCommandsRemoveParams {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  expected_revision: string
+  /**
+   * The label to remove, compared in lower case.
+   */
+  label: string
+}
+/**
+ * The result of `shell.launch.commands.remove`.
+ */
+export interface ShellLaunchCommandsRemoveResult {
+  /**
+   * Whether the removal was decided against the current revision. False means the list changed
+   * first: nothing was written and `commands` is the list as it stands.
+   */
+  applied: boolean
+  /**
+   * The list after the request.
+   */
+  commands: NamedLaunch[]
+  /**
+   * Whether a command was removed. False when no saved command has that label.
+   */
+  removed: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
+ * The parameters of `shell.launch.commands.save`.
+ */
+export interface ShellLaunchCommandsSaveParams {
+  command: NamedLaunch1
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  expected_revision: string
+}
+/**
+ * One saved launch command: the label a button shows, the program, and the arguments as the
+ * person wrote them. An argument may be empty. The host refuses a control, format, invisible or
+ * line-break character in any of the three fields.
+ */
+export interface NamedLaunch1 {
+  /**
+   * The arguments, at most 16 of at most 512 bytes each; the whole command is at most 3,072
+   * bytes.
+   */
+  arguments: string[]
+  /**
+   * What the button shows: 1 to 48 characters once trimmed, unique on this host when compared
+   * in lower case.
+   */
+  label: string
+  /**
+   * The program: 1 to 512 bytes, a full path or a program on the shell's path.
+   */
+  program: string
+}
+/**
+ * The result of `shell.launch.commands.save`.
+ */
+export interface ShellLaunchCommandsSaveResult {
+  /**
+   * Whether the save was decided against the current revision. False means the list changed
+   * first: nothing was written and `commands` is the list as it stands.
+   */
+  applied: boolean
+  /**
+   * Whether the list changed. False when it already held this command as written.
+   */
+  changed: boolean
+  /**
+   * The list after the request.
+   */
+  commands: NamedLaunch[]
+  /**
+   * Whether the command took the place of a saved command with the same label.
+   */
+  replaced: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
 }
 /**
  * Parameters of `shell.launch`.
