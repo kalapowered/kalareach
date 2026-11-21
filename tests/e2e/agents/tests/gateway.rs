@@ -154,6 +154,10 @@ mod generations;
 #[path = "gateway/staged_a.rs"]
 mod staged_a;
 
+/// The parts of the qualification that need the person's login (1, 3 and 4), on this driver.
+#[path = "gateway/staged_b.rs"]
+mod staged_b;
+
 /// The variable naming the build list entry of a real agent; without it the agent is the stand-in.
 const BUILD_VARIABLE: &str = "KR_AGENTS_GATEWAY_BUILD";
 
