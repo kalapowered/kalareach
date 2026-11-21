@@ -346,6 +346,36 @@ pub(super) fn turns_as_planned(charged: u64, submitted: u64, planned: u64) -> Re
     }
 }
 
+/// Whether the host took every one of the `length` bytes typed: each forwarded to the terminal, or
+/// held as the start of a bracketed-paste delimiter, as a lone Escape is while the terminal takes
+/// pastes (the worker forwards it once its short deadline passes), which the agent's interrupt key
+/// is.
+///
+/// # Errors
+///
+/// Returns how many bytes were taken.
+fn bytes_taken(forwarded: u64, held: u64, length: u64) -> Result<(), String> {
+    if forwarded.saturating_add(held) >= length {
+        Ok(())
+    } else {
+        Err(format!(
+            "{forwarded} byte(s) forwarded and {held} held of the {length} typed"
+        ))
+    }
+}
+
+/// A lone Escape that the worker holds for its deadline is taken, as the interrupt key is, and a
+/// byte that was neither forwarded nor held is not.
+#[test]
+fn a_byte_neither_forwarded_nor_held_is_not_taken_and_a_held_escape_is() {
+    assert!(bytes_taken(1, 0, 1).is_ok());
+    assert!(bytes_taken(0, 1, 1).is_ok());
+    assert!(bytes_taken(5, 0, 7).is_err());
+    assert!(bytes_taken(5, 1, 7).is_err());
+    assert!(bytes_taken(6, 1, 7).is_ok());
+    assert!(bytes_taken(0, 0, 1).is_err());
+}
+
 /// The device's keyboard on a session, and the person's screen it types at.
 pub(super) struct Typing<'a> {
     ctx: &'a Context,
@@ -370,12 +400,12 @@ impl<'a> Typing<'a> {
             .keys
             .type_text(self.at.remote, &self.ctx.runtime, text)
             .unwrap_or_else(|why| panic!("{why}"));
-        let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
-        assert!(
-            written.forwarded_bytes.get() >= length,
-            "{} of the {length} byte(s) typed were forwarded to the terminal",
-            written.forwarded_bytes.get()
-        );
+        bytes_taken(
+            written.forwarded_bytes.get(),
+            written.held_prefix_bytes.get(),
+            u64::try_from(text.len()).unwrap_or(u64::MAX),
+        )
+        .unwrap_or_else(|why| panic!("{why}"));
     }
 
     /// Where an approval dialog of the agent's is on the screen, a typed digit or the key that
