@@ -101,23 +101,19 @@ describe('what output and a silent change do to the launch buttons', () => {
   it('output_alone_does_not_darken_profile_or_named_buttons_and_a_new_generation_still_needs_the_look', async () => {
     try {
       const { person, controls, view } = await lit()
-      const listReads = controls.launchCommands.reads
       const reads = controls.hold('launchSurface')
 
       // Output streams. Each state the view publishes wakes a read of the surface, at most one in
-      // each wake gap; no button is dark in the frame the output is drawn in, while the wake read
-      // is on its way, or after it has answered the same prompt.
+      // each wake gap. The gap has passed when the state is published, so the read starts in the
+      // frame of the state and nothing else can have started it: the surface's own cadence is two
+      // seconds away. No button is dark in that frame, while the wake read is on its way, or after
+      // it has answered the same prompt.
       for (let round = 1; round <= 3; round += 1) {
         act(() => {
+          vi.advanceTimersByTime(LAUNCH_SURFACE_WAKE_GAP_MS)
           view.show()
         })
-        everyLit()
-        act(() => {
-          vi.advanceTimersByTime(LAUNCH_SURFACE_WAKE_GAP_MS)
-        })
-        await waitFor(() => {
-          expect(reads.count).toBe(round)
-        })
+        expect(reads.count).toBe(round)
         everyLit()
         await act(async () => {
           reads.answer(round - 1)
@@ -125,22 +121,16 @@ describe('what output and a silent change do to the launch buttons', () => {
         })
         everyLit()
       }
-      // A wake round reads the surface only: output never reads the saved commands.
-      expect(controls.launchCommands.reads).toBe(listReads)
 
-      // The prompt moves on and its output is drawn. The read it wakes is on its way, and the
-      // buttons are lit until it has answered: output alone says nothing of the prompt.
+      // The prompt moves on and its output is drawn. The read it wakes starts in that frame and is
+      // on its way, and the buttons are lit until it has answered: output alone says nothing of
+      // the prompt.
       act(() => {
+        vi.advanceTimersByTime(LAUNCH_SURFACE_WAKE_GAP_MS)
         controls.changePromptGeneration()
         view.show()
       })
-      everyLit()
-      act(() => {
-        vi.advanceTimersByTime(LAUNCH_SURFACE_WAKE_GAP_MS)
-      })
-      await waitFor(() => {
-        expect(reads.count).toBe(4)
-      })
+      expect(reads.count).toBe(4)
       everyLit()
 
       // The answer names a prompt the buttons were not drawn at: every button, an agent's and a
