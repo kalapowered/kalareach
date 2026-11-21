@@ -2957,3 +2957,739 @@ async fn parameters_are_decoded_before_the_session_is_asked() {
     );
     host.stop().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// The visits on the owner: what each visit commits, when it is told, and what a visit that began
+// under an authority that has gone writes (nothing).
+// ---------------------------------------------------------------------------------------------
+
+/// This phone paired with three hosts: the first in use, and the second (A) and the third (C) the
+/// others, with the dials governed.
+struct Visiting {
+    first: Host,
+    a: Host,
+    c: Host,
+    phone: Phone,
+    control: Arc<LinkControl>,
+    owner: DeviceKeys,
+    a_ref: String,
+    c_ref: String,
+}
+
+async fn visiting() -> Visiting {
+    let owner = DeviceKeys::generate().expect("keys");
+    let first = Host::start(&owner).await;
+    let a = Host::start(&owner).await;
+    let c = Host::start(&owner).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&first, &control);
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    connection(&phone.companion, true).await;
+    pair(&phone, &a, &owner, &[ActionRight::SessionView]).await;
+    pair(&phone, &c, &owner, &[ActionRight::SessionView]).await;
+    connection(&phone.companion, true).await;
+    let (a_ref, c_ref) = (
+        reference_for(&phone.companion, &a),
+        reference_for(&phone.companion, &c),
+    );
+    Visiting {
+        first,
+        a,
+        c,
+        phone,
+        control,
+        owner,
+        a_ref,
+        c_ref,
+    }
+}
+
+type Call = tokio::task::JoinHandle<Result<serde_json::Value, serde_json::Value>>;
+
+impl Visiting {
+    fn companion(&self) -> &Companion {
+        &self.phone.companion
+    }
+
+    /// A pass of the inbox, started now.
+    fn pass(&self) -> Call {
+        self.companion().start_call("inbox_hosts", json!({}))
+    }
+
+    fn id_of(&self, reference: &str) -> kr_protocol::ids::DeviceId {
+        self.companion()
+            .device()
+            .host_by_reference(reference)
+            .expect("the host is listed")
+            .host_device_id
+    }
+
+    /// Forgets A and records a pairing with it again under another identity, as a new pairing
+    /// would. The new record is returned.
+    fn pair_a_again(&self) -> kr_client::pairing::paired::PairedHost {
+        let device = self.companion().device();
+        let old = device.host_by_reference(&self.a_ref).expect("A is listed");
+        self.companion()
+            .call("hosts_forget", json!({ "reference": self.a_ref }))
+            .expect("A is forgotten");
+        let new = kr_client::pairing::paired::PairedHost {
+            device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [9; 16],
+            )),
+            ..old
+        };
+        device
+            .pairing()
+            .hosts
+            .record(new.clone())
+            .expect("the new pairing is recorded");
+        new
+    }
+
+    async fn stop(self) {
+        self.first.stop().await;
+        self.a.stop().await;
+        self.c.stop().await;
+    }
+}
+
+/// The refusal a host under a lapsed bound gives every request.
+fn lapsed() -> kr_protocol::error::ProtocolError {
+    kr_controller::grants::Refusal::BehindItsFeed.to_protocol_error()
+}
+
+/// How the owner says contact with the other host `reference` stands, with its epoch: its entry in
+/// `others`, from the states the page was told.
+fn told_other(companion: &Companion, reference: &str) -> Vec<serde_json::Value> {
+    companion
+        .told_connection()
+        .iter()
+        .filter_map(|state| {
+            let other = state["others"]
+                .as_array()?
+                .iter()
+                .find(|other| other["reference"] == reference)?;
+            let mut other = other.clone();
+            other["revision"] = state["revision"].clone();
+            Some(other)
+        })
+        .collect()
+}
+
+/// Waits until the page was told that contact with `reference` stands as `state`.
+async fn until_told(companion: &Companion, reference: &str, state: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(found) = told_other(companion, reference)
+                .into_iter()
+                .find(|other| other["contact"]["state"] == state)
+            {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "contact with the host was not told as {state}: it was told {:?}",
+            told_other(companion, reference)
+        )
+    })
+}
+
+/// Waits for the visit to `host` to reach its hold, and lets every other visit that reaches it go on.
+async fn visit_held(
+    visits: &mut tokio::sync::mpsc::UnboundedReceiver<companion_tauri::inbox::testing::VisitHold>,
+    host: kr_protocol::ids::DeviceId,
+) -> companion_tauri::inbox::testing::VisitHold {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let hold = visits.recv().await.expect("a visit reaches the hold");
+            if hold.host == host {
+                return hold;
+            }
+            hold.release();
+        }
+    })
+    .await
+    .expect("the visit reaches its hold")
+}
+
+/// A row of a pass's answer, by the reference of its host.
+fn row_of<'a>(reply: &'a serde_json::Value, reference: &str) -> Option<&'a serde_json::Value> {
+    hosts_of(reply)
+        .iter()
+        .find(|row| row["reference"] == reference)
+}
+
+/// A pass whose host A refuses and whose host C is held in its dial: A's refusal is told before the
+/// pass returns, and the owner's state has it while the reply is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_host_does_not_delay_another_hosts_contact_event() {
+    let v = visiting().await;
+    let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
+    v.control
+        .refuse_request(Some((Method::AttentionRead, lapsed())));
+    let pass = v.pass();
+    let refused = until_told(v.companion(), &v.a_ref, "refused").await;
+    assert_eq!(refused["contact"]["request"], "attention_read", "{refused}");
+    assert!(
+        !pass.is_finished(),
+        "A's refusal was told before the pass returned"
+    );
+    v.control.refuse_request(None);
+    v.control.release_dialled();
+    pass.await
+        .expect("the pass ran")
+        .expect("the pass answered");
+    v.stop().await;
+}
+
+/// The same moment, read from the owner's own state and not from what was told: the contact of A is
+/// in the connection's state while the pass's reply is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visits_contact_is_published_while_the_pass_reply_is_held() {
+    let v = visiting().await;
+    let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
+    v.control.end_connections(true);
+    let pass = v.pass();
+    let lost = until_told(v.companion(), &v.a_ref, "out_of_contact").await;
+    assert!(lost["contact"]["since_ms"].is_u64(), "{lost}");
+    assert!(!pass.is_finished(), "the reply is still held");
+    assert_eq!(
+        contact_of(v.companion(), &v.a_ref)["state"],
+        "out_of_contact"
+    );
+    v.control.end_connections(false);
+    v.control.release_dialled();
+    pass.await
+        .expect("the pass ran")
+        .expect("the pass answered");
+    v.stop().await;
+}
+
+/// A refuses and then recovers while C is slow: the page is told the two, in the order of their
+/// revisions, each once, and the second pass does not wait for C to tell it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_then_a_recovery_of_one_host_is_told_in_order_while_c_is_slow() {
+    let v = visiting().await;
+    let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
+    v.control
+        .refuse_request(Some((Method::AttentionRead, lapsed())));
+    let first = v.pass();
+    until_told(v.companion(), &v.a_ref, "refused").await;
+    v.control.refuse_request(None);
+    let second = v.pass();
+    until_told(v.companion(), &v.a_ref, "in_contact").await;
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "C holds both"
+    );
+    v.control.release_dialled();
+    first.await.expect("the first ran").expect("answered");
+    second.await.expect("the second ran").expect("answered");
+    let told = told_other(v.companion(), &v.a_ref);
+    let states: Vec<&str> = told
+        .iter()
+        .filter_map(|other| other["contact"]["state"].as_str())
+        .collect();
+    assert_eq!(states, ["refused", "in_contact"], "{told:?}");
+    let revisions: Vec<u64> = told
+        .iter()
+        .map(|other| other["revision"].as_u64().expect("a revision"))
+        .collect();
+    assert!(revisions[0] < revisions[1], "{revisions:?}");
+    v.stop().await;
+}
+
+/// A host that holds a loss from a visit and then becomes the one in use keeps that loss and its
+/// start: the one record has one loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_becomes_the_one_in_use_keeps_its_one_loss() {
+    let v = visiting().await;
+    v.control.end_connections(true);
+    v.pass()
+        .await
+        .expect("the pass ran")
+        .expect("the pass answered");
+    let lost = contact_of(v.companion(), &v.a_ref);
+    assert_eq!(lost["state"], "out_of_contact", "A's visit lost it: {lost}");
+    let since = lost["since_ms"].as_u64().expect("since when");
+    v.control.end_connections(false);
+    v.control.hold();
+    let using = v
+        .companion()
+        .start_call("hosts_use", json!({ "reference": v.a_ref }));
+    v.companion().told_host(&v.a_ref).await;
+    let told = v
+        .companion()
+        .told_connection()
+        .into_iter()
+        .rev()
+        .find(|state| state["host"]["reference"] == v.a_ref.as_str())
+        .expect("the choice was told");
+    assert_eq!(told["contact"]["state"], "out_of_contact", "{told}");
+    assert_eq!(told["contact"]["since_ms"].as_u64(), Some(since), "{told}");
+    v.control.stop_holding();
+    v.control.release_all();
+    using.await.expect("the choice ran").expect("A is chosen");
+    v.stop().await;
+}
+
+/// A refusal clears what was read of the host, in the one revision that tells the refusal: the
+/// refusal is told with a moved epoch, and the answer's row for the host holds no read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_clears_the_hosts_read_in_the_same_revision() {
+    let v = visiting().await;
+    let read = v.pass().await.expect("ran").expect("answered");
+    assert!(row_of(&read, &v.a_ref).expect("A's row")["result"].is_object());
+    let epoch = told_other(v.companion(), &v.a_ref)
+        .last()
+        .expect("A's contact was told")["inbox_epoch"]
+        .as_u64()
+        .expect("an epoch");
+    v.control
+        .refuse_request(Some((Method::AttentionRead, lapsed())));
+    let refused_answer = v.pass().await.expect("ran").expect("answered");
+    let refused = until_told(v.companion(), &v.a_ref, "refused").await;
+    assert!(
+        refused["inbox_epoch"].as_u64().expect("an epoch") > epoch,
+        "the refusal moved the epoch: {refused}"
+    );
+    let row = row_of(&refused_answer, &v.a_ref).expect("A's row");
+    assert!(
+        row["result"].is_null() && row["read_at_ms"].is_null(),
+        "{row}"
+    );
+    assert!(
+        refused_answer["revision"].as_u64() >= refused["revision"].as_u64(),
+        "the answer was read at or after the revision that told the refusal"
+    );
+    v.stop().await;
+}
+
+/// Two passes overlap, and the older answers with the newer read: a pass answers with what the owner
+/// holds, not with what its own visit read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_answers_with_the_records_not_its_own_results() {
+    let v = visiting().await;
+    let _arrivals = v.control.hold_dialled(v.c.network().endpoint_id());
+    let older = v.pass();
+    until_told(v.companion(), &v.a_ref, "in_contact").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let newer = v.pass();
+    // A is read twice: by the older pass, and by the newer one, which does not wait for C to read A.
+    tokio::time::timeout(WATCHDOG, async {
+        while v.control.sent(Method::AttentionRead) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A is read by both passes");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    v.control.release_dialled();
+    let older = older.await.expect("ran").expect("answered");
+    let newer = newer.await.expect("ran").expect("answered");
+    let (old_row, new_row) = (
+        row_of(&older, &v.a_ref).expect("A's row"),
+        row_of(&newer, &v.a_ref).expect("A's row"),
+    );
+    assert_eq!(
+        old_row["read_at_ms"], new_row["read_at_ms"],
+        "the older pass shows the newer read"
+    );
+    assert_eq!(old_row["read_serial"], new_row["read_serial"]);
+    v.stop().await;
+}
+
+/// A host that answers and whose inbox changes between two pages twice gave no complete inbox: it is
+/// in contact, a loss it had ends, and no result is added.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answered_visit_without_a_complete_inbox_ends_a_loss_and_adds_no_result() {
+    let v = visiting().await;
+    v.control.end_connections(true);
+    v.pass().await.expect("ran").expect("answered");
+    assert_eq!(
+        contact_of(v.companion(), &v.a_ref)["state"],
+        "out_of_contact"
+    );
+    v.control.end_connections(false);
+    v.control.refuse_request(Some((
+        Method::AttentionRead,
+        kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::DraftConflict,
+            "an item went between two pages",
+        ),
+    )));
+    let answered = v.pass().await.expect("ran").expect("answered");
+    assert_eq!(contact_of(v.companion(), &v.a_ref)["state"], "in_contact");
+    let row = row_of(&answered, &v.a_ref).expect("A's row");
+    assert!(row["result"].is_null(), "no result was added: {row}");
+    v.stop().await;
+}
+
+/// A loss is stamped when the visit that found it completed: a visit that waits out its bound for an
+/// answer that never comes stamps the moment it gave up, not the moment it began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_is_stamped_when_the_visit_completed() {
+    let v = visiting().await;
+    v.control.lose_the_answer_to(Some(Method::AttentionRead));
+    let before = now_ms();
+    v.pass().await.expect("ran").expect("answered");
+    let after = now_ms();
+    let lost = contact_of(v.companion(), &v.a_ref);
+    let since = lost["since_ms"].as_u64().expect("since when");
+    assert!(
+        since >= before + 9_000 && since <= after,
+        "stamped at the end of the visit: {before} {since} {after}"
+    );
+    v.stop().await;
+}
+
+/// The time a read is dated is the time its visit committed, not the time it began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_at_is_the_commit_time() {
+    let v = visiting().await;
+    let mut visits = v.companion().inbox().watch_visits();
+    let before = now_ms();
+    let pass = v.pass();
+    let a = v.id_of(&v.a_ref);
+    let hold = visit_held(&mut visits, a).await;
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    hold.release();
+    drop(visits);
+    let answered = pass.await.expect("ran").expect("answered");
+    let after = now_ms();
+    let read_at = row_of(&answered, &v.a_ref).expect("A's row")["read_at_ms"]
+        .as_u64()
+        .expect("a read time");
+    assert!(
+        read_at >= before + 2_000 && read_at <= after,
+        "dated at the commit: {before} {read_at} {after}"
+    );
+    v.stop().await;
+}
+
+/// A forget of a host that held a visible record (its own loss in `others`) is an event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forget_tells_a_host_that_had_a_visible_record() {
+    let v = visiting().await;
+    v.control.end_connections(true);
+    v.pass().await.expect("ran").expect("answered");
+    until_told(v.companion(), &v.a_ref, "out_of_contact").await;
+    v.companion().told_everything().await;
+    let before = v.companion().told_connection().len();
+    v.companion()
+        .call("hosts_forget", json!({ "reference": v.a_ref }))
+        .expect("A is forgotten");
+    v.companion().told_everything().await;
+    let told = v.companion().told_connection();
+    assert!(told.len() > before, "the forget was told");
+    let last = told.last().expect("a state");
+    assert!(
+        last["others"]
+            .as_array()
+            .expect("others")
+            .iter()
+            .all(|other| other["reference"] != v.a_ref.as_str()),
+        "A's row left `others`: {last}"
+    );
+    v.stop().await;
+}
+
+/// A visit held after its read, across a forget and a pairing again with the same host, commits
+/// nothing, and its connection is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_held_across_a_forget_and_a_repair_commits_nothing_and_closes_its_connection() {
+    let v = visiting().await;
+    let mut visits = v.companion().inbox().watch_visits();
+    let pass = v.pass();
+    let hold = visit_held(&mut visits, v.id_of(&v.a_ref)).await;
+    let closed = v.control.closed();
+    v.pair_a_again();
+    hold.release();
+    drop(visits);
+    let answered = pass.await.expect("ran").expect("answered");
+    assert!(
+        contact_of(v.companion(), &v.a_ref).is_null(),
+        "the held visit wrote nothing"
+    );
+    assert!(
+        row_of(&answered, &v.a_ref).is_none_or(|row| row["result"].is_null()),
+        "{answered}"
+    );
+    assert!(
+        v.control.closed() > closed,
+        "the visit's connection was closed"
+    );
+    v.stop().await;
+}
+
+/// A host forgotten and paired again after the pass listed it, and before the visit began, is not
+/// visited with the old credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listed_host_forgotten_and_paired_again_before_the_spawn_is_not_visited_with_the_old_credentials()
+ {
+    let v = visiting().await;
+    let mut passes = v.companion().inbox().watch_passes();
+    let pass = v.pass();
+    let hold = tokio::time::timeout(WATCHDOG, passes.recv())
+        .await
+        .expect("the pass reaches the hold")
+        .expect("a hold");
+    let endpoint = v.a.network().endpoint_id();
+    let asked = v.control.asked_of(&endpoint);
+    v.pair_a_again();
+    hold.release();
+    drop(passes);
+    pass.await.expect("ran").expect("answered");
+    assert_eq!(
+        v.control.asked_of(&endpoint),
+        asked,
+        "the old credentials were not used to visit A"
+    );
+    v.stop().await;
+}
+
+/// A re-pair after the read, with the same host and another identity and no forget, leaves the
+/// owner's generation, role and epoch as they are: only the second check of the pairing rejects the
+/// commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_pair_after_the_read_without_a_forget_is_rejected_by_the_second_verify() {
+    let v = visiting().await;
+    let mut visits = v.companion().inbox().watch_visits();
+    let pass = v.pass();
+    let a = v.id_of(&v.a_ref);
+    let hold = visit_held(&mut visits, a).await;
+    let device = v.companion().device();
+    let old = device.host_by_reference(&v.a_ref).expect("A is listed");
+    let new = kr_client::pairing::paired::PairedHost {
+        device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+        ..old
+    };
+    device
+        .pairing()
+        .hosts
+        .record(new)
+        .expect("the host is paired again, with no forget");
+    hold.release();
+    drop(visits);
+    let answered = pass.await.expect("ran").expect("answered");
+    assert!(
+        contact_of(v.companion(), &v.a_ref).is_null(),
+        "nothing was committed over the old pairing"
+    );
+    assert!(
+        row_of(&answered, &v.a_ref).is_none_or(|row| row["result"].is_null()),
+        "{answered}"
+    );
+    v.stop().await;
+}
+
+/// A visitor queued behind another visit of the same host, across a forget of it, takes no
+/// connection and makes no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visitor_queued_across_a_forget_takes_no_connection_and_makes_no_record() {
+    let v = visiting().await;
+    let mut visits = v.companion().inbox().watch_visits();
+    let first = v.pass();
+    let a = v.id_of(&v.a_ref);
+    let hold = visit_held(&mut visits, a).await;
+    let endpoint = v.a.network().endpoint_id();
+    let queued = v.pass();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let asked = v.control.asked_of(&endpoint);
+    v.companion()
+        .call("hosts_forget", json!({ "reference": v.a_ref }))
+        .expect("A is forgotten");
+    hold.release();
+    first.await.expect("ran").expect("answered");
+    drop(visits);
+    queued.await.expect("ran").expect("answered");
+    assert_eq!(
+        v.control.asked_of(&endpoint),
+        asked,
+        "the queued visitor asked for no connection"
+    );
+    assert!(contact_of(v.companion(), &v.a_ref).is_null());
+    v.stop().await;
+}
+
+/// A visit that began before its host was used and left again commits nothing: the host's epoch has
+/// moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_that_began_before_the_host_was_used_and_recovered_commits_nothing() {
+    let v = visiting().await;
+    let mut visits = v.companion().inbox().watch_visits();
+    let pass = v.pass();
+    let hold = visit_held(&mut visits, v.id_of(&v.a_ref)).await;
+    let first_ref = reference_for(v.companion(), &v.first);
+    v.companion()
+        .call("hosts_use", json!({ "reference": v.a_ref }))
+        .expect("A is chosen");
+    v.companion()
+        .call("hosts_use", json!({ "reference": first_ref }))
+        .expect("the first is chosen again");
+    hold.release();
+    drop(visits);
+    let answered = pass.await.expect("ran").expect("answered");
+    let row = row_of(&answered, &v.a_ref).expect("A is one of the others again");
+    assert!(
+        row["result"].is_null(),
+        "the visit that began before the host was used wrote no read: {row}"
+    );
+    v.stop().await;
+}
+
+/// A host that is the one in use when the visit is to begin is refused at the owner: no visit
+/// connection is asked for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_for_the_host_in_use_is_refused_at_admit() {
+    let v = visiting().await;
+    let mut passes = v.companion().inbox().watch_passes();
+    let pass = v.pass();
+    let hold = tokio::time::timeout(WATCHDOG, passes.recv())
+        .await
+        .expect("the pass reaches the hold")
+        .expect("a hold");
+    v.companion()
+        .call("hosts_use", json!({ "reference": v.a_ref }))
+        .expect("A is chosen");
+    let endpoint = v.a.network().endpoint_id();
+    let asked = v.control.asked_of(&endpoint);
+    hold.release();
+    drop(passes);
+    pass.await.expect("ran").expect("answered");
+    assert_eq!(
+        v.control.asked_of(&endpoint),
+        asked,
+        "no visit asked for a connection to the host in use"
+    );
+    v.stop().await;
+}
+
+/// A host left behind keeps its loss and the loss's start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_left_behind_keeps_its_loss_and_start() {
+    let v = visiting().await;
+    v.control.end_connections(true);
+    v.pass().await.expect("ran").expect("answered");
+    let since = contact_of(v.companion(), &v.a_ref)["since_ms"]
+        .as_u64()
+        .expect("since when");
+    v.control.end_connections(false);
+    v.control.hold();
+    let first_ref = reference_for(v.companion(), &v.first);
+    let using = v
+        .companion()
+        .start_call("hosts_use", json!({ "reference": v.a_ref }));
+    v.companion().told_host(&v.a_ref).await;
+    let leaving = v
+        .companion()
+        .start_call("hosts_use", json!({ "reference": first_ref }));
+    v.companion().told_host(&first_ref).await;
+    let kept = contact_of(v.companion(), &v.a_ref);
+    assert_eq!(kept["state"], "out_of_contact", "{kept}");
+    assert_eq!(kept["since_ms"].as_u64(), Some(since), "{kept}");
+    v.control.stop_holding();
+    v.control.release_all();
+    using.await.expect("ran").expect("A was chosen");
+    leaving.await.expect("ran").expect("the first was chosen");
+    v.stop().await;
+}
+
+/// A repeated failed visit leaves the loss as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_failed_visits_leave_the_loss_as_it_was() {
+    let v = visiting().await;
+    v.control.end_connections(true);
+    v.pass().await.expect("ran").expect("answered");
+    let first = contact_of(v.companion(), &v.a_ref);
+    assert_eq!(first["state"], "out_of_contact", "{first}");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    v.pass().await.expect("ran").expect("answered");
+    assert_eq!(contact_of(v.companion(), &v.a_ref), first);
+    v.stop().await;
+}
+
+/// A loss after a recovery is a new loss, with its own start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loss_after_a_restore_is_a_new_record() {
+    let v = visiting().await;
+    v.control.end_connections(true);
+    v.pass().await.expect("ran").expect("answered");
+    let first = contact_of(v.companion(), &v.a_ref)["since_ms"]
+        .as_u64()
+        .expect("since when");
+    v.control.end_connections(false);
+    v.pass().await.expect("ran").expect("answered");
+    assert_eq!(contact_of(v.companion(), &v.a_ref)["state"], "in_contact");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    v.control.end_connections(true);
+    v.pass().await.expect("ran").expect("answered");
+    let second = contact_of(v.companion(), &v.a_ref)["since_ms"]
+        .as_u64()
+        .expect("since when");
+    assert!(second > first, "{first} {second}");
+    v.stop().await;
+}
+
+/// A second visit of one host waits while the first holds the host's turn, and then reads over the
+/// connection the first kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_visit_waits_while_the_first_holds_the_gate() {
+    let v = visiting().await;
+    let mut visits = v.companion().inbox().watch_visits();
+    let first = v.pass();
+    let a = v.id_of(&v.a_ref);
+    let hold = visit_held(&mut visits, a).await;
+    let second = v.pass();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let reads = v.control.sent(Method::AttentionRead);
+    let asked = v.control.asked_of(&v.a.network().endpoint_id());
+    assert!(!second.is_finished(), "the second pass waits for A's turn");
+    hold.release();
+    drop(visits);
+    first.await.expect("ran").expect("answered");
+    second.await.expect("ran").expect("answered");
+    assert!(
+        v.control.sent(Method::AttentionRead) > reads,
+        "the second visit read A once it had its turn"
+    );
+    assert_eq!(
+        v.control.asked_of(&v.a.network().endpoint_id()),
+        asked,
+        "over the connection the first kept"
+    );
+    v.stop().await;
+}
+
+/// A host replaced at one endpoint by another host identity, with no forget, loses its row, its
+/// cache and its connection at the next pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_replaced_at_the_same_endpoint_loses_its_row_cache_and_connection() {
+    let v = visiting().await;
+    let first = v.pass().await.expect("ran").expect("answered");
+    assert!(row_of(&first, &v.a_ref).expect("A's row")["result"].is_object());
+    let closed = v.control.closed();
+    let device = v.companion().device();
+    let old = device.host_by_reference(&v.a_ref).expect("A is listed");
+    let replacement = kr_client::pairing::paired::PairedHost {
+        host_device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [7; 16],
+        )),
+        device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([8; 16])),
+        ..old
+    };
+    device
+        .pairing()
+        .hosts
+        .record(replacement)
+        .expect("the endpoint's record is replaced");
+    let next = v.pass().await.expect("ran").expect("answered");
+    assert!(row_of(&next, &v.a_ref).is_none(), "A's row is gone: {next}");
+    assert!(contact_of(v.companion(), &v.a_ref).is_null());
+    assert!(v.control.closed() > closed, "A's connection was closed");
+    v.stop().await;
+}
