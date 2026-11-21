@@ -102,29 +102,42 @@ pub fn status(command: &mut Command, deadline: Option<Deadline>) -> io::Result<W
     }
 }
 
+/// Why the trial of the host failed.
+#[derive(Debug)]
+pub enum Trial {
+    /// The command of the trial could not be started.
+    Start(io::Error),
+    /// The command was started and could not be waited for.
+    Wait(io::Error),
+}
+
 /// Whether this process can wait for a command it starts, which the time limits rely on. A process
 /// that ignores `SIGCHLD` cannot, on Linux: the system reaps its children as they end, so a wait
 /// fails, and the signals at a deadline could go to a group whose leader the system has already
-/// reaped. The question is asked of a command that does nothing.
+/// reaped. The question is asked of `/bin/sh -c :`, a command that does nothing.
 ///
 /// # Errors
 ///
-/// Says why a command could not be started, or could not be waited for.
+/// Says whether the command could not be started or could not be waited for, and why.
 #[cfg(unix)]
-pub fn waits_for_its_commands() -> io::Result<()> {
-    waited_for(Child::wait)
+pub fn waits_for_its_commands() -> Result<(), Trial> {
+    waited_for("/bin/sh", Child::wait)
 }
 
-/// [`waits_for_its_commands`] with `wait` as the wait.
+/// [`waits_for_its_commands`] with `program` as the command's program and `wait` as the wait.
 #[cfg(unix)]
-fn waited_for(wait: impl FnOnce(&mut Child) -> io::Result<ExitStatus>) -> io::Result<()> {
-    let mut child = Command::new("/bin/sh")
+fn waited_for(
+    program: &str,
+    wait: impl FnOnce(&mut Child) -> io::Result<ExitStatus>,
+) -> Result<(), Trial> {
+    let mut child = Command::new(program)
         .args(["-c", ":"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
-    wait(&mut child).map(drop)
+        .spawn()
+        .map_err(Trial::Start)?;
+    wait(&mut child).map(drop).map_err(Trial::Wait)
 }
 
 /// Where no step with a limit runs, no trial is needed.
@@ -133,7 +146,7 @@ fn waited_for(wait: impl FnOnce(&mut Child) -> io::Result<ExitStatus>) -> io::Re
 ///
 /// Never.
 #[cfg(not(unix))]
-pub fn waits_for_its_commands() -> io::Result<()> {
+pub fn waits_for_its_commands() -> Result<(), Trial> {
     Ok(())
 }
 
@@ -487,20 +500,30 @@ mod tests {
 
     /// KR-REQ-29.01, the part about reproducible commands: the report finds a host that cannot wait
     /// for a command it started before it runs a step with a limit. A wait that fails, as it does
-    /// under a parent that ignores `SIGCHLD`, is the trial's error, and a wait that works passes.
-    /// The stand-in waits for the command first, so that it leaves none.
+    /// under a parent that ignores `SIGCHLD`, is the trial's wait error; a command that cannot be
+    /// started is its start error, and not a wait failure; a wait that works passes. The stand-in
+    /// waits for the command first, so that it leaves none.
     #[test]
     fn a_host_that_cannot_wait_for_a_command_it_started_is_found_by_the_trial() {
-        let failed = waited_for(|child| {
+        let failed = waited_for("/bin/sh", |child| {
             child.wait()?;
             Err(io::Error::from(rustix::io::Errno::CHILD))
-        })
-        .expect_err("the trial passed");
-        assert_eq!(
-            failed.raw_os_error(),
-            Some(rustix::io::Errno::CHILD.raw_os_error())
-        );
-        assert!(waited_for(Child::wait).is_ok(), "the trial failed here");
+        });
+        let missing = waited_for("/nonexistent/program", Child::wait);
+        let mut wrong = Vec::new();
+        match failed {
+            Err(Trial::Wait(error))
+                if error.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error()) => {}
+            other => wrong.push(format!("a wait that fails gave {other:?}")),
+        }
+        match missing {
+            Err(Trial::Start(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            other => wrong.push(format!("a program that is not there gave {other:?}")),
+        }
+        if let Err(error) = waited_for("/bin/sh", Child::wait) {
+            wrong.push(format!("the trial failed here: {error:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// KR-REQ-29.01, the part about reproducible commands: the bytes queued in a pipe when the

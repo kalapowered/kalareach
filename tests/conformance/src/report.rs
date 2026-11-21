@@ -484,7 +484,7 @@ pub fn map_declared(options: &Options, typescript: bool) -> Map {
 /// process can wait for a command it started, fails.
 fn keeps_time_limits(
     steps: &[plan::Step],
-    trial: impl FnOnce() -> std::io::Result<()>,
+    trial: impl FnOnce() -> Result<(), crate::tree::Trial>,
 ) -> Result<(), Stopped> {
     if !steps
         .iter()
@@ -492,13 +492,19 @@ fn keeps_time_limits(
     {
         return Ok(());
     }
-    trial().map_err(|error| {
-        Stopped::Host(format!(
-            "a step has a time limit, and this process cannot wait for a command it started \
-             ({error}): a parent that ignores SIGCHLD causes this, and a time limit could then \
-             signal a process that is not the step's; start kr-conformance from a parent that does \
-             not ignore SIGCHLD"
-        ))
+    trial().map_err(|failed| {
+        Stopped::Host(match failed {
+            crate::tree::Trial::Wait(error) => format!(
+                "a step has a time limit, and this process cannot wait for a command it started \
+                 ({error}): a parent that ignores SIGCHLD causes this, and a time limit could then \
+                 signal a process that is not the step's; start kr-conformance from a parent that \
+                 does not ignore SIGCHLD"
+            ),
+            crate::tree::Trial::Start(error) => format!(
+                "a step has a time limit, and this process could not start a command to find \
+                 whether it can wait for one ({error})"
+            ),
+        })
     })
 }
 
@@ -2065,32 +2071,38 @@ mod tests {
     /// approved; a step with a budget has a limit too, and a plan with no limit asks nothing.
     #[test]
     fn a_run_with_a_time_limit_is_refused_where_a_command_cannot_be_waited_for() {
-        let failing = || Err(std::io::Error::from_raw_os_error(10));
+        use crate::tree::Trial;
+        let error = || std::io::Error::other("the error");
+        let waiting = || -> Result<(), Trial> { Err(Trial::Wait(error())) };
+        let starting = || -> Result<(), Trial> { Err(Trial::Start(error())) };
         let plain = plan::Step::cargo("rust", "a step", &["test"]);
         let mut timed = plain.clone();
         timed.timeout = Some(5);
         let mut budgeted = plain.clone();
         budgeted.budget = Some(("shared".to_owned(), 10));
+        let wait_words = "a step has a time limit, and this process cannot wait for a command it started (the error): a parent that ignores SIGCHLD causes this, and a time limit could then signal a process that is not the step's; start kr-conformance from a parent that does not ignore SIGCHLD";
+        let start_words = "a step has a time limit, and this process could not start a command to find whether it can wait for one (the error)";
         let asked = std::cell::Cell::new(false);
-        let counting = || {
+        let counting = || -> Result<(), Trial> {
             asked.set(true);
             Ok(())
         };
         let mut wrong = Vec::new();
         for (what, steps) in [("a timeout", &timed), ("a budget", &budgeted)] {
-            match keeps_time_limits(std::slice::from_ref(steps), failing) {
-                Err(Stopped::Host(words)) => {
-                    if !words.starts_with(
-                        "a step has a time limit, and this process cannot wait for a command it started (",
-                    ) || !words.ends_with("start kr-conformance from a parent that does not ignore SIGCHLD")
-                    {
-                        wrong.push(format!("{what}: the words were {words}"));
-                    }
+            for (how, words, waits) in [
+                ("a wait that failed", wait_words, true),
+                ("a start that failed", start_words, false),
+            ] {
+                let given = keeps_time_limits(std::slice::from_ref(steps), || {
+                    if waits { waiting() } else { starting() }
+                });
+                match given {
+                    Err(Stopped::Host(said)) if said == words => {}
+                    other => wrong.push(format!("{what}, {how}: gave {other:?}")),
                 }
-                other => wrong.push(format!("{what}: gave {other:?}")),
             }
         }
-        if keeps_time_limits(std::slice::from_ref(&plain), failing).is_err() {
+        if keeps_time_limits(std::slice::from_ref(&plain), waiting).is_err() {
             wrong.push("a plan with no limit was refused".to_owned());
         }
         if keeps_time_limits(std::slice::from_ref(&timed), counting).is_err() || !asked.get() {
