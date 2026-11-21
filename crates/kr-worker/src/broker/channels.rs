@@ -444,7 +444,8 @@ impl ChannelDispatch {
 
     /// Whether this channel can carry this message at all, before anything is marked: queued, text
     /// only, from a sender the host can name, and text within the package's declared length that
-    /// is neither shaped like an answer to an approval nor like the channel's own tag.
+    /// is not shaped like an answer to an approval and does not match the filter for the channel's
+    /// own tag.
     fn admit_message(
         &self,
         operation: RichOperation,
