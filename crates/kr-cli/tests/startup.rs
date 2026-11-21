@@ -1946,9 +1946,9 @@ fn a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for(
         host.tree.root(),
         &format!("printf '%s\\n' {}", single_quoted(&held)),
     );
-    let installation = stub_installation(&host, &daemon);
+    let stubbed = stub_installation(&host, &daemon);
 
-    let first = start(host.new_session_of(&installation, &shell));
+    let first = start(host.new_session_of(&stubbed, &shell));
     wait_for_mark(&started, "the stub daemon's start");
     std::thread::sleep(Duration::from_millis(2500));
     let second = start(host.new_session_of(installation(), &shell));
