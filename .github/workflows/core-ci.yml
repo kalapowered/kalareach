@@ -236,8 +236,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --features kr-cli/upgrade-suite -- -D warnings
 
       # The step grows with the tests. It took 120 to 166 minutes in each of the last seven runs in
-      # which the job passed, 99 to 107 in those before, and twice it ran to its limit of 110
-      # minutes without finishing. A test that waits for something that never comes would otherwise
+      # which the job passed, and twice it ran to its limit of 110 minutes without finishing. A
+      # test that waits for something that never comes would otherwise
       # hold the runner for the job's six hours and every branch's checks behind it, so the step is
       # given a little over twice those 110 minutes and no more: 225, which is 1.35 times the
       # longest of the seven. The job has no limit of its own, so it has GitHub's 360 minutes, and
@@ -246,10 +246,12 @@ jobs:
       # `deployment_legs`), 10 for each of the advisory check and the two stub-daemon steps, and 2
       # for each of the two archive steps. What the steps took in those seven runs is what has to
       # fit: the steps before this one 12 to 21 minutes, and 42 once, 26 of them for the desktop
-      # packages' install; the steps after it, the release gate apart, 17 to 25 minutes; and the
-      # gate 79 minutes in the one run that had it. A run of this step to its limit leaves the gate
-      # 89 minutes after the usual start and 68 after the slow one, so the gate is the step that
-      # the job's end cuts, and the steps between this one and the gate still report.
+      # packages' install; the steps after it, the release gate and the two stub-daemon steps
+      # apart, 17 to 25 minutes; those two steps 4.4 minutes together in the one run that had them;
+      # and the gate 79 minutes in the one run that had it. A run of this step to its limit leaves
+      # the gate 85 minutes after the usual start and 64 after the slow one, and 69 and 48 if the
+      # two stub-daemon steps also ran to their limits, so the gate is the step that the job's end
+      # cuts, and the steps between this one and the gate still report.
       - name: Test
         timeout-minutes: 225
         env:
@@ -3325,8 +3327,11 @@ jobs:
       # of the environment, as that job runs them, so that a start's report of why its daemon ended
       # is held on both platforms. They are `tests-2`'s because `kr-cli` is: the suite looks for
       # the held daemon and the worker beside its test program, which this leg's program build and
-      # Test step have built, and the stub starts nothing and asks no launchd. The leg's limits,
-      # with this one, add up to 354 of the job's 355 minutes.
+      # Test step have built, and the stub starts nothing and asks no launchd. The step builds
+      # `kr-cli` with the features of that package alone, so it compiles more than the leg's Test
+      # step did, as the rust job's teardown step does after its workspace build: that step took
+      # 2.4 minutes and this leg's documentation step 3.5. The limit of 9 minutes is what the leg's
+      # other limits leave of the job's 355: they add up to 354 with it.
       - name: A standalone start says why a stub daemon ended
         if: ${{ !cancelled() && matrix.part == 'tests-2' }}
         timeout-minutes: 9
