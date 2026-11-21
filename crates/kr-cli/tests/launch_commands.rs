@@ -5,9 +5,8 @@
 //! launch commands, and a supervisor that starts no worker, because none of these commands needs a
 //! session. `kr` is the real binary, copied to the internal disk and run with that tree's
 //! directories on plain pipes. The host decides every rule of a command; `kr` holds none, so each
-//! refusal here is the host's own sentence.
-
-#![cfg(unix)]
+//! refusal here is the host's own sentence. The suite runs on Unix and on Windows; the two differ
+//! only in the environment `kr` is given and the directory it runs in.
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -25,6 +24,12 @@ mod support;
 
 /// The rows the host's check is held to, which the page's own feedback reads as well.
 const ROWS: &str = include_str!("../../../tests/fixtures/launch-command-rows.json");
+
+/// The worker program the daemon is told of. It does not exist; none of these commands starts one.
+#[cfg(unix)]
+const NO_WORKER_PROGRAM: &str = "/nonexistent/kr-worker";
+#[cfg(windows)]
+const NO_WORKER_PROGRAM: &str = r"C:\nonexistent\kr-worker.exe";
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -79,7 +84,7 @@ impl Host {
             secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
             supervisor: Box::new(NoWorkers),
-            worker_program: PathBuf::from("/nonexistent/kr-worker"),
+            worker_program: PathBuf::from(NO_WORKER_PROGRAM),
             build_id: build(),
             release: "0".to_owned(),
             shell_packages: None,
@@ -108,15 +113,28 @@ impl Host {
     /// `kr` prepared on plain pipes with this tree's directories, from the root directory.
     fn command(&self, extra: &[(&str, &str)], line: &[&str]) -> Command {
         let mut command = Command::new(support::kr());
+        command.args(line);
+        #[cfg(unix)]
         command
-            .args(line)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.temp.root())
+            .current_dir("/");
+        // A program on Windows cannot start without the system's own variables, so `kr` has the
+        // account's environment, as it has in the other Windows suites, and never a session or an
+        // attachment of this test's own.
+        #[cfg(windows)]
+        {
+            let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
+            command
+                .env_remove("KR_SESSION")
+                .env_remove("KR_ATTACHMENT")
+                .current_dir(format!(r"{drive}\"));
+        }
+        command
             .env("KR_RUNTIME_DIR", self.temp.paths().runtime_root())
             .env("KR_STATE_DIR", self.temp.paths().state_root())
             .envs(extra.iter().copied())
-            .current_dir("/")
             .stdin(Stdio::null());
         command
     }
@@ -269,6 +287,40 @@ async fn kr_launch_adds_lists_replaces_and_removes_a_command() {
     assert_eq!(status, Some(0));
     assert_eq!(document["removed"], false, "{document}");
     assert_eq!(document["applied"], true, "{document}");
+}
+
+/// KR-REQ-13.11: a program whose path holds spaces, an empty argument, a path with spaces and an
+/// argument that ends in a backslash are kept as written, each as one field and never split or
+/// reinterpreted: the forms a Windows person types, which `kr` carries to the host exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_program_path_with_spaces_and_an_empty_argument_are_kept_as_written() {
+    let host = Host::start().await;
+    let program = r"C:\Program Files\Agent Tools\agent.exe";
+    let arguments = [
+        "",
+        "--config",
+        r"C:\Users\Some One\agent config.json",
+        "--name=two words",
+        r"C:\dir with space\",
+    ];
+    let mut line = vec!["launch", "add", "Agent", "--", program];
+    line.extend(arguments);
+    let (status, text, said) = host.said(&line);
+    assert_eq!(status, Some(0), "{said}");
+    assert_eq!(text.trim_end(), "Saved the launch command \"Agent\".");
+
+    let saved = host.listed();
+    assert_eq!(
+        saved["commands"][0],
+        serde_json::json!({ "label": "Agent", "program": program, "arguments": arguments }),
+        "the command is kept as written: {saved}"
+    );
+    let (status, text, _) = host.said(&["launch", "list"]);
+    assert_eq!(status, Some(0));
+    assert_eq!(
+        text.trim_end(),
+        r#"Agent: "C:\\Program Files\\Agent Tools\\agent.exe" "" "--config" "C:\\Users\\Some One\\agent config.json" "--name=two words" "C:\\dir with space\\""#
+    );
 }
 
 /// KR-REQ-13.11: a command that breaks a rule is refused by the host, `kr` prints the host's words
