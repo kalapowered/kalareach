@@ -211,11 +211,11 @@ fn fixture(mechanism: Mechanism) -> Fixture {
             "macro_rules! pick { ($v:ident) => { Method::$v }; }\npub fn f() { let _ = pick!(AgentTurnCancel); }\n",
             Sightings(&["f:Names", "macro:pick:Expands"]),
         ),
-        // A limit the request states: a type name that a macro's argument passes to a brace form is no
-        // brace form where it is written, so nothing is seen (no site at the head or at a tag).
+        // A type name in a macro's arguments is a sighting where it is written (S3), and marks the
+        // macro, whose transcriber may write the brace group.
         MetavariableType => one(
             "macro_rules! make { ($t:ident) => { $t { x: 1 } }; }\npub fn f() { let _ = make!(MutationRequest); }\n",
-            Sightings(&[]),
+            Sightings(&["f:Request", "macro:make:Expands"]),
         ),
         ExternalMacroListed => one("tokio::task_local! { static X: u8; }\n", Sightings(&[])),
         ExternalMacroUnlisted => one(

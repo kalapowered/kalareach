@@ -1129,6 +1129,66 @@ fn a_name_in_an_impl_header_an_associated_type_a_module_attribute_or_an_extern_b
 }
 
 #[test]
+fn a_type_name_or_self_in_the_arguments_of_a_macro_call_is_a_sighting_and_marks_the_macro() {
+    use SightKind::{Expands, Request, Target};
+    let make = "macro_rules! make { ($t:ident) => { $t { x: 1 } }; }\n";
+    let found = |lib: &str| kinds_found(&format!("{make}{lib}"), &[]);
+    let both = |name: &str, kind: SightKind| {
+        BTreeMap::from([
+            (name.to_owned(), vec![kind]),
+            ("macro:make".to_owned(), vec![Expands]),
+        ])
+    };
+    for (lib, expected) in [
+        (
+            "pub fn f() { let _ = make!(MutationRequest); }",
+            both("f", Request),
+        ),
+        (
+            "pub fn f() { let _ = make!(kr_protocol::ActionTarget); }",
+            both("f", Target),
+        ),
+        (
+            "pub fn f() { let _ = make!(r#MutationRequest); }",
+            both("f", Request),
+        ),
+        (
+            "pub fn f() { let _ = other!(vec![make!(ActionTarget::new)]); }",
+            both("f", Target),
+        ),
+        // `Self` in the arguments, with or without a brace group, in an impl for one of the types,
+        // also where a forwarding macro passes it on.
+        (
+            "impl MutationRequest { fn n() -> Self { make!(Self) } }",
+            both("MutationRequest::n", Request),
+        ),
+        (
+            "impl ActionTarget { fn n() -> Self { make!(Self { a: 1 }) } }",
+            both("ActionTarget::n", Target),
+        ),
+        (
+            "impl Tr for ActionTarget { fn n() -> Self { outer!(make!(Self)) } }",
+            both("ActionTarget::n", Target),
+        ),
+        // Another type's `Self`, and a type name outside the arguments of a call, are not.
+        (
+            "impl Other { fn n() -> Self { make!(Self) } }",
+            BTreeMap::new(),
+        ),
+        (
+            "pub fn f(_: MutationRequest) { make!(x); }",
+            BTreeMap::new(),
+        ),
+        (
+            "pub fn f() { let _: Option<MutationRequest> = None; }",
+            BTreeMap::new(),
+        ),
+    ] {
+        assert_eq!(found(lib), expected, "{lib}");
+    }
+}
+
+#[test]
 fn an_item_keeps_its_written_tokens_and_a_nested_place_no_configuration_builds_gives_no_sighting() {
     let lib = |nested: &str| {
         format!(

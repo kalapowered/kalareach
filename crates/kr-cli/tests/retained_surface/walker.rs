@@ -1849,7 +1849,7 @@ impl Scanner {
     /// The tokens of an item: its kinds, and the macros it calls when it is a sighting, whose
     /// bodies then give the parameters' target.
     fn body(&mut self, name: String, tokens: TokenStream) {
-        calls_in(&tokens, &mut self.calls);
+        calls_in(&tokens, &mut self.calls, self.self_kind);
         let kinds = kinds_in(&tokens, self.self_kind);
         self.sight(name, kinds, &tokens);
     }
@@ -1868,7 +1868,7 @@ impl Scanner {
         if kinds.is_empty() {
             return;
         }
-        calls_in(&tokens, &mut self.calls);
+        calls_in(&tokens, &mut self.calls, self.self_kind);
         self.scan_only
             .entry(name.clone())
             .or_insert_with(|| (file.to_owned(), Vec::new()))
@@ -2003,7 +2003,7 @@ impl Scanner {
                         self.macro_rules.insert(name.to_string());
                         let mut inner = Calls::default();
                         for expansion in transcribers(&call.mac.tokens) {
-                            calls_in(&expansion, &mut inner);
+                            calls_in(&expansion, &mut inner, self.self_kind);
                         }
                         self.calls.absorb(name.to_string(), inner);
                         self.sight(format!("macro:{name}"), kinds, &plain());
@@ -2015,7 +2015,7 @@ impl Scanner {
                     if let Some(last) = call.mac.path.segments.last() {
                         self.calls.sighted.insert(last.ident.unraw().to_string());
                     }
-                    calls_in(&call.mac.tokens, &mut self.calls);
+                    calls_in(&call.mac.tokens, &mut self.calls, self.self_kind);
                     match defined_name(&call.mac.tokens) {
                         Some(name) => self.sight(name, kinds, &plain()),
                         None => {
@@ -2206,7 +2206,7 @@ pub(super) fn path_before(flat: &[TokenTree], at: usize) -> Vec<String> {
 /// The macros the tokens call, at any depth. A `macro_rules!` definition is read by its
 /// transcribers, never by its matchers, where a call is only syntax to match: what they call is
 /// kept under the definition's name, and a call with a sighting in its arguments is marked.
-fn calls_in(stream: &TokenStream, calls: &mut Calls) {
+fn calls_in(stream: &TokenStream, calls: &mut Calls, owner: Option<SightKind>) {
     let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
     let mut at = 0;
     while at < flat.len() {
@@ -2221,14 +2221,14 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
                 {
                     let mut inner = Calls::default();
                     for expansion in transcribers(&arms.stream()) {
-                        calls_in(&expansion, &mut inner);
+                        calls_in(&expansion, &mut inner, owner);
                     }
                     calls.absorb(name.unraw().to_string(), inner);
                     at += 4;
                     continue;
                 }
             }
-            TokenTree::Group(group) => calls_in(&group.stream(), calls),
+            TokenTree::Group(group) => calls_in(&group.stream(), calls, owner),
             TokenTree::Ident(ident)
                 if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
                     && matches!(flat.get(at + 2), Some(TokenTree::Group(_))) =>
@@ -2241,7 +2241,7 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls) {
                     calls.all.through_metavariable = true;
                 }
                 if matches!(flat.get(at + 2), Some(TokenTree::Group(arguments))
-                    if !kinds_of(&arguments.stream()).is_empty())
+                    if !kinds_in_arguments(&arguments.stream(), owner).is_empty())
                 {
                     calls.sighted.insert(name);
                 }
@@ -2262,7 +2262,15 @@ fn kinds_of(stream: &TokenStream) -> BTreeSet<SightKind> {
 /// `MutationRequest` or `ActionTarget`, whose `Self { .. }` is a literal of it.
 fn kinds_in(stream: &TokenStream, owner: Option<SightKind>) -> BTreeSet<SightKind> {
     let mut kinds = BTreeSet::new();
-    collect_kinds(stream, &mut kinds, owner);
+    collect_kinds(stream, &mut kinds, owner, false);
+    kinds
+}
+
+/// What the arguments of a macro call sight: as [`kinds_in`], and where a macro may build the literal
+/// from a name its argument gives, either type name and `Self` count with no brace group after them.
+fn kinds_in_arguments(stream: &TokenStream, owner: Option<SightKind>) -> BTreeSet<SightKind> {
+    let mut kinds = BTreeSet::new();
+    collect_kinds(stream, &mut kinds, owner, true);
     kinds
 }
 
@@ -2287,13 +2295,29 @@ fn holds_a_wire_name(literal: &proc_macro2::Literal) -> bool {
 /// Each of the six variant names, wherever it stands, is a sighting, but for the one path
 /// `ActionRight::<Variant>`, which is a right of the same name. A wire name in a literal, and the
 /// brace form of `MutationRequest` and `ActionTarget`, are sightings.
-fn collect_kinds(stream: &TokenStream, kinds: &mut BTreeSet<SightKind>, owner: Option<SightKind>) {
+///
+/// In `arguments` (the arguments of a macro call, at any depth) the two type names are sightings of
+/// their kind wherever they stand, and `Self` of the enclosing impl's kind: the macro's transcriber
+/// may write the brace group.
+fn collect_kinds(
+    stream: &TokenStream,
+    kinds: &mut BTreeSet<SightKind>,
+    owner: Option<SightKind>,
+    arguments: bool,
+) {
     let flat: Vec<TokenTree> = stream.clone().into_iter().collect();
+    let is_bang = |tree: Option<&TokenTree>| matches!(tree, Some(TokenTree::Punct(punct)) if punct.as_char() == '!');
     let is_brace = |tree: Option<&TokenTree>| matches!(tree, Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace);
     let is_colon = |tree: Option<&TokenTree>| matches!(tree, Some(TokenTree::Punct(punct)) if punct.as_char() == ':');
     for (at, tree) in flat.iter().enumerate() {
         match tree {
-            TokenTree::Group(group) => collect_kinds(&group.stream(), kinds, owner),
+            TokenTree::Group(group) => {
+                // The group after `name !` holds a macro call's arguments.
+                let call = at >= 2
+                    && is_bang(flat.get(at - 1))
+                    && matches!(flat.get(at - 2), Some(TokenTree::Ident(_)));
+                collect_kinds(&group.stream(), kinds, owner, arguments || call);
+            }
             TokenTree::Literal(literal) => {
                 if holds_a_wire_name(literal) {
                     kinds.insert(SightKind::Names);
@@ -2302,15 +2326,15 @@ fn collect_kinds(stream: &TokenStream, kinds: &mut BTreeSet<SightKind>, owner: O
             TokenTree::Ident(ident) => {
                 let word = ident.to_string();
                 let word = word.trim_start_matches("r#");
-                if word == "MutationRequest" && is_brace(flat.get(at + 1)) {
+                if word == "MutationRequest" && (arguments || is_brace(flat.get(at + 1))) {
                     kinds.insert(SightKind::Request);
                 }
-                if word == "ActionTarget" && is_brace(flat.get(at + 1)) {
+                if word == "ActionTarget" && (arguments || is_brace(flat.get(at + 1))) {
                     kinds.insert(SightKind::Target);
                 }
                 if word == "Self"
                     && let Some(kind) = owner
-                    && is_brace(flat.get(at + 1))
+                    && (arguments || is_brace(flat.get(at + 1)))
                 {
                     kinds.insert(kind);
                 }
