@@ -2313,6 +2313,7 @@ mod tests {
             manifest: PathBuf::from(manifest),
             registry_crates: BTreeSet::new(),
             dependency_names: BTreeSet::new(),
+            dependency_aliases: std::collections::BTreeMap::new(),
             workspace: ".".to_owned(),
             workspace_members: Vec::new(),
             workspace_default_members: Vec::new(),
