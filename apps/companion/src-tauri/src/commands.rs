@@ -4361,6 +4361,7 @@ mod tests {
         "uploads_open",
         "upload_cancel",
         "draft_end",
+        "draft_set_text",
         "question_kept",
         "question_dismiss_kept",
         "attention_read",
@@ -4705,6 +4706,7 @@ mod tests {
                 "uploads_open",
                 "upload_cancel",
                 "draft_end",
+                "draft_set_text",
                 // The drafts this device keeps, in a store of its own.
                 "device_drafts",
                 "device_draft_save",
