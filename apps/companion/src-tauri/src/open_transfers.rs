@@ -17,7 +17,7 @@
 //! * **A key and a place are reserved before anything is sent.** The desk holds one lock from the
 //!   check of the count and the key to the insert of the upload, so no key is used twice and no
 //!   third upload is admitted.
-//! * **Written before the call that needs it.** The driver tells the [`Kept`] journal that it is
+//! * **Written before the call that needs it.** The driver tells the upload journal that it is
 //!   about to ask for a reservation, what the transfer identifier is, and that it is about to send
 //!   the finish, each before the call; a write that fails stops the send before the call, and a
 //!   transfer identifier the host gave is held in memory until it is kept.
