@@ -14,7 +14,7 @@
 use super::*;
 
 use kr_e2e_agents::conversation;
-use kr_e2e_agents::stage::Keyboard;
+use kr_e2e_agents::stage::{InputRefusal, Keyboard, events_snapshot};
 use kr_e2e_agents::transfer::{self, Caller, Transfer};
 
 use super::staged_c::{Seat, Turns, Typing, turns_as_planned};
@@ -943,6 +943,122 @@ fn the_two_approval_markers_are_as_long_as_each_other_and_differ() {
 // Part 4: the device goes after the agent took its prompt and before the reply.
 // ---------------------------------------------------------------------------------------------
 
+/// Whether the old attachment's input, tried on the device's new connection, was refused by the
+/// host with a code: input that was accepted, or that failed for a reason that is not the host's
+/// refusal (a connection that failed, no answer), does not show that the host dropped the old
+/// attachment, and says which refusal it was where it did.
+///
+/// # Errors
+///
+/// Returns why the result is not the host's refusal of the stale attachment.
+fn stale_input_refused<T>(result: &Result<T, InputRefusal>) -> Result<ErrorCode, String> {
+    match result {
+        Ok(_) => Err("the old attachment's input was accepted on the new connection".to_owned()),
+        Err(refusal) => refusal.code.ok_or_else(|| {
+            format!(
+                "the old attachment's input failed, and the host did not refuse it: {}",
+                refusal.detail
+            )
+        }),
+    }
+}
+
+/// A view of the session's screen from the paired device, over a connection of its own: the
+/// session's own connection carries the typed actions and the keyboard.
+struct Watch {
+    remote: Remote,
+    view: kr_e2e_m1b::view::View,
+}
+
+impl Watch {
+    /// Opens a connection of the paired device and attaches a view of the session over it.
+    fn open(ctx: &Context, session: &Session<'_>) -> Self {
+        let remote = reconnects(ctx, session);
+        let snapshot = events_snapshot(&remote, &ctx.runtime, session.session_id());
+        let view = ctx
+            .runtime
+            .block_on(kr_e2e_m1b::view::View::attach(
+                &remote,
+                session.session_id(),
+                snapshot.geometry.dimensions,
+                &kr_client::cursors::StreamCursors::new(),
+            ))
+            .unwrap_or_else(|why| panic!("the device attaches a view: {why}"));
+        Self { remote, view }
+    }
+
+    /// Applies the next event the device is sent, waiting at most `within` for it, and says
+    /// whether there was one.
+    fn pump_one(&mut self, ctx: &Context, within: Duration) -> bool {
+        ctx.runtime
+            .block_on(self.view.pump_one(&self.remote, within))
+            .unwrap_or_else(|why| panic!("{why}"))
+    }
+
+    /// Waits until the device's screen shows `needle`, and returns the screen. A worker tells a
+    /// view that fell behind to draw again, and the view is opened again then, so a screen that
+    /// stopped there is not read as one the agent stopped drawing.
+    fn wait_for(
+        &mut self,
+        ctx: &Context,
+        session: &Session<'_>,
+        needle: &str,
+        why: &str,
+    ) -> Vec<String> {
+        let deadline = Instant::now() + LIVENESS;
+        loop {
+            match ctx.runtime.block_on(self.view.wait_for(
+                &self.remote,
+                needle,
+                Duration::from_millis(500),
+            )) {
+                Ok(rows) => return rows,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{why}: the device's screen did not show {needle:?} within \
+                         {LIVENESS:?}: {error}; the view was sent {:?}",
+                        self.view.kinds()
+                    );
+                    if self
+                        .view
+                        .kinds()
+                        .iter()
+                        .any(|kind| kind == "session.resync")
+                    {
+                        let stale = std::mem::replace(self, Self::open(ctx, session));
+                        stale.close(ctx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Detaches the view and ends its connection.
+    fn close(self, ctx: &Context) {
+        let _ = ctx.runtime.block_on(self.view.detach(&self.remote));
+        self.remote.close();
+    }
+}
+
+/// A stale attachment's input is a refusal of the host's, with its code, and nothing else counts: an
+/// accepted input and a failure that is not a refusal fail the check.
+#[test]
+fn a_stale_attachments_input_that_was_accepted_or_not_refused_fails_the_check_of_part_4() {
+    let refused = |code: Option<ErrorCode>| -> Result<(), InputRefusal> {
+        Err(InputRefusal {
+            code,
+            detail: "input.write".to_owned(),
+        })
+    };
+    assert_eq!(
+        stale_input_refused(&refused(Some(ErrorCode::LeaseLost))),
+        Ok(ErrorCode::LeaseLost)
+    );
+    assert!(stale_input_refused(&refused(None)).is_err());
+    assert!(stale_input_refused::<()>(&Ok(())).is_err());
+}
+
 /// Whether a conversation holds one prompt and one finished reply for it.
 ///
 /// # Errors
@@ -1020,9 +1136,15 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                     admitted, 1,
                     "the server received one request that starts a turn"
                 );
+                // The device's keyboard holds the input lease before it goes, so that the refusal
+                // of its input afterwards is the host dropping the attachment, and not a keyboard
+                // that never held a lease.
                 let mut keyboard =
                     Keyboard::attach(&session.remote, &ctx.runtime, session.session_id())
                         .unwrap_or_else(|why| panic!("the device's keyboard attaches: {why}"));
+                keyboard
+                    .acquire(&session.remote, &ctx.runtime)
+                    .unwrap_or_else(|why| panic!("the device takes the input lease: {why}"));
                 // The device goes while the turn is in flight, and the turn ends while it is away.
                 session.remote.close();
                 releases(ctx);
@@ -1042,7 +1164,8 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 let prompts = requests_of(ctx, "turn/start");
                 once(prompts, 1).unwrap_or_else(|why| panic!("no duplicate work: {why}"));
                 let stale = keyboard.type_text(&fresh, &ctx.runtime, "x");
-                assert!(stale.is_err(), "the old attachment's next input is refused");
+                let stale_code = stale_input_refused(&stale)
+                    .unwrap_or_else(|why| panic!("the old attachment's next input: {why}"));
                 // The control: the same prompt sent again is a second request that starts a turn.
                 let again = ctx
                     .prompts(
@@ -1067,7 +1190,7 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 serde_json::json!({
                     "arm": arm(ctx),
                     "turn_requests": prompts,
-                    "stale_input": stale.err().map(|refusal| refusal.detail),
+                    "stale_input": { "refused_with": format!("{stale_code:?}"), "detail": stale.err().map(|refusal| refusal.detail) },
                     "control": { "what": "the same prompt sent again", "breaks_property": true,
                                  "turn_requests": prompts_twice, "check": control.err() },
                 })
@@ -1100,9 +1223,31 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                         &account.reply_line,
                     )
                 };
+                // The device's keyboard holds the input lease, and its input is accepted before it
+                // goes: the refusal of the same keyboard afterwards is the host dropping the
+                // attachment with the connection, which a keyboard that never held a lease cannot
+                // show.
                 let mut keyboard =
                     Keyboard::attach(&session.remote, &ctx.runtime, session.session_id())
                         .unwrap_or_else(|why| panic!("the device's keyboard attaches: {why}"));
+                keyboard
+                    .acquire(&session.remote, &ctx.runtime)
+                    .unwrap_or_else(|why| panic!("the device takes the input lease: {why}"));
+                keyboard
+                    .type_text(&session.remote, &ctx.runtime, &account.clear)
+                    .unwrap_or_else(|why| panic!("the device's input is accepted: {why}"));
+                // The device's own view of the screen: every event it is sent from the submission
+                // until it goes is applied and looked at, so that the moment it goes is known from
+                // what it saw, and not only from the agent's record.
+                let mut watch = Watch::open(ctx, session);
+                let code_start: String = upper.chars().take(4).collect();
+                let reply_marks = |rows: &[String]| {
+                    account.reply_mark.as_ref().map_or(0, |reply_mark| {
+                        rows.iter().filter(|row| row.contains(reply_mark)).count()
+                    })
+                };
+                let marks_before = reply_marks(&watch.view.rows());
+                let mut reached = false;
                 real.charge(&ctx.run, "4", "a prompt with a slow reply");
                 let started = ctx
                     .prompts(
@@ -1122,6 +1267,11 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 // The agent's own record of the prompt is its admission.
                 let admitted_at = Instant::now();
                 loop {
+                    while watch.pump_one(ctx, Duration::from_millis(5)) {
+                        let rows = watch.view.rows();
+                        reached |= rows.iter().any(|row| row.contains(&code_start))
+                            || reply_marks(&rows) > marks_before;
+                    }
                     if let Ok(text) = real.conversations(&ctx.run)
                         && counts(&text).0 >= 1
                     {
@@ -1131,10 +1281,42 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                         admitted_at.elapsed() < LIVENESS,
                         "the agent's record holds the prompt"
                     );
-                    std::thread::sleep(Duration::from_millis(5));
                 }
-                // The device goes: its connection closes, and the record is read after it.
+                // The device goes: both its connections close, and what was sent before the cut is
+                // applied and looked at; an event that cannot be applied leaves the boundary unknown.
                 session.remote.close();
+                watch.remote.close();
+                loop {
+                    match ctx
+                        .runtime
+                        .block_on(watch.view.pump_one(&watch.remote, Duration::from_millis(1)))
+                    {
+                        Ok(true) => {
+                            let rows = watch.view.rows();
+                            reached |= rows.iter().any(|row| row.contains(&code_start))
+                                || reply_marks(&rows) > marks_before;
+                        }
+                        Ok(false) => break,
+                        Err(_) => {
+                            reached = true;
+                            break;
+                        }
+                    }
+                }
+                if reached {
+                    // Something of the reply reached the device before it went, or whether it had
+                    // could not be told: no moment between the prompt and its reply was shown, and
+                    // the part is not run. The turn is let finish so that nothing is left running.
+                    let replied_at = Instant::now();
+                    while counts(&record(ctx, real)).1 == 0 && replied_at.elapsed() < LIVENESS {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    return serde_json::json!({
+                        "arm": arm(ctx),
+                        "not_run": "the reply reached the device before the agent recorded the prompt, or whether it had could not be told, so no moment between them was shown",
+                        "code_looked_for": code_start,
+                    });
+                }
                 let at_the_drop = counts(&record(ctx, real));
                 reply_unfinished(at_the_drop.1).unwrap_or_else(|why| panic!("{why}"));
                 // The reply finishes while the device is away.
@@ -1147,6 +1329,11 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 let fresh = reconnects(ctx, session);
+                // The new connection is drawn a fresh screen, and it shows the reply the agent
+                // wrote while the device was away: a screen that is empty or stale does not.
+                let mut redrawn = Watch::open(ctx, session);
+                let redrawn_rows =
+                    redrawn.wait_for(ctx, session, &end, "the new connection is drawn the reply");
                 let ended = Instant::now();
                 let after = loop {
                     let binding = ctx.binding(&fresh, session.session_id(), instance);
@@ -1164,7 +1351,9 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 once(prompts, replies)
                     .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
                 let stale = keyboard.type_text(&fresh, &ctx.runtime, &account.clear);
-                assert!(stale.is_err(), "the old attachment's next input is refused");
+                let stale_code = stale_input_refused(&stale)
+                    .unwrap_or_else(|why| panic!("the old attachment's next input: {why}"));
+                redrawn.close(ctx);
                 // The control: the same prompt sent again, and the count, read again, is two.
                 real.charge(&ctx.run, "4", "the control's prompt sent again");
                 let again = ctx
@@ -1189,8 +1378,8 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                     "arm": arm(ctx),
                     "markers": { "reply_ends": end },
                     "at_the_drop": { "prompts": at_the_drop.0, "finished_replies": at_the_drop.1 },
-                    "after_reconnect": { "prompts": prompts, "finished_replies": replies },
-                    "stale_input": stale.err().map(|refusal| refusal.detail),
+                    "after_reconnect": { "prompts": prompts, "finished_replies": replies, "shows": end, "screen_rows_holding_it": redrawn_rows.iter().filter(|row| row.contains(&end)).count() },
+                    "stale_input": { "refused_with": format!("{stale_code:?}"), "detail": stale.err().map(|refusal| refusal.detail) },
                     "control": { "what": "the same prompt sent again", "breaks_property": true,
                                  "prompts": prompts_twice, "finished_replies": replies_twice,
                                  "check": control.err() },
