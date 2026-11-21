@@ -582,8 +582,8 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect(records[0]).toHaveTextContent(
       'This device has not settled what became of it. Removing this record sends nothing.'
     )
-    expect(screen.getByText(/A message to a session that is not listed on studio, pressed at /)).toBeVisible()
-    const remove = within(screen.getByText(/A message to a session that is not listed/).closest('li')!).getByTestId(
+    expect(screen.getByText(/A message to a session that studio no longer lists, pressed at /)).toBeVisible()
+    const remove = within(screen.getByText(/A message to a session that studio no longer lists/).closest('li')!).getByTestId(
       'channel-hold-remove'
     )
     await person.click(remove)
@@ -605,9 +605,34 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     of.messages.refuseHoldWrites({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
     await person.click(within(record).getByTestId('channel-hold-remove'))
     await person.click(within(record).getByTestId('channel-hold-remove'))
-    expect(await screen.findByText(/The record was not removed/)).toBeVisible()
+    expect(await screen.findByText(/This device could not remove this record now\. It is still in place\. /)).toBeVisible()
     expect(of.messages.allHolds().map((each) => each.holdId)).toEqual(['hold-stays'])
     expect(screen.getByTestId('channel-hold')).toBeVisible()
+  })
+
+  it('K10d names the failure of a refused removal in the ruled words, and a record whose session cannot be listed', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    keepMessage(of, { text: 'one' })
+    keepMessage(of, { text: 'two' })
+    keepHold(of, MAIN, 'hold-main')
+    startOver(of, KEPT_PAGE, (port) => ({
+      ...port,
+      sessionList: () => Promise.reject(new Error('out of reach')),
+      deviceChannelMessageRemove: () => Promise.reject(new Error('refused'))
+    }))
+    expect(await screen.findByText(/A message to a session on studio, which this device cannot reach now, pressed at /)).toBeVisible()
+    const first = (await screen.findAllByTestId('channel-message'))[0]
+    await person.click(within(first).getByTestId('channel-message-remove'))
+    await person.click(within(first).getByTestId('channel-message-remove'))
+    expect(await screen.findByText(/This device could not remove this message now\. It is still in place\. /)).toBeVisible()
+    const all = screen.getByTestId('channel-session-remove-all')
+    await person.click(all)
+    await person.click(all)
+    expect(
+      await screen.findByText(/This device could not remove all of these messages now\. Some of them may still be in place\. /)
+    ).toBeVisible()
+    expect(of.messages.all()).toHaveLength(2)
   })
 
   it('K10c shows the warning from 900 records and not at 899', async () => {
@@ -689,6 +714,21 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     expect([started.counts.submit, started.counts.queue]).toEqual([0, 0])
   })
 
+  it('K13c says the list is not damaged when another window set it aside, and reads it again', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    of.messages.damageLedger('damaged')
+    startOver(of)
+    const control = await screen.findByTestId('ledger-set-aside')
+    of.messages.damageLedger('ok')
+    await person.click(within(control).getByTestId('ledger-set-aside-button'))
+    await person.click(within(control).getByTestId('ledger-set-aside-button'))
+    expect(await screen.findByText('The list of removals is not damaged, so it was not set aside.')).toBeVisible()
+    await waitFor(() => {
+      expect(screen.queryByTestId('ledger-set-aside-button')).toBeNull()
+    })
+  })
+
   it('K13b offers no set-aside for an unreadable list, and says N30 when the set-aside fails or is not confirmed', async () => {
     const unreadable = world()
     unreadable.messages.damageLedger('unreadable')
@@ -714,7 +754,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     await person.click(await screen.findByTestId('ledger-set-aside-button'))
     await person.click(await screen.findByTestId('ledger-set-aside-button'))
     expect(await screen.findByTestId('ledger-set-aside-note')).toHaveTextContent(
-      'The list was set aside, but this device could not confirm that on disk yet.'
+      'The list was set aside, but this device could not yet confirm that on disk. It will try again.'
     )
     expect(unconfirmed.messages.calls.filter((call) => call.kind === 'set-aside')).toHaveLength(1)
   })

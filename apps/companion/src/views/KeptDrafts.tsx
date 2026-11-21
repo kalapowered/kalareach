@@ -24,7 +24,7 @@ import { useChannelMessages, useChannelShelf } from '../app/channel-messages'
 import { useBook, useDraftBook } from '../app/drafts'
 import { useApp } from '../app/state'
 import { Banner, Button, CommitButton, TwoPressButton } from '../components/ui'
-import { failureMessage, watch, type StoredChannelMessage, type StoredHold, type Watch } from '../host/port'
+import { failureCode, failureMessage, watch, type StoredChannelMessage, type StoredHold, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import { MANY_HOLDS, nearlyFull, type ShelfSnapshot } from '../model/channel-messages'
 import type { KeptDraft, KeptWhy } from '../model/draft-book'
@@ -139,7 +139,7 @@ export function KeptDrafts({
     setBusy(id)
     ask(step)
       .catch((error: unknown) => {
-        say(`${failed}: ${failureMessage(error)}`, 'danger')
+        say(`${failed} ${failureMessage(error)}`, 'danger')
       })
       .finally(() => {
         setBusy(null)
@@ -199,6 +199,11 @@ export function KeptDrafts({
       {ledger === 'damaged' ? (
         <LedgerSetAside
           onSetAside={() => book.setLedgerAside()}
+          onNotDamaged={(words) => {
+            // Another window set the list aside: this one says so and reads it again, which ends the control.
+            say(words, 'danger')
+            void book.reload()
+          }}
         />
       ) : null}
       {sessions === null && kept.length > 0 ? (
@@ -273,13 +278,13 @@ export function KeptDrafts({
               unread={unread}
               busy={busy === each.id}
               onMove={(sessionId) => {
-                run(each.id, () => book.moveTo(each.id, sessionId, each.revision), 'The draft was not moved')
+                run(each.id, () => book.moveTo(each.id, sessionId, each.revision), 'The draft was not moved:')
               }}
               onUse={() => {
-                run(each.id, () => book.useHere(each.id, each.revision), 'The draft was not put in its composer')
+                run(each.id, () => book.useHere(each.id, each.revision), 'The draft was not put in its composer:')
               }}
               onDiscard={() => {
-                run(each.id, () => book.discard(each.id, each.revision), 'The draft was not discarded')
+                run(each.id, () => book.discard(each.id, each.revision), 'The draft was not discarded:')
               }}
             />
           ))}
@@ -290,10 +295,20 @@ export function KeptDrafts({
         sessions={sessions}
         busy={busy}
         onRemove={(id, removal) => {
-          run(id, () => channels.remove(removal).then(() => undefined), 'The message was not removed')
+          run(
+            id,
+            () => channels.remove(removal).then(() => undefined),
+            'actionId' in removal
+              ? 'This device could not remove this message now. It is still in place.'
+              : 'This device could not remove all of these messages now. Some of them may still be in place.'
+          )
         }}
         onClearHold={(holdId) => {
-          run(`hold-${holdId}`, () => channels.clearHold(holdId), 'The record was not removed')
+          run(
+            `hold-${holdId}`,
+            () => channels.clearHold(holdId),
+            'This device could not remove this record now. It is still in place.'
+          )
         }}
       />
     </>
@@ -447,7 +462,14 @@ function ChannelBanners({ ledger, shelf }: { readonly ledger: string; readonly s
 }
 
 /** The control that sets a damaged list of removals aside. It shows for a damaged list and for no other. */
-function LedgerSetAside({ onSetAside }: { readonly onSetAside: () => Promise<{ readonly moved: boolean; readonly confirmed: boolean }> }): ReactNode {
+function LedgerSetAside({
+  onSetAside,
+  onNotDamaged
+}: {
+  readonly onSetAside: () => Promise<{ readonly moved: boolean; readonly confirmed: boolean }>
+  /** Called with what to say when the host refused because the list is not damaged. */
+  readonly onNotDamaged: (words: string) => void
+}): ReactNode {
   const [note, setNote] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   return (
@@ -471,11 +493,16 @@ function LedgerSetAside({ onSetAside }: { readonly onSetAside: () => Promise<{ r
             ask(onSetAside)
               .then((done) => {
                 if (done.moved && !done.confirmed) {
-                  setNote('The list was set aside, but this device could not confirm that on disk yet.')
+                  setNote('The list was set aside, but this device could not yet confirm that on disk. It will try again.')
                 }
               })
-              .catch(() => {
-                setNote('This device could not set the list aside. The original list is still in place.')
+              .catch((error: unknown) => {
+                // A refusal as "not damaged" means another window set it aside: the original is not in place.
+                if (failureCode(error) === 'INVALID_ARGUMENT') {
+                  onNotDamaged('The list of removals is not damaged, so it was not set aside.')
+                } else {
+                  setNote('This device could not set the list aside. The original list is still in place.')
+                }
               })
               .finally(() => {
                 setBusy(false)
@@ -500,9 +527,16 @@ function whenWords(ms: string): string {
   return Number.isNaN(at.getTime()) ? 'an unknown time' : at.toLocaleString()
 }
 
-/** A session's line inside a sentence: its first letter is lower-case when it begins "A session" or "Its session". */
-function sessionPhrase(line: string): string {
-  return /^(A|Its) session/.test(line) ? `${line.charAt(0).toLowerCase()}${line.slice(1)}` : line
+/** What a record of a send says it was: to a session by its name, or to one that cannot be named. */
+function holdWords(sessions: readonly Session[] | null, hold: StoredHold): string {
+  const at = whenWords(hold.sentAtMs)
+  if (sessions === null) {
+    return `A message to a session on ${hold.hostName}, which this device cannot reach now, pressed at ${at}.`
+  }
+  const home = sessions.find((session) => session.session_id === hold.sessionId)
+  return home === undefined
+    ? `A message to a session that ${hold.hostName} no longer lists, pressed at ${at}.`
+    : `A message to ${sessionName(home)} on ${hold.hostName}, pressed at ${at}.`
 }
 
 /** The messages, the records of sends, and the ones that could not be read, below the drafts. */
@@ -694,8 +728,7 @@ function ChannelHoldRow({
   return (
     <li className="kept-draft" data-testid="channel-hold">
       <p className="small muted">
-        A message to {sessionPhrase(homeLine(sessions, hold.sessionId))} on {hold.hostName}, pressed at{' '}
-        {whenWords(hold.sentAtMs)}. This device has not settled what became of it. Removing this record
+        {holdWords(sessions, hold)} This device has not settled what became of it. Removing this record
         sends nothing.
       </p>
       <div className="row wrap">
