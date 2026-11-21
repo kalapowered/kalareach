@@ -97,6 +97,7 @@ import type {
   SessionScreenPreviewResult,
   RevocationResult,
   ShareOffer,
+  ShellLaunchCommandsListResult,
   ShellLaunchResult,
   ShellLaunchSurfaceParams,
   ShellLaunchSurfaceResult,
@@ -3115,6 +3116,15 @@ export interface TerminalView {
 export type LaunchSurfaceReading =
   | { readonly state: 'served'; readonly surface: ShellLaunchSurfaceResult }
   | { readonly state: 'not_served' }
+
+/**
+ * What a read of the host's saved launch commands came to: the list, or that the host is of a
+ * release that does not serve it, or that this connection does not hold the right to read it.
+ */
+export type LaunchCommandsReading =
+  | { readonly state: 'served'; readonly list: ShellLaunchCommandsListResult }
+  | { readonly state: 'not_served' }
+  | { readonly state: 'refused' }
 
 /**
  * A launch as a button presses it: the command its offer carries and the prompt generation and

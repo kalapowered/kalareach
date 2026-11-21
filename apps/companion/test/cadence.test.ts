@@ -122,4 +122,99 @@ describe('reading on a cadence', () => {
     expect(started).toBe(3)
     cadence.stop()
   })
+
+  it('a_state_the_view_publishes_wakes_the_read: starts it now, where the cadence would wait', async () => {
+    const held = reads()
+    const cadence = readOnCadence(held.read, 2_000, 250)
+    cadence.now()
+    await held.answer()
+    await vi.advanceTimersByTimeAsync(250)
+    expect(held.started()).toBe(1)
+    // The wake does not wait out the cadence: the last read started a gap ago.
+    cadence.soon()
+    expect(held.started()).toBe(2)
+    cadence.stop()
+  })
+
+  it('no_more_than_one_wake_read_starts_in_each_250_ms', async () => {
+    const held = reads()
+    const cadence = readOnCadence(held.read, 2_000, 250)
+    cadence.now()
+    await held.answer()
+    // Output arrives all the while: each wake asks, and the gap decides.
+    for (let each = 0; each < 20; each += 1) {
+      await vi.advanceTimersByTimeAsync(25)
+      cadence.soon()
+    }
+    // The first wake waited out the gap and started one read; the rest arrived while it was out.
+    expect(held.started()).toBe(2)
+    // They cost one more read, started once that one answers and a gap has passed, not one each.
+    await held.answer()
+    expect(held.started()).toBe(3)
+    await vi.advanceTimersByTimeAsync(100)
+    expect(held.started()).toBe(3)
+    cadence.stop()
+  })
+
+  it('states_that_arrive_while_a_read_is_out_cost_one_more_read_and_not_one_each', async () => {
+    const held = reads()
+    const cadence = readOnCadence(held.read, 2_000, 250)
+    cadence.now()
+    for (let each = 0; each < 10; each += 1) cadence.soon()
+    expect(held.started()).toBe(1)
+    await vi.advanceTimersByTimeAsync(300)
+    await held.answer()
+    expect(held.started()).toBe(2)
+    await held.answer()
+    await vi.advanceTimersByTimeAsync(249)
+    expect(held.started()).toBe(2)
+    cadence.stop()
+  })
+
+  it('a_hidden_page_wakes_no_read', async () => {
+    const held = reads()
+    const cadence = readOnCadence(held.read, 2_000, 250)
+    cadence.now()
+    await held.answer()
+    showPage('hidden')
+    await vi.advanceTimersByTimeAsync(1_000)
+    cadence.soon()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(held.started()).toBe(1)
+    showPage('visible')
+    expect(held.started()).toBe(2)
+    cadence.stop()
+  })
+
+  it('reads_nothing_on_a_wake_before_the_first_read_is_asked_for', async () => {
+    const held = reads()
+    const cadence = readOnCadence(held.read, 2_000, 250)
+    cadence.soon()
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(held.started()).toBe(0)
+    cadence.stop()
+  })
+
+  it('a_wake_every_250_ms_postpones_the_cadence_it_wakes_and_never_another_cadence', async () => {
+    // The surface is woken by output every 250 ms for ever; the list has a cadence of its own that
+    // no wake reaches, so its deadline is its last read plus a cadence whatever the surface does.
+    const surface = reads()
+    const list = reads()
+    const surfaceCadence = readOnCadence(surface.read, 2_000, 250)
+    const listCadence = readOnCadence(list.read, 2_000)
+    surfaceCadence.now()
+    listCadence.now()
+    await surface.answer()
+    await list.answer()
+    for (let each = 0; each < 7; each += 1) {
+      await vi.advanceTimersByTimeAsync(250)
+      surfaceCadence.soon()
+      await surface.answer()
+    }
+    expect(list.started()).toBe(1)
+    await vi.advanceTimersByTimeAsync(250)
+    expect(list.started()).toBe(2)
+    surfaceCadence.stop()
+    listCadence.stop()
+  })
 })

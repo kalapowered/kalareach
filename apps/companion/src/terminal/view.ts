@@ -30,6 +30,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 
 import type { ShellLaunchResult } from '@kalareach/protocol'
 
+import type { InputCounts } from '../app/launch-surface'
+
 import {
   failureCode,
   failureMessage,
@@ -133,7 +135,19 @@ export interface TerminalViewing {
     readonly read: () => Promise<LaunchSurfaceReading>
     readonly press: (press: LaunchPress) => Promise<ShellLaunchResult>
   } | null
+  /**
+   * How many inputs that reach the program the person has made through this view, and how many of
+   * them native code has answered. `now` is current before the page renders, so a read started in
+   * the frame of an input records it; `rendered` is what the page has drawn. An input that sends
+   * nothing, as a modifier pressed alone does, is not counted.
+   */
+  readonly inputs: { readonly now: () => InputCounts; readonly rendered: InputCounts }
+  /** How many states this opening has published, which grows with each: a screen, a move, a control change. */
+  readonly stamp: number
 }
+
+/** Before the person has made an input. */
+const NO_INPUTS: InputCounts = { submitted: 0, settled: 0 }
 
 /** The grid a view opens at when its surface cannot be measured yet. */
 export const FALLBACK_GRID: TerminalGrid = { columns: 80, rows: 24 }
@@ -260,6 +274,18 @@ export function useTerminalView(
     readonly view: TerminalView
   } | null>(null)
   const stamps = useRef(0)
+  // The inputs the person has made, and those native code has answered, across the openings of
+  // this hook: kept in a ref as well, so a read started before the page renders sees them.
+  const typed = useRef<InputCounts>(NO_INPUTS)
+  const [typedRendered, setTypedRendered] = useState<InputCounts>(NO_INPUTS)
+  const counting = useCallback((change: (counts: InputCounts) => InputCounts) => {
+    typed.current = change(typed.current)
+    setTypedRendered(typed.current)
+  }, [])
+  const inputs = useMemo(
+    () => ({ now: () => typed.current, rendered: typedRendered }),
+    [typedRendered]
+  )
   const opening = useRef<Opening | null>(null)
   const measuring = useRef(measure)
   useEffect(() => {
@@ -533,6 +559,11 @@ export function useTerminalView(
       const take = controlTake()
       if (open?.view == null || take === null) return Promise.resolve()
       const answer = inTurn(open, open.view, { ...input, take })
+      counting((counts) => ({ ...counts, submitted: counts.submitted + 1 }))
+      const answered = () => {
+        counting((counts) => ({ ...counts, settled: counts.settled + 1 }))
+      }
+      answer.then(answered, answered)
       // An input that reaches the program ends the words of one that did not. Native code writes a
       // press, a repeat, text and a paste whenever it takes them; it can take a release or a wheel
       // turn and write nothing, as for the release of a press it refused, so neither ends them. A
@@ -558,7 +589,7 @@ export function useTerminalView(
       )
       return answer
     },
-    [controlTake]
+    [controlTake, counting]
   )
 
   const refuse = useCallback(
@@ -677,6 +708,8 @@ export function useTerminalView(
     controlTake,
     refuse,
     unsent,
-    launch
+    launch,
+    inputs,
+    stamp
   }
 }
