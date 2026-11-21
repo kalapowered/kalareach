@@ -817,10 +817,12 @@ pub mod testing {
             }
         }
 
-        /// Waits here when a suite paused this place, once. A step that waits here is a plain
-        /// function, which a command calls from a task of Tauri's multi-threaded runtime, or a
-        /// suite calls from a thread of its own, and it cannot await, so it waits as the choice
-        /// gate does ([`super::blocking`]).
+        /// Waits here when a suite paused this place, once. The step that waits is a plain
+        /// function (the choice of a host, the read of the device's records, the replacer), which
+        /// cannot await, or an `async fn` on a task of Tauri's multi-threaded runtime (the
+        /// supervision's question of whether a connection was withdrawn). Neither awaits the wait:
+        /// each blocks its thread as the choice gate does ([`super::blocking`]), which moves the
+        /// runtime's other tasks to another worker.
         pub(super) fn wait(&self) {
             let held = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
             if let Some((reached, released)) = held {
@@ -863,10 +865,16 @@ pub mod testing {
             self.pauses.device_read.set()
         }
 
-        /// Pauses the next question of whether a connection was withdrawn before the host is asked
-        /// over it, and so before another connection is opened. The question and the opening are
-        /// each given a time to answer in, and neither has begun at this pause, so a suite can hold
-        /// the replacement here for as long as what it waits for takes.
+        /// Pauses the next question of whether a connection was withdrawn that the connection's
+        /// supervision asks ([`Self::replace_if_withdrawn`]) before the host is asked over it, and
+        /// so before another connection is opened. The question and the opening are each given a
+        /// time to answer in, and neither has begun at this pause, so a suite can hold the
+        /// replacement here for as long as what it waits for takes.
+        ///
+        /// Only the supervision's question is paused. Settings sync's host lists and the Devices
+        /// view ask the same question through `listed_replacing` without the pause, so a suite that
+        /// holds the replacement here and also starts either of them can still see a replacement
+        /// that the pause does not hold.
         #[must_use]
         pub fn hold_before_replacement(&self) -> Hold {
             self.pauses.before_replacement.set()
