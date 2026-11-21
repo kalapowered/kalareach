@@ -30,11 +30,16 @@ describe("the application's sentences are the ones the page recognises and shows
   it.each([
     ['open_transfers.rs', 'TOO_MANY_OPEN', words.TOO_MANY_OPEN],
     ['open_transfers.rs', 'CANNOT_RESUME', words.CANNOT_RESUME],
+    ['open_transfers.rs', 'KEY_IN_USE', words.KEY_IN_USE],
     ['open_transfers.rs', 'UNRECOVERABLE', words.UNRECOVERABLE],
     ['open_transfers.rs', 'CANCELLED', words.CANCELLED_BEFORE_SENT],
     ['paired_drafts.rs', 'GONE', words.DRAFT_GONE],
     ['paired_drafts.rs', 'GONE_FOR_TEXT', words.DRAFT_GONE_FOR_TEXT],
     ['paired_drafts.rs', 'NO_DRAFT', words.NO_DRAFT],
+    ['paired_drafts.rs', 'CHANGED_AGAIN', words.CHANGED_AGAIN],
+    ['paired_drafts.rs', 'NEWER_DRAFT', words.NEWER_DRAFT],
+    ['paired_drafts.rs', 'CREATE_PENDING', words.CREATE_PENDING],
+    ['paired_drafts.rs', 'DISCARD_PENDING', words.DISCARD_PENDING],
     ['paired_drafts.rs', 'UPDATE_THE_HOST', words.UPDATE_THE_HOST_TO_END_A_DRAFT]
   ])('%s %s', (file, name, constant) => {
     expect(constant).toBe(rustConstant(file, name))
@@ -60,6 +65,10 @@ describe('what each refusal means to the person, and the words it is shown in', 
     [host('PERMISSION_DENIED', words.CANCELLED_BEFORE_SENT), 'cancelled', 'This file was cancelled before it was sent in full'],
     [host('PERMISSION_DENIED', words.TOO_MANY_OPEN), 'too-many', words.sentence(words.TOO_MANY_OPEN)],
     [host('PERMISSION_DENIED', words.DRAFT_GONE), 'gone', words.sentence(words.DRAFT_GONE)],
+    // The application's other refusals come with the code of a missing right, and are not read as one.
+    [host('PERMISSION_DENIED', words.CANNOT_RESUME), 'other', words.sentence(words.CANNOT_RESUME)],
+    [host('PERMISSION_DENIED', words.KEY_IN_USE), 'other', words.sentence(words.KEY_IN_USE)],
+    [host('PERMISSION_DENIED', words.NEWER_DRAFT), 'other', words.sentence(words.NEWER_DRAFT)],
     [host('UNSUPPORTED_CAPABILITY', 'unknown method upload.begin'), 'earlier-host', words.EARLIER_HOST],
     [host('UNSUPPORTED_SCHEMA', 'schema'), 'earlier-host', words.EARLIER_HOST],
     [host('PERMISSION_DENIED', 'the device holds no right for files.upload'), 'no-right', words.NO_RIGHT_TO_SEND],

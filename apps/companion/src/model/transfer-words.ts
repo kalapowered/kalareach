@@ -21,6 +21,9 @@ export const CANNOT_RESUME =
 export const UNRECOVERABLE =
   'this device asked the host to take this file and did not get its answer: if the host agreed, it keeps the place for up to 24 hours and then releases it'
 
+/** A transfer key that an open upload, an entry or a copy holds already. */
+export const KEY_IN_USE = 'an upload with that transfer key is open already'
+
 /** What the command that waited for an upload is told when the person cancelled it. */
 export const CANCELLED_BEFORE_SENT = 'this file was cancelled before it was sent in full'
 
@@ -38,6 +41,21 @@ export const DRAFT_GONE_FOR_TEXT =
 
 /** This device keeps no draft for the session a text was for. */
 export const NO_DRAFT = 'this device keeps no draft for this session: add a file to it first'
+
+/** The draft this device kept for the session is of a later release. */
+export const NEWER_DRAFT =
+  'this device keeps a draft for this session in a format this release does not read: update the application to use it'
+
+/** The draft changed twice while a file was being added to it. */
+export const CHANGED_AGAIN = 'the draft changed again while the file was being added: the file was not added'
+
+/** The host was asked to make the draft and its answer has not been received. */
+export const CREATE_PENDING =
+  'the host was asked to make a draft for this session and its answer has not been received: try again later'
+
+/** The host was asked to end the draft and its answer has not been received. */
+export const DISCARD_PENDING =
+  'the host was asked to end the draft for this session and its answer has not been received: try again later'
 
 /** A host of an earlier build cannot end a draft. */
 export const UPDATE_THE_HOST_TO_END_A_DRAFT =
@@ -86,7 +104,16 @@ const APPLICATION_WORDS: readonly (readonly [string, RefusalKind])[] = [
   [TOO_MANY_OPEN, 'too-many'],
   [DRAFT_GONE, 'gone'],
   [DRAFT_GONE_FOR_TEXT, 'gone'],
-  [NO_DRAFT, 'gone']
+  [NO_DRAFT, 'gone'],
+  // The application refuses these as it refuses a missing right, so its code cannot tell them apart:
+  // each is shown in its own words and not as a right the device lacks.
+  [CANNOT_RESUME, 'other'],
+  [KEY_IN_USE, 'other'],
+  [NEWER_DRAFT, 'other'],
+  [CHANGED_AGAIN, 'other'],
+  [CREATE_PENDING, 'other'],
+  [DISCARD_PENDING, 'other'],
+  [UPDATE_THE_HOST_TO_END_A_DRAFT, 'other']
 ]
 
 /**
