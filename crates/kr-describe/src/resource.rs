@@ -185,12 +185,6 @@ impl ResourceState {
             Self::ResourcePaused { .. } => "resource_paused",
         }
     }
-
-    /// Returns whether a job may be dispatched in this state.
-    #[must_use]
-    pub const fn dispatches(self) -> bool {
-        matches!(self, Self::Admitted)
-    }
 }
 
 /// The owner's settings.
