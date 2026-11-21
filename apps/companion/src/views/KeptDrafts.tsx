@@ -130,7 +130,9 @@ export function KeptDrafts({
   // Messages are unread when a read failed or a file could not be read now; the list of removals, when it is not `ok`.
   const unread: Unread = {
     ledger: ledger !== 'ok',
-    messages: sources === 'unknown' && (ledger === 'ok' || shelf.status === 'failed' || shelf.unreadableMessages.now > 0)
+    messages:
+      sources === 'unknown' &&
+      (ledger === 'ok' || shelf.status === 'failed' || shelf.stale || shelf.unreadableMessages.now > 0)
   }
 
   const run = (id: string, step: () => Promise<void>, failed: string) => {
@@ -414,7 +416,7 @@ function ChannelBanners({ ledger, shelf }: { readonly ledger: string; readonly s
           }
         />
       )}
-      {shelf.status === 'failed' ? (
+      {shelf.status === 'failed' || shelf.stale ? (
         <Banner
           tone="warning"
           title="Some channel messages could not be read"
@@ -557,6 +559,7 @@ function ChannelGroup({
                       key={message.actionId}
                       message={message}
                       sessions={sessions}
+                      readFailed={shelf.stale}
                       busy={busy === message.actionId}
                       onRemove={() => {
                         onRemove(message.actionId, { actionId: message.actionId })
@@ -622,11 +625,14 @@ function ChannelGroup({
 function ChannelMessageRow({
   message,
   sessions,
+  readFailed,
   busy,
   onRemove
 }: {
   readonly message: StoredChannelMessage
   readonly sessions: readonly Session[] | null
+  /** True when the newest read of the shelf failed. */
+  readonly readFailed: boolean
   readonly busy: boolean
   readonly onRemove: () => void
 }): ReactNode {
@@ -641,9 +647,15 @@ function ChannelMessageRow({
         Sent at {whenWords(message.sentAtMs)}. When this was sent, the host could not tell whether Claude
         Code took it. Check the session before you send it again.
       </p>
-      <pre className="kept-draft-text" data-testid="channel-message-text" tabIndex={0}>
-        {message.text ?? ''}
-      </pre>
+      {message.text !== undefined ? (
+        <pre className="kept-draft-text" data-testid="channel-message-text" tabIndex={0}>
+          {message.text}
+        </pre>
+      ) : readFailed ? (
+        <p className="small" data-testid="channel-message-text-unavailable">
+          This device could not read the text of this message now.
+        </p>
+      ) : null}
       <div className="row wrap">
         <CommitButton tone="quiet" data-testid="channel-message-remove" disabled={busy} onCommit={onRemove}>
           Remove
