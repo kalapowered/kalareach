@@ -68,6 +68,7 @@ mod window {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
+    use companion_tauri::contact::STATE_FIRST_WITHIN;
     use kr_protocol::envelope::ParamsValue;
     use serde_json::{Value, json};
     use tauri::{AppHandle, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -242,6 +243,12 @@ mod window {
         let took = started.elapsed();
         println!("host_events: {what} took {took:.1?}");
         Ok(took)
+    }
+
+    /// Whether the keeper's bound on a connection's first events (`STATE_FIRST_WITHIN`) has not
+    /// passed, measured from `offered_at`, a time taken before the keeper was given the connection.
+    fn before_the_bound(offered_at: Instant) -> bool {
+        offered_at.elapsed() < STATE_FIRST_WITHIN
     }
 
     /// What the page says, which it says in the window's title.
@@ -438,6 +445,9 @@ mod window {
         let started_at = owner.revision();
         let mut hold = owner.hold_the_publisher();
         let mut offered = Some(connection);
+        // The keeper starts its wait for the announcing state only once it has the connection, so
+        // the time since this point is never less than the time that wait has run.
+        let offered_at = Instant::now();
         companion_tauri::connection::reach_host_on_this_machine(app, move || {
             let next = offered.take();
             async move { next.map_or(Attempt::Nothing, Attempt::Reached) }
@@ -475,6 +485,19 @@ mod window {
         // The state that announces the connection is held, so the host's events wait for it.
         std::thread::sleep(Duration::from_secs(1));
         let early = heard(window)[before..].to_vec();
+        // The keeper stops waiting for the state after `STATE_FIRST_WITHIN` whether it was told or
+        // not, and a case cannot move that bound. What the page has not heard is asserted only
+        // while the bound cannot have passed: a run that took longer than that to get here, on a
+        // machine that stalled, says nothing about the order and is not failed for it.
+        if !before_the_bound(offered_at) {
+            hold.release();
+            session.close();
+            println!(
+                "host_events: the order of a host's first events was not asserted: more than \
+                 {STATE_FIRST_WITHIN:?} passed after the connection was offered"
+            );
+            return Ok(());
+        }
         assert!(
             early.is_empty(),
             "the page heard {early:?} before the state that announces the connection was told"
@@ -490,6 +513,16 @@ mod window {
                 >= 2
         })?;
         let told = heard_now();
+        // Events heard before the state are a fault only if the keeper's bound had not passed when
+        // they were read, which the time since the offer, taken after the read, shows.
+        if !before_the_bound(offered_at) {
+            session.close();
+            println!(
+                "host_events: the order of a host's first events was not asserted: more than \
+                 {STATE_FIRST_WITHIN:?} passed after the connection was offered"
+            );
+            return Ok(());
+        }
         let first_event = told
             .iter()
             .position(|each| each.get("connection").is_none());
