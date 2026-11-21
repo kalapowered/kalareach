@@ -2936,8 +2936,7 @@ mod tests {
             path(ListenRole::Control),
             path(ListenRole::Transfer),
         );
-        let (shown_rendezvous, shown_control, shown_transfer) = (
-            said_path(ListenRole::Rendezvous),
+        let (shown_control, shown_transfer) = (
             said_path(ListenRole::Control),
             said_path(ListenRole::Transfer),
         );
@@ -2959,9 +2958,16 @@ mod tests {
             )),
             "{after_the_first}"
         );
+        // The words of two endpoints that no configured root names can read alike (a pipe's
+        // name is one placeholder), so each endpoint is counted by its role word.
+        let rendezvous_endpoint = format!("its {} endpoint", ListenRole::Rendezvous.word());
         assert_eq!(
-            after_the_first.as_str().matches(&shown_rendezvous).count(),
-            1
+            after_the_first
+                .as_str()
+                .matches(&rendezvous_endpoint)
+                .count(),
+            1,
+            "{after_the_first}"
         );
         let after_the_second = last_line_said(
             &written(ListenRole::Control, &unanswered, control.clone(), 4242),
@@ -2974,7 +2980,10 @@ mod tests {
             )),
             "{after_the_second}"
         );
-        assert!(!after_the_second.as_str().contains(&shown_rendezvous));
+        assert!(
+            !after_the_second.as_str().contains(&rendezvous_endpoint),
+            "{after_the_second}"
+        );
         let after_the_last = last_line_said(
             &written(ListenRole::Transfer, &unanswered, transfer.clone(), 4242),
             expect,
