@@ -319,7 +319,7 @@ fn read_forms() -> compiler::Reading {
     compiler::merge(
         root.path(),
         &meta,
-        &[platform.clone()],
+        std::slice::from_ref(platform),
         &[compiler::host_name()],
         &[],
     )
@@ -623,9 +623,7 @@ fn each_refusal_of_the_reading_has_the_text_the_lead_approved() {
             &[host, "elsewhere"],
             &[]
         ),
-        [format!(
-            "the platform elsewhere was not read, so the reading is not complete"
-        )]
+        ["the platform elsewhere was not read, so the reading is not complete".to_owned()]
     );
     // A tree the stamp could not mark.
     let mut stamp = platform.clone();
@@ -860,7 +858,7 @@ fn cargo_names_the_procedural_macro_crates_each_client_depends_on() {
         "a crate under tests/ is no client"
     );
     assert!(
-        meta.proc_macros.get("kr_protocol").is_none(),
+        !meta.proc_macros.contains_key("kr_protocol"),
         "a receiver is not checked"
     );
     let platform = Platform {

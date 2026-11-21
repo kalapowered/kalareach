@@ -251,7 +251,7 @@ fn mark_fields(text: &str, name: &str) -> Result<(String, usize), String> {
             format!("#[deprecated(note = \"{name}.{}\")] ", ident.unraw()),
         ));
     }
-    at.sort_by(|left, right| right.0.cmp(&left.0));
+    at.sort_by_key(|(offset, _)| std::cmp::Reverse(*offset));
     let count = at.len();
     let mut out = text.to_owned();
     for (offset, attribute) in at {
