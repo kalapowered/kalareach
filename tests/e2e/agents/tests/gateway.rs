@@ -2441,6 +2441,29 @@ impl Person {
         }
     }
 
+    /// Waits until the agent's start is over: the screen shows `composer` and none of the entry's
+    /// start `draft` texts. The agent's start draws a composer that drops what is typed at it, so
+    /// the first turn is typed only after this.
+    fn waits_for_the_start_draft_to_end(&self, composer: &str, draft: &[String], why: &str) {
+        let started = Instant::now();
+        loop {
+            let rows = self.window.screen();
+            if start_is_over(&rows, composer, draft) {
+                return;
+            }
+            assert!(
+                started.elapsed() < LIVENESS,
+                "{why}: {} after {LIVENESS:?}:\n{}",
+                draft_showing(&rows, draft).map_or_else(
+                    || "the composer does not wait for a prompt".to_owned(),
+                    |text| format!("the screen still shows the agent's start draft ({text})")
+                ),
+                rows.join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Clears the shell's screen, so that what it shows afterwards is what the next line did.
     fn clears_the_screen(&self) {
         self.window.type_text(b"\x0c");
@@ -2796,6 +2819,54 @@ fn draft_showing<'t>(rows: &[String], draft: &'t [String]) -> Option<&'t str> {
         .iter()
         .map(String::as_str)
         .find(|text| rows.iter().any(|row| row.contains(text)))
+}
+
+/// Whether the agent's start is over on `rows`: its composer shows, and none of the entry's start
+/// draft texts does. A composer drawn while the start is still a draft drops what is typed at it.
+fn start_is_over(rows: &[String], composer: &str, draft: &[String]) -> bool {
+    rows.iter().any(|row| row.contains(composer)) && draft_showing(rows, draft).is_none()
+}
+
+/// Said at a part's first start where the entry names no start draft text: nothing waits for the
+/// start draft to end before the first turn is typed.
+fn says_when_no_draft_is_named(account: &Account) {
+    if account.draft.is_empty() {
+        eprintln!(
+            "the entry names no start draft texts (account.draft), so the first turn is typed \
+             without waiting for the start draft to end"
+        );
+    }
+}
+
+/// The first turn is typed only once the agent's start is over: the draft's composer beside its
+/// `loading` header is not the real screen, the real screen is, and an entry that names no draft
+/// text has none to wait for.
+#[test]
+fn a_composer_drawn_beside_the_start_draft_is_not_the_real_screen() {
+    let rows = |rows: &[&str]| rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
+    let composer = "Ask Codex to do anything";
+    let draft = ["loading".to_owned()];
+    let drawn = rows(&[
+        "│ model:     loading   /model to change │",
+        "› Ask Codex to do anything",
+    ]);
+    let real = rows(&[
+        "│ model:     gpt-5.5   /model to change │",
+        "› Ask Codex to do anything",
+    ]);
+    assert!(
+        !start_is_over(&drawn, composer, &draft),
+        "the draft's composer, beside its loading header, is not the real screen"
+    );
+    assert!(start_is_over(&real, composer, &draft), "the real screen is");
+    assert!(
+        !start_is_over(&rows(&["starting"]), composer, &draft),
+        "no composer is no start over"
+    );
+    assert!(
+        start_is_over(&drawn, composer, &[]),
+        "an entry that names no draft text has none to wait for"
+    );
 }
 
 /// Whether `row` is the composer's own row holding the typed `command`: the command with
@@ -3330,6 +3401,16 @@ impl<'a> Session<'a> {
                         real.checks_the_route(&self.ctx.run);
                     },
                 );
+                if !self.ctx.manual {
+                    if not.is_none() {
+                        says_when_no_draft_is_named(&real.account);
+                    }
+                    self.person.waits_for_the_start_draft_to_end(
+                        &real.account.composer,
+                        &real.account.draft,
+                        "the agent reaches its composer",
+                    );
+                }
             }
         }
         let instance = self

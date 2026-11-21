@@ -209,6 +209,14 @@ fn starts_by_hand(
                     real.checks_the_route(&ctx.run);
                 },
             );
+            if first_start {
+                says_when_no_draft_is_named(&real.account);
+            }
+            at.person.waits_for_the_start_draft_to_end(
+                &real.account.composer,
+                &real.account.draft,
+                "the agent reaches its composer",
+            );
             // The driver skips this switch for a start by hand: the build list's request for a
             // run that stops before any turn is honoured here, with the agent up and nothing
             // charged.
