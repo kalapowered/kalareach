@@ -82,6 +82,38 @@ describe('reading on a cadence', () => {
     cadence.stop()
   })
 
+  it('takes a read asked for meanwhile as the further read that the read makes, and keeps a later one', async () => {
+    const waiting: (() => void)[] = []
+    let started = 0
+    let takeAskedFor: () => void = () => undefined
+    const answer = async () => {
+      waiting.shift()?.()
+      await Promise.resolve()
+      await Promise.resolve()
+    }
+    const cadence = readOnCadence((take) => {
+      started += 1
+      takeAskedFor = take
+      return new Promise<void>((resolve) => {
+        waiting.push(resolve)
+      })
+    }, 1_000)
+    cadence.now()
+    cadence.now()
+    // The read makes its further read, which is the one that was asked for: none runs after it.
+    takeAskedFor()
+    await answer()
+    expect(started).toBe(1)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(started).toBe(2)
+    // A read asked for after the call is not that one.
+    takeAskedFor()
+    cadence.now()
+    await answer()
+    expect(started).toBe(3)
+    cadence.stop()
+  })
+
   it('reads nothing while the page is hidden, and reads at once when it is shown again', async () => {
     const held = reads()
     const cadence = readOnCadence(held.read, 1_000)

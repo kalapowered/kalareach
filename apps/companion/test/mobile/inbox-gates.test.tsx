@@ -474,6 +474,61 @@ describe('what the host in use shows is stored and shown under the owner’s key
     expect(held.count).toBe(first + 3)
   })
 
+  // A change of host that comes while a read is on its way asks for a read of its own. The one new
+  // read that follows a dropped answer is that read, so two drops across the change make two reads.
+  it('a_change_of_host_during_a_dropped_read_is_read_by_the_retry_and_not_again', async () => {
+    const { controls } = start(null)
+    await shown('studio')
+    controls.supersedeNextInboxReads(2)
+    const held = controls.hold('attentionRead')
+    const first = held.count
+    readNow()
+    await settle()
+    expect(held.count).toBe(first + 1)
+    act(() => {
+      controls.setPairing({ hosts: [{ ...STUDIO, in_use: false }, { ...LAPTOP, in_use: true }] })
+    })
+    await settle()
+    // The change asks for no read while one is on its way.
+    expect(held.count).toBe(first + 1)
+    act(() => {
+      held.answer(first)
+    })
+    await settle()
+    expect(held.count).toBe(first + 2)
+    act(() => {
+      held.answer(first + 1)
+    })
+    await settle()
+    expect(held.count).toBe(first + 2)
+  })
+
+  // The retry covers the change that came before it began and no later one.
+  it('a_change_of_host_during_the_retry_still_makes_a_read_of_its_own', async () => {
+    const { controls } = start(null)
+    await shown('studio')
+    controls.supersedeNextInboxReads(1)
+    const held = controls.hold('attentionRead')
+    const first = held.count
+    readNow()
+    await settle()
+    act(() => {
+      held.answer(first)
+    })
+    await settle()
+    expect(held.count).toBe(first + 2)
+    act(() => {
+      controls.setPairing({ hosts: [{ ...STUDIO, in_use: false }, { ...LAPTOP, in_use: true }] })
+    })
+    await settle()
+    expect(held.count).toBe(first + 2)
+    act(() => {
+      held.answer(first + 1)
+    })
+    await settle()
+    expect(held.count).toBe(first + 3)
+  })
+
   // The numbers of an epoch are not the numbers of the next: a replacement moves it, the inbox is
   // read again, and the numbers' read has not answered, so the rows say "A session".
   it('a_replacement_leaves_the_old_numbers_unshown_while_the_new_numbers_are_unread', async () => {

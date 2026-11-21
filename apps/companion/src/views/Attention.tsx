@@ -171,14 +171,21 @@ export function Attention({ latest }: { readonly latest: ConnectionState | null 
     [port]
   )
 
-  const load = useCallback(async (): Promise<void> => {
-    const current = reads.current?.read() ?? null
-    if (current === null) return
-    // A read that is dropped makes one new read from the connection's state as it stands then; a
-    // second one that is dropped waits for the cadence.
-    if (await readOnce(current)) await readOnce(current)
-    if (current()) setNowMs(Date.now())
-  }, [readOnce])
+  const load = useCallback(
+    async (takeAskedFor: () => void): Promise<void> => {
+      const current = reads.current?.read() ?? null
+      if (current === null) return
+      // A read that is dropped makes one new read from the connection's state as it stands then, and
+      // that read is the one a change of connection asked for meanwhile; a second one that is dropped
+      // waits for the cadence or for a change that comes after.
+      if (await readOnce(current)) {
+        takeAskedFor()
+        await readOnce(current)
+      }
+      if (current()) setNowMs(Date.now())
+    },
+    [readOnce]
+  )
 
   // The inbox is read once the connection listener is registered, so no change of connection falls
   // between the read and it, and read again on the cadence and on each change of connection.

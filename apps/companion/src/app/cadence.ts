@@ -36,12 +36,14 @@ function hidden(): boolean {
 /**
  * Reads with `read` every `cadenceMs` while the page is shown, starting at the first `now()`.
  *
- * `read` settles once its read has answered or failed; how it shows either is its own affair. A
- * cadence that is a function is asked how long to wait each time a read has answered, so a caller
- * can read less often the longer nothing changes.
+ * `read` settles once its read has answered or failed; how it shows either is its own affair. It is
+ * given a function to call when it makes a further read of its own, as a retry: a read asked for
+ * until then is taken to be that further read and runs no read after it, while one asked for after
+ * the call still does. A cadence that is a function is asked how long to wait each time a read has
+ * answered, so a caller can read less often the longer nothing changes.
  */
 export function readOnCadence(
-  read: () => Promise<unknown>,
+  read: (takeAskedFor: () => void) => Promise<unknown>,
   cadenceMs: number | (() => number),
   wakeGapMs = 0
 ): Cadence {
@@ -73,7 +75,9 @@ export function readOnCadence(
     if (hidden()) return
     running = true
     lastStart = Date.now()
-    void read()
+    void read(() => {
+      owed = false
+    })
       .catch(() => undefined)
       .finally(() => {
         running = false
