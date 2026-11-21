@@ -4010,7 +4010,9 @@ mod tests {
     /// process, however many others the host is running.
     ///
     /// The process read is a shell this test starts, which has one thread and one child and holds
-    /// still while it is read. The test's own process is not one: its harness starts and ends a
+    /// still while it is read. The child waits on a pipe that the test keeps open through the
+    /// reading, so that nothing but the test ends it, however long the reading is put off. The
+    /// test's own process is not one: its harness starts and ends a
     /// thread for each case, and other cases make and end threads and children of it as this one
     /// reads, so no two readings of it need agree.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -4019,10 +4021,10 @@ mod tests {
         use std::io::BufRead;
         use std::process::Stdio;
 
-        // The shell starts a sleep, says its number, and waits for its input to close, which is
-        // when it ends the sleep and leaves.
+        // The shell starts a child that reads the shell's own input, says its number, and waits for
+        // the child. The child ends when the input closes, and the shell leaves with it.
         let mut shell = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30 >/dev/null & echo $!; read _; kill $!"])
+            .args(["-c", "cat <&0 >/dev/null & echo $!; wait $!"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -4034,14 +4036,18 @@ mod tests {
         let shell_pid = shell.id();
         let (children, read) = super::processes_read_during(|| super::children_of(shell_pid));
         drop(shell.stdin.take());
-        let _ = shell.wait();
-        said_so.expect("the shell says the sleep's number");
-        let held = held.expect("the number of the sleep the shell started");
+        let ended = shell.wait();
+        said_so.expect("the shell says the child's number");
+        let held = held.expect("the number of the child the shell started");
         let children = children.expect("the kernel lists the shell's children");
         assert_eq!(
             children,
             [held],
-            "the sleep is the shell's one child and is listed"
+            "the child is the shell's one child and is listed"
+        );
+        assert!(
+            ended.expect("the shell ends").success(),
+            "the child ended when the pipe closed, and the shell with it"
         );
         assert!(!read.is_empty(), "the reading is counted");
         assert!(
