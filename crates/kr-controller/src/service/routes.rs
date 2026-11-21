@@ -215,7 +215,7 @@ impl Controller {
 
     /// Serves one read whose answer is released under a privacy fence, to the owner at this
     /// machine, who reaches the whole of every session's history. The answer is written with
-    /// [`crate::attention::AttentionModule::write_released`], which checks what holds it before
+    /// [`crate::attention::AttentionModule::write_released_held`], which checks what holds it before
     /// every write.
     pub(super) async fn read_released(
         self: &Arc<Self>,
