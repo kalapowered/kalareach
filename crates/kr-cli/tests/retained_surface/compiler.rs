@@ -1568,6 +1568,14 @@ pub mod refusal {
     pub fn no_site(file: &str, line: usize) -> String {
         format!("{file}:{line}: the compiler reports a use at a place that is no file of this tree")
     }
+    pub fn no_tag_selected() -> String {
+        "the reading selected no release tag, so it is not complete".to_owned()
+    }
+    pub fn tags_short(written: usize, selected: usize) -> String {
+        format!(
+            "the reading wrote {written} of the {selected} release tags it selected, so it is not complete"
+        )
+    }
 }
 
 struct Parsed {
@@ -1922,6 +1930,73 @@ pub fn host_name() -> &'static str {
     } else {
         "other"
     }
+}
+
+/// The release tags a reading selects out of `all` (tag and commit, in the order of versions): the tags
+/// `named` lists, separated by commas, and then the ones whose place in `all` is `k` modulo `n` when
+/// `shard` is `<k>/<n>`. An empty list names every tag, and an empty shard is no shard. A selection of
+/// no tag is refused: a reading of nothing is never a pass.
+pub fn select_tags(
+    all: &[(String, String)],
+    named: Option<&str>,
+    shard: Option<&str>,
+) -> Result<Vec<(String, String)>, String> {
+    let named: Option<Vec<&str>> = named
+        .filter(|list| !list.is_empty())
+        .map(|list| list.split(',').collect());
+    let shard: Option<(usize, usize)> = match shard.filter(|text| !text.is_empty()) {
+        None => None,
+        Some(text) => {
+            let bad = || "KR_COMPILER_SHARD is <k>/<n>".to_owned();
+            let (k, n) = text.split_once('/').ok_or_else(bad)?;
+            let (k, n): (usize, usize) =
+                (k.parse().map_err(|_| bad())?, n.parse().map_err(|_| bad())?);
+            if n == 0 {
+                return Err(bad());
+            }
+            Some((k, n))
+        }
+    };
+    let selected: Vec<(String, String)> = all
+        .iter()
+        .enumerate()
+        .filter(|(at, (tag, _))| {
+            named
+                .as_ref()
+                .is_none_or(|names| names.contains(&tag.as_str()))
+                && shard.is_none_or(|(k, n)| at % n == k)
+        })
+        .map(|(_, release)| release.clone())
+        .collect();
+    if selected.is_empty() {
+        return Err(refusal::no_tag_selected());
+    }
+    Ok(selected)
+}
+
+/// Whether the text of a platform's report, as this run wrote it, holds every tag of the selection
+/// for `platform`: a report with fewer tags than were selected is refused.
+pub fn check_written(
+    platform: &str,
+    selected: &[(String, String)],
+    written: &str,
+) -> Result<(), String> {
+    if selected.is_empty() {
+        return Err(refusal::no_tag_selected());
+    }
+    let wrote = Platform::parse(written)?;
+    let count = selected
+        .iter()
+        .filter(|(tag, _)| {
+            wrote
+                .iter()
+                .any(|read| read.name == platform && read.tag == *tag)
+        })
+        .count();
+    if count < selected.len() {
+        return Err(refusal::tags_short(count, selected.len()));
+    }
+    Ok(())
 }
 
 /// Copies the files that Git tracks in the checkout `repository`, as they are now, into `dest`.

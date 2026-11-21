@@ -882,6 +882,133 @@ fn cargo_names_the_procedural_macro_crates_each_client_depends_on() {
     );
 }
 
+fn releases_named(names: &[&str]) -> Vec<(String, String)> {
+    names
+        .iter()
+        .map(|tag| ((*tag).to_owned(), format!("commit-of-{tag}")))
+        .collect()
+}
+
+#[test]
+fn an_empty_or_absent_list_of_tags_selects_every_release_tag_and_a_list_selects_its_own() {
+    let all = releases_named(&["packages/v1", "packages/v2", "packages/v3"]);
+    assert_eq!(compiler::select_tags(&all, None, None), Ok(all.clone()));
+    assert_eq!(compiler::select_tags(&all, Some(""), None), Ok(all.clone()));
+    assert_eq!(
+        compiler::select_tags(&all, Some(""), Some("")),
+        Ok(all.clone())
+    );
+    assert_eq!(
+        compiler::select_tags(&all, Some("packages/v3,packages/v1"), None),
+        Ok(vec![all[0].clone(), all[2].clone()])
+    );
+}
+
+#[test]
+fn a_shard_takes_the_tags_whose_place_is_its_number_modulo_the_count() {
+    let all = releases_named(&["a", "b", "c", "d", "e"]);
+    assert_eq!(
+        compiler::select_tags(&all, None, Some("0/2")),
+        Ok(vec![all[0].clone(), all[2].clone(), all[4].clone()])
+    );
+    assert_eq!(
+        compiler::select_tags(&all, None, Some("1/2")),
+        Ok(vec![all[1].clone(), all[3].clone()])
+    );
+    assert_eq!(
+        compiler::select_tags(&all, Some("b,c,d"), Some("1/2")),
+        Ok(vec![all[1].clone(), all[3].clone()])
+    );
+    assert_eq!(
+        compiler::select_tags(&all, None, Some("x")),
+        Err("KR_COMPILER_SHARD is <k>/<n>".to_owned())
+    );
+    assert_eq!(
+        compiler::select_tags(&all, None, Some("1/y")),
+        Err("KR_COMPILER_SHARD is <k>/<n>".to_owned())
+    );
+}
+
+#[test]
+fn a_selection_of_no_release_tag_is_refused_with_the_text() {
+    let none = "the reading selected no release tag, so it is not complete".to_owned();
+    assert_eq!(refusal::no_tag_selected(), none);
+    let all = releases_named(&["packages/v1", "packages/v2"]);
+    assert_eq!(
+        compiler::select_tags(&all, Some("packages/v9"), None),
+        Err(none.clone())
+    );
+    assert_eq!(
+        compiler::select_tags(&all, None, Some("5/2")),
+        Err(none.clone())
+    );
+    assert_eq!(compiler::select_tags(&[], None, None), Err(none.clone()));
+    assert_eq!(compiler::select_tags(&[], Some(""), Some("0/4")), Err(none));
+}
+
+#[test]
+fn a_report_that_holds_fewer_tags_than_the_selection_is_refused_with_the_text() {
+    let selected = releases_named(&["packages/v1", "packages/v2", "packages/v3"]);
+    let report = |platform: &str, tags: &[&str]| -> String {
+        tags.iter()
+            .map(|tag| {
+                Platform {
+                    name: platform.to_owned(),
+                    tag: (*tag).to_owned(),
+                    commit: format!("commit-of-{tag}"),
+                    ..Platform::default()
+                }
+                .text()
+            })
+            .collect()
+    };
+    assert_eq!(
+        refusal::tags_short(2, 3),
+        "the reading wrote 2 of the 3 release tags it selected, so it is not complete"
+    );
+    assert_eq!(
+        compiler::check_written(
+            "linux",
+            &selected,
+            &report("linux", &["packages/v1", "packages/v2", "packages/v3"])
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        compiler::check_written(
+            "linux",
+            &selected,
+            &report("linux", &["packages/v1", "packages/v3"])
+        ),
+        Err(refusal::tags_short(2, 3))
+    );
+    // Nothing written, another platform's lines and a tag written twice are no more than they hold.
+    assert_eq!(
+        compiler::check_written("linux", &selected, ""),
+        Err(refusal::tags_short(0, 3))
+    );
+    assert_eq!(
+        compiler::check_written(
+            "linux",
+            &selected,
+            &report("macos", &["packages/v1", "packages/v2", "packages/v3"])
+        ),
+        Err(refusal::tags_short(0, 3))
+    );
+    assert_eq!(
+        compiler::check_written(
+            "linux",
+            &selected,
+            &report("linux", &["packages/v1", "packages/v1", "packages/v2"])
+        ),
+        Err(refusal::tags_short(2, 3))
+    );
+    assert_eq!(
+        compiler::check_written("linux", &[], &report("linux", &["packages/v1"])),
+        Err(refusal::no_tag_selected())
+    );
+}
+
 /// The sightings of this checkout by this machine's platform, in the file that
 /// `KR_COMPILER_SIGHTINGS` names, and printed. Run by hand with `--show-output`: it stamps a copy of
 /// this checkout and builds it, which takes minutes.
@@ -907,7 +1034,7 @@ fn the_compiler_reads_this_checkout() {
 
 /// The release tags to read: all the repository lists, or the tags `KR_COMPILER_TAGS` names, and then
 /// the shard `KR_COMPILER_SHARD=<k>/<n>` (the tags whose place in the order is `k` modulo `n`), in the
-/// order of versions.
+/// order of versions. A selection of no tag is refused.
 fn selected_releases(repository: &Path) -> Vec<(String, String)> {
     let mut all = super::releases::inventory(repository).expect("the releases");
     all.sort_by(|left, right| {
@@ -915,23 +1042,14 @@ fn selected_releases(repository: &Path) -> Vec<(String, String)> {
             .cmp(&right.version)
             .then(left.tag.cmp(&right.tag))
     });
-    let named: Option<Vec<String>> = std::env::var("KR_COMPILER_TAGS")
-        .ok()
-        .map(|list| list.split(',').map(str::to_owned).collect());
-    let shard: Option<(usize, usize)> = std::env::var("KR_COMPILER_SHARD").ok().map(|text| {
-        let (k, n) = text.split_once('/').expect("KR_COMPILER_SHARD is <k>/<n>");
-        (k.parse().expect("k"), n.parse().expect("n"))
-    });
-    all.into_iter()
-        .enumerate()
-        .filter(|(at, release)| {
-            named
-                .as_ref()
-                .is_none_or(|names| names.contains(&release.tag))
-                && shard.is_none_or(|(k, n)| at % n == k)
-        })
-        .map(|(_, release)| (release.tag, release.commit))
-        .collect()
+    let all: Vec<(String, String)> = all
+        .into_iter()
+        .map(|release| (release.tag, release.commit))
+        .collect();
+    let named = std::env::var("KR_COMPILER_TAGS").ok();
+    let shard = std::env::var("KR_COMPILER_SHARD").ok();
+    compiler::select_tags(&all, named.as_deref(), shard.as_deref())
+        .unwrap_or_else(|text| panic!("{text}"))
 }
 
 /// This machine's reading of each release tag, appended to the file `KR_COMPILER_REPORT` names as each
@@ -957,6 +1075,7 @@ fn a_platform_reads_each_release_tag_and_writes_its_report() {
         .append(true)
         .open(&report)
         .expect("the report file");
+    let start = file.metadata().expect("the report file's size").len();
     let mut bad = 0;
     for (tag, commit) in &releases {
         let started = std::time::Instant::now();
@@ -995,6 +1114,9 @@ fn a_platform_reads_each_release_tag_and_writes_its_report() {
         "platform {platform} read {} tags, {bad} not complete",
         releases.len()
     );
+    let written = std::fs::read(&report).expect("the report");
+    let written = String::from_utf8_lossy(&written[usize::try_from(start).expect("a size")..]);
+    compiler::check_written(&platform, &releases, &written).unwrap_or_else(|text| panic!("{text}"));
 }
 
 /// The record of each release tag from the reports of the platforms in the files `KR_COMPILER_REPORTS`
