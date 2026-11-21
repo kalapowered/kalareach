@@ -373,6 +373,31 @@ describe('the files on the draft go with the prompt that names it', () => {
     expect(screen.getByText('next.pdf')).toBeInTheDocument()
   })
 
+  it('keeps the files bound to the draft when the host did not confirm the prompt, so taking one off still ends the draft the application keeps', async () => {
+    const { controls, person } = await open()
+    await pick(person, 'kept.pdf')
+    const key = await started(controls)
+    act(() => {
+      controls.pairedUploads.finish(key)
+    })
+    await waitFor(() => {
+      expect(line()).toBe('Added to this draft')
+    })
+    // The application keeps the draft, with its file, when nobody knows what became of the prompt.
+    // The file is still bound to it on the screen, so that taking it off ends that draft and no
+    // later prompt carries a file the person no longer sees.
+    controls.leaveNextSendUnconfirmed()
+    await person.type(screen.getByRole('textbox', { name: 'Message this session' }), 'read the file')
+    await person.click(screen.getByRole('button', { name: /^Send/ }))
+    await waitFor(() => {
+      expect(controls.promptParams).toHaveLength(1)
+    })
+    await person.click(await screen.findByRole('button', { name: /^Remove kept.pdf/ }))
+    await waitFor(() => {
+      expect(controls.pairedUploads.ended).toEqual([SESSION])
+    })
+  })
+
   it('sends inline text when no file is bound', async () => {
     const { controls, person } = await open()
     await person.type(screen.getByRole('textbox', { name: 'Message this session' }), 'hello')
