@@ -2924,17 +2924,18 @@ async fn kr_req_13_12_a_send_is_not_resumed_on_a_connection_of_another_account()
     adopted.stop().await;
 }
 
-/// Two uploads of `earlier` hold the device's two places on the host and are paused, and the phone
-/// has made a connection that is not theirs. Answers that connection.
-async fn two_places_held_by(
+/// `count` uploads of `earlier` hold that many of the device's places on the host and are paused, and
+/// the phone has made a connection that is not theirs. Answers that connection.
+async fn places_held_by(
     adopted: &Adopted,
     phone: &Phone,
     desk: &Arc<Desk>,
     earlier: &Paired,
+    count: usize,
 ) -> Paired {
     let bytes = pattern(5);
     let mut gates = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..count {
         let (content, gate, release) = gated(&bytes);
         let sent = request(adopted, &bytes, content, kr_ipc::new_uuid());
         let (desk, earlier) = (Arc::clone(desk), earlier.clone());
@@ -2958,7 +2959,7 @@ async fn two_places_held_by(
             .iter()
             .filter(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
             .count()
-            == 2
+            == count
     })
     .await;
     newer
@@ -2983,7 +2984,7 @@ async fn kr_req_13_12_a_begin_refused_for_the_devices_count_frees_the_other_acco
             account: Some(AccountMark::from_bytes([1; 32])),
             ..paired.clone()
         };
-        let newer = two_places_held_by(&adopted, &phone, &desk, &earlier).await;
+        let newer = places_held_by(&adopted, &phone, &desk, &earlier, 2).await;
         let now = Paired {
             account: Some(AccountMark::from_bytes([2; 32])),
             ..newer
@@ -3040,6 +3041,101 @@ async fn kr_req_13_12_a_begin_refused_for_the_devices_count_frees_the_other_acco
             "what is kept is the published uploads of the new account ({together})"
         );
         assert_eq!(copies_in(&folder(&phone)), 0);
+        adopted.stop().await;
+    }
+}
+
+/// KR-REQ-13.12: a begin the host refuses for the size of the file or for the bytes the environment
+/// stages is not a refusal for the device's count of transfers, and no cancel of another account's
+/// upload could make it pass: no place is freed, nothing is read or cancelled on the host, the begin
+/// is not tried again and the other account's uploads are left. The host checks the size before the
+/// count and the staged bytes after it, so the staged bytes are reached with one place held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_begin_refused_for_a_size_limit_frees_no_place_and_is_not_tried_again() {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+
+    for (limit, limits, places) in [
+        (
+            "the size of a file",
+            kr_transfer::Limits {
+                max_file_len: 1,
+                ..kr_transfer::Limits::default()
+            },
+            2,
+        ),
+        (
+            "the bytes staged",
+            kr_transfer::Limits {
+                max_staged_len: 1,
+                ..kr_transfer::Limits::default()
+            },
+            1,
+        ),
+    ] {
+        let adopted = Adopted::start(1).await;
+        let (phone, control) = phone_for(&adopted).await;
+        let desk = desk_of(&phone.companion);
+        let paired = paired_of(&phone.companion).await;
+        let earlier = Paired {
+            account: Some(AccountMark::from_bytes([1; 32])),
+            ..paired.clone()
+        };
+        let newer = places_held_by(&adopted, &phone, &desk, &earlier, places).await;
+        let now = Paired {
+            account: Some(AccountMark::from_bytes([2; 32])),
+            ..newer
+        };
+        adopted
+            .host
+            .controller()
+            .transfer()
+            .service()
+            .set_limits(limits)
+            .expect("the host's limits are set");
+        let (reads, cancels, begins) = (
+            control.sent(Method::UploadStatus),
+            control.sent(Method::UploadCancel),
+            control.sent(Method::UploadBegin),
+        );
+        let bytes = pattern(3);
+        let sent = desk
+            .send(
+                now,
+                request(
+                    &adopted,
+                    &bytes,
+                    Arc::new(Held::new(bytes.clone())),
+                    kr_ipc::new_uuid(),
+                ),
+            )
+            .await;
+        assert!(
+            sent.as_ref()
+                .err()
+                .is_some_and(|error| error.message.contains("at most")),
+            "the host's refusal for {limit} is told as it is: {sent:?}"
+        );
+        assert_eq!(
+            control.sent(Method::UploadBegin) - begins,
+            1,
+            "the begin is not tried again ({limit})"
+        );
+        assert_eq!(
+            control.sent(Method::UploadCancel) - cancels,
+            0,
+            "nothing is cancelled ({limit})"
+        );
+        assert_eq!(
+            control.sent(Method::UploadStatus) - reads,
+            0,
+            "nothing is read ({limit})"
+        );
+        assert_eq!(
+            desk.open(&earlier.who()).len(),
+            places,
+            "the other account's uploads are left ({limit})"
+        );
         adopted.stop().await;
     }
 }

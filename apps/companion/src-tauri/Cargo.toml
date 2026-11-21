@@ -152,6 +152,9 @@ kr-shell-integration.workspace = true
 # The sync service the recovery suite talks to over loopback, answering as the Worker did when it
 # was recorded.
 kr-service-stand-in = { path = "../../../tests/support/service-stand-in" }
+# The limits of a host's transfer store, which a suite sets to make the host refuse a begin for the
+# size of a file or for the bytes staged.
+kr-transfer.workspace = true
 # The voice service's stand-in, which serves the control socket of a call on the daemon's behalf: its
 # route is kr-client's, included by path.
 futures-util.workspace = true
