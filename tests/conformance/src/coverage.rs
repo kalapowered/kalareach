@@ -535,6 +535,15 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
         return Err("gives `--exclude` without `--workspace`, which Cargo refuses".to_owned());
     }
     let mut selection = read.selection;
+    // `--all-targets` takes the library and every kind whole, as each plural flag does, and Cargo
+    // reads no singular flag beside it.
+    if selection.all_targets {
+        selection.lib = true;
+        selection.bins = Rule::All;
+        selection.examples = Rule::All;
+        selection.tests = Rule::All;
+        selection.benches = Rule::All;
+    }
     // A plural flag takes every target of its kind and Cargo reads no name beside it, so only the
     // names of a kind that no plural flag takes are read as patterns.
     for (rule, names) in [
@@ -702,8 +711,19 @@ impl Selection {
     /// benchmarked, a library and the binaries among them; a singular flag takes the targets whose
     /// name it matches, and any of them builds the target to test it whatever its manifest says.
     fn selects_target(&self, package: &Package, target: &Target) -> bool {
-        // Cargo leaves out a target whose features are not on, however the command asks for it.
-        if !target.required_features.is_empty() {
+        let name = &target.id.name;
+        // Cargo leaves out a target whose features are not on when the command takes it by default,
+        // by a plural flag or by a test name. When `--bin`, `--example`, `--test` or `--bench` names
+        // it, Cargo refuses the command instead, so the target stays covered and the step's failure
+        // is the reason of its tests.
+        let named = match target.id.kind {
+            TargetKind::Lib => false,
+            TargetKind::Bin => self.bins.names(name),
+            TargetKind::Example => self.examples.names(name),
+            TargetKind::Test => self.tests.names(name),
+            TargetKind::Bench => self.benches.names(name),
+        };
+        if !named && !target.required_features.is_empty() {
             let on = self.enabled(package);
             if !target
                 .required_features
@@ -717,7 +737,6 @@ impl Selection {
             return target.tested_by_default;
         }
         let all = self.all_targets;
-        let name = &target.id.name;
         let by_kind = match target.id.kind {
             TargetKind::Lib => self.lib || all,
             TargetKind::Bin => all || self.bins.holds(name),
@@ -1028,6 +1047,43 @@ mod tests {
     }
 
     #[test]
+    fn all_targets_takes_every_kind_whole_and_reads_no_singular_flag_beside_it() {
+        use TargetKind::{Bench, Lib, Test};
+        let packages = [package(
+            "a",
+            vec![
+                target("a", Lib, "a", true),
+                target("a", Test, "t", true),
+                target("a", Test, "off", false),
+                target("a", Bench, "nb", false),
+            ],
+            &["a"],
+        )];
+        let members: Vec<&Package> = packages.iter().collect();
+        let found = |line: &str| -> Vec<String> {
+            parse(&words(line))
+                .unwrap_or_else(|why| panic!("{line}: {why}"))
+                .covers(&members)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        let all = found("cargo test --all-targets");
+        assert_eq!(all, ["a --lib", "a --test t", "a --bench nb"]);
+        for line in [
+            "cargo test --all-targets --test off",
+            "cargo test --test off --all-targets",
+            "cargo test --all-targets --bench nb --test t",
+            "cargo test --all-targets --test ***",
+            "cargo test --bench *** --all-targets",
+        ] {
+            assert_eq!(found(line), all, "{line}");
+        }
+        // Without it, a singular flag takes its target whatever its manifest says.
+        assert_eq!(found("cargo test --test off"), ["a --test off"]);
+    }
+
+    #[test]
     fn a_target_the_manifest_tests_by_default_is_covered_by_a_command_that_names_none() {
         use TargetKind::{Bench, Example, Lib};
         let packages = [package(
@@ -1261,8 +1317,15 @@ mod tests {
             found("cargo test --all-features"),
             a(&["lib", "d", "f", "fd", "g", "free"])
         );
-        assert_eq!(found("cargo test --test f"), Vec::<String>::new());
+        // A singular flag that names a target whose features are off keeps it covered: Cargo refuses
+        // the command, and the step's failure is the reason of the target's tests.
+        assert_eq!(found("cargo test --test f"), a(&["f"]));
+        assert_eq!(found("cargo test --test f*"), a(&["f", "fd", "free"]));
         assert_eq!(found("cargo test --test f --features f"), a(&["f"]));
+        assert_eq!(
+            found("cargo test --tests --test f"),
+            a(&["lib", "d", "free"])
+        );
         let own = |line: &str, package: &str| -> Vec<String> {
             found(line)
                 .into_iter()
