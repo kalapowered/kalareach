@@ -475,6 +475,7 @@ mod tests {
     }
 
     #[test]
+        &kr_client::uploads::NoJournal,
     fn a_name_is_the_last_component_and_never_a_path() {
         assert_eq!(file_name(Path::new("/tmp/pictures/a.png")), "a.png");
         assert_eq!(file_name(Path::new("/")), "attachment");

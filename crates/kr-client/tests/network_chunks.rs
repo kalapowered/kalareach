@@ -783,6 +783,7 @@ async fn an_upload_goes_on_a_stream_after_the_host_said_it_takes_one() {
         &mut upload,
         TTL,
         &progress,
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect("the upload reaches a handle");
@@ -952,6 +953,7 @@ async fn a_stream_the_client_reset_is_replaced_and_only_the_rest_is_sent() {
         &mut upload,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect("the upload reaches a handle");
@@ -976,6 +978,103 @@ async fn a_stream_the_client_reset_is_replaced_and_only_the_rest_is_sent() {
     });
 }
 
+/// A journal that writes down what it is told, and refuses the step it is told to.
+#[derive(Default)]
+struct Recording {
+    told: Mutex<Vec<String>>,
+    refuse: Option<&'static str>,
+}
+
+impl Recording {
+    fn tell(&self, step: &'static str) -> kr_client::Result<()> {
+        self.told.lock().expect("the list").push(step.to_owned());
+        if self.refuse == Some(step) {
+            return Err(ClientError::Host(ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                "the caller could not keep it",
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl uploads::Journal for Recording {
+    fn beginning(&self) -> kr_client::Result<()> {
+        self.tell("beginning")
+    }
+
+    fn begun(&self, _transfer_id: TransferId) -> kr_client::Result<()> {
+        self.tell("begun")
+    }
+
+    fn finishing(&self, _transfer_id: TransferId) -> kr_client::Result<()> {
+        self.tell("finishing")
+    }
+
+    fn published(
+        &self,
+        _handle: &kr_protocol::transfer::AttachmentHandle,
+    ) -> kr_client::Result<()> {
+        self.tell("published")
+    }
+}
+
+/// KR-REQ-23.21: the journal is told of each step in order, and a step it refuses to keep is not
+/// taken: a refused `beginning` sends no `upload.begin`, and a refused `finishing` sends no
+/// `upload.finish`.
+#[tokio::test]
+async fn the_journal_is_told_before_each_call_that_needs_it_and_a_refusal_stops_the_send() {
+    let first = pair(Script::new(true)).await;
+    let route = ChunkRoute::network(&first.session, environment())
+        .await
+        .expect("a route");
+    let journal = Recording::default();
+    within(uploads::send(
+        &first.session,
+        &route,
+        &target(),
+        &mut plan(THREE_CHUNKS),
+        TTL,
+        &unwatched(),
+        &journal,
+    ))
+    .await
+    .expect("the upload reaches a handle");
+    assert_eq!(
+        *journal.told.lock().expect("the list"),
+        ["beginning", "begun", "finishing", "published"]
+    );
+    first.session.close();
+
+    for (step, begins, finishes) in [("beginning", 0, 0), ("finishing", 1, 0)] {
+        let fresh = pair(Script::new(true)).await;
+        let route = ChunkRoute::network(&fresh.session, environment())
+            .await
+            .expect("a route");
+        let journal = Recording {
+            refuse: Some(step),
+            ..Recording::default()
+        };
+        let refused = within(uploads::send(
+            &fresh.session,
+            &route,
+            &target(),
+            &mut plan(THREE_CHUNKS),
+            TTL,
+            &unwatched(),
+            &journal,
+        ))
+        .await
+        .err()
+        .expect("the send stops");
+        assert_eq!(refused.code(), ErrorCode::ResourceUnavailable, "{step}");
+        fresh.script.seen(|seen| {
+            assert_eq!((seen.begins, seen.finishes), (begins, finishes), "{step}");
+        });
+        fresh.session.close();
+    }
+}
+
 /// The host refused a chunk's window before its replacement reached the client: the host issues the
 /// replacement right after, and the chunk goes again under it and not under the refused one.
 #[tokio::test]
@@ -990,7 +1089,15 @@ async fn a_window_the_host_refused_is_replaced_by_one_it_issued_since() {
     let mut upload = plan(THREE_CHUNKS);
     let at = target();
     let progress = unwatched();
-    let sending = uploads::send(&pair.session, &route, &at, &mut upload, TTL, &progress);
+    let sending = uploads::send(
+        &pair.session,
+        &route,
+        &at,
+        &mut upload,
+        TTL,
+        &progress,
+        &kr_client::uploads::NoJournal,
+    );
     let renewing = async {
         script
             .until("a chunk under the first window", |seen| {
@@ -1225,7 +1332,15 @@ async fn a_host_that_holds_a_chunk_ends_the_lane_at_the_clients_bound() {
     let mut upload = plan(UPLOAD_CHUNK_LEN);
     let at = target();
     let progress = unwatched();
-    let sending = uploads::send(&pair.session, &route, &at, &mut upload, TTL, &progress);
+    let sending = uploads::send(
+        &pair.session,
+        &route,
+        &at,
+        &mut upload,
+        TTL,
+        &progress,
+        &kr_client::uploads::NoJournal,
+    );
     // The wait for the answer is cut once the host holds the chunk: a chunk the host has not read
     // yet is not one it holds.
     let cutting = async {
@@ -1427,6 +1542,7 @@ async fn a_stream_the_host_refuses_ends_in_the_status_and_is_not_opened_again() 
         &mut upload,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect_err("an upload the host ended cannot go on");
@@ -1458,6 +1574,7 @@ async fn a_chunk_with_an_unknown_outcome_is_decided_by_the_status_alone() {
             &mut upload,
             TTL,
             &unwatched(),
+            &kr_client::uploads::NoJournal,
         ))
         .await
         .expect("the upload reaches a handle");
@@ -1824,7 +1941,15 @@ async fn a_sign_out_that_reads_as_a_refused_window_reaches_the_caller_of_send_as
 
     let mut upload = plan(THREE_CHUNKS);
     let progress = unwatched();
-    let sending = uploads::send(&session, &route, &at, &mut upload, TTL, &progress);
+    let sending = uploads::send(
+        &session,
+        &route,
+        &at,
+        &mut upload,
+        TTL,
+        &progress,
+        &kr_client::uploads::NoJournal,
+    );
     let signing_out = async {
         script
             .until("the reservation", |seen| seen.begins == 1)
@@ -1961,6 +2086,7 @@ async fn a_sign_out_between_a_lane_failure_and_the_status_read_reaches_the_calle
         &mut upload,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect_err("the upload ends with the sign-out");
@@ -2001,6 +2127,7 @@ async fn a_finish_the_status_does_not_show_published_ends_the_send_with_the_host
         &mut upload,
         TTL,
         &progress,
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect_err("the host cannot say what became of the finish, and the status shows no handle");
@@ -2017,6 +2144,7 @@ async fn a_finish_the_status_does_not_show_published_ends_the_send_with_the_host
         &mut upload,
         TTL,
         &progress,
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect("the next send reads the status, finishes and returns the handle");
@@ -2061,6 +2189,7 @@ async fn a_finish_that_a_sign_out_leaves_unanswered_is_submission_uncertain() {
         &mut upload,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect_err("the finish is not answered");
@@ -2114,6 +2243,7 @@ async fn a_finish_that_a_lost_connection_leaves_unanswered_is_submission_uncerta
         &mut upload,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect_err("the finish is not answered");
@@ -2166,6 +2296,7 @@ async fn a_status_read_that_a_sign_out_stops_after_an_unknown_finish_leaves_the_
         &mut upload,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     ))
     .await
     .expect_err("the host cannot say what became of the finish, and the status read is stopped");
@@ -2203,7 +2334,15 @@ async fn a_finish_the_host_took_and_did_not_answer_before_the_connection_ended_i
     let mut upload = plan(THREE_CHUNKS);
     let at = target();
     let progress = unwatched();
-    let sending = uploads::send(&pair.session, &route, &at, &mut upload, TTL, &progress);
+    let sending = uploads::send(
+        &pair.session,
+        &route,
+        &at,
+        &mut upload,
+        TTL,
+        &progress,
+        &kr_client::uploads::NoJournal,
+    );
     let ending = async {
         script.until("the finish", |seen| seen.finishes == 1).await;
         pair.session.close();

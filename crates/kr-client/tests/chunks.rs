@@ -828,6 +828,7 @@ async fn a_full_chunk_travels_on_the_lane_under_the_window_the_host_renewed() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect("the upload reaches a handle");
@@ -1049,6 +1050,7 @@ async fn the_driver_resumes_from_the_status_bitmap_after_its_lane_drops() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect("the upload resumes and reaches a handle");
@@ -1077,6 +1079,7 @@ async fn a_plan_that_holds_a_transfer_starts_from_status() {
         &mut first,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect("the upload reaches a handle");
@@ -1093,6 +1096,7 @@ async fn a_plan_that_holds_a_transfer_starts_from_status() {
         &mut resumed,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect("the resumed plan reaches the published handle");
@@ -1120,6 +1124,7 @@ async fn an_uncertain_reservation_is_never_reserved_again() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("the reservation's reply was lost");
@@ -1138,6 +1143,7 @@ async fn an_uncertain_reservation_is_never_reserved_again() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("a new session does not reserve again either");
@@ -1162,6 +1168,7 @@ async fn never_reserved_twice(reply: Reply) -> ClientError {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("the reservation has no definite answer");
@@ -1174,6 +1181,7 @@ async fn never_reserved_twice(reply: Reply) -> ClientError {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("the same session does not reserve again");
@@ -1186,6 +1194,7 @@ async fn never_reserved_twice(reply: Reply) -> ClientError {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("a new session does not reserve again either");
@@ -1227,6 +1236,7 @@ async fn a_reservation_whose_receipt_says_it_never_took_effect_may_be_asked_for_
             &mut plan,
             TTL,
             &unwatched(),
+            &kr_client::uploads::NoJournal,
         )
         .await
         .expect_err("the host's receipt refuses the reservation");
@@ -1248,6 +1258,7 @@ async fn a_reservation_whose_receipt_says_it_never_took_effect_may_be_asked_for_
             &mut plan,
             TTL,
             &unwatched(),
+            &kr_client::uploads::NoJournal,
         )
         .await;
         assert_eq!(host.seen().reservations, 2, "{state:?}: it asked again");
@@ -1269,7 +1280,15 @@ async fn a_reservation_abandoned_in_flight_is_never_reserved_again() {
     let target = host.target();
     {
         let progress = unwatched();
-        let first = uploads::send(&session, &route, &target, &mut plan, TTL, &progress);
+        let first = uploads::send(
+            &session,
+            &route,
+            &target,
+            &mut plan,
+            TTL,
+            &progress,
+            &kr_client::uploads::NoJournal,
+        );
         tokio::pin!(first);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -1294,6 +1313,7 @@ async fn a_reservation_abandoned_in_flight_is_never_reserved_again() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("the plan does not reserve again");
@@ -1324,6 +1344,7 @@ async fn a_reservation_that_never_left_the_client_may_be_asked_for_again() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("a session with no window sends no reservation");
@@ -1352,6 +1373,7 @@ async fn a_refused_reservation_may_be_asked_for_again() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("the host refuses a reservation for another environment");
@@ -1622,6 +1644,7 @@ async fn a_chunk_refused_for_its_window_goes_once_more_on_a_new_lane() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect("the upload goes on over a new lane");
@@ -1651,6 +1674,7 @@ async fn a_chunk_refused_on_the_new_lane_too_ends_the_upload() {
         &mut plan,
         TTL,
         &unwatched(),
+        &kr_client::uploads::NoJournal,
     )
     .await
     .expect_err("the host refuses every chunk");
