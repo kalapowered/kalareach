@@ -68,7 +68,12 @@ impl Page {
 /// A managed session at an empty prompt, a view of it that has taken control, and the reader's
 /// proof of the fence that control asks for.
 async fn controlled() -> (Hosted, Page, String) {
-    let mut hosted = hosted("exec cat").await;
+    controlled_by("exec cat").await
+}
+
+/// The same, for a session whose shell runs `script`.
+async fn controlled_by(script: &str) -> (Hosted, Page, String) {
+    let mut hosted = hosted(script).await;
     hosted.enters_the_prompt().await;
     let page = Page::new(hosted.temp.environment());
     let view = page.showing(hosted.session_id, FIRST).await;
@@ -329,4 +334,67 @@ async fn a_named_command_press_is_refused_exactly_as_a_profile_press_is() {
         );
         assert_eq!(codes[0], wanted, "{state}");
     }
+}
+
+/// The text the session draws as its next prompt.
+const NEXT_PROMPT: &str = "next-prompt> ";
+
+/// KR-REQ-13.11: a prompt the session draws after a view has read the surface is shown by the next
+/// read. The view reads the prompt the reader reported; the session's script then writes the text of
+/// the next prompt and the view publishes a state that holds it; the reader leaves the line it
+/// accepted, enters the next prompt and proves a fence at it. The next read of the surface answers
+/// the new prompt generation and not the one the first read saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prompt_the_session_draws_after_a_view_has_read_the_surface_is_shown_by_the_next_read() {
+    let (mut hosted, page, view) =
+        controlled_by(&format!("read go; printf '{NEXT_PROMPT}'; exec cat")).await;
+
+    let first = page.surface(&view).await;
+    assert_eq!(first["surface"]["editor"]["state"], "verified", "{first}");
+    assert_eq!(
+        first["surface"]["editor"]["prompt_generation"],
+        PROMPT.to_string(),
+        "{first}"
+    );
+
+    // Return ends the line the script reads, and the script writes the next prompt's text. The view
+    // publishes a state that holds it before the reader moves on, as a shell draws its prompt before
+    // its reader enters it, so that nothing is drawn after the fence the reader proves.
+    page.enter(&view).await;
+    page.newest(FIRST, |state| {
+        Page::lines(state)
+            .iter()
+            .any(|line| line.contains(NEXT_PROMPT.trim_end()))
+    })
+    .await;
+    let leaving = RootEditorLeaveParams {
+        session_id: hosted.session_id,
+        prompt_generation: PromptGeneration::new(PROMPT),
+        reader_revision: ReaderRevision::new(hosted.reader.numbers.reader_revision),
+        reason: EditorLeaveReason::CommandAccepted,
+    };
+    hosted
+        .reader
+        .bridge
+        .send_event(BridgeEvent::EditorLeave(leaving))
+        .await
+        .expect("the reader leaves");
+    hosted.settled().await;
+    hosted.reader.numbers.prompt_generation = PROMPT + 1;
+    hosted
+        .reader
+        .enters()
+        .await
+        .expect("the reader enters the next prompt");
+    hosted.proves_a_fence().await;
+
+    let next = page.surface(&view).await;
+    assert_eq!(next["state"], "served", "{next}");
+    assert_eq!(next["surface"]["editor"]["state"], "verified", "{next}");
+    assert_eq!(
+        next["surface"]["editor"]["prompt_generation"],
+        (PROMPT + 1).to_string(),
+        "{next}"
+    );
+    hosted.close().await;
 }
