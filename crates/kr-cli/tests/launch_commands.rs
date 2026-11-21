@@ -551,10 +551,19 @@ async fn kr_launch_add_remove_and_list_are_refused_inside_a_session_and_change_n
     let kept = std::fs::read(host.file()).expect("the file");
 
     let session = "9f8e7d6c-5b4a-4938-8271-605f4e3d2c1b";
-    for line in [
-        vec!["launch", "list"],
-        vec!["launch", "add", "Other", "--", "other"],
-        vec!["launch", "remove", "Claude"],
+    for (line, because) in [
+        (
+            vec!["launch", "list"],
+            "so launch commands are listed only outside a session",
+        ),
+        (
+            vec!["launch", "add", "Other", "--", "other"],
+            "so launch commands are added and removed only outside a session",
+        ),
+        (
+            vec!["launch", "remove", "Claude"],
+            "so launch commands are added and removed only outside a session",
+        ),
     ] {
         let output = host
             .command(&[("KR_SESSION", session)], &line)
@@ -564,7 +573,8 @@ async fn kr_launch_add_remove_and_list_are_refused_inside_a_session_and_change_n
         assert_eq!(status, Some(8), "{line:?}: {text}{said}");
         assert_eq!(text, "", "{line:?}: nothing is listed or said as done");
         assert!(
-            said.contains("KR_SESSION is set, so this is inside a KalaReach session; a saved"),
+            said.contains("KR_SESSION is set, so this is inside a KalaReach session; a saved")
+                && said.contains(because),
             "{line:?}: {said}"
         );
         let mut as_a_document = vec!["--json"];
