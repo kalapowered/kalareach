@@ -46,15 +46,12 @@ export const DRAFT_GONE_FOR_TEXT =
 export const NO_DRAFT = 'this device keeps no draft for this session: add a file to it first'
 
 /**
- * What the application says when the draft the device keeps for a session cannot be read. It comes
- * with the code of a missing right, so it is shown in its own words and not as a right the device lacks.
+ * The draft this device kept for the session cannot be read: another release wrote it, or it is
+ * damaged. The application refuses with the code of a missing right, so it is shown in its own words
+ * and not as a right the device lacks.
  */
-export const DRAFT_UNREADABLE =
-  'this device keeps a draft for this session that this release cannot read: another release wrote it, or it is damaged'
-
-/** The draft this device kept for the session is of a later release. */
 export const NEWER_DRAFT =
-  'this device keeps a draft for this session in a format this release does not read: update the application to use it'
+  'this device keeps a draft for this session that this release cannot read: another release wrote it, or it is damaged'
 
 /** The draft changed twice while a file was being added to it. */
 export const CHANGED_AGAIN = 'the draft changed again while the file was being added: the file was not added'
@@ -123,8 +120,7 @@ const APPLICATION_WORDS: readonly (readonly [string, RefusalKind])[] = [
   [CHANGED_AGAIN, 'other'],
   [CREATE_PENDING, 'other'],
   [DISCARD_PENDING, 'other'],
-  [UPDATE_THE_HOST_TO_END_A_DRAFT, 'other'],
-  [DRAFT_UNREADABLE, 'other']
+  [UPDATE_THE_HOST_TO_END_A_DRAFT, 'other']
 ]
 
 /**

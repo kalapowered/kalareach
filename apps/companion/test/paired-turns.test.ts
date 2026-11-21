@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { fakeHost } from '../src/host/fake'
 import type { AttachmentHandle } from '../src/host/port'
 import { PairedUploads, type UploadRow } from '../src/model/paired-uploads'
-import { DRAFT_UNREADABLE, sentence } from '../src/model/transfer-words'
+import { NEWER_DRAFT, sentence } from '../src/model/transfer-words'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const subject = { sessionId: SESSION, sessionEpoch: '1' }
@@ -175,12 +175,12 @@ describe('the reconciliation of a session with the draft the device keeps', () =
 
   it('says the application’s own words for a kept draft it cannot read, not a right the device lacks', async () => {
     // The application refuses it with the code of a missing right.
-    const failure = { code: 'PERMISSION_DENIED', message: DRAFT_UNREADABLE }
+    const failure = { code: 'PERMISSION_DENIED', message: NEWER_DRAFT }
     const { uploads, note } = attached(() => Promise.reject(failure))
     note('C', false)
     await uploads.bind('C', handle('C'), () => Promise.resolve())
     expect(uploads.ready(SESSION)).toBe(false)
-    expect(uploads.snapshot().get('C')?.phase).toEqual({ kind: 'kept', words: sentence(DRAFT_UNREADABLE) })
+    expect(uploads.snapshot().get('C')?.phase).toEqual({ kind: 'kept', words: sentence(NEWER_DRAFT) })
   })
 
   it('starts one for a bind that finds none in this cycle', async () => {
