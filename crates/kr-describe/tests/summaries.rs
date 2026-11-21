@@ -18,7 +18,9 @@ use kr_describe::profile::catalogue::MetGates;
 use kr_describe::prompt::{Prompt, PromptKind};
 use kr_describe::queue::{Enqueued, Priority, Scheduler};
 use kr_describe::resource::ResourceSettings;
-use kr_describe::service::{Answered, DescriptionService, Instruction, Outcome, ProcessEnd, Work};
+use kr_describe::service::{
+    Answered, DescriptionService, Instruction, Outcome, ProcessEnd, RESTART_FIRST_MS, Work,
+};
 use kr_describe::store::DescriptionStore;
 use kr_describe::summary::{
     MAX_SUMMARIES_PER_SESSION, MAX_SUMMARY_CHANGES, SummaryAsk, SummaryAsked, SummaryChange,
@@ -583,7 +585,20 @@ fn a_summary_is_judged_against_what_is_in_force_when_it_arrives() {
             session_id: session(1)
         })
     );
-    assert!(service.scheduler().has_queued(&session(1)));
+    let Instruction::Generate { request, .. } = loaded(&mut service, at(100 + RESTART_FIRST_MS))
+    else {
+        panic!("the summary is sent again");
+    };
+    assert_eq!(request.prompt.kind, PromptKind::Summary);
+    assert_eq!(request.grammar, SUMMARY_GRAMMAR);
+    assert_eq!(
+        (
+            request.prompt.cursor_from.get(),
+            request.prompt.cursor_to.get()
+        ),
+        (10, 14),
+        "the same summary, from the queue it was taken from"
+    );
 }
 
 /// KR-REQ-18.02: a request for a session the service does not track, or on a host that selected no
