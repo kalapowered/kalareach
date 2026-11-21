@@ -322,14 +322,6 @@ fn next_value(words: &[&str], at: &mut usize, flag: &str) -> Result<String, Stri
     }
 }
 
-/// A value that a flag was given, with the index of the word of the command that held it, so that a
-/// step's list of the words that hold a placeholder says which values the run gives.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Given {
-    value: String,
-    word: usize,
-}
-
 /// What the words of a command hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Part {
@@ -390,7 +382,7 @@ impl Rule {
 }
 
 /// What a `cargo test` command selects, read from its words.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Selection {
     packages: Packages,
     lib: bool,
@@ -400,14 +392,9 @@ pub struct Selection {
     benches: Rule,
     all_targets: bool,
     /// The features that `--features` names, each as written: `f` or `<package>/f`.
-    features: Vec<Given>,
+    features: Vec<String>,
     all_features: bool,
     no_default_features: bool,
-    release: bool,
-    profile: Option<Given>,
-    /// Each `--target`: Cargo builds for every one.
-    targets: Vec<Given>,
-    configs: Vec<Given>,
     /// Every flag and test name before `--`, in the order the command gave them.
     spans: Vec<Span>,
 }
@@ -427,10 +414,8 @@ struct Parsed {
 }
 
 impl Parsed {
-    /// Takes `flag`, the first of its spellings, with its value, which the word at `word` of the
-    /// command holds: empty for a flag that takes none.
-    fn give(&mut self, flag: &str, value: String, word: usize) -> Result<(), String> {
-        let given = |value: String| Given { value, word };
+    /// Takes `flag`, the first of its spellings, with its value: empty for a flag that takes none.
+    fn give(&mut self, flag: &str, value: String) -> Result<(), String> {
         let selection = &mut self.selection;
         match flag {
             "--manifest-path" => {
@@ -460,17 +445,13 @@ impl Parsed {
             "--benches" => selection.benches = Rule::All,
             "--bench" => self.bench_names.push(value),
             "--all-targets" => selection.all_targets = true,
-            "--release" => selection.release = true,
             "--all-features" => selection.all_features = true,
             "--no-default-features" => selection.no_default_features = true,
-            "--profile" => selection.profile = Some(given(value)),
-            "--target" => selection.targets.push(given(value)),
-            "--config" => selection.configs.push(given(value)),
             "--features" => selection.features.extend(
                 value
                     .split(|one: char| one == ',' || one.is_whitespace())
                     .filter(|item| !item.is_empty())
-                    .map(|item| given(item.to_owned())),
+                    .map(str::to_owned),
             ),
             _ => {}
         }
@@ -511,10 +492,6 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
             features: Vec::new(),
             all_features: false,
             no_default_features: false,
-            release: false,
-            profile: None,
-            targets: Vec::new(),
-            configs: Vec::new(),
             spans: Vec::new(),
         },
         named: Vec::new(),
@@ -571,7 +548,7 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
                 last: at_word,
                 part: part_of(flag),
             });
-            read.give(flag, value, at_word)?;
+            read.give(flag, value)?;
         } else {
             // Short flags may be written together, as `-qp a`: each takes the next letter, until one
             // takes a value, which is the rest of the word or, with none, the next word.
@@ -586,7 +563,7 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
                 refused(flag, &spelling)?;
                 rest = &rest[letter.len_utf8()..];
                 if takes == Takes::No {
-                    read.give(flag, String::new(), here)?;
+                    read.give(flag, String::new())?;
                     continue;
                 }
                 // `-F=` gives an empty list of features, and the next word is not its value.
@@ -603,7 +580,7 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
                     value
                 };
                 last = at_word;
-                read.give(flag, value, at_word)?;
+                read.give(flag, value)?;
                 break;
             }
             read.selection.spans.push(Span {
@@ -774,7 +751,7 @@ impl Selection {
         } else if !self.no_default_features {
             pending.push("default".to_owned());
         }
-        for item in self.features.iter().map(|item| &item.value) {
+        for item in &self.features {
             match item.split_once('/') {
                 None => pending.push(item.clone()),
                 Some((owner, feature)) if owner.trim_end_matches('?') == package.name => {
