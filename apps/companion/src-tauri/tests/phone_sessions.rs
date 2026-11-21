@@ -4847,6 +4847,55 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
     adopted.stop().await;
 }
 
+/// KR-REQ-19.08: a choice that is refused, because the pairing it names is not the one this computer
+/// holds, leaves the sessions a person has open on the host in use as they are: the link of an open
+/// session stays, and the owner's revision does not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_refused_choice_leaves_the_sessions_open_on_the_host_in_use() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, _control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let reference = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen")["hosts"][0]["reference"]
+        .as_str()
+        .expect("a host")
+        .to_owned();
+
+    let opened = opening_call(companion, session, None, "before-the-stale-choice")
+        .await
+        .expect("the call ran")
+        .expect("the host opens the session");
+    assert_eq!(opened["state"], "open", "{opened}");
+    assert_eq!(state.paired_links().opened(), 1, "the session is open");
+    let before = state.contact_owner().revision();
+
+    // The listing the choice was made from names another pairing with the same host.
+    let mut stale = companion
+        .device()
+        .host_by_reference(&reference)
+        .expect("the pairing is listed");
+    stale.device_id =
+        kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([42; 16]));
+    let refused = companion_tauri::hosts::use_host(companion.app.handle(), stale).await;
+    assert!(refused.is_err(), "the stale choice is refused");
+    assert_eq!(
+        state.contact_owner().revision(),
+        before,
+        "the refused choice made no revision"
+    );
+    assert_eq!(
+        state.paired_links().opened(),
+        1,
+        "the refused choice left the open session's link as it was"
+    );
+    adopted.stop().await;
+}
+
 /// KR-REQ-19.08: a session opened while a choice of host is still letting go of the sessions of the
 /// host before keeps its link. The owner has accepted the choice and told the page, and only then is
 /// the choice's cleanup let through: the opening waits for the choice to finish, and is admitted for
