@@ -8,18 +8,21 @@
  * nothing was sent.
  */
 
+import { useEffect } from 'react'
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { App } from '../src/App'
-import { AppProvider, type Place } from '../src/app/state'
+import { AppProvider, useApp, type Place } from '../src/app/state'
 import { FakeChannelMessageStore } from '../src/host/fake-channel-messages'
 import { FakeDraftStore } from '../src/host/fake-drafts'
 import { fakeHost } from '../src/host/fake'
 import type { ChannelMessageKeep, HostPort } from '../src/host/port'
 import { ChannelShelf, EMPTY_SHELF, MANY_HOLDS, type ShelfSnapshot } from '../src/model/channel-messages'
 import { keptEntry } from '../src/model/draft-book'
+import type { InputState, Submission } from '../src/model/receipts'
+import type { SessionStates } from '../src/model/sessions'
 
 const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
@@ -45,8 +48,23 @@ interface Counts {
   draftSave: number
 }
 
+/** Hands the test the window's rows of sends, which a part of the page reads and writes. */
+function Probe({ give }: { readonly give: (states: SessionStates) => void }): null {
+  const { sessions } = useApp()
+  useEffect(() => {
+    give(sessions)
+  }, [give, sessions])
+  return null
+}
+
+/** A row of this window's, for the record `holdId`, in `state`. */
+function rowFor(holdId: string, state: InputState): Submission {
+  return { localId: `s-${holdId}`, actionId: null, label: 'a message', text: 'a message', state, createdAtMs: 0, error: null, holdId }
+}
+
 function startOver(of: World, place: Place = KEPT_PAGE, wrap?: (port: HostPort) => HostPort) {
   const counts: Counts = { submit: 0, queue: 0, draftSave: 0 }
+  const grabbed: { states: SessionStates | null } = { states: null }
   const host = fakeHost({ drafts: of.drafts, channelMessages: of.messages })
   const counted: HostPort = {
     ...host.port,
@@ -66,9 +84,18 @@ function startOver(of: World, place: Place = KEPT_PAGE, wrap?: (port: HostPort) 
   const view = render(
     <AppProvider port={wrap ? wrap(counted) : counted} initialPlace={place}>
       <App />
+      <Probe
+        give={(held) => {
+          grabbed.states = held
+        }}
+      />
     </AppProvider>
   )
-  return { ...host, view, counts }
+  const states = (): SessionStates => {
+    if (grabbed.states === null) throw new Error('the application did not render')
+    return grabbed.states
+  }
+  return { ...host, view, counts, states }
 }
 
 /** What the host's store was asked, of one kind. */
@@ -594,6 +621,54 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     await waitFor(() => {
       expect(of.messages.allHolds().map((each) => each.holdId)).toEqual(['hold-main'])
     })
+  })
+
+  it('K10e offers Remove on a record only for a row that is unknown or gone, and removing it drops the row', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    keepHold(of, MAIN, 'hold-waits')
+    keepHold(of, MAIN, 'hold-unknown')
+    keepHold(of, MAIN, 'hold-no-row')
+    const { states } = startOver(of)
+    expect(await screen.findAllByTestId('channel-hold')).toHaveLength(3)
+    // The first record's row is still waiting for its answer, as a queued or a sent one is.
+    act(() => {
+      states().update(MAIN, (current) => ({
+        ...current,
+        submissions: [rowFor('hold-waits', 'queued'), rowFor('hold-unknown', 'unknown')]
+      }))
+    })
+    await waitFor(() => {
+      expect(screen.getAllByTestId('channel-hold-remove')).toHaveLength(2)
+    })
+    let records = screen.getAllByTestId('channel-hold')
+    expect(within(records[0]).queryByTestId('channel-hold-remove')).toBeNull()
+    act(() => {
+      states().update(MAIN, (current) => ({
+        ...current,
+        submissions: [rowFor('hold-waits', 'sent'), rowFor('hold-unknown', 'unknown')]
+      }))
+    })
+    records = screen.getAllByTestId('channel-hold')
+    expect(within(records[0]).queryByTestId('channel-hold-remove')).toBeNull()
+    expect(within(records[1]).getByTestId('channel-hold-remove')).toBeVisible()
+    expect(within(records[2]).getByTestId('channel-hold-remove')).toBeVisible()
+    // A press on an unknown row's record: nothing at the first, then the record and the row go.
+    const remove = within(records[1]).getByTestId('channel-hold-remove')
+    await person.click(remove)
+    expect(asked(of, 'hold-clear')).toBe(0)
+    expect(states().submissionsOf(MAIN).map((row) => row.holdId)).toEqual(['hold-waits', 'hold-unknown'])
+    await person.click(remove)
+    await waitFor(() => {
+      expect(of.messages.allHolds().map((each) => each.holdId)).toEqual(['hold-waits', 'hold-no-row'])
+    })
+    expect(states().submissionsOf(MAIN).map((row) => row.holdId)).toEqual(['hold-waits'])
+    // The waiting row is unknown at last: its record can go.
+    act(() => {
+      states().update(MAIN, (current) => ({ ...current, submissions: [rowFor('hold-waits', 'unknown')] }))
+    })
+    records = screen.getAllByTestId('channel-hold')
+    expect(within(records[0]).getByTestId('channel-hold-remove')).toBeVisible()
   })
 
   it('K10b keeps a record whose removal the device refused, and says so', async () => {

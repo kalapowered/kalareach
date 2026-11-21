@@ -29,6 +29,7 @@ import { ManualPaths } from '../model/manual-paths'
 import { QuestionForms } from '../model/question-forms'
 import { Openings } from '../model/openings'
 import { ReceiptReads } from '../model/receipt-reads'
+import type { Submission } from '../model/receipts'
 import { SessionStates, type SessionState } from '../model/sessions'
 import { ConfirmationStore } from '../pairing/confirmationStore'
 import { applyMode, modeApplications } from '../theme-init'
@@ -393,6 +394,15 @@ export function useKeptPlace(sessionId: string): KeptPlace {
       }
     }),
     [sessions, sessionId]
+  )
+}
+
+/** What this device has sent to one session, read without making a state for it. */
+export function useSubmissions(sessionId: string): readonly Submission[] {
+  const { sessions } = useApp()
+  return useSyncExternalStore(
+    useCallback((listener) => sessions.subscribe(listener), [sessions]),
+    () => sessions.submissionsOf(sessionId)
   )
 }
 

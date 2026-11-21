@@ -22,12 +22,13 @@ import type { SessionListResult } from '@kalareach/protocol'
 
 import { useChannelMessages, useChannelShelf } from '../app/channel-messages'
 import { useBook, useDraftBook } from '../app/drafts'
-import { useApp } from '../app/state'
+import { useApp, useSubmissions } from '../app/state'
 import { Banner, Button, CommitButton, TwoPressButton } from '../components/ui'
 import { failureCode, failureMessage, watch, type StoredChannelMessage, type StoredHold, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import { MANY_HOLDS, nearlyFull, type ShelfSnapshot } from '../model/channel-messages'
 import type { KeptDraft, KeptWhy } from '../model/draft-book'
+import { holdRemovable } from '../model/receipts'
 
 type Session = SessionListResult['sessions'][number]
 
@@ -92,7 +93,7 @@ export function KeptDrafts({
   /** True on a phone, whose bar already names the screen and leaves it. */
   readonly phone?: boolean
 }): ReactNode {
-  const { port, say } = useApp()
+  const { port, say, sessions: states } = useApp()
   const book = useDraftBook()
   const { kept, status, problem, unreadable, unstored, ledger, sources } = useBook()
   const shelf = useChannelMessages()
@@ -303,10 +304,14 @@ export function KeptDrafts({
               : 'This device could not remove all of these messages now. Some of them may still be in place.'
           )
         }}
-        onClearHold={(holdId) => {
+        onClearHold={(holdId, sessionId) => {
           run(
             `hold-${holdId}`,
-            () => channels.clearHold(holdId),
+            () =>
+              channels.clearHold(holdId).then(() => {
+                // The record is gone, and the row it held the next message for goes with it.
+                if (sessionId !== null) states.dropHoldRow(sessionId, holdId)
+              }),
             'This device could not remove this record now. It is still in place.'
           )
         }}
@@ -551,7 +556,8 @@ function ChannelGroup({
   readonly sessions: readonly Session[] | null
   readonly busy: string | null
   readonly onRemove: (id: string, removal: { readonly actionId: string } | { readonly sessionId: string }) => void
-  readonly onClearHold: (holdId: string) => void
+  /** `sessionId` is the session the record was written for, or null for one that cannot be read. */
+  readonly onClearHold: (holdId: string, sessionId: string | null) => void
 }): ReactNode {
   const bySession = new Map<string, StoredChannelMessage[]>()
   for (const message of shelf.messages) {
@@ -630,7 +636,7 @@ function ChannelGroup({
                 sessions={sessions}
                 busy={busy === `hold-${hold.holdId}`}
                 onClear={() => {
-                  onClearHold(hold.holdId)
+                  onClearHold(hold.holdId, hold.sessionId)
                 }}
               />
             ))}
@@ -648,7 +654,7 @@ function ChannelGroup({
                     armedLabel="Press again to remove"
                     disabled={busy === `hold-${name}`}
                     onCommit={() => {
-                      onClearHold(name)
+                      onClearHold(name, null)
                     }}
                   >
                     Remove
@@ -725,23 +731,28 @@ function ChannelHoldRow({
   readonly busy: boolean
   readonly onClear: () => void
 }): ReactNode {
+  // Removing the record of a send that still waits for its answer would drop the row that holds the
+  // session, and the answer could then arrive for a session nothing holds: only an unknown row's record goes.
+  const removable = holdRemovable(useSubmissions(hold.sessionId), hold.holdId)
   return (
     <li className="kept-draft" data-testid="channel-hold">
       <p className="small muted">
         {holdWords(sessions, hold)} This device has not settled what became of it. Removing this record
         sends nothing.
       </p>
-      <div className="row wrap">
-        <TwoPressButton
-          tone="quiet"
-          data-testid="channel-hold-remove"
-          armedLabel="Press again to remove"
-          disabled={busy}
-          onCommit={onClear}
-        >
-          Remove
-        </TwoPressButton>
-      </div>
+      {removable ? (
+        <div className="row wrap">
+          <TwoPressButton
+            tone="quiet"
+            data-testid="channel-hold-remove"
+            armedLabel="Press again to remove"
+            disabled={busy}
+            onCommit={onClear}
+          >
+            Remove
+          </TwoPressButton>
+        </div>
+      ) : null}
     </li>
   )
 }
