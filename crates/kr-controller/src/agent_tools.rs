@@ -1436,8 +1436,9 @@ impl Installer {
         // removal will do to it: a removal that took the package and then refused the document
         // would leave the agent with an entry pointing at a skill that is no longer there. Under
         // the walk the guard is made below, for the documents the removal deletes or rewrites,
-        // and not for one it keeps.
-        if !matches!(self.fs, Fs::Walk(_)) {
+        // and not for one it keeps; where the root was not there nothing is read, so no document
+        // is guarded.
+        if matches!(self.fs, Fs::Paths) {
             for (_, step) in &in_record_order {
                 if let Planned::Entry { .. } = step.what {
                     guard_access_controls(Path::new(step.operation.path()), CONFIGURATION_BY_HAND)?;
@@ -7753,6 +7754,45 @@ mod tests {
         assert!(
             !text.contains("agent-tools"),
             "and the entry is taken: {text}"
+        );
+    }
+
+    /// KR-REQ-11.01: a removal of a declared word whose root was not there when the request began
+    /// reads nothing, so it keeps every document, and a document that stands there by the time the
+    /// removal is judged is not guarded: an access list on it does not stop the removal.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_root_that_was_not_there_gives_a_removal_no_document_to_guard() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let document = tree.home().join(".amp/mcp.json");
+        #[cfg(target_os = "macos")]
+        let _entry = {
+            let restriction = Restriction(document.clone());
+            exacl::setfacl(
+                &[&document],
+                &[exacl::AclEntry::deny_group(
+                    "everyone",
+                    exacl::Perm::DELETE,
+                    None,
+                )],
+                None,
+            )
+            .expect("a deny entry");
+            restriction
+        };
+        #[cfg(target_os = "linux")]
+        if !set_read_only_posix_list(&document) {
+            println!("this file system keeps no POSIX lists, so there is nothing to keep");
+            return;
+        }
+        let mut absent = installer.clone();
+        absent.fs = Fs::Absent(tree.home());
+        let plan = absent.removable(&params(amp(), InstallScope::User));
+        assert!(
+            plan.is_ok(),
+            "nothing is read, so no document is guarded: {:?}",
+            plan.err()
         );
     }
 
