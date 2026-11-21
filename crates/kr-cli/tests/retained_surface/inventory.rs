@@ -553,6 +553,8 @@ impl<'ast> Visit<'ast> for Reader<'_> {
     gated! {
         visit_item_const => visit_item_const(syn::ItemConst);
         visit_item_fn => visit_item_fn(syn::ItemFn);
+        visit_item_impl => visit_item_impl(syn::ItemImpl);
+        visit_item_enum => visit_item_enum(syn::ItemEnum);
         visit_item_foreign_mod => visit_item_foreign_mod(syn::ItemForeignMod);
         visit_item_static => visit_item_static(syn::ItemStatic);
         visit_item_struct => visit_item_struct(syn::ItemStruct);
@@ -560,6 +562,8 @@ impl<'ast> Visit<'ast> for Reader<'_> {
         visit_item_trait_alias => visit_item_trait_alias(syn::ItemTraitAlias);
         visit_item_union => visit_item_union(syn::ItemUnion);
         visit_impl_item_const => visit_impl_item_const(syn::ImplItemConst);
+        visit_variant => visit_variant(syn::Variant);
+        visit_field => visit_field(syn::Field);
         visit_impl_item_fn => visit_impl_item_fn(syn::ImplItemFn);
         visit_trait_item_const => visit_trait_item_const(syn::TraitItemConst);
         visit_trait_item_fn => visit_trait_item_fn(syn::TraitItemFn);
