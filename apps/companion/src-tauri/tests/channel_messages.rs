@@ -2417,3 +2417,192 @@ fn a_read_with_no_folder_of_messages_holds_the_ledger_lock_against_another_proce
     );
     drop(reader);
 }
+
+/// KR-REQ-12.26: over a list of removals that cannot be read at all (a directory at its name) a
+/// keep fails with its references and with none, the entry stays, a mark refuses, and nothing is
+/// written over the list; once it reads again the same keep completes.
+#[test]
+fn a_keep_or_a_mark_over_a_list_that_cannot_be_read_fails_and_writes_nothing() {
+    let data = data();
+    let window = Window::over(data.path());
+    let named = window.draft("a draft");
+    window
+        .keep(message(9, "first", &[]))
+        .expect("the directory exists");
+    let ledger = data.path().join("drafts-removals");
+    std::fs::create_dir(&ledger).expect("a directory at the list's name");
+    {
+        let refusal = (window.keep(message(1, "with a draft", std::slice::from_ref(&named))))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
+    {
+        let refusal = (window.keep(message(2, "no draft", &[])))
+            .clone()
+            .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
+    {
+        let refusal = (window.call(
+            "device_draft_mark_removal",
+            json!({ "id": named.0, "expectedRevision": named.1 }),
+        ))
+        .clone()
+        .expect_err("the call is refused");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
+    let held = names(&dir(data.path()));
+    assert!(
+        held.contains(&format!("{}.message", action(1)))
+            && held.contains(&format!("{}.message", action(2))),
+        "each entry stays: a list that cannot be read may name its references: {held:?}"
+    );
+    assert!(ledger.is_dir(), "nothing was written over the list");
+    std::fs::remove_dir(&ledger).expect("the list can be read again");
+    window
+        .keep(message(1, "with a draft", std::slice::from_ref(&named)))
+        .expect("the same keep completes");
+    assert_eq!(ledger_refs(data.path()), vec![named]);
+}
+
+/// KR-REQ-12.26: a keep under a used identity is a resume only for the same session, instance,
+/// binding and set of references (an order or a repeat makes no difference); any other is refused
+/// and the file and the list stay as they were.
+#[test]
+fn a_resume_that_differs_in_session_instance_binding_or_references_is_refused() {
+    let data = data();
+    let window = Window::over(data.path());
+    let first = window.draft("one");
+    let second = window.draft("two");
+    let both = [first.clone(), second.clone()];
+    window
+        .keep(message(1, "same", &both))
+        .expect("the message is kept");
+    let file = dir(data.path()).join(format!("{}.message", action(1)));
+    let bytes = std::fs::read(&file).ok();
+    let list = ledger_bytes(data.path());
+    let reversed = [second.clone(), first.clone()];
+    let again = window
+        .keep(message(1, "same", &reversed))
+        .expect("the same references in another order are a resume");
+    assert_eq!(again["resumed"], true, "{again}");
+    let mut other_session = message(1, "same", &both);
+    other_session["sessionId"] = json!(OTHER_SESSION);
+    let mut other_instance = message(1, "same", &both);
+    other_instance["applicationInstanceId"] = json!("9a7b6c50-22bb-4c3d-8e4f-000000000202");
+    let mut other_binding = message(1, "same", &both);
+    other_binding["agentBindingRevision"] = json!("2");
+    for (name, differs) in [
+        ("session", other_session),
+        ("instance", other_instance),
+        ("binding", other_binding),
+        ("fewer references", message(1, "same", &both[..1])),
+        (
+            "a reference more",
+            message(
+                1,
+                "same",
+                &[first.clone(), second.clone(), window.draft("three")],
+            ),
+        ),
+        (
+            "other references",
+            message(1, "same", &[first.clone(), window.draft("four")]),
+        ),
+    ] {
+        let refusal = window
+            .keep(differs)
+            .expect_err(&format!("a resume with another {name} is refused"));
+        assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{name}: {refusal}");
+    }
+    assert_eq!(std::fs::read(&file).ok(), bytes, "the file is as it was");
+    assert_eq!(ledger_bytes(data.path()), list, "the list is as it was");
+}
+
+/// KR-REQ-12.26: a message that is already absent is removed again only while the folder can be
+/// flushed: a removal never answers before the absence is durable.
+#[test]
+fn a_message_removed_again_while_the_flush_is_refused_fails_until_it_works() {
+    let data = data();
+    let window = Window::over(data.path());
+    window.keep(message(1, "one", &[])).expect("kept");
+    let removed = window
+        .call(
+            "device_channel_message_remove",
+            json!({ "actionId": action(1) }),
+        )
+        .expect("the message is removed");
+    assert_eq!(removed["removed"], 1, "{removed}");
+    {
+        let _guard = kr_flush::testing::refuse_flushes_of(dir(data.path()));
+        let refusal = window
+            .call(
+                "device_channel_message_remove",
+                json!({ "actionId": action(1) }),
+            )
+            .expect_err("a removal of an absent message is refused while the flush is");
+        assert_eq!(code_of(&refusal), "RESOURCE_UNAVAILABLE", "{refusal}");
+    }
+    let again = window
+        .call(
+            "device_channel_message_remove",
+            json!({ "actionId": action(1) }),
+        )
+        .expect("the removal completes once the flush works");
+    assert_eq!(again["removed"], 0, "{again}");
+}
+
+/// KR-REQ-12.26: every file the store makes is for its owner alone: the entry, the ledger, the
+/// ledger while it is staged, and the copy a set-aside keeps.
+#[cfg(unix)]
+#[test]
+fn the_staged_ledger_the_ledger_and_the_copy_of_a_set_aside_are_private_to_the_owner() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|held| held.permissions().mode() & 0o777)
+            .ok()
+    };
+    let data = data();
+    let window = Window::over(data.path());
+    let kept = window.draft("kept text");
+    let staged: Arc<Mutex<Vec<Option<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let seen = Arc::clone(&staged);
+        let root = data.path().to_path_buf();
+        let _at = testing::at(data.path(), Point::LedgerBeforeRename, move || {
+            for entry in std::fs::read_dir(&root)?.flatten() {
+                if entry.file_name().to_string_lossy().contains(".staged-") {
+                    seen.lock().expect("a lock").push(mode(&entry.path()));
+                }
+            }
+            Ok(())
+        });
+        window
+            .keep(message(1, "kept text", std::slice::from_ref(&kept)))
+            .expect("kept");
+    }
+    assert_eq!(
+        *staged.lock().expect("a lock"),
+        vec![Some(0o600)],
+        "the staged ledger is private to its owner"
+    );
+    assert_eq!(mode(&data.path().join("drafts-removals")), Some(0o600));
+    std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
+    let _clock = testing::clock(data.path(), 1_700_000_000_321);
+    window
+        .call("device_drafts_ledger_set_aside", json!(null))
+        .expect("set aside");
+    assert_eq!(
+        mode(&data.path().join("drafts-removals.set-aside-1700000000321")),
+        Some(0o600),
+        "the copy is private to its owner"
+    );
+    assert_eq!(
+        mode(&data.path().join("drafts-removals")),
+        Some(0o600),
+        "the rebuilt list is private to its owner"
+    );
+}
