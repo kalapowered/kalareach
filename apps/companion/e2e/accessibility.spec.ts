@@ -381,6 +381,8 @@ async function pressPage(
     { messages: options.only ?? [...PRESS_MESSAGES, ...(options.extra ?? [])], session: SESSION, shipped: options.shipped ?? false }
   )
   await page.locator('.m-node .md-link').last().waitFor({ state: 'attached' })
+  // The page measures the room of the links in the frame after they attach: a case reads the boxes only once it has.
+  await settle(page)
   await watchClicks(page)
 }
 
