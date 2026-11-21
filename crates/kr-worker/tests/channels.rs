@@ -2864,6 +2864,79 @@ async fn kr_req_12_26_each_message_on_one_channel_names_its_own_sender() {
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }
 
+/// KR-REQ-12.26: an answer to an approval and a message are recorded under one verified actor. A
+/// paired device sends a message and then answers the pending approval. The message names the
+/// identifier of the device's actor as its sender, and the actor the ledger records as the one who
+/// decided is that same actor: one principal stands behind both paths, and the channel they share
+/// is neither.
+#[tokio::test]
+async fn kr_req_12_26_an_answer_and_a_message_are_recorded_under_one_verified_actor() {
+    let broker = memory_broker();
+    let (_package, mut channel, resource) = channel_with_a_relayed_approval(&broker).await;
+    let device = paired_device();
+
+    let ended = broker
+        .agent_prompt(
+            &device,
+            &queued(2, "deploy the build"),
+            true,
+            TimestampMs::new(5),
+        )
+        .await
+        .expect_err("the channel confirms nothing");
+    assert_eq!(ended.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        channel.next().await,
+        Some(message_frame(
+            "deploy the build",
+            "paired_device",
+            "03204de92e11fc8c"
+        ))
+    );
+
+    let answered = broker
+        .agent_approval_respond(&device, &respond(2, &resource, "deny"), TimestampMs::new(6))
+        .await
+        .expect_err("the answer ends as an outcome nobody can establish");
+    assert_eq!(answered.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        channel.next().await,
+        Some(serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "abcde", "behavior": "deny" }
+        })),
+        "the first frame after the message is the verdict"
+    );
+
+    let deciders: Vec<_> = recorded_events(&broker)
+        .into_iter()
+        .filter(|event| {
+            event.resource_id == resource.resource_id
+                && matches!(event.state, PendingState::Claimed | PendingState::Uncertain)
+        })
+        .map(|event| event.actor_id)
+        .collect();
+    assert!(!deciders.is_empty(), "the answer is recorded");
+    assert!(
+        deciders
+            .iter()
+            .all(|actor| actor.as_ref() == Some(&device.actor_id)),
+        "the KR actor who decided is the device that sent the message: {deciders:?}"
+    );
+    let decider = deciders[0].clone().expect("a decider is named");
+    assert_eq!(
+        kr_worker::broker::channel_prompt::PromptSender {
+            actor_id: decider,
+            ..kr_worker::broker::channel_prompt::PromptSender::of(&device)
+        }
+        .sender_id(),
+        "03204de92e11fc8c",
+        "the identifier the message carried is the one the decider's actor has"
+    );
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+}
+
 /// KR-REQ-12.26: an actor the host cannot name a sender for has no message written. Each
 /// combination of ingress, device and grant that is neither a local caller with no device and no
 /// grant nor a paired device under its grant is refused as not permitted, and the next frame the
