@@ -159,8 +159,11 @@ export function keptEntry(
   const holdsUnreadable = shelf.unreadableHolds.layout + shelf.unreadableHolds.now + shelf.damagedHolds.length
   if (book.ledger !== 'ok') return alone('The list of removals for drafts', 'could not be read.')
   if (shelf.status === 'failed') return alone('Channel messages', 'could not be read now.')
-  if (book.unreadable > 0 && messagesUnreadable + holdsUnreadable > 0) {
+  if (book.unreadable > 0 && messagesUnreadable > 0) {
     return alone('Some drafts and channel messages', 'could not be read.')
+  }
+  if (book.unreadable > 0 && holdsUnreadable > 0) {
+    return alone('Some drafts and records of messages being sent', 'could not be read.')
   }
   if (messagesUnreadable > 0) return alone('Some channel messages', 'could not be read.')
   if (holdsUnreadable > 0) return alone('Some records of messages being sent', 'could not be read.')
@@ -188,10 +191,7 @@ export function keptEntry(
     draftsLabel === '' ? messagesLabel : messagesLabel === '' ? draftsLabel : `${draftsLabel} and ${messagesLabel.toLowerCase()}`
   const heldNote = held === 0 ? '' : ' Some text is held in this window only.'
   const plural = stored + messages > 1
-  const rest =
-    stored === 0
-      ? `${plural ? 'are' : 'is'} kept apart from the composers.${heldNote}`
-      : `${plural ? 'are' : 'is'} not in a composer.${heldNote}`
+  const rest = `${plural ? 'are' : 'is'} not in a composer.${heldNote}`
   return {
     title: held === 0 ? label : `${label}, and text held in this window only`,
     label,
