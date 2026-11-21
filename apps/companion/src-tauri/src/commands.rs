@@ -1217,7 +1217,8 @@ macro_rules! agent_mutate_command {
 /// prompt that names a draft goes through the host's control daemon instead, which holds the draft
 /// and its attachments: the daemon records that the draft is sent to the session before it passes
 /// the prompt to the worker, so what was submitted follows the session's retention. The worker
-/// serves a prompt that names a draft to nothing else.
+/// serves a prompt that names a draft to nothing else. Over a host this device is paired with, the
+/// prompt goes on the session's own link, the one connection of that host that serves a worker.
 ///
 /// `supersedes` is the explicit later request that follows an outcome nobody could establish: the
 /// prompt names the earlier action and the revision of its record the person was shown.
@@ -1234,7 +1235,18 @@ async fn send_prompt(
     let target = typed.target;
     let expected = PromptPreconditions(supersedes);
     if typed.draft_id.is_present() {
-        let settled = send_draft_prompt(state, method, &typed, &expected).await?;
+        let settled = if state.paired_context().is_some() {
+            // A host this device is paired with serves a route to a worker only on a connection
+            // scoped to the session, and refuses it on the connection the application keeps for the
+            // host. The prompt goes on the session's own link, as a prompt that carries its text does.
+            submitted(
+                links
+                    .mutate(state, opening, target, method, &expected, &typed)
+                    .await?,
+            )?
+        } else {
+            send_draft_prompt(state, method, &typed, &expected).await?
+        };
         // A prompt that names the draft records the send on the host, which frees the draft's place:
         // the draft is the session's now, and what this device kept of it ends. Only a result, or a
         // receipt that says the prompt was applied, says so; a refusal or an answer that cannot be
