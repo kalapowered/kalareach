@@ -2882,9 +2882,9 @@ jobs:
       # `scripts/check-macos-test-division.py` fails each leg before its tests when the lists have
       # either fault, name a package the workspace does not have, are empty, or when the matrix has
       # a test leg twice or one more, and a new crate has to be put in a list before the job
-      # passes. The same script's `features` command fails on a package a leg builds with other
-      # features than the whole workspace's one step gave it, unless the script names it with its
-      # reason.
+      # passes. The same script's `features` command fails on a feature that a leg builds a
+      # package without and the whole workspace's one step built it with, unless the script names
+      # that package, leg and feature with its reason.
       #
       # The division is by the minutes the test programs of each package took in the run of 20
       # November, which ran the whole workspace in one step: 668 programs in 157 minutes, after 32

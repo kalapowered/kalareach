@@ -14,14 +14,19 @@ two lists from the workflow, asks Cargo for the workspace's members, and fails w
   * a list has a word that is not `-p` or a package, or names no package (`cargo test` with no
     package selects every member of the workspace),
   * the matrix has a test leg twice, has none, or has a test part besides the two (the Test step
-    runs every part that begins with `tests`, so an extra one would run packages again).
+    runs every part that begins with `tests`, so an extra one would run packages again), where a
+    part is read as GitHub reads it: quoted or plain, with a comment after it, in any case,
+  * the matrix has a part or an entry in a form this does not read (a flow mapping, an expression).
 
 A new crate therefore has to be put in one of the lists before the job passes.
 
 The legs also build with the features of their own packages' dependency graph, and the one step
 that ran the whole workspace built with the features all 47 packages asked for together. The
-`features` command compares the two with `cargo tree` and fails on a package whose features differ
-and that is not named, with its reason, in `FEATURE_DIFFERENCES` below.
+`features` command compares the two with `cargo tree`, in two views (the host and target copies
+merged, and the target build alone), and fails on a feature that a leg lacks and that
+`FEATURE_DIFFERENCES` below does not name, keyed by package, leg, direction and feature, with its
+reason. It compares the test builds. The programs a leg builds for its suites are built by the
+form that has the whole workspace's features, which the conformance case holds.
 
     python3 scripts/check-macos-test-division.py check [--locked]
     python3 scripts/check-macos-test-division.py features
@@ -30,7 +35,8 @@ and that is not named, with its reason, in `FEATURE_DIFFERENCES` below.
 `self-test` puts the check through a workflow and a workspace that are written out here: the
 division that holds, a member left out, a member in both lists, a member twice in one list, a name
 that is no member, the left-out package named, a word that is no package, a leg that is missing, a
-leg twice, an extra test leg, an empty list, and the comparison of features. Each fault must be
+leg twice, an extra test leg (also quoted, in another case, or with a comment), a part in a form not
+read, an empty list, and the comparison of features. Each fault must be
 refused and named, and the division that holds must pass.
 """
 
