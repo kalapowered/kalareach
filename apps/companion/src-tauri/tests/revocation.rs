@@ -4547,10 +4547,9 @@ async fn a_replacement_moves_the_epoch_and_the_withdrawn_results_have_another_ep
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_read_refused_on_a_withdrawn_connection_is_cleared_by_the_replacement() {
     let rig = Rig::start().await;
-    let dials = Arc::new(Dials::default());
     rig.host_polls().await;
     let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let _keeper = keeper_with(&rig, reopens, None, Some(Arc::clone(&dials))).await;
+    let _keeper = keeper_with(&rig, reopens, None, None).await;
     rig.app.told_everything().await;
     // The replacement is held before it asks the host or opens another connection, so the read
     // finishes over the connection that is still the one held, however long the call takes, and
