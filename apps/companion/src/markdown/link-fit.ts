@@ -59,6 +59,9 @@ export interface Column {
 const LEFT = '--md-link-left'
 const RIGHT = '--md-link-right'
 
+/** The attributes of a message's elements that move words with no change of the message's size or text: a table cell's alignment is a style. */
+const LAYOUT_ATTRIBUTES = ['style', 'class', 'align', 'dir', 'hidden']
+
 /** The grid an engine lays a box out on: a padding is held to it, so a box never ends a rounding past its column. */
 const GRID = 64
 
@@ -273,18 +276,26 @@ export function startLinkFit(pane: HTMLElement): () => void {
     }
   }
   const changed = new MutationObserver((records) => {
+    let structure = false
     for (const record of records) {
+      if (record.type === 'attributes') {
+        // The room that this hook writes is a style of the link itself, and is no change of the message's layout.
+        const own = record.attributeName === 'style' && record.target instanceof Element && record.target.classList.contains('md-link')
+        if (!own) mark(record.target)
+        continue
+      }
+      structure = true
       mark(record.target)
       for (const node of record.addedNodes) mark(node)
       mark(record.previousSibling)
       mark(record.nextSibling)
     }
-    watch()
-    schedule()
+    if (structure) watch()
+    if (structure || dirty.size > 0) schedule()
   })
 
   resized?.observe(pane)
-  changed.observe(pane, { childList: true, subtree: true, characterData: true })
+  changed.observe(pane, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: LAYOUT_ATTRIBUTES })
   watch()
   markAll()
   const fonts = document.fonts as FontFaceSet | undefined

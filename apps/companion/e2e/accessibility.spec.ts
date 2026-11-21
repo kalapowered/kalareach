@@ -864,6 +864,10 @@ const endingNow = (page: Page): Promise<Ending> =>
     }
   })
 
+/** Waits two animation frames: the page measures the room of a link in the frame after a change, and the next one has it laid out. */
+const settle = (page: Page): Promise<unknown> =>
+  page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(() => done(null)))))
+
 /** The first difference between two lists of rectangles beyond a layout's rounding, or null. */
 function firstDifference(what: string, before: readonly number[][], after: readonly number[][]): string | null {
   if (before.length !== after.length) return `${what}: ${String(before.length)} rectangles, then ${String(after.length)}`
@@ -892,6 +896,10 @@ const GAP_SECOND = 'https://example.org/gap-second'
 const GAPPED = `See [docs](${GAP_FIRST}) for the [1](${GAP_SECOND})[the full reference list](https://example.org/gap-wide) too.`
 /** What the cases of a link's box add to the conversation's messages. */
 const BOXED_EXTRAS = [HEMMED, GAPPED]
+/** Two short links in the two columns of a table, the first column wider than its link: a newer revision of the message aligns the column to the right. */
+const CELL_FIRST = 'https://example.org/cell-first'
+const CELL_SECOND = 'https://example.org/cell-second'
+const TABLE_CELLS = ['| a header that is wider than its link | b |', '| --- | --- |', `| [1](${CELL_FIRST}) | [2](${CELL_SECOND}) |`].join('\n')
 
 // KR-REQ-13.19: the box that a screen reader reads for a link of a message is the least size high, and the
 // message lies where it would with no box: the room around the words takes no tap, so a link beside or
@@ -1015,6 +1023,25 @@ test.describe('the box of a link in a message', () => {
         expect(grown, 'the growth of the pane’s scroll range, which is no more than half of what the line lacks of the least size').toBeLessThanOrEqual(lack / 2 + 1)
         expect(boxed.room - bare.room, 'the room under the last words, which the pane’s scroll range sets').toBeCloseTo(grown, 1)
       })
+
+      if (ratio === 1) {
+        test(`measures the links of a table again when the alignment of a column moves their words and nothing else of the message changes, on ${surface}`, async ({ page }) => {
+          await pressPage(page, surface, { only: [TABLE_CELLS] })
+          const before = (await boxesNow(page)).links.find((link) => link.href === CELL_FIRST)
+          // What React does for a newer revision with `---:` in place of `---`: a style on the cells, and the same text and size.
+          await page.evaluate(() => {
+            for (const cell of document.querySelectorAll<HTMLElement>('.m-node tr > :first-child')) cell.style.textAlign = 'right'
+          })
+          await settle(page)
+          const { links } = await boxesNow(page)
+          const first = links.find((link) => link.href === CELL_FIRST)
+          const second = links.find((link) => link.href === CELL_SECOND)
+          if (!before || !first || !second) throw new Error('the page shows no table links')
+          expect(first.wordsLeft - before.wordsLeft, 'how far the alignment moved the first link’s words').toBeGreaterThan(30)
+          const across = Math.min(first.right, second.right) - Math.max(first.left, second.left)
+          expect(across, 'how far the box of the first link lies over the box of the second').toBeLessThanOrEqual(0.02)
+        })
+      }
 
       test(`gives the words of every link their own tap though a box of a link on the next line lies over them, on ${surface} at ${size} text size`, async ({
         page
