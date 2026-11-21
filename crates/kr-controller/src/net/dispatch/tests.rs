@@ -1162,7 +1162,11 @@ fn refusal(answer: kr_protocol::envelope::ControlFrame) -> kr_protocol::error::P
 }
 
 /// One question the application inside `session_id` asked, as that session's worker holds it.
-fn asked(session_id: SessionId, byte: u8, created_at_ms: u64) -> kr_protocol::question::Question {
+pub(super) fn asked(
+    session_id: SessionId,
+    byte: u8,
+    created_at_ms: u64,
+) -> kr_protocol::question::Question {
     use kr_protocol::question::{
         Question, QuestionChoice, QuestionKind, QuestionSource, QuestionState,
     };

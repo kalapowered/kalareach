@@ -14,6 +14,7 @@ use kr_protocol::envelope::{ControlFrame, MutationRequest, Outcome, ParamsValue,
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ConnectionId, SessionId};
 use kr_protocol::method::Method;
+use kr_protocol::receipt::{ActionReadParams, ActionReadResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Durability, SessionCloseParams, SessionCloseResult, SessionState};
 
@@ -87,6 +88,36 @@ async fn a_worker_that_answers_from_its_receipt(receipt: Receipt) -> fake::Silen
                                         outcome: receipt(identity.session_id()),
                                     }))]
                                 }
+                                // A read of the receipt of an action this worker answered: the
+                                // receipt, and the result it kept when it kept one.
+                                ControlFrame::ForwardedRead(forwarded)
+                                    if forwarded.request.method == Method::ActionRead.into() =>
+                                {
+                                    let request = &forwarded.request;
+                                    let kept = match request.params.to_typed::<ActionReadParams>() {
+                                        Ok(params) => match receipt(identity.session_id()) {
+                                            Outcome::Ok(result) => Some((params.action_id, result)),
+                                            Outcome::Error(_) => None,
+                                        },
+                                        Err(_) => None,
+                                    };
+                                    vec![ControlFrame::Response(Response {
+                                        request_id: request.request_id,
+                                        outcome: match kept {
+                                            Some((action_id, result)) => Outcome::Ok(
+                                                ParamsValue::from_typed(&ActionReadResult {
+                                                    receipt: a_receipt_of(action_id),
+                                                    result: Nullable::some(result),
+                                                })
+                                                .expect("encodes"),
+                                            ),
+                                            None => Outcome::Error(ProtocolError::new(
+                                                ErrorCode::ResourceUnavailable,
+                                                "this worker holds no receipt for that action",
+                                            )),
+                                        },
+                                    })]
+                                }
                                 _ => Vec::new(),
                             },
                         };
@@ -101,6 +132,24 @@ async fn a_worker_that_answers_from_its_receipt(receipt: Receipt) -> fake::Silen
         })
     })
     .await
+}
+
+/// The receipt a worker that answers from its receipts holds for `action_id`.
+fn a_receipt_of(action_id: kr_protocol::ids::ActionId) -> kr_protocol::receipt::Receipt {
+    kr_protocol::receipt::Receipt {
+        action_id,
+        actor_id: kr_protocol::ids::ActorId::new("device:test").expect("a principal"),
+        method: Method::QuestionAnswer.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        revision: kr_protocol::scalars::U64::new(2),
+        state: kr_protocol::receipt::ReceiptState::Applied,
+        reason: Nullable::null(),
+        payload_digest: kr_protocol::scalars::Digest256::from_bytes([0; 32]),
+        accepted_deadline_ms: Nullable::null(),
+        error: Nullable::null(),
+        error_withheld: false,
+        updated_at_ms: kr_ipc::now_ms(),
+    }
 }
 
 /// What the worker kept of a close it accepted: the session is closing.
@@ -406,6 +455,118 @@ async fn a_mutation_the_worker_answers_from_its_receipt_is_not_shown_when_privac
             );
         } else {
             assert_eq!(told, None, "the receipt's result is shown");
+        }
+        world.serving.abort();
+    }
+}
+
+/// What a device's answer to a question gives back: the question as it stands, with its wording.
+fn the_result_of_answering_a_question(session_id: SessionId) -> Outcome {
+    let question = super::tests::asked(session_id, 0x31, 1_000);
+    Outcome::Ok(
+        ParamsValue::from_typed(&kr_protocol::question::QuestionResolveResult {
+            question_id: question.question_id,
+            revision: question.revision,
+            state: kr_protocol::question::QuestionState::Answered,
+            session_id,
+            resolved_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(2_000)),
+            question: Nullable::some(question),
+        })
+        .expect("encodes"),
+    )
+}
+
+/// An answer to a question on `connection`, which a worker performs.
+fn an_answer_to_a_question_of(
+    world: &fake::Silent,
+    connection: &super::RemoteConnection,
+    session_id: SessionId,
+) -> MutationRequest {
+    let question = super::tests::asked(session_id, 0x31, 1_000);
+    write_naming(
+        world,
+        connection,
+        Method::QuestionAnswer,
+        10,
+        &kr_protocol::question::QuestionAnswerParams {
+            session_id,
+            question_id: question.question_id,
+            expected_revision: question.revision,
+            answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
+        },
+        Some(session_id),
+    )
+}
+
+/// KR-REQ-24.28: a completed answer to a question that is submitted again is answered from the
+/// worker's receipt, which carries the question's wording and which privacy mode removes. The
+/// action has a route, so the repeat reads the receipt before anything is forwarded. Privacy mode
+/// starts while the answer waits to be written; the device is told that the outcome is not shown,
+/// and the question's wording is not sent. The control: with no change the device is told the
+/// question as the receipt holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_answered_from_a_receipt_with_a_question_is_not_shown_when_privacy_mode_starts_before_it_is_sent()
+ {
+    for starts in [false, true] {
+        let world =
+            a_worker_that_answers_from_its_receipt(Arc::new(the_result_of_answering_a_question))
+                .await;
+        let (connection, recording) = paired_connection(&world.controller, 47, EVERY_RIGHT);
+        let answer = an_answer_to_a_question_of(&world, &connection, world.session_id);
+        // The first submission is dispatched, which records the action's route; its answer is not
+        // written.
+        connection
+            .answer_now(ControlFrame::Mutation(Box::new(answer.clone())))
+            .await
+            .expect("the first submission is answered");
+        let repeated = connection
+            .answer_now(ControlFrame::Mutation(Box::new(answer)))
+            .await
+            .expect("the repeat is answered");
+        assert!(
+            repeated
+                .asked
+                .as_ref()
+                .is_some_and(|asked| asked.is_kept() && asked.read_under.is_some()),
+            "an answer read from a worker's receipt is held to the privacy state it was read under: {:?}",
+            repeated.frame()
+        );
+        if starts {
+            super::tests::privacy_mode_is_turned_on(&world.controller).await;
+        }
+        assert!(
+            connection.write_answer(connection.output(), repeated).await,
+            "the connection stands"
+        );
+        match (&recording.frames()[0], starts) {
+            (
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Error(told),
+                    ..
+                }),
+                true,
+            ) => assert_eq!(
+                told.code,
+                ErrorCode::OutcomeUnknown,
+                "the outcome is not shown"
+            ),
+            (
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Ok(value),
+                    ..
+                }),
+                false,
+            ) => {
+                let resolved: kr_protocol::question::QuestionResolveResult =
+                    value.to_typed().expect("a question's resolution");
+                assert!(
+                    resolved.question.0.is_some(),
+                    "the control shows the question's wording"
+                );
+            }
+            (frame, starts) => panic!(
+                "a repeat answered from a receipt (privacy mode started: {starts}) was written as {frame:?}"
+            ),
         }
         world.serving.abort();
     }
