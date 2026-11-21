@@ -1113,6 +1113,7 @@ impl Installer {
         // or runs. A name the plan deletes or rewrites is read again at its turn, and acted on
         // only while it is still what the plan decided: the file the plan deleted, the document
         // as it then stands, and no other kind of act.
+        let mut entry_stays = false;
         for Step { operation, what } in steps {
             let path = operation.path();
             match what {
@@ -1154,6 +1155,10 @@ impl Installer {
                     Removal::Kept(reason) => {
                         retained.push(format!("{entry} in {path}: {reason}"));
                     }
+                    Removal::Held(reason) => {
+                        retained.push(format!("{entry} in {path}: {reason}"));
+                        entry_stays = true;
+                    }
                     Removal::Told(words) => retained.push(words),
                 },
                 Planned::Folder(plan) => match plan {
@@ -1172,8 +1177,10 @@ impl Installer {
                 },
             }
         }
+        // The record goes with what it names. An entry that stays unchanged, the host's own, keeps
+        // it, or no record would name the entry and nothing could take it again.
         let record = self.record_path(params);
-        if record.exists() {
+        if record.exists() && !entry_stays {
             std::fs::remove_file(&record).map_err(storage)?;
             sync_directory(&self.records, NameKind::File)?;
         }
@@ -1462,7 +1469,7 @@ impl Installer {
                         }
                     }
                     Planned::Entry { plan, .. } => match plan {
-                        EntryPlan::Keep(_) => {}
+                        EntryPlan::Keep(_) | EntryPlan::Held(_) => {}
                         EntryPlan::Delete { .. } => {
                             guard_access_controls(path, CONFIGURATION_BY_HAND)?;
                             walk.refuse_shared_folder(path, anchor::Act::Remove)?;
@@ -1888,7 +1895,11 @@ impl Installer {
             (EntryPlan::Delete { .. }, now @ EntryPlan::Delete { .. })
             | (EntryPlan::Edit { .. }, now @ EntryPlan::Edit { .. })
             | (_, now @ EntryPlan::Keep(_)) => now,
-            _ => EntryPlan::Keep("it has changed since it was installed".to_owned()),
+            _ => EntryPlan::Held(
+                "the document changed while the removal ran, so the entry stays and its record is \
+                 kept; run the removal again to remove the entry"
+                    .to_owned(),
+            ),
         })
     }
 
@@ -1897,6 +1908,7 @@ impl Installer {
     fn remove_entry(&self, path: &Path, plan: EntryPlan) -> Result<Removal> {
         Ok(match plan {
             EntryPlan::Keep(reason) => Removal::Kept(reason),
+            EntryPlan::Held(reason) => Removal::Held(reason),
             EntryPlan::Delete { checked } => match self.fs.remove_file(path, checked)? {
                 anchor::Taken::Removed => Removal::Removed,
                 anchor::Taken::Gone => Removal::Kept("it is already gone".to_owned()),
@@ -3017,6 +3029,10 @@ enum FilePlan {
 enum EntryPlan {
     /// The entry and its document stay, for the stated reason.
     Keep(String),
+    /// Made only at the act: the entry is the host's and unchanged, but the document no longer
+    /// calls for the kind of act that was decided, so it stays, and so does the record that names
+    /// it, for a later removal to finish.
+    Held(String),
     /// The document held nothing but the entry; the removal takes it out while it is the file with
     /// the digest `checked`.
     Delete { checked: Digest256 },
@@ -3034,6 +3050,8 @@ enum Removal {
     Removed,
     /// It was left alone, for the stated reason.
     Kept(String),
+    /// It was left alone, for the stated reason, and its record stays.
+    Held(String),
     /// It was left alone, and these words, which name the file and the entry whole, say what
     /// became of the file.
     Told(String),
@@ -7728,9 +7746,25 @@ mod tests {
             removed
                 .retained
                 .iter()
-                .any(|note| note.contains("it has changed since it was installed")),
+                .any(|note| note.contains("its record is kept")),
             "{:?}",
             removed.retained
+        );
+        // The entry stays, unchanged and the host's own: so does the record that names it, and a
+        // later removal takes the entry and the record without a repair of the document.
+        assert!(
+            installer.record_path(&params).exists(),
+            "the record of the entry that stays is kept"
+        );
+        installer.remove(&params).expect("a later removal finishes");
+        let text = std::fs::read_to_string(&document).expect("the document stays");
+        assert!(
+            text.contains("\"theme\"") && !text.contains("agent-tools"),
+            "the later removal takes the entry and keeps the setting: {text}"
+        );
+        assert!(
+            !installer.record_path(&params).exists(),
+            "and the record goes with the entry"
         );
     }
 
