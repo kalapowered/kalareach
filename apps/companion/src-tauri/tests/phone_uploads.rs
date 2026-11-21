@@ -3218,6 +3218,72 @@ async fn kr_req_13_12_a_begin_refused_for_a_size_limit_frees_no_place_and_is_not
     }
 }
 
+/// KR-REQ-13.12: a send whose begin the host refused for the device's count while another send's
+/// freeing ran, and whose own look for places comes after that freeing is over, finds nothing left
+/// to free and still tries its begin once more: the place the other send freed may be its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_refused_begin_that_finds_the_places_already_freed_is_tried_once_more() {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let newer = places_held_by(&adopted, &phone, &desk, &earlier, 2).await;
+    let now = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..newer
+    };
+    let (cancels, begins) = (
+        control.sent(Method::UploadCancel),
+        control.sent(Method::UploadBegin),
+    );
+    let bytes = pattern(3);
+    let send = |key: Uuid| {
+        let desk = Arc::clone(&desk);
+        let now = now.clone();
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        async move { desk.send(now, sent).await }
+    };
+    // The second send's begin is refused, and the send is held before it looks for places to free.
+    let second_key = kr_ipc::new_uuid();
+    let refused = testing::hold_at(second_key, Point::Refused);
+    let _letting_go = LetsGo(Arc::clone(&refused));
+    let second = tokio::spawn(send(second_key));
+    until("the second send's begin is refused", || {
+        refused.passed() >= 1
+    })
+    .await;
+
+    // The first send is refused too, frees both places and goes on, all before the second looks.
+    let first = send(kr_ipc::new_uuid()).await;
+    assert!(first.is_ok(), "the first send goes on: {first:?}");
+    refused.release();
+    let second = second.await.expect("the task ran");
+
+    assert!(
+        second.is_ok(),
+        "the second send tries its begin once more: {second:?}"
+    );
+    assert_eq!(
+        control.sent(Method::UploadCancel) - cancels,
+        2,
+        "each place is cancelled once"
+    );
+    assert_eq!(
+        control.sent(Method::UploadBegin) - begins,
+        4,
+        "two begins refused, two tried again"
+    );
+    adopted.stop().await;
+}
+
 /// The request that makes a draft on the host for `session`, composed and not sent.
 async fn compose_create(
     adopted: &Adopted,
