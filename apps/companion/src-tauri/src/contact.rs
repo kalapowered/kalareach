@@ -2087,6 +2087,17 @@ pub mod testing {
             .disposal
         }
 
+        /// Gives the record of `host` another generation and changes nothing else: the state of a
+        /// record that another pairing replaced while the choice, the connection and the session
+        /// stayed the same, which no event of the application makes alone.
+        pub fn move_generation_of(&self, host: kr_protocol::ids::DeviceId) {
+            let mut state = self.lock();
+            let generation = state.next();
+            if let Some(record) = state.hosts.get_mut(&HostKey::Paired(host)) {
+                record.generation = generation;
+            }
+        }
+
         /// The generation of the record of `host`, when it has one.
         #[must_use]
         pub fn generation_of(&self, host: kr_protocol::ids::DeviceId) -> Option<u64> {
@@ -2108,7 +2119,7 @@ pub mod testing {
 }
 
 #[cfg(all(test, feature = "testing"))]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use kr_client::error::Result as ClientResult;
@@ -2127,6 +2138,8 @@ mod tests {
     struct Silent {
         id: ConnectionId,
         closed: Arc<AtomicBool>,
+        /// Set when the account the connection was opened under has left.
+        left: Arc<AtomicBool>,
         first: std::sync::Mutex<Option<ControlFrame>>,
     }
 
@@ -2154,7 +2167,15 @@ mod tests {
         }
 
         fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
-            None
+            self.left
+                .load(Ordering::SeqCst)
+                .then(|| kr_client::transport::DeviceEnd {
+                    error: kr_protocol::error::ProtocolError::new(
+                        kr_protocol::error::ErrorCode::PermissionDenied,
+                        "the account signed out",
+                    ),
+                    action: kr_client::retry::UserAction::SignIn,
+                })
         }
 
         fn send<'a>(&'a self, _: &'a ControlFrame) -> TransportFuture<'a, ()> {
@@ -2192,10 +2213,21 @@ mod tests {
 
     /// A connection of its own, and the flag that says its transport was closed.
     fn connection(byte: u8) -> (Connection, Arc<AtomicBool>) {
+        let (connection, closed, _) = connection_of_an_account(byte);
+        (connection, closed)
+    }
+
+    /// A connection of its own, the flag that says its transport was closed, and the flag that
+    /// makes the transport say this device ended it, as when the account it was opened under left.
+    pub(crate) fn connection_of_an_account(
+        byte: u8,
+    ) -> (Connection, Arc<AtomicBool>, Arc<AtomicBool>) {
         let closed = Arc::new(AtomicBool::new(false));
+        let left = Arc::new(AtomicBool::new(false));
         let session = Session::start(Arc::new(Silent {
             id: ConnectionId::new(Uuid::from_bytes([byte; 16])),
             closed: Arc::clone(&closed),
+            left: Arc::clone(&left),
             first: std::sync::Mutex::new(None),
         }))
         .expect("a session");
@@ -2206,7 +2238,7 @@ mod tests {
             None,
             None,
         );
-        (connection, closed)
+        (connection, closed, left)
     }
 
     /// A session whose host refused the connection with `code`: the first error the host answered
@@ -2216,6 +2248,7 @@ mod tests {
         let session = Session::start(Arc::new(Silent {
             id: ConnectionId::new(Uuid::from_bytes([30; 16])),
             closed: Arc::new(AtomicBool::new(false)),
+            left: Arc::new(AtomicBool::new(false)),
             first: std::sync::Mutex::new(Some(ControlFrame::Response(
                 kr_protocol::envelope::Response {
                     request_id: kr_protocol::ids::RequestId::new(0),
@@ -3133,6 +3166,26 @@ mod tests {
             Finish::Superseded,
             "the choice and the generation moved"
         );
+        assert_eq!(
+            owner.snapshot().contact,
+            HostContact::InContact,
+            "a superseded read writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_finishes_after_only_the_generation_moved_is_superseded() {
+        let owner = ContactOwner::new();
+        let (_choice, _session) = reaching_paired(&owner, 1);
+        let ticket = owner.read_started(ReadKind::Contact).expect("held");
+        owner.move_generation_of(host(1));
+        let finished = owner.read_finished(&ticket, refused_read());
+        assert_eq!(
+            finished.value,
+            Finish::Superseded,
+            "the choice and the session are the ticket's: only the generation moved"
+        );
+        drop(finished);
         assert_eq!(
             owner.snapshot().contact,
             HostContact::InContact,

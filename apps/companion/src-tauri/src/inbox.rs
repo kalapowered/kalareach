@@ -875,3 +875,111 @@ pub mod testing {
         }
     }
 }
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use kr_protocol::scalars::Uuid;
+
+    use super::*;
+    use crate::contact::tests::connection_of_an_account;
+    use crate::contact::{HostContact, Target};
+
+    fn host(byte: u8) -> DeviceId {
+        DeviceId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    fn a() -> Target {
+        Target::Paired {
+            host: host(5),
+            pairing: host(6),
+            reference: "reference-5".to_owned(),
+            name: "host 5".to_owned(),
+        }
+    }
+
+    /// A visit to A that found a whole inbox over a connection of an account that has left, and
+    /// committed it: the flag says when the account leaves.
+    fn read_over(owner: &ContactOwner, byte: u8) -> Arc<std::sync::atomic::AtomicBool> {
+        let target = a();
+        let fence = owner.fence();
+        let Admit::Admitted { ticket, .. } = owner.admit(&target, fence).value else {
+            panic!("the visit is admitted");
+        };
+        let Begin::Go(_) = owner.begin_visit(&ticket).value else {
+            panic!("the visit begins");
+        };
+        let (connection, _, left) = connection_of_an_account(byte);
+        let committed = owner.commit_visit(
+            &ticket,
+            Found::Inbox {
+                connection: Arc::new(connection),
+                result: AttentionReadResult {
+                    items: Vec::new(),
+                    more: false,
+                    dropped: U64::new(0),
+                    gaps: Vec::new(),
+                    quiet_hours: Nullable::null(),
+                    quiet_now: false,
+                    quiet_hours_provable: false,
+                },
+                sessions: Vec::new(),
+            },
+        );
+        assert!(matches!(committed.value, Committed::Accepted));
+        left
+    }
+
+    /// The first pass finds the read of A over a connection whose account has left, and is held
+    /// before it retires it; another visit then replaces that read with one over another connection
+    /// of the same account, and the pass goes on: the read it returns passed the check, so there is
+    /// none, and the host's contact is the account's refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pass_returns_no_unchecked_read_when_an_overlapping_visit_replaces_the_one_being_retired()
+     {
+        let owner = Arc::new(ContactOwner::new());
+        let first = read_over(&owner, 10);
+        first.store(true, std::sync::atomic::Ordering::SeqCst);
+        let desk = Arc::new(InboxDesk::with_owner(Arc::clone(&owner)));
+        let mut checks = desk.watch_checks();
+        let answering = tokio::spawn({
+            let desk = Arc::clone(&desk);
+            async move { desk.answer(&[host(5)]).await }
+        });
+        let hold = tokio::time::timeout(Duration::from_secs(30), checks.recv())
+            .await
+            .expect("the pass reaches the check")
+            .expect("a hold");
+        // Another visit completes a read over another connection of the account, before the pass
+        // retires the first.
+        let second = read_over(&owner, 11);
+        second.store(true, std::sync::atomic::Ordering::SeqCst);
+        hold.release();
+        let answered = answering.await.expect("the pass ran");
+        let row = &answered.hosts[0];
+        assert!(
+            row.result().is_none() && row.read_serial().is_none(),
+            "the second read was not checked: {row:?}"
+        );
+        assert!(
+            answered.hosts.iter().all(|row| {
+                row.read
+                    .as_ref()
+                    .is_none_or(|read| read.origin().ended_by_this_device().is_none())
+            }),
+            "every read returned passed the check"
+        );
+        let others = owner.snapshot().visible.others;
+        assert!(
+            matches!(
+                others[0].contact,
+                HostContact::Refused {
+                    request: Asked::Connection,
+                    ..
+                }
+            ),
+            "{:?}",
+            others[0].contact
+        );
+        assert!(!owner.holds_resources_of(host(5)));
+    }
+}
