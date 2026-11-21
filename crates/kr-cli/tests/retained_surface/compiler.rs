@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead as _;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
@@ -1788,28 +1788,13 @@ impl Parsed {
     }
 }
 
-/// The path of a file the way the tree names it: relative to `root`, with each `..` taken out against
-/// the folder before it (rustc names a file that `#[path = "../extra/more.rs"]` loads as
-/// `crates/c/src/../extra/more.rs`), or none for a file outside the tree.
+/// The path of a file the way the tree names it: the file that the written path names once the system
+/// has resolved it, each link followed before the `..` that comes after it (rustc writes a file that
+/// `#[path = "../extra/more.rs"]` loads as `crates/c/src/../extra/more.rs`), relative to `root`. A file
+/// outside the tree, and one that cannot be resolved, is none.
 fn in_tree(root: &Path, file: &str) -> Option<String> {
-    let mut parts: Vec<Component> = Vec::new();
-    for part in Path::new(file).components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir => match parts.pop() {
-                Some(Component::Normal(_)) => {}
-                _ => return None,
-            },
-            other => parts.push(other),
-        }
-    }
-    let path: PathBuf = parts.into_iter().collect();
-    let relative = if path.is_absolute() {
-        path.strip_prefix(root).ok()?.to_path_buf()
-    } else {
-        path
-    };
-    Some(relative.display().to_string())
+    let resolved = std::fs::canonicalize(root.join(file)).ok()?;
+    Some(resolved.strip_prefix(root).ok()?.display().to_string())
 }
 
 /// The sightings of the tree at `root` from the reports of the platforms that read it, and the closed

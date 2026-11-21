@@ -994,6 +994,33 @@ fn a_report_at_a_place_outside_the_tree_is_refused() {
 }
 
 #[test]
+fn a_report_at_a_path_whose_link_leads_out_of_the_tree_is_refused_where_it_stands() {
+    // `src/link` points to a folder outside the tree, so `src/link/../send.rs` is the file beside that
+    // folder and not `src/send.rs`, which the tree holds as well.
+    let (root, meta, platform) = reports_for_refusals();
+    let outside = tempfile::tempdir().expect("a folder");
+    let send = "use kr_protocol::method::Method;\n\npub fn send() -> Method {\n    Method::AgentTurnCancel\n}\n";
+    write(outside.path(), "inner/keep", "");
+    write(outside.path(), "send.rs", send);
+    write(root.path(), "crates/kr-forms/src/send.rs", send);
+    std::os::unix::fs::symlink(
+        outside.path().join("inner"),
+        root.path().join("crates/kr-forms/src/link"),
+    )
+    .expect("a link");
+    let file = "crates/kr-forms/src/link/../send.rs";
+    let mut read = platform.clone();
+    read.reports = vec![report_at(file, 4, 5, 28, "agent.turn.cancel")];
+    let problems = refused(root.path(), &meta, &[read], &[compiler::host_name()], &[]);
+    assert_eq!(
+        problems,
+        [format!(
+            "{file}:4: the compiler reports a use at a place that is no file of this tree"
+        )]
+    );
+}
+
+#[test]
 fn the_data_of_a_platform_reads_back_as_it_was_written() {
     let (_, _, platform) = built();
     let text = platform.text();
