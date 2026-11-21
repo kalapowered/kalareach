@@ -969,12 +969,17 @@ async fn answering_worker(
         answers,
         recorded,
         stated,
-        kr_protocol::error::ProtocolError::new(
-            kr_protocol::error::ErrorCode::ResourceUnavailable,
-            "this worker answers only the reads its test gave it",
-        ),
+        what_a_worker_refuses_with_when_its_test_gave_it_nothing(),
     )
     .await
+}
+
+/// What a worker refuses a request its test gave it no answer for.
+fn what_a_worker_refuses_with_when_its_test_gave_it_nothing() -> kr_protocol::error::ProtocolError {
+    kr_protocol::error::ProtocolError::new(
+        kr_protocol::error::ErrorCode::ResourceUnavailable,
+        "this worker answers only the reads its test gave it",
+    )
 }
 
 /// As [`answering_worker`], and what it refuses a request with is `refusal`.
@@ -983,6 +988,20 @@ async fn answering_worker_refusing(
     recorded: crate::service::a_close_a_worker_never_answers::Recorded,
     stated: CanonicalSet<kr_protocol::ids::CapabilityId>,
     refusal: kr_protocol::error::ProtocolError,
+) -> crate::service::a_close_a_worker_never_answers::Silent {
+    a_worker_answering(answers, recorded, stated, refusal, false).await
+}
+
+/// As [`answering_worker_refusing`], and when `acks_privacy` it answers the privacy notice the
+/// daemon's tick sends at once, with its cleanup complete, as a worker that holds nothing does. A
+/// world whose cases need the removal of a session to stand open until the case ends does not set
+/// it.
+async fn a_worker_answering(
+    answers: Answers,
+    recorded: crate::service::a_close_a_worker_never_answers::Recorded,
+    stated: CanonicalSet<kr_protocol::ids::CapabilityId>,
+    refusal: kr_protocol::error::ProtocolError,
+    acks_privacy: bool,
 ) -> crate::service::a_close_a_worker_never_answers::Silent {
     use std::sync::Arc;
 
@@ -1051,6 +1070,17 @@ async fn answering_worker_refusing(
                                     }
                                     ControlFrame::Forwarded(forwarded) => {
                                         Some(refused(forwarded.mutation.request_id))
+                                    }
+                                    ControlFrame::PrivacyGeneration(notice) if acks_privacy => {
+                                        Some(ControlFrame::PrivacyGenerationAck(Box::new(
+                                            kr_protocol::privacy::PrivacyGenerationAck {
+                                                session_id: identity.session_id(),
+                                                generation: notice.generation,
+                                                enabled: notice.enabled,
+                                                completion:
+                                                    kr_protocol::privacy::PrivacyCompletion::Complete,
+                                            },
+                                        )))
                                     }
                                     ControlFrame::ForwardedRead(forwarded) => {
                                         Some(match answers(&forwarded.request) {
@@ -2411,6 +2441,25 @@ fn voicing_connection(
     (connection, kept)
 }
 
+/// A daemon whose session's worker answers the privacy notice at once and no read, which is the
+/// world of a voice call's context: the context is read from the daemon's own stores and the
+/// worker's session read, and the tick's notice does not hold the worker's one link while a read
+/// waits for it.
+async fn worker_for_a_voice_call() -> crate::service::a_close_a_worker_never_answers::Silent {
+    use crate::service::a_close_a_worker_never_answers as fake;
+
+    let world = a_worker_answering(
+        std::sync::Arc::new(|_| None),
+        std::sync::Arc::default(),
+        reads_scopes(),
+        what_a_worker_refuses_with_when_its_test_gave_it_nothing(),
+        true,
+    )
+    .await;
+    fake::acknowledged(&world.controller, world.session_id);
+    world
+}
+
 /// A managed voice service that answers without a network call, the one the daemon's voice suites
 /// share.
 #[path = "../../../tests/voice_provider/mod.rs"]
@@ -2430,13 +2479,6 @@ async fn a_voice_call_over(
     controller.voice().attach_provider(Some(std::sync::Arc::new(
         voice_provider::OfflineProvider::default(),
     )));
-    // These cases are about the write of an answer, not about how fast the session's worker is
-    // reached: its first link can take longer than the stated wait on a busy machine.
-    *controller.voice_budgets.lock().expect("the voice budgets") =
-        crate::service::voice_actions::VoiceBudgets {
-            read: std::time::Duration::from_secs(120),
-            ..crate::service::voice_actions::VoiceBudgets::STATED
-        };
     let device_id = connection.device.device_id;
     let coordinator = controller.voice().coordinator();
     let revision = controller.policy().authority_revision();
@@ -2562,7 +2604,7 @@ fn a_context_refused_as_moved(frame: &kr_protocol::envelope::ControlFrame) {
 async fn a_voice_context_is_written_whole_under_the_privacy_state_it_was_read_in() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
-    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    let world = worker_for_a_voice_call().await;
     let (connection, kept) = voicing_connection(&world.controller, 69);
     let call = a_voice_call_over(&world.controller, &connection, world.session_id).await;
     let answer =
@@ -2594,7 +2636,7 @@ async fn a_voice_context_is_written_whole_under_the_privacy_state_it_was_read_in
 /// own refusal has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_voice_context_is_refused_when_privacy_mode_starts_before_it_is_sent() {
-    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    let world = worker_for_a_voice_call().await;
     let controller = &world.controller;
     let (connection, kept) = voicing_connection(controller, 70);
     let call = a_voice_call_over(controller, &connection, world.session_id).await;
@@ -2672,7 +2714,7 @@ async fn privacy_mode_is_turned_off(controller: &crate::service::Controller) {
 async fn a_voice_context_read_with_privacy_mode_on_is_written_while_the_mode_stands() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
-    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    let world = worker_for_a_voice_call().await;
     let controller = &world.controller;
     privacy_mode_is_on_and_settled(controller, world.session_id).await;
     let (connection, kept) = voicing_connection(controller, 75);
@@ -2706,7 +2748,7 @@ async fn a_voice_context_read_with_privacy_mode_on_is_written_while_the_mode_sta
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes_off_before_it_is_sent()
  {
-    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    let world = worker_for_a_voice_call().await;
     let controller = &world.controller;
     privacy_mode_is_on_and_settled(controller, world.session_id).await;
     let (connection, kept) = voicing_connection(controller, 76);
@@ -2737,7 +2779,7 @@ async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes_off_and_on_again_before_it_is_sent()
  {
-    let world = worker_answering_pages_with(&a_page_of_retained_output()).await;
+    let world = worker_for_a_voice_call().await;
     let controller = &world.controller;
     privacy_mode_is_on_and_settled(controller, world.session_id).await;
     let (connection, kept) = voicing_connection(controller, 77);
