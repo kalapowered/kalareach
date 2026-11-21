@@ -277,7 +277,7 @@ describe('the scripted host and attention, review and sharing', () => {
     expect((await slow).key).toEqual(quick.key)
   })
 
-  it('answers a paired host\u2019s inbox and numbers under that host and its epoch, as the connection says them', async () => {
+  it('answers a paired host’s inbox and numbers under that host and its epoch, as the connection says them', async () => {
     const { port, controls } = fakeHost()
     controls.reachAsPairedDevice()
     const params = { session_id: null, include_acknowledged: false, max_items: '200', after: null }
