@@ -6,10 +6,9 @@
 //! that, so nothing of the sequence is written here: this module says who sends, where the chunks
 //! travel and what is read of the outcome.
 //!
-//! Where the chunks travel is [`chunk_route`], the one place that names it. The client library has
-//! the host's local attachment-chunk endpoint today, which is a route for a caller on the host's
-//! own machine; the route a paired device's chunks will take belongs to the network form of the
-//! transfer, and replaces that one function's body when the client library has it.
+//! Where the chunks travel is [`device_route`] for a paired device, the data streams of its own
+//! connection, and [`chunk_route`] for a caller on the host's machine, the host's local
+//! attachment-chunk endpoint.
 //!
 //! What the host published is found where the host stages it ([`staged_file`]), because no device
 //! is shown a path: the attachment handle names a transfer, not a location.
@@ -156,6 +155,9 @@ pub enum Lane {
     /// The host's local attachment-chunk endpoint, which only the host's own owner on this machine
     /// reaches: chunks sent on it are not a paired device's, whoever began the upload.
     Local,
+    /// The data streams of the connection a paired device holds to the host: the lane a device's
+    /// chunks travel.
+    Network,
 }
 
 impl Lane {
@@ -164,6 +166,7 @@ impl Lane {
     pub const fn word(self) -> &'static str {
         match self {
             Self::Local => "local endpoint",
+            Self::Network => "paired host's data streams",
         }
     }
 
@@ -172,14 +175,13 @@ impl Lane {
     pub const fn is_a_devices(self) -> bool {
         match self {
             Self::Local => false,
+            Self::Network => true,
         }
     }
 }
 
-/// The route the device's chunks travel, and whose lane it is: the host's local attachment-chunk
-/// endpoint, which is the only route the client library has. The network route a paired device's
-/// chunks will take replaces this body, and a lane for it is added, when the client library has it;
-/// until then no transfer passes as a device's.
+/// The route a caller on the host's own machine sends chunks on, and whose lane it is: the host's
+/// local attachment-chunk endpoint. A paired device's route is [`device_route`].
 ///
 /// # Errors
 ///
@@ -189,6 +191,23 @@ pub fn chunk_route(
     build_id: BuildId,
 ) -> Result<(ChunkRoute, Lane), ClientError> {
     Ok((ChunkRoute::local(environment, build_id)?, Lane::Local))
+}
+
+/// The route a paired device's chunks travel: the data streams of the host its own `session` is
+/// connected to, which the host says it takes before anything is reserved.
+///
+/// # Errors
+///
+/// Returns the client library's refusal when the connection has no data streams or the host takes
+/// no attachment stream from a device.
+pub async fn device_route(
+    session: &ClientSession,
+    environment: &EnvironmentPaths,
+) -> Result<(ChunkRoute, Lane), ClientError> {
+    Ok((
+        ChunkRoute::network(session, environment.environment_id()).await?,
+        Lane::Network,
+    ))
 }
 
 /// A session of the host's own owner on this machine, over the local control endpoint, as the
