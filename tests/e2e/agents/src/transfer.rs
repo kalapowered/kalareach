@@ -6,9 +6,8 @@
 //! that, so nothing of the sequence is written here: this module says who sends, where the chunks
 //! travel and what is read of the outcome.
 //!
-//! Where the chunks travel is [`device_route`] for a paired device, the data streams of its own
-//! connection, and [`chunk_route`] for a caller on the host's machine, the host's local
-//! attachment-chunk endpoint.
+//! Where the chunks travel is [`device_route`] for a paired device: the data streams of its own
+//! connection.
 //!
 //! What the host published is found where the host stages it ([`staged_file`]), because no device
 //! is shown a path: the attachment handle names a transfer, not a location.
@@ -47,26 +46,6 @@ impl Caller {
         match self {
             Self::Device => "paired device",
             Self::LocalOwner => "local owner",
-        }
-    }
-}
-
-/// The variable that selects the caller, by the word `device` or `local`: the offline check of the
-/// part's later steps uses `local`. Without it the paired device sends.
-pub const CALLER_VARIABLE: &str = "KR_AGENTS_TRANSFER_CALLER";
-
-/// The caller this run was told to use.
-///
-/// # Panics
-///
-/// Panics when the variable names neither word.
-#[must_use]
-pub fn caller_from_environment() -> Caller {
-    match std::env::var(CALLER_VARIABLE).as_deref() {
-        Err(_) | Ok("" | "device") => Caller::Device,
-        Ok("local") => Caller::LocalOwner,
-        Ok(other) => {
-            panic!("{CALLER_VARIABLE} is {other:?}, and names neither `device` nor `local`")
         }
     }
 }
@@ -178,19 +157,6 @@ impl Lane {
             Self::Network => true,
         }
     }
-}
-
-/// The route a caller on the host's own machine sends chunks on, and whose lane it is: the host's
-/// local attachment-chunk endpoint. A paired device's route is [`device_route`].
-///
-/// # Errors
-///
-/// Returns the client library's refusal when the endpoint's address does not fit the platform.
-pub fn chunk_route(
-    environment: &EnvironmentPaths,
-    build_id: BuildId,
-) -> Result<(ChunkRoute, Lane), ClientError> {
-    Ok((ChunkRoute::local(environment, build_id)?, Lane::Local))
 }
 
 /// The route a paired device's chunks travel: the data streams of the host its own `session` is
@@ -340,17 +306,14 @@ pub fn hex_of(bytes: &[u8]) -> String {
     })
 }
 
-/// The digests of the images a conversation file records as given to the agent: each line the
+/// The digests of the images a conversation's `text` records as given to the agent: each line the
 /// build list's `marker` is in, with the base64 text after each `base64,` in it decoded and hashed,
 /// so a message that holds several images gives one digest for each. A line the marker is in with
 /// no image text after it, or whose image cannot be decoded, gives `None`.
 #[must_use]
-pub fn images_recorded(conversation: &Path, marker: &str) -> Vec<Option<String>> {
+pub fn images_recorded(text: &str, marker: &str) -> Vec<Option<String>> {
     use base64::Engine as _;
 
-    let Ok(text) = std::fs::read_to_string(conversation) else {
-        return Vec::new();
-    };
     let mut found = Vec::new();
     for line in text.lines().filter(|line| line.contains(marker)) {
         let mut images = line.split("base64,").skip(1).peekable();
@@ -389,10 +352,7 @@ mod tests {
             encode(b"first image"),
             encode(b"second image")
         );
-        let file = std::env::temp_dir().join(format!("kr-images-{}.jsonl", kr_ipc::new_uuid()));
-        std::fs::write(&file, format!("{line}\n")).expect("writes the record");
-        let found = images_recorded(&file, "\"type\":\"input_image\"");
-        let _ = std::fs::remove_file(&file);
+        let found = images_recorded(&format!("{line}\n"), "\"type\":\"input_image\"");
         assert_eq!(
             found,
             vec![
