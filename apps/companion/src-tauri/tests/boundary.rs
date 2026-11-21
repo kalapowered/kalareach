@@ -1637,6 +1637,22 @@ fn the_android_activity_is_restarted_by_a_font_scale_change_so_the_page_follows_
     }
 }
 
+/// An XML document's text with its comments taken out, so a name in a comment that explains an
+/// entry is not read as the entry.
+fn without_comments(document: &str) -> String {
+    let mut declared = String::new();
+    let mut rest = document;
+    while let Some(start) = rest.find("<!--") {
+        declared.push_str(&rest[..start]);
+        let end = rest[start..]
+            .find("-->")
+            .expect("every comment in the document is closed");
+        rest = &rest[start + end + "-->".len()..];
+    }
+    declared.push_str(rest);
+    declared
+}
+
 /// KR-REQ-13.17: "Take a photo" opens the camera on Android. The page's file input asks for the
 /// camera, and the WebView's file chooser opens it only after it finds an application that answers
 /// the image-capture action. The application targets Android 11 or later, where an application sees
@@ -1649,16 +1665,7 @@ fn the_android_manifest_names_the_image_capture_action_so_take_a_photo_finds_the
             .expect("the application's manifest can be read");
     // What the manifest declares, with its comments taken out: the action's name in a comment that
     // explains the entry is not the entry.
-    let mut declared = String::new();
-    let mut rest = manifest.as_str();
-    while let Some(start) = rest.find("<!--") {
-        declared.push_str(&rest[..start]);
-        let end = rest[start..]
-            .find("-->")
-            .expect("every comment in the manifest is closed");
-        rest = &rest[start + end + "-->".len()..];
-    }
-    declared.push_str(rest);
+    let declared = without_comments(&manifest);
     // The actions of every intent that a `<queries>` element lists.
     let queried: Vec<&str> = declared
         .split("<queries>")
@@ -1673,6 +1680,63 @@ fn the_android_manifest_names_the_image_capture_action_so_take_a_photo_finds_the
     assert!(
         queried.contains(&"android.media.action.IMAGE_CAPTURE"),
         "no `<queries>` intent names android.media.action.IMAGE_CAPTURE, so \"Take a photo\" cannot see the camera and opens the photo picker: {queried:?}"
+    );
+}
+
+/// KR-REQ-13.17: the photos "Take a photo" leaves are not copied off the phone. The WebView's
+/// camera path makes a file in the application's Pictures folder under its external files before the
+/// camera opens, and Auto Backup and a device transfer copy that folder unless the application's
+/// rules leave it out. The manifest names both rules files (Android 12 and later read the first,
+/// earlier versions the second), and each excludes the folder in every copy it governs.
+#[test]
+fn the_android_manifest_keeps_the_camera_photos_out_of_backup_and_device_transfer() {
+    let root = crate_root().join("gen/android/app/src/main");
+    let manifest = without_comments(
+        &std::fs::read_to_string(root.join("AndroidManifest.xml"))
+            .expect("the application's manifest can be read"),
+    );
+    let application = manifest
+        .split("<application")
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .expect("the manifest declares the application");
+    // The rules file an attribute of the application names, read from the resources it points at.
+    let rules = |attribute: &str| -> String {
+        let name = application
+            .split(&format!("android:{attribute}=\"@xml/"))
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("the application declares no android:{attribute}"));
+        let file = root.join("res/xml").join(format!("{name}.xml"));
+        without_comments(
+            &std::fs::read_to_string(&file)
+                .unwrap_or_else(|error| panic!("{} could not be read: {error}", file.display())),
+        )
+    };
+    // Whether one section of a rules file holds an `<exclude>` of the Pictures folder of the
+    // external files, whatever order its attributes come in.
+    let excludes_the_photos = |document: &str, section: &str| -> bool {
+        document
+            .split(&format!("<{section}>"))
+            .nth(1)
+            .and_then(|rest| rest.split(&format!("</{section}>")).next())
+            .is_some_and(|body| {
+                body.split("<exclude").skip(1).any(|element| {
+                    let element = element.split('>').next().unwrap_or_default();
+                    element.contains("domain=\"external\"") && element.contains("path=\"Pictures\"")
+                })
+            })
+    };
+    let extraction = rules("dataExtractionRules");
+    for section in ["cloud-backup", "device-transfer"] {
+        assert!(
+            excludes_the_photos(&extraction, section),
+            "the data extraction rules do not exclude the external Pictures folder from {section}, so a photo taken for an attachment is copied off the phone"
+        );
+    }
+    assert!(
+        excludes_the_photos(&rules("fullBackupContent"), "full-backup-content"),
+        "the full backup rules do not exclude the external Pictures folder, so a photo taken for an attachment is copied off the phone"
     );
 }
 
