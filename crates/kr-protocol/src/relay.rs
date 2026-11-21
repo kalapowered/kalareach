@@ -682,6 +682,9 @@ impl RelayConsumptionReceipt {
     }
 
     /// Returns true when this receipt could be the first one of its reservation.
+    ///
+    /// Only this crate's tests call it. The relay program, which is outside this repository, reads
+    /// it, so it stays.
     #[must_use]
     pub fn is_first(&self) -> bool {
         self.sequence.get() == FIRST_RECEIPT_SEQUENCE
