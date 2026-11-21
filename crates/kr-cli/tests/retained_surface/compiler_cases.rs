@@ -744,6 +744,7 @@ fn meta_with(meta: &Meta) -> Meta {
         members: meta.members.clone(),
         folders: meta.folders.clone(),
         proc_macros: meta.proc_macros.clone(),
+        model_runtime: meta.model_runtime.clone(),
     }
 }
 
@@ -930,6 +931,64 @@ fn cargo_names_the_procedural_macro_crates_each_client_depends_on() {
             &[]
         ),
         [refusal::proc_macro_member("kr_user", "kr-derive")]
+    );
+}
+
+#[test]
+fn the_windows_check_leaves_out_the_members_that_depend_directly_on_the_model_runtime() {
+    let root = tempfile::tempdir().expect("a folder");
+    write(
+        root.path(),
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+    );
+    protocol(root.path());
+    write(
+        root.path(),
+        "crates/llama-cpp-2/Cargo.toml",
+        &manifest("llama-cpp-2", ""),
+    );
+    write(root.path(), "crates/llama-cpp-2/src/lib.rs", "");
+    write(
+        root.path(),
+        "crates/kr-model/Cargo.toml",
+        &manifest("kr-model", "llama-cpp-2 = { path = \"../llama-cpp-2\" }\n"),
+    );
+    write(root.path(), "crates/kr-model/src/lib.rs", "");
+    write(
+        root.path(),
+        "crates/kr-user/Cargo.toml",
+        &manifest("kr-user", "kr-model = { path = \"../kr-model\" }\n"),
+    );
+    write(root.path(), "crates/kr-user/src/lib.rs", "");
+    let lock = compiler::cargo_command()
+        .args(["generate-lockfile", "--offline"])
+        .current_dir(root.path())
+        .output()
+        .expect("cargo runs");
+    assert!(
+        lock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+    let meta = compiler::metadata(root.path()).expect("the metadata");
+    assert_eq!(
+        meta.model_runtime,
+        BTreeSet::from(["kr-model".to_owned()]),
+        "only a member that depends directly on llama-cpp-2"
+    );
+    let left_out = |name: &str| {
+        let config = PLAN
+            .iter()
+            .find(|config| config.name == name)
+            .expect("a configuration");
+        compiler::excluded(*config, &meta)
+    };
+    assert_eq!(left_out("host"), ["kr-controller", "kr-worker"]);
+    assert_eq!(left_out("host-tests"), ["kr-controller", "kr-worker"]);
+    assert_eq!(
+        left_out("windows"),
+        ["kr-controller", "kr-worker", "kr-model"]
     );
 }
 
