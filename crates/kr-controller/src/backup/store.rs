@@ -3640,19 +3640,6 @@ impl BackupStore {
         })
     }
 
-    /// Returns one privacy request, if this host accepted it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn privacy_request(&self, privacy_generation: u64) -> Result<Option<PrivacyRequest>> {
-        read_request(
-            &self.connection,
-            i64::try_from(privacy_generation).unwrap_or(i64::MAX),
-        )
-    }
-
     /// Returns the privacy generation backup production is stopped at, if it is stopped.
     ///
     /// # Errors
