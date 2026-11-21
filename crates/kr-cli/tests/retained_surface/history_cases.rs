@@ -700,7 +700,7 @@ fn a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_t
         report.problems,
         vec![
             said(&format!("{third}: the crate kr_hook cannot be read: k")),
-            said(&format!("{third}: the scan failed: scan")),
+            said(&format!("{third}: the reading failed: scan")),
             said(&format!(
                 "{third}: the item companion_tauri::Link::target cannot be read: e"
             )),
@@ -748,7 +748,7 @@ fn a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_t
             ))
         })
         .collect();
-    expected_problems.push(said(&format!("{tag}: the scan failed: {scan_error}")));
+    expected_problems.push(said(&format!("{tag}: the reading failed: {scan_error}")));
     for item in ["Link::target", "old_builder", "relay"] {
         expected_problems.push(said(&format!(
             "{tag}: the item companion_tauri::{item} cannot be read: {crate_error}"
@@ -788,7 +788,7 @@ fn a_source_that_cannot_be_read_at_a_tag_is_a_text_of_its_own() {
     assert_eq!(
         report.problems,
         vec![
-            said(&format!("{}: the scan failed: {scan_error}", at.at.tag)),
+            said(&format!("{}: the reading failed: {scan_error}", at.at.tag)),
             said(&format!(
                 "{}: the source of kr_other::other_one cannot be read: {error}",
                 at.at.tag

@@ -221,7 +221,7 @@ pub fn audit_tags(entry: &Narrower, expected: &[Tagged], snapshots: &[Snapshot])
         if let Err(error) = &snapshot.sightings {
             report
                 .problems
-                .push(said(format!("{tag}: the scan failed: {error}")));
+                .push(said(format!("{tag}: the reading failed: {error}")));
         }
         for ((krate, name), error) in &snapshot.source_errors {
             report.problems.push(said(format!(

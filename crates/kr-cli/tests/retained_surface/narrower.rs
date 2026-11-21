@@ -647,7 +647,7 @@ impl Checker<'_> {
         let sightings = match input.current.sightings() {
             Ok(sightings) => sightings,
             Err(error) => {
-                self.say(format!("the scan of this checkout failed: {error}"));
+                self.say(format!("the reading of this checkout failed: {error}"));
                 return;
             }
         };
