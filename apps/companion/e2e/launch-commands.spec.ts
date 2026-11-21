@@ -113,7 +113,8 @@ for (const reduced of [false, true]) {
       expect(await overrunning(page, '[data-testid="launch-commands"]')).toEqual([])
       await section.getByTestId('launch-commands-save').click()
       const row = section.getByTestId('launch-commands-list').locator('li[data-label="Agent"]')
-      await expect(row).toContainText('"C:\\\\tools\\\\agent.exe" "two words"')
+      // The list shows each word as the preview does: one backslash, as the person typed it.
+      await expect(row).toContainText('"C:\\tools\\agent.exe" "two words"')
       await section.screenshot({
         path: screenshotPath(
           `kr-companion-launch-commands-settings-${reduced ? 'reduced' : 'motion'}-13.11-${test.info().project.name}`

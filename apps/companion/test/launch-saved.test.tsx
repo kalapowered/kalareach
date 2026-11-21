@@ -447,6 +447,16 @@ describe('the Settings form for the saved commands', () => {
     expect(screen.queryByTestId('launch-commands-conflict')).toBeNull()
   })
 
+  it('shows each word of a saved command as the preview does, with one backslash for each one the host holds', async () => {
+    const { port, controls } = fakeHost()
+    controls.launchCommands.changeElsewhere([
+      { label: 'Agent', program: 'C:\\tools\\agent.exe', arguments: ['two words', ''] }
+    ])
+    settings(port)
+    const list = await screen.findByTestId('launch-commands-list')
+    expect(list).toHaveTextContent('"C:\\tools\\agent.exe" "two words" ""')
+  })
+
   it('holds the form still while a save waits, so an edit made in the meantime is not lost', async () => {
     const person = userEvent.setup()
     const { port } = fakeHost()
