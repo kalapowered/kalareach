@@ -57,6 +57,10 @@ const CHANGED: &str =
 const UNCONFIRMED: &str =
     "The host could not confirm the change. Run kr launch list to check the current list.";
 
+/// What a write says when the host answered that it could not write the change.
+const NOT_SAVED: &str =
+    "The host could not save the change. Run kr launch list to check the current list.";
+
 /// What every command says of a host that does not serve the methods.
 const NOT_SERVED: &str = "This host does not serve launch commands.";
 
@@ -115,7 +119,7 @@ async fn add(paths: &HostPaths, arguments: LaunchAddArguments, json: bool) -> Re
             },
         )
         .await
-        .map_err(|error| in_the_hosts_words(error, &file))?;
+        .map_err(|error| after_a_write(error, &file))?;
     let label = command.label.trim();
     let holds_it = holds(
         &saved.commands,
@@ -166,7 +170,7 @@ async fn remove(
             },
         )
         .await
-        .map_err(|error| in_the_hosts_words(error, &file))?;
+        .map_err(|error| after_a_write(error, &file))?;
     let label = arguments.label.trim();
     let absent = !removed
         .commands
@@ -229,6 +233,20 @@ async fn read_list(daemon: &mut Daemon, file: &Path) -> Result<ShellLaunchComman
             })
         }
         Err(error) => Err(in_the_hosts_words(error, file)),
+    }
+}
+
+/// A refusal of a write as `kr launch` tells it. A write is sent only after the list was read, so a
+/// `STORAGE_UNAVAILABLE` that answers it is the host failing to write the change, or the file
+/// failing between the two requests; an unreadable file stops the read before a write is sent.
+/// Neither is told as an unreadable file, so the sentence says nothing of the file and advises no
+/// removal. Every other refusal is told as [`in_the_hosts_words`] tells it.
+fn after_a_write(error: CliError, file: &Path) -> CliError {
+    match error {
+        CliError::Refused(refused) if refused.code == ErrorCode::StorageUnavailable => {
+            failed(ErrorCode::StorageUnavailable, NOT_SAVED)
+        }
+        other => in_the_hosts_words(other, file),
     }
 }
 

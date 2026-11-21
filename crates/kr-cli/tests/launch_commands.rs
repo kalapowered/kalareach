@@ -6,7 +6,8 @@
 //! session. `kr` is the real binary, copied to the internal disk and run with that tree's
 //! directories on plain pipes. The host decides every rule of a command; `kr` holds none, so each
 //! refusal here is the host's own sentence. The suite runs on Unix and on Windows; the two differ
-//! only in the environment `kr` is given and the directory it runs in.
+//! only in the environment `kr` is given and the directory it runs in, and in one case that needs
+//! file modes (a state directory that cannot be written), which runs on Unix only.
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -591,6 +592,78 @@ async fn kr_launch_add_remove_and_list_are_refused_inside_a_session_and_change_n
     }
     assert_eq!(std::fs::read(host.file()).expect("the file"), kept);
     assert_eq!(labels(&host.listed()), ["Claude"]);
+}
+
+/// A state directory that is read-only for as long as it lives: the file in it can be read, and
+/// nothing can be written beside it. The mode is put back when it is dropped, so the test tree can
+/// be removed.
+#[cfg(unix)]
+struct ReadOnly(PathBuf);
+
+#[cfg(unix)]
+impl ReadOnly {
+    fn new(directory: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+            .expect("a read-only directory");
+        Self(directory)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// KR-REQ-13.11: a save or a removal that the host could not write, the earlier file standing, is
+/// not told as a file that cannot be read: it says the host could not save the change and to look
+/// at the list, advises no removal, exits 8, and the list is as it was. A list that is unreadable
+/// is the case above, and its words are unchanged. The control is the unreadable file, whose
+/// words stay.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_the_host_could_not_write_is_not_told_as_an_unreadable_file_and_the_list_stands() {
+    let host = Host::start().await;
+    host.said(&["launch", "add", "Claude", "--", "claude"]);
+    host.said(&["launch", "add", "Codex", "--", "codex"]);
+    let kept = std::fs::read(host.file()).expect("the file");
+
+    let state = host.temp.environment().state_dir().to_path_buf();
+    let (adds, removes, as_a_document) = {
+        let _locked = ReadOnly::new(state);
+        (
+            host.said(&["launch", "add", "Other", "--", "other"]),
+            host.said(&["launch", "remove", "Claude"]),
+            host.json(&["launch", "add", "Third", "--", "third"]),
+        )
+    };
+    for (status, text, said) in [adds, removes] {
+        assert_eq!(status, Some(8), "{text}{said}");
+        assert!(
+            said.contains(
+                "The host could not save the change. Run kr launch list to check the current list."
+            ),
+            "{said}"
+        );
+        assert!(
+            !said.contains("could not be read") && !said.contains("Move that file away"),
+            "a failed write advises no removal of a file that can be read: {said}"
+        );
+    }
+    let (status, document) = as_a_document;
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "STORAGE_UNAVAILABLE", "{document}");
+    assert_eq!(
+        std::fs::read(host.file()).expect("the file"),
+        kept,
+        "the earlier file stands"
+    );
+    assert_eq!(labels(&host.listed()), ["Claude", "Codex"]);
 }
 
 /// KR-REQ-13.11: a revision above 2^53 is written exactly, as the protocol writes a `U64`: a
