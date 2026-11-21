@@ -4444,6 +4444,16 @@ async fn kr_req_12_18_a_typed_answer_that_passes_the_workers_bound_is_not_a_chan
         ErrorCode::DraftConflict,
         "a typed upstream's unknown outcome holds the next answer to the same approval"
     );
+    // A thread that is slow to make the call can pass the bound before it makes it, so the call's
+    // arrival is waited for and not looked for at the moment the bound passed.
+    let started = std::time::Instant::now();
+    while upstream.carried.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the first answer reached the upstream by now"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         1,
