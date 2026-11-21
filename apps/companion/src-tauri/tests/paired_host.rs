@@ -3572,8 +3572,46 @@ async fn a_re_pair_after_the_read_without_a_forget_is_rejected_by_the_second_ver
     v.stop().await;
 }
 
-/// A visitor queued behind another visit of the same host, across a forget of it, takes no
-/// connection and makes no record.
+/// A visitor queued behind another visit of the same host, across a forget of it that is not
+/// undone, takes no connection and makes no record: the host is no longer listed, so the visit that
+/// holds the turn fails its second check, and the queued one finds no record to visit under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visitor_queued_across_a_forget_that_is_not_undone_takes_no_connection_and_makes_no_record()
+ {
+    let v = visiting().await;
+    let mut visits = v.companion().inbox().watch_visits();
+    let first = v.pass();
+    let a = v.id_of(&v.a_ref);
+    let hold = visit_held(&mut visits, a).await;
+    let endpoint = v.a.network().endpoint_id();
+    // The first visit to A is past its admission: the visitors that reach theirs from here are the
+    // queued pass's.
+    let mut admissions = v.companion().inbox().watch_admissions();
+    let queued = v.pass();
+    tokio::time::timeout(WATCHDOG, async {
+        while admissions.recv().await.expect("a visit is admitted") != a {}
+    })
+    .await
+    .expect("the queued visitor to A is admitted and waits for its turn");
+    let asked = v.control.asked_of(&endpoint);
+    v.companion()
+        .call("hosts_forget", json!({ "reference": v.a_ref }))
+        .expect("A is forgotten");
+    hold.release();
+    drop(visits);
+    first.await.expect("ran").expect("answered");
+    queued.await.expect("ran").expect("answered");
+    assert_eq!(
+        v.control.asked_of(&endpoint),
+        asked,
+        "the queued visitor asked for no connection"
+    );
+    assert!(contact_of(v.companion(), &v.a_ref).is_null());
+    v.stop().await;
+}
+
+/// The same, with the pairing listed again as it was: the visit that holds the turn passes its
+/// second check, and only the owner's record, which the forget removed, rejects its commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_visitor_queued_across_a_forget_takes_no_connection_and_makes_no_record() {
     let v = visiting().await;
