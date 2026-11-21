@@ -87,7 +87,8 @@ impl ChannelRoot {
     ///
     /// Returns a refusal when the root cannot be read, is not root metadata, gives one key to two
     /// roles, names one key under two identifiers in a role or a key that is not an Ed25519 key of
-    /// 32 bytes, or is not signed by its own root keys.
+    /// 32 bytes, has no root role, lists the signature of one key twice, holds a number with a
+    /// fraction or an exponent, or is not signed by its own root keys.
     pub fn read(release: &Path) -> Result<Option<Self>> {
         let path = release.join(CHANNEL_ROOT);
         let bytes = match read_bounded(&path, MAX_ROOT_LEN) {
@@ -127,6 +128,20 @@ impl ChannelRoot {
                      bytes",
                     Shown::root(&path)
                 ),
+                kr_release::VerifyError::DuplicateSignature => shown!(
+                    "the update channel's root at {} lists the signature of one key twice",
+                    Shown::root(&path)
+                ),
+                kr_release::VerifyError::MissingRole { .. } => shown!(
+                    "the update channel's root at {} has no root role, so it names no keys that \
+                     sign it",
+                    Shown::root(&path)
+                ),
+                kr_release::VerifyError::NoCanonicalForm(_) => shown!(
+                    "the update channel's root at {} holds a number written with a fraction or an \
+                     exponent, which a signed document cannot hold",
+                    Shown::root(&path)
+                ),
                 _ => shown!(
                     "the update channel's root at {} is not signed by the root keys it names",
                     Shown::root(&path)
@@ -141,8 +156,9 @@ impl ChannelRoot {
     /// # Errors
     ///
     /// Returns a refusal when it gives one key to two roles, names one key under two identifiers in
-    /// a role or a key that is not an Ed25519 key of 32 bytes, or is not signed by its own root
-    /// keys.
+    /// a role or a key that is not an Ed25519 key of 32 bytes, has no root role, lists the
+    /// signature of one key twice, holds a number with a fraction or an exponent, or is not signed
+    /// by its own root keys.
     pub fn kept(signed: tough::schema::Signed<tough::schema::Root>) -> Result<Self> {
         kr_release::verify_root_itself(&signed).map_err(|error| {
             CliError::Other(Shown::said(match error {
@@ -158,6 +174,17 @@ impl ChannelRoot {
                 kr_release::VerifyError::UnsupportedKey { .. } => {
                     "the update channel's root this host kept names a key that is not an Ed25519 \
                      key of 32 bytes"
+                }
+                kr_release::VerifyError::DuplicateSignature => {
+                    "the update channel's root this host kept lists the signature of one key twice"
+                }
+                kr_release::VerifyError::MissingRole { .. } => {
+                    "the update channel's root this host kept has no root role, so it names no \
+                     keys that sign it"
+                }
+                kr_release::VerifyError::NoCanonicalForm(_) => {
+                    "the update channel's root this host kept holds a number written with a \
+                     fraction or an exponent, which a signed document cannot hold"
                 }
                 _ => {
                     "the update channel's root this host kept is not signed by the root keys it \
@@ -226,8 +253,9 @@ impl ChannelRoot {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when the document is not a signed manifest, or its signatures do not
-    /// reach the threshold.
+    /// Returns a refusal when the document is not a signed manifest, lists the signature of one key
+    /// twice or holds a number with a fraction or an exponent, the root has no targets role, or the
+    /// signatures do not reach the threshold.
     pub fn verify(&self, document: &[u8]) -> Result<ReleaseManifest> {
         let members = kr_release::verify_manifest(&self.signed.signed, document).map_err(
             |error| match error {
@@ -241,6 +269,17 @@ impl ChannelRoot {
                 | kr_release::VerifyError::Threshold => CliError::Other(Shown::said(
                     "the release's manifest is not signed by the release keys the update \
                          channel's root names",
+                )),
+                kr_release::VerifyError::DuplicateSignature => CliError::Other(Shown::said(
+                    "the release's manifest lists the signature of one key twice",
+                )),
+                kr_release::VerifyError::MissingRole { .. } => CliError::Other(Shown::said(
+                    "the update channel's root has no targets role, so it names no keys that sign \
+                     a release's manifest",
+                )),
+                kr_release::VerifyError::NoCanonicalForm(_) => CliError::Other(Shown::said(
+                    "the release's manifest holds a number written with a fraction or an \
+                     exponent, which a signed document cannot hold",
                 )),
             },
         )?;

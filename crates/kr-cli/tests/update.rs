@@ -3686,6 +3686,185 @@ fn a_host_refuses_a_channel_root_that_names_a_wrapped_key_as_that() {
     );
 }
 
+/// The harness's own channel root with `change` made to the document, signed again by its root key
+/// over the form the change leaves, so that the change is its only defect.
+fn channel_root_changed(change: &dyn Fn(&mut serde_json::Value)) -> String {
+    let k = keys();
+    let sound = channel_root_over(
+        1,
+        [&k.root, &k.targets, &k.snapshot, &k.timestamp],
+        &[&k.root],
+    );
+    let mut document: serde_json::Value = serde_json::from_str(&sound).expect("a root");
+    change(&mut document);
+    let edited: tough::schema::Root =
+        serde_json::from_value(document["signed"].clone()).expect("root metadata");
+    let canonical = tough::schema::Role::canonical_form(&edited).expect("canonical");
+    document["signatures"] =
+        serde_json::to_value([signature(&k.root, &canonical)]).expect("a signature");
+    document.to_string()
+}
+
+/// The channel root `text` holds, read back as a release would carry it.
+fn trusted_from(text: &str) -> kr_cli::update::release::ChannelRoot {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join(kr_cli::update::release::CHANNEL_ROOT);
+    std::fs::create_dir_all(path.parent().expect("share")).expect("share");
+    std::fs::write(&path, text).expect("the root");
+    kr_cli::update::release::ChannelRoot::read(directory.path())
+        .unwrap_or_else(|error| panic!("the root reads: {error}"))
+        .expect("the root is there")
+}
+
+/// KR-REQ-26.40: a root that lists the signature of its one key twice is refused as that, and is
+/// not said to be unsigned.
+#[cfg(unix)]
+#[test]
+fn a_host_refuses_a_channel_root_that_lists_a_signature_twice_as_that() {
+    let k = keys();
+    let text = channel_root_over(
+        1,
+        [&k.root, &k.targets, &k.snapshot, &k.timestamp],
+        &[&k.root, &k.root],
+    );
+    let carried = said_of_a_carried_root(&text);
+    assert!(
+        carried.contains("lists the signature of one key twice"),
+        "{carried}"
+    );
+    let kept = said_of_a_kept_root(&text);
+    assert!(
+        kept.contains("this host kept lists the signature of one key twice"),
+        "{kept}"
+    );
+    assert!(
+        !carried.contains("is not signed by") && !kept.contains("is not signed by"),
+        "{carried} {kept}"
+    );
+}
+
+/// KR-REQ-26.40: a root with no root role is refused as that, and is not said to be unsigned.
+#[cfg(unix)]
+#[test]
+fn a_host_refuses_a_channel_root_with_no_root_role_as_that() {
+    let text = channel_root_changed(&|document| {
+        document["signed"]["roles"]
+            .as_object_mut()
+            .expect("roles")
+            .remove("root");
+    });
+    let carried = said_of_a_carried_root(&text);
+    assert!(
+        carried.contains("has no root role, so it names no keys that sign it"),
+        "{carried}"
+    );
+    let kept = said_of_a_kept_root(&text);
+    assert!(
+        kept.contains("this host kept has no root role, so it names no keys that sign it"),
+        "{kept}"
+    );
+    assert!(
+        !carried.contains("is not signed by") && !kept.contains("is not signed by"),
+        "{carried} {kept}"
+    );
+}
+
+/// KR-REQ-26.40: a root with a member that has no canonical form, here a number with a fraction,
+/// which no signature can be made over, is refused as that and is not said to be unsigned.
+#[cfg(unix)]
+#[test]
+fn a_host_refuses_a_channel_root_with_a_member_that_has_no_canonical_form_as_that() {
+    let k = keys();
+    let sound = channel_root_over(
+        1,
+        [&k.root, &k.targets, &k.snapshot, &k.timestamp],
+        &[&k.root],
+    );
+    let mut document: serde_json::Value = serde_json::from_str(&sound).expect("a root");
+    document["signed"]["ratio"] = serde_json::json!(1.5);
+    let text = document.to_string();
+    let words = "holds a number written with a fraction or an exponent, which a signed document \
+                 cannot hold";
+    let carried = said_of_a_carried_root(&text);
+    assert!(carried.contains(words), "{carried}");
+    let kept = said_of_a_kept_root(&text);
+    assert!(kept.contains(&format!("this host kept {words}")), "{kept}");
+    assert!(
+        !carried.contains("is not signed by") && !kept.contains("is not signed by"),
+        "{carried} {kept}"
+    );
+}
+
+/// KR-REQ-26.09: a manifest that lists the signature of its key twice, or holds a member with no
+/// canonical form, is refused as that and is not said to be unsigned.
+#[cfg(unix)]
+#[test]
+fn a_host_refuses_a_manifest_that_lists_a_signature_twice_or_has_no_canonical_form_as_that() {
+    let root = trusted();
+    let (_, _, document) = small_release(&keys().targets);
+    let said = |document: &Value| {
+        root.verify(document.to_string().as_bytes())
+            .err()
+            .expect("a host refuses the manifest")
+            .to_string()
+    };
+    let signed: Value = serde_json::from_str(&document).expect("JSON");
+
+    let mut twice = signed.clone();
+    let listed = twice["signatures"][0].clone();
+    twice["signatures"]
+        .as_array_mut()
+        .expect("signatures")
+        .push(listed);
+    let said_twice = said(&twice);
+    assert!(
+        said_twice.contains("the release's manifest lists the signature of one key twice"),
+        "{said_twice}"
+    );
+
+    let mut fractional = signed;
+    fractional["signed"]["ratio"] = serde_json::json!(1.5);
+    let said_fractional = said(&fractional);
+    assert!(
+        said_fractional.contains(
+            "the release's manifest holds a number written with a fraction or an exponent, which \
+             a signed document cannot hold"
+        ),
+        "{said_fractional}"
+    );
+    assert!(
+        !said_twice.contains("is not signed by") && !said_fractional.contains("is not signed by"),
+        "{said_twice} {said_fractional}"
+    );
+}
+
+/// KR-REQ-26.09: a manifest checked against a root with no targets role is refused as that, since
+/// the root names no keys that sign it.
+#[cfg(unix)]
+#[test]
+fn a_host_refuses_a_manifest_when_its_root_has_no_targets_role_as_that() {
+    let root = trusted_from(&channel_root_changed(&|document| {
+        document["signed"]["roles"]
+            .as_object_mut()
+            .expect("roles")
+            .remove("targets");
+    }));
+    let (_, _, document) = small_release(&keys().targets);
+    let said = root
+        .verify(document.as_bytes())
+        .err()
+        .expect("a host refuses the manifest")
+        .to_string();
+    assert!(
+        said.contains(
+            "the update channel's root has no targets role, so it names no keys that sign a \
+             release's manifest"
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("is not signed by"), "{said}");
+}
+
 /// KR-REQ-26.09: an archive is refused at its first entry that is not a file or a directory of the
 /// one release under one top directory, and an archive that is only files unpacks.
 #[cfg(unix)]

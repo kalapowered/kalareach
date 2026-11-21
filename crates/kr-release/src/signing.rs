@@ -60,6 +60,19 @@ pub enum VerifyError {
         /// The role.
         role: &'static str,
     },
+    /// A document lists the signature of one key twice.
+    #[error("it lists the signature of one key twice")]
+    DuplicateSignature,
+    /// The root names no keys for a role the check needs.
+    #[error("the root has no {role} role")]
+    MissingRole {
+        /// The role.
+        role: &'static str,
+    },
+    /// The document holds a member that has no canonical form, so no signature over it can be
+    /// checked: a number written with a fraction or an exponent.
+    #[error("it has no canonical form: {0}")]
+    NoCanonicalForm(String),
     /// Fewer distinct keys than the role's threshold signed.
     #[error("it is not signed by the number of keys the root names for the role")]
     Threshold,
@@ -168,6 +181,21 @@ const fn role_name(role: RoleType) -> &'static str {
     }
 }
 
+/// Names what the signature library found wrong when it checked a role's signatures.
+fn refused(error: &tough::schema::Error) -> VerifyError {
+    match error {
+        tough::schema::Error::DuplicateKeyId { .. } => VerifyError::DuplicateSignature,
+        tough::schema::Error::MissingRole { role, .. } => VerifyError::MissingRole {
+            role: role_name(*role),
+        },
+        tough::schema::Error::JsonSerialization { source, .. } => {
+            VerifyError::NoCanonicalForm(source.to_string())
+        }
+        // An error the library adds later keeps the threshold's refusal until it is named here.
+        _ => VerifyError::Threshold,
+    }
+}
+
 /// Checks a release manifest's document against `root`: that it is a signed envelope, that the root
 /// passes [`check_root_keys`], and that a threshold of the keys the root names for its targets role
 /// signed it. Returns the members as the signer wrote them.
@@ -175,13 +203,13 @@ const fn role_name(role: RoleType) -> &'static str {
 /// # Errors
 ///
 /// Returns [`VerifyError`] for a document that is not an envelope, a root that [`check_root_keys`]
-/// refuses, or signatures short of the threshold.
+/// refuses or that has no targets role, a document that lists the signature of one key twice or
+/// holds a member with no canonical form, or signatures short of the threshold.
 pub fn verify_manifest(root: &Root, document: &[u8]) -> Result<SignedMembers, VerifyError> {
     let signed: Signed<Signable> =
         serde_json::from_slice(document).map_err(VerifyError::Document)?;
     check_root_keys(root)?;
-    root.verify_role(&signed)
-        .map_err(|_| VerifyError::Threshold)?;
+    root.verify_role(&signed).map_err(|error| refused(&error))?;
     Ok(signed.signed.0)
 }
 
@@ -189,8 +217,9 @@ pub fn verify_manifest(root: &Root, document: &[u8]) -> Result<SignedMembers, Ve
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError`] when [`check_root_keys`] refuses the root or the signatures are short of
-/// the threshold.
+/// Returns [`VerifyError`] when [`check_root_keys`] refuses the root, the root has no root role,
+/// lists the signature of one key twice or holds a member with no canonical form, or the signatures
+/// are short of the threshold.
 pub fn verify_root_itself(signed: &Signed<Root>) -> Result<(), VerifyError> {
     verify_root_by(&signed.signed, signed)
 }
@@ -199,14 +228,13 @@ pub fn verify_root_itself(signed: &Signed<Root>) -> Result<(), VerifyError> {
 ///
 /// # Errors
 ///
-/// Returns [`VerifyError`] when [`check_root_keys`] refuses `trusted` or `next`, or the signatures
-/// are short of the threshold.
+/// Returns [`VerifyError`] when [`check_root_keys`] refuses `trusted` or `next`, `trusted` has no
+/// root role, `next` lists the signature of one key twice or holds a member with no canonical
+/// form, or the signatures are short of the threshold.
 pub fn verify_root_by(trusted: &Root, next: &Signed<Root>) -> Result<(), VerifyError> {
     check_root_keys(trusted)?;
     check_root_keys(&next.signed)?;
-    trusted
-        .verify_role(next)
-        .map_err(|_| VerifyError::Threshold)
+    trusted.verify_role(next).map_err(|error| refused(&error))
 }
 
 /// Signs a manifest's members with each of `signers`, and returns the signed document.
