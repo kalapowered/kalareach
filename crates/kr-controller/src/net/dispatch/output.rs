@@ -724,9 +724,11 @@ impl RemoteOutput {
     /// connection for no refusal. A failure frame is not held, so the device is told why.
     ///
     /// What a read carries of a session's text is held to the privacy state it was read under,
-    /// `read_under`, in the same places: a page, retained entries, a receipt's result, a context for
-    /// a voice call or an answer kept from an earlier submission that no longer stands before any of
-    /// it went is decided again, and the connection ends once bytes are moving.
+    /// `read_under`, in the same places: a page, retained entries, a receipt a session's worker
+    /// gave, a context for a voice call or an answer a session's worker gave from its receipt for a
+    /// repeated mutation that no longer stands before any of it went is decided again, and the
+    /// connection ends once bytes are moving. A receipt the daemon keeps, an answer the daemon's
+    /// own stores kept and a close a worker answers from its receipt carry no such state.
     pub(super) async fn write_held(
         &self,
         frame: &ControlFrame,

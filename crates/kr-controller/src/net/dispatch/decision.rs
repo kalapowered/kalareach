@@ -51,14 +51,17 @@ pub(super) struct Asked {
     /// holds ([`Answers::Conflict`]).
     admitted: Option<Footing>,
     /// For a page of retained output, an agent's retained entries, a context for a voice call, a
-    /// receipt's result, an answer kept from an earlier submission, or an answer with text a model
-    /// wrote, the privacy state it was read under, which the answer is released under
-    /// ([`RemoteConnection::write_answer`]). A page and a snapshot read while privacy mode is on
-    /// are never released; a receipt, or an answer kept from an earlier submission, read then is
-    /// released if its own session owed no removal when the read began, and is refused, or told as
-    /// an outcome not shown, once the state has moved; a voice context read then is released only
-    /// while that same state stands, and any change of it gives the refusal a context read that
-    /// privacy mode moved under is given.
+    /// receipt a session's worker gave, an answer a session's worker gave from its receipt for a
+    /// repeated mutation, or an answer with text a model wrote, the privacy state it was read
+    /// under, which the answer is released under ([`RemoteConnection::write_answer`]). A page and a
+    /// snapshot read while privacy mode is on are never released; a receipt, or an answer a worker
+    /// gave from its receipt, read then is released if its own session owed no removal when the
+    /// read began, and is refused, or told as an outcome not shown, once the state has moved; a
+    /// voice context read then is released only while that same state stands, and any change of it
+    /// gives the refusal a context read that privacy mode moved under is given. A receipt the
+    /// daemon keeps and an answer the daemon's own stores kept have none, because the removal does
+    /// not reach those stores; nor has a close a worker answers from its receipt, because a
+    /// close's result holds no text a session or a model wrote.
     pub(super) read_under: Option<ReadUnder>,
     /// For an answer with text a model wrote, the same answer without it, which is written in its
     /// place once `read_under` no longer stands.
@@ -224,15 +227,18 @@ impl RemoteConnection {
                 &asked.decision.decided.permitted.rights,
                 &asked.acting.grant.history,
             );
-            // A page of retained output, an agent's retained entries, a receipt's result, a
-            // context for a voice call or an answer kept from an earlier submission goes only
-            // under the privacy state it was read under. Once that has moved, a page or a
-            // snapshot goes with none of its text and says the range it covered is gone, as
-            // privacy mode left it; an answer with text a model wrote is replaced by the answer
-            // without that text; a successful context is replaced by the refusal a read that
-            // privacy mode moved under is given; a receipt's result is refused as one that cannot
-            // be shown; and an answer kept from an earlier submission is told as an outcome not
-            // shown.
+            // A page of retained output, an agent's retained entries, a receipt a session's worker
+            // gave, a context for a voice call or an answer a session's worker gave from its
+            // receipt for a repeated mutation goes only under the privacy state it was read under.
+            // Once that has moved, a page or a snapshot goes with none of its text and says the
+            // range it covered is gone, as privacy mode left it; an answer with text a model wrote
+            // is replaced by the answer without that text; a successful context is replaced by the
+            // refusal a read that privacy mode moved under is given; a receipt's result is refused
+            // as one that cannot be shown; and an answer from a worker's receipt for a repeated
+            // mutation is told as an outcome not shown. A receipt the daemon keeps, an answer the
+            // daemon's own stores kept and a close a worker answers from its receipt have no such
+            // state: the removal does not reach those stores, and a close's result holds no text a
+            // session or a model wrote.
             let (shown, read_under) = match asked.read_under.as_ref() {
                 Some(read_under) if !read_under.stands() => {
                     let held_back = match asked.withheld.as_ref() {
