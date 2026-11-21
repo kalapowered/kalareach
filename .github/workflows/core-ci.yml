@@ -3246,7 +3246,7 @@ jobs:
       # leg builds with other features than the whole workspace did, its programs are built in a
       # step of their own, and no run has measured a leg or a build with no cache. The limits are
       # 174 and 158 minutes, about half as much again, and each leg's limits, with the 45 minutes
-      # of its program build, add up to 335 and 345 of the job's 355 minutes.
+      # of its program build and its other steps, add up to 335 and 354 of the job's 355 minutes.
       - name: Test
         if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         timeout-minutes: ${{ matrix.minutes }}
@@ -3288,6 +3288,19 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the workspace's tests"
+
+      # Two of `kr-cli`'s startup cases have a stub for a daemon, a script that prints what a daemon
+      # prints when it cannot listen and ends. They are ignored in the leg's Test step, as in the
+      # rust job's, and run here by name with the account's runtime directory and message bus out
+      # of the environment, as that job runs them, so that a start's report of why its daemon ended
+      # is held on both platforms. They are `tests-2`'s because `kr-cli` is: the suite looks for
+      # the held daemon and the worker beside its test program, which this leg's program build and
+      # Test step have built, and the stub starts nothing and asks no launchd. The leg's limits,
+      # with this one, add up to 354 of the job's 355 minutes.
+      - name: A standalone start says why a stub daemon ended
+        if: ${{ !cancelled() && matrix.part == 'tests-2' }}
+        timeout-minutes: 9
+        run: env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test startup -- --nocapture --ignored --exact a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon
 
       # The cases that put another filesystem in or beside a tree: a disk image attached inside a
       # location or a tree, a disk image attached where a directory a service recorded was, a
