@@ -439,16 +439,10 @@ impl HeldBound {
         judged(published, now, utc_ms)
     }
 
-    /// Whether the cell still publishes the snapshot the decision was taken under, and it still
-    /// holds at these readings: what a relayed batch is written under. A renewal publishes a new
-    /// snapshot, so a batch decided before it is decided again.
-    #[must_use]
-    pub fn holds_as_decided(&self, now: ContinuousInstant, utc_ms: u64) -> Stands {
-        self.holds_as_decided_in(&self.published(), now, utc_ms)
-    }
-
-    /// [`Self::holds_as_decided`], from a snapshot that [`Self::published`] copied out earlier:
-    /// only comparisons, so nothing in it allocates, frees, takes a lock or waits.
+    /// Whether the cell still publishes `published`, which [`Self::published`] copied out earlier,
+    /// and it still holds at these readings: what a relayed batch is written under. A renewal
+    /// publishes a new snapshot, so a batch decided before it is decided again. Only comparisons,
+    /// so nothing in it allocates, frees, takes a lock or waits.
     #[must_use]
     pub fn holds_as_decided_in(
         &self,
