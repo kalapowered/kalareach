@@ -253,6 +253,8 @@ pub struct Upload {
     layout: ChunkLayout,
     sent: Option<ChunkBitmap>,
     transfer_id: Option<TransferId>,
+    /// Whether the host's transfer identifier was accepted and the journal has not kept it yet.
+    id_unkept: bool,
     handle: Option<AttachmentHandle>,
     phase: Phase,
     /// Where the reservation stands while this plan holds no transfer.
@@ -283,6 +285,7 @@ impl Upload {
             layout,
             sent: None,
             transfer_id: None,
+            id_unkept: false,
             handle: None,
             phase: Phase::Reserving,
             reservation: Reservation::NotAsked,
@@ -812,6 +815,14 @@ async fn drive(
     // A plan that holds a transfer is resuming it: the host's bitmap decides what is sent.
     let mut resuming = plan.transfer_id().is_some();
     publish(progress, plan.progress_at(Stage::Starting));
+    // An identifier the host gave and the journal has not kept is kept first: nothing is read or sent
+    // for a transfer the caller has not written down.
+    if plan.id_unkept
+        && let Some(transfer_id) = plan.transfer_id().copied()
+    {
+        journal.begun(transfer_id)?;
+        plan.id_unkept = false;
+    }
     if let (Some(transfer_id), None) = (plan.transfer_id().copied(), plan.handle()) {
         plan.accept(Answer::Status(Box::new(
             status(session, transfer_id).await?,
@@ -886,7 +897,9 @@ async fn drive(
                 };
                 plan.accept(Answer::Begun(Box::new(begun)))?;
                 if let Some(transfer_id) = plan.transfer_id().copied() {
+                    plan.id_unkept = true;
                     journal.begun(transfer_id)?;
+                    plan.id_unkept = false;
                 }
             }
             Step::Chunk(params) => {

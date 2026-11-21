@@ -1074,6 +1074,52 @@ async fn the_journal_is_told_before_each_call_that_needs_it_and_a_refusal_stops_
     }
 }
 
+/// KR-REQ-23.21: a retry of the same plan after the journal refused the transfer identifier keeps the
+/// identifier first: no status is read and no chunk is sent for a transfer the caller has not written
+/// down.
+#[tokio::test]
+async fn a_retry_after_a_refused_begun_keeps_the_identifier_before_anything_is_sent() {
+    let first = pair(Script::new(true)).await;
+    let route = ChunkRoute::network(&first.session, environment())
+        .await
+        .expect("a route");
+    let mut upload = plan(THREE_CHUNKS);
+    let refusing = Recording {
+        refuse: Some("begun"),
+        ..Recording::default()
+    };
+    within(uploads::send(
+        &first.session,
+        &route,
+        &target(),
+        &mut upload,
+        TTL,
+        &unwatched(),
+        &refusing,
+    ))
+    .await
+    .expect_err("the send stops at the identifier the journal refused");
+    let journal = Recording::default();
+    within(uploads::send(
+        &first.session,
+        &route,
+        &target(),
+        &mut upload,
+        TTL,
+        &unwatched(),
+        &journal,
+    ))
+    .await
+    .expect("the retry reaches a handle");
+    let told = journal.told.lock().expect("the list").clone();
+    assert_eq!(
+        told.first().map(String::as_str),
+        Some("begun"),
+        "the identifier is kept before anything is sent: {told:?}"
+    );
+    first.session.close();
+}
+
 /// The host refused a chunk's window before its replacement reached the client: the host issues the
 /// replacement right after, and the chunk goes again under it and not under the refused one.
 #[tokio::test]
