@@ -251,20 +251,37 @@ export class PairedUploads {
         await this.#binding(key, handle, bind)
         return handle
       },
-      (failure: unknown) => {
+      async (failure: unknown) => {
         const refusal = refusalOf(failure)
         const phase = this.#rows.get(key)?.phase.kind
         // The person's own cancel has said what became of it.
         if (phase !== 'cancelling' && phase !== 'cancelled') {
-          this.#patch(key, {
-            phase:
-              refusal.kind === 'cancelled' ? { kind: 'cancelled', released: null } : { kind: 'refused', refusal },
-            awaited: false
-          })
+          if (refusal.kind === 'cancelled') {
+            this.#patch(key, { phase: { kind: 'cancelled', released: null }, awaited: false })
+          } else {
+            // A reservation the application still keeps stays on the screen with what the application
+            // says of it, so that it can be cancelled; only an upload it keeps nothing of is refused.
+            const kept = await this.#kept(key)
+            this.#patch(
+              key,
+              kept === null
+                ? { phase: { kind: 'refused', refusal }, awaited: false }
+                : { phase: phaseOf(kept), handle: kept.handle ?? undefined, awaited: false }
+            )
+          }
         }
         throw failure
       }
     )
+  }
+
+  /** What the application keeps of the upload `key`, none when it keeps nothing. */
+  async #kept(key: string): Promise<OpenUpload | null> {
+    try {
+      return (await this.#port.uploadsOpen()).find((view) => view.key === key) ?? null
+    } catch {
+      return null
+    }
   }
 
   /** Adds a published file to the draft again, or for the first time after a restart. */
