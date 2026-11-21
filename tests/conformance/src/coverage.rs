@@ -663,14 +663,15 @@ impl Selection {
     /// The words of a command that runs one test of `target` with the build that `command` made, as
     /// `cargo test` takes them before `--`: the command's own words, as written and in order, less
     /// `--no-run` and each word that holds a placeholder with its flag (`held` lists their indexes in
-    /// `command`). Where `built`, the targets that the command's build made, holds `target` and every
-    /// target that the test's own flag names in the selected packages among `packages`, that flag
-    /// replaces the command's target flags and test names. Otherwise they stay.
+    /// `command`). Where each `-p` name is a member among `packages`, and `built`, the targets that
+    /// the command's build made, holds `target` and every target that the test's own flag names in the
+    /// selected packages, that flag replaces the command's target flags and test names. Otherwise they
+    /// stay.
     ///
     /// Cargo reads features from the whole set of packages and flags, so no other word changes. It
     /// applies a singular target flag to each selected package and refuses it for a target whose
     /// features are off, so the test's flag replaces the command's only for targets that the build
-    /// made.
+    /// made, in packages that the report reads.
     #[must_use]
     pub fn test_words(
         &self,
@@ -705,16 +706,26 @@ impl Selection {
         words
     }
 
-    /// Whether `built` holds `target` and every target that the flag naming it names in the selected
-    /// packages among `packages`: `--lib` names each package's library, and `--bin`, `--example`,
-    /// `--test` and `--bench` the targets of their kind that bear the name.
+    /// Whether the flag naming `target` reaches only targets that `built` holds: each `-p` name is a
+    /// member among `packages`, and `built` holds `target` and every target that the flag names in the
+    /// selected packages. `--lib` names each package's library, and `--bin`, `--example`, `--test` and
+    /// `--bench` the targets of their kind that bear the name. Cargo finds a plain `-p` name in the
+    /// whole dependency graph, so a name that no member has selects a package that the report does not
+    /// read, and the flag reaches that package's targets too.
     fn names_only_built(
         &self,
         target: &TargetId,
         packages: &[&Package],
         built: &[TargetId],
     ) -> bool {
-        built.contains(target)
+        let members_only = match &self.packages {
+            Packages::Named(specs) => specs
+                .iter()
+                .all(|spec| packages.iter().any(|package| spec.matches(&package.name))),
+            Packages::Default | Packages::Workspace(_) => true,
+        };
+        members_only
+            && built.contains(target)
             && packages
                 .iter()
                 .filter(|package| self.selects_package(package))
@@ -1773,6 +1784,14 @@ mod tests {
                 &b_t,
                 vec![a_t.clone(), b_t.clone()],
                 "--test t",
+            ),
+            // A `-p` name that no member has selects a package the report does not read: the
+            // command's own flags stay.
+            (
+                "cargo test -p a -p ext --tests",
+                &a_t,
+                vec![a_t.clone(), b_t.clone()],
+                "-p a -p ext --tests",
             ),
             // One of them is not built: the command's own flags and test names stay.
             (
