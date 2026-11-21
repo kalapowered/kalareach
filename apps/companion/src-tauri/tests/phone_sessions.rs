@@ -2960,8 +2960,18 @@ async fn kr_req_19_08_a_device_revoked_before_its_admission_is_told_the_hosts_wo
     // words say that and not what the host said to the try before.
     let before = control.asked();
     asked_since(&control, before, 3).await;
-    let told = told_of(companion, "revoked");
-    assert!(!told.is_empty(), "the watch told what its tries came to");
+    // The watch tells a try after the host was asked, so the first of what it told is waited for.
+    let told = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let told = told_of(companion, "revoked");
+            if !told.is_empty() {
+                return told;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the watch told what its tries came to");
     for told in told {
         assert_eq!(told["state"], "reconnecting", "{told}");
         assert_eq!(
