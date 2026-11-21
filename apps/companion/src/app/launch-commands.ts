@@ -62,14 +62,19 @@ export function useSavedCommands(
     if (!read) return
     let watching: ReturnType<typeof watch> | null = null
     let remembered = false
+    // `connection` counts the changes of the connection: an answer to a read that began on an
+    // earlier connection says nothing of this one, so it neither shows a list nor remembers a
+    // refusal that would stop the reads.
+    let connection = 0
     const cadence = readOnCadence(() => {
       const current = watching?.read() ?? null
       if (current === null || remembered) return Promise.resolve()
       started.current += 1
       const number = started.current
+      const asked = connection
       return ask(() => port.launchCommands()).then(
         (reading) => {
-          if (!current() || number <= adoptedAfter.current) return
+          if (!current() || number <= adoptedAfter.current || asked !== connection) return
           if (reading.state === 'served') {
             setSaved({ state: 'served', list: reading.list, unread: null })
           } else {
@@ -89,6 +94,7 @@ export function useSavedCommands(
     watching = watch(
       [
         port.onConnection((state) => {
+          connection += 1
           remembered = false
           if (state.connected) cadence.now()
         })
