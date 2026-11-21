@@ -18,6 +18,14 @@ inputs:
       ~/.cargo/registry/index
       ~/.cargo/registry/cache
       target
+  # Temporary: the landing workflow's macOS legs pass the name of the entry that the one job they
+  # replaced saved. Remove the input with that last use, once main has saved the legs' own entries.
+  fallback-name:
+    description: >-
+      The name of another entry that a run of settings like this one may start from when its own
+      entry has none, tried after the entry of `name`. Leave it empty to start from `name` alone.
+    required: false
+    default: ""
 
 outputs:
   cache-hit:
@@ -46,4 +54,6 @@ runs:
       with:
         path: ${{ inputs.paths }}
         key: cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.part }}
-        restore-keys: cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && steps.key.outputs.week || steps.key.outputs.settings }}-
+        restore-keys: |
+          cargo-v1-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ github.ref == 'refs/heads/main' && steps.key.outputs.week || steps.key.outputs.settings }}-
+          ${{ inputs.fallback-name != '' && format('cargo-v1-{0}-{1}-{2}-{3}-', inputs.fallback-name, runner.os, runner.arch, github.ref == 'refs/heads/main' && steps.key.outputs.week || steps.key.outputs.settings) || '' }}

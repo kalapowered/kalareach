@@ -3056,6 +3056,12 @@ jobs:
         uses: ./.github/actions/cargo-cache-restore
         with:
           name: ${{ matrix.cache }}
+          # Only a run on main saves a cache, so until main's first run after the split saves
+          # `macos-tests-1` and `macos-tests-2`, a run on any other ref finds neither and would build
+          # every program from nothing. The one job these legs replaced saved its debug build output
+          # as `macos`, of the same settings, so a run that finds no entry of its own starts from that
+          # one. Remove this line, and the input in the action, once that run has saved both entries.
+          fallback-name: macos
 
       # The release profile's third-party output apart from the debug profile's, which the two test
       # legs save: this leg is the one that builds in release, and an entry of its own keeps the
