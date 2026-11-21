@@ -151,14 +151,16 @@ export function keptEntry(
   book: Pick<BookSnapshot, 'kept' | 'unreadable' | 'unstored' | 'ledger'>,
   shelf: Pick<
     ShelfSnapshot,
-    'status' | 'messages' | 'holds' | 'damagedHolds' | 'unreadableMessages' | 'unreadableHolds'
+    'status' | 'stale' | 'messages' | 'holds' | 'damagedHolds' | 'unreadableMessages' | 'unreadableHolds'
   >
 ): KeptEntry | null {
   const alone = (label: string, rest: string): KeptEntry => ({ title: `${label} ${rest}`.replace(/\.$/, ''), label, rest })
   const messagesUnreadable = shelf.unreadableMessages.layout + shelf.unreadableMessages.now
   const holdsUnreadable = shelf.unreadableHolds.layout + shelf.unreadableHolds.now + shelf.damagedHolds.length
   if (book.ledger !== 'ok') return alone('The list of removals for drafts', 'could not be read.')
-  if (shelf.status === 'failed') return alone('Channel messages', 'could not be read now.')
+  // A newest read that failed counts as a failed read whether or not an earlier one worked: what is
+  // listed may be out of date, and the person is told.
+  if (shelf.status === 'failed' || shelf.stale) return alone('Channel messages', 'could not be read now.')
   if (book.unreadable > 0 && messagesUnreadable > 0) {
     return alone('Some drafts and channel messages', 'could not be read.')
   }

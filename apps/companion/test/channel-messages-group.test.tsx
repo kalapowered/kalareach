@@ -317,6 +317,57 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     ).toBeVisible()
   })
 
+  it('K14 treats a newest read that failed as a failed read after one that worked, and keeps what was listed', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    startOver(of, { view: 'sessions' })
+    await waitFor(() => {
+      expect(of.messages.calls.some((call) => call.kind === 'list')).toBe(true)
+    })
+    expect(screen.queryByTestId('kept-drafts-entry')).toBeNull()
+    of.messages.refuseListings({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+    const line = await screen.findByTestId('kept-drafts-entry')
+    expect(line).toHaveTextContent('Channel messages could not be read now.')
+    await person.click(within(line).getByRole('button'))
+    expect(await screen.findByText('The messages kept on this device could not be read now.')).toBeVisible()
+    cleanup()
+    const stale = world()
+    keepMessage(stale, { text: 'listed before the failure' })
+    startOver(stale)
+    expect(await screen.findByTestId('channel-message-text')).toHaveTextContent('listed before the failure')
+    stale.messages.refuseListings({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+    expect(await screen.findByText('The messages kept on this device could not be read now.')).toBeVisible()
+    expect(screen.getByTestId('channel-message-text')).toHaveTextContent('listed before the failure')
+  })
+
+  it('K15 says the text could not be read when the read for the page failed after a read without text worked', async () => {
+    const of = world()
+    const person = userEvent.setup()
+    keepMessage(of, { text: 'its text' })
+    startOver(of, { view: 'sessions' }, (port) => ({
+      ...port,
+      deviceChannelMessages: (request) =>
+        request.withText === true
+          ? Promise.reject(new Error('the text is not readable'))
+          : port.deviceChannelMessages(request)
+    }))
+    const line = await screen.findByTestId('kept-drafts-entry')
+    await person.click(within(line).getByRole('button'))
+    expect(await screen.findByTestId('channel-message-text-unavailable')).toHaveTextContent(
+      'This device could not read the text of this message now.'
+    )
+    expect(screen.queryByTestId('channel-message-text')).toBeNull()
+    expect(screen.getByTestId('channel-message')).toBeVisible()
+  })
+
   it('K6 reads every mix of drafts, messages, records and what could not be read (pure)', () => {
     const none = { ...NO_BOOK }
     const forms: readonly [string, ReturnType<typeof keptEntry>][] = [
