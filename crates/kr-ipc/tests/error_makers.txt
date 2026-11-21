@@ -151,6 +151,7 @@ crates/kr-ipc/src/starter.rs | read_claim | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/starter.rs | take_claim | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/verify.rs | IpcError::from | IdentityUnavailable | 1 | conversion | own | - | agrees   # the verification of a worker's identity
 crates/kr-plugin-service/src/client.rs | write_offered | PeerClosed | 2 | stream | closure | - | agrees
+crates/kr-plugin-service/src/launcher.rs | HostReservation::receive | Frame | 1 | arrived | closure | - | agrees
 crates/kr-shell-integration/src/host/endpoint.rs | occupied | Listen | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-shell-integration/src/host/startup.rs | EntryRecord::hold | Io | 1 | own | own | - | agrees
 crates/kr-shell-integration/src/host/terminal_profile/record.rs | ProfileRecord::hold | Io | 1 | own | own | - | agrees
