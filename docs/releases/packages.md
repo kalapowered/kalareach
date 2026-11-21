@@ -148,6 +148,33 @@ that lists the release. A host refuses any revision below that constant, held co
 lower value, a host with no copy would take a rolled-back revision that lists no build of the
 release.
 
+The installed-client window is the least number of days that the managed service keeps serving the
+package version of a host release after a newer host release replaces it. The table below gives it,
+and a case holds it to the newest saved reply. Today the service keeps every such version with no
+end: its deployment refuses a matrix that serves the package version of a published host release
+worse than an earlier revision did, out of the compatible tier or out of every tier, and nothing
+retires a version yet; a cut that raises the package version removes none of them. The same holds
+for each release this build retains and for this build's own version. A version that none of these
+carries has no window. At or below this build's own version it may be left out, as revision 2 left
+out 0.1.0 to 0.4.99, but a version that an earlier revision served from the compatible tier is never
+served from a later tier. A version above this build's own is served at least as well as any earlier
+revision served it, because a later release of this build can carry it. A revision may narrow a
+tier's relay or discovery range. A range that grows for a protected version needs a recorded
+exchange test of the builds it adds, and only of the builds the new range holds that the earlier one
+did not. Before a revision is deployed, the matrix readers of every host release, of each retained
+release that has one and of this build read it, each under a test key in place of its own, and each
+must find the tier the deployment computes for its version. A deployment that publishes a matrix
+with the same signed fields as the one the service serves changes nothing that a host is served;
+when the service's route answers, it needs no new reader evidence and no register row for a host
+release published since. A key change does not invalidate historical evidence, and it gives an
+installed host no new trusted key.
+
+<!-- installed-client-window:begin -->
+| Setting                    | Days |
+| -------------------------- | ---- |
+| installedClientWindowDays  | 90   |
+<!-- installed-client-window:end -->
+
 ## A level is one surface
 
 A compatibility level is `0.<minor>` below `1.0.0` and the major number from it, and every build at

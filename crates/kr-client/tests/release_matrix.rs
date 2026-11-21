@@ -273,6 +273,115 @@ mod the_deployed_document {
             Some(Refusal::Signature)
         );
     }
+
+    /// KR-REQ-17.46: the installed-client window that `docs/releases/packages.md` states is the
+    /// one the newest saved reply of the service carries, so a revision that changes the window
+    /// cannot leave the document behind.
+    #[test]
+    fn the_documented_window_is_the_newest_saved_replys() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let document = std::fs::read_to_string(root.join("../../docs/releases/packages.md"))
+            .expect("the packages document");
+        let table = document
+            .split("<!-- installed-client-window:begin -->")
+            .nth(1)
+            .and_then(|rest| rest.split("<!-- installed-client-window:end -->").next())
+            .expect("the marked table of the window");
+        let documented: u64 = table
+            .lines()
+            .find_map(|line| {
+                let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+                (cells.get(1) == Some(&"installedClientWindowDays"))
+                    .then(|| cells.get(2).and_then(|days| days.parse().ok()))
+                    .flatten()
+            })
+            .expect("a row of installedClientWindowDays with a number of days");
+
+        let fixtures = root.join("tests/fixtures/release-matrix");
+        let newest = std::fs::read_dir(&fixtures)
+            .expect("the fixtures")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                let revision: u64 = name
+                    .strip_prefix("deployed-revision-")?
+                    .strip_suffix(".json")?
+                    .parse()
+                    .ok()?;
+                Some((revision, name))
+            })
+            .max()
+            .expect("a saved reply");
+        let reply: Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join(&newest.1)).expect("the reply"))
+                .expect("a reply is JSON");
+        assert_eq!(
+            reply["matrix"]["installedClientWindowDays"].as_u64(),
+            Some(documented),
+            "packages.md states a window other than the one in {}",
+            newest.1
+        );
+    }
+
+    /// KR-REQ-17.46: a saved reply is read under the key recorded for it and never under another,
+    /// so a later change of the signing key leaves every earlier reply readable under its own
+    /// pins and gives none of them a key it does not record.
+    ///
+    /// The production reply is recorded under its key as text, not under this build's pins, so a
+    /// later rotation of the pins cannot fail the case. Revision 2 of the synthetic pair is signed
+    /// by one generated key and revision 3 by another. Nothing in a deployment's checks reads it.
+    #[test]
+    fn a_two_key_fixture_is_read_under_its_recorded_key() {
+        const PRODUCTION_KEY: &str = "rXLAn41VOtyCoQ-_rp42_jyBj6eVuv7J9leeBbwMjBI";
+        let first = AuthorisationKeyPair::generate().expect("a key pair");
+        let second = AuthorisationKeyPair::generate().expect("a key pair");
+        let recorded: Vec<(&str, Vec<u8>, Pins)> = vec![
+            (
+                "the production reply",
+                DEPLOYED.to_vec(),
+                Pins::from_key_text(PRODUCTION_KEY).expect("the recorded production key"),
+            ),
+            (
+                "revision 2 under the first key",
+                reply(
+                    &matrix("2", ("0.77.0", "0.79.99"), ("1.0.0", "1.0.99")),
+                    &first,
+                ),
+                pins(&first),
+            ),
+            (
+                "revision 3 under the second key",
+                reply(
+                    &matrix("3", ("0.77.0", "0.79.99"), ("1.0.0", "1.0.99")),
+                    &second,
+                ),
+                pins(&second),
+            ),
+        ];
+        for (index, (name, bytes, own)) in recorded.iter().enumerate() {
+            assert!(
+                Document::verify(bytes, own).is_ok(),
+                "{name} is read under the key recorded for it"
+            );
+            for (other_index, (other, _, others_pins)) in recorded.iter().enumerate() {
+                if other_index != index {
+                    assert_eq!(
+                        Document::verify(bytes, others_pins).err(),
+                        Some(Refusal::Signature),
+                        "{name} is not read under the key recorded for {other}"
+                    );
+                }
+            }
+        }
+        // The pins an installed host carries read no reply of the pair: a key a reply records
+        // gives that host nothing.
+        for (name, bytes, _) in &recorded[1..] {
+            assert_eq!(
+                Document::verify(bytes, &Pins::production()).err(),
+                Some(Refusal::Signature),
+                "{name} is refused under the pins a host carries"
+            );
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------- */
