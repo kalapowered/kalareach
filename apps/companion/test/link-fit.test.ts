@@ -10,7 +10,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 
-import { fitLinks, packRooms, startLinkFit, type Beside, type Column } from '../src/markdown/link-fit'
+import { fitLinks, packRooms, startLinkFit, type Beside, type Column, type Item } from '../src/markdown/link-fit'
 
 const LEAST = 44
 
@@ -115,6 +115,26 @@ describe('the room beside a link', () => {
     const room = besideOf(row(400, 410), LEAST, [], column)
     expect(room.right).toBe(0)
     expect(10 + room.left).toBeGreaterThanOrEqual(LEAST)
+  })
+
+  it('gives each link the same room whichever line’s links come first in the list, and the least size to every link of two lines that reach one another', () => {
+    // Three links on the line at 20 and two on the line at 44; the boxes are 44 high, so the two lines reach one another and every link is short.
+    const word = (left: number, right: number, top: number): Item => ({ box: { left, top, right, bottom: top + 44 }, link: true, column })
+    const upper = [word(90.4375, 101.546875, 20), word(130.5625, 138.09375, 20), word(165.453125, 190.765625, 20)]
+    const lower = [word(54.09375, 65.390625, 44), word(97.078125, 107.34375, 44)]
+    const roomsOf = (items: readonly Item[]): Map<number, Beside> => {
+      const rooms = packRooms(items, LEAST)
+      return new Map(items.map((item, at) => [item.box.left, rooms[at] ?? { left: 0, right: 0 }]))
+    }
+    const upperFirst = roomsOf([...upper, ...lower])
+    const lowerFirst = roomsOf([...lower, ...upper])
+    for (const [order, rooms] of [['upper line first', upperFirst], ['lower line first', lowerFirst]] as const) {
+      for (const item of [...upper, ...lower]) {
+        const room = rooms.get(item.box.left) ?? { left: 0, right: 0 }
+        expect(item.box.right - item.box.left + room.left + room.right, `${order}: the box of the link at ${String(item.box.left)}`).toBeGreaterThanOrEqual(LEAST)
+      }
+    }
+    expect(lowerFirst, 'the rooms with the lower line first').toEqual(upperFirst)
   })
 })
 
@@ -398,6 +418,28 @@ describe('the room that the page gives the links of a message', () => {
     fitLinks(root, messages)
     const boxes = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
     expect((boxes[1] as { left: number; right: number }).right - (boxes[1] as { left: number }).left, 'the box of the link that the packing completes').toBeGreaterThanOrEqual(LEAST)
+  })
+
+  it('gives a completed link the least size where the column starts off the grid (a message padded by 0.3 px), at 44 and at 48', () => {
+    // The first link's room on its left is what the column leaves it, 1.121875 px: held to the grid, with what it lacks rounded up to the grid.
+    for (const [least, first, second] of [
+      [44, [1.421875, 33.4375], [51.125, 67.6875]],
+      [48, [1.421875, 37.4375], [55.125, 71.6875]]
+    ] as const) {
+      const { pane: root, messages } = pane(1, (message) => {
+        computed.set(message, { 'padding-left': '0.3px' })
+        link(message, first[0], first[1])
+        link(message, second[0], second[1])
+      })
+      computed.set(root, { '--target': `${String(least)}px` })
+      fitLinks(root, messages)
+      const [one, two] = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
+      if (!one || !two) throw new Error('the made page has no links')
+      expect(one.right - one.left, `${String(least)}: the box of the first link`).toBeGreaterThanOrEqual(least)
+      expect(two.right - two.left, `${String(least)}: the box of the second link`).toBeGreaterThanOrEqual(least)
+      expect(one.right, `${String(least)}: the end of the first box`).toBeLessThanOrEqual(two.left)
+      document.body.replaceChildren()
+    }
   })
 
   it('leaves a short link that cannot be completed the gap that a completed neighbour does not need of it', () => {
