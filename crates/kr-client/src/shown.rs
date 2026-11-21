@@ -1753,8 +1753,13 @@ mod tests {
                 os: Some(2),
             });
         }
-        // Names the tree writes, so the command line says the path whole.
+        // Names the tree writes, so the command line says the path whole, with this platform's own
+        // separators (the command line says every path that way; a path the host writes as it was
+        // given reads the same only where it is already written so).
+        #[cfg(unix)]
         let endpoint = "/run/r.sock";
+        #[cfg(windows)]
+        let endpoint = r"\run\r.sock";
         for refusal in classes {
             let host = refusal.said(endpoint);
             assert_eq!(
