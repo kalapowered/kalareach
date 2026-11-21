@@ -17,7 +17,9 @@
  *
  * The host's saved launch commands are read on a cadence of their own, which nothing wakes: output
  * does not change the list, a full list is large, and a deadline that a wake could push back would
- * leave a button for a command removed elsewhere on the page for as long as output streamed.
+ * leave a button for a command removed elsewhere on the page for as long as output streamed. Each
+ * of the two reads is numbered apart from the other, so a wake that starts a read of the surface
+ * does not discard the answer to the list read on its way.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -159,10 +161,13 @@ export function useLaunchSurface(
 
   useEffect(() => {
     if (read === null) return
-    let watching: ReturnType<typeof watch> | null = null
+    // The surface and the list are numbered by a reader each: output wakes the surface's read four
+    // times a second, and a read of one must not outdate the read of the other.
+    let readSurface: (() => (() => boolean) | null) | null = null
+    let readSaved: (() => (() => boolean) | null) | null = null
     const cadence = readOnCadence(
       () => {
-        const current = watching?.read() ?? null
+        const current = readSurface?.() ?? null
         if (current === null) return Promise.resolve()
         started.current += 1
         const number = started.current
@@ -189,7 +194,7 @@ export function useLaunchSurface(
       readList === null
         ? null
         : readOnCadence(() => {
-            const current = watching?.read() ?? null
+            const current = readSaved?.() ?? null
             if (current === null || remembered) return Promise.resolve()
             return ask(readList).then(
               (reading) => {
@@ -211,7 +216,7 @@ export function useLaunchSurface(
               }
             )
           }, cadenceMs)
-    watching = watch(
+    const watched = watch(
       [
         port.onConnection((state) => {
           remembered = false
@@ -235,12 +240,13 @@ export function useLaunchSurface(
         })
       }
     )
+    readSurface = watched.reader()
+    readSaved = watched.reader()
     again.current = cadence.now
     soon.current = cadence.soon
     listAgain.current = () => {
       listCadence?.now()
     }
-    const watched = watching
     return () => {
       cadence.stop()
       listCadence?.stop()
