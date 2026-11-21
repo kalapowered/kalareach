@@ -2202,36 +2202,56 @@ fn a_keep_that_has_staged_the_ledger_makes_a_repair_and_a_set_aside_wait() {
     let data = data();
     let window = Window::over(data.path());
     let refs = vec![window.draft("text")];
+    // The keep stops after its entry is durable, where it holds the folder's lock and not yet the
+    // ledger's: a repair that did not take the folder's lock would run here and name the draft.
     let (hook, reached, release) = a_wait();
-    let _at = testing::at(data.path(), Point::LedgerBeforeRename, hook);
+    let _at = testing::at(dir(data.path()), Point::AfterEntry, hook);
+    // The keep's ledger step is then refused, once: the entry is undone, and nothing may have named
+    // the draft between the refusal and the undo.
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let _refused = testing::at(data.path(), Point::LedgerBeforeRename, move || {
+        if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            Err(io_fault("the ledger is refused"))
+        } else {
+            Ok(())
+        }
+    });
     let named = refs.clone();
     let keep = on_thread(data.path(), move |window| {
         window.keep(message(1, "text", &named))
     });
     reached
         .recv_timeout(WAIT)
-        .expect("the keep has staged the ledger");
+        .expect("the keep has written its entry");
     let repair = on_thread(data.path(), |window| window.drafts());
     let set_aside = on_thread(data.path(), |window| {
         window.call("device_drafts_ledger_set_aside", json!(null))
     });
     assert!(
         repair.recv_timeout(SHORT).is_err(),
-        "a repair waits for a keep that holds the locks"
+        "a repair waits for a keep that holds the folder's lock"
     );
     assert!(
         set_aside.recv_timeout(SHORT).is_err(),
-        "a set-aside waits for a keep that holds the locks"
+        "a set-aside waits for a keep that holds the folder's lock"
     );
     release.send(()).expect("let the keep go");
     let kept = keep.recv_timeout(WAIT).expect("the keep ends");
-    assert!(kept.is_ok(), "the keep succeeds: {kept:?}");
+    assert!(kept.is_err(), "the keep fails at its ledger step: {kept:?}");
     let read = repair.recv_timeout(WAIT).expect("the repair ends");
     assert!(read.is_ok(), "the repair reads: {read:?}");
+    assert_eq!(
+        pending(read.as_ref().expect("a read")),
+        Vec::<(String, String)>::new(),
+        "the entry was undone before the repair ran, so it names nothing: {read:?}"
+    );
     let moved = set_aside.recv_timeout(WAIT).expect("the set-aside ends");
     let refusal = moved.expect_err("the list is not damaged, so nothing is moved");
     assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
-    assert_eq!(ledger_refs(data.path()), sorted(refs));
+    assert!(
+        ledger_refs(data.path()).is_empty(),
+        "no line of the list names the draft"
+    );
 }
 
 /// KR-REQ-12.26: a set-aside that holds every lock makes a keep and a repair wait, and nothing
@@ -2256,6 +2276,15 @@ fn a_set_aside_that_holds_every_lock_makes_a_keep_and_a_repair_wait() {
     assert!(
         keep.recv_timeout(SHORT).is_err(),
         "a keep waits for a set-aside that holds the locks"
+    );
+    // At the hold the keep has not begun: it waits at the folder's lock, before its entry, which is
+    // what a set-aside without the folder's lock would not make it do (the keep would wait at the
+    // ledger instead, with its entry written).
+    assert!(
+        !dir(data.path())
+            .join(format!("{}.message", action(1)))
+            .exists(),
+        "the keep's entry is not written while the set-aside holds the folder's lock"
     );
     assert!(
         repair.recv_timeout(SHORT).is_err(),
