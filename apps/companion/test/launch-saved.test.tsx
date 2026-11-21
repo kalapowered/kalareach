@@ -758,6 +758,40 @@ describe('the Settings form for the saved commands', () => {
     expect(screen.queryByTestId('launch-commands-form')).toBeNull()
   })
 
+  it('a_not_served_answer_for_a_connection_that_was_replaced_does_not_stop_the_reads_of_the_list', async () => {
+    const { port, controls } = fakeHost()
+    controls.launchCommands.changeElsewhere(SAVED)
+    controls.launchCommands.scenario = 'not_served'
+    const reads = controls.hold('launchCommands')
+    settings(port)
+    await waitFor(() => {
+      expect(reads.count).toBe(1)
+    })
+
+    // The host serves the list from now on, and replaces the connection with the first read still
+    // out. The answer of the read that began on the replaced connection says nothing of the new
+    // one: it neither shows the words for a host that serves no list nor stops the reads, so the
+    // read the replacement owed is made.
+    controls.launchCommands.scenario = 'serve'
+    act(() => {
+      controls.replaceConnection()
+    })
+    expect(reads.count).toBe(1)
+    await act(async () => {
+      reads.answer(0)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(reads.count).toBe(2)
+    expect(screen.queryByTestId('launch-commands-not-served')).toBeNull()
+
+    act(() => {
+      reads.release()
+    })
+    const list = await screen.findByTestId('launch-commands-list')
+    expect(list).toHaveTextContent('Claude Code')
+    expect(list).toHaveTextContent('Codex CLI')
+  })
+
   it('lists on a paired host and cannot change it', async () => {
     const { port, controls } = fakeHost()
     controls.launchCommands.changeElsewhere(SAVED)
