@@ -407,6 +407,9 @@ pub enum Stopped {
     /// The plan cannot be cut into the parts the run is asked for: a budget's steps fall in more than
     /// one. No step has run.
     Plan(String),
+    /// A step has a time limit, and this process cannot wait for a command it started, so the limit
+    /// cannot be kept. No step has run.
+    Host(String),
 }
 
 /// The directories a step of `options` builds in that are known from the options, the steps and the
@@ -475,6 +478,28 @@ pub fn map_declared(options: &Options, typescript: bool) -> Map {
             lane_directories: plan.lane_directories(),
         },
     )
+}
+
+/// Refuses the run when a step of `steps` has a time limit and `trial`, which asks whether this
+/// process can wait for a command it started, fails.
+fn keeps_time_limits(
+    steps: &[plan::Step],
+    trial: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), Stopped> {
+    if !steps
+        .iter()
+        .any(|step| step.timeout.is_some() || step.budget.is_some())
+    {
+        return Ok(());
+    }
+    trial().map_err(|error| {
+        Stopped::Host(format!(
+            "a step has a time limit, and this process cannot wait for a command it started \
+             ({error}): a parent that ignores SIGCHLD causes this, and a time limit could then \
+             signal a process that is not the step's; start kr-conformance from a parent that does \
+             not ignore SIGCHLD"
+        ))
+    })
 }
 
 /// Runs everything `options` asks for.
@@ -566,6 +591,7 @@ pub fn run(options: &Options, progress: &mut dyn FnMut(&str)) -> Result<Document
         }
         None => steps,
     };
+    keeps_time_limits(&steps, crate::tree::waits_for_its_commands)?;
     let runner = runner_copy::private_copy(
         &options.lister,
         &options.runner_base,
@@ -2033,6 +2059,45 @@ fn reproducing(runs: &[RunRecord]) -> Option<&RunRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-29.01, the part about reproducible commands: a run with a step that has a time limit is
+    /// refused when this process cannot wait for a command it started, with the words the lead
+    /// approved; a step with a budget has a limit too, and a plan with no limit asks nothing.
+    #[test]
+    fn a_run_with_a_time_limit_is_refused_where_a_command_cannot_be_waited_for() {
+        let failing = || Err(std::io::Error::from_raw_os_error(10));
+        let plain = plan::Step::cargo("rust", "a step", &["test"]);
+        let mut timed = plain.clone();
+        timed.timeout = Some(5);
+        let mut budgeted = plain.clone();
+        budgeted.budget = Some(("shared".to_owned(), 10));
+        let asked = std::cell::Cell::new(false);
+        let counting = || {
+            asked.set(true);
+            Ok(())
+        };
+        let mut wrong = Vec::new();
+        for (what, steps) in [("a timeout", &timed), ("a budget", &budgeted)] {
+            match keeps_time_limits(std::slice::from_ref(steps), failing) {
+                Err(Stopped::Host(words)) => {
+                    if !words.starts_with(
+                        "a step has a time limit, and this process cannot wait for a command it started (",
+                    ) || !words.ends_with("start kr-conformance from a parent that does not ignore SIGCHLD")
+                    {
+                        wrong.push(format!("{what}: the words were {words}"));
+                    }
+                }
+                other => wrong.push(format!("{what}: gave {other:?}")),
+            }
+        }
+        if keeps_time_limits(std::slice::from_ref(&plain), failing).is_err() {
+            wrong.push("a plan with no limit was refused".to_owned());
+        }
+        if keeps_time_limits(std::slice::from_ref(&timed), counting).is_err() || !asked.get() {
+            wrong.push("a host that waits was refused, or the trial was not run".to_owned());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     /// KR-REQ-29.01, the part about reproducible commands: the result of a step that was not run
     /// spends none of the budget its step names, whatever time the report measured around it: the
