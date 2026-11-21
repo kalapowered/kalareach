@@ -28,6 +28,7 @@ use kr_protocol::scalars::Digest256;
 use kr_protocol::transfer::AttachmentHandle;
 
 use crate::error::{CommandError, Result};
+use crate::open_transfers::{Desk, Keeping, Paired, Request};
 
 /// The largest file this application will read for one drop.
 ///
@@ -98,6 +99,11 @@ impl HandedFile {
     #[must_use]
     pub fn media_type(&self) -> &str {
         &self.media_type
+    }
+
+    /// The content, the name and the media type.
+    fn into_parts(self) -> (Held, String, String) {
+        (self.content, self.name, self.media_type)
     }
 }
 
@@ -370,6 +376,76 @@ pub async fn upload_handed_to(
     .await
 }
 
+/// Sends one dropped file to a host this device is paired with, and returns the verified handle.
+///
+/// The desk owns the upload from here: it goes on when this call is dropped, resumes on a new
+/// connection, and is kept across a restart with the path it is read from.
+///
+/// # Errors
+///
+/// Returns what [`Desk::send`] returns, and the file's own failure to be read.
+pub async fn upload_paired(
+    desk: &std::sync::Arc<Desk>,
+    paired: Paired,
+    key: kr_protocol::scalars::Uuid,
+    target: ActionTarget,
+    session_id: Option<kr_protocol::ids::SessionId>,
+    path: PathBuf,
+) -> Result<AttachmentHandle> {
+    let opened = path.clone();
+    let content = tauri::async_runtime::spawn_blocking(move || DroppedFile::open(&opened))
+        .await
+        .map_err(|error| {
+            CommandError::local_failure(format!("the file was not read: {error}"))
+        })??;
+    let name = content.name().to_owned();
+    let media_type = content.media_type().to_owned();
+    desk.send(
+        paired,
+        Request {
+            key,
+            target,
+            session_id,
+            content: std::sync::Arc::new(content),
+            name,
+            media_type,
+            keeping: Keeping::Path(path),
+        },
+    )
+    .await
+}
+
+/// Sends one file the page handed over to a host this device is paired with, and returns the
+/// verified handle. A copy of the bytes is kept until the upload ends, so that a restart can send on.
+///
+/// # Errors
+///
+/// Returns what [`Desk::send`] returns.
+pub async fn upload_handed_paired(
+    desk: &std::sync::Arc<Desk>,
+    paired: Paired,
+    key: kr_protocol::scalars::Uuid,
+    target: ActionTarget,
+    session_id: Option<kr_protocol::ids::SessionId>,
+    file: HandedFile,
+    bytes: Vec<u8>,
+) -> Result<AttachmentHandle> {
+    let (content, name, media_type) = file.into_parts();
+    desk.send(
+        paired,
+        Request {
+            key,
+            target,
+            session_id,
+            content: std::sync::Arc::new(content),
+            name,
+            media_type,
+            keeping: Keeping::Copy(bytes),
+        },
+    )
+    .await
+}
+
 /// Declares, sends and publishes one file's content, under the name and media type it carries.
 async fn send(
     session: &Session,
@@ -399,6 +475,7 @@ async fn send(
         &mut plan,
         crate::commands::MUTATION_TTL,
         &progress,
+        &kr_client::uploads::NoJournal,
     )
     .await?)
 }
@@ -475,7 +552,6 @@ mod tests {
     }
 
     #[test]
-        &kr_client::uploads::NoJournal,
     fn a_name_is_the_last_component_and_never_a_path() {
         assert_eq!(file_name(Path::new("/tmp/pictures/a.png")), "a.png");
         assert_eq!(file_name(Path::new("/")), "attachment");

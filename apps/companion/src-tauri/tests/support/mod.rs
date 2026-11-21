@@ -861,6 +861,9 @@ impl Companion {
                 companion_tauri::commands::draft_add_attachment,
                 companion_tauri::commands::attachment_upload,
                 companion_tauri::commands::attachment_upload_bytes,
+                companion_tauri::commands::uploads_open,
+                companion_tauri::commands::upload_cancel,
+                companion_tauri::commands::draft_end,
                 companion_tauri::commands::host_info,
                 companion_tauri::commands::attention_read,
                 companion_tauri::commands::session_numbers,
@@ -971,6 +974,49 @@ impl Companion {
                     url: BUNDLE.parse().expect("the bundle's address"),
                     body: tauri::ipc::InvokeBody::Json(body),
                     headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            )
+        });
+        match answered {
+            Ok(answer) => {
+                let answer: serde_json::Value =
+                    answer.deserialize().expect("an answer the page can read");
+                self.answered.keep(&answer);
+                Ok(answer)
+            }
+            Err(refusal) => {
+                self.answered.keep(&refusal);
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Calls `command` with `bytes` as its raw body and `headers` beside it, as the page hands a
+    /// file over, and returns what the page receives.
+    pub fn call_bytes(
+        &self,
+        command: &str,
+        bytes: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> Result<serde_json::Value, serde_json::Value> {
+        let mut map = tauri::http::HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(
+                tauri::http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+                tauri::http::HeaderValue::from_str(value).expect("a header value"),
+            );
+        }
+        let answered = tokio::task::block_in_place(|| {
+            tauri::test::get_ipc_response(
+                &self.window,
+                tauri::webview::InvokeRequest {
+                    cmd: command.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: BUNDLE.parse().expect("the bundle's address"),
+                    body: tauri::ipc::InvokeBody::Raw(bytes),
+                    headers: map,
                     invoke_key: tauri::test::INVOKE_KEY.to_owned(),
                 },
             )

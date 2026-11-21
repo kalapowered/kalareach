@@ -1010,6 +1010,10 @@ async fn supervise<R: Runtime>(
         Standing::Paired { host, .. } => Some(host.host_device_id),
         Standing::Owner => None,
     };
+    let paired_device = match connection.standing() {
+        Standing::Paired { device_id, .. } => Some(*device_id),
+        Standing::Owner => None,
+    };
     // A host whose grant answers to an organisation holds this device's lease only while the
     // device keeps it fresh.
     let leased = match connection.standing() {
@@ -1028,6 +1032,21 @@ async fn supervise<R: Runtime>(
     // A host that is reached again is asked once more for what a call left owed it.
     if let (Some(host), Some(calls)) = (paired_host, app.try_state::<crate::voice::Calls>()) {
         calls.host_reached(host, environment_id, Arc::clone(&session));
+    }
+    // The uploads that waited for a connection resume on it, and what a restart left is read
+    // against the host's own record.
+    if let Some(device_id) = paired_device {
+        state
+            .transfers()
+            .host_reached(device_id, environment_id, Arc::clone(&session));
+        // The drafts kept for sessions the host no longer lists are ended.
+        let drafts = state.paired_drafts();
+        let paired = crate::open_transfers::Paired {
+            device_id,
+            environment_id,
+            session: Arc::clone(&session),
+        };
+        tauri::async_runtime::spawn(async move { drafts.sweep_after_reach(paired).await });
     }
     if let Some(first) = first.take() {
         let _ = first.send(());

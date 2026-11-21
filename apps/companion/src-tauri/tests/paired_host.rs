@@ -817,6 +817,24 @@ async fn until_held(control: &LinkControl, count: usize) {
     .expect("the connections are held");
 }
 
+/// Waits until the host was asked for its list of sessions at least `count` times, on any
+/// connection, and answers how many times it was. A reach to a paired host reads the list once of
+/// its own, to end the drafts of sessions the host no longer lists, so a case that counts the reads
+/// of one command starts from this count.
+async fn until_sessions_listed(control: &LinkControl, count: usize) -> usize {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let asked = control.sent(Method::SessionList);
+            if asked >= count {
+                return asked;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the reach's own read of the sessions is counted")
+}
+
 /// KR-REQ-13.01: a pass reports a host only if it is still one of the others when the pass ends.
 /// Each visit asks about its own host when it ends, and a slower visit runs on after that: a host
 /// the phone begins to use, or forgets, once its visit is over and before the pass is, is left out of
@@ -2774,6 +2792,7 @@ async fn session_numbers_carries_the_key_takes_no_serial_and_writes_no_contact()
 async fn session_numbers_answering_first_supersedes_no_attention_read() {
     let (host, phone, control) = a_paired_host_and_its_control().await;
     let companion = &phone.companion;
+    let listed_at_the_reach = until_sessions_listed(&control, 1).await;
     let mut holds = contact_owner(companion).watch_reads();
     let page = companion.start_call("attention_read", inbox_read());
     let page_hold = next_read_hold(&mut holds).await;
@@ -2799,7 +2818,11 @@ async fn session_numbers_answering_first_supersedes_no_attention_read() {
         1,
         "no page is read again"
     );
-    assert_eq!(control.sent(Method::SessionList), 1);
+    assert_eq!(
+        control.sent(Method::SessionList),
+        listed_at_the_reach + 1,
+        "the numbers ask the host once"
+    );
     host.stop().await;
 }
 
@@ -2811,6 +2834,7 @@ async fn session_numbers_answering_first_supersedes_no_attention_refusal() {
 
     let (host, phone, control) = a_paired_host_and_its_control().await;
     let companion = &phone.companion;
+    let listed_at_the_reach = until_sessions_listed(&control, 1).await;
     let lapsed = Refusal::BehindItsFeed.to_protocol_error();
     control.refuse_request(Some((Method::AttentionRead, lapsed.clone())));
     let mut holds = contact_owner(companion).watch_reads();
@@ -2844,7 +2868,11 @@ async fn session_numbers_answering_first_supersedes_no_attention_refusal() {
         0,
         "the refused page was not sent, and is not asked again"
     );
-    assert_eq!(control.sent(Method::SessionList), 1);
+    assert_eq!(
+        control.sent(Method::SessionList),
+        listed_at_the_reach + 1,
+        "the numbers ask the host once"
+    );
     host.stop().await;
 }
 

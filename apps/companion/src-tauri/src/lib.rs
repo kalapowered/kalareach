@@ -46,7 +46,9 @@ pub mod launch;
 pub mod lease;
 pub mod links;
 pub mod mailbox;
+pub mod open_transfers;
 pub mod owner;
+pub mod paired_drafts;
 pub mod pairing;
 pub mod places;
 /// The checks a debug build runs for the voice call's bridge on a phone.

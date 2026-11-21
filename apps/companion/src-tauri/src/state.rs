@@ -56,6 +56,10 @@ pub struct AppState {
     mailbox: OnceLock<Arc<crate::mailbox::MailboxDesk>>,
     settings: OnceLock<Arc<crate::settings::Settings>>,
     drafts: Arc<crate::drafts::DraftDesk>,
+    /// The files this device sends to a host it is paired with, and what is kept of them.
+    transfers: Arc<crate::open_transfers::Desk>,
+    /// The drafts this device keeps on the hosts it is paired with.
+    paired_drafts: Arc<crate::paired_drafts::Drafts>,
     channels: Arc<crate::channel_messages::ChannelDesk>,
     questions: crate::questions::QuestionDesk,
     shares: Arc<crate::sharing::ShareDesk>,
@@ -99,6 +103,8 @@ impl AppState {
             mailbox: OnceLock::new(),
             settings: OnceLock::new(),
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
+            transfers: Arc::new(crate::open_transfers::Desk::default()),
+            paired_drafts: Arc::new(crate::paired_drafts::Drafts::default()),
             channels: Arc::new(crate::channel_messages::ChannelDesk::default()),
             questions: crate::questions::QuestionDesk::default(),
             shares: Arc::new(crate::sharing::ShareDesk::default()),
@@ -707,6 +713,9 @@ impl AppState {
             .set(Arc::new(crate::settings::Settings::open(data)));
         self.questions.keep_at(crate::questions::kept_in(data));
         self.drafts.keep_at(data.to_path_buf());
+        self.transfers.keep_at(crate::open_transfers::kept_in(data));
+        self.paired_drafts
+            .keep_at(crate::open_transfers::kept_in(data));
         self.channels.keep_at(data.to_path_buf());
         self.shares.keep_at(crate::sharing::kept_in(data));
     }
@@ -715,6 +724,18 @@ impl AppState {
     #[must_use]
     pub fn drafts(&self) -> Arc<crate::drafts::DraftDesk> {
         Arc::clone(&self.drafts)
+    }
+
+    /// The files this device sends to a host it is paired with.
+    #[must_use]
+    pub fn transfers(&self) -> Arc<crate::open_transfers::Desk> {
+        Arc::clone(&self.transfers)
+    }
+
+    /// The drafts this device keeps on the hosts it is paired with.
+    #[must_use]
+    pub fn paired_drafts(&self) -> Arc<crate::paired_drafts::Drafts> {
+        Arc::clone(&self.paired_drafts)
     }
 
     /// The messages this device keeps that were sent over a channel that confirms nothing.
