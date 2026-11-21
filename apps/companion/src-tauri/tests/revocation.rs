@@ -4424,6 +4424,141 @@ async fn the_replacer_closes_the_withdrawn_session_after_the_swap() {
     after.release();
 }
 
+/// A read of the inbox whose answer is in hand, held, when the host withdraws the connection it went
+/// over and the application replaces it. Returns the keeper, the held read and the call that waits
+/// for its answer.
+async fn a_held_read_across_a_replacement<'r>(
+    rig: &'r Rig,
+    dials: &Arc<Dials>,
+) -> (
+    EndsTheKeeper<'r>,
+    companion_tauri::contact::testing::ReadHold,
+    tokio::task::JoinHandle<Result<Value, Value>>,
+) {
+    use kr_protocol::hostinfo::HostInfoResult;
+    use kr_protocol::method::Method;
+
+    rig.host_polls().await;
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let keeper = keeper_with(rig, reopens, None, Some(Arc::clone(dials))).await;
+    let state = rig.app.app.state::<AppState>();
+    let mut holds = state.contact_owner().watch_reads();
+    let read = rig.app.start_call("attention_read", support::inbox_read());
+    let hold = support::next_read_hold(&mut holds).await;
+    let first = state.session().expect("connected");
+    the_host_narrows_its_rights_ceiling(rig).await;
+    let refused = first
+        .read::<_, HostInfoResult>(Method::HostInfo, &json!({}))
+        .await;
+    assert!(
+        refused.is_err(),
+        "the host refuses a connection it withdrew"
+    );
+    eventually("the application holds a connection the host admits", || {
+        state
+            .session()
+            .ok()
+            .filter(|session| !Arc::ptr_eq(session, &first))
+    })
+    .await;
+    (keeper, hold, read)
+}
+
+/// KR-REQ-13.01: a read whose answer is in hand when its connection is replaced is superseded: the
+/// withdrawn session's result reaches no page, and nothing is told when it is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_released_after_a_replacement_answers_superseded() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, hold, read) = a_held_read_across_a_replacement(&rig, &dials).await;
+    rig.app.told_everything().await;
+    let told_before = rig.app.told_connection().len();
+
+    hold.release();
+    let answered = read.await.expect("the call's task");
+    assert!(
+        answered.is_ok(),
+        "a superseded read is a value, not a failure: {answered:?}"
+    );
+    let answer = answered.expect("a value");
+    assert_eq!(answer["superseded"], true, "{answer}");
+    assert!(answer.get("result").is_none(), "no data: {answer}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    rig.app.told_everything().await;
+    assert_eq!(
+        rig.app.told_connection().len(),
+        told_before,
+        "nothing was told"
+    );
+}
+
+/// KR-REQ-23.22: a replacement moves the epoch of the host in use, so that what a read of the
+/// withdrawn connection answered is under another epoch than what the page is told after it, and a
+/// read of the replacement answers the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_moves_the_epoch_and_the_withdrawn_results_have_another_epoch() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    let (_keeper, hold, read) = a_held_read_across_a_replacement(&rig, &dials).await;
+    rig.app.told_everything().await;
+    hold.release();
+    let withdrawn = read
+        .await
+        .expect("the call's task")
+        .expect("a superseded read is a value");
+    let after = told_until(&rig, |told| {
+        told.last().is_some_and(|state| state["replaced"] == 1)
+    })
+    .await;
+    let told = after.last().expect("a state");
+    assert_ne!(
+        withdrawn["key"]["epoch"], told["inbox_epoch"],
+        "the replacement moved the epoch: {withdrawn} then {told}"
+    );
+    let fresh = rig
+        .app
+        .call("attention_read", support::inbox_read())
+        .expect("the replacement answers");
+    assert_eq!(fresh["key"]["epoch"], told["inbox_epoch"], "{fresh}");
+    assert!(
+        fresh["key"]["link"].as_u64() > withdrawn["key"]["link"].as_u64(),
+        "{fresh} after {withdrawn}"
+    );
+}
+
+/// KR-REQ-23.22: a refusal that a read of the inbox met on the connection the host withdrew is told
+/// as the inbox's, and the replacement clears it: the first state that tells the replacement reads
+/// the host in contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_refused_on_a_withdrawn_connection_is_cleared_by_the_replacement() {
+    let rig = Rig::start().await;
+    let dials = Arc::new(Dials::default());
+    rig.host_polls().await;
+    let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _keeper = keeper_with(&rig, reopens, None, Some(dials)).await;
+    rig.app.told_everything().await;
+    the_host_narrows_its_rights_ceiling(&rig).await;
+
+    rig.app
+        .call("attention_read", support::inbox_read())
+        .expect_err("the host refuses what a withdrawn connection asks");
+    let told = told_until(&rig, |told| told.iter().any(|state| state["replaced"] == 1)).await;
+    let refused = told
+        .iter()
+        .position(|state| state["contact"]["state"] == "refused")
+        .expect("the refusal of the inbox is told");
+    let replaced = told
+        .iter()
+        .position(|state| state["replaced"] == 1)
+        .expect("the replacement is told");
+    assert!(refused < replaced, "the refusal comes first: {told:?}");
+    assert_eq!(
+        told[replaced]["contact"]["state"], "in_contact",
+        "the replacement clears the refusal: {:?}",
+        told[replaced]
+    );
+}
+
 /// Whether `future` is ready the first time it is polled.
 fn ready_at_once(future: impl std::future::Future) -> bool {
     let mut future = std::pin::pin!(future);

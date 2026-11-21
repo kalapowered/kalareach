@@ -697,6 +697,26 @@ pub fn inbox_of(reply: &serde_json::Value) -> &serde_json::Value {
     &reply["result"]
 }
 
+/// The parameters of a read of the whole inbox's first page, as the page sends them.
+pub fn inbox_read() -> serde_json::Value {
+    serde_json::json!({ "params": {
+        "session_id": null,
+        "include_acknowledged": false,
+        "max_items": "200",
+        "after": null
+    } })
+}
+
+/// The next active read to reach the hold the owner keeps after a read has its answer.
+pub async fn next_read_hold(
+    holds: &mut tokio::sync::mpsc::UnboundedReceiver<companion_tauri::contact::testing::ReadHold>,
+) -> companion_tauri::contact::testing::ReadHold {
+    tokio::time::timeout(WATCHDOG, holds.recv())
+        .await
+        .expect("a read reaches the hold")
+        .expect("a hold")
+}
+
 impl Companion {
     /// Starts the backend on `parts`, with its records under `data`, answering confirmations
     /// through `ceremony` and pasting through `paste`.
@@ -1302,6 +1322,9 @@ struct LinkState {
     /// The code the host refuses the connection with after it is admitted, as an error with
     /// request identifier zero that ends the connection, as a host does that cannot take another.
     refusing_connection: Option<kr_protocol::error::ErrorCode>,
+    /// The method whose next answer is read as the host's refusal of the connection it comes on, and
+    /// the code of that refusal: once.
+    refusing_the_answer_to: Option<(String, kr_protocol::error::ErrorCode)>,
     /// The method of the requests the host refuses, on any connection to it, and its refusal: the
     /// connection is admitted and every other request is answered.
     refusing_request: Option<(String, kr_protocol::error::ProtocolError)>,
@@ -1588,6 +1611,22 @@ impl LinkControl {
     /// Connections made before stay as they are.
     pub fn refuse_the_connection(&self, code: Option<kr_protocol::error::ErrorCode>) {
         self.state.lock().expect("the record").refusing_connection = code;
+    }
+
+    /// Makes the host answer the next request of `method`, on any connection to it, as it answers
+    /// when it refuses the connection that request comes on: with an error of request identifier
+    /// zero, which the connection's session keeps and answers every call with. The connections made
+    /// before are the ones it reaches, and it happens once. The connection is not closed here: what
+    /// the application does about it is what a case looks at.
+    pub fn refuse_the_connection_at_the_next(
+        &self,
+        method: kr_protocol::method::Method,
+        code: kr_protocol::error::ErrorCode,
+    ) {
+        self.state
+            .lock()
+            .expect("the record")
+            .refusing_the_answer_to = Some((method.as_str().to_owned(), code));
     }
 
     /// Makes the host refuse every request of `method`, on any connection to it, with `refusal`, or
@@ -2399,6 +2438,39 @@ impl Tapped {
             .insert(request_id, method.to_owned());
     }
 
+    /// The host's refusal of this connection, in place of `response`, when a test asked for it at the
+    /// method of the request `response` answers.
+    fn the_connection_refused_at(
+        &self,
+        response: &kr_protocol::envelope::Response,
+    ) -> Option<ControlFrame> {
+        let method = self
+            .asked
+            .lock()
+            .expect("the record")
+            .get(&response.request_id)
+            .cloned()?;
+        let code = {
+            let mut state = self.control.state.lock().expect("the record");
+            if state
+                .refusing_the_answer_to
+                .as_ref()
+                .is_some_and(|(wanted, _)| *wanted == method)
+            {
+                state.refusing_the_answer_to.take().map(|(_, code)| code)
+            } else {
+                None
+            }
+        }?;
+        Some(ControlFrame::Response(kr_protocol::envelope::Response {
+            request_id: kr_protocol::ids::RequestId::new(0),
+            outcome: kr_protocol::envelope::Outcome::Error(kr_protocol::error::ProtocolError::new(
+                code,
+                "the host refused the connection",
+            )),
+        }))
+    }
+
     /// Counts an answer read from the host, by the method of the request it answers.
     fn note_answered(&self, response: &kr_protocol::envelope::Response) {
         let method = self
@@ -2595,6 +2667,11 @@ impl kr_client::transport::ControlTransport for Tapped {
                 )));
             }
             let frame = self.inner.recv().await?;
+            if let Some(ControlFrame::Response(response)) = &frame
+                && let Some(refusal) = self.the_connection_refused_at(response)
+            {
+                return Ok(Some(refusal));
+            }
             if let Some(ControlFrame::Response(response)) = &frame {
                 self.note_answered(response);
             }

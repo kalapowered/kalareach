@@ -2627,6 +2627,17 @@ mod tests {
             "the session moved"
         );
 
+        // The choice moved while the same connection is held again: only the choice differs.
+        let ticket = owner.read_started(ReadKind::Contact).expect("held");
+        let kept = owner.held().expect("a connection is held");
+        drop(owner.choose(&paired(1, 2), "chosen again"));
+        drop(owner.install(kept));
+        assert_eq!(
+            owner.read_finished(&ticket, ReadOutcome::Answered).value,
+            Finish::Superseded,
+            "the choice moved"
+        );
+
         // The choice moved, and with it the record's generation: the host is chosen again under
         // another pairing.
         let ticket = owner.read_started(ReadKind::Contact).expect("held");

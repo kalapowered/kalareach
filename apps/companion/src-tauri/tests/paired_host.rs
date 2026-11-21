@@ -23,8 +23,8 @@ use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use serde_json::json;
 use support::{
-    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, pair, phone_paired_with,
-    unpaired_phone_controlled,
+    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, inbox_read, next_read_hold, pair,
+    phone_paired_with, unpaired_phone_controlled,
 };
 use tauri::Manager as _;
 
@@ -2120,16 +2120,6 @@ async fn a_lost_final_emit_is_found_by_the_tail() {
     host.stop().await;
 }
 
-/// The parameters of a read of the whole inbox's first page, as the page sends them.
-fn inbox_read() -> serde_json::Value {
-    json!({ "params": {
-        "session_id": null,
-        "include_acknowledged": false,
-        "max_items": "200",
-        "after": null
-    } })
-}
-
 /// KR-REQ-13.01: an active read that has its answer in hand waits at the hold until it is released,
 /// and then answers what the host sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2144,6 +2134,11 @@ async fn the_hold_releases_a_read_after_its_answer_is_in_hand() {
     let mut holds = contact_owner(companion).watch_reads();
 
     let read = companion.start_call("attention_read", inbox_read());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !read.is_finished(),
+        "a read whose answer is in hand waits at the hold"
+    );
     let held = tokio::time::timeout(WATCHDOG, holds.recv())
         .await
         .expect("the read reaches the hold")
@@ -2165,16 +2160,6 @@ async fn the_hold_releases_a_read_after_its_answer_is_in_hand() {
         .expect("the host's inbox");
     assert!(support::inbox_of(&answer)["items"].is_array(), "{answer}");
     host.stop().await;
-}
-
-/// The next active read to reach the hold.
-async fn next_hold(
-    holds: &mut tokio::sync::mpsc::UnboundedReceiver<companion_tauri::contact::testing::ReadHold>,
-) -> companion_tauri::contact::testing::ReadHold {
-    tokio::time::timeout(WATCHDOG, holds.recv())
-        .await
-        .expect("a read reaches the hold")
-        .expect("a hold")
 }
 
 /// The state the page was last told.
@@ -2200,8 +2185,7 @@ async fn a_paired_host_and_its_control() -> (net_support::Host, Phone, Arc<LinkC
 }
 
 /// KR-REQ-13.01: a host that refuses the inbox over a live connection is a host that refused it:
-/// the contact reads refused for that request, and the change is told; a read the host then answers
-/// clears it, and that is told too.
+/// the contact reads refused for that request, and the change is told.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_read_over_a_live_connection_reads_refused_and_is_told() {
     use kr_controller::grants::Refusal;
@@ -2224,6 +2208,25 @@ async fn a_refused_read_over_a_live_connection_reads_refused_and_is_told() {
     let refused = last_told(companion);
     assert_eq!(refused["contact"]["state"], "refused", "{refused}");
     assert_eq!(refused["contact"]["request"], "attention_read", "{refused}");
+    host.stop().await;
+}
+
+/// KR-REQ-13.01: a read the host then answers ends the refusal of the inbox, and that is told too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_valid_read_clears_it_and_is_told() {
+    use kr_controller::grants::Refusal;
+
+    let (host, phone, control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    control.refuse_request(Some((
+        Method::AttentionRead,
+        Refusal::BehindItsFeed.to_protocol_error(),
+    )));
+    companion
+        .call("attention_read", inbox_read())
+        .expect_err("the host refuses its inbox");
+    companion.told_everything().await;
+    assert_eq!(last_told(companion)["contact"]["state"], "refused");
 
     control.refuse_request(None);
     let answer = companion
@@ -2250,13 +2253,13 @@ async fn a_late_success_cannot_clear_a_newer_refusal() {
     let companion = &phone.companion;
     let mut holds = contact_owner(companion).watch_reads();
     let older = companion.start_call("attention_read", inbox_read());
-    let older_hold = next_hold(&mut holds).await;
+    let older_hold = next_read_hold(&mut holds).await;
     control.refuse_request(Some((
         Method::AttentionRead,
         Refusal::BehindItsFeed.to_protocol_error(),
     )));
     let newer = companion.start_call("attention_read", inbox_read());
-    let newer_hold = next_hold(&mut holds).await;
+    let newer_hold = next_read_hold(&mut holds).await;
     newer_hold.release();
     newer
         .await
@@ -2298,7 +2301,7 @@ async fn a_read_released_after_the_session_ended_answers_superseded_and_writes_n
     companion.told_everything().await;
     let mut holds = contact_owner(companion).watch_reads();
     let read = companion.start_call("attention_read", inbox_read());
-    let hold = next_hold(&mut holds).await;
+    let hold = next_read_hold(&mut holds).await;
 
     let stopped = host.shut_down().await;
     connection(companion, false).await;
@@ -2309,11 +2312,14 @@ async fn a_read_released_after_the_session_ended_answers_superseded_and_writes_n
     let told_before = told_states(companion).len();
 
     hold.release();
-    let answer = read
-        .await
-        .expect("the call's task")
-        .expect("a superseded read is a value, not a failure");
+    let answered = read.await.expect("the call's task");
+    assert!(
+        answered.is_ok(),
+        "a superseded read is a value, not a failure: {answered:?}"
+    );
+    let answer = answered.expect("a value");
     assert_eq!(answer["superseded"], true, "{answer}");
+    assert!(answer.get("key").is_some(), "its key is answered: {answer}");
     assert!(answer.get("result").is_none(), "no data: {answer}");
     tokio::time::sleep(Duration::from_millis(300)).await;
     companion.told_everything().await;
@@ -2323,5 +2329,521 @@ async fn a_read_released_after_the_session_ended_answers_superseded_and_writes_n
         "nothing was told"
     );
     assert_eq!(last_told(companion)["contact"]["state"], "in_contact");
+    host.stop().await;
+}
+
+/// KR-REQ-13.01: a read whose answer is in hand when the person chooses another host and then this
+/// one again is superseded: it answers no data, writes no contact and tells nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_released_after_a_switch_away_and_back_answers_superseded() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    let in_use = connection(companion, true).await["host"]["reference"]
+        .as_str()
+        .expect("a host in use")
+        .to_owned();
+    let other = if in_use == two.references.0 {
+        two.references.1.clone()
+    } else {
+        two.references.0.clone()
+    };
+    companion.told_everything().await;
+    let mut holds = contact_owner(companion).watch_reads();
+    let read = companion.start_call("attention_read", inbox_read());
+    let hold = next_read_hold(&mut holds).await;
+
+    two.uses(&other);
+    two.uses(&in_use);
+    connection(companion, true).await;
+    companion.told_everything().await;
+    let told_before = told_states(companion).len();
+
+    hold.release();
+    let answered = read.await.expect("the call's task");
+    assert!(
+        answered.is_ok(),
+        "a superseded read is a value, not a failure: {answered:?}"
+    );
+    let answer = answered.expect("a value");
+    assert_eq!(answer["superseded"], true, "{answer}");
+    assert!(answer.get("key").is_some(), "its key is answered: {answer}");
+    assert!(answer.get("result").is_none(), "no data: {answer}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    companion.told_everything().await;
+    assert_eq!(
+        told_states(companion).len(),
+        told_before,
+        "nothing was told"
+    );
+    assert_eq!(last_told(companion)["contact"]["state"], "in_contact");
+    two.stop().await;
+}
+
+/// KR-REQ-13.01: a read whose answer is in hand when the host in use is forgotten is superseded: it
+/// answers no data and writes nothing of the host that is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_released_after_a_forget_answers_superseded() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    let in_use = connection(companion, true).await["host"]["reference"]
+        .as_str()
+        .expect("a host in use")
+        .to_owned();
+    companion.told_everything().await;
+    let mut holds = contact_owner(companion).watch_reads();
+    let read = companion.start_call("attention_read", inbox_read());
+    let hold = next_read_hold(&mut holds).await;
+
+    companion
+        .call("hosts_forget", json!({ "reference": in_use }))
+        .expect("the host is forgotten");
+    companion.told_everything().await;
+    let told_before = told_states(companion).len();
+
+    hold.release();
+    let answered = read.await.expect("the call's task");
+    assert!(
+        answered.is_ok(),
+        "a superseded read is a value, not a failure: {answered:?}"
+    );
+    let answer = answered.expect("a value");
+    assert_eq!(answer["superseded"], true, "{answer}");
+    assert!(answer.get("key").is_some(), "its key is answered: {answer}");
+    assert!(answer.get("result").is_none(), "no data: {answer}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    companion.told_everything().await;
+    assert_eq!(
+        told_states(companion).len(),
+        told_before,
+        "nothing was told"
+    );
+    two.stop().await;
+}
+
+/// Waits until a connection is held that is a later one than number `link`, and returns its number.
+async fn a_connection_after(companion: &Companion, link: u64) -> u64 {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let state = companion
+                .call("connection_state", json!({}))
+                .expect("the connection's state");
+            let now = state["link"].as_u64().expect("a link");
+            if state["connected"] == true && now > link {
+                return now;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a later connection is reached")
+}
+
+/// KR-REQ-13.01: each way a read of the inbox can fail without an answer answers with the words its
+/// cause has everywhere else: the host's own refusal of the request, a host that was not reached,
+/// a connection the host did not admit, and a host that cannot take another. Only the first is a
+/// refusal of the inbox.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_typed_failure_of_the_read_answers_its_unopened_words() {
+    use kr_controller::grants::Refusal;
+    use kr_protocol::error::ErrorCode;
+
+    let (host, phone, control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    let code_of = |code: ErrorCode| serde_json::to_value(code).expect("a code");
+
+    // A refusal of the request: the host's own words and code, and the inbox reads refused.
+    let lapsed = Refusal::BehindItsFeed.to_protocol_error();
+    control.refuse_request(Some((Method::AttentionRead, lapsed.clone())));
+    let refused = companion
+        .call("attention_read", inbox_read())
+        .expect_err("the host refuses its inbox");
+    control.refuse_request(None);
+    assert_eq!(refused["code"], code_of(lapsed.code), "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|said| said.ends_with(lapsed.message.as_str())),
+        "the host's own words: {refused}"
+    );
+    companion.told_everything().await;
+    assert_eq!(last_told(companion)["contact"]["state"], "refused");
+    companion
+        .call("attention_read", inbox_read())
+        .expect("the host answers its inbox");
+    companion.told_everything().await;
+    let settled = told_states(companion).len();
+
+    // A host that was not reached: the connection ends under the call.
+    control.lose_the_answer_to(Some(Method::AttentionRead));
+    let unreached = companion
+        .call("attention_read", inbox_read())
+        .expect_err("the answer never comes");
+    control.lose_the_answer_to(None);
+    assert_ne!(unreached["code"], code_of(lapsed.code), "{unreached}");
+
+    // A connection the host refused, as it does one that it cannot admit or has no room for: the
+    // refusal ends the connection. A read that finished before the end was applied answers the
+    // typed words of the refusal, and one that finished after it is superseded; the page is told
+    // the loss of the connection either way. Neither is a refusal of the inbox.
+    for (code, words, own_code, lost_as) in [
+        (
+            ErrorCode::PermissionDenied,
+            "the host refused the connection",
+            true,
+            "out_of_contact",
+        ),
+        (
+            ErrorCode::ResourceUnavailable,
+            "cannot take another connection",
+            false,
+            "refused",
+        ),
+    ] {
+        let told_before = companion.told_connection().len();
+        let link = companion
+            .call("connection_state", json!({}))
+            .expect("the state")["link"]
+            .as_u64()
+            .expect("a link");
+        control.refuse_the_connection_at_the_next(Method::AttentionRead, code);
+        match companion.call("attention_read", inbox_read()) {
+            Ok(answer) => assert_eq!(
+                answer["superseded"], true,
+                "a read over a connection that ended is superseded: {answer}"
+            ),
+            Err(error) => {
+                assert!(
+                    error["message"]
+                        .as_str()
+                        .is_some_and(|said| said.contains(words)),
+                    "the host's words: {error}"
+                );
+                assert!(
+                    !own_code || error["code"] != code_of(code),
+                    "the code the host refused the connection with is for the connection: {error}"
+                );
+            }
+        }
+        let ended = tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let told = companion.told_connection();
+                if let Some(ended) = told[told_before..]
+                    .iter()
+                    .find(|state| state["connected"] == false)
+                {
+                    return ended.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the loss of the connection is told");
+        assert_eq!(
+            ended["contact"]["state"], lost_as,
+            "the end of the connection reads as its cause does: {ended}"
+        );
+        assert_ne!(
+            ended["contact"]["request"], "attention_read",
+            "no refusal of the inbox: {ended}"
+        );
+        a_connection_after(companion, link).await;
+    }
+    companion.told_everything().await;
+    let told = companion.told_connection();
+    assert!(
+        told[settled..]
+            .iter()
+            .all(|state| state["contact"]["request"] != "attention_read"),
+        "only a refusal of the request reads refused for the inbox: {told:?}"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-13.01: the answer to a read of the inbox carries the key of the host in use, its epoch and
+/// the connection the read went over, which are what the state the page is told says of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attention_answer_carries_the_owners_key() {
+    let (host, phone, _control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    let state = companion
+        .call("connection_state", json!({}))
+        .expect("the state");
+    let answer = companion
+        .call("attention_read", inbox_read())
+        .expect("the inbox");
+    assert_eq!(
+        answer["key"],
+        json!({
+            "host": { "kind": "paired", "reference": state["host"]["reference"] },
+            "epoch": state["inbox_epoch"],
+            "link": state["link"],
+        }),
+        "{answer} under {state}"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-13.01: a read begun after the choice moved to another host answers that host's key, though
+/// the page has not yet been told the choice: the key is the owner's, not the page's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_whose_choice_moved_to_b_answers_b_not_a() {
+    let two = two_hosts().await;
+    let companion = &two.phone.companion;
+    let a = connection(companion, true).await["host"]["reference"]
+        .as_str()
+        .expect("a host in use")
+        .to_owned();
+    let b = if a == two.references.0 {
+        two.references.1.clone()
+    } else {
+        two.references.0.clone()
+    };
+    companion.told_everything().await;
+
+    let hold = contact_owner(companion).hold_the_publisher();
+    two.uses(&b);
+    let answer = companion
+        .call("attention_read", inbox_read())
+        .expect("the inbox");
+    assert_eq!(answer["key"]["host"]["reference"], json!(b), "{answer}");
+    assert_eq!(
+        last_told(companion)["host"]["reference"],
+        json!(a),
+        "the page has not been told the choice"
+    );
+
+    hold.release();
+    companion.told_everything().await;
+    let told = last_told(companion);
+    assert_eq!(told["host"]["reference"], json!(b), "{told}");
+    assert_eq!(answer["key"]["epoch"], told["inbox_epoch"], "{answer}");
+    two.stop().await;
+}
+
+/// KR-REQ-13.01: the numbers of the sessions are read under the same key as the inbox, and what
+/// the host says of them writes nothing of contact: a refusal of them reads as no refusal of the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_numbers_carries_the_key_takes_no_serial_and_writes_no_contact() {
+    use kr_controller::grants::Refusal;
+
+    let (host, phone, control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    let inbox = companion
+        .call("attention_read", inbox_read())
+        .expect("the inbox");
+    let numbers = companion
+        .call("session_numbers", json!({}))
+        .expect("the numbers");
+    assert_eq!(numbers["key"], inbox["key"], "one key for both reads");
+    assert!(numbers["result"]["sessions"].is_array(), "{numbers}");
+
+    let told_before = told_states(companion).len();
+    control.refuse_request(Some((
+        Method::SessionList,
+        Refusal::BehindItsFeed.to_protocol_error(),
+    )));
+    companion
+        .call("session_numbers", json!({}))
+        .expect_err("the host refuses the numbers");
+    control.refuse_request(None);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    companion.told_everything().await;
+    assert_eq!(
+        told_states(companion).len(),
+        told_before,
+        "a refusal of the numbers tells nothing"
+    );
+    assert_eq!(last_told(companion)["contact"]["state"], "in_contact");
+    host.stop().await;
+}
+
+/// KR-REQ-13.01: the numbers read while a page of the inbox is held answer first and supersede
+/// nothing: the page is released and answers its data under the key both reads began under, and the
+/// host was asked once for each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_numbers_answering_first_supersedes_no_attention_read() {
+    let (host, phone, control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    let mut holds = contact_owner(companion).watch_reads();
+    let page = companion.start_call("attention_read", inbox_read());
+    let page_hold = next_read_hold(&mut holds).await;
+    let numbers = companion.start_call("session_numbers", json!({}));
+    let numbers_hold = next_read_hold(&mut holds).await;
+    assert_eq!(numbers_hold.command, "session_numbers");
+    numbers_hold.release();
+    let numbers = numbers
+        .await
+        .expect("the call's task")
+        .expect("the numbers");
+
+    page_hold.release();
+    let page = page.await.expect("the call's task").expect("the page");
+    assert!(page["result"]["items"].is_array(), "{page}");
+    assert_eq!(page["key"], numbers["key"], "one key for both reads");
+    assert!(numbers["result"]["sessions"].is_array(), "{numbers}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    companion.told_everything().await;
+    assert_eq!(last_told(companion)["contact"]["state"], "in_contact");
+    assert_eq!(
+        control.sent(Method::AttentionRead),
+        1,
+        "no page is read again"
+    );
+    assert_eq!(control.sent(Method::SessionList), 1);
+    host.stop().await;
+}
+
+/// KR-REQ-13.01: as above when the held page is one the host refuses: the numbers that answered
+/// first do not clear the refusal, and the page's own refusal is the host's, told once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_numbers_answering_first_supersedes_no_attention_refusal() {
+    use kr_controller::grants::Refusal;
+
+    let (host, phone, control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    let lapsed = Refusal::BehindItsFeed.to_protocol_error();
+    control.refuse_request(Some((Method::AttentionRead, lapsed.clone())));
+    let mut holds = contact_owner(companion).watch_reads();
+    let page = companion.start_call("attention_read", inbox_read());
+    let page_hold = next_read_hold(&mut holds).await;
+    let numbers = companion.start_call("session_numbers", json!({}));
+    let numbers_hold = next_read_hold(&mut holds).await;
+    numbers_hold.release();
+    let numbers = numbers
+        .await
+        .expect("the call's task")
+        .expect("the numbers");
+    assert!(numbers["result"]["sessions"].is_array(), "{numbers}");
+
+    page_hold.release();
+    let refusal = page
+        .await
+        .expect("the call's task")
+        .expect_err("the page is refused");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .is_some_and(|said| said.ends_with(lapsed.message.as_str())),
+        "the host's own words: {refusal}"
+    );
+    companion.told_everything().await;
+    let refused = last_told(companion);
+    assert_eq!(refused["contact"]["state"], "refused", "{refused}");
+    assert_eq!(
+        control.sent(Method::AttentionRead),
+        0,
+        "the refused page was not sent, and is not asked again"
+    );
+    assert_eq!(control.sent(Method::SessionList), 1);
+    host.stop().await;
+}
+
+/// KR-REQ-13.01: a conflict the host answers a page with is an answer and not a refusal: the page
+/// is told to read again and the contact is neither written nor told; and when the inbox had been
+/// refused, the conflict is the host answering it, which ends the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draft_conflict_is_an_answer_and_makes_no_event() {
+    use kr_controller::grants::Refusal;
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+
+    let (host, phone, control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    let conflict = ProtocolError::new(ErrorCode::DraftConflict, "the page is not one held");
+    control.refuse_request(Some((Method::AttentionRead, conflict.clone())));
+    let told_before = told_states(companion).len();
+    let answered = companion
+        .call("attention_read", inbox_read())
+        .expect_err("the page reads again");
+    assert_eq!(
+        answered["code"],
+        serde_json::to_value(ErrorCode::DraftConflict).expect("a code"),
+        "{answered}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    companion.told_everything().await;
+    assert_eq!(
+        told_states(companion).len(),
+        told_before,
+        "a conflict tells nothing"
+    );
+
+    control.refuse_request(Some((
+        Method::AttentionRead,
+        Refusal::BehindItsFeed.to_protocol_error(),
+    )));
+    companion
+        .call("attention_read", inbox_read())
+        .expect_err("the host refuses its inbox");
+    companion.told_everything().await;
+    assert_eq!(last_told(companion)["contact"]["state"], "refused");
+    control.refuse_request(Some((Method::AttentionRead, conflict)));
+    companion
+        .call("attention_read", inbox_read())
+        .expect_err("the page reads again");
+    companion.told_everything().await;
+    assert_eq!(
+        last_told(companion)["contact"]["state"],
+        "in_contact",
+        "the conflict is the host answering: it ends the refusal and says so"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-18.01: a refusal the host repeats is no new change: the second read tells nothing and the
+/// epoch stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identical_refusal_makes_no_second_event() {
+    use kr_controller::grants::Refusal;
+
+    let (host, phone, control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    control.refuse_request(Some((
+        Method::AttentionRead,
+        Refusal::BehindItsFeed.to_protocol_error(),
+    )));
+    companion
+        .call("attention_read", inbox_read())
+        .expect_err("the host refuses its inbox");
+    companion.told_everything().await;
+    let first = last_told(companion);
+    assert_eq!(first["contact"]["state"], "refused", "{first}");
+    let told_before = told_states(companion).len();
+
+    companion
+        .call("attention_read", inbox_read())
+        .expect_err("the host refuses its inbox again");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    companion.told_everything().await;
+    assert_eq!(
+        told_states(companion).len(),
+        told_before,
+        "the same refusal tells nothing again"
+    );
+    assert_eq!(
+        last_told(companion)["inbox_epoch"],
+        first["inbox_epoch"],
+        "the epoch did not move"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-13.01: the parameters of a read are decoded before the host is asked: a body that is not
+/// the method's shape is refused as an invalid argument and nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parameters_are_decoded_before_the_session_is_asked() {
+    let (host, phone, control) = a_paired_host_and_its_control().await;
+    let companion = &phone.companion;
+    let refusal = companion
+        .call(
+            "attention_read",
+            json!({ "params": { "not_a_parameter": true } }),
+        )
+        .expect_err("a body that is not the method's");
+    assert_eq!(refusal["code"], "INVALID_ARGUMENT", "{refusal}");
+    assert_eq!(
+        control.sent(Method::AttentionRead),
+        0,
+        "the host was not asked"
+    );
     host.stop().await;
 }

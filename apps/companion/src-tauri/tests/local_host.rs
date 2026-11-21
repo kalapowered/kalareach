@@ -453,6 +453,37 @@ async fn the_inbox_is_read_and_acknowledged_on_the_host() {
     );
 }
 
+/// KR-REQ-13.01: a read over a connection with no host in use answers a key that names no host, at
+/// epoch 0, over the connection the application's state names, and writes no contact: there is no
+/// record of a host to write it to.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_over_a_connection_with_no_host_in_use_has_a_null_host_key_and_writes_no_contact() {
+    let host = Host::start().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    let revision = state.contact_owner().revision();
+    let answer = host
+        .call(
+            "attention_read",
+            json!({ "params": {
+                "session_id": null,
+                "include_acknowledged": false,
+                "max_items": "50",
+                "after": null
+            } }),
+        )
+        .await
+        .expect("the inbox");
+    assert!(answer["key"]["host"].is_null(), "{answer}");
+    assert_eq!(answer["key"]["epoch"], 0, "{answer}");
+    let told = serde_json::to_value(state.connection_state()).expect("a state");
+    assert_eq!(answer["key"]["link"], told["link"], "{answer} under {told}");
+    assert_eq!(
+        state.contact_owner().revision(),
+        revision,
+        "a read with no host in use makes no event"
+    );
+}
+
 /// KR-REQ-13.09: a page of the inbox or of review state continues only after a key or subject the
 /// host holds, and anything else is a conflict the page reads again from the start; a review
 /// subject the host does not hold cannot be acknowledged. The page's scripted host keeps the same
