@@ -35,11 +35,11 @@ configured for.
   line. A build given no value uses the official gateway, `https://reach.kala.to`, and sends the
   same requests as the official build. A value that is not such an origin stops the build. A build
   given one prints `this build registers with the push gateway at <origin>` among its cargo
-  warnings, which is the sign that the input reached the build. The app takes its gateway from what
-  the build accepted, so the warning and the app cannot name different gateways. A
+  warnings, which is the sign that the input reached the build. The app takes the gateway it is built
+  with from what the build accepted, so the warning and that gateway cannot differ. A
   Cargo configuration file's `[env]` table reaches the build as the environment does. A debug build
-  also reads an origin from a device test's file in its data directory; a release build has no
-  other way to change the origin. The input moves only the push gateway: the account the app signs
+  also reads an origin from a device test's file in its data directory and uses it in place of the
+  one it was built with; a release build has no other way to change the origin. The input moves only the push gateway: the account the app signs
   in to and its other services stay where they are. Each request is bound to the exact origin it
   was addressed to, so a signature made for one deployment cannot be replayed against another, and
   a gateway refuses a request authorised for somebody else's origin. The gateway compares the
