@@ -209,7 +209,7 @@ async fn kr_launch_adds_lists_replaces_and_removes_a_command() {
          [arguments...]"
     );
     let empty = host.listed();
-    assert_eq!(empty["revision"], 0, "{empty}");
+    assert_eq!(empty["revision"], "0", "{empty}");
     assert_eq!(empty["commands"], Value::Array(Vec::new()), "{empty}");
 
     let (status, text, _) = host.said(&[
@@ -591,4 +591,32 @@ async fn kr_launch_add_remove_and_list_are_refused_inside_a_session_and_change_n
     }
     assert_eq!(std::fs::read(host.file()).expect("the file"), kept);
     assert_eq!(labels(&host.listed()), ["Claude"]);
+}
+
+/// KR-REQ-13.11: a revision above 2^53 is written exactly, as the protocol writes a `U64`: a
+/// decimal string, in the list and in both answers to a change. A JSON reader that holds a number
+/// as a double would round it. The revisions are random, so the case reads the one the host kept
+/// and compares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revision_is_written_as_the_protocols_decimal_string_in_every_document() {
+    let host = Host::start().await;
+    let revision_in_the_file = |host: &Host| -> String {
+        let file: Value = serde_json::from_slice(&std::fs::read(host.file()).expect("the file"))
+            .expect("a record");
+        file["revision"].as_u64().expect("a revision").to_string()
+    };
+
+    let (status, saved) = host.json(&["launch", "add", "Claude", "--", "claude"]);
+    assert_eq!(status, Some(0), "{saved}");
+    assert_eq!(saved["revision"], revision_in_the_file(&host), "{saved}");
+    let listed = host.listed();
+    assert_eq!(listed["revision"], revision_in_the_file(&host), "{listed}");
+    let (status, removed) = host.json(&["launch", "remove", "Claude"]);
+    assert_eq!(status, Some(0), "{removed}");
+    assert_eq!(
+        removed["revision"],
+        revision_in_the_file(&host),
+        "{removed}"
+    );
+    assert!(removed["revision"].is_string(), "{removed}");
 }
