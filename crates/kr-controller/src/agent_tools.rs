@@ -1488,18 +1488,22 @@ impl Installer {
 
     /// What a removal does to a folder the installation made: it stays where something is left in
     /// it once the names the removal deletes, `deleted`, are gone; under the walk the folder is
-    /// listed through a handle opened on it. A removal that works by paths tries each folder.
+    /// listed through a handle opened on it, and a deleted name is matched to the entry the folder
+    /// holds for it, which on some volumes is spelled otherwise. A removal that works by paths
+    /// tries each folder.
     fn plan_folder(&self, path: &Path, deleted: &[PathBuf]) -> Result<FolderPlan> {
         let Fs::Walk(walk) = &self.fs else {
             return Ok(FolderPlan::Remove);
         };
-        let Some(names) = walk.folder_names(path)? else {
+        let going: Vec<&str> = deleted
+            .iter()
+            .filter(|gone| gone.parent() == Some(path))
+            .filter_map(|gone| gone.file_name().and_then(|name| name.to_str()))
+            .collect();
+        let Some(left) = walk.names_left_by(path, &going)? else {
             return Ok(FolderPlan::Gone);
         };
-        let emptied = names
-            .iter()
-            .all(|name| deleted.iter().any(|gone| *gone == path.join(name)));
-        Ok(if emptied {
+        Ok(if left.is_empty() {
             FolderPlan::Remove
         } else {
             FolderPlan::Retained
@@ -7793,6 +7797,99 @@ mod tests {
             plan.is_ok(),
             "nothing is read, so no document is guarded: {:?}",
             plan.err()
+        );
+    }
+
+    /// KR-REQ-11.01: on a volume that ignores the case of names, a recorded file that was renamed by
+    /// its case alone is the one entry that the removal takes out of its folder, so the folder is
+    /// empty afterwards and is taken too.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_file_renamed_by_its_case_alone_does_not_keep_its_folder() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let tools = tree.home().join(TOOLS_FILE);
+        std::fs::rename(&tools, tools.with_file_name("tools.md")).expect("renamed by its case");
+        if !tools.exists() {
+            println!("this volume tells names apart by case, so there is no alias to read");
+            return;
+        }
+        let removed = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("removes");
+        assert!(
+            !tree.home().join(".amp/skills/kalareach-contact").exists(),
+            "the folder the file was in is taken: {removed:?}"
+        );
+        assert!(
+            !removed
+                .retained
+                .iter()
+                .any(|note| note.ends_with("kalareach-contact is not empty")),
+            "{:?}",
+            removed.retained
+        );
+    }
+
+    /// KR-REQ-11.01: where names that differ by case alone are two files, the one that is not
+    /// recorded stays, and so does the folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_differs_from_a_recorded_name_by_case_alone_keeps_its_folder() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let folder = tree.home().join(".amp/skills/kalareach-contact");
+        let other = folder.join("tools.md");
+        std::fs::write(&other, "theirs\n").expect("another file");
+        if std::fs::read_dir(&folder).expect("the folder").count() != 3 {
+            println!("this volume ignores case, so the two names are one file");
+            return;
+        }
+        let removed = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("removes");
+        assert_eq!(
+            std::fs::read(&other).ok().as_deref(),
+            Some(&b"theirs\n"[..]),
+            "the file that is not recorded is kept"
+        );
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.ends_with("kalareach-contact is not empty")),
+            "{:?}",
+            removed.retained
+        );
+    }
+
+    /// KR-REQ-11.01: a second name for a recorded file is not the recorded name: the removal takes
+    /// the recorded name, and the folder stays for the other, so the folder that holds it is not
+    /// judged, though every user can change it.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_second_name_for_a_recorded_file_keeps_its_folder() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let tools = tree.home().join(TOOLS_FILE);
+        let link = tools.with_file_name("kept.md");
+        std::fs::hard_link(&tools, &link).expect("a second name for the file");
+        set_mode(&tree.home().join(".amp/skills"), 0o757);
+        let removed = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect("removes");
+        assert_eq!(
+            std::fs::read(&link).ok().as_deref(),
+            Some(TOOLS_MD.as_bytes()),
+            "the second name is kept"
+        );
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.ends_with("kalareach-contact is not empty")),
+            "{:?}",
+            removed.retained
         );
     }
 

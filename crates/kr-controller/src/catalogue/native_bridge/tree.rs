@@ -403,6 +403,19 @@ mod platform {
             })
         }
 
+        /// The identity of whatever is at one name, without following a link, or none where
+        /// nothing is there.
+        pub(in crate::catalogue::native_bridge) fn object_at(
+            &self,
+            name: &str,
+        ) -> std::io::Result<Option<Identity>> {
+            match rustix::fs::statat(self.handle.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => Ok(Some(identity_of_stat(&stat))),
+                Err(Errno::NOENT) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        }
+
         /// Says what is at one name, without following a link.
         pub(in crate::catalogue::native_bridge) fn entry(
             &self,
@@ -1117,6 +1130,13 @@ mod platform {
             &self,
             _name: &str,
         ) -> std::io::Result<Option<Owners>> {
+            Err(unsupported())
+        }
+
+        pub(in crate::catalogue::native_bridge) fn object_at(
+            &self,
+            _name: &str,
+        ) -> std::io::Result<Option<Identity>> {
             Err(unsupported())
         }
 

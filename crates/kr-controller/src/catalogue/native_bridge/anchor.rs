@@ -294,18 +294,53 @@ impl Anchor {
         ))
     }
 
-    /// The names held in the folder at `path`, listed through a handle opened on it, or none where
-    /// nothing is at `path`. Something at `path` that is not a folder is an error.
-    pub(crate) fn folder_names(&self, path: &Path) -> Result<Option<Vec<String>>> {
+    /// The names that stay in the folder at `path` once the entries named in `going` are gone,
+    /// listed through a handle opened on the folder, or none where nothing is at `path`. A name in
+    /// `going` that the folder does not list by that spelling reaches its entry by another, as a
+    /// volume does that ignores the case or the form of a name: that entry goes with it. A second
+    /// name for the same file stays, as does any other name a volume that tells names apart lists.
+    /// Something at `path` that is not a folder is an error.
+    pub(crate) fn names_left_by(&self, path: &Path, going: &[&str]) -> Result<Option<Vec<String>>> {
         let place = self.place(path)?;
         let Some(parent) = self.parent(&place, false)? else {
             return Ok(None);
         };
-        match parent.child(place.name).map_err(storage)? {
-            Child::Directory(folder) => Ok(Some(folder.names().map_err(storage)?)),
-            Child::Absent => Ok(None),
-            Child::NotADirectory => Err(storage(std::io::Error::from(ErrorKind::NotADirectory))),
+        let folder = match parent.child(place.name).map_err(storage)? {
+            Child::Directory(folder) => folder,
+            Child::Absent => return Ok(None),
+            Child::NotADirectory => {
+                return Err(storage(std::io::Error::from(ErrorKind::NotADirectory)));
+            }
+        };
+        let listed = folder.names().map_err(storage)?;
+        let mut left: Vec<String> = listed
+            .iter()
+            .filter(|name| !going.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        for name in going
+            .iter()
+            .filter(|name| !listed.iter().any(|one| one == **name))
+        {
+            let Some(reached) = folder.object_at(name).map_err(storage)? else {
+                continue;
+            };
+            let mut found = None;
+            for (index, other) in left.iter().enumerate() {
+                let same = folder
+                    .object_at(other)
+                    .map_err(storage)?
+                    .is_some_and(|object| object.same_object(&reached));
+                if same {
+                    found = Some(index);
+                    break;
+                }
+            }
+            if let Some(index) = found {
+                left.remove(index);
+            }
         }
+        Ok(Some(left))
     }
 
     /// True when anything is at `path`.
