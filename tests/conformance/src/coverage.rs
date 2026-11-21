@@ -984,6 +984,8 @@ mod tests {
             "cargo test --test *** --tests",
             "cargo test --test a** --tests --test x**",
         ] {
+            let read = parse(&words(line));
+            assert!(read.is_ok(), "{line}: {read:?}");
             assert_eq!(covered(line), tests, "{line}");
         }
         assert_eq!(
@@ -1006,6 +1008,8 @@ mod tests {
             "cargo test --package b",
             "cargo test --package=b",
         ] {
+            let read = parse(&words(spelling));
+            assert!(read.is_ok(), "{spelling}: {read:?}");
             assert_eq!(covered(spelling), one, "{spelling}");
         }
         assert_eq!(covered("cargo test --bin=x"), ["a --bin x"]);
@@ -1023,6 +1027,8 @@ mod tests {
             "cargo test -qp=b",
             "cargo test -rqpb",
         ] {
+            let read = parse(&words(spelling));
+            assert!(read.is_ok(), "{spelling}: {read:?}");
             assert_eq!(covered(spelling), one, "{spelling}");
         }
         let plain = covered("cargo test");
@@ -1036,6 +1042,8 @@ mod tests {
             "cargo test --jobs=-1",
             "cargo test --jobs -1 -qr",
         ] {
+            let read = parse(&words(spelling));
+            assert!(read.is_ok(), "{spelling}: {read:?}");
             assert_eq!(covered(spelling), plain, "{spelling}");
         }
     }
