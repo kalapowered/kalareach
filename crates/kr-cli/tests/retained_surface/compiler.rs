@@ -1500,6 +1500,22 @@ fn decoded(literal: &proc_macro2::Literal) -> Option<String> {
     }
 }
 
+/// Whether the name at `at` ends the return type of a function (`-> Name`, `-> &Name`, `-> &'a mut Name`):
+/// the brace group after it is the body, not a value of the type.
+fn is_return_type(trees: &[TokenTree], at: usize) -> bool {
+    let punct = |index: usize, wanted: char| matches!(trees.get(index), Some(TokenTree::Punct(found)) if found.as_char() == wanted);
+    let mut back = at;
+    while back > 0 {
+        match &trees[back - 1] {
+            TokenTree::Punct(found) if found.as_char() == '&' => back -= 1,
+            TokenTree::Ident(word) if word == "mut" => back -= 1,
+            TokenTree::Ident(_) if back >= 2 && punct(back - 2, '\'') => back -= 2,
+            _ => break,
+        }
+    }
+    back >= 2 && punct(back - 1, '>') && punct(back - 2, '-')
+}
+
 fn walk_tokens(stream: TokenStream, found: &mut Vec<Candidate>) {
     let trees: Vec<TokenTree> = stream.into_iter().collect();
     let punct = |at: usize| match trees.get(at) {
@@ -1531,6 +1547,7 @@ fn walk_tokens(stream: TokenStream, found: &mut Vec<Candidate>) {
                 } else if STAMPED_STRUCTS.iter().any(|(stamped, _)| *stamped == name)
                     && matches!(trees.get(at + 1), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace)
                     && !matches!(at.checked_sub(1).map(|before| &trees[before]), Some(TokenTree::Ident(before)) if BEFORE_A_BODY.contains(&before.to_string().as_str()))
+                    && !is_return_type(&trees, at)
                 {
                     let mut candidate = position(format!("{name} {{"));
                     let after = trees[at + 1].span().end();

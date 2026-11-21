@@ -668,7 +668,11 @@ fn a_token_that_names_a_stamped_item_is_found_in_a_group_a_raw_name_and_a_litera
          fn f() { let _ = MutationRequest { a: 1 }; let _ = ActionTarget { a: 1 }; }\n\
          impl Trait for ActionTarget { }\n\
          impl ActionTarget { }\n\
-         fn g() -> &'static str { \"agent_turn_steer\" }\n",
+         fn g() -> &'static str { \"agent_turn_steer\" }\n\
+         fn h(&self) -> ActionTarget { self.t() }\n\
+         fn i(&self) -> &MutationRequest { &self.r }\n\
+         fn j<'a>(&'a self) -> &'a mut ActionTarget { &mut self.t }\n\
+         fn k() -> ActionTarget { ActionTarget { a: 1 } }\n",
     );
     assert_eq!(
         found,
@@ -680,6 +684,8 @@ fn a_token_that_names_a_stamped_item_is_found_in_a_group_a_raw_name_and_a_litera
             ("\"agent.turn.steer\"".to_owned(), 5),
             ("MutationRequest {".to_owned(), 6),
             ("ActionTarget {".to_owned(), 6),
+            // A return type before a function's body is no struct value; a value in the body is.
+            ("ActionTarget {".to_owned(), 13),
         ]
     );
 }
