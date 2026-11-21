@@ -2362,3 +2362,104 @@ async fn kr_req_23_41_an_answered_draft_action_leaves_the_clients_book() {
     );
     adopted.stop().await;
 }
+
+fn drafts_in(folder: &Path) -> usize {
+    std::fs::read_dir(folder)
+        .map(|listing| {
+            listing
+                .flatten()
+                .filter(|item| item.path().extension().is_some_and(|ext| ext == "draft"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// KR-REQ-13.12, KR-REQ-23.41: an account replacement, end to end. When the host is reached as the
+/// device is now, an upload still sent as the earlier principal is stopped with its copy, and an
+/// entry, a copy and a draft that a process of the earlier principal left when it stopped before it
+/// saw the change are dropped. Nothing of the earlier principal is resumed or read from the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_what_it_left() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let paired = paired_of(companion);
+    let session = adopted.workers[0].session_id;
+    let earlier = Paired {
+        device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+        ..paired.clone()
+    };
+
+    // An upload that is still sent as the earlier principal, held in its content.
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let running = {
+        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let (desk, earlier) = (Arc::clone(&desk), earlier.clone());
+        tokio::spawn(async move { desk.send(earlier, sent).await })
+    };
+    gate.reached().await;
+    // What a process of the earlier principal left: an upload entry with its copy, and a draft.
+    let left = vec![9_u8; 16];
+    let key = kr_ipc::new_uuid();
+    testing::keep(
+        &folder(&phone),
+        key,
+        earlier.environment_id,
+        earlier.device_id,
+        net_support::on_the_host(&adopted.host),
+        Some(kr_protocol::ids::TransferId::new(kr_ipc::new_uuid())),
+        testing::Got::Begun,
+        16,
+        Held::new(left.clone()).digest(),
+        testing::Where::Copy,
+    );
+    testing::keep_copy(&folder(&phone), key, &left);
+    companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts()
+        .keep_for_test(
+            &earlier,
+            session,
+            &net_support::on_the_session(&adopted.host, session),
+            Some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid())),
+            Some(kr_protocol::ids::DraftRevision::new(1)),
+        );
+    assert_eq!(entries_in(&folder(&phone)), 2);
+    assert_eq!(copies_in(&folder(&phone)), 2);
+    assert_eq!(drafts_in(&folder(&phone)), 1);
+    let status_reads = control.sent(Method::UploadStatus);
+
+    // The host is reached again, as the device is now.
+    let old = Arc::clone(&paired.session);
+    old.transport().close();
+    on_another_connection(companion, &old).await;
+    connected(companion).await;
+
+    let stopped = tokio::time::timeout(WATCHDOG, running)
+        .await
+        .expect("the upload of the earlier principal ends")
+        .expect("the task ran")
+        .expect_err("an upload of another principal is not sent on");
+    assert_eq!(stopped.message, companion_tauri::open_transfers::CANCELLED);
+    tokio::time::timeout(WATCHDOG, async {
+        while entries_in(&folder(&phone)) + copies_in(&folder(&phone)) + drafts_in(&folder(&phone))
+            > 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every entry, copy and draft of the earlier principal is dropped");
+    assert_eq!(
+        control.sent(Method::UploadStatus),
+        status_reads,
+        "nothing of the earlier principal is read from the host or resumed"
+    );
+    gate.release();
+    adopted.stop().await;
+}
