@@ -334,9 +334,11 @@ deadline, the step runs out of time and the report closes the pipe. The kill doe
 
 Ctrl-C and a closed terminal reach the report and not the step's group, so an interrupted run can
 leave a step's processes running. An interactive command in the step's group that reads the
-controlling terminal, for example to ask for a password, stops the group, because the group is not
-the terminal's foreground group, and the group stays stopped until the deadline. When the step's own
-process has ended, or the command ignores or blocks the stop signal, the read fails at once instead.
+controlling terminal, for example to ask for a password, can stop the group, because the group is
+not the terminal's foreground group, and the group can stay stopped until the deadline if no signal
+resumes it. The read fails at once instead when the group is orphaned (no process of the group has a
+parent in another group of the same session, as when the step's own process has ended), or when the
+command ignores or blocks the stop signal.
 
 Playwright 1.63.0 starts each browser in a session of its own, so the kill does not reach a browser.
 Playwright's test workers are in the step's group. On the request to end they start to close their
