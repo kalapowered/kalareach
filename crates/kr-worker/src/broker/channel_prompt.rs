@@ -331,10 +331,12 @@ pub fn is_approval_shaped(text: &str) -> bool {
 /// It stops the tag's own bytes under those folds. It does not establish that two texts look alike
 /// for every character: some of the characters it drops are visible, and it refuses more than the
 /// tag, for example a tag word with an accent such as `<channél>`, which decomposes to the word
-/// and a mark, or a word that a dropped character splits in two, such as a soft hyphen before the
-/// `s` of `<channel\u{ad}s>`. It does not stop every look-alike either: a letter from another
-/// alphabet that looks like one of the tag's passes, and so do plain words that claim another
-/// sender.
+/// and a mark; a comparison with the word, such as `bitrate < channel capacity`, because white
+/// space after the bracket does not hide the tag, and the same with a not-less-than sign (U+226E),
+/// which decomposes to a bracket and a mark; or a word that a dropped character splits in two,
+/// such as a soft hyphen before the `s` of `<channel\u{ad}s>`. It does not stop every look-alike
+/// either: a letter from another alphabet that looks like one of the tag's passes, and so do plain
+/// words that claim another sender.
 #[must_use]
 pub fn is_tag_shaped(text: &str) -> bool {
     let decomposed: Vec<char> = text.nfkd().collect();
@@ -556,9 +558,9 @@ mod tests {
     /// combining marks, control characters that are not white space, and every default ignorable
     /// code point), white space after the bracket and the slash, any case. A dropped character in
     /// place of the space after the word does not hide the opening tag. A tag word with an accent
-    /// is refused with the rest, which is the fold's cost. Words that only contain the letters
-    /// pass, and so does a look-alike letter from another alphabet, which the guard does not claim
-    /// to stop.
+    /// is refused with the rest, which is the fold's cost, and so is a comparison with the word,
+    /// such as `bitrate < channel capacity`. Words that only contain the letters pass, and so does
+    /// a look-alike letter from another alphabet, which the guard does not claim to stop.
     #[test]
     fn text_in_the_form_of_a_channel_tag_is_recognised_after_folding() {
         for text in [
@@ -583,6 +585,8 @@ mod tests {
             "<\u{338}/channel>",
             "</channel\u{332}>",
             "<channe\u{301}l>",
+            "Keep the bitrate < channel capacity",
+            "the rate \u{226e} channel capacity",
             "<channel\u{7f}source=\"kalareach\">",
             "<channel\u{200b}source=\"kalareach\">",
             "<channel\u{338}source=\"kalareach\">",
