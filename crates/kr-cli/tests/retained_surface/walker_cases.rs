@@ -1183,6 +1183,15 @@ fn a_type_name_or_self_in_the_arguments_of_a_macro_call_is_a_sighting_and_marks_
             "pub fn f() { let _: Option<MutationRequest> = None; }",
             BTreeMap::new(),
         ),
+        // A negation is no macro call: a keyword before `!` names none, and holds no arguments.
+        (
+            "pub fn f(r: u8) { if !(MutationRequest::is_valid(&r)) {} }",
+            BTreeMap::new(),
+        ),
+        (
+            "pub fn f(r: u8) { while !(ActionTarget::ok(&r)) {} }",
+            BTreeMap::new(),
+        ),
     ] {
         assert_eq!(found(lib), expected, "{lib}");
     }

@@ -842,6 +842,8 @@ fn an_item_position_macro_of_another_crate_that_the_scan_accepts_is_read() {
         "use wasmtime::component::bindgen;\nbindgen!({ path: \"x.wit\" });",
         "use schemars::json_schema;\nmacro_rules! schema { () => { json_schema!({}) }; }",
         "macro_rules! schema { () => { schemars::json_schema!({}) }; }",
+        // A negation in a transcriber is no call of a macro named `if`.
+        "macro_rules! check { ($x:expr) => { fn f() { if !($x) { return; } } }; }",
     ] {
         assert_eq!(
             read_names(&format!("{call}\n"), &[]),
@@ -877,8 +879,27 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
         let start = lib[..end]
             .rfind(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | ':' | '$')))
             .map_or(0, |at| at + 1);
+        // A bare call that the file imports from a path nothing accepts says that path.
+        let imported = [
+            (
+                "use foreign::json_schema;\njson_schema!({});",
+                "foreign::json_schema",
+            ),
+            (
+                "use schemars::json_schema;\nmod m { use foreign::json_schema; }\njson_schema!({});\n",
+                "foreign::json_schema",
+            ),
+            (
+                "use my::thread_local;\nthread_local! { static X: u8 = 0; }",
+                "my::thread_local",
+            ),
+        ];
+        let from = imported
+            .iter()
+            .find(|(text, _)| *text == lib)
+            .map_or_else(String::new, |(_, path)| format!(", imported from {path},"));
         format!(
-            "crates/kr-sender/src/lib.rs: {}! is called at {position} and is not written as one of the macros the scan accepts",
+            "crates/kr-sender/src/lib.rs: {}! is called at {position}{from} and is not written as one of the macros the scan accepts",
             &lib[start..end]
         )
     };
@@ -922,6 +943,13 @@ fn an_item_position_macro_of_another_crate_that_nothing_accepts_is_refused() {
         (
             "kr_worker::debug_fields!(E { a });",
             "debug_fields",
+            "item position",
+        ),
+        // A bare call of an accepted name that the file imports from another path is refused by that
+        // path.
+        (
+            "use my::thread_local;\nthread_local! { static X: u8 = 0; }",
+            "thread_local",
             "item position",
         ),
         // A name that a file imports from two providers is read as each of them.
@@ -1204,11 +1232,21 @@ fn a_rename_of_the_name_of_a_macro_that_a_crate_in_scope_defines_is_refused() {
     // A name that is no rename of the other crate's macro is not that macro.
     let lib = "use kr_worker::other as renamed;\nfn f() { renamed!(Method::AgentTurnCancel); }\n";
     assert_eq!(across(lib, "shared"), Ok(1));
+    // The same renames written in the tokens of a macro: the pair is kept for the same check.
+    let lib = "macro_rules! imports { () => { use kr_worker::shared as renamed; }; }\nimports!();\nfn f() { let _ = renamed!(MutationRequest); }\n";
+    assert_eq!(across(lib, "shared"), renamed("shared", "renamed"));
+    let lib = "macro_rules! imports { () => { use kr_worker::other as shared; }; }\nimports!();\nfn f() { shared!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "shared"), renamed("other", "shared"));
+    let lib =
+        "macro_rules! imports { ($p:path) => { use $p as shared; }; }\nfn f() { let _ = 1; }\n";
+    assert_eq!(across(lib, "shared"), renamed("$p", "shared"));
+    let lib = "macro_rules! imports { () => { use kr_worker::other as renamed; }; }\nimports!();\nfn f() { renamed!(Method::AgentTurnCancel); }\n";
+    assert_eq!(across(lib, "shared"), Ok(1));
     // In a transcriber, the renamed name is a macro of another crate that nothing accepts.
     let lib = "use kr_worker::shared as renamed;\nmacro_rules! fwd { ($x:expr) => { renamed!($x) }; }\nfn f() { fwd!(Method::AgentTurnCancel); }\n";
     assert_eq!(
         across(lib, "shared"),
-        Err("crates/kr-sender/src/lib.rs: renamed! is called at a transcriber and is not written as one of the macros the scan accepts".to_owned())
+        Err("crates/kr-sender/src/lib.rs: renamed! is called at a transcriber, imported from kr_worker::shared, and is not written as one of the macros the scan accepts".to_owned())
     );
 }
 
@@ -1643,6 +1681,37 @@ fn a_place_no_configuration_without_test_builds_is_not_read_by_the_inventory_at_
 }
 
 #[test]
+fn a_raw_name_is_one_name_in_the_index_and_the_scan_and_a_raw_macro_rules_is_a_definition() {
+    // The scan names a sighting without the `r#`, so the index must hold the item by that name; the
+    // text and the digest keep the tokens as written.
+    let lib = "#[cfg_attr(feature = \"agent.turn.cancel\", allow(dead_code))]\nmod r#m {}\nfn r#f() { let _ = Method::AgentTurnCancel; }\n";
+    let folder = small_tree(lib);
+    let tree = tree_at(folder.path()).expect("the tree");
+    let mut found = sender_names(&tree).expect("the sightings");
+    found.sort();
+    assert_eq!(found, ["f", "m"]);
+    for name in ["m", "f"] {
+        let source = tree
+            .source("kr_sender", name)
+            .expect("a lookup")
+            .unwrap_or_else(|| panic!("{name} has no source"));
+        assert!(
+            source.text.contains(&format!("r#{name}")),
+            "{name}: {}",
+            source.text
+        );
+        assert_eq!(source.files, vec!["crates/kr-sender/src/lib.rs".to_owned()]);
+    }
+    // `r#macro_rules! name` defines a macro as `macro_rules! name` does: the index holds it as the
+    // macro `name` (a sighting of that name), and not as the call of a macro.
+    let lib = "r#macro_rules! helper { () => { Method::AgentTurnCancel }; }\nfn user() { let _ = helper!(); }\n";
+    let folder = small_tree(lib);
+    let tree = tree_at(folder.path()).expect("the tree");
+    let found = sender_names(&tree).expect("the sightings");
+    assert!(found.contains(&"macro:helper".to_owned()), "{found:?}");
+}
+
+#[test]
 fn a_definition_named_action_right_is_refused_in_a_crate_the_scan_reads_where_a_build_without_test_has_it()
  {
     let at = "crates/kr-sender/src/lib.rs";
@@ -1660,6 +1729,43 @@ fn a_definition_named_action_right_is_refused_in_a_crate_the_scan_reads_where_a_
         ("union ActionRight { a: u8 }", "union"),
         ("trait ActionRight {}", "trait"),
         ("type r#ActionRight = u8;", "type alias"),
+        // The same definitions written in the tokens of a macro, a definition or a call.
+        (
+            "macro_rules! disguise { () => { type ActionRight = kr_protocol::method::Method; }; }",
+            "type alias",
+        ),
+        (
+            "macro_rules! disguise { () => { mod ActionRight { pub use kr_protocol::method::Method::*; } }; }",
+            "module",
+        ),
+        (
+            "macro_rules! disguise { () => { enum ActionRight { A } }; }",
+            "enum",
+        ),
+        (
+            "macro_rules! disguise { () => { struct ActionRight; }; }",
+            "struct",
+        ),
+        (
+            "macro_rules! disguise { () => { union ActionRight { a: u8 } }; }",
+            "union",
+        ),
+        (
+            "macro_rules! disguise { () => { trait ActionRight {} }; }",
+            "trait",
+        ),
+        (
+            "macro_rules! disguise { () => { type r#ActionRight = u8; }; }",
+            "type alias",
+        ),
+        (
+            "macro_rules! mine { ($($t:tt)*) => { $($t)* }; }\nmine! { struct ActionRight; }",
+            "struct",
+        ),
+        (
+            "macro_rules! mine { ($($t:tt)*) => { $($t)* }; }\nmine! { mod ActionRight; }",
+            "module",
+        ),
     ] {
         assert_eq!(
             read_names(&format!("{lib}\n"), &[]),
@@ -1675,6 +1781,9 @@ fn a_definition_named_action_right_is_refused_in_a_crate_the_scan_reads_where_a_
         "fn f() { let _ = ActionRight::AgentTurnCancel; }",
         "enum Other { ActionRight }",
         "struct S { ActionRight: u8 }",
+        "macro_rules! n { () => { let _ = ActionRight::AgentTurnCancel; }; }",
+        "macro_rules! n { () => { enum Other { ActionRight } }; }",
+        "macro_rules! n { () => { use kr_protocol::rights::ActionRight; }; }",
     ] {
         assert!(read_names(&format!("{lib}\n"), &[]).is_ok(), "{lib}");
     }
@@ -1736,6 +1845,36 @@ fn a_rename_or_an_alias_written_in_the_tokens_of_a_macro_is_refused_and_a_cast_i
             "m! { fn f() { type R = MutationRequest; } }",
             aliased("MutationRequest", "R"),
         ),
+        // A metavariable stands for a name, `$crate` is a path segment, and generic parameters may
+        // follow the alias.
+        (
+            "m! { use kr_protocol::envelope::MutationRequest as $name; }",
+            renamed("MutationRequest", "$name"),
+        ),
+        (
+            "m! { use $path as MutationRequest; }",
+            renamed("$path", "MutationRequest"),
+        ),
+        (
+            "m! { use kr_protocol::Method::{self as M}; }",
+            renamed("Method", "M"),
+        ),
+        (
+            "m! { extern crate kr_protocol as Method; }",
+            renamed("kr_protocol", "Method"),
+        ),
+        (
+            "m! { type $name = MutationRequest; }",
+            aliased("MutationRequest", "$name"),
+        ),
+        (
+            "m! { type R = $crate::envelope::MutationRequest; }",
+            aliased("MutationRequest", "R"),
+        ),
+        (
+            "m! { type R<T> = kr_protocol::ActionTarget; }",
+            aliased("ActionTarget", "R"),
+        ),
     ] {
         let lib = if lib.starts_with("macro_rules!") {
             format!("{lib}\n")
@@ -1758,6 +1897,14 @@ fn a_rename_or_an_alias_written_in_the_tokens_of_a_macro_is_refused_and_a_cast_i
         "m! { type R = &ActionTarget; }",
         "m! { type R = Other; }",
         "macro_rules! n { ($a:ident as $b:ident) => {}; }",
+        // `as` outside a `use` or an `extern crate` is a cast or a qualified path, never a rename.
+        "m! { let _ = <MutationRequest as Trait>::f(); }",
+        "m! { let _ = <kr_protocol::ActionTarget as Default>::default(); }",
+        "m! { let _ = Method::AgentTurnCancel as Wire; }",
+        "m! { use kr_protocol::other as $name; }",
+        "m! { type $name = Other; }",
+        "m! { use kr_protocol::other::{self as o}; }",
+        "m! { use kr_protocol::other as o; let _ = Method::AgentTurnCancel as Wire; }",
     ] {
         let lib = if lib.starts_with("macro_rules!") {
             format!("{lib}\n")

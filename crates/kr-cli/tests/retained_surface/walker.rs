@@ -765,11 +765,11 @@ impl CrateIndex {
                         krate,
                         workspace,
                         Kind::Named,
-                        vec![module.ident.to_string()],
+                        vec![module.ident.unraw().to_string()],
                     );
                     if let Some((_, inner)) = &module.content {
                         self.files_of_module
-                            .entry(module.ident.to_string())
+                            .entry(module.ident.unraw().to_string())
                             .or_default()
                             .insert(file.to_owned());
                         self.add_items(inner, file, krate, workspace, imports)?;
@@ -779,16 +779,16 @@ impl CrateIndex {
                 _ => {}
             }
             let (kind, names) = match item {
-                syn::Item::Fn(item) => (Kind::Named, vec![item.sig.ident.to_string()]),
-                syn::Item::Struct(item) => (Kind::Named, vec![item.ident.to_string()]),
-                syn::Item::Enum(item) => (Kind::Named, vec![item.ident.to_string()]),
-                syn::Item::Union(item) => (Kind::Named, vec![item.ident.to_string()]),
-                syn::Item::Trait(item) => (Kind::Named, vec![item.ident.to_string()]),
-                syn::Item::Type(item) => (Kind::Named, vec![item.ident.to_string()]),
-                syn::Item::Const(item) => (Kind::Named, vec![item.ident.to_string()]),
-                syn::Item::Static(item) => (Kind::Named, vec![item.ident.to_string()]),
+                syn::Item::Fn(item) => (Kind::Named, vec![item.sig.ident.unraw().to_string()]),
+                syn::Item::Struct(item) => (Kind::Named, vec![item.ident.unraw().to_string()]),
+                syn::Item::Enum(item) => (Kind::Named, vec![item.ident.unraw().to_string()]),
+                syn::Item::Union(item) => (Kind::Named, vec![item.ident.unraw().to_string()]),
+                syn::Item::Trait(item) => (Kind::Named, vec![item.ident.unraw().to_string()]),
+                syn::Item::Type(item) => (Kind::Named, vec![item.ident.unraw().to_string()]),
+                syn::Item::Const(item) => (Kind::Named, vec![item.ident.unraw().to_string()]),
+                syn::Item::Static(item) => (Kind::Named, vec![item.ident.unraw().to_string()]),
                 syn::Item::Macro(item) => match &item.ident {
-                    Some(name) if item.mac.path.is_ident("macro_rules") => {
+                    Some(name) if is_macro_rules(&item.mac.path) => {
                         (Kind::MacroRules, vec![name.unraw().to_string()])
                     }
                     _ => (
@@ -848,12 +848,12 @@ impl CrateIndex {
         collector.visit_impl_item_fn(method);
         let at = self.items.len();
         self.methods
-            .entry(method.sig.ident.to_string())
+            .entry(method.sig.ident.unraw().to_string())
             .or_default()
             .push(at);
         self.items.push(Item {
             file: file.to_owned(),
-            label: format!("{owner}::{}", method.sig.ident),
+            label: format!("{owner}::{}", method.sig.ident.unraw()),
             kind: Kind::Method,
             text: without_docs(method.to_token_stream()).to_string(),
             refs: collector.refs,
@@ -2012,7 +2012,7 @@ impl Scanner {
                                     strip.visit_impl_item_fn_mut(node);
                                 })?;
                                 self.body(
-                                    format!("{owner}::{}", method.sig.ident),
+                                    format!("{owner}::{}", method.sig.ident.unraw()),
                                     without_docs(kept.to_token_stream()),
                                 );
                             }
@@ -2035,7 +2035,7 @@ impl Scanner {
                 }
                 syn::Item::Trait(definition) => {
                     // `Strip` takes the members that no configuration builds out of the trait.
-                    self.body(definition.ident.to_string(), text()?);
+                    self.body(definition.ident.unraw().to_string(), text()?);
                 }
                 syn::Item::Macro(call) => {
                     let kinds = kinds_of(&plain());
@@ -2078,25 +2078,25 @@ impl Scanner {
                     }
                 }
                 syn::Item::Fn(definition) => {
-                    self.body(definition.sig.ident.to_string(), text()?);
+                    self.body(definition.sig.ident.unraw().to_string(), text()?);
                 }
                 syn::Item::Struct(definition) => {
-                    self.body(definition.ident.to_string(), text()?);
+                    self.body(definition.ident.unraw().to_string(), text()?);
                 }
                 syn::Item::Enum(definition) => {
-                    self.body(definition.ident.to_string(), text()?);
+                    self.body(definition.ident.unraw().to_string(), text()?);
                 }
                 syn::Item::Union(definition) => {
-                    self.body(definition.ident.to_string(), text()?);
+                    self.body(definition.ident.unraw().to_string(), text()?);
                 }
                 syn::Item::Type(definition) => {
-                    self.body(definition.ident.to_string(), text()?);
+                    self.body(definition.ident.unraw().to_string(), text()?);
                 }
                 syn::Item::Const(definition) => {
-                    self.body(definition.ident.to_string(), text()?);
+                    self.body(definition.ident.unraw().to_string(), text()?);
                 }
                 syn::Item::Static(definition) => {
-                    self.body(definition.ident.to_string(), text()?);
+                    self.body(definition.ident.unraw().to_string(), text()?);
                 }
                 // Items with no name of their own: the file names the sighting, as for a `use`.
                 syn::Item::ForeignMod(_) | syn::Item::TraitAlias(_) | syn::Item::Verbatim(_) => {
@@ -2214,6 +2214,16 @@ pub(super) fn is_macro_rules(path: &syn::Path) -> bool {
     path.segments.len() == 1 && path.segments[0].ident.unraw() == "macro_rules"
 }
 
+/// The words that stand before a `!` and are no macro name: `if !(..)` negates what follows.
+const NOT_MACROS: [&str; 9] = [
+    "if", "while", "match", "return", "break", "in", "else", "yield", "let",
+];
+
+/// Whether `word`, before a `!` and a group, names a macro and is no keyword that negates.
+pub(super) fn names_a_macro(word: &proc_macro2::Ident) -> bool {
+    !NOT_MACROS.contains(&word.to_string().as_str())
+}
+
 /// The path that the macro name at `flat[at]` is written with: the segments before it that `::`
 /// joins to it, `$crate` as one segment.
 pub(super) fn path_before(flat: &[TokenTree], at: usize) -> Vec<String> {
@@ -2271,7 +2281,8 @@ fn calls_in(stream: &TokenStream, calls: &mut Calls, owner: Option<SightKind>) {
             }
             TokenTree::Group(group) => calls_in(&group.stream(), calls, owner),
             TokenTree::Ident(ident)
-                if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
+                if names_a_macro(ident)
+                    && matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
                     && matches!(flat.get(at + 2), Some(TokenTree::Group(_))) =>
             {
                 let name = ident.unraw().to_string();
@@ -2356,7 +2367,7 @@ fn collect_kinds(
                 // The group after `name !` holds a macro call's arguments.
                 let call = at >= 2
                     && is_bang(flat.get(at - 1))
-                    && matches!(flat.get(at - 2), Some(TokenTree::Ident(_)));
+                    && matches!(flat.get(at - 2), Some(TokenTree::Ident(name)) if names_a_macro(name));
                 collect_kinds(&group.stream(), kinds, owner, arguments || call);
             }
             TokenTree::Literal(literal) => {
