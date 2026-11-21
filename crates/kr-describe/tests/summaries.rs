@@ -585,6 +585,11 @@ fn a_summary_is_judged_against_what_is_in_force_when_it_arrives() {
             session_id: session(1)
         })
     );
+    assert_eq!(
+        service.standing(&session(1), at(100)).queued_age_ms,
+        None,
+        "a summary put back holds no description's place"
+    );
     let Instruction::Generate { request, .. } = loaded(&mut service, at(100 + RESTART_FIRST_MS))
     else {
         panic!("the summary is sent again");
