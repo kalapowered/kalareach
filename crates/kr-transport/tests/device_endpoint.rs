@@ -41,11 +41,11 @@ const REPORT_PATIENCE: Duration = Duration::from_secs(120);
 /// How often a case looks at a count that no future announces.
 const LOOK: Duration = Duration::from_millis(50);
 
-/// How long after it starts a lookup of a host can still ask its last question. The library asks a
-/// name again at 0.2, 0.3, 0.6, 1, 2 and 3 seconds after the lookup starts, each moved by up to a
-/// fifth either way, so the last is at most 3.6 seconds in; the rest is room for a loaded machine.
-/// A lookup that a dial starts goes on in the background after the dial has returned.
-const LAST_QUESTION_OF_A_LOOKUP: Duration = Duration::from_secs(5);
+/// How many questions one lookup of a host asks of the name server, which answers every name as
+/// missing: the library asks a name when the lookup starts and again at 0.2, 0.3, 0.6, 1, 2 and 3
+/// seconds after it. A lookup that a dial starts goes on in the background after the dial has
+/// returned, so a case that counts questions waits for this many from each lookup.
+const QUESTIONS_OF_A_LOOKUP: usize = 7;
 
 fn loopback() -> Option<std::net::SocketAddr> {
     Some("127.0.0.1:0".parse().expect("a loopback address"))
@@ -658,8 +658,15 @@ async fn forgetting_a_host_removes_its_lookups_and_the_relays_no_other_host_name
     .expect("the device's endpoint");
     device.introduce(paired(&view_a, &a)).await.expect("host A");
     device.introduce(paired(&view_b, &b)).await.expect("host B");
-    let dialed = tokio::time::Instant::now();
+    let asked_about_b = |names: &NameServer| {
+        names
+            .asked()
+            .iter()
+            .filter(|question| question.name.contains(&b.id().to_z32()))
+            .count()
+    };
     let to_a = dial(&device, &view_a, &a).await;
+    let before_the_dial_of_b = asked_about_b(&names);
     let to_b = dial(&device, &view_b, &b).await;
     assert_eq!(answered(&to_a).await, "A");
     assert_eq!(answered(&to_b).await, "B");
@@ -668,20 +675,22 @@ async fn forgetting_a_host_removes_its_lookups_and_the_relays_no_other_host_name
         BTreeSet::from([r1.url.clone(), r2.url.clone()])
     );
 
-    // The control: while B is known, its lookups are asked about it.
+    // The dial of B started a lookup of its own, which goes on asking after the dial has returned.
+    // The control below starts a second lookup, so a count taken after it is the count of two
+    // lookups that have both asked their last question only if the dial's has asked all of its
+    // before the control starts.
+    until("the questions of the dial of B's lookup", || {
+        asked_about_b(&names) - before_the_dial_of_b >= QUESTIONS_OF_A_LOOKUP
+    })
+    .await;
+    // The control: while B is known, its lookups are asked about it. It ends with its last
+    // question asked.
     registry_yields(&device, b.id()).await;
-    // The dial of B started a lookup of its own, which is still asking: a count taken before it has
-    // asked its last question would show forgetting B as asking one more.
-    tokio::time::sleep_until(dialed + LAST_QUESTION_OF_A_LOOKUP).await;
-    let asked_about_b = |names: &NameServer| {
-        names
-            .asked()
-            .iter()
-            .filter(|question| question.name.contains(&b.id().to_z32()))
-            .count()
-    };
     let (questions, requests) = (asked_about_b(&names), p_b.lookups(&b.id()));
-    assert!(questions >= 1 && requests >= 1);
+    assert!(
+        questions >= before_the_dial_of_b + 2 * QUESTIONS_OF_A_LOOKUP && requests >= 1,
+        "the dial's lookup and the control's asked all their questions: {questions}"
+    );
 
     device.forget(&b.key()).await.expect("forgetting B");
     assert_eq!(device.relay_urls(), BTreeSet::from([r1.url.clone()]));
