@@ -672,8 +672,9 @@ fn a_call_that_ignores_the_termination_signal_is_killed_inside_the_deadline() {
 #[test]
 fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
     // A deadline under 10 s can run out between two calls, so such a run may end without
-    // installing; the bounds it did make are held to the time left either way. At 2 s the first
-    // call itself can find less than 2 s left.
+    // installing; the bounds it did make are held to the time left either way. A deadline can
+    // also run out before the first call, when the machine is slow to start the script: at 2 s
+    // the first call itself can find less than 2 s left.
     for deadline in [2_u32, 3, 4, 5, 6, 7, 8, 9] {
         let rig = Rig::new();
         let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
@@ -683,8 +684,17 @@ fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
             outcome.stdout,
             outcome.stderr
         );
-        if deadline > 2 {
-            assert!(!rig.bounds().is_empty(), "{deadline}: no call was bounded");
+        // A run that made no call is one whose deadline ran out before its first: the script
+        // stops when under 2 s are left, and it counts whole seconds, so it has then run for more
+        // than the deadline less 2 s, however slow the machine is. A stop sooner than that is a
+        // script that did not use its time. That a call is made is held by the deadlines from
+        // 10 s, below.
+        if rig.bounds().is_empty() {
+            assert!(
+                outcome.elapsed.as_secs_f64() > f64::from(deadline) - 2.0,
+                "{deadline}: the script stopped after {:?} with no call bounded",
+                outcome.elapsed
+            );
         }
         for (grace, seconds) in rig.bounds() {
             assert!(
