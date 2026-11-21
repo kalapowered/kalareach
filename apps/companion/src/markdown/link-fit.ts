@@ -10,22 +10,21 @@
  * button has no hit of its own, so a tap beside the words is on the text there and `useLinkPress` says
  * which link's it is.
  *
- * Where the room lies:
+ * The room is one packing of each line's links (`packRooms`). The boxes of a line are intervals that
+ * hold their links' words, stay in the message's column (or in the box that clips the link, where one
+ * does: a scroller inside a message keeps the box in its own scrolled content), and keep off one another
+ * and off the controls beside them. A link that lacks room takes it from the gaps beside it, and the
+ * packing completes as many of a line's short links as any assignment of such boxes can: a link is left
+ * under the least size only where no assignment gives it the least size together with the other links
+ * that the packing completes (the proof is a case that compares the packing with an exhaustive search
+ * over many small random lines). A link that is completed has the room it lacks, centred on its words
+ * where the neighbours allow it; a link that cannot be completed has all the room that is left, shared in
+ * halves with a short neighbour that cannot be completed either.
  *
- * - The box stays in the message's column, so that it never makes the pane scroll sideways, and inside
- *   the box that clips the link where one does (a scroller inside a message keeps the box in its own
- *   scrolled content).
- * - The box does not reach another link's or control's box beside it on the same line or on a line whose
- *   box reaches this one's (the boxes are as high as the least size, so the line above and below count).
- *   A gap between two links that both take room is shared in halves; a gap to a control, or to a link
- *   that is wide enough, is the narrow link's to its edge. A link that the halves leave under the least
- *   size is measured again, with each neighbour that the halves brought to the least size as the box it
- *   is, so that a neighbour that needed less than its half leaves the rest of the gap.
- * - Where the column cuts one side of the room, the other side grows by what was cut (the rule of
- *   `link-target.ts`'s `fit`), so a link at the end of a line is as wide as the least size when the
- *   column has room for it on the other side. Where both sides together lack room (two short links with
- *   a space between them), the box is the room there is: the link is narrower than the least size, and
- *   that is as far as the page can go without a box over another control.
+ * Links on neighbouring lines whose boxes reach each other's height are kept off one another by the
+ * middle of the gap between their words (and off a link that is wide enough or a control by its edge):
+ * that part is not packed, so a short link beside another line's short link can stay under the least
+ * size where a packing of both lines together would give it the least size.
  *
  * Which link opens is not decided here. The padding is measured from the words' own box, which the
  * padding does not move, so a measure of a measured link gives the same answer and a change that adds
@@ -35,7 +34,7 @@
 import { useEffect, type RefObject } from 'react'
 
 import { OTHER_CONTROLS } from './link-press'
-import { fit, type Rect } from './link-target'
+import { type Rect } from './link-target'
 
 /** The room given to a link on each side of its words, in px, by the page's own left and right (the writing's direction does not matter). */
 export interface Beside {
@@ -43,10 +42,11 @@ export interface Beside {
   readonly right: number
 }
 
-/** A box that lies beside a link, and whether it is a link that takes room beside its own words. */
-export interface Neighbour {
+/** A link or a control: its box (the words' box across, the stylesheet's box down) and, for a link, the column its box has to keep within. */
+export interface Item {
   readonly box: Rect
-  readonly shares: boolean
+  readonly link: boolean
+  readonly column: Column
 }
 
 /** What a box has to keep within: the part of the page's width that its words may be padded over. */
@@ -70,33 +70,176 @@ const SLACK = 0.05
 
 const NONE: Beside = { left: 0, right: 0 }
 
+/** The same line: boxes that are as high as one another, which is how an engine lays out the buttons of a line of text. */
+const sameLine = (a: Rect, b: Rect): boolean => Math.abs(a.top - b.top) <= 1 && Math.abs(a.bottom - b.bottom) <= 1
+
+/** What the packing of one line knows of a link: its words, what it lacks, and the room its walls leave on each side. */
+interface Slot {
+  readonly at: number
+  readonly left: number
+  readonly right: number
+  readonly lack: number
+  readonly leftRoom: number
+  readonly rightRoom: number
+}
+
 /**
- * The room to give a link whose box (as the words have it across and the stylesheet has it down) is `box`.
- * `neighbours` are the other links and controls near it; only those whose box reaches `box`'s height can
- * lie beside it.
+ * The room of each of `items`, in order: none for a control and for a link that is as wide as `least`.
+ * `slack` is what is added to the room a link lacks on each side (see `SLACK`).
  */
-export function besideOf(box: Rect, least: number, neighbours: readonly Neighbour[], column: Column): Beside {
-  const width = box.right - box.left
-  if (width >= least) return NONE
-  // The room is the column, held in from each side by the nearest box beside the link: a link whose box
-  // already overlaps another's across has no side to keep from it, and a box that lies on the same side
-  // (or is only in the way of a part of it) keeps the nearest edge.
-  let min = Math.min(column.left, box.left)
-  let max = Math.max(column.right, box.right)
-  for (const other of neighbours) {
-    if (other.box.bottom <= box.top || other.box.top >= box.bottom) continue
-    if (other.box.right <= box.left) min = Math.max(min, other.shares ? (other.box.right + box.left) / 2 : other.box.right)
-    else if (other.box.left >= box.right) max = Math.min(max, other.shares ? (box.right + other.box.left) / 2 : other.box.left)
+export function packRooms(items: readonly Item[], least: number, slack: number = SLACK): Beside[] {
+  const rooms: Beside[] = items.map(() => NONE)
+  const width = (item: Item): number => item.box.right - item.box.left
+  const short = (item: Item): boolean => item.link && width(item) > 0 && width(item) < least
+  // The walls of each short link: its column, and every box on a line that reaches its height that does not lie on its own line.
+  const walls = new Map<number, { left: number; right: number }>()
+  items.forEach((item, at) => {
+    if (!short(item)) return
+    let left = Math.min(item.column.left, item.box.left)
+    let right = Math.max(item.column.right, item.box.right)
+    items.forEach((other, index) => {
+      if (index === at || width(other) <= 0) return
+      if (other.box.bottom <= item.box.top || other.box.top >= item.box.bottom) return
+      if (other.link && sameLine(other.box, item.box)) return
+      const middle = other.link && short(other)
+      if (other.box.right <= item.box.left) left = Math.max(left, middle ? (other.box.right + item.box.left) / 2 : other.box.right)
+      else if (other.box.left >= item.box.right) right = Math.min(right, middle ? (item.box.right + other.box.left) / 2 : other.box.left)
+    })
+    walls.set(at, { left, right })
+  })
+  // The lines that hold a short link, each of them packed alone.
+  const lines: number[][] = []
+  const placed = new Set<number>()
+  for (const at of walls.keys()) {
+    if (placed.has(at)) continue
+    const line = items.flatMap((other, index) => (other.link && width(other) > 0 && sameLine(other.box, (items[at]).box) ? [index] : []))
+    line.sort((a, b) => (items[a]).box.left - (items[b]).box.left)
+    for (const index of line) placed.add(index)
+    lines.push(line)
   }
-  const grow = (least - width) / 2 + SLACK
-  const [from, to] = fit(box.left - grow, box.right + grow, min, max)
-  return { left: held(box.left - from), right: held(to - box.right) }
+  for (const line of lines) {
+    const slots: Slot[] = line.map((index) => {
+      const item = items[index]
+      const wall = walls.get(index)
+      return {
+        at: index,
+        left: item.box.left,
+        right: item.box.right,
+        lack: short(item) ? least - width(item) + 2 * slack : 0,
+        leftRoom: wall === undefined ? 0 : Math.max(0, item.box.left - wall.left),
+        rightRoom: wall === undefined ? 0 : Math.max(0, wall.right - item.box.right)
+      }
+    })
+    const given = packLine(slots)
+    slots.forEach((slot, index) => {
+      const own = given[index] ?? NONE
+      rooms[slot.at] = { left: held(own.left), right: held(own.right) }
+    })
+  }
+  return rooms
+}
+
+const EPSILON = 1e-9
+
+/**
+ * Packs one line's links, left to right: which of the short links can all have the room they lack (the most that
+ * any assignment allows), and how much of it each takes from each side. Two neighbours share the gap between
+ * their words, and a link's room on a side is no more than its wall leaves.
+ */
+function packLine(slots: readonly Slot[]): Beside[] {
+  const count = slots.length
+  const gap = (k: number): number => Math.max(0, (slots[k + 1]).left - (slots[k]).right)
+  interface State {
+    readonly right: number
+    readonly took: boolean
+  }
+  // table[k][c]: after the first k + 1 links, with c of them completed, the least that the last one takes from the gap on its right.
+  const table: (State | undefined)[][] = []
+  let before: (State | undefined)[] = [{ right: 0, took: false }]
+  for (let k = 0; k < count; k += 1) {
+    const slot = slots[k]
+    const now: (State | undefined)[] = []
+    const offer = (completed: number, state: State): void => {
+      const own = now[completed]
+      if (own === undefined || state.right < own.right - EPSILON || (state.right <= own.right + EPSILON && state.took)) now[completed] = state
+    }
+    before.forEach((state, completed) => {
+      if (state === undefined) return
+      offer(completed, { right: 0, took: false })
+      if (slot.lack <= 0) return
+      const free = k > 0 ? Math.min(slot.leftRoom, gap(k - 1) - state.right) : slot.leftRoom
+      const left = Math.min(slot.lack, Math.max(0, free))
+      const right = slot.lack - left
+      if (right <= Math.min(slot.rightRoom, k < count - 1 ? gap(k) : Infinity) + EPSILON) offer(completed + 1, { right, took: true })
+    })
+    table.push(now)
+    before = now
+  }
+  const done: boolean[] = new Array<boolean>(count).fill(false)
+  let completed = (table[count - 1] ?? []).length - 1
+  for (let k = count - 1; k >= 0; k -= 1) {
+    const state = table[k]?.[completed]
+    if (state?.took === true) {
+      done[k] = true
+      completed -= 1
+    }
+  }
+  // What each completed link has to take from the gap on its left, at the least, for the links after it to be completed.
+  const needs: number[] = new Array<number>(count + 1).fill(0)
+  for (let k = count - 1; k >= 0; k -= 1) {
+    const slot = slots[k]
+    if (!done[k]) continue
+    const room = Math.min(slot.rightRoom, k < count - 1 ? gap(k) - (needs[k + 1] ?? 0) : Infinity)
+    needs[k] = Math.max(0, slot.lack - room)
+  }
+  // The completed links, from the left: each takes the half of what it lacks from each side that the others leave it.
+  const given: { left: number; right: number }[] = slots.map(() => ({ left: 0, right: 0 }))
+  let taken = 0
+  for (let k = 0; k < count; k += 1) {
+    const slot = slots[k]
+    const own = given[k]
+    if (!done[k]) {
+      taken = 0
+      continue
+    }
+    const free = Math.min(slot.leftRoom, slot.lack, k > 0 ? gap(k - 1) - taken : Infinity)
+    own.left = Math.min(Math.max(slot.lack / 2, needs[k] ?? 0), Math.max(0, free))
+    own.right = slot.lack - own.left
+    taken = own.right
+  }
+  // The links that cannot be completed have all the room that is left: a gap between two of them is shared in halves.
+  const rest = (k: number): number => gap(k) - (done[k] ? (given[k] as { right: number }).right : 0) - (done[k + 1] ? (given[k + 1] as { left: number }).left : 0)
+  const open = (k: number): boolean => (slots[k]).lack > 0 && !done[k]
+  for (let k = 0; k < count; k += 1) {
+    if (!open(k)) continue
+    const slot = slots[k]
+    const own = given[k]
+    if (k === 0) own.left = slot.leftRoom
+    else if (!open(k - 1)) own.left = Math.min(slot.leftRoom, Math.max(0, rest(k - 1)))
+    if (k === count - 1) own.right = slot.rightRoom
+    else if (!open(k + 1)) own.right = Math.min(slot.rightRoom, Math.max(0, rest(k)))
+  }
+  for (let k = 0; k + 1 < count; k += 1) {
+    if (!open(k) || !open(k + 1)) continue
+    const space = Math.max(0, rest(k))
+    const first = slots[k]
+    const second = slots[k + 1]
+    let right = Math.min(first.rightRoom, space / 2)
+    const left = Math.min(second.leftRoom, space - right)
+    right = Math.min(first.rightRoom, space - left)
+    ;(given[k] as { right: number }).right = right
+    ;(given[k + 1] as { left: number }).left = left
+  }
+  return given
 }
 
 /** `value` rounded down to the engine's grid, and never below nothing. */
 function held(value: number): number {
   return Math.floor(Math.max(0, value) * GRID) / GRID
 }
+
+/** A link's `style` attribute with the two properties of the room taken out, and the spaces. */
+const withoutRoom = (style: string | null): string => (style ?? '').replace(/--md-link-(?:left|right):[^;]*;?/g, '').replace(/\s+/g, '')
 
 /** What the page has given a link, read from its element. */
 function givenTo(link: HTMLElement): Beside {
@@ -163,47 +306,20 @@ export function fitLinks(pane: HTMLElement, messages: readonly Element[]): void 
       boxes.push({ element, box: { ...placed, left: placed.left + given.left, right: placed.right - given.right }, link, message })
     }
   }
-  const neighbours: Neighbour[] = boxes
-    .filter(({ box }) => box.right > box.left)
-    .map(({ box, link }) => ({ box, shares: link && box.right - box.left < least }))
-  const widthOf = (box: Rect, room: Beside): number => box.right - box.left + room.left + room.right
-  // Pass 1: every link takes half of a gap to a short link beside it, as if that link needed all of its half.
-  const first = new Map<HTMLElement, Beside>()
-  for (const { element, box, link, message } of boxes) {
-    if (!link || !mine.has(message)) continue
-    const room =
-      box.right > box.left
-        ? besideOf(
-            box,
-            least,
-            neighbours.filter((other) => other.box !== box),
-            columnOf(element, message)
-          )
-        : NONE
-    first.set(element, room)
-  }
-  // Pass 2: a link that pass 1 left under the least size is measured again with each neighbour that pass 1 brought to the least size
-  // as the box it is, not as a short link that takes half of the gap: a neighbour that needed less than its half leaves the rest.
-  const rooms = new Map(first)
-  for (const { element, box, message } of boxes) {
-    const room = first.get(element)
-    if (room === undefined || box.right <= box.left || widthOf(box, room) >= least) continue
-    const fixed: Neighbour[] = boxes
-      .filter((other) => other.box !== box && other.box.right > other.box.left)
-      .map((other) => {
-        const taken = first.get(other.element)
-        if (other.link && taken !== undefined && widthOf(other.box, taken) >= least) {
-          return { box: { ...other.box, left: other.box.left - taken.left, right: other.box.right + taken.right }, shares: false }
-        }
-        return { box: other.box, shares: other.link && other.box.right - other.box.left < least }
-      })
-    rooms.set(element, besideOf(box, least, fixed, columnOf(element, message)))
-  }
+  // Only a link that lacks room needs its column.
+  const items: Item[] = boxes.map(({ element, box, link, message }) => ({
+    box,
+    link,
+    column: link && box.right > box.left && box.right - box.left < least ? columnOf(element, message) : { left: box.left, right: box.right }
+  }))
+  const rooms = packRooms(items, least)
   const writes: { link: HTMLElement; room: Beside }[] = []
-  for (const [element, room] of rooms) {
+  boxes.forEach(({ element, link, message }, index) => {
+    if (!link || !mine.has(message)) return
+    const room = rooms[index] ?? NONE
     const now = givenTo(element)
     if (Math.abs(room.left - now.left) > 1 / GRID || Math.abs(room.right - now.right) > 1 / GRID) writes.push({ link: element, room })
-  }
+  })
   for (const { link, room } of writes) {
     give(link, LEFT, room.left)
     give(link, RIGHT, room.right)
@@ -279,8 +395,13 @@ export function startLinkFit(pane: HTMLElement): () => void {
     let structure = false
     for (const record of records) {
       if (record.type === 'attributes') {
-        // The room that this hook writes is a style of the link itself, and is no change of the message's layout.
-        const own = record.attributeName === 'style' && record.target instanceof Element && record.target.classList.contains('md-link')
+        // The room that this hook writes is a style of the link itself, and is no change of the message's layout: a style
+        // that differs from what it was in more than the two properties of the room is.
+        const own =
+          record.attributeName === 'style' &&
+          record.target instanceof Element &&
+          record.target.classList.contains('md-link') &&
+          withoutRoom(record.oldValue) === withoutRoom(record.target.getAttribute('style'))
         if (!own) mark(record.target)
         continue
       }
@@ -295,7 +416,7 @@ export function startLinkFit(pane: HTMLElement): () => void {
   })
 
   resized?.observe(pane)
-  changed.observe(pane, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: LAYOUT_ATTRIBUTES })
+  changed.observe(pane, { childList: true, subtree: true, characterData: true, attributes: true, attributeOldValue: true, attributeFilter: LAYOUT_ATTRIBUTES })
   watch()
   markAll()
   const fonts = document.fonts as FontFaceSet | undefined

@@ -146,7 +146,7 @@ function fitted(rect: Rect, reach: Reach, bounds: Rect): Rect {
 }
 
 /** The span from `low` to `high` held to the span from `min` to `max`, a cut on one side given to the other. */
-export function fit(low: number, high: number, min: number, max: number): readonly [number, number] {
+function fit(low: number, high: number, min: number, max: number): readonly [number, number] {
   let from = low
   let to = high
   if (from < min) {

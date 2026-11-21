@@ -10,9 +10,21 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 
-import { besideOf, fitLinks, startLinkFit, type Neighbour } from '../src/markdown/link-fit'
+import { fitLinks, packRooms, startLinkFit, type Beside, type Column } from '../src/markdown/link-fit'
 
 const LEAST = 44
+
+/** A box that lies beside a link, and whether it is a link that takes room beside its own words (a control, or a link that is wide enough, does not). */
+interface Neighbour {
+  readonly box: { left: number; top: number; right: number; bottom: number }
+  readonly shares: boolean
+}
+
+/** The room of one link with the boxes of the links and controls near it, as the packing of its line gives it. */
+function besideOf(box: Neighbour['box'], least: number, neighbours: readonly Neighbour[], column: Column): Beside {
+  const rooms = packRooms([{ box, link: true, column }, ...neighbours.map((other) => ({ box: other.box, link: other.shares, column }))], least)
+  return rooms[0] ?? { left: 0, right: 0 }
+}
 /** A box of 44 px, high enough for the least size: a line with its box padded out above and below. */
 const row = (left: number, right: number, top = 100): { left: number; top: number; right: number; bottom: number } => ({ left, top, right, bottom: top + 44 })
 const column = { left: 0, right: 390 }
@@ -57,11 +69,19 @@ describe('the room beside a link', () => {
     expect(10 + room.left + room.right, 'the width of the box').toBeGreaterThanOrEqual(LEAST)
   })
 
-  it('shares a gap with a link that takes room beside its own words in halves', () => {
+  it('shares a gap with a link that takes room beside its own words in halves, where neither can have the least size', () => {
+    const other: Neighbour = { box: row(130, 140), shares: true }
+    // The column holds both within 5 px of their words: each lacks 34 px, and the 20 px between them are all there is.
+    const room = besideOf(row(100, 110), LEAST, [other], { left: 95, right: 145 })
+    expect(room.right, 'half of the 20 px between the words').toBe(10)
+    expect(room.left, 'all of the room that the column leaves').toBe(5)
+  })
+
+  it('gives each of two short links the least size where the gap between them holds both', () => {
     const other: Neighbour = { box: row(130, 140), shares: true }
     const room = besideOf(row(100, 110), LEAST, [other], column)
-    expect(room.right, 'half of the 20 px between the words').toBe(10)
     expect(10 + room.left + room.right, 'the width of the box').toBeGreaterThanOrEqual(LEAST)
+    expect(room.right, 'what the first takes of the gap, which leaves the second what it lacks of it').toBeLessThanOrEqual(20)
   })
 
   it('has no room on a side where another box touches the words, and is as wide as the room there is when both sides touch', () => {
@@ -206,10 +226,12 @@ describe('the room that the page gives the links of a message', () => {
     expect(writes(), 'the writes of the second read').toEqual([])
   })
 
-  it('shares the gap between two short links and keeps both boxes off each other', () => {
+  it('shares the gap between two short links that cannot both have the least size, and keeps both boxes off each other', () => {
+    // The first link is at the column's start and the second has a wide link on its other side: each lacks more than the 20 px gap holds.
     const { pane: root, messages } = pane(1, (message) => {
-      link(message, 100, 110)
-      link(message, 130, 140)
+      link(message, 0, 10)
+      link(message, 30, 40)
+      link(message, 40, 380)
     })
     fitLinks(root, messages)
     const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
@@ -239,17 +261,64 @@ describe('the room that the page gives the links of a message', () => {
     expect(writes(), 'the writes of a second read').toEqual([])
   })
 
-  it('keeps two short links that both need more than half of their gap at the middle of it, as the first pass has them', () => {
+  it('gives two short links the least size each where the gap between them holds both, and keeps their boxes apart', () => {
     const { pane: root, messages } = pane(1, (message) => {
       link(message, 100, 110)
       link(message, 130, 140)
-      link(message, 140, 380)
     })
     fitLinks(root, messages)
     const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
     if (!first || !second) throw new Error('the made page has no links')
+    expect(boxOf(first).right - boxOf(first).left, 'the first box').toBeGreaterThanOrEqual(LEAST)
+    expect(boxOf(second).right - boxOf(second).left, 'the second box').toBeGreaterThanOrEqual(LEAST)
     expect(boxOf(first).right, 'the end of the first box').toBeLessThanOrEqual(boxOf(second).left)
-    expect(given(first).right, 'half of the gap').toBe(10)
+  })
+
+  // The two lines that read 2 of the review of the first fix: a link that the first fix left under the least size where non-overlapping boxes give it.
+  it('completes a link that the room another one completed frees (the third link of a row of four)', () => {
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 100, 142)
+      link(message, 162, 172)
+      link(message, 212, 222)
+      link(message, 234, 380)
+    })
+    fitLinks(root, messages)
+    const boxes = Array.from(root.querySelectorAll<HTMLElement>('.md-link')).map(boxOf)
+    for (const box of boxes.slice(0, 3)) expect(box.right - box.left, 'the box of a link that a row of four allows the least size').toBeGreaterThanOrEqual(LEAST)
+    for (let at = 0; at + 1 < boxes.length; at += 1) expect((boxes[at] as { right: number }).right, `the end of box ${String(at)}`).toBeLessThanOrEqual((boxes[at + 1] as { left: number }).left)
+  })
+
+  it('moves a neighbour’s room to its far side where that frees the gap for the link beside a wide link', () => {
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 100, 199)
+      link(message, 199, 208)
+      link(message, 248, 257)
+    })
+    fitLinks(root, messages)
+    const [wide, first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    if (!wide || !first || !second) throw new Error('the made page has no links')
+    expect(given(wide)).toEqual({ left: 0, right: 0 })
+    expect(boxOf(first).right - boxOf(first).left, 'the first box').toBeGreaterThanOrEqual(LEAST)
+    expect(boxOf(second).right - boxOf(second).left, 'the second box').toBeGreaterThanOrEqual(LEAST)
+    expect(boxOf(first).right, 'the end of the first box').toBeLessThanOrEqual(boxOf(second).left)
+  })
+
+  it('gives two short links at the start of a line the least size at 44 and at 48, the first against the column', () => {
+    for (const least of [44, 48]) {
+      computed.set(document.body, {})
+      const { pane: root, messages } = pane(1, (message) => {
+        link(message, 0, 9)
+        link(message, 57.6, 66.6)
+      })
+      computed.set(root, { '--target': `${String(least)}px` })
+      fitLinks(root, messages)
+      const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+      if (!first || !second) throw new Error('the made page has no links')
+      expect(boxOf(first).right - boxOf(first).left, `the first box at ${String(least)}`).toBeGreaterThanOrEqual(least)
+      expect(boxOf(second).right - boxOf(second).left, `the second box at ${String(least)}`).toBeGreaterThanOrEqual(least)
+      expect(boxOf(first).right, `the end of the first box at ${String(least)}`).toBeLessThanOrEqual(boxOf(second).left)
+      document.body.replaceChildren()
+    }
   })
 
   it('keeps a link’s box off a control beside it', () => {
@@ -431,24 +500,33 @@ describe('the page’s keeping of the room', () => {
   })
 
   it('measures a message again when an attribute moves its words with no change of size or text, and not for its own padding', async () => {
+    // The first link is at the column's start and the second has a wide link on its other side: neither has the least size, and the first shares the gap.
     const { pane: root, messages } = pane(1, (message) => {
-      link(message, 100, 110)
-      link(message, 130, 140)
+      link(message, 0, 10)
+      link(message, 30, 40)
+      link(message, 40, 380)
     })
     const stop = startLinkFit(root)
     frame()
     await mutations()
     expect(frames.length, 'frames asked for by the hook’s own writes to the links’ style').toBe(0)
-    const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
-    if (!first || !second) throw new Error('the made page has no links')
+    const [first, second, wide] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    if (!first || !second || !wide) throw new Error('the made page has no links')
     expect(given(first).right, 'the first link shares the gap with the second').toBe(10)
     // A cell's alignment moves the second link's words away with the message's size and text as they were.
-    words.set(second, { left: 300, top: 20, right: 310, bottom: 64 })
+    words.set(second, { left: 200, top: 20, right: 210, bottom: 64 })
+    words.set(wide, { left: 210, top: 20, right: 380, bottom: 64 })
     messages[0]?.setAttribute('style', 'text-align: right')
     await mutations()
     expect(frames.length, 'one frame asked for by the attribute').toBe(1)
     frame()
     expect(given(first).right, 'the first link now has the room, the second being far').toBeGreaterThan(10)
+    await mutations()
+    expect(frames.length, 'frames asked for by the room that the hook wrote after the attribute').toBe(0)
+    // A style of a link that is not its room is a change of the message's layout.
+    first.style.fontSize = '30px'
+    await mutations()
+    expect(frames.length, 'one frame asked for by a style of the link that is no room').toBe(1)
     stop()
   })
 
