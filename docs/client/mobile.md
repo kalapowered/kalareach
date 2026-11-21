@@ -172,12 +172,12 @@ instead of offering a button.
   application's page in the system's settings; a camera that is allowed and closed by the person
   says nothing. Android tells a refusal for good only after a request the plugin made itself, so a
   refusal the web view's own request met shows when the camera closes with no picture. None of this
-  is drawn while the picker offers no file: a host this phone is paired with takes none. A picked file is uploaded, not held in the screen: the page hands its bytes to
-  native code, which sends them through the transfer service, and the file stays on the draft,
-  uploading, uploaded or failed, until the person removes it. The phone takes a picked file of up to
-  1,020 KB, what its connection carries in one chunk; a larger one is refused with that reason. A
-  prompt sent from the phone carries its text inline and cannot carry the file, so a draft that
-  holds one is not sent until the person removes it.
+  is drawn while the picker offers no file: the phone is out of contact with its host, or it does
+  not hold `files.upload` and `agent.prompt` there, and the screen says whom to ask. A picked file
+  is not held in the screen: the page hands its bytes to native code, up to 64 MiB, and a larger
+  file is refused by its name and size before anything is sent. A host takes up to 2 GiB, so the
+  phone's bound is the one a person meets. What happens to the file after that is in "Files sent to
+  a paired host".
 - **The accessory row** carries the keys a software keyboard buries: escape, tab, control, alt, the
   arrows, home, end and the punctuation a shell needs. A modifier has three states (off, held for
   one key, and held) and says which one it is in rather than leaving it to a colour. A tap on a key
@@ -190,6 +190,57 @@ instead of offering a button.
   terminal controls its program, what the software keyboard types goes to the program: its text as
   text, and its Enter and Backspace as keys. The field holds one invisible character between edits,
   so a Backspace always has something to delete.
+
+## Files sent to a paired host
+
+Over a host the phone is paired with, the application owns an upload from the moment the page hands
+it the file. The upload goes on when the screen stops waiting for it, pauses when the connection
+ends and resumes on the next one, and is named by a key the page chooses, which is also the file's
+identity on the composer. The page reads where each upload stands by asking the application again
+while any is going (`uploads_open`, twice a second); it does not hold the bytes or the transfer.
+
+Each file is a card on the composer with its name, its size, one sentence for the state and, while
+the host holds part of it, a bar. The sentence is the state; the bar and the border colour say it a
+second way, and the bar is a `progressbar` with its value. The states and their words are:
+
+- **Checking with the host**, while the file is read and the host is asked to take it.
+- **Sending, 25%**, from the chunks the host has acknowledged.
+- **Paused: the host is out of reach. Sending resumes when contact returns.** The bar keeps what
+  the host holds. **Resuming at chunk 4 of 12** names the first chunk the host lacks, once the
+  connection is back and the application has read what the host holds.
+- **Finishing with the host**, while the handle is published.
+- **Cancelling**, from a press of Cancel until the host answers, and then **Cancelled. The host
+  released 4.2 MB.** with the size from the host's own answer; a cancel the host did not answer has
+  no size to show. Cancel keeps its place while it waits and does nothing a second time. If the host
+  already holds the file in full, the answer is that the upload is published and kept: the card says
+  "This file was already sent in full and the host keeps it: it was not cancelled", and the file goes
+  on to the draft.
+- **Added to this draft**, once the finished file is bound to the draft the phone keeps for the
+  session. A finished file the draft did not take stays on the composer as **Sent in full and kept
+  by the host. It was not added to this draft:** with the reason, and **Add again** binds it.
+
+Each refusal says what to do. A host of an earlier build: "update the host". No `files.upload`
+right: ask the host's owner. Two uploads open already: wait for one to finish, or cancel one.
+A host with no room: wait for other files to finish; the sentence states no totals, because a
+phone is not told what other devices hold. A file that changed while it was sent: choose it again.
+A draft or session that is gone: the file was not added to it. Any other refusal is shown in the
+host's own words.
+
+**After a restart** the application reads the host's record of each kept upload before it does
+anything else. A card appears on the session it was for for each one that is still open: one the
+host still receives resumes where it stopped, one whose kept copy is gone or changed says it cannot
+resume and offers Cancel, one whose reservation was never answered says that the host keeps the
+place for up to 24 hours and then releases it, and one that was published and not added shows
+**Add to draft**.
+
+**The draft.** The host keeps one draft for the phone for each session, made when the first file
+is added. The files bound to it go with a prompt that names the draft; the prompt carries no text
+of its own, so the text is set on the draft first (`draft_set_text`, at the revision the phone
+keeps), and a composer with no bound file sends its text inline as before. The host has no way to
+take one file off a draft, so Remove on a bound file ends the draft (`draft_end`) and every file
+bound to it leaves the composer; its label says so. Motion is a card arriving from just under the
+picker and a bar that follows the chunks; with reduced motion the card appears in place and the bar
+jumps.
 
 ## The raw terminal
 
