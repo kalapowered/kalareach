@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       macos:
-        description: "Run the macOS jobs (macos, macos-demonstrations, macos-powershell, macos-shell-packages, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
+        description: "Run the macOS jobs (macos, macos-demonstrations, macos-shipped-hold, macos-powershell, macos-shell-packages, macos-reference, and the companion's macos-15 leg). Turned off, a manual run checks Linux and Windows only. A push or a pull request always runs them."
         type: boolean
         default: true
       ios:
@@ -3344,21 +3344,6 @@ jobs:
           KR_PERF_SETTLE_LOAD: "1.5"
         run: bash scripts/performance.sh
 
-      # The programs a release ships for this platform hold none of the refusal that test builds
-      # carry for the account's own launchd, read in the release build of the workspace and in each
-      # program built alone, as the Linux job reads them for its platform. The test builds of the
-      # steps above (`cargo test --release -p kr-worker`) put their own build of a program in the
-      # place of the workspace's in the same target directory, so the workspace is built again
-      # first, which puts each program of the plain build back in its place, and the gate reads that.
-      - name: The programs a release ships hold no launchd refusal
-        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
-        timeout-minutes: 90
-        env:
-          KR_SHIPPED_WORKSPACE_TARGET: ${{ github.workspace }}/target
-        run: |
-          CARGO_TARGET_DIR="$KR_SHIPPED_WORKSPACE_TARGET" cargo build --locked --release --workspace
-          bash scripts/shipped-hold-gate.sh
-
       # The figures and whatever else the steps above wrote to the artefact directory, kept whether
       # or not the run passed: on this platform they are the only record of how a failure looked.
       - name: Keep the test evidence
@@ -3420,6 +3405,74 @@ jobs:
           primary-key: ${{ steps.release-cache.outputs.primary-key }}
           cache-hit: ${{ steps.release-cache.outputs.cache-hit }}
           paths: target/release
+
+  # The programs a release ships for macOS hold none of the refusal that test builds carry for the
+  # account's own launchd. `scripts/shipped-hold-gate.sh` builds, each in a new target directory and
+  # from nothing, the two test programs that carry the refusal, the whole workspace in the release
+  # profile and each shipped program alone, and reads the bytes of all of them. The check stands in
+  # a job of its own because it did not fit at the end of the macos-demonstrations leg: after the
+  # demonstrations, the release build of the measurements (37 minutes) and the measurements, the 90
+  # minutes it had there ran out on a hosted runner (07:25 to 08:55 UTC on 21 November), and it
+  # has never completed on one. Here it starts at once and in parallel with the other jobs, and it
+  # waits behind none of them. No time is known for it to run to its end, so the step has a limit
+  # of 300 minutes, and every step has a limit of its own: they add up to 327 of this job's 330
+  # minutes, under the 360 at which GitHub ends a hosted job. It restores no cache, because every
+  # build of the script goes in a new directory and no restored output would be read.
+  macos-shipped-hold:
+    name: macos-shipped-hold
+    # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
+    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    runs-on: macos-15
+    timeout-minutes: 330
+    steps:
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The disk as the image arrives, and from here to the last report the lowest free space in
+      # each stretch of the job: three release builds from nothing fill a disk.
+      - name: What the disk holds
+        continue-on-error: true
+        timeout-minutes: 5
+        run: bash scripts/disk-report.sh begin "the image as it arrives"
+
+      # The runner image carries a simulator runtime for each Xcode platform and release, 113 GB of
+      # disk images, and this job builds on the host and starts no simulator. Freeing the disk is
+      # best effort and the job goes on if it fails, with the free space of the reports around it
+      # to show what was left.
+      - name: Free the disk the build needs
+        continue-on-error: true
+        timeout-minutes: 8
+        run: bash scripts/free-simulator-runtimes.sh
+
+      # What this runner is, printed before the builds, so a failure below names the processor, the
+      # memory and the system it happened on. Every build here is given one job per processor.
+      - name: What this runner is
+        timeout-minutes: 2
+        run: |
+          sw_vers
+          uname -srm
+          echo "processors: $(sysctl -n hw.logicalcpu) logical, $(sysctl -n machdep.cpu.brand_string)"
+          echo "memory: $(( $(sysctl -n hw.memsize) / 1073741824 )) GiB"
+          df -h /System/Volumes/Data
+          echo "CARGO_BUILD_JOBS=$(sysctl -n hw.logicalcpu)" >> "$GITHUB_ENV"
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 5
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: The programs a release ships hold no launchd refusal
+        timeout-minutes: 300
+        run: bash scripts/shipped-hold-gate.sh
+
+      - name: What the disk has left
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash scripts/disk-report.sh end "what the disk has left"
 
   # The PowerShell package's cases on the macOS runner. The package's reader counts the input the
   # runtime has taken through .NET internals that differ by platform, and the shell-packages job
