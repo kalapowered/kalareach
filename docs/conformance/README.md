@@ -424,10 +424,11 @@ comes from the step that ran the test or, where none did, from the first step th
 target. It begins `cd <directory> && ` when the test's workspace is not the root, and it repeats the
 step's variables whose value holds no placeholder, written `NAME=value`. Then come `cargo test` and
 the words of the step's command before `--`, as the step wrote them and in the same order, less
-`--no-run`, its target flags and its test names. Those words decide which packages Cargo builds and
-with which features, platforms and profile, so the command builds the test's program as the step
-did. It never narrows the step's package flags: a command for fewer packages can build the test's
-package and its dependencies with other features.
+`--no-run` and, where the test's own flag takes their place (see below), its target flags and its
+test names. Those words decide which packages Cargo builds and with which features, platforms and
+profile, so the command builds the test's program as the step did. It never narrows the step's
+package flags: a command for fewer packages can build the test's package and its dependencies with
+other features.
 
 In place of the step's target flags the command gives the test's own: `--lib`, or `--bin`,
 `--example`, `--test` or `--bench` with the target's name. Cargo applies that flag to every package
@@ -437,8 +438,14 @@ another package, and when the step's build made every target the flag names in t
 packages. Otherwise it keeps the step's target flags and test names, and Cargo runs every program
 the step ran. After `--` come the options the step passes the test programs, with their values,
 except the filters, `--skip`, `--exact`, `--list`, `--show-output` and `--logfile`, then `--exact`
-and the test's name. Every program the command starts runs the tests of that exact name, so a test
-of the same name in another of them runs too. A test that no step covers gets `--locked`, `-p <package>` and its target's flag.
+and the test's name. A test that no step covers gets `--locked`, `-p <package>` and its target's
+flag.
+
+The name does not always select one test. A program of the standard test harness runs the tests
+whose name is exactly the test's, so a test of the same name in another program that the command
+starts runs too. A test name that the command keeps from the step is one more exact name, and its
+tests run as well. A program with a harness of its own (`harness = false`) reads its own arguments:
+it can ignore `--exact` and the name, and run everything it holds.
 
 The command does not give what the report gives the step: `KR_TEST_ARTIFACTS_DIR`, the runner, and
 the option that makes each test program write its record. A word whose value holds a placeholder is
@@ -843,7 +850,7 @@ identifier's `references` and `figures`.
 | `tests[].test` | The package, target and test name, or the TypeScript file and its titles as the run gave them, joined by ` > ` |
 | `tests[].source` | Where the key is written |
 | `tests[].keyed_by` | `attached_comment`, `comment_inside`, `test_name`, `section_comment`, `called_function`, `module_comment`, `case_table`, `title` or `file_comment` |
-| `tests[].command` | The command that reproduces the test on its own, narrowed from the step that ran it |
+| `tests[].command` | A POSIX shell line that runs the test with the build of the step it comes from; what else it runs is in "Which tests a step covers" |
 | `tests[].runs` | Each step that listed the test and what it came to there |
 | `references` | Mentions that key no test, with what they are on |
 | `figures` | The figures the identifier's measurements recorded in this run |

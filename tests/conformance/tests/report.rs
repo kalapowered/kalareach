@@ -3909,6 +3909,92 @@ fn a_command_starts_only_the_programs_its_target_flag_names_in_the_steps_package
     assert!(ran.command.contains(" --test ta "), "{}", ran.command);
 }
 
+/// The step gives a test name, and a target of another package has its features off, so the command
+/// keeps the step's own words, the name included. After `--` that name is one more exact name: the
+/// step's `check` runs as well as `check_one`.
+#[cfg(unix)]
+#[test]
+fn a_command_keeps_a_test_name_of_its_step_as_one_more_exact_name() {
+    let files = [
+        file("a/Cargo.toml", &manifest("a", "")),
+        file("a/src/lib.rs", ""),
+        file(
+            "a/tests/t.rs",
+            "#[test]\nfn check() {}\n\n#[test]\nfn check_one() {}\n",
+        ),
+        file(
+            "b/Cargo.toml",
+            &manifest(
+                "b",
+                "[features]\nslow = []\n\n[[test]]\nname = \"t\"\nrequired-features = [\"slow\"]\n",
+            ),
+        ),
+        file("b/src/lib.rs", ""),
+        file("b/tests/t.rs", WORKS),
+    ];
+    let disk = on_disk(&["a", "b"], &files);
+    let (t, b_t) = (
+        target_of("a", TargetKind::Test, "t"),
+        target_of("b", TargetKind::Test, "t"),
+    );
+    let ran = reproduced(&disk, &["test", "--locked", "check"], &t, "check_one");
+    assert_eq!(ran.step_failed, None);
+    assert!(!ran.programs.contains_key(&b_t), "the step built b's t");
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert!(
+        ran.command.ends_with("check -- --exact check_one"),
+        "{}",
+        ran.command
+    );
+    assert!(
+        ran.shown
+            .lines()
+            .any(|line| line.trim() == "test check ... ok"),
+        "{}\n{}",
+        ran.command,
+        ran.shown
+    );
+}
+
+/// A program with a harness of its own that the step built, and that the test's own flag names in
+/// another package, reads its own arguments: it ignores `--exact` and the test's name and runs
+/// everything it holds.
+#[cfg(unix)]
+#[test]
+fn a_program_with_a_harness_of_its_own_that_the_command_starts_runs_everything_it_holds() {
+    let files = [
+        file("a/Cargo.toml", &manifest("a", "")),
+        file("a/src/lib.rs", ""),
+        file("a/tests/ta.rs", WORKS),
+        file(
+            "b/Cargo.toml",
+            &manifest("b", "[[test]]\nname = \"ta\"\nharness = false\n"),
+        ),
+        file("b/src/lib.rs", ""),
+        file(
+            "b/tests/ta.rs",
+            "fn main() {\n    println!(\"b ta ran everything, given {:?}\", std::env::args().skip(1).collect::<Vec<_>>());\n}\n",
+        ),
+    ];
+    let disk = on_disk(&["a", "b"], &files);
+    let a_ta = target_of("a", TargetKind::Test, "ta");
+    let ran = reproduced(&disk, &["test", "--locked", "--workspace"], &a_ta, "works");
+    assert_eq!(ran.step_failed, None);
+    assert_eq!(ran.exit, Some(0), "{}\n{}", ran.command, ran.shown);
+    assert_eq!(ran.compiled, Vec::<String>::new(), "{}", ran.command);
+    assert!(ran.passed_in_its_program, "{}\n{}", ran.command, ran.shown);
+    assert!(ran.command.contains(" --test ta "), "{}", ran.command);
+    assert!(
+        ran.shown
+            .contains("b ta ran everything, given [\"--exact\", \"works\"]"),
+        "{}\n{}",
+        ran.command,
+        ran.shown
+    );
+}
+
 /// A step that gives `--ignore-rust-version` over a package whose `rust-version` the toolchain does
 /// not meet: the command keeps the word, which `Selection` does not read, so Cargo accepts it.
 #[cfg(unix)]
