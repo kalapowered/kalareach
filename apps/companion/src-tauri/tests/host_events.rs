@@ -503,8 +503,8 @@ mod window {
             );
         } else {
             println!(
-                "host_events: what the page heard while the state was held was not asserted: more \
-                 than {STATE_FIRST_WITHIN:?} passed after the connection was offered"
+                "not exercised: what the page heard while the state was held: more than \
+                 {STATE_FIRST_WITHIN:?} passed after the connection was offered"
             );
         }
 
@@ -566,7 +566,7 @@ mod window {
             );
         } else {
             println!(
-                "host_events: the order of a host's first events was not asserted: more than \
+                "not exercised: the order of a host's first events: more than \
                  {STATE_FIRST_WITHIN:?} passed after the connection was offered"
             );
         }

@@ -68,7 +68,7 @@ struct Allowed {
 const ALLOWED: &[Allowed] = &[
     Allowed {
         path: "apps/companion/src-tauri/tests/host_events.rs",
-        said: "host_events: ",
+        said: "host_events: a task panicked: ",
         reason: "the helper's failure report, which it ends with exit status 1",
     },
     Allowed {
