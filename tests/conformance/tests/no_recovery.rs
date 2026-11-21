@@ -882,37 +882,27 @@ const SIGNALLERS: [&str; 4] = ["kill", "pkill", "killall", "taskkill"];
 /// The names of the calls that reap a process by its number.
 const REAPS: [&str; 3] = ["waitpid", "waitid", "wait4"];
 
-/// The words that lead a shell command without being the program it runs: the keywords of a
-/// condition or a loop, the words that run what follows, and (by their `=`) an assignment.
-const LEADING: [&str; 15] = [
-    "if", "then", "else", "elif", "do", "while", "until", "!", "exec", "command", "builtin",
-    "nohup", "env", "time", "xargs",
-];
-
-/// Whether `text`, taken as shell text, sends a signal: a part that runs one of the programs of
-/// [`SIGNALLERS`], but for `kill -0`, which asks whether a process exists and sends nothing. The
-/// text is cut at `;`, `|`, `&`, a new line, a back tick, a bracket, a brace and a quote, and in
-/// each part the leading words of [`LEADING`] and the assignments are passed over, so that
-/// `if kill -0 "$p"; then kill -9 "$p"; fi`, `(kill -9 1)`, `exec kill -9 1` and `trap 'kill -9 $c'
-/// TERM` are read.
+/// Whether `text`, taken as shell text, sends a signal: a part of it has a word that is one of the
+/// programs of [`SIGNALLERS`], whatever comes before that word (a wrapper and its options, an
+/// assignment, a keyword), but for `kill -0`, which asks whether a process exists and sends
+/// nothing, and only when no later word of the part is an option. The quotes are removed first, as
+/// the shell removes them: a quoted option is an option (`kill -0 "-s" KILL "$p"`), and a quoted
+/// command is read with the rest (`trap 'kill -9 $c' TERM`). The text is cut at `;`, `|`, `&`, a new
+/// line, a back tick, `$(`, a bracket and a brace, and each word of a part is read with the
+/// complete list of the words after it.
 fn signals_by_text(text: &str) -> bool {
-    text.replace("$(", ";")
-        .split([';', '|', '&', '\n', '`', '(', ')', '{', '}', '\'', '"'])
+    text.replace(['\'', '"'], "")
+        .replace("$(", ";")
+        .split([';', '|', '&', '\n', '`', '(', ')', '{', '}'])
         .any(|part| {
-            let mut words = part
-                .split_whitespace()
-                .skip_while(|word| LEADING.contains(word) || word.contains('='));
-            let Some(first) = words.next() else {
-                return false;
-            };
-            let program = first.rsplit(['/', '\\']).next().unwrap_or(first);
-            if !SIGNALLERS.contains(&program) {
-                return false;
-            }
-            let only_looks = program == "kill"
-                && words.next() == Some("-0")
-                && !words.any(|word| word.starts_with('-'));
-            !only_looks
+            let words: Vec<&str> = part.split_whitespace().collect();
+            words.iter().enumerate().any(|(at, word)| {
+                let program = word.rsplit(['/', '\\']).next().unwrap_or(word);
+                SIGNALLERS.contains(&program)
+                    && !(program == "kill"
+                        && words.get(at + 1) == Some(&"-0")
+                        && !words[at + 2..].iter().any(|later| later.starts_with('-')))
+            })
         })
 }
 
@@ -926,7 +916,7 @@ fn waits_for_a_child(tokens: &[Token], at: usize) -> bool {
 }
 
 /// What in the Rust source of a case file sends a signal or reaps a process by its number, each with
-/// its line: a text that runs a program of [`SIGNALLERS`] (but for `kill -0`), the type `Signal`,
+/// its line: a text that holds a program of [`SIGNALLERS`] (but for `kill -0`), the type `Signal`,
 /// every name of a signal and every name that begins `kill` (which covers `Child::kill` and
 /// `kill_process_group`), `start_kill`, and a call of [`REAPS`] or of a bare `wait`, which reaps any
 /// child, none of which a case makes: the wait of a `Child` (`child.wait()`, `Child::wait`) is
@@ -1102,6 +1092,57 @@ fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_l
             "a reap by `waitid`",
             "fn other() { waitid(P::Pid(x), W::EXITED); }",
         ),
+        (
+            "a look with a quoted option",
+            r#"fn f() { run("kill -0 \"-s\" KILL \"$p\""); }"#,
+        ),
+        (
+            "a look with an option in single quotes",
+            r#"fn f() { run("kill -0 '-s' KILL $p"); }"#,
+        ),
+        (
+            "a look with a quoted option in a trap",
+            r#"fn f() { run("trap 'kill -0 \"-s\" KILL $c' TERM"); }"#,
+        ),
+        (
+            "a kill whose name is quoted in part",
+            r#"fn f() { run("ki\"ll\" -9 1"); }"#,
+        ),
+        (
+            "a kill after env and its option",
+            r#"fn f() { run("env -i kill -9 1"); }"#,
+        ),
+        (
+            "a kill after command and its option",
+            r#"fn f() { run("command -p kill -9 1"); }"#,
+        ),
+        (
+            "a kill after exec and its option",
+            r#"fn f() { run("exec -a name kill -9 1"); }"#,
+        ),
+        (
+            "a kill by xargs, with an option",
+            r#"fn f() { run("xargs -0 kill -9"); }"#,
+        ),
+        (
+            "a kill by xargs, with a count",
+            r#"fn f() { run("xargs -n 1 kill"); }"#,
+        ),
+        (
+            "a kill after nohup and the end of its options",
+            r#"fn f() { run("nohup -- kill -9 1"); }"#,
+        ),
+        (
+            "a kill after time and its option",
+            r#"fn f() { run("time -p kill -9 1"); }"#,
+        ),
+        ("a kill by eval", r#"fn f() { run("eval kill -9 1"); }"#),
+        ("a kill after nice", r#"fn f() { run("nice kill -9 1"); }"#),
+        ("a kill after sudo", r#"fn f() { run("sudo kill -9 1"); }"#),
+        (
+            "a kill after setsid",
+            r#"fn f() { run("setsid kill -9 1"); }"#,
+        ),
     ];
     let let_through_rust = [
         (
@@ -1112,6 +1153,10 @@ fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_l
         (
             "a look in an if",
             "fn f() { run(\"if kill -0 \\\"$p\\\"; then :; fi\"); }",
+        ),
+        (
+            "a look with a quoted pid",
+            r#"fn f() { run("kill -0 \"$p\" 2>/dev/null"); }"#,
         ),
         (
             "the wait of a child",
@@ -1134,6 +1179,12 @@ fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_l
         ),
         ("a script that kills in a trap", "trap 'kill -9 $c' TERM\n"),
         ("a script that kills after a pipe", "ps | kill -9 1\n"),
+        (
+            "a script that looks with a quoted option",
+            "kill -0 \"-s\" KILL \"$p\"\n",
+        ),
+        ("a script that kills after env", "env -i kill -9 1\n"),
+        ("a script that kills after setsid", "setsid kill -9 1\n"),
     ];
     let let_through_script = [
         ("a script that waits", "trap '' TERM\nsleep 61 &\nwait\n"),
@@ -1141,6 +1192,10 @@ fn the_check_of_the_case_files_refuses_each_signal_and_reap_and_lets_through_a_l
         (
             "a script that looks in an if",
             "if kill -0 \"$p\"; then :; fi\n",
+        ),
+        (
+            "a script that looks at a quoted pid",
+            "kill -0 \"$p\" 2>/dev/null\n",
         ),
     ];
     let mut wrong = Vec::new();
