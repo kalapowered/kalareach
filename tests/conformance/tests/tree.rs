@@ -15,7 +15,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, WaitOptions, waitpid};
+use rustix::process::{Pid, WaitOptions};
 
 use kr_conformance::tree::{self, Captured, Deadline, GRACE, Waited};
 
@@ -145,7 +145,7 @@ fn a_leader_reaped_by_another_waiter_gives_the_error_and_no_signal_is_sent() {
     let call = start(bash(script, &[&pids, &marker, &release]), deadline_in(20));
     let recorded = recorded_pids(&pids, 2);
     let leader = Pid::from_raw(recorded[0].parse().expect("a pid")).expect("a process");
-    let reaped = waitpid(Some(leader), WaitOptions::empty());
+    let reaped = rustix::process::waitpid(Some(leader), WaitOptions::empty());
     // The barrier is let go whatever came of the reap, so that a failed case leaves nothing.
     std::fs::write(&release, "").expect("the release file");
     let (reaped, status) = reaped
