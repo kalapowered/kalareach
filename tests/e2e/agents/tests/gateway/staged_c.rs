@@ -1266,8 +1266,9 @@ fn a_turn_submitted_without_its_charge_fails_the_check_of_2a() {
 enum Started {
     /// Its first screen is the composer: the agent runs a second process.
     Running,
-    /// Its start reached no composer, and the screen shows one of the texts the entry names for a
-    /// refusal.
+    /// The screen shows one of the texts the entry names for a refusal: the agent ended, or, as
+    /// Codex does, went on running with the conversation open read-only and a notice in place of
+    /// the composer.
     Refused,
     /// Its start ended with the shell's prompt back and none of those texts.
     Ended,
@@ -1419,8 +1420,83 @@ fn the_old_shell_prompt_is_no_end_of_the_second_start_and_the_prompt_below_the_e
     );
 }
 
-/// Waits for the second start to end one way or the other, and says how: the composer, one of the
-/// refusal texts, or the shell's prompt back below the typed line `typed`.
+/// The provisional line an agent draws beside its startup composer while a resume runs (Codex
+/// 0.155.1's `  Resuming session…`): a composer that shows beside it is the startup draft, which
+/// is drawn for a resume that ends read-only as it is for one that continues.
+const RESUMING: &str = "Resuming session…";
+
+/// How the second start stands on `rows`, or `None` while it stands nowhere yet. One of the texts
+/// the entry names for a refusal is a refusal, whether the process went on running or not (Codex
+/// shows a card, "This conversation is open in another app", in place of the composer and keeps
+/// the conversation read-only). The composer with the resume done is a running continuation; the
+/// composer beside [`RESUMING`] is the startup draft and says nothing yet. The shell's prompt
+/// below the typed line's echo is an end.
+fn second_screen(
+    rows: &[String],
+    typed: &str,
+    composer: &str,
+    refusals: &[String],
+) -> Option<(Started, Option<String>)> {
+    if let Some(text) = refusals
+        .iter()
+        .find(|text| rows.iter().any(|row| row.contains(text.as_str())))
+    {
+        return Some((Started::Refused, Some(text.clone())));
+    }
+    if rows.iter().any(|row| row.contains(composer)) {
+        return if rows.iter().any(|row| row.contains(RESUMING)) {
+            None
+        } else {
+            Some((Started::Running, None))
+        };
+    }
+    prompt_back(rows, typed).then_some((Started::Ended, None))
+}
+
+/// The card that says the conversation is open in another app is a refusal where the entry names
+/// its words, the startup composer beside "Resuming session…" is no answer yet, and the composer
+/// with the resume done is a continuation.
+#[test]
+fn a_card_is_a_refusal_the_startup_composer_is_no_answer_and_a_resumed_composer_is_a_continuation()
+{
+    let screen = |rows: &[&str]| rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
+    let typed = "codex resume 0123-4567";
+    let composer = "Ask Codex to do anything";
+    let refusals = [
+        "This conversation is open in another app".to_owned(),
+        "Close it there and press R to continue here.".to_owned(),
+    ];
+    let card = screen(&[
+        "kr-session$ codex resume 0123-4567",
+        "> (kr1) Remember the code kr1.",
+        "  This conversation is open in another app  R to Retry",
+        "  Close it there and press R to continue here.",
+    ]);
+    assert_eq!(
+        second_screen(&card, typed, composer, &refusals),
+        Some((
+            Started::Refused,
+            Some("This conversation is open in another app".to_owned())
+        ))
+    );
+    let draft = screen(&[
+        "kr-session$ codex resume 0123-4567",
+        "  Resuming session…",
+        "> Ask Codex to do anything",
+    ]);
+    assert_eq!(second_screen(&draft, typed, composer, &refusals), None);
+    let resumed = screen(&[
+        "kr-session$ codex resume 0123-4567",
+        "> (kr1) Remember the code kr1.",
+        "> Ask Codex to do anything",
+    ]);
+    assert_eq!(
+        second_screen(&resumed, typed, composer, &refusals),
+        Some((Started::Running, None))
+    );
+}
+
+/// Waits for the second start to end one way or the other, and says how, by [`second_screen`].
 fn second_start(
     person: &Person,
     typed: &str,
@@ -1430,17 +1506,8 @@ fn second_start(
     let started = Instant::now();
     loop {
         let rows = person.window.screen();
-        if rows.iter().any(|row| row.contains(composer)) {
-            return (Started::Running, None);
-        }
-        if let Some(text) = refusals
-            .iter()
-            .find(|text| rows.iter().any(|row| row.contains(text.as_str())))
-        {
-            return (Started::Refused, Some(text.clone()));
-        }
-        if prompt_back(&rows, typed) {
-            return (Started::Ended, None);
+        if let Some(answer) = second_screen(&rows, typed, composer, refusals) {
+            return answer;
         }
         assert!(
             started.elapsed() < LIVENESS,
@@ -1450,6 +1517,56 @@ fn second_start(
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Every file of the agent's record with its content, in the order of their places.
+fn record_files(ctx: &Context, real: &Real) -> Vec<(PathBuf, String)> {
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    read_record(
+        ctx.run.root(),
+        ctx.run.pin(),
+        &conversations_relative(&real.account),
+        &mut |place, content| {
+            files.push((
+                PathBuf::from(String::from_utf8_lossy(place).into_owned()),
+                String::from_utf8_lossy(content).into_owned(),
+            ));
+        },
+    )
+    .unwrap_or_else(|why| panic!("the agent's record is not whole: {why}"));
+    files.sort();
+    files
+}
+
+/// Whether the agent's record is as it was: the same files with the same content. A conversation
+/// that is open read-only in a second process is not written by it.
+///
+/// # Errors
+///
+/// Returns what changed.
+fn record_unchanged(
+    before: &[(PathBuf, String)],
+    after: &[(PathBuf, String)],
+) -> Result<(), String> {
+    if before == after {
+        Ok(())
+    } else {
+        Err(format!(
+            "the agent's record held {} file(s) and now holds {}, or a file's content changed",
+            before.len(),
+            after.len()
+        ))
+    }
+}
+
+/// A record in which a file was written or added is not as it was.
+#[test]
+fn a_record_in_which_a_file_was_written_or_added_is_not_unchanged() {
+    let file = |place: &str, text: &str| (PathBuf::from(place), text.to_owned());
+    let before = vec![file("a.jsonl", "one\n")];
+    assert!(record_unchanged(&before, &before.clone()).is_ok());
+    assert!(record_unchanged(&before, &[file("a.jsonl", "one\ntwo\n")]).is_err());
+    assert!(record_unchanged(&before, &[file("a.jsonl", "one\n"), file("b.jsonl", "x")]).is_err());
 }
 
 /// The conversation identifier of the file `place` holding `content`: the member of its first line
@@ -1579,6 +1696,7 @@ fn second_process(
         .collect();
     let extra: Vec<&str> = words.iter().map(String::as_str).collect();
     // Session B: the agent's own command on the saved conversation. No `kr` runs: B's shell is open.
+    let record_before = record_files(ctx, real);
     b.person.clears_the_screen();
     ctx.checks_the_placed_files();
     real.checks_the_route(&ctx.run);
@@ -1598,10 +1716,21 @@ fn second_process(
         "session_b": { "started_with": words, "same_conversation": !forks },
     });
     if started != Started::Running {
-        // The agent's start ended: the host shows no instance for it, and session A as it was.
-        check_unchanged(None, &shown_now(ctx, &b)).unwrap_or_else(|why| {
-            panic!("the refused start announces no instance of its own: {why}")
-        });
+        if started == Started::Refused {
+            // The agent may refuse and go on running, with the conversation open read-only and a
+            // notice in place of the composer: the process is recorded, and session A's
+            // conversation is as it was, since a read-only view writes nothing.
+            let agent_b = HandAgent::found(ctx, b.session_id);
+            record_unchanged(&record_before, &record_files(ctx, real))
+                .unwrap_or_else(|why| panic!("session A's conversation is as it was: {why}"));
+            evidence["session_b"]["still_running_read_only"] =
+                serde_json::json!(agent_b.runs().is_ok());
+        } else {
+            // The agent's start ended: the host shows no instance for it.
+            check_unchanged(None, &shown_now(ctx, &b)).unwrap_or_else(|why| {
+                panic!("the ended start announces no instance of its own: {why}")
+            });
+        }
         let what = taken(started, None, None).unwrap_or_else(|why| panic!("{why}"));
         evidence["resume"] = serde_json::json!({ "outcome": what.word(), "shown": refusal });
         evidence["control"] = serde_json::json!({ "what": "session B's marker typed into session A", "breaks_property": false, "why_not": "no second execution ran, so there was no second session to type a marker from" });
