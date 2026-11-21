@@ -388,6 +388,9 @@ struct Live {
     issued: Mutex<Option<TransferId>>,
     /// A write of the entry failed: the failure is this device's, never the host's.
     journal_failed: AtomicBool,
+    /// This upload asked once for the places other accounts of the device hold, and does not ask
+    /// again: the freeing is tried once for each upload, whatever the answer.
+    places_asked: AtomicBool,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -410,6 +413,7 @@ impl Live {
             beginning_kept: AtomicBool::new(beginning_kept),
             issued: Mutex::new(None),
             journal_failed: AtomicBool::new(false),
+            places_asked: AtomicBool::new(false),
         })
     }
 
@@ -830,6 +834,9 @@ pub struct Desk {
     registry: Mutex<Registry>,
     /// What a restart or a failure found of entries it could not resume.
     verdicts: Mutex<HashMap<Uuid, Verdict>>,
+    /// How many times a freeing of other accounts' places freed something, so that an upload whose
+    /// begin was refused while another upload's freeing ran knows a place may be free.
+    places_freed: AtomicU64,
     /// The newest connection of each host's device, with its account, so that an upload whose
     /// connection ended while a newer one of the same account was coming up goes on at once.
     sessions: Mutex<HashMap<(EnvironmentId, DeviceId), Connection>>,
@@ -882,6 +889,16 @@ pub(crate) fn host_words(error: &ClientError) -> Option<&str> {
 fn host_does_not_know(error: &ClientError) -> bool {
     error.code() == ErrorCode::InvalidArgument
         && host_words(error).is_some_and(|words| words.starts_with("no transfer "))
+}
+
+/// Whether the host's refusal of `upload.begin` says this device already holds as many concurrent
+/// transfers as it may. The host gives that refusal the code for a resource that is not available
+/// now and, as the other temporary causes do not, words that name the count. The file-size limit,
+/// the device's staged uploads and the environment's staged bytes answer `QUOTA_EXCEEDED`, and no
+/// cancel of another account's upload could make those pass.
+fn is_the_count_refusal(error: &ClientError) -> bool {
+    error.code() == ErrorCode::ResourceUnavailable
+        && host_words(error).is_some_and(|words| words.contains("concurrent transfers"))
 }
 
 /// Removes the entry of `key` and its copy when the host's answer says it knows nothing of the
@@ -1108,7 +1125,21 @@ impl Desk {
             if verify && !desk.is_the_content(&running, generation).await {
                 return;
             }
-            let result = desk.send_once(&running, &session).await;
+            let freed_before = desk.places_freed.load(Ordering::Acquire);
+            let mut result = desk.send_once(&running, &session).await;
+            // The host holds the device's places for every account of the device, and another account
+            // cannot see its own. A refusal for the count of open transfers frees the places other
+            // accounts' uploads hold, once, and the begin is tried once more. A freeing that another
+            // upload made meanwhile counts: the place it freed may be this one's.
+            if let Err(error) = &result
+                && is_the_count_refusal(error)
+                && running.transfer().is_none()
+                && !running.places_asked.swap(true, Ordering::AcqRel)
+                && (desk.free_places(&running, &session).await
+                    || desk.places_freed.load(Ordering::Acquire) != freed_before)
+            {
+                result = desk.send_once(&running, &session).await;
+            }
             desk.settle(&running, &session, generation, result);
         });
         *locked(&live.task) = Some(task);
@@ -1477,7 +1508,9 @@ impl Desk {
         if file.cancel_asked || self.is_cancelled(key) {
             // A key the person cancelled is finished, whether or not the record of it could be
             // written.
-            let _ = self.finish_cancel(&turn, store, paired, None, file).await;
+            let _ = self
+                .finish_cancel(&turn, store, &paired.session, None, file)
+                .await;
             return;
         }
         let Some(status) = status else { return };
@@ -1706,7 +1739,10 @@ impl Desk {
             }
             return Ok(Self::asked(key, None));
         };
-        match self.finish_cancel(&turn, &store, &paired, held, file).await {
+        match self
+            .finish_cancel(&turn, &store, &paired.session, held, file)
+            .await
+        {
             Ok(answer) => Ok(answer),
             Err(error) => Ok(Self::asked(key, Some(error.message))),
         }
@@ -1773,7 +1809,10 @@ impl Desk {
             ..file
         };
         // A host that cannot be asked leaves the cancel kept: the next reach finishes it.
-        match self.finish_cancel(&turn, &store, paired, held, file).await {
+        match self
+            .finish_cancel(&turn, &store, &paired.session, held, file)
+            .await
+        {
             Ok(answer) => Ok(answer),
             Err(error) => Ok(Self::asked(key, Some(error.message))),
         }
@@ -1785,7 +1824,7 @@ impl Desk {
         self: &Arc<Self>,
         _turn: &Turn,
         store: &Store,
-        paired: &Paired,
+        session: &Arc<Session>,
         held: Option<Arc<Live>>,
         file: UploadFile,
     ) -> Result<Cancelled> {
@@ -1801,8 +1840,7 @@ impl Desk {
             return Ok(Self::said(key, "forgotten", None, None));
         };
         // The host's record is read before anything is cancelled.
-        let read: UploadStatusResult = match paired
-            .session
+        let read: UploadStatusResult = match session
             .read(Method::UploadStatus, &UploadStatusParams { transfer_id })
             .await
         {
@@ -1842,7 +1880,7 @@ impl Desk {
             return Ok(Self::said(key, "published", None, Some(handle)));
         }
         let answer: UploadCancelResult = match uploads::cancel(
-            &paired.session,
+            session,
             &file.target,
             transfer_id,
             crate::commands::MUTATION_TTL,
@@ -1862,6 +1900,83 @@ impl Desk {
             Some(answer.released_byte_len.get().to_string()),
             None,
         ))
+    }
+
+    /// Frees the places on the host that other accounts of this device hold, for the upload
+    /// `wanting`, whose begin the host refused for the device's count of open transfers. The host
+    /// counts for the device's principal, which every account of the device shares, so an account
+    /// cannot see or free the reservations another account left. Each reservation of another account
+    /// of this device on this host that is not published is taken one at a time in its key's turn,
+    /// read again there, and cancelled on `session`, the connection in force; its entry and copy go
+    /// with it. A published upload holds no place and is never cancelled, and a cancel the host did
+    /// not answer keeps its entry. Says whether a place was freed, or was found already gone.
+    async fn free_places(self: &Arc<Self>, wanting: &Arc<Live>, session: &Arc<Session>) -> bool {
+        let Ok(store) = self.store() else {
+            return false;
+        };
+        let owner = &wanting.owner;
+        let held_by_another = |file: &UploadFile| {
+            file.key != wanting.key
+                && file.device_id == owner.device_id
+                && file.environment_id == owner.environment_id
+                && file.account != owner.account
+        };
+        let mut keys: Vec<Uuid> = locked(&self.registry)
+            .held
+            .values()
+            .filter(|live| {
+                live.key != wanting.key
+                    && live.owner.device_id == owner.device_id
+                    && live.owner.environment_id == owner.environment_id
+                    && live.owner.account != owner.account
+                    && !live.published.load(Ordering::Acquire)
+            })
+            .map(|live| live.key)
+            .collect();
+        for file in store.all().entries {
+            if held_by_another(&file)
+                && file.reached != Reached::Published
+                && file.transfer_id.is_some()
+                && !keys.contains(&file.key)
+            {
+                keys.push(file.key);
+            }
+        }
+        let mut freed = false;
+        for key in keys {
+            let turn = self.turn(key).await;
+            self.stopped(&turn).await;
+            let held = locked(&self.registry).held.get(&key).cloned();
+            let file = match &held {
+                Some(live) => live.file(),
+                None => match store.entry(key) {
+                    Some(file) => file,
+                    // Another freeing took it first.
+                    None => {
+                        freed = true;
+                        continue;
+                    }
+                },
+            };
+            if !held_by_another(&file)
+                || file.reached == Reached::Published
+                || Self::transfer_of(&held, &file).is_none()
+            {
+                if let Some(live) = &held {
+                    *locked(&live.phase) = Phase::Paused;
+                }
+                continue;
+            }
+            if let Ok(answer) = self.finish_cancel(&turn, &store, session, held, file).await
+                && matches!(answer.state, "cancelled" | "forgotten")
+            {
+                freed = true;
+            }
+        }
+        if freed {
+            self.places_freed.fetch_add(1, Ordering::AcqRel);
+        }
+        freed
     }
 
     /// Ends an upload that is over for good, and removes its entry and its copy.
@@ -2593,6 +2708,35 @@ mod tests {
         desk.settle_as(&live, None, 0, true, Err(ClientError::ConnectionEnded));
         assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
         assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
+    }
+
+    /// KR-REQ-13.12: only the host's refusal of a begin for the device's count of open transfers
+    /// frees another account's places: the file-size and staged-byte limits, which answer with the
+    /// code of a quota, and a refusal for another temporary cause, do not.
+    #[test]
+    fn only_the_count_refusal_of_a_begin_frees_other_accounts_places() {
+        let said = |code, words: &str| ClientError::Host(ProtocolError::new(code, words));
+        assert!(is_the_count_refusal(&said(
+            ErrorCode::ResourceUnavailable,
+            "this device already holds 2 of 2 concurrent transfers; finish or cancel one first"
+        )));
+        assert!(!is_the_count_refusal(&said(
+            ErrorCode::QuotaExceeded,
+            "a file is at most 10 bytes in this environment, and this one declares 20"
+        )));
+        assert!(!is_the_count_refusal(&said(
+            ErrorCode::QuotaExceeded,
+            "this environment stages at most 10 bytes in all, and the 20 this upload declares do \
+             not fit in what is left of that"
+        )));
+        assert!(!is_the_count_refusal(&said(
+            ErrorCode::QuotaExceeded,
+            "this device already holds 2 of 2 concurrent transfers"
+        )));
+        assert!(!is_the_count_refusal(&said(
+            ErrorCode::ResourceUnavailable,
+            "the host is busy"
+        )));
     }
 
     /// KR-REQ-13.12: a send of an account that this device ended, by a sign-out or the sign-in of

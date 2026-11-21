@@ -2813,6 +2813,270 @@ async fn kr_req_13_12_a_send_is_not_resumed_on_a_connection_of_another_account()
     adopted.stop().await;
 }
 
+/// Two uploads of `earlier` hold the device's two places on the host and are paused, and the phone
+/// has made a connection that is not theirs. Answers that connection.
+async fn two_places_held_by(
+    adopted: &Adopted,
+    phone: &Phone,
+    desk: &Arc<Desk>,
+    earlier: &Paired,
+) -> Paired {
+    let bytes = pattern(5);
+    let mut gates = Vec::new();
+    for _ in 0..2 {
+        let (content, gate, release) = gated(&bytes);
+        let sent = request(adopted, &bytes, content, kr_ipc::new_uuid());
+        let (desk, earlier) = (Arc::clone(desk), earlier.clone());
+        tokio::spawn(async move { desk.send(earlier, sent).await });
+        gates.push((gate, release));
+    }
+    for (gate, _) in &gates {
+        gate.reached().await;
+    }
+    earlier.session.transport().close();
+    let newer = on_another_connection(&phone.companion, &earlier.session).await;
+    until("the desk is told of the new connection", || {
+        desk.holds_newest_for_test(&newer)
+    })
+    .await;
+    for (gate, _) in &gates {
+        gate.release();
+    }
+    until("both uploads are paused", || {
+        desk.open(&earlier.who())
+            .iter()
+            .filter(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
+            .count()
+            == 2
+    })
+    .await;
+    newer
+}
+
+/// KR-REQ-13.12: the host counts a device's open transfers for every account of the device, so an
+/// account cannot see or free the places another left. A begin the host refuses for that count frees
+/// the other account's places, each read and cancelled once on the connection in force, and is tried
+/// once more; two sends refused together free each place once and both go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_begin_refused_for_the_devices_count_frees_the_other_accounts_places_and_goes_on()
+ {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+
+    for together in [false, true] {
+        let adopted = Adopted::start(1).await;
+        let (phone, control) = phone_for(&adopted).await;
+        let desk = desk_of(&phone.companion);
+        let paired = paired_of(&phone.companion).await;
+        let earlier = Paired {
+            account: Some(AccountMark::from_bytes([1; 32])),
+            ..paired.clone()
+        };
+        let newer = two_places_held_by(&adopted, &phone, &desk, &earlier).await;
+        let now = Paired {
+            account: Some(AccountMark::from_bytes([2; 32])),
+            ..newer
+        };
+        let (reads, cancels, begins) = (
+            control.sent(Method::UploadStatus),
+            control.sent(Method::UploadCancel),
+            control.sent(Method::UploadBegin),
+        );
+        let bytes = pattern(3);
+        let send = |desk: &Arc<Desk>| {
+            let desk = Arc::clone(desk);
+            let now = now.clone();
+            let sent = request(
+                &adopted,
+                &bytes,
+                Arc::new(Held::new(bytes.clone())),
+                kr_ipc::new_uuid(),
+            );
+            async move { desk.send(now, sent).await }
+        };
+        let sent = if together {
+            let (first, second) = tokio::join!(send(&desk), send(&desk));
+            vec![first, second]
+        } else {
+            vec![send(&desk).await]
+        };
+        for outcome in sent {
+            outcome.expect(
+                "the begin is tried again once the places are freed, and the upload is published",
+            );
+        }
+        assert_eq!(
+            control.sent(Method::UploadCancel) - cancels,
+            2,
+            "each place is cancelled once ({together})"
+        );
+        assert_eq!(
+            control.sent(Method::UploadStatus) - reads,
+            2,
+            "each is read before it is cancelled ({together})"
+        );
+        assert!(
+            control.sent(Method::UploadBegin) - begins >= 2,
+            "the begin was refused, then tried again ({together})"
+        );
+        assert!(
+            desk.open(&earlier.who()).is_empty(),
+            "the earlier account's uploads are gone ({together})"
+        );
+        assert_eq!(
+            entries_in(&folder(&phone)),
+            if together { 2 } else { 1 },
+            "what is kept is the published uploads of the new account ({together})"
+        );
+        assert_eq!(copies_in(&folder(&phone)), 0);
+        adopted.stop().await;
+    }
+}
+
+/// A draft the host holds for this device, which no entry of this application names.
+async fn host_draft(
+    adopted: &Adopted,
+    paired: &Paired,
+    session: kr_protocol::ids::SessionId,
+) -> kr_protocol::ids::DraftId {
+    use kr_protocol::ids::ActionId;
+    use kr_protocol::method::Method;
+    use kr_protocol::transfer::{DraftCreateParams, DraftCreateResult};
+
+    let composed = paired
+        .session
+        .compose(
+            Method::DraftCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            net_support::on_the_session(&adopted.host, session),
+            None,
+            &json!({}),
+            &DraftCreateParams {
+                environment_id: adopted.host.environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session),
+                application_instance_id: Nullable::null(),
+                text: "a draft the host holds".to_owned(),
+            },
+            kr_protocol::scalars::DurationMs::new(60_000),
+        )
+        .await
+        .expect("composed");
+    let made: DraftCreateResult = paired
+        .session
+        .send(&composed)
+        .await
+        .expect("the host made the draft")
+        .to_typed()
+        .expect("a result");
+    made.draft.draft_id
+}
+
+/// KR-REQ-23.41: the host counts a device's open drafts for every account of the device. A creation
+/// the host refuses for that count discards the other account's known drafts, each by its own
+/// account's entry and in its own turn, and is tried once more; the new account's own entry is not
+/// touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_draft_creation_refused_for_the_devices_count_discards_the_other_accounts_drafts_and_goes_on()
+ {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(3).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let paired = paired_of(companion).await;
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let now = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..paired.clone()
+    };
+    let sessions: Vec<_> = adopted
+        .workers
+        .iter()
+        .map(|worker| worker.session_id)
+        .collect();
+    // The earlier account keeps a draft for each session, and the device holds the host's whole bound
+    // of 64 open drafts.
+    for session in &sessions {
+        let id = host_draft(&adopted, &paired, *session).await;
+        drafts.keep_for_test(
+            &earlier,
+            *session,
+            &net_support::on_the_session(&adopted.host, *session),
+            Some(id),
+            Some(kr_protocol::ids::DraftRevision::new(1)),
+        );
+    }
+    for _ in sessions.len()..64 {
+        host_draft(&adopted, &paired, sessions[0]).await;
+    }
+    // A file of the new account is published, and its bind asks the host for a draft.
+    let bytes = vec![7_u8; 1000];
+    let handle = desk
+        .send(
+            now.clone(),
+            request(
+                &adopted,
+                &bytes,
+                Arc::new(Held::new(bytes.clone())),
+                kr_ipc::new_uuid(),
+            ),
+        )
+        .await
+        .expect("the upload is published");
+    let creates = control.sent(Method::DraftCreate);
+    let bind: companion_tauri::paired_drafts::Bind = serde_json::from_value(json!({
+        "session_id": sessions[0].to_string(),
+        "text": "see the file",
+        "transfer_id": handle.transfer_id,
+        "contribution": contribution(),
+    }))
+    .expect("a bind");
+    drafts
+        .bind(
+            now.clone(),
+            net_support::on_the_session(&adopted.host, sessions[0]),
+            bind,
+        )
+        .await
+        .expect("the creation is tried again once the places are freed, and the file is bound");
+    assert_eq!(
+        control.sent(Method::DraftCreate) - creates,
+        2,
+        "refused once, then tried again"
+    );
+    assert_eq!(
+        control.sent(Method::DraftDiscard),
+        3,
+        "the earlier account's three drafts"
+    );
+    for session in &sessions {
+        assert!(
+            !drafts.kept(&earlier, *session).made,
+            "the earlier account's entry went with the host's answer"
+        );
+    }
+    assert!(
+        drafts.kept(&now, sessions[0]).made,
+        "the new account's draft is its own"
+    );
+    assert_eq!(
+        drafts_in(&folder(&phone)),
+        1,
+        "only the new account's entry is kept"
+    );
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12: while the host is out of reach the application still answers what it holds: an
 /// upload whose connection ended reads as paused, with no connection to ask on, and reads as sent
 /// again once the host is reached.
