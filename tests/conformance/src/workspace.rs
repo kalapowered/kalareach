@@ -127,8 +127,6 @@ pub struct Package {
     /// The names its dependencies are known by in its source: a rename where the manifest gives
     /// one, the package's name otherwise.
     pub dependency_names: BTreeSet<String>,
-    /// The name a dependency that the manifest renames is known by, by the name of its package.
-    pub dependency_aliases: BTreeMap<String, String>,
     /// The directory of its workspace's root, relative to the tested root, as Cargo's path for it
     /// resolves: `.` for the root.
     pub workspace: String,
@@ -480,15 +478,6 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
             .filter(|name| !renamed.contains(name))
             .map(str::to_owned)
             .collect();
-        let dependency_aliases = dependencies
-            .iter()
-            .filter_map(|dependency| {
-                Some((
-                    dependency["name"].as_str()?.to_owned(),
-                    dependency["rename"].as_str()?.to_owned(),
-                ))
-            })
-            .collect();
         let dependency_names = dependencies
             .iter()
             .filter_map(|dependency| {
@@ -529,7 +518,6 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
             manifest,
             registry_crates,
             dependency_names,
-            dependency_aliases,
             workspace: String::new(),
             workspace_members: Vec::new(),
             workspace_default_members: Vec::new(),
@@ -600,34 +588,6 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<BTreeSet<_>>()
-        );
-    }
-
-    #[test]
-    fn a_dependency_the_manifest_renames_is_known_by_its_rename() {
-        let value = serde_json::json!({
-            "workspace_members": ["path+file:///w/a#0.1.0"],
-            "workspace_default_members": ["path+file:///w/a#0.1.0"],
-            "packages": [{
-                "id": "path+file:///w/a#0.1.0",
-                "name": "a",
-                "version": "0.1.0",
-                "manifest_path": "/w/a/Cargo.toml",
-                "targets": [],
-                "dependencies": [
-                    { "name": "b", "rename": "dep", "source": null },
-                    { "name": "c", "rename": null, "source": null }
-                ]
-            }]
-        });
-        let packages = parse(&value).expect("parses");
-        assert_eq!(
-            packages[0].dependency_aliases,
-            BTreeMap::from([("b".to_owned(), "dep".to_owned())])
-        );
-        assert_eq!(
-            packages[0].dependency_names,
-            BTreeSet::from(["c".to_owned(), "dep".to_owned()])
         );
     }
 
