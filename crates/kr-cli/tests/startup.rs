@@ -389,6 +389,8 @@ struct Standalone {
     home: PathBuf,
     /// The lifeline every supervisor in this tree waits on, held open for as long as the test runs.
     lifeline: Option<std::fs::File>,
+    /// The `PATH` every command of this tree is given.
+    path: String,
 }
 
 impl Drop for Standalone {
@@ -541,7 +543,18 @@ impl Standalone {
             tree,
             home,
             lifeline: Some(lifeline),
+            path: "/usr/bin:/bin".to_owned(),
         }
+    }
+
+    /// This tree's commands get a `PATH` that names a folder of its own with nothing in it, so a
+    /// real daemon here finds no program of the system by name: it runs only what is named by its
+    /// whole path.
+    fn with_an_empty_path(mut self) -> Self {
+        let folder = self.tree.root().join("no-tools");
+        std::fs::create_dir_all(&folder).expect("an empty folder for the path");
+        self.path = folder.display().to_string();
+        self
     }
 
     /// Selects the standalone start as `kr host startup --set standalone` records it: the first
@@ -693,7 +706,7 @@ impl Standalone {
         command
             .args(arguments)
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", &self.path)
             .env("HOME", &self.home)
             .env(
                 kr_ipc::paths::RUNTIME_DIR_VARIABLE,
@@ -718,6 +731,11 @@ impl Standalone {
 
     /// [`Self::new_session`] from another installation.
     fn new_session_from(&self, installation: &Path) -> Command {
+        self.new_session_of(installation, "/bin/sh")
+    }
+
+    /// [`Self::new_session`] from another installation, with `shell` as the session's shell.
+    fn new_session_of(&self, installation: &Path, shell: &str) -> Command {
         let cwd = self.tree.root().display().to_string();
         self.kr_from(
             installation,
@@ -731,11 +749,23 @@ impl Standalone {
                 "--cwd",
                 &cwd,
                 "--shell",
-                "/bin/sh",
+                shell,
                 "--startup",
                 "interactive",
             ],
         )
+    }
+
+    /// A shell that ends by itself two minutes after it starts, named `sh` in a folder of its own,
+    /// for a case whose session is closed by the case and must not outlive it if the case fails.
+    fn a_short_lived_shell(&self) -> String {
+        let folder = self.tree.root().join("short-lived");
+        std::fs::create_dir_all(&folder).expect("a folder for the shell");
+        let script = self.tree.root().join("short-lived.sh");
+        std::fs::write(&script, "#!/bin/sh\nexec /bin/sleep 120\n").expect("writes the shell");
+        let shell = folder.join("sh");
+        kr_ipc::testing::place_program(&script, &shell);
+        shell.display().to_string()
     }
 
     /// `kr new` as above, naming no shell mode: the host's default decides.
@@ -1592,18 +1622,10 @@ fn wait_for_mark(mark: &Path, what: &str) {
     }
 }
 
-/// What a start says when its daemon ended after writing the line for a file where its rendezvous
-/// endpoint belongs, whichever way the case made the daemon end.
-fn assert_says_the_rendezvous_endpoint_holds_a_file(
-    output: &Output,
-    host: &Standalone,
-    tail: &str,
-) {
-    let failure = document(output, "kr new");
-    assert_eq!(output.status.code(), Some(1), "{failure}");
-    assert_eq!(failure["ok"], false, "{failure}");
-    assert_eq!(failure["code"], "ENVIRONMENT_UNAVAILABLE", "{failure}");
-    let message = failure["message"].as_str().unwrap_or_default();
+/// The words a start says when its daemon ended after writing the line for a file where its
+/// rendezvous endpoint belongs: how its failure begins, and what it says of the daemon's end. The
+/// case asserts them against the command's own failure.
+fn words_of_a_daemon_that_could_not_listen(host: &Standalone) -> (String, String) {
     // The command knows this tree's own folders, so it names the path whole.
     let rendezvous = host
         .tree
@@ -1611,29 +1633,17 @@ fn assert_says_the_rendezvous_endpoint_holds_a_file(
         .rendezvous_endpoint()
         .expect("an endpoint")
         .as_text();
-    assert!(
-        message.starts_with(&format!(
+    (
+        format!(
             "the control daemon this command started for environment {} (process ",
             host.tree.environment_id()
-        )),
-        "{message}"
-    );
-    assert!(
-        message.contains(&format!(
+        ),
+        format!(
             ") ended; its log reports that it could not listen on its rendezvous endpoint \
              {rendezvous}: it holds a file; kr does not remove what it did not make; if you do not \
              need it, move it away, then run the command again; what it writes is in "
-        )),
-        "the failure says why the daemon ended, in this command's words: {message}"
-    );
-    assert!(
-        !message.contains("seconds"),
-        "and says no bound was waited out: {message}"
-    );
-    assert!(
-        !message.contains(tail),
-        "and repeats nothing of the daemon's own text: {message}"
-    );
+        ),
+    )
 }
 
 /// KR-REQ-07.12: a standalone start whose daemon ended after writing why it could not listen says
@@ -1666,7 +1676,25 @@ fn a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why() {
     let installation = stub_installation(&host, &daemon);
 
     let output = start(host.new_session_from(&installation)).finish("kr new");
-    assert_says_the_rendezvous_endpoint_holds_a_file(&output, &host, tail);
+    let failure = document(&output, "kr new");
+    assert_eq!(output.status.code(), Some(1), "{failure}");
+    assert_eq!(failure["ok"], false, "{failure}");
+    assert_eq!(failure["code"], "ENVIRONMENT_UNAVAILABLE", "{failure}");
+    let message = failure["message"].as_str().unwrap_or_default();
+    let (begins, says) = words_of_a_daemon_that_could_not_listen(&host);
+    assert!(message.starts_with(&begins), "{message}");
+    assert!(
+        message.contains(&says),
+        "the failure says why the daemon ended, in this command's words: {message}"
+    );
+    assert!(
+        !message.contains("seconds"),
+        "and says no bound was waited out: {message}"
+    );
+    assert!(
+        !message.contains(tail),
+        "and repeats nothing of the daemon's own text: {message}"
+    );
 }
 
 /// Something that listens on an endpoint, accepts every connection and never says a word.
@@ -1787,9 +1815,35 @@ fn a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon(
     // This case's own connection, and the command's.
     silent.wait_for_accepts(2);
     std::fs::write(&go, b"").expect("lets the stub go");
+    let released = Instant::now();
 
     let output = running.finish("kr new");
-    assert_says_the_rendezvous_endpoint_holds_a_file(&output, &host, tail);
+    let failure = document(&output, "kr new");
+    assert_eq!(output.status.code(), Some(1), "{failure}");
+    assert_eq!(failure["ok"], false, "{failure}");
+    assert_eq!(failure["code"], "ENVIRONMENT_UNAVAILABLE", "{failure}");
+    let message = failure["message"].as_str().unwrap_or_default();
+    let (begins, says) = words_of_a_daemon_that_could_not_listen(&host);
+    assert!(message.starts_with(&begins), "{message}");
+    assert!(
+        message.contains(&says),
+        "the failure says why the daemon ended, in this command's words: {message}"
+    );
+    assert!(
+        !message.contains("seconds"),
+        "and says no bound was waited out: {message}"
+    );
+    assert!(
+        !message.contains(tail),
+        "and repeats nothing of the daemon's own text: {message}"
+    );
+    // The silent listener holds the command's one attempt for the whole of its 30 second bound
+    // unless the wait stops when the daemon has ended, so the answer comes well before it.
+    assert!(
+        released.elapsed() < Duration::from_secs(20),
+        "the command waited on the silent listener: {:?}",
+        released.elapsed()
+    );
     drop(silent);
 }
 
@@ -1805,8 +1859,9 @@ fn a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon(
 #[test]
 #[ignore = "run by name with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS removed from the environment"]
 fn a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for() {
-    let host = Standalone::without_service_manager();
+    let host = Standalone::without_service_manager().with_an_empty_path();
     host.select_standalone();
+    let shell = host.a_short_lived_shell();
     let started = host.tree.root().join("stub-started");
     let held = format!(
         "kr-controller: another control daemon already owns environment {}",
@@ -1820,10 +1875,10 @@ fn a_daemon_that_ended_with_the_held_line_while_the_winner_starts_is_waited_for(
     );
     let installation = stub_installation(&host, &daemon);
 
-    let first = start(host.new_session_from(&installation));
+    let first = start(host.new_session_of(&installation, &shell));
     wait_for_mark(&started, "the stub daemon's start");
     std::thread::sleep(Duration::from_millis(2500));
-    let second = start(host.new_session());
+    let second = start(host.new_session_of(installation(), &shell));
 
     let mut created = Vec::new();
     for (what, running) in [("the first kr new", first), ("the second kr new", second)] {
