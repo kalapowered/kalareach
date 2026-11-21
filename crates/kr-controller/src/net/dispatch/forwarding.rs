@@ -1172,6 +1172,12 @@ impl RemoteConnection {
                     ))
                 })?,
         };
+        // The receipt's result carries what privacy mode removes from a session's receipts, a
+        // question's wording among it. It is released only under the privacy state it was read
+        // under, which is taken before the worker is asked and before any deadline is.
+        let read_under = super::output::ReadUnder::now_settled(&self.controller, Some(session_id))
+            .await
+            .map_err(RouteRefusal::not_shown)?;
         let envelope = self.envelope(asked.acting.grant.grant_id, validated);
         let authority = self
             .authority_deadline(asked)
@@ -1240,6 +1246,9 @@ impl RemoteConnection {
                 receipt: read_back.receipt,
             })),
         };
+        // The closure record above carries no such text, so only this answer is held.
+        let mut read = read;
+        read.read_under = Some(read_under);
         Ok(Some((Recorded::read(answered), read)))
     }
 
