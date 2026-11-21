@@ -927,9 +927,7 @@ impl ChannelDesk {
             None
         } else {
             // With no folder there is no store lock to hold, so the ledger's own lock stands in for
-            // it from the proof to the read. The draft store is opened first: that makes the data
-            // directory, each new name proved durable, which the proof below needs.
-            drafts.store()?;
+            // it from the proof to the read. Taking it makes the data directory when there is none.
             let locked = drafts.lock_ledger()?;
             flush_directory(&self.data()?, NameKind::Directory)
                 .map_err(|error| crate::drafts::ledger_storage(&error))?;
@@ -1223,7 +1221,9 @@ impl ChannelDesk {
     /// Returns why nothing was moved. A flush that fails after the ledger was replaced is not an
     /// error: the answer says the move is not yet confirmed, and the flush stays owed.
     pub fn set_aside(&self, drafts: &DraftDesk) -> Result<SetAside> {
-        let held = self.lock(false)?;
+        // The folder's lock too, and so the folder: a process that makes it meanwhile (the first
+        // record of a send) then waits for this set-aside to end, as it would for any other.
+        let held = self.lock(true)?;
         let locked = drafts.lock_ledger()?;
         let data = locked.data().to_path_buf();
         let _ = reach(&data, Point::SetAsideLocked);
@@ -1235,23 +1235,16 @@ impl ChannelDesk {
         // The rebuilt list names the sources of the entries it lists, and a name in it is removed at
         // the next start: the entries' names are proved durable first, under this lock, or nothing
         // moves.
-        if held.present {
-            self.make_durable(&held)?;
-        }
-        let rebuilt = if held.present {
-            let found = scan(&held.directory).map_err(|error| storage(STORE, &error))?;
-            let mut rebuilt: Vec<DiscardParams> = Vec::new();
-            for message in &found.messages {
-                for reference in &message.drafts {
-                    if !names_reference(&rebuilt, reference) {
-                        rebuilt.push(reference.clone());
-                    }
+        self.make_durable(&held)?;
+        let found = scan(&held.directory).map_err(|error| storage(STORE, &error))?;
+        let mut rebuilt: Vec<DiscardParams> = Vec::new();
+        for message in &found.messages {
+            for reference in &message.drafts {
+                if !names_reference(&rebuilt, reference) {
+                    rebuilt.push(reference.clone());
                 }
             }
-            rebuilt
-        } else {
-            Vec::new()
-        };
+        }
         let bytes = std::fs::read(locked.file())
             .map_err(|error| failed("This device could not read its list of removals.", &error))?;
         // Owed before anything moves: a flush that fails from here on is finished by the next read
