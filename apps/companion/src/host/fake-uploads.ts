@@ -165,7 +165,8 @@ export class FakeUploads {
     const sessionId = String(params.session_id)
     const draft = this.#drafts.get(sessionId) ?? this.#start(sessionId, typeof params.text === 'string' ? params.text : '')
     draft.revision += 1
-    const attachment = { transfer_id: params.transfer_id }
+    // The application's own shape: the attachment carries the handle it was bound with.
+    const attachment = { handle: { transfer_id: params.transfer_id } }
     draft.attachments.push(attachment)
     const value: PairedBound & { readonly attachment: unknown } = {
       draftId: draft.draftId,
