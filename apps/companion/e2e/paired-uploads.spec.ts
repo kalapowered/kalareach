@@ -185,7 +185,8 @@ for (const surface of ['ios', 'android'] as const) {
       await expect(fill).toHaveCSS('transform-origin', /^0px /)
 
       await page.emulateMedia({ reducedMotion: 'reduce' })
-      expect(await styles()).toEqual({ fill: ['transform', '0s', 'ease'], card: 'border-color' })
+      // No transition at all on the bar, and the card changes its border colour and nothing that moves.
+      expect(await styles()).toEqual({ fill: ['none', '0s', 'ease'], card: 'border-color' })
       await expect(card).toBeVisible()
     })
   })
