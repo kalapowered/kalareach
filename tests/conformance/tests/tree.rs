@@ -85,6 +85,22 @@ fn left_after(pids: &[String], within: Duration) -> Vec<String> {
     }
 }
 
+/// Shell text that writes zero bytes to descriptors 1 and 2, the pieces of `plan` as (descriptor,
+/// bytes) in order, with nonblocking writes and its own monotonic deadline: it ends by itself
+/// `seconds` after it starts at the latest, with no signal, whatever the reader of its pipes does.
+/// A write that a pipe's reader does not take is retried until then, so a case that leaves a call
+/// whose reader failed leaves a process that ends by itself.
+fn writing(plan: &[(u8, u64)], seconds: u64) -> String {
+    let pieces: Vec<String> = plan
+        .iter()
+        .map(|(descriptor, bytes)| format!("({descriptor},{bytes})"))
+        .collect();
+    format!(
+        "python3 -c \"import os,time,fcntl\nend=time.monotonic()+{seconds}\nfor fd,left in [{}]:\n    fcntl.fcntl(fd,fcntl.F_SETFL,fcntl.fcntl(fd,fcntl.F_GETFL)|os.O_NONBLOCK)\n    while left>0 and time.monotonic()<end:\n        try:\n            left-=os.write(fd,bytes(min(65536,left)))\n        except BlockingIOError:\n            time.sleep(0.01)\n\"",
+        pieces.join(",")
+    )
+}
+
 /// What a call that was supervised gave.
 type Call = std::io::Result<Waited<Output>>;
 
@@ -220,9 +236,14 @@ fn a_process_that_writes_more_than_a_pipe_holds_when_asked_to_end_is_read_throug
     let place = tempfile::tempdir().expect("a directory");
     let marker = place.path().join("marker.txt");
     let pids = place.path().join("pids.txt");
-    let script = "trap 'head -c 600000 /dev/zero; printf \"%s\\n\" done >> \"$1\"; exit 0' TERM\nsleep 61 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait";
+    // The write is the fixture's own, with a deadline of 20 s, so that it ends by itself if the
+    // report does not read what it writes.
+    let script = format!(
+        "trap '{}; printf \"%s\\n\" done >> \"$1\"; exit 0' TERM\nsleep 61 &\nprintf '%s\\n' \"$!\" > \"$2\"\nwait",
+        writing(&[(1, 600_000)], 20)
+    );
     let captured = timed_out(returned(run(
-        bash(script, &[&marker, &pids]),
+        bash(&script, &[&marker, &pids]),
         deadline_in(3),
     )));
     let written = std::fs::read_to_string(&marker).unwrap_or_default();
@@ -339,8 +360,11 @@ fn what_a_command_wrote_before_its_time_was_spent_is_kept() {
 /// output: both pipes are read while the command runs.
 #[test]
 fn a_command_that_writes_a_great_deal_to_both_pipes_ends_in_its_time_with_all_it_wrote() {
-    let script = "head -c 3000000 /dev/zero >&2; head -c 3000000 /dev/zero";
-    let mut command = bash(script, &[]);
+    // The writer is the fixture's own, with a deadline of 50 s for both writes together: if the
+    // report does not read both pipes while the command runs, the writer is blocked on the first
+    // and ends by itself at the deadline.
+    let script = writing(&[(2, 3_000_000), (1, 3_000_000)], 50);
+    let mut command = bash(&script, &[]);
     command.stderr(Stdio::piped());
     let waited = returned(run(command, deadline_in(30)));
     let Waited::Done(output) = waited else {
