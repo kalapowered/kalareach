@@ -41,6 +41,12 @@ const REPORT_PATIENCE: Duration = Duration::from_secs(120);
 /// How often a case looks at a count that no future announces.
 const LOOK: Duration = Duration::from_millis(50);
 
+/// How long after it starts a lookup of a host can still ask its last question. The library asks a
+/// name again at 0.2, 0.3, 0.6, 1, 2 and 3 seconds after the lookup starts, each moved by up to a
+/// fifth either way, so the last is at most 3.6 seconds in; the rest is room for a loaded machine.
+/// A lookup that a dial starts goes on in the background after the dial has returned.
+const LAST_QUESTION_OF_A_LOOKUP: Duration = Duration::from_secs(5);
+
 fn loopback() -> Option<std::net::SocketAddr> {
     Some("127.0.0.1:0".parse().expect("a loopback address"))
 }
@@ -652,6 +658,7 @@ async fn forgetting_a_host_removes_its_lookups_and_the_relays_no_other_host_name
     .expect("the device's endpoint");
     device.introduce(paired(&view_a, &a)).await.expect("host A");
     device.introduce(paired(&view_b, &b)).await.expect("host B");
+    let dialed = tokio::time::Instant::now();
     let to_a = dial(&device, &view_a, &a).await;
     let to_b = dial(&device, &view_b, &b).await;
     assert_eq!(answered(&to_a).await, "A");
@@ -663,6 +670,9 @@ async fn forgetting_a_host_removes_its_lookups_and_the_relays_no_other_host_name
 
     // The control: while B is known, its lookups are asked about it.
     registry_yields(&device, b.id()).await;
+    // The dial of B started a lookup of its own, which is still asking: a count taken before it has
+    // asked its last question would show forgetting B as asking one more.
+    tokio::time::sleep_until(dialed + LAST_QUESTION_OF_A_LOOKUP).await;
     let asked_about_b = |names: &NameServer| {
         names
             .asked()
