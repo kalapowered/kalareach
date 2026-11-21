@@ -12,6 +12,7 @@ use super::{
     refresh, removal_where_a_full_queue_refuses, removal_where_a_refused_connect_proves_an_end,
     try_exclusive,
 };
+use crate::endpoint::platform::copies::ProgramWithACopy;
 use crate::testing::PrivateTempDir;
 
 /// Opens (and makes) a file in the case's folder.
@@ -416,4 +417,61 @@ async fn a_name_that_leads_to_another_held_file_is_not_this_listeners_self_test(
         0,
         "no record"
     );
+}
+
+/// A listener's lock ends with its hold, though a program that started while the lock was held
+/// keeps a copy of the lock file.
+#[test]
+fn a_hold_lets_go_of_its_lock_though_a_program_keeps_a_copy_of_the_file() {
+    let folder = PrivateTempDir::create();
+    let socket = folder.path().join("a.sock");
+    let hold = Hold::take(&socket).expect("a lock");
+    let _program = ProgramWithACopy::of(&hold.file);
+    drop(hold);
+    let other = File::open(super::path_of(&socket)).expect("the lock file");
+    assert!(
+        rustix::fs::flock(&other, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok(),
+        "the lock is free once the hold ended"
+    );
+}
+
+/// The probe of a lock file leaves no lock behind, though a program that started while the probe
+/// held its lock keeps a copy of the file: the lock a bind takes next is not refused.
+#[test]
+fn the_probe_of_a_lock_file_leaves_no_lock_though_a_program_keeps_a_copy_of_the_file() {
+    let folder = PrivateTempDir::create();
+    let file = file_in(&folder, "lock");
+    let mut program = None;
+    let evidence = read_open(&file, (1, 2), |probed| {
+        try_exclusive(probed)?;
+        program = Some(ProgramWithACopy::of(probed));
+        Ok(())
+    });
+    assert_eq!(evidence.lock, Lock::Free);
+    let next = File::open(folder.path().join("lock")).expect("the lock file");
+    assert!(
+        rustix::fs::flock(&next, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok(),
+        "the lock a bind takes next is not refused by the probe's copy"
+    );
+    drop(program);
+}
+
+/// The self-test of the lock leaves no lock behind either, where the lock is not enforced.
+#[test]
+fn the_self_test_of_a_lock_leaves_no_lock_though_a_program_keeps_a_copy_of_the_file() {
+    let folder = PrivateTempDir::create();
+    let file = file_in(&folder, "lock");
+    let mut program = None;
+    let enforced = lock_is_enforced(&file, |second| {
+        try_exclusive(second)?;
+        program = Some(ProgramWithACopy::of(second));
+        Ok(())
+    });
+    assert!(!enforced, "nobody else holds the file");
+    let next = File::open(folder.path().join("lock")).expect("the lock file");
+    assert!(
+        rustix::fs::flock(&next, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok(),
+        "the self-test's copy keeps no lock"
+    );
+    drop(program);
 }
