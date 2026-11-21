@@ -442,6 +442,34 @@ describe('a message handed over to the channel store', () => {
     expect(book.snapshot().kept).toEqual([])
   })
 
+  it('lists a newer revision that only the store holds when a retirement conflicts, by reading the store again', async () => {
+    const of = world()
+    const book = await opened(of)
+    type(book, MAIN, 'what the composer holds')
+    await book.settled()
+    const save = (id: string | null, expectedRevision: string | null, text: string) =>
+      of.drafts.save({
+        id,
+        expectedRevision,
+        sessionId: MAIN,
+        applicationInstanceId: null,
+        agentBindingRevision: null,
+        state: 'open',
+        text,
+        attachments: []
+      }).draft
+    const apart = save(null, null, 'the draft that was held')
+    await book.reload()
+    expect(book.snapshot().kept.map((each) => each.text)).toEqual(['the draft that was held'])
+    // Another window saves a newer revision. This window has not read it: only the store holds it.
+    const newer = save(apart.id, apart.revision, 'edited since')
+    expect(book.snapshot().kept.map((each) => each.revision)).toEqual([apart.revision])
+    await book.retireHeld([{ id: apart.id, revision: apart.revision }])
+    await book.settled()
+    // The conflict says the draft changed; the list is read again, and shows the revision it did not know.
+    expect(book.snapshot().kept.map((each) => [each.text, each.revision])).toEqual([['edited since', newer.revision]])
+  })
+
   it('leaves a newer revision listed when the retirement conflicts and the read after it fails too', async () => {
     const of = world()
     let failing = false
