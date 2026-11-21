@@ -219,36 +219,6 @@ fn answer_names_the_colour(rows: &[String], code: &str) -> Result<(), String> {
     }
 }
 
-/// The digests of the images the agent's record holds: for each line of `text` that holds
-/// `marker`, the text after each `base64,` in it, decoded and hashed. A line with no image text
-/// after it, or whose image cannot be decoded, gives `None`.
-fn images_in(text: &str, marker: &str) -> Vec<Option<String>> {
-    use base64::Engine as _;
-
-    let mut found = Vec::new();
-    for line in text.lines().filter(|line| line.contains(marker)) {
-        let mut images = line.split("base64,").skip(1).peekable();
-        if images.peek().is_none() {
-            found.push(None);
-        }
-        for after in images {
-            let encoded: String = after
-                .chars()
-                .take_while(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
-                })
-                .collect();
-            found.push(
-                base64::engine::general_purpose::STANDARD
-                    .decode(encoded.as_bytes())
-                    .ok()
-                    .map(|bytes| transfer::hex_of(&kr_cbor::sha256(&bytes))),
-            );
-        }
-    }
-    found
-}
-
 /// Transfers `bytes` as the paired device does, with the client library's upload driver on the data
 /// streams of the device's own connection: the device begins the upload, sends the bytes and
 /// finishes it. Nothing runs `kr`.
@@ -439,7 +409,7 @@ fn gateway_a_device_prompts_the_agent_and_adds_an_image_and_the_local_terminal_s
                     .image_line
                     .as_deref()
                     .expect("the build list names a marker for an image in the agent's record");
-                let recorded = images_in(&record(ctx, real), marker);
+                let recorded = transfer::images_recorded(&record(ctx, real), marker);
                 image_received_is_the_one_sent(
                     &sent_digest,
                     staged_digest.as_deref(),
@@ -509,7 +479,7 @@ fn the_digests_of_the_images_a_record_holds_are_read_from_its_marked_lines_only(
          {{\"type\":\"input_image\"}}\n",
         encode(COLOUR_PNG)
     );
-    let found = images_in(&text, "\"type\":\"input_image\"");
+    let found = transfer::images_recorded(&text, "\"type\":\"input_image\"");
     assert_eq!(
         found,
         vec![Some(transfer::hex_of(&kr_cbor::sha256(COLOUR_PNG))), None]
