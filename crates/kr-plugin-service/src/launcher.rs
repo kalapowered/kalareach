@@ -2254,6 +2254,34 @@ mod tests {
             pid: Some(std::process::id()),
         };
         verify_peer(&itself, &this_process()).expect("the process that was started is accepted");
+
+        // A process this account can read that is not the launched one is refused by the
+        // comparison, not by a failure to read it.
+        #[cfg(unix)]
+        {
+            let mut other = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("a process of this account");
+            let refused = verify_peer(
+                &PeerIdentity {
+                    uid,
+                    gid: 0,
+                    pid: Some(other.id()),
+                },
+                &this_process(),
+            );
+            other.kill().expect("ends the other process");
+            other.wait().expect("collects the other process");
+            assert!(
+                matches!(
+                    &refused,
+                    Err(LaunchError::Refused { detail })
+                        if detail.contains("the service manager started")
+                ),
+                "{refused:?}"
+            );
+        }
     }
 
     #[tokio::test]
