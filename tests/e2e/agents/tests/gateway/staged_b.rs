@@ -13,6 +13,7 @@
 
 use super::*;
 
+use kr_e2e_agents::conversation;
 use kr_e2e_agents::transfer::{self, Caller, Transfer};
 
 /// The colour that fills [`COLOUR_PNG`], as a one-word answer names it.
@@ -31,6 +32,13 @@ const COLOUR_PNG: &[u8] = &[
 /// The variants of the stand-in that part 1 and part 4 run: the terminal's own turn waits for its
 /// approval to be answered, and goes on reading.
 const HELD_TURN: &str = "answer-when-released,keep-reading,stay";
+
+/// The variants of the stand-in that part 3 runs: the approval of the terminal's turn is left to
+/// whoever answers it first.
+const RACED_APPROVAL: &str = "answer-when-released,keep-reading,ping-when-released,stay";
+
+/// How long a case lets what it did settle before it reads the counts a second time.
+const SETTLE: Duration = Duration::from_secs(3);
 
 /// The route as the case's own record names it, beside the host-side `route` every case writes.
 fn arm(ctx: &Context) -> &'static str {
@@ -61,6 +69,12 @@ fn image_input(account: &Account, file: &Path) -> String {
     }
 }
 
+/// The first line of `text` that holds every one of `needles`, by index.
+fn line_of(text: &str, needles: &[&str]) -> Option<usize> {
+    text.lines()
+        .position(|line| needles.iter().all(|needle| line.contains(needle)))
+}
+
 /// The agent's record of its conversation, read whole, read again until it can be.
 fn record(ctx: &Context, real: &Real) -> String {
     let started = Instant::now();
@@ -73,6 +87,54 @@ fn record(ctx: &Context, real: &Real) -> String {
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }
     }
+}
+
+/// A new connection of the paired device, as it makes one after the old one went.
+fn reconnects(ctx: &Context, session: &Session<'_>) -> Remote {
+    ctx.runtime
+        .block_on(session.device.connect(&session.paired))
+        .unwrap_or_else(|why| panic!("the device connects again: {why}"))
+}
+
+/// The approval the host holds pending and has interpreted, read through `remote`: the one resource
+/// in the state pending, where earlier ones may be listed as resolved.
+fn pending_approval(
+    ctx: &Context,
+    remote: &Remote,
+    session: &Session<'_>,
+) -> kr_protocol::gateway::PendingResource {
+    let pending = |read: &AgentInstancesResult| {
+        read.agent_resources
+            .resources
+            .iter()
+            .filter(|resource| {
+                resource.state == PendingState::Pending && resource.interpretation_verified
+            })
+            .count()
+            == 1
+    };
+    let read = ctx.instances_until(
+        remote,
+        session.session_id(),
+        "a pending request is interpreted",
+        pending,
+    );
+    read.agent_resources
+        .resources
+        .iter()
+        .find(|resource| resource.state == PendingState::Pending)
+        .cloned()
+        .expect("the one pending resource")
+}
+
+/// How many approvals the host holds pending, read through `remote`.
+fn pending_count(ctx: &Context, remote: &Remote, session: &Session<'_>) -> usize {
+    ctx.instances(remote, session.session_id())
+        .agent_resources
+        .resources
+        .iter()
+        .filter(|resource| resource.state == PendingState::Pending)
+        .count()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -451,4 +513,418 @@ fn the_digests_of_the_images_a_record_holds_are_read_from_its_marked_lines_only(
         found,
         vec![Some(transfer::hex_of(&kr_cbor::sha256(COLOUR_PNG))), None]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Part 3: the device and the local terminal answer one approval at once.
+// ---------------------------------------------------------------------------------------------
+
+/// Whether the approval was resolved once: exactly one answer reached the server, and where the
+/// command's runs were counted, it ran once if the device's answer, which allows it, was the one
+/// carried, and not at all if the local terminal's, which refuses it, was.
+///
+/// # Errors
+///
+/// Returns what shows that more than one resolution happened.
+fn one_answer_reached_the_server(
+    answers: usize,
+    ran: Option<usize>,
+    device_carried: bool,
+) -> Result<(), String> {
+    if answers != 1 {
+        return Err(format!(
+            "{answers} answer(s) reached the server, where one resolution gives it one"
+        ));
+    }
+    if let Some(ran) = ran {
+        let expected = usize::from(device_carried);
+        if ran != expected {
+            return Err(format!(
+                "the command ran {ran} time(s), where the answer that was carried (the device's \
+                 allow: {device_carried}) runs it {expected}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether nothing either side typed was typed again after the device connected again: the counts
+/// of the answers the server received and of the command's runs are what they were.
+///
+/// # Errors
+///
+/// Returns what changed.
+fn nothing_typed_again(
+    before: (usize, Option<usize>),
+    after: (usize, Option<usize>),
+    pending: usize,
+) -> Result<(), String> {
+    if before != after || pending != 0 {
+        return Err(format!(
+            "after the device connected again the server holds {} answer(s) and the command ran \
+             {:?} time(s), where it was {} and {:?}, with {pending} approval(s) pending",
+            after.0, after.1, before.0, before.1
+        ));
+    }
+    Ok(())
+}
+
+/// How many answers the stand-in's server received.
+fn responses(ctx: &Context) -> usize {
+    received_lines(ctx)
+        .iter()
+        .filter(|line| line.starts_with("response "))
+        .count()
+}
+
+/// The race: the local terminal's key that refuses the approval is written to its terminal, and at
+/// once the device's answer, which allows it, is sent through the gateway.
+fn race(
+    ctx: &Context,
+    session: &Session<'_>,
+    instance: ApplicationInstanceId,
+    binding: &AgentBindingState,
+    resource: PendingResourceId,
+    deny: &str,
+) -> Result<AgentApprovalRespondResult, RequestError> {
+    session.person.window.type_text(deny.as_bytes());
+    ctx.answers(
+        &session.remote,
+        session.session_id(),
+        instance,
+        binding,
+        resource,
+        ACCEPT,
+    )
+}
+
+/// How many answers to approvals the agent's record holds after the prompt that holds `mark`, as
+/// the build list's marks count them, waiting until there are at least `least` and the count has
+/// held for a second.
+fn recorded_answers(ctx: &Context, real: &Real, mark: &str, least: usize) -> usize {
+    let account = &real.account;
+    let count = || {
+        let text = record(ctx, real);
+        let prompt_at = line_of(&text, &[mark, &account.prompt_line]);
+        conversation::answers(
+            &text,
+            prompt_at,
+            (
+                &account.decision_line,
+                &account.call_lines,
+                &account.decision_calls,
+            ),
+        )
+        .unwrap_or_else(|why| panic!("the answers to the approval cannot be counted: {why}"))
+    };
+    let started = Instant::now();
+    let mut seen = count();
+    while seen < least && started.elapsed() < LIVENESS {
+        std::thread::sleep(Duration::from_millis(200));
+        seen = count();
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let again = count();
+        if again == seen {
+            return seen;
+        }
+        seen = again;
+    }
+}
+
+/// Reads the command's pipe until the turn on `instance` has ended, as read through `remote`: a
+/// run of the command is a line in the pipe, and the reader stays open so that a second run would
+/// find it open and write its line too.
+fn until_the_turn_ends(
+    ctx: &Context,
+    remote: &Remote,
+    session: &Session<'_>,
+    instance: ApplicationInstanceId,
+    reader: &mut FifoReader,
+) {
+    let started = Instant::now();
+    loop {
+        reader.poll();
+        let binding = ctx.binding(remote, session.session_id(), instance);
+        if binding.turn_id.0.is_none() && unsuspended(&binding) {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the turn does not end after {LIVENESS:?}: the binding is {binding:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    reader.poll();
+}
+
+/// The two markers of the part's two commands: each as long as the other, and different.
+///
+/// # Panics
+///
+/// Panics when the two are the same, which would let one command's marker stand for the other's.
+fn approval_markers(mark: &str) -> (String, String) {
+    let first = format!("kr{}", &mark[mark.len() - 6..]);
+    let second = format!("kr{}", &mark[2..8]);
+    assert_ne!(first, second, "the part's two markers are the same");
+    (first, second)
+}
+
+/// How many lines of the pipe's reader are `tag`, and how many are anything else.
+fn runs_of(reader: &FifoReader, tag: &str) -> (usize, usize) {
+    let lines = reader.lines();
+    let ran = lines.iter().filter(|line| line.as_str() == tag).count();
+    (ran, lines.len() - ran)
+}
+
+/// KR-REQ-12.32, case 3, part 3: the agent raises its approval dialog for a shell command, and the
+/// local terminal, which refuses it, and the paired device, whose rich answer allows it and is
+/// dispatched through the gateway, answer it at the same moment. One resolution: exactly one answer
+/// reaches the server, and the command runs once if the device's answer is the one carried and not
+/// at all if the terminal's is, so the agent's own record holds one answer to it; the host holds no
+/// approval pending after it. After the device connects again nothing either typed is typed again:
+/// the counts are as they were. The control, on a real route, breaks the property: a second
+/// approval is answered by the local terminal alone, the command never runs, and the check that
+/// says the device's allow ran it fails on that command.
+#[test]
+fn gateway_a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
+    const TEST: &str = "gateway_a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once";
+    login_case("3", TEST, RACED_APPROVAL, |ctx, session| {
+        // The pipes are made before the agent first starts: nothing is written through a path of
+        // the run after that.
+        let pipes = matches!(ctx.route, Route::Real(_))
+            .then(|| (Fifo::made_in(ctx, "f"), Fifo::made_in(ctx, "g")));
+        let instance = session.starts_the_agent(&[], None, &[]);
+        match &ctx.route {
+            Route::StandIn => {
+                let binding = session.binding_until(
+                    instance,
+                    "the stream names the thread and the turn",
+                    |binding| names(binding, "thread-1", Some("turn-1")),
+                );
+                let pending = pending_approval(ctx, &session.remote, session);
+                let answered = race(ctx, session, instance, &binding, pending.resource_id, "d");
+                let _ = session.person.sees(
+                    "TUI: serverRequest/resolved",
+                    "the terminal reads the server's word that the request was answered",
+                );
+                let device_carried =
+                    matches!(&answered, Ok(done) if done.state == PendingState::Resolved);
+                let received = responses(ctx);
+                one_answer_reached_the_server(received, None, device_carried)
+                    .unwrap_or_else(|why| panic!("one resolution: {why}"));
+                session.remote.close();
+                let fresh = reconnects(ctx, session);
+                std::thread::sleep(SETTLE);
+                nothing_typed_again(
+                    (received, None),
+                    (responses(ctx), None),
+                    pending_count(ctx, &fresh, session),
+                )
+                .unwrap_or_else(|why| panic!("{why}"));
+                serde_json::json!({
+                    "arm": arm(ctx),
+                    "answers_the_server_received": received,
+                    "device_answer": match &answered {
+                        Ok(done) => format!("{:?}", done.state),
+                        Err(refusal) => format!("refused: {refusal:?}"),
+                    },
+                    "device_won": device_carried,
+                })
+            }
+            Route::Real(real) => {
+                let marked = mark();
+                let (tag, second) = approval_markers(&marked);
+                let (pipe, second_pipe) =
+                    pipes.expect("the real route made its pipes before the start");
+                let command = format!("echo {tag} > {}", ctx.run.work().join("f").display());
+                let second_command =
+                    format!("echo {second} > {}", ctx.run.work().join("g").display());
+                for line in [&command, &second_command] {
+                    assert!(
+                        real.account
+                            .approval
+                            .command_line
+                            .as_deref()
+                            .unwrap_or("")
+                            .len()
+                            + line.len()
+                            + 8
+                            <= usize::from(kr_e2e_m1b::window::COLUMNS),
+                        "the case's command, {} characters, would not fit on one line of the \
+                         agent's dialog",
+                        line.len()
+                    );
+                }
+                real.charge(&ctx.run, "3", "an approval-gated command");
+                session.person.composes(
+                    &format!(
+                        "({marked}) Use your shell tool to run exactly this command and nothing \
+                         else: {command}"
+                    ),
+                    &marked,
+                );
+                // The device answers only a dialog that asks to run the case's command and nothing
+                // else: an accepted request runs outside the read-only sandbox.
+                let _ = session.person.dialog_names(&real.account, &command);
+                let binding = session.binding_until(
+                    instance,
+                    "the stream names the thread and the running turn",
+                    |binding| {
+                        binding.thread_id.0.is_some()
+                            && binding.turn_id.0.is_some()
+                            && unsuspended(binding)
+                    },
+                );
+                let pending = pending_approval(ctx, &session.remote, session);
+                let answered = race(
+                    ctx,
+                    session,
+                    instance,
+                    &binding,
+                    pending.resource_id,
+                    &real.account.approval.deny,
+                );
+                session.person.stops_seeing(
+                    &real.account.approval.shows,
+                    "the terminal's prompt goes once the approval is resolved",
+                );
+                let device_carried =
+                    matches!(&answered, Ok(done) if done.state == PendingState::Resolved);
+                let mut reader = pipe.reader(ctx);
+                until_the_turn_ends(ctx, &session.remote, session, instance, &mut reader);
+                let (ran, others) = runs_of(&reader, &tag);
+                assert_eq!(
+                    others, 0,
+                    "the command wrote something else through its pipe"
+                );
+                let decided = recorded_answers(ctx, real, &marked, 1);
+                one_answer_reached_the_server(decided, Some(ran), device_carried)
+                    .unwrap_or_else(|why| panic!("one resolution: {why}"));
+                assert_eq!(
+                    pending_count(ctx, &session.remote, session),
+                    0,
+                    "the host holds an approval pending after the race"
+                );
+                // After the device connects again, nothing either typed is typed again.
+                session.remote.close();
+                let fresh = reconnects(ctx, session);
+                std::thread::sleep(SETTLE);
+                reader.poll();
+                let rows = session.person.window.screen();
+                assert!(
+                    !rows
+                        .iter()
+                        .any(|row| row.contains(&real.account.approval.shows)),
+                    "the agent shows an approval after the device connected again:\n{}",
+                    rows.join("\n")
+                );
+                nothing_typed_again(
+                    (decided, Some(ran)),
+                    (
+                        recorded_answers(ctx, real, &marked, 0),
+                        Some(runs_of(&reader, &tag).0),
+                    ),
+                    pending_count(ctx, &fresh, session),
+                )
+                .unwrap_or_else(|why| panic!("{why}"));
+                // The control: a second approval that the local terminal answers alone. The device's
+                // allow is refused, the command never runs, and the check that says the device's
+                // allow ran it fails on that command.
+                real.charge(&ctx.run, "3", "the control's second approval");
+                // A mark of its own: the first prompt's is on the screen already.
+                let second_mark = format!("{marked}-2");
+                session.person.composes(
+                    &format!(
+                        "({second_mark}) Use your shell tool to run exactly this command and \
+                         nothing else: {second_command}"
+                    ),
+                    &second_mark,
+                );
+                let _ = session.person.dialog_names(&real.account, &second_command);
+                let second_pending = pending_approval(ctx, &fresh, session);
+                session
+                    .person
+                    .window
+                    .type_text(real.account.approval.deny.as_bytes());
+                session.person.stops_seeing(
+                    &real.account.approval.shows,
+                    "the local terminal's refusal closes the second dialog",
+                );
+                let now = ctx.binding(&fresh, session.session_id(), instance);
+                let device_refused = ctx
+                    .answers(
+                        &fresh,
+                        session.session_id(),
+                        instance,
+                        &now,
+                        second_pending.resource_id,
+                        ACCEPT,
+                    )
+                    .is_err();
+                let mut second_reader = second_pipe.reader(ctx);
+                until_the_turn_ends(ctx, &fresh, session, instance, &mut second_reader);
+                let control_ran = runs_of(&second_reader, &second).0;
+                let decided_control = recorded_answers(ctx, real, &marked, decided + 1);
+                let control = one_answer_reached_the_server(
+                    decided_control - decided,
+                    Some(control_ran),
+                    true,
+                );
+                assert!(
+                    control.is_err() && control_ran == 0 && device_refused,
+                    "the check fails once the local terminal alone answered: {control:?}; the \
+                     command ran {control_ran} time(s) and the device's answer was refused: \
+                     {device_refused}"
+                );
+                serde_json::json!({
+                    "arm": arm(ctx),
+                    "answers_in_the_record": decided,
+                    "command_ran": ran,
+                    "device_answer": match &answered {
+                        Ok(done) => format!("{:?}", done.state),
+                        Err(refusal) => format!("refused: {refusal:?}"),
+                    },
+                    "device_won": device_carried,
+                    "control": {
+                        "what": "a second approval answered by the local terminal alone",
+                        "breaks_property": true,
+                        "command_ran": control_ran,
+                        "device_refused": device_refused,
+                        "check": control.err(),
+                    },
+                })
+            }
+        }
+    });
+}
+
+#[test]
+fn a_second_answer_or_a_run_the_carried_answer_does_not_explain_fails_the_check_of_part_3() {
+    assert!(one_answer_reached_the_server(1, None, true).is_ok());
+    assert!(one_answer_reached_the_server(1, None, false).is_ok());
+    assert!(one_answer_reached_the_server(2, None, true).is_err());
+    assert!(one_answer_reached_the_server(0, None, false).is_err());
+    assert!(one_answer_reached_the_server(1, Some(1), true).is_ok());
+    assert!(one_answer_reached_the_server(1, Some(0), false).is_ok());
+    assert!(one_answer_reached_the_server(1, Some(0), true).is_err());
+    assert!(one_answer_reached_the_server(1, Some(1), false).is_err());
+    assert!(one_answer_reached_the_server(1, Some(2), true).is_err());
+}
+
+#[test]
+fn an_answer_typed_again_after_the_device_connected_again_fails_the_check_of_part_3() {
+    assert!(nothing_typed_again((1, Some(1)), (1, Some(1)), 0).is_ok());
+    assert!(nothing_typed_again((1, None), (1, None), 0).is_ok());
+    assert!(nothing_typed_again((1, None), (2, None), 0).is_err());
+    assert!(nothing_typed_again((1, Some(1)), (1, Some(2)), 0).is_err());
+    assert!(nothing_typed_again((1, Some(1)), (1, Some(1)), 1).is_err());
+}
+
+#[test]
+fn the_two_approval_markers_are_as_long_as_each_other_and_differ() {
+    let (first, second) = approval_markers("kr0123456789ab");
+    assert_eq!(first.len(), second.len());
+    assert_ne!(first, second);
 }
