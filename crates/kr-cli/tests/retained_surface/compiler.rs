@@ -1999,6 +1999,37 @@ pub fn check_written(
     Ok(())
 }
 
+/// Whether the reports of the platforms hold, for each platform that must be among them, every tag that
+/// the record is made for: the texts that refuse them, none when they do. Reports with no tag, or
+/// without a tag of one platform, are refused: a record of nothing is never a pass.
+pub fn inputs_short(
+    expected: &[(String, String)],
+    by_tag: &BTreeMap<String, Vec<Platform>>,
+    required: &[&str],
+) -> Vec<String> {
+    if expected.is_empty() {
+        return vec![refusal::no_tag_selected()];
+    }
+    let mut problems = Vec::new();
+    for need in required {
+        let count = expected
+            .iter()
+            .filter(|(tag, _)| {
+                by_tag
+                    .get(tag)
+                    .is_some_and(|read| read.iter().any(|platform| platform.name == *need))
+            })
+            .count();
+        if count < expected.len() {
+            problems.push(format!(
+                "{need}: {}",
+                refusal::tags_short(count, expected.len())
+            ));
+        }
+    }
+    problems
+}
+
 /// Copies the files that Git tracks in the checkout `repository`, as they are now, into `dest`.
 pub fn copy_checkout(repository: &Path, dest: &Path) -> Result<(), String> {
     let output = Command::new("git")

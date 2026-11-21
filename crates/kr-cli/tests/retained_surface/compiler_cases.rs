@@ -1009,6 +1009,67 @@ fn a_report_that_holds_fewer_tags_than_the_selection_is_refused_with_the_text() 
     );
 }
 
+#[test]
+fn reports_with_no_tag_or_without_a_tag_of_a_platform_are_refused_with_the_text() {
+    use std::collections::BTreeMap;
+    let expected = releases_named(&["packages/v1", "packages/v2", "packages/v3"]);
+    let read = |platform: &str, tag: &str| Platform {
+        name: platform.to_owned(),
+        tag: tag.to_owned(),
+        commit: format!("commit-of-{tag}"),
+        ..Platform::default()
+    };
+    let mut by_tag: BTreeMap<String, Vec<Platform>> = BTreeMap::new();
+    for platform in ["linux", "macos"] {
+        for (tag, _) in &expected {
+            by_tag
+                .entry(tag.clone())
+                .or_default()
+                .push(read(platform, tag));
+        }
+    }
+    let both = ["linux", "macos"];
+    assert_eq!(
+        compiler::inputs_short(&expected, &by_tag, &both),
+        Vec::<String>::new()
+    );
+    // Reports with no tag at all.
+    assert_eq!(
+        compiler::inputs_short(&expected, &BTreeMap::new(), &both),
+        [
+            "linux: the reading wrote 0 of the 3 release tags it selected, so it is not complete",
+            "macos: the reading wrote 0 of the 3 release tags it selected, so it is not complete",
+        ]
+    );
+    // A tag that one platform lacks.
+    by_tag
+        .get_mut("packages/v2")
+        .expect("a tag")
+        .retain(|platform| platform.name != "macos");
+    assert_eq!(
+        compiler::inputs_short(&expected, &by_tag, &both),
+        ["macos: the reading wrote 2 of the 3 release tags it selected, so it is not complete"]
+    );
+    // A tag that no report holds; a platform that is not required is not counted.
+    by_tag.remove("packages/v3");
+    assert_eq!(
+        compiler::inputs_short(&expected, &by_tag, &both),
+        [
+            "linux: the reading wrote 2 of the 3 release tags it selected, so it is not complete",
+            "macos: the reading wrote 1 of the 3 release tags it selected, so it is not complete",
+        ]
+    );
+    assert_eq!(
+        compiler::inputs_short(&expected, &by_tag, &["linux"]),
+        ["linux: the reading wrote 2 of the 3 release tags it selected, so it is not complete"]
+    );
+    // No tag selected.
+    assert_eq!(
+        compiler::inputs_short(&[], &by_tag, &both),
+        [refusal::no_tag_selected()]
+    );
+}
+
 /// The sightings of this checkout by this machine's platform, in the file that
 /// `KR_COMPILER_SIGHTINGS` names, and printed. Run by hand with `--show-output`: it stamps a copy of
 /// this checkout and builds it, which takes minutes.
@@ -1120,8 +1181,10 @@ fn a_platform_reads_each_release_tag_and_writes_its_report() {
 }
 
 /// The record of each release tag from the reports of the platforms in the files `KR_COMPILER_REPORTS`
-/// names (separated by `:`), each tag's own tree read again for its items and its tokens. A tag
-/// that a refusal stops is named with its texts and fails the case. The lines go to the file
+/// names (separated by `:`), each tag's own tree read again for its items and its tokens. The tags are
+/// every release tag, or the ones `KR_COMPILER_TAGS` names: reports that lack one of them for a
+/// platform that is required (`KR_COMPILER_REQUIRED`) are refused. A tag that a refusal stops is
+/// named with its texts and fails the case. The lines go to the file
 /// `KR_COMPILER_RECORD` names, and the difference from the committed record is printed, by item and
 /// kind, with the number of tags it holds for.
 #[test]
@@ -1147,13 +1210,17 @@ fn the_reports_of_the_platforms_give_the_record_of_each_release_tag() {
         }
     }
     let releases = super::releases::inventory(&repository).expect("the releases");
-    let mut tags: Vec<(String, String)> = releases
+    let all: Vec<(String, String)> = releases
         .iter()
-        .filter(|release| by_tag.contains_key(&release.tag))
         .map(|release| (release.tag.clone(), release.commit.clone()))
         .collect();
+    let named = std::env::var("KR_COMPILER_TAGS").ok();
+    let mut tags =
+        compiler::select_tags(&all, named.as_deref(), None).unwrap_or_else(|text| panic!("{text}"));
     tags.sort();
     let required: Vec<&str> = required.iter().map(String::as_str).collect();
+    let short = compiler::inputs_short(&tags, &by_tag, &required);
+    assert!(short.is_empty(), "{}", short.join("\n"));
     let results = super::history::in_threads_of_their_own(tags.clone(), 4, |(tag, commit)| {
         let folder = tempfile::tempdir().map_err(|error| vec![error.to_string()])?;
         compiler::unpack_commit(&repository, &commit, folder.path())
