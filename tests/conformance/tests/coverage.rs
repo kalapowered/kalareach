@@ -94,7 +94,8 @@ fn names(root: &Path, directory: &str) {
 }
 
 /// The workspace `variants`: `p` has features, targets that need them, a dev-dependency on itself,
-/// and targets with a `bench` key; `r` has a dev-dependency on itself that leaves its default
+/// and targets with a `bench` key, written as TOML allows (single quotes, a spaced header, a quoted
+/// key); `r` has a dev-dependency on itself that leaves its default
 /// features off; `q` has no feature.
 fn variants(root: &Path, directory: &str) {
     write(
@@ -117,6 +118,9 @@ fn variants(root: &Path, directory: &str) {
              [[test]]\nname = \"needg\"\npath = \"tests/needg.rs\"\nrequired-features = [\"g\"]\n\n\
              [[test]]\nname = \"v\"\npath = \"tests/v.rs\"\ntest = false\nbench = true\n\n\
              [[test]]\nname = \"w\"\npath = \"tests/w.rs\"\nbench = true\n\n\
+             [[test]]\nname = 'sq'\npath = 'tests/sq.rs'\nbench = true\n\n\
+             [[ test ]]\nname = \"sp\"\npath = \"tests/sp.rs\"\nbench = true\n\n\
+             [[test]]\nname = \"qk\"\npath = \"tests/qk.rs\"\n\"bench\" = true\n\n\
              [[bench]]\nname = \"m\"\npath = \"benches/m.rs\"\nharness = false\n\n\
              [[bench]]\nname = \"nb\"\npath = \"benches/nb.rs\"\nharness = false\nbench = false\n\n\
              [[example]]\nname = \"g\"\npath = \"examples/g.rs\"\nbench = true\n",
@@ -125,7 +129,9 @@ fn variants(root: &Path, directory: &str) {
     write(root, &format!("{directory}/p/src/lib.rs"), LIB);
     write(root, &format!("{directory}/p/src/bin/x.rs"), MAIN);
     write(root, &format!("{directory}/p/src/bin/y.rs"), MAIN);
-    for test in ["t1", "off", "needf", "needs", "needd", "needg", "v", "w"] {
+    for test in [
+        "t1", "off", "needf", "needs", "needd", "needg", "v", "w", "sq", "sp", "qk",
+    ] {
         write(root, &format!("{directory}/p/tests/{test}.rs"), TEST);
     }
     for bench in ["m", "nb"] {
