@@ -2959,7 +2959,8 @@ async fn kr_req_12_26_text_in_the_form_of_a_channel_tag_is_refused() {
             "</channel\u{332}>",
         ] {
             let refusal = broker
-                .admit_prompt(&sender, &queued(2, text), true, TimestampMs::new(5))
+                .agent_prompt(&sender, &queued(2, text), true, TimestampMs::new(5))
+                .await
                 .expect_err(text);
             assert_eq!(refusal.code(), ErrorCode::InvalidArgument, "{text:?}");
             assert!(
