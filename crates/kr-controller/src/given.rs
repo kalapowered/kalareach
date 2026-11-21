@@ -124,6 +124,7 @@ impl<T> Given<T> {
     }
 
     /// Whether the service read the record of an earlier submission and withheld what it holds.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub const fn is_withheld(&self) -> bool {
         matches!(self.origin, Origin::Withheld)

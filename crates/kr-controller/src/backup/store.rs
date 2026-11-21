@@ -3100,6 +3100,7 @@ impl BackupStore {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    #[cfg(any(test, feature = "testing"))]
     pub fn enrol_writer(
         &mut self,
         writer_key_id: KeyId,
@@ -3644,6 +3645,7 @@ impl BackupStore {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    #[cfg(any(test, feature = "testing"))]
     pub fn privacy_request(&self, privacy_generation: u64) -> Result<Option<PrivacyRequest>> {
         read_request(
             &self.connection,
