@@ -38,30 +38,36 @@ fn the_connection_event_is_told_only_by_the_publisher() {
     for (path, text) in sources("src") {
         for (number, line) in text.lines().enumerate() {
             if line.contains("CONNECTION_EVENT") && !line.trim_start().starts_with("//") {
-                told.push(format!("{}:{}", path.display(), number + 1));
+                told.push((path.clone(), number + 1));
             }
         }
     }
-    let outside: Vec<&String> = told
+    // A path is read by its components, which hold where the platform's separator is a backslash.
+    let outside: Vec<String> = told
         .iter()
-        .filter(|place| !place.contains("src/contact.rs") && !place.contains("src/connection.rs"))
+        .filter(|(path, _)| {
+            !path.ends_with("src/contact.rs") && !path.ends_with("src/connection.rs")
+        })
+        .map(|(path, number)| format!("{}:{number}", path.display()))
         .collect();
     assert!(
         outside.is_empty(),
         "the event is named outside its publisher: {outside:?}"
     );
-    let in_connection: Vec<&String> = told
+    let in_connection: Vec<String> = told
         .iter()
-        .filter(|place| place.contains("src/connection.rs"))
+        .filter(|(path, _)| path.ends_with("src/connection.rs"))
+        .map(|(path, number)| format!("{}:{number}", path.display()))
         .collect();
     assert_eq!(
         in_connection.len(),
         1,
         "connection.rs only defines the event's name: {in_connection:?}"
     );
-    let emits: Vec<&String> = told
+    let emits: Vec<String> = told
         .iter()
-        .filter(|place| place.contains("src/contact.rs"))
+        .filter(|(path, _)| path.ends_with("src/contact.rs"))
+        .map(|(path, number)| format!("{}:{number}", path.display()))
         .collect();
     assert!(
         emits.len() <= 3,
