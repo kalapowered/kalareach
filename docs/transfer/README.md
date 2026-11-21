@@ -746,7 +746,8 @@ published upload keeps its handle and is never cancelled; one the host still rec
 the copy is kept and its digest is the declared one, and otherwise the person is told it cannot
 resume and offers to cancel it; one the host does not know is dropped with its copy. A
 reservation whose answer never came cannot be found again, because the client holds no transfer
-identifier for it: the host keeps the place until its 24-hour sweep, and the person is told so.
+identifier for it: if the host agreed, it keeps the place until its 24-hour sweep, and the person is
+told so.
 A copy is removed when its upload is published, cancelled or dropped. An older release ignores the
 folder.
 
@@ -755,7 +756,9 @@ the draft identifier, the last revision and the files bound to it. The draft is 
 bind and never before. Each answer rewrites the kept revision before the next call uses it, and a
 stale revision (`DRAFT_CONFLICT`) is read from the host's own words and the call goes on once. The
 text of the draft is set with `draft.update` at that revision (`draft_set_text`), because the prompt
-that names a draft carries no text of its own, and a prompt that names the draft ends the entry.
+that names a draft carries no text of its own. A prompt that names the draft ends the entry only
+when the host performed it, with a result or a receipt that says applied; an outcome nobody knows
+leaves the entry, and the files bound to it, as they were.
 `draft.discard` ends the draft when the composer drops its files unsent (`draft_end`); the host
 cannot take one file off a draft.
 

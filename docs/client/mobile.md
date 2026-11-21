@@ -229,8 +229,8 @@ host's own words.
 **After a restart** the application reads the host's record of each kept upload before it does
 anything else. A card appears on the session it was for for each one that is still open: one the
 host still receives resumes where it stopped, one whose kept copy is gone or changed says it cannot
-resume and offers Cancel, one whose reservation was never answered says that the host keeps the
-place for up to 24 hours and then releases it, and one that was published and not added shows
+resume and offers Cancel, one whose reservation was never answered says that, if the host agreed,
+it keeps the place for up to 24 hours and then releases it, and one that was published and not added shows
 **Add to draft**.
 
 **The draft.** The host keeps one draft for the phone for each session, made when the first file
