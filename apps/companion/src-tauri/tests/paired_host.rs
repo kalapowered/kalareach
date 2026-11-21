@@ -3717,6 +3717,82 @@ async fn a_host_replaced_at_the_same_endpoint_loses_its_row_cache_and_connection
     v.stop().await;
 }
 
+/// A pass that listed the host under one pairing, and goes on to visit it after the host was
+/// forgotten and paired again, under another pairing that a visit has read since, changes nothing:
+/// the current record, its read and its connection stand, and no revision is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_listing_leaves_the_current_record_alone() {
+    let v = visiting().await;
+    let device = v.companion().device();
+    let current = device.host_by_reference(&v.a_ref).expect("A is listed");
+    let earlier = kr_client::pairing::paired::PairedHost {
+        device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+        ..current.clone()
+    };
+    device
+        .pairing()
+        .hosts
+        .record(earlier)
+        .expect("A is listed under the earlier pairing");
+    let mut passes = v.companion().inbox().watch_passes();
+    let old = v.pass();
+    let hold = tokio::time::timeout(WATCHDOG, passes.recv())
+        .await
+        .expect("the old pass reaches the hold")
+        .expect("a hold");
+
+    // The host is forgotten and paired again, and a new pass reads it under the current pairing.
+    v.companion()
+        .call("hosts_forget", json!({ "reference": v.a_ref }))
+        .expect("A is forgotten");
+    device
+        .pairing()
+        .hosts
+        .record(current)
+        .expect("A is paired again");
+    let fresh = v.pass();
+    tokio::time::timeout(WATCHDOG, passes.recv())
+        .await
+        .expect("the new pass reaches the hold")
+        .expect("a hold")
+        .release();
+    let fresh = fresh.await.expect("ran").expect("answered");
+    let serial = row_of(&fresh, &v.a_ref).expect("A's row")["read_serial"].clone();
+    assert!(
+        serial.is_u64(),
+        "A was read under the current pairing: {fresh}"
+    );
+    let revision = v
+        .companion()
+        .call("connection_state", json!({}))
+        .expect("the connection's state")["revision"]
+        .clone();
+    let endpoint = v.a.network().endpoint_id();
+    let asked = v.control.asked_of(&endpoint);
+
+    hold.release();
+    drop(passes);
+    let answered = old.await.expect("ran").expect("answered");
+    assert_eq!(
+        row_of(&answered, &v.a_ref).map(|row| row["read_serial"].clone()),
+        Some(serial),
+        "the stale listing did not read A again: {answered}"
+    );
+    assert_eq!(
+        v.companion()
+            .call("connection_state", json!({}))
+            .expect("the connection's state")["revision"],
+        revision,
+        "no revision"
+    );
+    assert_eq!(
+        v.control.asked_of(&endpoint),
+        asked,
+        "no connection was asked for"
+    );
+    v.stop().await;
+}
+
 /// A visit that found the host's record to be of another pairing, and verified the listing again,
 /// is held before it replaces the record while the host is chosen and reached under the pairing it
 /// was listed with: the replace is refused, and nothing changes: not the record, not the
