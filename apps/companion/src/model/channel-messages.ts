@@ -90,11 +90,20 @@ export class ChannelShelf {
   #withText = false
   #reads = 0
   #pages = 0
-  /** The book's first read, while it has not ended: no read of the shelf starts before it ends. */
-  #first: Promise<void> | null = null
+  /** True once the book's first read of the drafts has ended: until then no read of the shelf starts. */
+  #open = false
+  #opens: () => void = () => undefined
+  /** The gate of that first read: closed when the shelf is made, whoever asks for a read first. */
+  readonly #gate: Promise<void>
 
   constructor(port: HostPort) {
     this.#port = port
+    this.#gate = new Promise<void>((resolve) => {
+      this.#opens = () => {
+        this.#open = true
+        resolve()
+      }
+    })
   }
 
   subscribe = (listener: () => void): (() => void) => {
@@ -107,20 +116,15 @@ export class ChannelShelf {
   snapshot = (): ShelfSnapshot => this.#state
 
   /**
-   * Holds every read of the shelf, whoever asks for it, until `first` has ended whether or not it
-   * worked: what the shelf says about the messages and what the book says about the drafts are one
-   * moment's, so the shelf is never read before the drafts are. A read asked for while it waits
-   * begins when it ends, and only the newest of them is made.
+   * Opens the gate when `first`, the book's first read of the drafts, has ended whether or not it
+   * worked. The shelf is made with the gate closed and holds every read, whoever asks for it and in
+   * whatever order the window's parts start, until then: what the shelf says about the messages and
+   * what the book says about the drafts are one moment's, so the shelf is never read before the
+   * drafts are. A read asked for while the gate is closed begins when it opens, and only the newest
+   * of them is made.
    */
   after(first: Promise<unknown>): void {
-    const held = first.then(
-      () => undefined,
-      () => undefined
-    )
-    this.#first = held
-    void held.then(() => {
-      if (this.#first === held) this.#first = null
-    })
+    void first.then(this.#opens, this.#opens)
   }
 
   /**
@@ -147,7 +151,7 @@ export class ChannelShelf {
   async refresh(): Promise<void> {
     this.#reads += 1
     const mine = this.#reads
-    if (this.#first !== null) await this.#first
+    if (!this.#open) await this.#gate
     if (mine !== this.#reads) return
     const withText = this.#withText
     let listed: ChannelMessageList
