@@ -1772,7 +1772,7 @@ impl Installer {
         except: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
         #[cfg(test)]
-        holders_pause::run(path);
+        scan_pause::run(path);
         Ok(self
             .claims_on(path, key, except)?
             .into_iter()
@@ -1962,11 +1962,21 @@ impl Installer {
         created_document: bool,
         params: &AgentToolsParams,
     ) -> Result<EntryPlan> {
+        // The records are scanned before the document is read, and what the scan gave, a result or
+        // an error, is used only once the entry is found present and unchanged: so the scan lies
+        // before the read and not between the read and the act, and the reasons and the errors
+        // come in the order they did.
+        let others = self.record_source(params).and_then(|source| {
+            let own = source.unwrap_or_else(|| self.record_path(params));
+            self.holders(path, key, &digest, Some(&own))
+        });
         // The document is read once: the entry is checked, and the digest and the edit are taken,
         // from these same bytes, so a change made between two reads is never acted on.
         let Some(text) = self.fs.read_text(path)? else {
             return Ok(EntryPlan::Keep("it is already gone".to_owned()));
         };
+        #[cfg(test)]
+        holders_pause::run(path);
         let Some(present) = Self::entry_digest_in(&text, path, key)? else {
             return Ok(EntryPlan::Keep("it is already gone".to_owned()));
         };
@@ -1980,10 +1990,7 @@ impl Installer {
         // record claims it. This record is excluded by the file it is read from, which an earlier
         // build may have named otherwise, and not by counting, because a count cannot tell this
         // record from somebody else's when its own file has already gone.
-        let own = self
-            .record_source(params)?
-            .unwrap_or_else(|| self.record_path(params));
-        let others = self.holders(path, key, &digest, Some(&own))?;
+        let others = others?;
         if !others.is_empty() {
             return Ok(EntryPlan::Keep(format!(
                 "{} other installation(s) on this host still use it; {} at {} scope was removed \
@@ -3283,6 +3290,43 @@ fn entry_command_of(running: Option<&kr_ipc::install::Running>) -> String {
 /// between. `once(skip, then)` runs `then` at the call after `skip` calls have passed.
 #[cfg(test)]
 mod holders_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static AT: RefCell<Option<(usize, Then)>> = const { RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    pub(super) fn once(skip: usize, then: impl FnOnce(&Path) + 'static) {
+        AT.with(|at| *at.borrow_mut() = Some((skip, Box::new(then))));
+    }
+
+    pub(super) fn run(path: &Path) {
+        let due = AT.with(|at| {
+            let mut at = at.borrow_mut();
+            match at.take() {
+                Some((0, then)) => Some(then),
+                Some((left, then)) => {
+                    *at = Some((left - 1, then));
+                    None
+                }
+                None => None,
+            }
+        });
+        if let Some(then) = due {
+            then(path);
+        }
+    }
+}
+
+/// What the unit tests run while a removal scans the records for the holders of an entry, to make
+/// the change another process could make during the scan. `once(skip, then)` runs `then` at the call
+/// after `skip` calls have passed.
+#[cfg(test)]
+mod scan_pause {
     use std::cell::RefCell;
     use std::path::Path;
 
@@ -7939,6 +7983,36 @@ mod tests {
             &params(amp(), InstallScope::User),
             &document,
             &removed,
+        );
+    }
+
+    /// KR-REQ-11.01: a setting another process writes while the removal of a compiled agent scans
+    /// the records is kept: the scan comes before the one read of the document, not between that
+    /// read and the act.
+    #[cfg(unix)]
+    #[test]
+    fn a_setting_written_while_the_records_are_scanned_is_kept_by_the_removal_of_a_compiled_agent()
+    {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::CODEX, InstallScope::User);
+        installer.install(&params).expect("installs");
+        let config = tree.home().join(".codex/config.toml");
+        let at = config.clone();
+        scan_pause::once(1, move |_| {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, format!("model = \"another\"\n{text}"))
+                .expect("another process writes a setting");
+        });
+        installer.remove(&params).expect("removes");
+        let text = std::fs::read_to_string(&config).expect("the document stays");
+        assert!(
+            text.contains("model = \"another\""),
+            "the setting written during the scan is kept: {text}"
+        );
+        assert!(
+            !text.contains("agent-tools"),
+            "and the entry is taken: {text}"
         );
     }
 
