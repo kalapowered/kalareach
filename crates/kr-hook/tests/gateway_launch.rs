@@ -1072,8 +1072,9 @@ fn kr_req_07_60_a_server_whose_record_cannot_be_written_is_not_left_running() {
 /// The bind is the last step of a start that has the worker's own window to itself, counted from its
 /// read of the launcher's "going", so a start that uses that window up leaves no time to write the
 /// refusal; this case fails then, by its own words. The launcher counts from before it wrote
-/// "going", so it can have stopped waiting first: the case holds what the worker wrote, not that
-/// the launcher was still waiting.
+/// "going", so it can have stopped waiting first, and the worker's own window cannot promise that
+/// the launcher still waits: this case requires that the refusal reached the launcher before its
+/// deadline, and the worker's local write bound is held by the paused-clock case of its library.
 #[test]
 fn kr_req_12_07_a_gateway_that_cannot_bind_tells_the_launcher_why() {
     let shell = Gateway::new();
@@ -1153,13 +1154,19 @@ fn kr_req_12_07_a_backend_whose_bind_failed_leaves_what_stands_at_gw_sock() {
         );
         // The next line of the session ends this one, and the backend the launch gave back is
         // retired: its directory's files go, and a socket it did not make stays.
+        let old_line = shell.generation.load(std::sync::atomic::Ordering::SeqCst) - 1;
         let _next = shell
             .establish(&["codex"])
             .expect("the next line's backend is established");
-        assert!(
-            !directory.join("launch").exists(),
-            "{case}: the first backend was retired"
-        );
+        // A launcher that stopped on the refusal can be ahead of the rollback, which then retires
+        // the backend itself: the record goes first, and ending the old line once more returns
+        // after the retirement that is left.
+        eventually("the first backend's record was removed", || {
+            !directory.join("launch").exists()
+        });
+        shell
+            .backends
+            .line_ended(kr_protocol::root::PromptGeneration::new(old_line));
         let left = std::fs::symlink_metadata(&socket);
         assert!(
             left.is_ok(),
@@ -1216,6 +1223,8 @@ fn kr_req_12_07_a_retired_backend_removes_its_own_sockets_and_leaves_what_replac
             &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
         );
         launched.prints("TUI: turn/completed");
+        let started = shell.announcement();
+        assert!(!started.instance.ended_at.is_present(), "{started:?}");
         assert!(
             std::fs::symlink_metadata(&bridge).is_ok()
                 && std::fs::symlink_metadata(&gateway).is_ok(),
@@ -1227,9 +1236,19 @@ fn kr_req_12_07_a_retired_backend_removes_its_own_sockets_and_leaves_what_replac
         // The program ends, and the instance and the backend end with it.
         let _ = launched.child.kill();
         let _ = launched.ends();
-        eventually("the backend was retired", || {
-            !directory.join("launch").exists()
-        });
+        // The supervision retires the backend, files and sockets, before it announces the
+        // instance ended: the sockets are read after that announcement and not before.
+        let ended = shell.announcement();
+        assert!(
+            ended.instance.ended_at.is_present()
+                && ended.instance.application_instance_id
+                    == started.instance.application_instance_id,
+            "{ended:?}"
+        );
+        assert!(
+            !directory.join("launch").exists(),
+            "the backend was retired: {ended:?}"
+        );
         if others.is_some() {
             assert!(
                 std::os::unix::net::UnixStream::connect(&gateway).is_ok(),
