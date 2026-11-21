@@ -33,7 +33,7 @@ interface Line {
 }
 
 /** Links and controls in a row, with random widths and gaps (some gaps none), in a column that is at times no wider than the row. */
-function lineOf(seed: number): Line {
+function lineOf(seed: number, rows = 1): Line {
   const next = generator(seed)
   const between = (low: number, high: number): number => low + Math.floor(next() * (high - low + 1))
   const count = between(2, 5)
@@ -51,7 +51,11 @@ function lineOf(seed: number): Line {
   const column = { left: next() < 0.4 ? first : Math.max(0, first - between(0, 14)), right: next() < 0.4 ? last : last + between(0, 14) }
   return {
     column,
-    items: boxes.map((box) => ({ box: { left: box.left, top: 0, right: box.right, bottom: HIGH }, link: !box.control, column }))
+    items: boxes.map((box) => {
+      // On two lines every box reaches every other's height, and none is on the same line as one a few px lower.
+      const top = rows === 2 && next() < 0.5 ? 5 : 0
+      return { box: { left: box.left, top, right: box.right, bottom: top + HIGH }, link: !box.control, column }
+    })
   }
 }
 
@@ -90,43 +94,70 @@ function bestCount(line: Line): number {
   return best
 }
 
+/** Packs `line` and checks it against the search: no box past the column or across another, and as many completed as the best assignment completes. */
+function verify(line: Line, label: string, slack = 0): { completed: number; best: number; shortLinks: number } {
+  const rooms = packRooms(line.items, LEAST, slack)
+  const boxes = line.items.map((item, index) => {
+    const room = rooms[index] ?? { left: 0, right: 0 }
+    return { left: item.box.left - room.left, right: item.box.right + room.right }
+  })
+  const where = `${label}: ${JSON.stringify(line.items.map((item) => [item.link ? 'link' : 'control', item.box.left, item.box.right, item.box.top]))} in ${JSON.stringify(line.column)}`
+  line.items.forEach((item, index) => {
+    const box = boxes[index]
+    expect(box.left, `${where}: the box of item ${String(index)} past the column`).toBeGreaterThanOrEqual(Math.min(line.column.left, item.box.left))
+    expect(box.right, `${where}: the box of item ${String(index)} past the column`).toBeLessThanOrEqual(Math.max(line.column.right, item.box.right))
+    if (!item.link) expect(rooms[index], `${where}: a control with room`).toEqual({ left: 0, right: 0 })
+  })
+  for (let first = 0; first < boxes.length; first += 1) {
+    for (let second = first + 1; second < boxes.length; second += 1) {
+      const a = boxes[first]
+      const b = boxes[second]
+      expect(a.right <= b.left || b.right <= a.left, `${where}: boxes ${String(first)} and ${String(second)} cross`).toBe(true)
+    }
+  }
+  const completed = line.items.filter((item, index) => {
+    const box = boxes[index]
+    return item.link && box.right - box.left >= LEAST && item.box.right - item.box.left < LEAST
+  }).length
+  const best = bestCount(line)
+  expect(completed, `${where}: links completed by the packing, against the most that any assignment completes`).toBe(best)
+  return { completed, best, shortLinks: line.items.filter((item) => item.link && item.box.right - item.box.left < LEAST).length }
+}
+
+/** A line of links at `words` (left, right), in a column. */
+const fixed = (words: readonly (readonly [number, number])[], column: { left: number; right: number }): Line => ({
+  column,
+  items: words.map(([left, right]) => ({ box: { left, top: 0, right, bottom: HIGH }, link: true, column }))
+})
+
 describe('the packing of a line', () => {
   it('completes as many short links as any assignment of non-overlapping boxes does, and no box crosses another, in 600 random lines', () => {
     let crowded = 0
     let completable = 0
     for (let seed = 1; seed <= 600; seed += 1) {
-      const line = lineOf(seed)
-      const rooms = packRooms(line.items, LEAST, 0)
-      const boxes = line.items.map((item, index) => {
-        const room = rooms[index] ?? { left: 0, right: 0 }
-        return { left: item.box.left - room.left, right: item.box.right + room.right }
-      })
-      const label = `line ${String(seed)}: ${JSON.stringify(line.items.map((item) => [item.link ? 'link' : 'control', item.box.left, item.box.right]))} in ${JSON.stringify(line.column)}`
-      line.items.forEach((item, index) => {
-        const box = boxes[index]
-        expect(box.left, `${label}: the box of item ${String(index)} past the column`).toBeGreaterThanOrEqual(Math.min(line.column.left, item.box.left))
-        expect(box.right, `${label}: the box of item ${String(index)} past the column`).toBeLessThanOrEqual(Math.max(line.column.right, item.box.right))
-        if (!item.link) expect(rooms[index], `${label}: a control with room`).toEqual({ left: 0, right: 0 })
-      })
-      for (let first = 0; first < boxes.length; first += 1) {
-        for (let second = first + 1; second < boxes.length; second += 1) {
-          const a = boxes[first]
-          const b = boxes[second]
-          expect(a.right <= b.left || b.right <= a.left, `${label}: boxes ${String(first)} and ${String(second)} cross`).toBe(true)
-        }
-      }
-      const completed = line.items.filter((item, index) => {
-        const box = boxes[index]
-        return item.link && box.right - box.left >= LEAST && item.box.right - item.box.left < LEAST
-      }).length
-      const best = bestCount(line)
-      expect(completed, `${label}: links completed by the packing, against the most that any assignment completes`).toBe(best)
-      const shortLinks = line.items.filter((item) => item.link && item.box.right - item.box.left < LEAST).length
+      const { best, shortLinks } = verify(lineOf(seed), `line ${String(seed)}`)
       if (shortLinks > best) crowded += 1
       if (best >= 2) completable += 1
     }
     // The case is vacuous unless some lines have links that compete for room and some have several that can all be completed.
     expect(crowded, 'lines where no assignment completes every short link').toBeGreaterThan(20)
     expect(completable, 'lines where two or more short links are completed').toBeGreaterThan(100)
+  })
+
+  it('completes as many short links as any assignment does across two lines whose links stand apart, in 600 random layouts', () => {
+    let across = 0
+    for (let seed = 1; seed <= 600; seed += 1) {
+      const line = lineOf(seed + 10_000, 2)
+      verify(line, `layout ${String(seed)}`)
+      if (new Set(line.items.map((item) => item.box.top)).size === 2 && line.items.filter((item) => item.link).length >= 2) across += 1
+    }
+    expect(across, 'layouts that have links on both lines').toBeGreaterThan(200)
+  })
+
+  it('completes the two links that fit where the row has them, whatever the order of the choices of the table (fixed lines)', () => {
+    // The first and the third link are completed (3 to 5 and 16 to 23 with 11 to 13 left short), not the second alone.
+    expect(verify(fixed([[3, 5], [11, 13], [16, 23]], { left: 0, right: 23 }), 'three links').completed).toBe(2)
+    // A skipped middle link leaves its gap whole: the first and the third reach 10 each, the second does not.
+    expect(verify(fixed([[5, 7], [10, 12], [17, 19]], { left: 0, right: 22 }), 'three links in a narrow column').completed).toBe(2)
   })
 })
