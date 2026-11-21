@@ -1246,6 +1246,11 @@ fn a_step_that_ends_in_its_time_is_read_as_a_step_without_a_limit() {
     }
 }
 
+/// The seconds a step of a case waits when nothing ends it: a step that is not ended ends by itself
+/// then, so that a failed case leaves nothing after it.
+#[cfg(unix)]
+const UNENDED: u64 = 61;
+
 /// The step of the plan `time-limits` that waits `seconds` with `sleep`, with `limits`.
 #[cfg(unix)]
 fn waiting(id: &str, seconds: u64, limits: &str) -> String {
@@ -1268,7 +1273,7 @@ fn a_step_that_spends_its_budget_fails_and_each_later_step_of_the_budget_is_not_
     let text = timed_plan(
         "[[budget]]\nid = 'shared'\nseconds = 3\n",
         &[
-            waiting("first", 300, "budget = 'shared'"),
+            waiting("first", UNENDED, "budget = 'shared'"),
             waiting("second", 0, "budget = 'shared'"),
             waiting("free", 0, ""),
         ],
@@ -1304,7 +1309,7 @@ fn a_step_that_spends_its_budget_fails_and_each_later_step_of_the_budget_is_not_
 
 /// KR-REQ-29.01, the part about reproducible commands: a step that comes after a step that took part
 /// of the budget has what is left and not the whole budget. The first of two steps takes 4 of the 10
-/// seconds and passes; the second would take the 300 it waits for, and is ended when the 6 left are
+/// seconds and passes; the second would take the 61 it waits for, and is ended when the 6 left are
 /// spent, which is under the 12 s (the whole budget and the wait that ends the group) it would take
 /// if it had the whole budget.
 #[cfg(unix)]
@@ -1315,7 +1320,7 @@ fn a_step_has_the_time_its_budget_has_left_after_the_steps_before_it() {
         "[[budget]]\nid = 'shared'\nseconds = 10\n",
         &[
             waiting("first", 4, "budget = 'shared'"),
-            waiting("second", 300, "budget = 'shared'"),
+            waiting("second", UNENDED, "budget = 'shared'"),
         ],
     );
     let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
@@ -1356,7 +1361,7 @@ fn a_step_that_names_a_set_up_step_its_budget_stopped_is_not_run_with_the_budget
     let text = timed_plan(
         "[[budget]]\nid = 'shared'\nseconds = 2\n",
         &[
-            waiting("first", 300, "budget = 'shared'"),
+            waiting("first", UNENDED, "budget = 'shared'"),
             set_up,
             waiting("last", 0, "after = ['prepare']"),
             waiting("both", 0, "after = ['prepare']\nbudget = 'shared'"),
@@ -1403,7 +1408,7 @@ fn a_step_that_is_not_run_spends_none_of_its_budget() {
         &[
             set_up,
             waiting("stopped", 0, "after = ['prepare']\nbudget = 'shared'"),
-            waiting("waits", 300, "budget = 'shared'"),
+            waiting("waits", UNENDED, "budget = 'shared'"),
         ],
     );
     let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
@@ -1436,7 +1441,7 @@ fn the_earlier_of_a_steps_timeout_and_its_budget_is_the_end_of_its_time() {
             &[
                 waiting(
                     "first",
-                    300,
+                    UNENDED,
                     &format!("timeout = {timeout}\nbudget = 'shared'"),
                 ),
                 waiting("second", 0, "budget = 'shared'"),
