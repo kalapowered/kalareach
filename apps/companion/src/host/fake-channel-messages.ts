@@ -92,8 +92,8 @@ export class FakeChannelMessageStore {
     }
   }
 
-  /** Makes the next `times` keeps (every keep, by default) refuse with `refusal`, until it is cleared. */
-  refuseKeeps(refusal: { code: string; message: string } | null, times = Infinity): void {
+  /** Makes the next `times` keeps refuse with `refusal`, one by default as a refused write is; `Infinity` refuses every keep until it is cleared. */
+  refuseKeeps(refusal: { code: string; message: string } | null, times = 1): void {
     this.#refuseKeeps = refusal
     this.#refuseKeepsLeft = times
   }
@@ -164,7 +164,7 @@ export class FakeChannelMessageStore {
   setAside(): LedgerSetAside {
     this.calls.push({ kind: 'set-aside' })
     if (this.#refuseSetAside) refuse(this.#refuseSetAside.code, this.#refuseSetAside.message)
-    if (this.#ledger !== 'damaged') refuse('INVALID_ARGUMENT', 'the list of removals is not damaged, so it is not set aside')
+    if (this.#ledger !== 'damaged') refuse('INVALID_ARGUMENT', 'The list of removals is not damaged, so it was not set aside.')
     this.#ledger = 'ok'
     const confirmed = !this.#setAsideUnconfirmed
     this.#setAsideUnconfirmed = false
@@ -188,7 +188,7 @@ export class FakeChannelMessageStore {
   list(withText: boolean): ChannelMessageList {
     this.calls.push({ kind: 'list', withText })
     if (this.#refuseListings) refuse(this.#refuseListings.code, this.#refuseListings.message)
-    if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'the messages kept on this device could not be read')
+    if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'This device could not read or write its channel messages.')
     const entries = [...this.#entries.values()]
     return {
       messages: this.all().map((message) => {
@@ -216,7 +216,7 @@ export class FakeChannelMessageStore {
       if (this.#refuseKeepsLeft <= 0) this.#refuseKeeps = null
       refuse(refusal.code, refusal.message)
     }
-    if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'the messages kept on this device could not be read')
+    if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'This device could not read or write its channel messages.')
     if (request.text === '' || bytesOf(request.text) > MAX_TEXT) {
       refuse('INVALID_ARGUMENT', 'a message is 1 byte to 64 KiB of text')
     }
@@ -240,7 +240,7 @@ export class FakeChannelMessageStore {
       // A file that cannot be read still takes its place: it counts against the bound of entries.
       const places = this.#entries.size + this.#unreadableMessages.layout + this.#unreadableMessages.now
       if (places >= this.#limits.entries || used + sizeOf(entry) > this.#limits.bytes) {
-        refuse('QUOTA_EXCEEDED', 'Channel messages is full: nothing was kept and nothing was removed')
+        refuse('QUOTA_EXCEEDED', 'Channel messages is full. Remove some on the Kept drafts page.')
       }
       this.#entries.set(request.actionId, entry)
       this.#write()
@@ -249,10 +249,12 @@ export class FakeChannelMessageStore {
       this.#stopAfterEntry = false
       refuse('RESOURCE_UNAVAILABLE', 'the process stopped after the message was kept')
     }
+    // A list of removals that cannot be read is never written over: the entry stays, and the keep fails.
+    if (this.#ledger !== 'ok') refuse('LOCAL_FAILURE', 'This device could not read its list of removals.')
     for (const reference of request.drafts) draftStore.markRemoval(reference)
     if (this.#ledgerFaultAfterRename) {
       this.#ledgerFaultAfterRename = false
-      refuse('RESOURCE_UNAVAILABLE', 'the removals cannot be proved durable')
+      refuse('RESOURCE_UNAVAILABLE', 'This device could not read or write its list of removals.')
     }
     if (request.holdId !== null) {
       this.#holds.delete(request.holdId)
@@ -309,7 +311,7 @@ export class FakeChannelMessageStore {
    * an entry ends goes.
    */
   drafts(draftStore: FakeDraftStore): StoredDrafts {
-    if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'the messages kept on this device could not be read')
+    if (this.#unavailable) refuse('STORAGE_UNAVAILABLE', 'This device could not read or write its channel messages.')
     if (this.#flushOwed) {
       this.#flushOwed = false
       refuse('STORAGE_UNAVAILABLE', 'the data directory could not be made durable yet')
