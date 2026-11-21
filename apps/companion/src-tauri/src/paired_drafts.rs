@@ -1059,6 +1059,22 @@ impl Drafts {
         self.write(paired, &file).expect("the entry is kept");
     }
 
+    /// Makes this process's first send of `action` `age` ago, so that a case reaches the end of the
+    /// wait for a lost answer without waiting for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the clock has not run for as long as `age`.
+    pub fn armed_ago_for_test(&self, action: ActionId, age: Duration) {
+        let then = Instant::now()
+            .checked_sub(age)
+            .expect("the clock has run for that long");
+        self.armed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(action.to_string(), then);
+    }
+
     /// Keeps the entry of a made draft whose `draft.discard` went out as `composed` and whose answer
     /// was lost.
     ///
