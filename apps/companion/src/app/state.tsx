@@ -212,10 +212,11 @@ export function AppProvider({
   // The drafts kept on this device are read once, and written as the window is hidden or closed.
   // A write is also made at every change, so these two are a second chance, not the only one.
   useEffect(() => {
-    // The shelf is first read once the book's first read has answered, whether or not it worked, so
-    // that what the shelf says about the messages and what the book says about the drafts are one
-    // moment's. It is read again at each later read of the drafts and when the window shows again.
-    void drafts.hydrate().then(() => channelMessages.refresh())
+    // The shelf is read once the book's first read has answered, whether or not it worked, and no
+    // read of it, from the page or the window showing again, starts before: the shelf holds each
+    // one until then. It is read again at the end of each later read of the drafts.
+    channelMessages.after(drafts.hydrate())
+    void channelMessages.refresh()
     const reread = drafts.onReloaded(() => {
       void channelMessages.refresh()
     })
