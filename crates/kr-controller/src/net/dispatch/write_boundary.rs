@@ -869,6 +869,16 @@ fn member(
     (organisation, grant, connection, asked)
 }
 
+/// Whether the cell still publishes the snapshot that `bound` was decided under, read now, and it
+/// still holds.
+fn holds_as_decided(
+    bound: &HeldBound,
+    now: kr_transport::clock::ContinuousInstant,
+    utc_ms: u64,
+) -> Stands {
+    bound.holds_as_decided_in(&bound.published(), now, utc_ms)
+}
+
 /// Runs the frame gate's check of `under` by `judge` on a thread of its own, and fails the test
 /// when it has not answered within [`WAIT_BOUND`].
 fn gate(
@@ -964,7 +974,7 @@ async fn a_frame_gate_reads_one_snapshot_and_never_waits_for_its_writer() {
         "after the swap it reads the renewal"
     );
     assert!(
-        !gate(&controller, &under, HeldBound::holds_as_decided),
+        !gate(&controller, &under, holds_as_decided),
         "and a batch decided under the old snapshot is decided again"
     );
     finish.send(()).expect("the writer waits");
