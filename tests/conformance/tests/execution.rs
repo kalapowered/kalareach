@@ -1581,7 +1581,7 @@ fn marking_plan(mark: &Path) -> String {
     timed_plan("", &[timed_step("mark", "exit", &command, "timeout = 5")])
 }
 
-/// KR-REQ-29.01, the part about reproducible commands: on Linux, a run with a time limit under a
+/// On Linux, a run with a time limit under a
 /// parent that ignores `SIGCHLD` is refused before any step, because the system reaps the children
 /// of such a process as they end, and the report's signals at a deadline could then reach a group
 /// that is not the step's. The mark that the step would write is not there. A program whose
@@ -1611,7 +1611,7 @@ fn a_run_with_a_time_limit_is_refused_under_a_parent_that_ignores_sigchld() {
     assert!(!mark.exists(), "a step ran");
 }
 
-/// KR-REQ-29.01, the part about reproducible commands: the control of the case above: under a
+/// The control of the case above: under a
 /// parent that does not ignore `SIGCHLD` the same run starts its step, and the mark is there.
 #[cfg(unix)]
 #[test]
