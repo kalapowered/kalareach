@@ -2784,23 +2784,6 @@ impl WorkflowStore {
         })
     }
 
-    /// Loads or creates a causal budget for a causal root, one a new root inherits section 25's
-    /// defaults and no managed allowance into.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when the row cannot be read or written.
-    pub fn get_or_create_budget(&self, root_id: CausalRootId, now_ms: u64) -> Result<CausalBudget> {
-        self.write(|journal| {
-            if let Some(budget) = journal.load_budget(root_id)? {
-                return Ok(budget);
-            }
-            let budget = CausalBudget::new(root_id, now_ms, Inherited::DEFAULTS);
-            journal.save_budget(&budget)?;
-            Ok(budget)
-        })
-    }
-
     /// Loads an existing causal budget if present.
     ///
     /// # Errors
@@ -3344,15 +3327,6 @@ impl WorkflowStore {
         Ok(status.and_then(|value| NodeStatus::from_wire(&value)))
     }
 
-    /// Lists durable run records sharing a causal root.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when the rows cannot be read.
-    pub fn list_runs_by_root(&self, root_id: CausalRootId) -> Result<Vec<StoredRunRecord>> {
-        self.read(|journal| journal.runs_by_root(root_id))
-    }
-
     /// Reads the grant a run acts under.
     ///
     /// # Errors
@@ -3402,64 +3376,6 @@ impl WorkflowStore {
             tx.commit()?;
         }
         outcome
-    }
-
-    /// Overwrites a run's status, whatever it was.
-    ///
-    /// A record-keeping operation for a caller that is restoring a known state; the engine itself
-    /// moves a run only through [`Self::claim_queued_run`], [`Self::finish_run`],
-    /// [`Self::pause_on_refusal`] and [`Self::cancel_run`], which respect a cancellation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when the row cannot be written.
-    pub fn update_run_status(
-        &self,
-        run_id: WorkflowRunId,
-        status: WorkflowRunStatus,
-        ended_at_ms: Option<u64>,
-    ) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE workflow_runs SET status = ?1, ended_at_ms = ?2 WHERE run_id = ?3",
-            params![status.as_str(), ended_at_ms.map(stored), run_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    /// Overwrites a node's receipt, whatever it held.
-    ///
-    /// A record-keeping operation, as [`Self::update_run_status`]; the engine settles a node
-    /// through [`Self::settle_node`], which respects a cancellation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when the row cannot be written.
-    pub fn update_node_receipt(
-        &self,
-        run_id: WorkflowRunId,
-        node_id: &str,
-        status: NodeStatus,
-        output: Option<&NodeOutput>,
-        error: Option<&str>,
-        ended_at_ms: Option<u64>,
-    ) -> Result<()> {
-        let output = output.map(serde_json::to_string).transpose()?;
-        let conn = self.lock();
-        conn.execute(
-            "UPDATE node_receipts SET status = ?1, output_json = ?2, error_json = ?3,
-                    ended_at_ms = ?4
-             WHERE run_id = ?5 AND node_id = ?6",
-            params![
-                status.as_str(),
-                output,
-                error,
-                ended_at_ms.map(stored),
-                run_id.to_string(),
-                node_id,
-            ],
-        )?;
-        Ok(())
     }
 
     /// Reads run summaries.

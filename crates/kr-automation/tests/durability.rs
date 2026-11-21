@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kr_automation::{CausalContext, WorkflowStore, create_workflow_definition};
+use kr_automation::{CausalContext, NodeSettlement, WorkflowStore, create_workflow_definition};
 use kr_protocol::automation::WorkflowActionKind;
 use kr_protocol::automation::{NodeStatus, WorkflowRunStatus};
 use kr_protocol::ids::{GrantId, WorkflowId, WorkflowRunId};
@@ -55,22 +55,25 @@ fn sqlite_persistence_survives_drop_and_reopen() {
             .commit_trigger_and_run(run_id, &def, "evt-init", &causal_ctx, 1050)
             .unwrap();
 
-        // Update node receipt and run status
+        // Dispatch the node, settle it and finish the run, as the engine does
+        assert!(store.claim_node_for_dispatch(run_id, "step1").unwrap());
+        assert!(
+            store
+                .settle_node(&NodeSettlement {
+                    run_id,
+                    node_id: "step1",
+                    status: NodeStatus::Success,
+                    output: Some(&kr_automation::stand_in_output(
+                        WorkflowActionKind::RunTests,
+                    )),
+                    error: None,
+                    produced: None,
+                    at_ms: 1100,
+                })
+                .unwrap()
+        );
         store
-            .update_node_receipt(
-                run_id,
-                "step1",
-                NodeStatus::Success,
-                Some(&kr_automation::stand_in_output(
-                    WorkflowActionKind::RunTests,
-                )),
-                None,
-                Some(1100),
-            )
-            .unwrap();
-
-        store
-            .update_run_status(run_id, WorkflowRunStatus::Completed, Some(1105))
+            .finish_run(run_id, WorkflowRunStatus::Completed, 1105)
             .unwrap();
     }
 

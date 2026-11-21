@@ -435,7 +435,7 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
     );
     install_and_enable(&service, &def, 1_000);
 
-    let first = service
+    service
         .submit_run(&run_params(&def, "evt-1"), 1_000)
         .await
         .expect("the first run is admitted");
@@ -448,7 +448,7 @@ async fn self_retrigger_is_refused_without_explicit_recurrence() {
     assert_eq!(
         service
             .store()
-            .list_runs_by_root(first.causal_root_id)
+            .list_runs(Some(def.workflow_id))
             .expect("the journal")
             .len(),
         1,
@@ -833,7 +833,13 @@ fn budget_persists_across_store_reopen() {
         let store = WorkflowStore::open(journal.path()).unwrap();
         // A chain's budget is written with its root; a reservation reaches no chain that has none.
         assert!(store.reserve_budget_action(root, 0, 0, 1_000).is_err());
-        store.get_or_create_budget(root, 1_000).unwrap();
+        store
+            .save_budget(&CausalBudget::new(
+                root,
+                1_000,
+                kr_automation::Inherited::DEFAULTS,
+            ))
+            .unwrap();
         store.reserve_budget_action(root, 0, 0, 1_010).unwrap();
         store.reserve_budget_action(root, 0, 0, 1_020).unwrap();
     }
