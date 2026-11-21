@@ -8,7 +8,7 @@
  * restart is shown on its own session's composer.
  */
 
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 
 import { useApp } from '../app/state'
 import type { Draft, DraftAttachment } from '../model/drafts'
@@ -16,8 +16,8 @@ import type { AttachmentHandle, SessionSubject } from '../host/port'
 import { failureWords } from '../host/port'
 import { attachContribution } from '../model/manual-paths'
 import type { UploadRow } from '../model/paired-uploads'
-import { boundIdsOf, isReset, lineOf } from '../model/paired-uploads'
-import { refusalOf } from '../model/transfer-words'
+import { boundIdsOf, isReset, keptHandlesOf, lineOf } from '../model/paired-uploads'
+import { refusalOf, wordsOf } from '../model/transfer-words'
 import { ask } from './model/call'
 import type { Picked } from './model/media'
 
@@ -30,6 +30,21 @@ function newKey(): string {
   bytes[8] = (bytes[8] ?? 0) & 0x3f | 0x80
   const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+/** The card of a file the draft the device keeps holds, bound: its key is the transfer's. */
+function cardOf(handle: AttachmentHandle): DraftAttachment {
+  return {
+    localId: `file-${handle.transfer_id}`,
+    transferId: handle.transfer_id,
+    name: handle.original_file_name,
+    byteLen: Number(handle.byte_len),
+    mediaType: handle.declared_media_type,
+    presentedAsImage: handle.presented_as_image,
+    upload: 'uploaded',
+    acceptedUpstream: false,
+    handle
+  }
 }
 
 /** What the composer needs of the files it sends over a paired connection. */
@@ -76,73 +91,104 @@ export function usePairedFiles({
     [uploads, sessionId, files, rows]
   )
 
+  // What a reconciliation uses is the newest of these, whichever render it was made in.
+  const latest = useRef({ files, nameSession, changeFiles })
+  useEffect(() => {
+    latest.current = { files, nameSession, changeFiles }
+  })
+
   // The application's account of the uploads, and the draft it keeps for this session: what a
-  // restart left is shown, and a file the composer kept is said to be on the draft or not.
+  // restart or a change of account left is shown, and a file the composer kept is said to be on the
+  // draft or not. The session is not ready until its kept draft has been read and shown.
   useEffect(() => {
     if (!active) return
-    let current = true
-    void (async () => {
-      const listed = await uploads.restore()
-      const subject = await nameSession()
-      const connection = await port.connectionState()
-      if (connection.environment_id === null) return
-      const made = await port.draftCreate(
-        {
-          environment_id: connection.environment_id,
-          device_id: null,
-          session_id: sessionId,
-          application_instance_id: null,
-          text: ''
-        },
-        subject
-      )
-      if (!current) return
-      const boundIds = boundIdsOf(made.value)
-      // The stored drafts keep no account, so a restart restores the cards of whoever was signed in
-      // before. A card is kept only for a file this window has a row for, the application lists for
-      // the account in force, or the kept draft holds; any other is dropped from the composer. An
-      // application that could not be read says nothing, and nothing is dropped for it.
-      const listedIds =
-        listed === null ? null : new Set(listed.flatMap((view) => (view.handle ? [view.handle.transfer_id] : [])))
-      const known = (file: DraftAttachment): boolean =>
-        file.handle === null ||
-        listedIds === null ||
-        listedIds.has(file.handle.transfer_id) ||
-        boundIds.has(file.handle.transfer_id) ||
-        uploads.snapshot().has(file.localId)
-      const foreign = new Set(
-        files.filter((file) => file.upload === 'uploaded' && file.handle !== null && !known(file)).map((file) => file.localId)
-      )
-      if (foreign.size > 0) changeFiles((current) => current.filter((each) => !foreign.has(each.localId)))
-      uploads.noteFiles(
-        files.flatMap((file) =>
-          file.upload === 'uploaded' && file.handle !== null && !foreign.has(file.localId)
-            ? [
-                {
-                  row: {
-                    key: file.localId,
-                    sessionId,
-                    name: file.name,
-                    byteLen: file.byteLen,
-                    phase: { kind: 'bound' as const },
-                    handle: file.handle,
-                    note: null,
-                    awaited: false
-                  },
-                  bound: boundIds.has(file.handle.transfer_id)
-                }
-              ]
-            : []
+    const detach = uploads.attach(sessionId, {
+      read: async () => {
+        // The listing decides which cards the application still knows; one that cannot be read decides nothing.
+        const listed = await uploads.restore()
+        const subject = await latest.current.nameSession()
+        const connection = await port.connectionState()
+        if (connection.environment_id === null) throw new Error('')
+        const made = await port.draftCreate(
+          {
+            environment_id: connection.environment_id,
+            device_id: null,
+            session_id: sessionId,
+            application_instance_id: null,
+            text: ''
+          },
+          subject
         )
-      )
-    })().catch(() => {
-      // Not in contact: the rows stay as they were, and the next screen asks again.
+        return { listed, held: keptHandlesOf(made.value), boundIds: boundIdsOf(made.value) }
+      },
+      apply: ({ listed, held, boundIds }) => {
+        const { files: composer, changeFiles: change } = latest.current
+        // The stored drafts keep no account, so a restart restores the cards of whoever was signed in
+        // before. A card is kept only for a file this window has a row for, the application lists for
+        // the account in force, or the kept draft holds; any other is dropped from the composer. An
+        // application that could not be read says nothing, and nothing is dropped for it.
+        const listedIds =
+          listed === null ? null : new Set(listed.flatMap((view) => (view.handle ? [view.handle.transfer_id] : [])))
+        const known = (file: DraftAttachment): boolean =>
+          file.handle === null ||
+          listedIds === null ||
+          listedIds.has(file.handle.transfer_id) ||
+          boundIds.has(file.handle.transfer_id) ||
+          uploads.snapshot().has(file.localId)
+        const foreign = new Set(
+          composer
+            .filter((file) => file.upload === 'uploaded' && file.handle !== null && !known(file))
+            .map((file) => file.localId)
+        )
+        // A file the kept draft holds that has no card is shown as a bound card. Whether it has one is
+        // decided by its transfer, whatever key the card or the row is under.
+        const isOf = (file: DraftAttachment, handle: AttachmentHandle): boolean =>
+          file.transferId === handle.transfer_id || file.handle?.transfer_id === handle.transfer_id
+        const missing = held.filter((handle) => !uploads.hasTransfer(handle.transfer_id))
+        if (foreign.size > 0 || missing.length > 0) {
+          change((current) => [
+            ...current.filter((each) => !foreign.has(each.localId)),
+            ...missing.filter((handle) => !current.some((each) => isOf(each, handle))).map(cardOf)
+          ])
+        }
+        uploads.noteFiles([
+          ...composer.flatMap((file) =>
+            file.upload === 'uploaded' && file.handle !== null && !foreign.has(file.localId)
+              ? [
+                  {
+                    row: {
+                      key: file.localId,
+                      sessionId,
+                      name: file.name,
+                      byteLen: file.byteLen,
+                      phase: { kind: 'bound' as const },
+                      handle: file.handle,
+                      note: null,
+                      awaited: false
+                    },
+                    bound: boundIds.has(file.handle.transfer_id)
+                  }
+                ]
+              : []
+          ),
+          ...missing.map((handle) => ({
+            row: {
+              key: cardOf(handle).localId,
+              sessionId,
+              name: handle.original_file_name,
+              byteLen: Number(handle.byte_len),
+              phase: { kind: 'bound' as const },
+              handle,
+              note: null,
+              awaited: false
+            },
+            bound: true
+          }))
+        ])
+      }
     })
-    return () => {
-      current = false
-    }
-    // Asked when the screen opens and when contact returns, not on each change of a file.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    void uploads.reconcile(sessionId)
+    return detach
   }, [active, sessionId, uploads, port, cycle])
 
   /** Adds a published file to the draft the device keeps for this session. */
@@ -293,34 +339,30 @@ export function usePairedFiles({
     (key: string) => {
       removed.current.add(key)
       const row = uploads.snapshot().get(key)
-      const onDraft = (each: DraftAttachment) => {
-        const phase = uploads.snapshot().get(each.localId)?.phase.kind
-        return phase === 'bound' || phase === 'adding'
-      }
       if (row?.phase.kind === 'bound') {
         // The host keeps one draft for the session and no way to take one file off it, so the draft
-        // ends and every file bound to it leaves the composer.
-        const gone = new Set(files.filter(onDraft).map((each) => each.localId))
-        // The files leave the composer only once the draft is ended: while it cannot be, they stay
-        // on the screen, and a later prompt does not carry files the person no longer sees.
-        void nameSession()
-          .then((subject) => port.draftEnd(subject, sessionId))
-          .then(() => {
-            for (const each of gone) {
-              removed.current.add(each)
-              uploads.forget(each)
-            }
-            changeFiles((current) => current.filter((each) => !gone.has(each.localId)))
+        // ends and every file bound to it leaves the composer. The end takes its turn after the
+        // binds that were asked for before it, and the files leave the composer only once the draft
+        // is ended: while it cannot be, they stay on the screen, and a failure says so.
+        void uploads
+          .end(sessionId, key, async () => {
+            await port.draftEnd(await nameSession(), sessionId)
           })
-          .catch(() => {
+          .then((gone) => {
+            for (const each of gone) removed.current.add(each)
+            changeFiles((current) => current.filter((each) => !gone.includes(each.localId)))
+          })
+          .catch((failure: unknown) => {
             removed.current.delete(key)
+            if (isReset(failure)) return
+            say(wordsOf(failure) || `${row.name} was not removed.`, 'danger')
           })
         return
       }
       uploads.forget(key)
       changeFiles((current) => current.filter((each) => each.localId !== key))
     },
-    [changeFiles, files, nameSession, port, removed, sessionId, uploads]
+    [changeFiles, nameSession, port, removed, say, sessionId, uploads]
   )
 
   return { rows, found, send, cancel, add, remove }

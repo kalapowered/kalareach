@@ -22,6 +22,7 @@ import {
   isNoOpenUpload,
   refusalOf,
   sentence,
+  wordsOf,
   type Refusal
 } from './transfer-words'
 
@@ -230,6 +231,20 @@ export function isReset(failure: unknown): boolean {
   return failure instanceof ResetError
 }
 
+/** What a screen gives the store to reconcile a session: reading the kept draft, and showing what it holds. */
+export interface Reconciler<Read = unknown> {
+  /** Reads the draft the device keeps for the session. A read that fails leaves the session not ready. */
+  readonly read: () => Promise<Read>
+  /** Shows what the read found, in one synchronous step: the files of the kept draft that have no card. */
+  readonly apply: (found: Read) => void
+}
+
+interface Reconciliation {
+  readonly cycle: number
+  readonly state: 'pending' | 'done' | 'failed'
+  readonly failure?: unknown
+}
+
 export class PairedUploads {
   readonly #port: HostPort
   readonly #pollMs: number
@@ -243,6 +258,12 @@ export class PairedUploads {
   #reading: number | null = null
   /** How many times the store was reset: a call that began in an earlier cycle changes nothing. */
   #cycle = 0
+  /** The end of the last turn of each session: a turn starts when the one before it has settled. */
+  #turns = new Map<string, Promise<void>>()
+  /** The screens that show a session's composer, and how each reads the kept draft and shows what it holds. */
+  readonly #attached = new Map<string, Reconciler>()
+  /** Where the reconciliation of each session stands in this cycle. */
+  #reconciled = new Map<string, Reconciliation>()
 
   constructor(port: HostPort, pollMs = DEFAULT_POLL_MS) {
     this.#port = port
@@ -289,6 +310,8 @@ export class PairedUploads {
     this.#cycle += 1
     this.#rows.clear()
     this.#cancelledEarly.clear()
+    this.#turns = new Map()
+    this.#reconciled = new Map()
     if (this.#timer !== null) {
       clearInterval(this.#timer)
       this.#timer = null
@@ -374,17 +397,162 @@ export class PairedUploads {
     await this.#binding(key, handle, bind, still)
   }
 
-  /** Binds `handle` to the draft; a store reset before or during the bind ends it with `ResetError`, bound to nothing. */
-  async #binding(key: string, handle: AttachmentHandle, bind: Bind, still: () => void): Promise<void> {
-    try {
+  /**
+   * Binds `handle` to the draft, in the turn of the row's session and after the reconciliation of
+   * the session has succeeded: a bind that finds none for this cycle starts one first. The turn is
+   * taken in the step that made the row `adding`. A store reset before or during the bind ends it
+   * with `ResetError`, bound to nothing; a reconciliation that failed leaves the file kept, with the
+   * words the read failed with.
+   */
+  #binding(key: string, handle: AttachmentHandle, bind: Bind, still: () => void): Promise<void> {
+    const sessionId = this.#rows.get(key)?.sessionId ?? ''
+    this.#reconcileIfNone(sessionId)
+    return this.#inTurn(sessionId, async () => {
+      try {
+        still()
+        const reconciled = this.#reconciled.get(sessionId)
+        if (this.#attached.has(sessionId) && reconciled?.state !== 'done') {
+          // eslint-disable-next-line @typescript-eslint/only-throw-error -- the read's own failure is data
+          throw reconciled?.failure ?? new Error('')
+        }
+        await bind(handle)
+        still()
+        this.#patch(key, { phase: { kind: 'bound' } })
+      } catch (failure) {
+        if (isReset(failure)) throw failure
+        this.#patch(key, { phase: { kind: 'kept', words: wordsOf(failure) || null } })
+      }
+    })
+  }
+
+  /**
+   * Runs `work` after the work before it in the session has settled, whatever that ended with. A
+   * bind, an end, a completion and a reconciliation each take a turn, so they run in the order they
+   * were asked for.
+   */
+  #inTurn<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+    const turns = this.#turns
+    const run = (turns.get(sessionId) ?? Promise.resolve()).then(work)
+    const tail = run.then(
+      () => undefined,
+      () => undefined
+    )
+    turns.set(sessionId, tail)
+    void tail.then(() => {
+      if (turns.get(sessionId) === tail) turns.delete(sessionId)
+    })
+    return run
+  }
+
+  /**
+   * Ends the draft the device keeps for `sessionId` with `end`, in the session's turn, and drops the
+   * rows that were bound to it when the turn began (the ones that were still being added are in that
+   * turn's order, so they are bound or kept by then). Answers their keys. When `end` fails the rows
+   * stay and the failure is rethrown. A row that is not bound when the turn begins ends nothing.
+   */
+  end(sessionId: string, key: string, end: () => Promise<void>): Promise<readonly string[]> {
+    const still = this.guard()
+    return this.#inTurn(sessionId, async () => {
       still()
-      await bind(handle)
+      if (this.#rows.get(key)?.phase.kind !== 'bound') return []
+      const gone = [...this.#rows]
+        .filter(([, row]) => row.sessionId === sessionId && row.phase.kind === 'bound')
+        .map(([each]) => each)
+      await end()
       still()
-      this.#patch(key, { phase: { kind: 'bound' } })
-    } catch (failure) {
-      if (isReset(failure)) throw failure
-      this.#patch(key, { phase: { kind: 'kept', words: refusalOf(failure).words } })
+      for (const each of gone) this.#rows.delete(each)
+      this.#changed()
+      return gone
+    })
+  }
+
+  /**
+   * Drops the rows of `sessionId` that went with a prompt the host performed, and only those: a file
+   * bound to a new draft since the prompt was pressed keeps its row. Never fails.
+   */
+  async completeSent(sessionId: string, sentKeys: ReadonlySet<string>): Promise<void> {
+    const cycle = this.#cycle
+    await this.#inTurn(sessionId, () => {
+      if (cycle === this.#cycle) {
+        for (const key of sentKeys) {
+          if (this.#rows.get(key)?.sessionId === sessionId && this.#rows.get(key)?.phase.kind === 'bound') {
+            this.#rows.delete(key)
+          }
+        }
+        this.#changed()
+      }
+      return Promise.resolve()
+    })
+  }
+
+  /**
+   * Makes `reconciler` the way `sessionId` is reconciled while a screen shows its composer. A session
+   * with none has nothing to reconcile. Answers a function that takes it away.
+   */
+  attach<Read>(sessionId: string, reconciler: Reconciler<Read>): () => void {
+    this.#attached.set(sessionId, reconciler as Reconciler)
+    this.#reconciled.delete(sessionId)
+    this.#notify()
+    return () => {
+      if (this.#attached.get(sessionId) === reconciler) {
+        this.#attached.delete(sessionId)
+        this.#reconciled.delete(sessionId)
+        this.#notify()
+      }
     }
+  }
+
+  /**
+   * Whether what the device keeps for the session is shown: true when a reconciliation of this cycle
+   * succeeded, and for a session no screen reconciles. False while one is pending, after one failed
+   * and after a reset until the next.
+   */
+  ready(sessionId: string): boolean {
+    return !this.#attached.has(sessionId) || this.#reconciled.get(sessionId)?.state === 'done'
+  }
+
+  /**
+   * Reads the draft the device keeps for the session and shows its files that have no card, in the
+   * session's turn, and checks the cycle before it shows them. A read that fails leaves the session not
+   * ready.
+   */
+  reconcile(sessionId: string): Promise<void> {
+    const reconciler = this.#attached.get(sessionId)
+    if (reconciler === undefined) return Promise.resolve()
+    const cycle = this.#cycle
+    const settle = (next: Reconciliation) => {
+      if (cycle !== this.#cycle || this.#attached.get(sessionId) !== reconciler) return
+      this.#reconciled.set(sessionId, next)
+      this.#notify()
+    }
+    settle({ cycle, state: 'pending' })
+    return this.#inTurn(sessionId, async () => {
+      try {
+        const found = await reconciler.read()
+        if (cycle !== this.#cycle || this.#attached.get(sessionId) !== reconciler) return
+        reconciler.apply(found)
+        settle({ cycle, state: 'done' })
+      } catch (failure) {
+        settle({ cycle, state: 'failed', failure })
+      }
+    })
+  }
+
+  /** Starts a reconciliation when the session has none that is pending or done in this cycle. */
+  #reconcileIfNone(sessionId: string): void {
+    const now = this.#reconciled.get(sessionId)
+    if (this.#attached.has(sessionId) && (now === undefined || now.state === 'failed')) void this.reconcile(sessionId)
+  }
+
+  /** Tells the screens that what is read from the store, other than its rows, changed. */
+  #notify(): void {
+    for (const listener of this.#listeners) listener()
+  }
+
+  /** Whether a row holds the transfer `transferId`. */
+  hasTransfer(transferId: string): boolean {
+    for (const row of this.#rows.values()) if (row.handle?.transfer_id === transferId) return true
+    return false
   }
 
   /**
@@ -452,16 +620,6 @@ export class PairedUploads {
     if (this.#rows.delete(key)) this.#changed()
   }
 
-  /** Drops the rows of `sessionId` that are on the draft the prompt just sent. */
-  forgetSent(sessionId: string): void {
-    for (const [key, row] of this.#rows) {
-      if (row.sessionId === sessionId && (row.phase.kind === 'bound' || row.phase.kind === 'adding')) {
-        this.#rows.delete(key)
-      }
-    }
-    this.#changed()
-  }
-
   /**
    * Reads the application's account once, adding the uploads this window did not start. Answers what
    * the application listed, or null when it could not be read or another read of this cycle is under way.
@@ -479,7 +637,8 @@ export class PairedUploads {
   noteFiles(files: readonly { readonly row: UploadRow; readonly bound: boolean }[]): void {
     let changed = false
     for (const { row, bound } of files) {
-      if (this.#rows.has(row.key)) continue
+      // A file is one row: by its key, or by its transfer when another key (a send's) holds it.
+      if (this.#rows.has(row.key) || (row.handle !== null && this.hasTransfer(row.handle.transfer_id))) continue
       this.#rows.set(row.key, { ...row, phase: bound ? { kind: 'bound' } : { kind: 'kept', words: null } })
       changed = true
     }
@@ -601,6 +760,20 @@ export class PairedUploads {
       if (this.#reading === cycle) this.#reading = null
     }
   }
+}
+
+/**
+ * The files the draft this device keeps holds, each as the handle it was bound with. An attachment
+ * that carries only the transfer is left out: it cannot be shown as a card.
+ */
+export function keptHandlesOf(view: unknown): readonly AttachmentHandle[] {
+  const attachments = (view as { attachments?: readonly { handle?: unknown }[] } | null)?.attachments ?? []
+  return attachments.flatMap((each) => {
+    const handle = each.handle as Partial<AttachmentHandle> | undefined
+    return typeof handle?.transfer_id === 'string' && typeof handle.original_file_name === 'string'
+      ? [handle as AttachmentHandle]
+      : []
+  })
 }
 
 /**

@@ -65,10 +65,12 @@ export class FakeUploads {
   readonly ended: string[] = []
   readonly #live = new Map<string, Live>()
   readonly #drafts = new Map<string, HostDraft>()
+  /** The handle of each upload this host published, by transfer: a draft's attachment carries the handle it was bound with. */
+  readonly #handles = new Map<string, AttachmentHandle>()
   readonly #make: (file: HandedFile) => AttachmentHandle
   readonly #throw: (failure: ScriptedFailure) => never
   #left: OpenUpload[] = []
-  #endRefused = false
+  #endRefused: ScriptedFailure | null = null
   #refuseNext: ScriptedFailure | null = null
   #bindRefusal: ScriptedFailure | null = null
   #cancelState: UploadCancelled['state'] = 'cancelled'
@@ -91,13 +93,15 @@ export class FakeUploads {
       this.#throw(failure)
     }
     this.started.push({ key, name: file.name, byteLen: file.bytes.length, sessionId })
+    const handle = this.#make(file)
+    this.#handles.set(handle.transfer_id, handle)
     return new Promise((resolve, reject) => {
       this.#live.set(key, {
         key,
         name: file.name,
         byteLen: file.bytes.length,
         sessionId,
-        handle: this.#make(file),
+        handle,
         state: 'sending',
         stage: 'starting',
         done: 0,
@@ -181,7 +185,8 @@ export class FakeUploads {
     const draft = this.#drafts.get(sessionId) ?? this.#start(sessionId, typeof params.text === 'string' ? params.text : '')
     draft.revision += 1
     // The application's own shape: the attachment carries the handle it was bound with.
-    const attachment = { handle: { transfer_id: params.transfer_id } }
+    const transfer = String(params.transfer_id)
+    const attachment = { handle: this.#handles.get(transfer) ?? { transfer_id: transfer } }
     draft.attachments.push(attachment)
     const value: PairedBound & { readonly attachment: unknown } = {
       draftId: draft.draftId,
@@ -189,6 +194,12 @@ export class FakeUploads {
       attachment
     }
     return { receipt: null, action_id: null, value, answer_lost: false }
+  }
+
+  /** The draft the device keeps for a session already holds a file: one bound before this window, or by another. */
+  keep(sessionId: string, handle: AttachmentHandle): void {
+    const draft = this.#drafts.get(sessionId) ?? this.#start(sessionId, '')
+    draft.attachments.push({ handle })
   }
 
   kept(sessionId: string): { made: boolean; draftId: string | null; revision: string | null; attachments: unknown[] } {
@@ -210,14 +221,15 @@ export class FakeUploads {
   }
 
   /** The next end of a draft fails, as one does when the host is out of contact. */
-  refuseNextEnd(): void {
-    this.#endRefused = true
+  refuseNextEnd(failure: ScriptedFailure = { code: 'HOST_NOT_CONFIGURED', message: 'the host is not connected' }): void {
+    this.#endRefused = failure
   }
 
   end(sessionId: string): void {
-    if (this.#endRefused) {
-      this.#endRefused = false
-      this.#throw({ code: 'HOST_NOT_CONFIGURED', message: 'the host is not connected' })
+    if (this.#endRefused !== null) {
+      const failure = this.#endRefused
+      this.#endRefused = null
+      this.#throw(failure)
     }
     this.ended.push(sessionId)
     this.#drafts.delete(sessionId)

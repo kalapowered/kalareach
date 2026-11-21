@@ -24,7 +24,17 @@
  * the browser its own way with the text.
  */
 
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode
+} from 'react'
 import { flushSync } from 'react-dom'
 
 import { useApp, useKeptPlace, useSession, useWaitingHolds } from '../../app/state'
@@ -464,6 +474,13 @@ export function MobileSession({
     paired &&
     draft.attachments.length > 0 &&
     draft.attachments.every((file) => pairedFiles.rows.get(file.localId)?.phase.kind === 'bound')
+  // The kept draft's files are shown once its reconciliation has succeeded; until then a prompt that
+  // names the draft is held (the Send button is off) and a text-only prompt is not.
+  const filesShown = useSyncExternalStore(uploads.subscribe, () => uploads.ready(sessionId))
+  const holdsDraft =
+    paired &&
+    [...pairedFiles.rows.values()].some((row) => row.sessionId === sessionId && row.phase.kind === 'bound')
+  const heldForFiles = holdsDraft && !filesShown
 
   // A draft written before the agent was read keeps the first conversation it learns, so that a
   // later move is a conflict rather than a new conversation the text follows.
@@ -700,6 +717,12 @@ export function MobileSession({
 
   const send = useCallback(
     (text: string, anyway = false, quoting: Supersession | null = null) => {
+      // A prompt that names the draft the device keeps waits until that draft's files are shown: it
+      // would carry files the person has not seen. A text-only prompt carries none and does not wait.
+      const pairedDraft =
+        paired &&
+        [...uploads.snapshot().values()].some((row) => row.sessionId === sessionId && row.phase.kind === 'bound')
+      if (pairedDraft && !uploads.ready(sessionId)) return
       const now = Date.now()
       // The opening this send is made under. Its answer may come after the screen has opened the
       // session again, and then it settles its own record and nothing the new opening shows.
@@ -747,11 +770,6 @@ export function MobileSession({
       // nothing, and the host decides.
       const quote = anyway ? quoting : null
       const wentWith = new Set(draft.attachments.map((file) => file.localId))
-      const pairedDraft =
-        paired &&
-        [...uploads.snapshot().values()].some(
-          (row) => row.sessionId === sessionId && row.phase.kind === 'bound'
-        )
       ask(async () => {
         // The prompt is sent only once the stored draft is this window's to send: another window
         // that holds the same draft claims it first, and the other one sends nothing.
@@ -799,7 +817,7 @@ export function MobileSession({
           // once the host performed it: the application ends its draft only then, so a prompt it
           // has only accepted, or whose outcome nobody knows, leaves the files bound to the draft.
           const performed = pairedDraft && state === 'applied'
-          if (performed) uploads.forgetSent(sessionId)
+          if (performed) void uploads.completeSent(sessionId, wentWith)
           // The composer is cleared only when it still holds what was submitted. A person who
           // typed the next thing while this one was in flight keeps what they typed, whichever
           // opening they typed it under.
@@ -1023,7 +1041,7 @@ export function MobileSession({
         data-testid="composer-send-anyway"
         data-wraps
         aria-describedby={describedBy}
-        disabled={!submittable(draft, carriesFiles) || !submitOffer.offered || busy}
+        disabled={!submittable(draft, carriesFiles) || !submitOffer.offered || busy || heldForFiles}
         style={{ minBlockSize: target }}
         onClick={() => {
           sendAnyway()
@@ -1104,7 +1122,7 @@ export function MobileSession({
     <Button
       id={sendId}
       tone="primary"
-      disabled={!submittable(draft, carriesFiles) || !submitOffer.offered || busy || waiting.length > 0}
+      disabled={!submittable(draft, carriesFiles) || !submitOffer.offered || busy || waiting.length > 0 || heldForFiles}
       style={{ minBlockSize: target }}
       onClick={() => {
         send(draft.text)

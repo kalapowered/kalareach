@@ -170,4 +170,72 @@ describe('a card the device kept for an earlier sign-in', () => {
     const left = changes[0]?.(attachments) ?? []
     expect(left.map((each) => each.transferId)).toEqual(['t-listed', 't-bound'])
   })
+
+  it('has the kept draft’s other files shown as bound cards by transfer, and no second card for one it has', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS, organisation: true })
+    // The kept draft holds a file the composer has (as a card named by an upload key) and one it has not.
+    controls.pairedUploads.keep(SESSION, handleOf('t-card'))
+    controls.pairedUploads.keep(SESSION, handleOf('t-only-kept'))
+    const own: DraftAttachment = { ...card('t-card'), localId: 'an-upload-key' }
+    const draft = {
+      ...startDraft('composer', { sessionId: SESSION, applicationInstanceId: null, agentBindingRevision: null }, 1),
+      attachments: [own]
+    }
+    const changes: ((files: readonly DraftAttachment[]) => readonly DraftAttachment[])[] = []
+    const wrapper = ({ children }: { children: ReactNode }) => <AppProvider port={port}>{children}</AppProvider>
+    renderHook(
+      () =>
+        usePairedFiles({
+          active: true,
+          sessionId: SESSION,
+          draft,
+          nameSession: () => Promise.resolve({ sessionId: SESSION, sessionEpoch: '1' }),
+          changeFiles: (change) => changes.push(change),
+          removed: { current: new Set<string>() }
+        }),
+      { wrapper }
+    )
+    await waitFor(() => {
+      expect(changes).toHaveLength(1)
+    })
+    const after = changes[0]?.([own]) ?? []
+    expect(after.map((each) => [each.localId, each.transferId])).toEqual([
+      ['an-upload-key', 't-card'],
+      ['file-t-only-kept', 't-only-kept']
+    ])
+  })
+})
+
+describe('the files the device kept for the account in force, after a change of account', () => {
+  it('are shown again as bound cards, once each', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS, organisation: true })
+    controls.pairedUploads.keep(SESSION, handleOf('t-kept'))
+    const status = vi.spyOn(port, 'accountStatus')
+    render(
+      <AppProvider port={port} uploadPollMs={10}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    const person = userEvent.setup({ applyAccept: false })
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    // The kept draft's file has a card when the session opens, with nothing sent from this window.
+    await waitFor(() => {
+      expect(screen.getAllByTestId('m-upload')).toHaveLength(1)
+    })
+    expect(screen.getByTestId('m-upload')).toHaveTextContent('t-kept.pdf')
+    expect(screen.getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+    await Promise.all(status.mock.results.map((result) => result.value as Promise<unknown>))
+
+    controls.account.set(signedIn('aa'))
+    expect(await screen.findByText(FILES_OF_EARLIER_SIGN_IN_REMOVED)).toBeInTheDocument()
+    // What the application keeps for the account is shown again, once.
+    await waitFor(() => {
+      expect(screen.getAllByTestId('m-upload')).toHaveLength(1)
+    })
+    expect(screen.getByTestId('m-upload')).toHaveTextContent('t-kept.pdf')
+    expect(screen.getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+  })
 })
