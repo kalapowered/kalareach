@@ -494,6 +494,21 @@ impl Anchor {
         default_mode: u32,
         replaces: Option<Digest256>,
     ) -> Result<()> {
+        match self.write_if_checked(path, bytes, default_mode, replaces)? {
+            Written::Done => Ok(()),
+            Written::Changed => Err(changed_since_checked(path)),
+        }
+    }
+
+    /// Writes as `write` does, but a file at the name that is not the one the caller checked is an
+    /// outcome, [`Written::Changed`], and nothing is written: the caller decides what it means.
+    pub(crate) fn write_if_checked(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        default_mode: u32,
+        replaces: Option<Digest256>,
+    ) -> Result<Written> {
         let place = self.place(path)?;
         let Some(parent) = self.parent(&place, true)? else {
             return Err(refused(format!(
@@ -509,7 +524,7 @@ impl Anchor {
             Fetched::File(read) if replaces == Some(digest_of(&read.bytes)) => {
                 (read.mode, Some(read.identity))
             }
-            Fetched::Absent | Fetched::File(_) => return Err(changed_since_checked(path)),
+            Fetched::Absent | Fetched::File(_) => return Ok(Written::Changed),
             Fetched::NotRegular | Fetched::TooLarge => {
                 return Err(refused(format!(
                     "{} is not a regular file an installation can replace",
@@ -529,7 +544,8 @@ impl Anchor {
             path,
         }
         .publish(bytes, mode, replaces.zip(checked), existing.as_ref())?;
-        parent.flush().map_err(|_| not_confirmed(path))
+        parent.flush().map_err(|_| not_confirmed(path))?;
+        Ok(Written::Done)
     }
 
     /// Removes the file at `path` where it is the file the caller checked, the one whose contents
@@ -633,6 +649,14 @@ impl Anchor {
             Err(error) => Err(storage(error)),
         }
     }
+}
+
+/// What a write came to.
+pub(crate) enum Written {
+    /// The file was written.
+    Done,
+    /// The file at the name is not the one the caller checked, and nothing was written.
+    Changed,
 }
 
 /// Puts a file a removal took out of `name` back, though it is not the file the removal checked,

@@ -232,6 +232,25 @@ impl Fs {
         }
     }
 
+    /// Writes as `write` does, but tells a file that is not the one the caller checked as an
+    /// outcome where the walk can see it; by path nothing is compared.
+    fn write_if_checked(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        default_mode: u32,
+        replaces: Option<Digest256>,
+    ) -> Result<anchor::Written> {
+        match self {
+            Self::Paths => {
+                write_atomically(path, bytes, default_mode)?;
+                Ok(anchor::Written::Done)
+            }
+            Self::Walk(walk) => walk.write_if_checked(path, bytes, default_mode, replaces),
+            Self::Absent(root) => Err(no_folder_to_write(root)),
+        }
+    }
+
     /// Removes the file at `path`. `expected` is the digest of the file the caller checked there:
     /// nothing else is removed, by the walk or by a path, and a file that is not that one is told
     /// as changed.
@@ -1946,8 +1965,13 @@ impl Installer {
                 }
             },
             EntryPlan::Edit { text, replaces } => {
-                self.fs.write(path, text.as_bytes(), PRIVATE, replaces)?;
-                Removal::Removed
+                match self
+                    .fs
+                    .write_if_checked(path, text.as_bytes(), PRIVATE, replaces)?
+                {
+                    anchor::Written::Done => Removal::Removed,
+                    anchor::Written::Changed => self.held_or_kept(path, key, digest)?,
+                }
             }
         })
     }
@@ -8013,6 +8037,38 @@ mod tests {
         assert!(
             !text.contains("agent-tools"),
             "and the entry is taken: {text}"
+        );
+    }
+
+    /// KR-REQ-11.01: a setting written after the removal's last read of a document it rewrites, and
+    /// before the write, is an outcome, not an error: the entry is the host's and unchanged, so it
+    /// stays with its record, and a later removal finishes.
+    #[cfg(unix)]
+    #[test]
+    fn a_setting_written_before_the_write_of_a_rewritten_document_keeps_the_entry_and_its_record() {
+        let tree = Tree::create();
+        let amp_folder = tree.home().join(".amp");
+        std::fs::create_dir_all(amp_folder.join("skills")).expect("the folders are there before");
+        let document = amp_folder.join("mcp.json");
+        std::fs::write(&document, "{\n  \"theme\": \"dark\"\n}\n").expect("a document");
+        set_mode(&document, 0o600);
+        let installer = amp_installed(&tree);
+        let at = document.clone();
+        when_walked_to(".amp/mcp.json", move || {
+            let text = std::fs::read_to_string(&at).expect("the document");
+            std::fs::write(&at, text.replacen('{', "{\n  \"other\": 1,", 1))
+                .expect("another process writes a setting");
+        });
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "a document that changed under the write is told, not refused: {removed:?}"
+        );
+        assert_held_and_finished(
+            &installer,
+            &params(amp(), InstallScope::User),
+            &document,
+            &removed.expect("a removal"),
         );
     }
 
