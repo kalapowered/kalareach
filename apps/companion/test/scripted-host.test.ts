@@ -277,6 +277,23 @@ describe('the scripted host and attention, review and sharing', () => {
     expect((await slow).key).toEqual(quick.key)
   })
 
+  it('answers a paired host\u2019s inbox and numbers under that host and its epoch, as the connection says them', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPairedDevice()
+    const params = { session_id: null, include_acknowledged: false, max_items: '200', after: null }
+    const state = await port.connectionState()
+    expect(state.host).toEqual({ kind: 'paired', reference: 'studio-reference', name: 'Studio' })
+    expect(state.inbox_epoch).toBeGreaterThan(0)
+    const inbox = await port.attentionRead(params)
+    const numbers = await port.sessionNumbers()
+    expect(inbox.key).toEqual({
+      host: { kind: 'paired', reference: 'studio-reference' },
+      epoch: state.inbox_epoch,
+      link: state.link
+    })
+    expect(numbers.key).toEqual(inbox.key)
+  })
+
   it('pages the inbox and review state, and refuses a page after something it does not hold', async () => {
     const { port } = fakeHost()
     const first = (

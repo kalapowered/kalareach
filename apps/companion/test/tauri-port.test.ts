@@ -835,6 +835,26 @@ describe('the desktop port and a host that changed', () => {
     expect(heard).toEqual(['1'])
   })
 
+  it('an inbox_hosts answer above the cursor asks the feed to catch up', async () => {
+    const { port } = await following()
+    shell.answers.set('inbox_hosts', { revision: 4, hosts: [] })
+    shell.answers.set('connection_since', { revision: 4, resync: false, states: [] })
+    const answer = await port.inboxHosts()
+    await settle()
+    expect(answer).toEqual({ revision: 4, hosts: [] })
+    expect(shell.invoked.filter((each) => each.command === 'connection_since')).toEqual([
+      { command: 'connection_since', args: { after: 1 } }
+    ])
+  })
+
+  it('an inbox_hosts answer at the cursor asks the feed for nothing', async () => {
+    const { port } = await following()
+    shell.answers.set('inbox_hosts', { revision: 1, hosts: [] })
+    await port.inboxHosts()
+    await settle()
+    expect(shell.invoked.filter((each) => each.command === 'connection_since')).toEqual([])
+  })
+
   it('holds at most 256 events and delivers one resync after the ones it kept', async () => {
     const { heard } = await following()
     shell.answers.set('connection_since', new Promise(() => undefined))
