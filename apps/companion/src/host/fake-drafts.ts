@@ -65,6 +65,7 @@ export class FakeDraftStore {
   #refuseDiscards: { code: string; message: string } | null = null
   #refuseMarks: { code: string; message: string } | null = null
   #refuseMarksLeft = 0
+  #ledgerChanges = 0
   readonly #disk: DraftDisk | null
   /** Every save and discard this store was asked for, for a test to read. */
   readonly calls: { readonly kind: 'save' | 'retarget' | 'discard'; readonly text?: string }[] = []
@@ -201,6 +202,7 @@ export class FakeDraftStore {
   markRemovals(requests: readonly DraftDiscardRequest[]): void {
     this.#takeRefusal()
     for (const request of requests) this.#removals.set(removalKey(request), request)
+    this.#ledgerChanges += 1
     this.#write()
   }
 
@@ -208,7 +210,13 @@ export class FakeDraftStore {
   replaceRemovals(requests: readonly DraftDiscardRequest[]): void {
     this.#takeRefusal()
     this.#removals = new Map(requests.map((request) => [removalKey(request), request]))
+    this.#ledgerChanges += 1
     this.#write()
+  }
+
+  /** How many changes of the list of removals were made, as a test reads them: a set of marks is one. */
+  get ledgerChanges(): number {
+    return this.#ledgerChanges
   }
 
   #takeRefusal(): void {

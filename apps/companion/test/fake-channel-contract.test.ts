@@ -213,6 +213,7 @@ describe('the scripted store counts and changes the list of removals as native c
     // The refusal was one: the same keep now names both drafts in one change.
     expect(refusal(() => store.keep(request({ drafts: [a, b] }), drafts))).toBeNull()
     expect(drafts.pendingRemovals()).toHaveLength(2)
+    expect(drafts.ledgerChanges).toBe(1)
     // A resume whose change is refused leaves the entry it resumes.
     drafts.refuseMarks(refused)
     expect(refusal(() => store.keep(request({ drafts: [a, b] }), drafts))).toBe('RESOURCE_UNAVAILABLE')
@@ -259,21 +260,24 @@ describe('the scripted store counts and changes the list of removals as native c
     expect(store.allHolds()).toEqual([])
   })
 
-  it('returns the owed drafts over a list that cannot be read, names none of them in it, and refuses a mark', () => {
+  it('returns the owed drafts over a list that cannot be read, reads the list as naming none, and refuses a mark', () => {
     const drafts = new FakeDraftStore()
     const store = new FakeChannelMessageStore()
     const a = stored(drafts, 'a')
     const b = stored(drafts, 'b')
+    const c = stored(drafts, 'c')
     store.keep(request({ drafts: [a] }), drafts)
+    drafts.markRemoval(b)
     store.damageLedger('unreadable')
     const read = store.drafts(drafts)
     expect(read.ledger).toBe('unreadable')
+    // What the entries owe is returned; what the list that cannot be read names is not.
     expect(read.pendingRemovals).toEqual([a])
-    expect(refusal(() => store.markRemoval(b, drafts))).toBe('RESOURCE_UNAVAILABLE')
-    expect(drafts.pendingRemovals()).toEqual([a])
-    store.damageLedger('ok')
-    expect(refusal(() => store.markRemoval(b, drafts))).toBeNull()
+    expect(refusal(() => store.markRemoval(c, drafts))).toBe('RESOURCE_UNAVAILABLE')
     expect(drafts.pendingRemovals()).toEqual([a, b])
+    store.damageLedger('ok')
+    expect(refusal(() => store.markRemoval(c, drafts))).toBeNull()
+    expect(drafts.pendingRemovals()).toEqual([a, b, c])
   })
 
   it('replaces the list with the one the entries rebuild when a damaged one is set aside, and leaves it when the change is refused', () => {
