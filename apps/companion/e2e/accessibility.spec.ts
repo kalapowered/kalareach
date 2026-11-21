@@ -883,6 +883,15 @@ const justifiedAt = (href: string): string => `.m-node p:has(.md-link[title='${h
 /** Three short links with no word between them: the one in the middle has a box beside it on each side, so its box has no room to grow into. */
 const HEMMED = 'Hemmed in: [m](https://example.org/hem-1)[n](https://example.org/hem-2)[o](https://example.org/hem-3) end of the line.'
 const HEMMED_IN = ['https://example.org/hem-2']
+/**
+ * Two short links with a gap of plain words between them, and a wide link touching the second one's end: the first needs less than half
+ * of the gap to reach the least size, and the second needs the rest, which halves of the gap would not give it.
+ */
+const GAP_FIRST = 'https://example.org/gap-first'
+const GAP_SECOND = 'https://example.org/gap-second'
+const GAPPED = `See [docs](${GAP_FIRST}) for the [1](${GAP_SECOND})[the full reference list](https://example.org/gap-wide) too.`
+/** What the cases of a link's box add to the conversation's messages. */
+const BOXED_EXTRAS = [HEMMED, GAPPED]
 
 // KR-REQ-13.19: the box that a screen reader reads for a link of a message is the least size high, and the
 // message lies where it would with no box: the room around the words takes no tap, so a link beside or
@@ -892,7 +901,7 @@ test.describe('the box of a link in a message', () => {
   for (const surface of SURFACES) {
     for (const [size, ratio] of SIZES) {
       test(`is at least the least size high for every link on ${surface} at ${size} text size`, async ({ page }) => {
-        await pressPage(page, surface, { scale: ratio, extra: [HEMMED] })
+        await pressPage(page, surface, { scale: ratio, extra: BOXED_EXTRAS })
         const boxes = await boxesNow(page)
         expect(boxes.links.length, 'links on the page').toBeGreaterThan(20)
         const least = FINGER[surface]
@@ -905,7 +914,7 @@ test.describe('the box of a link in a message', () => {
       test(`is at least the least size wide for every link, or is as wide as the boxes beside it allow, on ${surface} at ${size} text size`, async ({
         page
       }) => {
-        await pressPage(page, surface, { scale: ratio, extra: [HEMMED] })
+        await pressPage(page, surface, { scale: ratio, extra: BOXED_EXTRAS })
         const { links, controls } = await boxesNow(page)
         const least = FINGER[surface]
         const limited: string[] = []
@@ -927,13 +936,27 @@ test.describe('the box of a link in a message', () => {
           expect(right - link.right, `the gap right of ${link.href} after its box, which may be no more than its own padding there`).toBeLessThanOrEqual(link.right - link.wordsRight + 0.1)
         }
         expect(limited.filter((each) => HEMMED_IN.some((href) => each.startsWith(href))), 'the link that a box on each side hems in: the case is vacuous where it is as wide as the least size').not.toEqual([])
+        // The second of two short links, whose neighbour needs less than half of the gap: it has the rest, and the least size.
+        if (ratio === 1) {
+          const first = links.find((link) => link.href === GAP_FIRST)
+          const second = links.find((link) => link.href === GAP_SECOND)
+          expect(first && second, 'the two short links of the gapped message').toBeTruthy()
+          if (first && second) {
+            const need = least - (second.wordsRight - second.wordsLeft)
+            const gap = second.wordsLeft - first.wordsRight
+            expect(first.wordsRight - first.wordsLeft, 'the first link’s words, which are narrower than the least size').toBeLessThan(least)
+            expect(gap, 'the gap between their words, half of which leaves the second link under the least size').toBeLessThan(2 * need)
+            expect(gap, 'the gap between their words, which the first link leaves enough of for the second').toBeGreaterThanOrEqual(need + (least - (first.wordsRight - first.wordsLeft)) / 2)
+            expect(second.right - second.left, 'the box of the second link').toBeGreaterThanOrEqual(least - 0.01)
+          }
+        }
         // The stated limit: the width of every link whose line has no room for the least size.
         test.info().annotations.push({ type: 'limit', description: limited.join(', ') })
         console.log(`narrow links ${surface} ${size}: ${limited.join(', ')}`)
       })
 
       test(`puts no box over the box of a link or control that lies beside it, on ${surface} at ${size} text size`, async ({ page }) => {
-        await pressPage(page, surface, { scale: ratio, extra: [HEMMED] })
+        await pressPage(page, surface, { scale: ratio, extra: BOXED_EXTRAS })
         const boxed = await boxesNow(page)
         await page.addStyleTag({ content: '.m-node .md-link { padding: 0 !important; margin: 0 !important; }' })
         const bare = await boxesNow(page)

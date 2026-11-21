@@ -219,6 +219,39 @@ describe('the room that the page gives the links of a message', () => {
     expect(given(second).left).toBe(10)
   })
 
+  it('gives a short link the rest of a gap that its short neighbour needs less than half of, where a wide link holds its other side', () => {
+    // S (30 px of words) needs 7 px on each side; L (9 px) has a wide link touching its right end. Halves of the gap would leave L at 39 px.
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 100, 130)
+      link(message, 190, 199)
+      link(message, 199, 380)
+    })
+    fitLinks(root, messages)
+    const [short, shared, wide] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    if (!short || !shared || !wide) throw new Error('the made page has no links')
+    expect(boxOf(shared).right - boxOf(shared).left, 'the box of the link whose gap its neighbour shares').toBeGreaterThanOrEqual(LEAST)
+    expect(boxOf(short).right - boxOf(short).left, 'the box of its neighbour').toBeGreaterThanOrEqual(LEAST)
+    expect(boxOf(short).right, 'the end of the neighbour’s box').toBeLessThanOrEqual(boxOf(shared).left)
+    expect(boxOf(shared).right, 'the end of the box, at the wide link’s start').toBeLessThanOrEqual(199)
+    expect(given(wide)).toEqual({ left: 0, right: 0 })
+    setter.mockClear()
+    fitLinks(root, messages)
+    expect(writes(), 'the writes of a second read').toEqual([])
+  })
+
+  it('keeps two short links that both need more than half of their gap at the middle of it, as the first pass has them', () => {
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 100, 110)
+      link(message, 130, 140)
+      link(message, 140, 380)
+    })
+    fitLinks(root, messages)
+    const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    if (!first || !second) throw new Error('the made page has no links')
+    expect(boxOf(first).right, 'the end of the first box').toBeLessThanOrEqual(boxOf(second).left)
+    expect(given(first).right, 'half of the gap').toBe(10)
+  })
+
   it('keeps a link’s box off a control beside it', () => {
     const { pane: root, messages } = pane(1, (message) => {
       link(message, 100, 110)

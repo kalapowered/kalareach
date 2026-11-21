@@ -18,7 +18,9 @@
  * - The box does not reach another link's or control's box beside it on the same line or on a line whose
  *   box reaches this one's (the boxes are as high as the least size, so the line above and below count).
  *   A gap between two links that both take room is shared in halves; a gap to a control, or to a link
- *   that is wide enough, is the narrow link's to its edge.
+ *   that is wide enough, is the narrow link's to its edge. A link that the halves leave under the least
+ *   size is measured again, with each neighbour that the halves brought to the least size as the box it
+ *   is, so that a neighbour that needed less than its half leaves the rest of the gap.
  * - Where the column cuts one side of the room, the other side grows by what was cut (the rule of
  *   `link-target.ts`'s `fit`), so a link at the end of a line is as wide as the least size when the
  *   column has room for it on the other side. Where both sides together lack room (two short links with
@@ -161,7 +163,9 @@ export function fitLinks(pane: HTMLElement, messages: readonly Element[]): void 
   const neighbours: Neighbour[] = boxes
     .filter(({ box }) => box.right > box.left)
     .map(({ box, link }) => ({ box, shares: link && box.right - box.left < least }))
-  const writes: { link: HTMLElement; room: Beside }[] = []
+  const widthOf = (box: Rect, room: Beside): number => box.right - box.left + room.left + room.right
+  // Pass 1: every link takes half of a gap to a short link beside it, as if that link needed all of its half.
+  const first = new Map<HTMLElement, Beside>()
   for (const { element, box, link, message } of boxes) {
     if (!link || !mine.has(message)) continue
     const room =
@@ -173,6 +177,27 @@ export function fitLinks(pane: HTMLElement, messages: readonly Element[]): void 
             columnOf(element, message)
           )
         : NONE
+    first.set(element, room)
+  }
+  // Pass 2: a link that pass 1 left under the least size is measured again with each neighbour that pass 1 brought to the least size
+  // as the box it is, not as a short link that takes half of the gap: a neighbour that needed less than its half leaves the rest.
+  const rooms = new Map(first)
+  for (const { element, box, message } of boxes) {
+    const room = first.get(element)
+    if (room === undefined || box.right <= box.left || widthOf(box, room) >= least) continue
+    const fixed: Neighbour[] = boxes
+      .filter((other) => other.box !== box && other.box.right > other.box.left)
+      .map((other) => {
+        const taken = first.get(other.element)
+        if (other.link && taken !== undefined && widthOf(other.box, taken) >= least) {
+          return { box: { ...other.box, left: other.box.left - taken.left, right: other.box.right + taken.right }, shares: false }
+        }
+        return { box: other.box, shares: other.link && other.box.right - other.box.left < least }
+      })
+    rooms.set(element, besideOf(box, least, fixed, columnOf(element, message)))
+  }
+  const writes: { link: HTMLElement; room: Beside }[] = []
+  for (const [element, room] of rooms) {
     const now = givenTo(element)
     if (Math.abs(room.left - now.left) > 1 / GRID || Math.abs(room.right - now.right) > 1 / GRID) writes.push({ link: element, room })
   }
