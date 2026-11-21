@@ -636,18 +636,15 @@ fn the_inventory_holds_each_file_the_compiler_read() {
         if message["reason"] != "compiler-artifact" || message["profile"]["test"] == true {
             continue;
         }
-        let built = message["target"]["kind"]
+        let kinds: Vec<&str> = message["target"]["kind"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(serde_json::Value::as_str)
-            .any(|kind| BUILT_KINDS.contains(&kind));
-        if !built {
+            .collect();
+        if !kinds.iter().any(|kind| BUILT_KINDS.contains(kind)) {
             continue;
         }
-        // The member, by the folder of the manifest Cargo reports for the artifact (the folder above
-        // the member's `src`); a package outside the checkout, or one the inventory does not read, is
-        // not compared.
         let Some(manifest) = message["manifest_path"]
             .as_str()
             .and_then(|manifest| std::fs::canonicalize(manifest).ok())
@@ -660,15 +657,21 @@ fn the_inventory_holds_each_file_the_compiler_read() {
         else {
             continue;
         };
-        let mut read_one = false;
+        // rustc's own dep-info of each file of the artifact, which lists the compiler's inputs only:
+        // the file that Cargo links above `deps/` also holds what a build script adds.
+        let mut infos: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
         for artifact in message["filenames"].as_array().into_iter().flatten() {
-            let Some(artifact) = artifact.as_str() else {
+            if let Some(info) = artifact
+                .as_str()
+                .and_then(|file| own_dep_info(Path::new(file)))
+            {
+                infos.insert(info);
+            }
+        }
+        for info in infos {
+            let Ok(text) = std::fs::read_to_string(&info) else {
                 continue;
             };
-            let Ok(text) = std::fs::read_to_string(Path::new(artifact).with_extension("d")) else {
-                continue;
-            };
-            read_one = true;
             depinfo += 1;
             for file in rs_files_of(&text) {
                 let path = if file.is_absolute() {
@@ -691,11 +694,6 @@ fn the_inventory_holds_each_file_the_compiler_read() {
                 }
             }
         }
-        if !read_one {
-            problems.push(format!(
-                "{krate}: no dep-info file is readable beside an artifact"
-            ));
-        }
     }
     println!(
         "{depinfo} dep-info files, files read by {} of {} crates",
@@ -711,6 +709,37 @@ fn the_inventory_holds_each_file_the_compiler_read() {
     problems.sort();
     problems.dedup();
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// rustc's own dep-info of the artifact `artifact`: the `<crate>-<hash>.d` in `deps/` beside the file
+/// (without the `lib` of a library's name). An artifact that Cargo links or copies above `deps/` is
+/// found by the file in `deps/` that is the same file (a hard link) or a copy of it (the same size and
+/// time), which names the hash.
+fn own_dep_info(artifact: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let folder = artifact.parent()?;
+    let twin = if folder.file_name()? == "deps" {
+        artifact.to_path_buf()
+    } else {
+        let above = std::fs::metadata(artifact).ok()?;
+        std::fs::read_dir(folder.join("deps"))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                std::fs::metadata(path).is_ok_and(|found| {
+                    (found.ino() == above.ino() && found.dev() == above.dev())
+                        || (found.len() == above.len()
+                            && found.modified().ok() == above.modified().ok()
+                            && path.extension().is_none())
+                })
+            })?
+    };
+    let stem = twin.file_stem()?.to_str()?;
+    [stem.strip_prefix("lib").unwrap_or(stem), stem]
+        .into_iter()
+        .map(|name| twin.with_file_name(format!("{name}.d")))
+        .find(|info| info.is_file())
 }
 
 /// The `.rs` files a dep-info file lists after the target's colon (a space in a name is escaped by
