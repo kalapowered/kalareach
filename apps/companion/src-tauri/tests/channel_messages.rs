@@ -408,7 +408,9 @@ fn a_new_application_state_over_the_directory_lists_what_was_kept() {
     first.keep(message(1, "still here", &[])).expect("kept");
     drop(first);
     let second = Window::over(data.path());
-    assert_eq!(messages(&second.list())[0]["text"], "still here");
+    let list = second.list();
+    assert_eq!(messages(&list).len(), 1, "{list}");
+    assert_eq!(messages(&list)[0]["text"], "still here");
 }
 
 /// KR-REQ-12.26: a keep under an identity that holds a file of another layout, or a message that
@@ -804,9 +806,8 @@ fn the_bounds_refuse_and_evict_nothing_and_a_bad_text_is_not_a_quota() {
         assert_eq!(code_of(&refusal), "QUOTA_EXCEEDED", "{refusal}");
     }
     assert_eq!(messages(&window.list()).len(), 2, "nothing was evicted");
-    window
-        .keep(message(1, "one", &[]))
-        .expect("a repeat is no new entry");
+    let repeated = window.keep(message(1, "one", &[]));
+    assert!(repeated.is_ok(), "a repeat is no new entry: {repeated:?}");
     let _bytes = testing::lower_limits(
         dir(data.path()),
         Limits {
@@ -1250,8 +1251,10 @@ fn a_record_of_a_send_is_made_once_updated_with_its_action_and_cleared() {
             .expect_err("the call is refused");
         assert_eq!(code_of(&refusal), "INVALID_ARGUMENT", "{refusal}");
     }
-    update("hold-a", 1).expect("null to a value");
-    update("hold-a", 1).expect("the same value again");
+    let first = update("hold-a", 1);
+    assert!(first.is_ok(), "null to a value: {first:?}");
+    let again = update("hold-a", 1);
+    assert!(again.is_ok(), "the same value again: {again:?}");
     {
         let refusal = (update("hold-a", 2))
             .clone()
@@ -1315,12 +1318,8 @@ fn an_update_whose_flush_failed_after_its_rename_may_have_left_the_identity() {
 fn only_readable_records_count_towards_the_bound() {
     let data = data();
     let window = Window::over(data.path());
-    window
-        .create_hold("hold-0", &[])
-        .expect("the directory exists");
-    window
-        .call("device_channel_hold_clear", json!({ "holdId": "hold-0" }))
-        .expect("cleared");
+    // The folder is made here, so that the unreadable file below needs nothing of the store.
+    std::fs::create_dir_all(dir(data.path())).expect("the folder is made");
     let _limits = testing::lower_limits(
         dir(data.path()),
         Limits {
@@ -1332,21 +1331,25 @@ fn only_readable_records_count_towards_the_bound() {
     window.create_hold("hold-1", &[]).expect("one");
     window.create_hold("hold-2", &[]).expect("two");
     std::fs::write(dir(data.path()).join("hold-bad.held"), b"not json").expect("an unreadable one");
-    window
-        .create_hold("hold-3", &[])
-        .expect("999 of 1,000 readable and one unreadable: made");
+    let made = window.create_hold("hold-3", &[]);
+    assert!(
+        made.is_ok(),
+        "two readable and one unreadable of three: made: {made:?}"
+    );
     {
         let refusal = (window.create_hold("hold-4", &[]))
             .clone()
             .expect_err("the call is refused");
         assert_eq!(code_of(&refusal), "QUOTA_EXCEEDED", "{refusal}");
     }
-    window
-        .call(
-            "device_channel_hold_update",
-            json!({ "holdId": "hold-3", "actionId": action(1) }),
-        )
-        .expect("a replacement is always allowed");
+    let replaced = window.call(
+        "device_channel_hold_update",
+        json!({ "holdId": "hold-3", "actionId": action(1) }),
+    );
+    assert!(
+        replaced.is_ok(),
+        "a replacement is always allowed: {replaced:?}"
+    );
 }
 
 /// KR-REQ-12.26: a record of another layout is counted and left; a damaged one is listed by its
@@ -1355,8 +1358,10 @@ fn only_readable_records_count_towards_the_bound() {
 fn a_damaged_record_is_listed_by_its_name_and_a_later_one_is_left_alone() {
     let data = data();
     let window = Window::over(data.path());
-    window.create_hold("hold-ok", &[]).expect("made");
     let folder = dir(data.path());
+    // The folder is made here, so that the files below need nothing of the store.
+    std::fs::create_dir_all(&folder).expect("the folder is made");
+    window.create_hold("hold-ok", &[]).expect("made");
     std::fs::write(folder.join("hold-bad.held"), b"not json at all").expect("damaged");
     std::fs::write(
         folder.join("hold-member.held"),
@@ -2087,9 +2092,9 @@ fn a_keep_with_no_references_takes_the_ledger_step_too() {
     }
     drop(guard);
     // The keep reported the failure, so the page sends nothing; the same keep, repeated, completes.
-    let done = window
-        .keep(message(2, "no draft either", &[]))
-        .expect("the repeated keep completes");
+    let done = window.keep(message(2, "no draft either", &[]));
+    assert!(done.is_ok(), "the repeated keep completes: {done:?}");
+    let done = done.unwrap_or_default();
     assert_eq!(done["resumed"], true, "{done}");
 }
 
