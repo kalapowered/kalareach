@@ -2111,6 +2111,16 @@ pub mod testing {
                 .map(|record| record.generation)
         }
 
+        /// The serial of the read the owner holds of `host`, when it holds one. It is read from the
+        /// record itself, not from the rows `records` gives.
+        #[must_use]
+        pub fn read_serial_of(&self, host: kr_protocol::ids::DeviceId) -> Option<u64> {
+            self.lock()
+                .hosts
+                .get(&HostKey::Paired(host))
+                .and_then(|record| record.read.as_ref().map(|read| read.serial()))
+        }
+
         /// Whether the record of `host` holds a read or a retained connection.
         #[must_use]
         pub fn holds_resources_of(&self, host: kr_protocol::ids::DeviceId) -> bool {

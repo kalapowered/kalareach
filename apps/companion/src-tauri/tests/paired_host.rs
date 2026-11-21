@@ -3074,19 +3074,26 @@ fn told_other(companion: &Companion, reference: &str) -> Vec<serde_json::Value> 
         .collect()
 }
 
+/// Resolves once the page was told that contact with `reference` stands as `state`. It has no bound
+/// of its own: a case that bounds it where it waits says in the bound's message what it waited for.
+async fn told_as(companion: &Companion, reference: &str, state: &str) -> serde_json::Value {
+    loop {
+        if let Some(found) = told_other(companion, reference)
+            .into_iter()
+            .find(|other| other["contact"]["state"] == state)
+        {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Waits until the page was told that contact with `reference` stands as `state`.
 async fn until_told(companion: &Companion, reference: &str, state: &str) -> serde_json::Value {
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            if let Some(found) = told_other(companion, reference)
-                .into_iter()
-                .find(|other| other["contact"]["state"] == state)
-            {
-                return found;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        told_as(companion, reference, state),
+    )
     .await
     .unwrap_or_else(|_| {
         panic!(
@@ -3170,12 +3177,7 @@ async fn read_newer_than(
 ) -> u64 {
     tokio::time::timeout(WATCHDOG, async {
         loop {
-            let serial = owner
-                .records(&[host])
-                .rows
-                .first()
-                .and_then(|row| row.read.as_ref().map(|read| read.serial()));
-            if let Some(serial) = serial
+            if let Some(serial) = owner.read_serial_of(host)
                 && Some(serial) > after
             {
                 return serial;
@@ -3194,8 +3196,8 @@ fn row_of<'a>(reply: &'a serde_json::Value, reference: &str) -> Option<&'a serde
         .find(|row| row["reference"] == reference)
 }
 
-/// A pass whose host A refuses and whose host C is held in its dial: A's refusal is told before the
-/// pass returns, and the owner's state has it while the reply is held.
+/// A pass whose host A refuses and whose host C's visit is held after its read: A's refusal is told
+/// before the pass returns, and the owner's state has it while the reply is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_host_does_not_delay_another_hosts_contact_event() {
     let v = visiting().await;
@@ -3205,7 +3207,11 @@ async fn a_slow_host_does_not_delay_another_hosts_contact_event() {
     v.control
         .refuse_request(Some((Method::AttentionRead, lapsed())));
     let pass = v.pass();
-    let refused = until_told(v.companion(), &v.a_ref, "refused").await;
+    // The case's first wait: were the visits to run one after another, C's first, A would not be
+    // visited and this wait would end at the watchdog.
+    let refused = tokio::time::timeout(WATCHDOG, told_as(v.companion(), &v.a_ref, "refused"))
+        .await
+        .expect("A's refusal is told while C's visit is held");
     assert_eq!(refused["contact"]["request"], "attention_read", "{refused}");
     assert!(
         !pass.is_finished(),
@@ -3229,7 +3235,11 @@ async fn a_visits_contact_is_published_while_the_pass_reply_is_held() {
     let slow = hold_visit_of(v.companion().inbox().watch_visits(), v.id_of(&v.c_ref));
     v.control.end_connections(true);
     let pass = v.pass();
-    let lost = until_told(v.companion(), &v.a_ref, "out_of_contact").await;
+    // The case's first wait: were the visits to run one after another, C's first, A would not be
+    // visited and this wait would end at the watchdog.
+    let lost = tokio::time::timeout(WATCHDOG, told_as(v.companion(), &v.a_ref, "out_of_contact"))
+        .await
+        .expect("A's loss of contact is told while C's visit is held");
     assert!(lost["contact"]["since_ms"].is_u64(), "{lost}");
     assert!(!pass.is_finished(), "the reply is still held");
     assert_eq!(
@@ -3255,7 +3265,11 @@ async fn a_refusal_then_a_recovery_of_one_host_is_told_in_order_while_c_is_slow(
     v.control
         .refuse_request(Some((Method::AttentionRead, lapsed())));
     let first = v.pass();
-    until_told(v.companion(), &v.a_ref, "refused").await;
+    // The case's first wait: were the visits to run one after another, C's first, A would not be
+    // visited and this wait would end at the watchdog.
+    tokio::time::timeout(WATCHDOG, told_as(v.companion(), &v.a_ref, "refused"))
+        .await
+        .expect("A's refusal is told while C's visit is held");
     v.control.refuse_request(None);
     let second = v.pass();
     until_told(v.companion(), &v.a_ref, "in_contact").await;
