@@ -645,8 +645,9 @@ fn the_inventory_holds_each_file_the_compiler_read() {
         if !built {
             continue;
         }
-        // The member, by the folder of the manifest Cargo reports for the artifact; a package outside
-        // the checkout, or one the inventory does not read, is not compared.
+        // The member, by the folder of the manifest Cargo reports for the artifact (the folder above
+        // the member's `src`); a package outside the checkout, or one the inventory does not read, is
+        // not compared.
         let Some(manifest) = message["manifest_path"]
             .as_str()
             .and_then(|manifest| std::fs::canonicalize(manifest).ok())
@@ -655,7 +656,7 @@ fn the_inventory_holds_each_file_the_compiler_read() {
         };
         let Some((krate, (_, files))) = known
             .iter()
-            .find(|(_, (folder, _))| manifest.parent() == Some(folder.as_path()))
+            .find(|(_, (src, _))| src.parent() == manifest.parent())
         else {
             continue;
         };
