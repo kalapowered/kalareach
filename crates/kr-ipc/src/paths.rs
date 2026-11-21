@@ -3049,6 +3049,39 @@ mod windows {
             }
         }
 
+        /// A refusal removes the name of the file it made even while another program still holds the
+        /// file open: the deletion is marked in the form of a Unix unlink, which takes the name away
+        /// at once, and not in the older form, which leaves the name until the last handle closes.
+        /// The other program here holds a handle it opened by the name before the writer's check
+        /// ran, and keeps it until the folder has been read.
+        #[test]
+        fn a_refused_new_file_leaves_no_name_while_another_program_still_holds_it() {
+            for (writer, write) in WRITERS {
+                let folder = Folder::new("held-open");
+                let destination = folder.0.join("setting");
+                let held = std::rc::Rc::new(std::cell::RefCell::new(None::<std::fs::File>));
+                let keeping = std::rc::Rc::clone(&held);
+                let _hooked = Hooked::install(move |path, _file| {
+                    *keeping.borrow_mut() = Some(
+                        std::fs::File::open(path).expect("another program opens the new file"),
+                    );
+                    Some(Seen::NoLists)
+                });
+                let error = write(&destination, b"other").expect_err("the write is refused");
+                assert!(error.to_string().contains(NO_LISTS), "{writer}: {error}");
+                assert!(
+                    held.borrow().is_some(),
+                    "{writer}: the other program held the file when the writer closed its own handle"
+                );
+                assert_eq!(
+                    folder.names(),
+                    Vec::<String>::new(),
+                    "{writer}: the name of the refused file is gone while another program holds it"
+                );
+                held.borrow_mut().take();
+            }
+        }
+
         /// A refusal that cannot remove the file it made says so after its own reason, and leaves
         /// the empty file where it is, with the file at the destination and its list as they were.
         /// The deletion is refused because the new file carries the read-only attribute.
