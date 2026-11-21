@@ -391,8 +391,8 @@ function unreadableWords(count: { readonly layout: number; readonly now: number 
     const things = n === 1 ? 'A record of a message that was being sent' : `${String(n)} records of messages that were being sent`
     const left = n === 1 ? 'It was left as it is' : 'They were left as they are'
     return kind === 'layout'
-      ? `${things} could not be read by this version of the application. ${left}. Check the session before you send again.`
-      : `${things} could not be read now. Check the session before you send again.`
+      ? `${things} could not be read by this version of the application. ${left}. Check your sessions before you send again.`
+      : `${things} could not be read now. Check your sessions before you send again.`
   }
   return [count.layout > 0 ? word(count.layout, 'layout') : '', count.now > 0 ? word(count.now, 'now') : '']
     .filter((each) => each !== '')

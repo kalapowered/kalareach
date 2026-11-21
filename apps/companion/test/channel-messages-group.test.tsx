@@ -305,6 +305,18 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     )
   })
 
+  it('K5b ends the warning for records that could not be read with the ruled words, in both forms', async () => {
+    const of = world()
+    of.messages.leaveUnreadable('holds', { layout: 1, now: 2 })
+    startOver(of)
+    expect(await screen.findByText('Some records of messages being sent could not be read')).toBeVisible()
+    expect(
+      await screen.findByText(
+        'A record of a message that was being sent could not be read by this version of the application. It was left as it is. Check your sessions before you send again. 2 records of messages that were being sent could not be read now. Check your sessions before you send again.'
+      )
+    ).toBeVisible()
+  })
+
   it('K6 reads every mix of drafts, messages, records and what could not be read (pure)', () => {
     const none = { ...NO_BOOK }
     const forms: readonly [string, ReturnType<typeof keptEntry>][] = [
@@ -335,13 +347,13 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
       ['ledger and read', 'The list of removals for drafts', 'could not be read.'],
       ['failed read', 'Channel messages', 'could not be read now.'],
       ['drafts and messages unreadable', 'Some drafts and channel messages', 'could not be read.'],
-      ['drafts and holds unreadable', 'Some drafts and channel messages', 'could not be read.'],
+      ['drafts and holds unreadable', 'Some drafts and records of messages being sent', 'could not be read.'],
       ['messages unreadable', 'Some channel messages', 'could not be read.'],
       ['holds unreadable', 'Some records of messages being sent', 'could not be read.'],
       ['one hold', 'One record of a message being sent', 'can be removed on this page.'],
       ['holds', '2 records of messages being sent', 'can be removed on this page.'],
-      ['one message', 'One channel message', 'is kept apart from the composers.'],
-      ['messages', '2 channel messages', 'are kept apart from the composers.'],
+      ['one message', 'One channel message', 'is not in a composer.'],
+      ['messages', '2 channel messages', 'are not in a composer.'],
       ['draft and message', 'One kept draft and one channel message', 'are not in a composer.'],
       ['drafts unreadable only', 'Some drafts', 'could not be read.']
     ])
@@ -362,7 +374,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
       await Promise.resolve()
     })
     const line = await screen.findByTestId('kept-drafts-entry')
-    expect(line).toHaveTextContent('One channel message is kept apart from the composers.')
+    expect(line).toHaveTextContent('One channel message is not in a composer.')
     await person.click(within(line).getByRole('button'))
     expect(await screen.findByTestId('channel-message-text')).toHaveTextContent('kept by another window')
   })
