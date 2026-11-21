@@ -324,7 +324,7 @@ crates/kr-describe/src/supervise.rs | start_thread | .spawn | work | 1 | supervi
 crates/kr-describe/src/testing.rs | JobThreads::start | .spawn | closure{.wait} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-describe/src/testing.rs | Resident::keep | .spawn | closure{.chunks_mut} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-describe/src/testing.rs | stub_main | std::thread::spawn | closure{std::io::stderr} | 1 | test | - | compiled in only with the testing feature or a test module
-crates/kr-ipc/src/endpoint/platform/live.rs | keep_the_times_fresh | tokio::spawn | async{.tick} | 1 | request | - | bound(guard at crates/kr-ipc/src/endpoint/platform/live.rs:345); the listener's hold owns the refresh task and its Drop aborts it, so whatever owns the listener ends the task
+crates/kr-ipc/src/endpoint/platform/live.rs | keep_the_times_fresh | tokio::spawn | async{.tick} | 1 | request | - | bound(guard at crates/kr-ipc/src/endpoint/platform/live.rs:358); the listener's hold owns the refresh task and its Drop aborts it, so whatever owns the listener ends the task
 crates/kr-ipc/src/testing.rs | Serving::spawn | tokio::spawn | task | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-ipc/src/testing.rs | say_on_the_standard_error | say_by | closure{.write_all} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-ipc/src/testing.rs | say_by | .spawn | closure{.send} | 1 | test | - | compiled in only with the testing feature or a test module
