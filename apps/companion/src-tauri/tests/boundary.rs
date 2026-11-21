@@ -1637,6 +1637,45 @@ fn the_android_activity_is_restarted_by_a_font_scale_change_so_the_page_follows_
     }
 }
 
+/// KR-REQ-13.17: "Take a photo" opens the camera on Android. The page's file input asks for the
+/// camera, and the WebView's file chooser opens it only after it finds an application that answers
+/// the image-capture action. The application targets Android 11 or later, where an application sees
+/// only the apps its own manifest names, so without this entry the chooser finds none and shows the
+/// photo picker in place of the camera.
+#[test]
+fn the_android_manifest_names_the_image_capture_action_so_take_a_photo_finds_the_camera() {
+    let manifest =
+        std::fs::read_to_string(crate_root().join("gen/android/app/src/main/AndroidManifest.xml"))
+            .expect("the application's manifest can be read");
+    // What the manifest declares, with its comments taken out: the action's name in a comment that
+    // explains the entry is not the entry.
+    let mut declared = String::new();
+    let mut rest = manifest.as_str();
+    while let Some(start) = rest.find("<!--") {
+        declared.push_str(&rest[..start]);
+        let end = rest[start..]
+            .find("-->")
+            .expect("every comment in the manifest is closed");
+        rest = &rest[start + end + "-->".len()..];
+    }
+    declared.push_str(rest);
+    // The actions of every intent that a `<queries>` element lists.
+    let queried: Vec<&str> = declared
+        .split("<queries>")
+        .skip(1)
+        .filter_map(|element| element.split("</queries>").next())
+        .flat_map(|element| element.split("<intent>").skip(1))
+        .filter_map(|entry| entry.split("</intent>").next())
+        .flat_map(|entry| entry.split("<action").skip(1))
+        .filter_map(|action| action.split("android:name=\"").nth(1))
+        .filter_map(|name| name.split('"').next())
+        .collect();
+    assert!(
+        queried.contains(&"android.media.action.IMAGE_CAPTURE"),
+        "no `<queries>` intent names android.media.action.IMAGE_CAPTURE, so \"Take a photo\" cannot see the camera and opens the photo picker: {queried:?}"
+    );
+}
+
 /// The scan reads each way a file can write a floor, so a floor written another way is held to the
 /// baseline like any other and is never passed over.
 #[test]
