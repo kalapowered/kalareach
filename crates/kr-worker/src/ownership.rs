@@ -1444,25 +1444,23 @@ impl OwnedProcesses {
             ));
             return false;
         };
-        let mut empty = true;
         match job.process_ids() {
-            Ok(held) if held.is_empty() => {}
+            Ok(held) if held.is_empty() => true,
             Ok(held) => {
                 self.note_unestablished(format!(
                     "the session's job object still held {} process(es) when the closure was \
                      written",
                     held.len()
                 ));
-                empty = false;
+                false
             }
             Err(error) => {
                 self.note_unestablished(format!(
                     "the session's job object would not say what was left in it: {error}"
                 ));
-                empty = false;
+                false
             }
         }
-        empty
     }
 
     /// Asks the boundary itself whether it is holding anything.
@@ -2294,12 +2292,6 @@ impl OwnedProcesses {
     }
 }
 
-/// Establishes the strongest ownership boundary this host offers for a session.
-///
-/// # Errors
-///
-/// Never fails: a host with nothing better falls back to the terminal's process group, which is
-/// weaker but honest about being weaker.
 /// Establishes the strongest ownership boundary this host offers for a session.
 ///
 /// There is one on this platform, and a live session has it. The terminal created the session's
