@@ -319,7 +319,9 @@ struct Backend {
 const GATEWAY_SOCKET: &str = "gw.sock";
 
 /// How long a launcher waits for the answer to the launch it said it is going with, counted from
-/// the moment it says so.
+/// before it writes that it is going. This host counts a window of its own from the moment it reads
+/// that line: the launcher's count began earlier and can end first, and a refusal written after
+/// that is not read.
 #[cfg(unix)]
 const COMMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -3136,6 +3138,17 @@ fn refusal_frame(why: &str) -> Vec<u8> {
 #[cfg(unix)]
 fn gateway_failure_said(error: &BrokerError) -> String {
     let text = match error {
+        // The folder this backend made goes when its session closes, with what stands at the
+        // address, and the next command gets a folder of its own: so no instruction to move the
+        // thing away is given, and no claim that kr leaves it for good.
+        BrokerError::Listen {
+            endpoint,
+            refusal: kr_ipc::listen::ListenRefusal::NotASocket { object },
+        } => format!(
+            "the gateway could not listen on {endpoint}: it holds {}, which kr did not make; the \
+             next command you run gets a new folder for its gateway, so run the command again",
+            object.phrase()
+        ),
         BrokerError::Listen { endpoint, refusal } => format!(
             "the gateway could not listen on {}",
             refusal.said_then(endpoint, "run the command again")
@@ -3166,9 +3179,10 @@ async fn write_refusal(stream: &mut BridgeStream, why: &str, budget: std::time::
     )
 }
 
-/// Tells the launcher why its launch is not committed, within what is left of the window it gave,
-/// which it counted from the moment it said it is going: none left is no write. Says whether the
-/// refusal was written whole.
+/// Tells the launcher why its launch is not committed, within what is left of this host's own
+/// window, counted from the moment it read that the launcher is going: none left is no write. Says
+/// whether the refusal was written whole; the launcher may have stopped waiting before it was, and
+/// a write is not a claim that it was read.
 #[cfg(unix)]
 async fn refuse(stream: &mut BridgeStream, why: &str, going_at: tokio::time::Instant) -> bool {
     let Some(budget) = COMMIT_WINDOW
@@ -3598,8 +3612,9 @@ mod tests {
         };
         assert_eq!(
             gateway_failure_said(&bind),
-            "the gateway could not listen on /run/kr/gw.sock: it holds a file; kr does not remove \
-             what it did not make; if you do not need it, move it away, then run the command again"
+            "the gateway could not listen on /run/kr/gw.sock: it holds a file, which kr did not \
+             make; the next command you run gets a new folder for its gateway, so run the command \
+             again"
         );
         let held = BrokerError::Listen {
             endpoint: "/run/kr/gw.sock".to_owned(),
@@ -3627,9 +3642,10 @@ mod tests {
     }
 
     /// KR-REQ-12.07: a refusal that the connection takes whole is written whole, and one that it
-    /// cannot take in the time given, or that has no time left, is not claimed.
+    /// cannot take in the time given, or that has no time left, is not claimed. The clock is
+    /// paused, so the windows are counted exactly.
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_refusal_that_cannot_be_written_in_time_is_not_claimed() {
         use kr_protocol::gateway::NativeFraming;
         use tokio::io::AsyncReadExt as _;
@@ -3660,6 +3676,24 @@ mod tests {
         assert!(
             !write_refusal(&mut full, "why", std::time::Duration::from_millis(100)).await,
             "a write that waits past its budget is not claimed"
+        );
+
+        // A window part used up leaves the rest of it, less the margin, and a write that waits
+        // past that is not claimed: a second of the two is gone, so seven hundred and fifty
+        // milliseconds are left.
+        let (mut part, _unread) = stream_of(8);
+        let begun = tokio::time::Instant::now();
+        let going_at = begun
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the clock has run for a second");
+        assert!(
+            !refuse(&mut part, "why", going_at).await,
+            "a write that waits past what is left of the window is not claimed"
+        );
+        assert_eq!(
+            begun.elapsed(),
+            COMMIT_WINDOW - REFUSAL_MARGIN - std::time::Duration::from_secs(1),
+            "it waited for what was left, and no longer"
         );
 
         // A window already used up leaves no budget, and nothing is written.

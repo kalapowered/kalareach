@@ -158,7 +158,8 @@ impl Placed {
         }
     }
 
-    /// The forwarder with these arguments and a clean environment, run from the tree's root.
+    /// The forwarder with these arguments and a clean environment, run from the tree's root, with a
+    /// home of the tree's own and the system's plain `PATH`.
     #[must_use]
     pub fn command(&self, arguments: &[&str]) -> Command {
         let mut command = Command::new(&self.forwarder);
@@ -166,6 +167,9 @@ impl Placed {
         for variable in FORWARDER_VARIABLES {
             command.env_remove(variable);
         }
+        command.env("HOME", self.host.root());
+        #[cfg(unix)]
+        command.env("PATH", "/usr/bin:/bin");
         command
     }
 }

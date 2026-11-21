@@ -1079,8 +1079,8 @@ fn kr_req_12_07_a_gateway_that_cannot_bind_tells_the_launcher_why() {
     );
     assert!(
         said.contains(
-            "gw.sock: it holds a file; kr does not remove what it did not make; if you do not need \
-             it, move it away, then run the command again), so the program runs as typed"
+            "gw.sock: it holds a file, which kr did not make; the next command you run gets a new \
+             folder for its gateway, so run the command again), so the program runs as typed"
         ),
         "{said}"
     );
@@ -1104,9 +1104,11 @@ fn kr_req_12_07_a_gateway_that_cannot_bind_tells_the_launcher_why() {
 }
 
 /// KR-REQ-12.07: a backend whose bind of the gateway's socket failed leaves what stands there alone
-/// through the launch's rollback: a file, and another program's live listener, which still accepts
-/// afterwards. (What the backend's own endpoint removes when it ends is held by the worker's
-/// endpoint cases; a session's close takes its whole private folder.)
+/// through the launch's rollback and through its retirement: a file, and another program's live
+/// listener, which still accepts afterwards. The line ends with the next establish of the session,
+/// which retires the backend the failed launch gave back. (A session's close takes its whole
+/// private folder; what the backend's own endpoint removes when it ends is held by the worker's
+/// endpoint cases.)
 #[test]
 fn kr_req_12_07_a_backend_whose_bind_failed_leaves_what_stands_at_gw_sock() {
     for (case, other_listener) in [("a file", false), ("another listener", true)] {
@@ -1126,13 +1128,30 @@ fn kr_req_12_07_a_backend_whose_bind_failed_leaves_what_stands_at_gw_sock() {
         let status = launched.ends();
         assert_eq!(status.code(), Some(2), "{case}: {}", launched.said());
         // The launch is given back with its server ended, as the cases above wait for.
-        eventually("the launch is given back and its server ended", || {
-            shell.last_launch_failure().is_some()
-                && shell.servers().iter().all(|server| {
-                    kr_ipc::identity::process_state(server) == kr_ipc::identity::ProcessState::Ended
-                })
+        eventually("the launch's server ended", || {
+            shell.servers().iter().all(|server| {
+                kr_ipc::identity::process_state(server) == kr_ipc::identity::ProcessState::Ended
+            })
         });
-        let left = std::fs::symlink_metadata(&socket).expect("what stood there still stands");
+        assert!(
+            shell.last_launch_failure().is_some(),
+            "{case}: the failed launch was recorded"
+        );
+        // The next line of the session ends this one, and the backend the launch gave back is
+        // retired: its directory's files go, and a socket it did not make stays.
+        let _next = shell
+            .establish(&["codex"])
+            .expect("the next line's backend is established");
+        assert!(
+            !directory.join("launch").exists(),
+            "{case}: the first backend was retired"
+        );
+        let left = std::fs::symlink_metadata(&socket);
+        assert!(
+            left.is_ok(),
+            "{case}: what stood there still stands after the retirement"
+        );
+        let left = left.expect("what stood there");
         if listener.is_some() {
             assert!(
                 std::os::unix::fs::FileTypeExt::is_socket(&left.file_type()),
@@ -1146,6 +1165,73 @@ fn kr_req_12_07_a_backend_whose_bind_failed_leaves_what_stands_at_gw_sock() {
             assert!(left.is_file(), "{case}: the file stands");
         }
         drop(listener);
+    }
+}
+
+/// KR-REQ-12.07: a backend that is retired after a launch removes the sockets its own binds made,
+/// the bridge's and the gateway's, and leaves a socket that replaced either of them: another
+/// program's listener at the same path still takes a connection.
+#[test]
+fn kr_req_12_07_a_retired_backend_removes_its_own_sockets_and_leaves_what_replaced_them() {
+    let replace = |path: &std::path::Path| {
+        std::fs::remove_file(path).expect("the socket the backend made goes");
+        std::os::unix::net::UnixListener::bind(path).expect("another listener takes the path")
+    };
+    for replaced in [false, true] {
+        let shell = Gateway::new();
+        let answer = shell
+            .establish(&["codex"])
+            .expect("a backend is established");
+        let directory = directory_of(&answer);
+        let gateway = directory.join("gw.sock");
+        // The backend's bridge socket is the other socket in its folder: the answer's own variable
+        // names the registration, not the socket.
+        let bridge = std::fs::read_dir(&directory)
+            .expect("the backend's folder")
+            .map(|entry| entry.expect("an entry").path())
+            .find(|path| {
+                path != &gateway
+                    && std::fs::symlink_metadata(path).is_ok_and(|found| {
+                        std::os::unix::fs::FileTypeExt::is_socket(&found.file_type())
+                    })
+            })
+            .expect("the backend's bridge socket");
+        let mut launched = shell.launch(
+            &answer,
+            "retired",
+            &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+        );
+        launched.prints("TUI: turn/completed");
+        assert!(
+            std::fs::symlink_metadata(&bridge).is_ok()
+                && std::fs::symlink_metadata(&gateway).is_ok(),
+            "the backend's two sockets are there: {} and {}",
+            bridge.display(),
+            gateway.display()
+        );
+        let others = replaced.then(|| (replace(&bridge), replace(&gateway)));
+        // The program ends, and the instance and the backend end with it.
+        let _ = launched.child.kill();
+        let _ = launched.ends();
+        eventually("the backend was retired", || {
+            !directory.join("launch").exists()
+        });
+        if others.is_some() {
+            assert!(
+                std::os::unix::net::UnixStream::connect(&gateway).is_ok(),
+                "a listener that replaced the gateway's socket still takes a connection"
+            );
+            assert!(
+                std::os::unix::net::UnixStream::connect(&bridge).is_ok(),
+                "a listener that replaced the bridge's socket still takes a connection"
+            );
+        } else {
+            assert!(
+                !gateway.exists() && !bridge.exists(),
+                "the sockets the backend made went with it"
+            );
+        }
+        drop(others);
     }
 }
 
