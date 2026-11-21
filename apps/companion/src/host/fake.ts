@@ -131,7 +131,12 @@ import { receivedFailure } from './tauri'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } from './fake-decode'
 import { FakeChannelMessageStore } from './fake-channel-messages'
 import { FakeDraftStore } from './fake-drafts'
-import { ScriptedLaunching, type InstalledLaunch, type LaunchScenario } from './fake-launch'
+import {
+  ScriptedLaunchCommands,
+  ScriptedLaunching,
+  type InstalledLaunch,
+  type LaunchScenario
+} from './fake-launch'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
 import { ScriptedRetained, type FakeRetained } from './fake-retained'
@@ -569,6 +574,11 @@ export interface FakeHostControls {
   refuseLaunches(code: string | null, message: string): void
   /** The launches the host installed, oldest first. */
   readonly launches: readonly InstalledLaunch[]
+  /**
+   * The launch commands the host saves: what it holds, what it answers to a read of the list, how
+   * many reads it has had and every save and remove it was asked for.
+   */
+  readonly launchCommands: ScriptedLaunchCommands
   /**
    * Opens the pairing records the address said were not open, as native code does at the unlock of
    * a phone that was started before it: the page is told the pairing view it would have read.
@@ -1036,6 +1046,7 @@ export type HeldRead =
   | 'questionRead'
   | 'sessionRead'
   | 'launchSurface'
+  | 'launchCommands'
   | 'launch'
   | 'openSession'
   | 'sessionAgents'
@@ -1125,6 +1136,7 @@ export function fakeHost(
   /** Native code's words for the loss of the connection, while it is lost. */
   let lostBecause = UNREACHABLE
   const launching = new ScriptedLaunching(refuse)
+  const savedCommands = new ScriptedLaunchCommands(refuse)
   let pairing: PairingView = {
     origin: { origin: 'https://reach.kala.to', host: 'reach.kala.to', is_default: true },
     device_name: 'studio-mbp',
@@ -1753,6 +1765,16 @@ export function fakeHost(
       refuse('PERMISSION_DENIED', 'This device may not manage this host.')
     }
   }
+  /** The saved launch commands change from the local connection only. */
+  const requireLocalOwner = () => {
+    requireOwner()
+    if (pairedDevice) {
+      refuse(
+        'RESOURCE_UNAVAILABLE',
+        'a change to the saved launch commands is not offered over a host this device is paired with'
+      )
+    }
+  }
   /** The two writes of description setup are the host's own to make: a paired device is refused. */
   const requireLocalSocket = (change: 'a setting' | 'the download' | 'the checks') => {
     requireOwner()
@@ -2137,6 +2159,24 @@ export function fakeHost(
           refuse('UNKNOWN_SESSION', 'This session is not running on this computer.')
         }
         return launching.read(sessionId, false, stockShellOf(sessionId))
+      }),
+
+    // The host's own list, read on the connection for the host alone.
+    launchCommands: () =>
+      reading('launchCommands', () => {
+        requireConnection()
+        return savedCommands.read(rights.includes('host.manage'))
+      }),
+    // The two writes are the local owner's: a paired device is refused, as native code refuses it.
+    launchCommandSave: (params) =>
+      attempting(() => {
+        requireLocalOwner()
+        return { receipt: null, action_id: nextActionId(), value: savedCommands.save(params) }
+      }),
+    launchCommandRemove: (params) =>
+      attempting(() => {
+        requireLocalOwner()
+        return { receipt: null, action_id: nextActionId(), value: savedCommands.remove(params) }
       }),
 
     // The agent's calls, as the session's own worker answers them.
@@ -3611,6 +3651,9 @@ export function fakeHost(
     },
     get launches() {
       return launching.installed
+    },
+    get launchCommands() {
+      return savedCommands
     },
     openPairingRecords() {
       recordsNotOpen = null

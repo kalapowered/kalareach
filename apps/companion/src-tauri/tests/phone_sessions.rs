@@ -2197,7 +2197,7 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
             "agent_prompt_queue",
             prompt(shared.session_id, instance, "queued"),
         ),
-        "UNSUPPORTED_CAPABILITY",
+        "RESOURCE_UNAVAILABLE",
         "agent.prompt.queue",
     );
     let target =
@@ -5374,5 +5374,135 @@ async fn kr_req_13_11_a_phone_whose_link_is_lost_after_the_reader_has_the_reques
         "the reader is asked no second time"
     );
     assert_eq!(worker.launches_received(), 1, "the press is not replayed");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.11: a phone paired with `host.manage` lists the host's launch commands, and the list
+/// is the one the owner saved at the machine, in its order with every argument exact. The same
+/// phone is refused a save and a remove by its own application before anything is sent, and the
+/// host's list is the same after. A phone that holds `session.view` and not `host.manage`, and a
+/// device that holds a share of a session only, are told they may not read the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_11_a_phone_lists_the_hosts_launch_commands_and_is_refused_a_save_and_a_remove() {
+    use kr_protocol::launch_commands::{
+        NamedLaunch, ShellLaunchCommandsSaveParams, ShellLaunchCommandsSaveResult,
+    };
+    use kr_protocol::method::Method;
+    use kr_protocol::scalars::U64;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let mut owner = adopted.host.client().await;
+    let mut revision = U64::ZERO;
+    let mut saved = Vec::new();
+    for (label, arguments) in [
+        (
+            "Claude Code",
+            vec!["--resume", "two words", "", "C:\\tools\\agent.exe"],
+        ),
+        ("Codex", Vec::new()),
+    ] {
+        let command = NamedLaunch {
+            label: label.to_owned(),
+            program: "claude".to_owned(),
+            arguments: arguments.into_iter().map(str::to_owned).collect(),
+        };
+        let answer: ShellLaunchCommandsSaveResult = net_support::pairing::mutate(
+            adopted.host.environment_id,
+            &mut owner,
+            Method::ShellLaunchCommandsSave,
+            &ShellLaunchCommandsSaveParams {
+                expected_revision: revision,
+                command: command.clone(),
+            },
+        )
+        .await
+        .expect("the owner saves at the machine");
+        assert!(answer.applied && answer.changed, "{answer:?}");
+        revision = answer.revision;
+        saved.push(command);
+    }
+
+    let manager = phone_under(
+        &adopted,
+        pairing(&[ActionRight::HostManage, ActionRight::SessionView]),
+    )
+    .await;
+    let listed = manager
+        .companion
+        .call("launch_commands_list", json!({}))
+        .expect("the list is read");
+    assert_eq!(listed["state"], "served", "{listed}");
+    assert_eq!(
+        listed["list"]["commands"],
+        serde_json::to_value(&saved).expect("commands"),
+        "the phone's list is the owner's: {listed}"
+    );
+    assert_eq!(listed["list"]["revision"], revision.to_string(), "{listed}");
+
+    // The phone's own application refuses a change before it sends one, even with the right to
+    // read; the host's list is as it was.
+    let refused_save = manager
+        .companion
+        .call(
+            "launch_commands_save",
+            json!({
+                "params": {
+                    "expected_revision": revision.to_string(),
+                    "command": { "label": "Phone", "program": "claude", "arguments": [] },
+                },
+                "subject": {},
+            }),
+        )
+        .expect_err("a save is refused on a paired host");
+    assert_eq!(
+        code(&refused_save),
+        "RESOURCE_UNAVAILABLE",
+        "{refused_save}"
+    );
+    let refused_remove = manager
+        .companion
+        .call(
+            "launch_commands_remove",
+            json!({
+                "params": { "expected_revision": revision.to_string(), "label": "Codex" },
+                "subject": {},
+            }),
+        )
+        .expect_err("a remove is refused on a paired host");
+    assert_eq!(
+        code(&refused_remove),
+        "RESOURCE_UNAVAILABLE",
+        "{refused_remove}"
+    );
+    let again = manager
+        .companion
+        .call("launch_commands_list", json!({}))
+        .expect("the list is read again");
+    assert_eq!(again, listed, "a refused change altered the host's list");
+
+    // `session.view` without `host.manage` is told it may not read the list, and a share of one
+    // session gives no right to it either.
+    let viewer = phone_under(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let none = viewer
+        .companion
+        .call("launch_commands_list", json!({}))
+        .expect("the read is answered");
+    assert_eq!(none["state"], "refused", "{none}");
+    let mut grant = pairing(&[ActionRight::SessionView]);
+    grant.session_selector = kr_protocol::grant::SessionSelector::None;
+    let sharing = phone_under(&adopted, grant).await;
+    shared_with(
+        &adopted,
+        &sharing,
+        session,
+        RoleSelection::plain(SessionRole::Viewer),
+    )
+    .await;
+    let shared = sharing
+        .companion
+        .call("launch_commands_list", json!({}))
+        .expect("the read is answered");
+    assert_eq!(shared["state"], "refused", "{shared}");
     adopted.stop().await;
 }

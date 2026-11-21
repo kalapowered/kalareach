@@ -12,10 +12,19 @@
  * A quote that has gone stale installs nothing.
  */
 
-import type { LaunchShell, ShellLaunchResult, ShellLaunchSurfaceResult } from '@kalareach/protocol'
+import type {
+  LaunchShell,
+  NamedLaunch,
+  ShellLaunchCommandsRemoveParams,
+  ShellLaunchCommandsRemoveResult,
+  ShellLaunchCommandsSaveParams,
+  ShellLaunchCommandsSaveResult,
+  ShellLaunchResult,
+  ShellLaunchSurfaceResult
+} from '@kalareach/protocol'
 
 import recorded from '../../../../fixtures/shell-launch/answers.json'
-import type { LaunchPress, LaunchSurfaceReading } from './port'
+import type { LaunchCommandsReading, LaunchPress, LaunchSurfaceReading } from './port'
 
 /** The states a worker was recorded in. */
 export type RecordedLaunchState = keyof typeof recorded
@@ -122,6 +131,131 @@ export class ScriptedLaunching {
       fence_id: '00000000-0000-4000-8000-0000000000ff',
       prompt_generation: String(this.generation),
       buffer_revision: String(this.revision + 1)
+    }
+  }
+}
+
+/** One save or remove the host was asked for. */
+export type LaunchCommandWrite =
+  | ({ readonly kind: 'save' } & ShellLaunchCommandsSaveParams)
+  | ({ readonly kind: 'remove' } & ShellLaunchCommandsRemoveParams)
+
+/**
+ * What the test host says of the saved launch commands: a list in the order the commands were first
+ * saved, and a revision that moves with every change that lands. A save or a remove is taken as the
+ * host takes it: against the revision it names, and a request against an old one changes nothing and
+ * is answered with the list as it stands. The host's own character rules are the page's to foresee;
+ * a test that needs the host to refuse what the page let through says so with `refuseNext`.
+ */
+export class ScriptedLaunchCommands {
+  /** What the host answers to a read of the list. */
+  scenario: 'serve' | 'not_served' | 'unreadable' = 'serve'
+  /** The commands the host holds, oldest first. */
+  commands: NamedLaunch[] = []
+  /** How many reads of the list the page has made. */
+  reads = 0
+  /** Every save and remove the host was asked for, in order. */
+  readonly writes: LaunchCommandWrite[] = []
+  /** The revision of the list: a decimal number that moves each time the list changes. */
+  private revision = 1_000_000
+  /** What the host refuses the next write with, when a test says so. */
+  private refusal: { readonly code: string; readonly message: string } | null = null
+
+  constructor(private readonly refuse: Refuse) {}
+
+  /** The revision now, as the protocol writes it. */
+  get current(): string {
+    return String(this.revision)
+  }
+
+  /** The list changes somewhere else, as `kr launch` or the host's own screen changes it. */
+  changeElsewhere(commands: readonly NamedLaunch[]): void {
+    this.commands = commands.map((command) => structuredClone(command))
+    this.revision += 7
+  }
+
+  /** The host refuses the next write with this code and these words, whatever it asks. */
+  refuseNext(code: string, message: string): void {
+    this.refusal = { code, message }
+  }
+
+  /** What a read of the list comes to, for a connection that may or may not read it. */
+  read(mayRead: boolean): LaunchCommandsReading {
+    this.reads += 1
+    if (!mayRead) return { state: 'refused' }
+    if (this.scenario === 'not_served') return { state: 'not_served' }
+    if (this.scenario === 'unreadable') {
+      this.refuse('STORAGE_UNAVAILABLE', 'The saved launch commands could not be read.')
+    }
+    return {
+      state: 'served',
+      list: { revision: this.current, commands: structuredClone(this.commands) }
+    }
+  }
+
+  private refused(): void {
+    const refusal = this.refusal
+    this.refusal = null
+    if (refusal !== null) this.refuse(refusal.code, refusal.message)
+  }
+
+  /** Takes a save. */
+  save(params: ShellLaunchCommandsSaveParams): ShellLaunchCommandsSaveResult {
+    this.writes.push({ kind: 'save', ...structuredClone(params) })
+    this.refused()
+    const command = { ...params.command, label: params.command.label.trim() }
+    if (params.expected_revision !== this.current) {
+      return {
+        applied: false,
+        changed: false,
+        replaced: false,
+        revision: this.current,
+        commands: structuredClone(this.commands)
+      }
+    }
+    const at = this.commands.findIndex(
+      (held) => held.label.toLowerCase() === command.label.toLowerCase()
+    )
+    const same =
+      at >= 0 && JSON.stringify(this.commands[at]) === JSON.stringify(command)
+    if (!same) {
+      if (at >= 0) this.commands[at] = command
+      else this.commands.push(command)
+      this.revision += 1
+    }
+    return {
+      applied: true,
+      changed: !same,
+      replaced: at >= 0,
+      revision: this.current,
+      commands: structuredClone(this.commands)
+    }
+  }
+
+  /** Takes a remove. */
+  remove(params: ShellLaunchCommandsRemoveParams): ShellLaunchCommandsRemoveResult {
+    this.writes.push({ kind: 'remove', ...structuredClone(params) })
+    this.refused()
+    if (params.expected_revision !== this.current) {
+      return {
+        applied: false,
+        removed: false,
+        revision: this.current,
+        commands: structuredClone(this.commands)
+      }
+    }
+    const at = this.commands.findIndex(
+      (held) => held.label.toLowerCase() === params.label.toLowerCase()
+    )
+    if (at >= 0) {
+      this.commands.splice(at, 1)
+      this.revision += 1
+    }
+    return {
+      applied: true,
+      removed: at >= 0,
+      revision: this.current,
+      commands: structuredClone(this.commands)
     }
   }
 }
