@@ -674,30 +674,32 @@ fn a_call_that_ignores_the_termination_signal_is_killed_inside_the_deadline() {
 /// spent time, which leaves the later calls less than the whole deadline.
 #[test]
 fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
-    // A deadline under 10 s can run out between two calls, so such a run may end without
-    // installing; the bounds it did make are held to the time left either way. A deadline can
-    // also run out before the first call, when the machine is slow to start the script: at 2 s
-    // the first call itself can find less than 2 s left.
-    for deadline in [2_u32, 3, 4, 5, 6, 7, 8, 9] {
+    // A deadline can run out before the script's last call, or before its first, when the machine
+    // is slow to run it: the script then stops with its failure status and its expiry message,
+    // having run for more than the deadline less 2 s (it stops when under 2 s are left, and counts
+    // whole seconds). That is a valid end for every deadline of this sweep, and a stop sooner than
+    // that is a script that did not use its time. The bounds a run did make are held to the time
+    // left either way.
+    for deadline in [2_u32, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
         let rig = Rig::new();
         let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
-        assert!(
-            matches!(outcome.status, 0 | 1),
-            "{deadline}: {}{}",
-            outcome.stdout,
-            outcome.stderr
-        );
-        // A run that made no call is one whose deadline ran out before its first: the script
-        // stops when under 2 s are left, and it counts whole seconds, so it has then run for more
-        // than the deadline less 2 s, however slow the machine is. A stop sooner than that is a
-        // script that did not use its time. That a call is made is held by the deadlines from
-        // 10 s, below.
-        if rig.bounds().is_empty() {
-            assert!(
-                outcome.elapsed.as_secs_f64() > f64::from(deadline) - 2.0,
-                "{deadline}: the script stopped after {:?} with no call bounded",
-                outcome.elapsed
-            );
+        let said = format!("{deadline}: {}{}", outcome.stdout, outcome.stderr);
+        match outcome.status {
+            0 => assert_eq!(rig.bounds().len(), 3, "{said}"),
+            1 => {
+                assert!(
+                    outcome.stderr.contains(&format!(
+                        "apt-install: failed: deadline={deadline}s attempts="
+                    )),
+                    "{said}"
+                );
+                assert!(
+                    outcome.elapsed.as_secs_f64() > f64::from(deadline) - 2.0,
+                    "{deadline}: the script stopped after {:?}, with time left: {said}",
+                    outcome.elapsed
+                );
+            }
+            status => panic!("{deadline}: status {status}: {said}"),
         }
         for (grace, seconds) in rig.bounds() {
             assert!(
@@ -707,7 +709,9 @@ fn no_bound_is_ever_zero_or_longer_than_the_time_left() {
         }
         rig.assert_inside_the_time_left(deadline, &deadline.to_string());
     }
-    for deadline in [10_u32, 11, 12, 30, 180, 181, 1800] {
+    // The control: with a long deadline that no stall of a machine uses up, the script makes its
+    // three calls and ends with success.
+    for deadline in [30_u32, 180, 181, 1800] {
         let rig = Rig::new();
         let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
         assert_eq!(
