@@ -1189,6 +1189,33 @@ fn a_type_name_or_self_in_the_arguments_of_a_macro_call_is_a_sighting_and_marks_
 }
 
 #[test]
+fn a_function_written_in_a_function_body_is_part_of_the_function_that_holds_it() {
+    // The index holds the items of a file, the members of an impl block and of a trait: no function of
+    // a body. A name in a nested function is a sighting of the function that holds it, at any depth,
+    // and a nested function that no configuration builds is none.
+    for (lib, expected) in [
+        (
+            "fn outer() { fn inner() { let _ = Method::AgentTurnCancel; } inner(); }",
+            one("outer", SightKind::Names),
+        ),
+        (
+            "impl S { fn m() { fn inner() { let _ = Method::AgentTurnCancel; } } }",
+            one("S::m", SightKind::Names),
+        ),
+        (
+            "mod a { fn outer() { fn inner() { fn deeper() { let _ = Method::AgentTurnCancel; } } } }",
+            one("outer", SightKind::Names),
+        ),
+        (
+            "fn outer() { #[cfg(test)] fn inner() { let _ = Method::AgentTurnCancel; } }",
+            BTreeMap::new(),
+        ),
+    ] {
+        assert_eq!(kinds_found(lib, &[]), expected, "{lib}");
+    }
+}
+
+#[test]
 fn an_item_keeps_its_written_tokens_and_a_nested_place_no_configuration_builds_gives_no_sighting() {
     let lib = |nested: &str| {
         format!(
