@@ -230,11 +230,11 @@ export function Attention({ latest }: { readonly latest: ConnectionState | null 
   const escalatesAtMs = lost?.escalatesAtMs ?? null
   const urgent = escalatesAtMs !== null && nowMs >= escalatesAtMs
 
-  // The level a loss has reached moves at the instant its state says, whatever the reads do.
+  // The level a loss has reached moves at the instant its state says, whatever the reads do. A state
+  // that arrives after its instant has its timer run at once, so the clock is never behind it.
   useEffect(() => {
     if (escalatesAtMs === null) return undefined
-    const wait = escalatesAtMs - Date.now()
-    if (wait <= 0) return undefined
+    const wait = Math.max(0, escalatesAtMs - Date.now())
     const timer = setTimeout(() => {
       setNowMs(Date.now())
     }, wait)

@@ -430,4 +430,33 @@ describe('the escalation of a loss', () => {
     expect(within(contactRows()[0]).getByText('Urgent')).toBeInTheDocument()
     expect(wordsOfItems()).toEqual(before)
   })
+
+  // The host in use is told out of contact after the instant its loss reaches its next level, while
+  // every read is held: the clock has no timer to wait for, so the state itself moves it.
+  it('a_desktop_loss_told_after_its_instant_is_urgent_at_once', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
+    const { controls } = start((host) => {
+      host.setHostInUse(STUDIO)
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(itemRows().length).toBeGreaterThan(0)
+    // Every read from here on is held, so only the state and the clock move the page.
+    controls.hold('attentionRead')
+    controls.hold('sessionNumbers')
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    const since = Date.now() - 61_000
+    act(() => {
+      controls.setContact({ state: 'out_of_contact', since_ms: since, escalates_at_ms: since + 60_000 })
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(contactRows()).toHaveLength(1)
+    expect(contactRows()[0]).toHaveAttribute('data-level', 'urgent')
+    expect(within(contactRows()[0]).getByText('Urgent')).toBeInTheDocument()
+  })
 })

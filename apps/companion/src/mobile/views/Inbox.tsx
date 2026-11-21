@@ -293,12 +293,12 @@ export function Inbox({
     return lost
   }, [latest, inUseName, inUse, here, others.hosts, others.contacts])
 
-  // The level a loss has reached moves at the instant its state says, by one timer for each row.
+  // The level a loss has reached moves at the instant its state says, by one timer for each row. A
+  // state that arrives after its instant has its timer run at once, so the clock is never behind it.
   useEffect(() => {
     const timers = contacts.flatMap((each) => {
       if (each.escalatesAtMs === null) return []
-      const wait = each.escalatesAtMs - Date.now()
-      if (wait <= 0) return []
+      const wait = Math.max(0, each.escalatesAtMs - Date.now())
       return [
         setTimeout(() => {
           setNowMs(Date.now())
