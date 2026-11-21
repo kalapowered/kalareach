@@ -26,6 +26,7 @@ import { closeSheets, type ToastAction, type ToastMessage } from '../components/
 import { ChannelShelf } from '../model/channel-messages'
 import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
+import { PairedUploads } from '../model/paired-uploads'
 import { QuestionForms } from '../model/question-forms'
 import { Openings } from '../model/openings'
 import { ReceiptReads } from '../model/receipt-reads'
@@ -70,6 +71,11 @@ interface AppValue {
   readonly channelMessages: ChannelShelf
   /** The paths the host gave for the files attached to drafts, for the person to give to an agent. */
   readonly paths: ManualPaths
+  /**
+   * The files this window sends to a host the device is paired with, and where each stands. Like the
+   * application's own upload, it outlives the screen that started it.
+   */
+  readonly uploads: PairedUploads
   /** The answers people have begun to give, which outlive the screen that showed each. */
   readonly questionForms: QuestionForms
   /**
@@ -123,11 +129,14 @@ const CONFIRMATIONS_TOPIC = 'owner-confirmations'
 export function AppProvider({
   port,
   children,
-  initialPlace = { view: 'attention' }
+  initialPlace = { view: 'attention' },
+  uploadPollMs
 }: {
   readonly port: HostPort
   readonly children: ReactNode
   readonly initialPlace?: Place
+  /** How often the application is asked how far the open uploads are. A case asks often. */
+  readonly uploadPollMs?: number
 }): ReactNode {
   const [place, setPlace] = useState<Place>(initialPlace)
   const [toast, setToast] = useState<ToastMessage | null>(null)
@@ -143,6 +152,7 @@ export function AppProvider({
   const [drafts] = useState(() => new DraftBook(port))
   const [channelMessages] = useState(() => new ChannelShelf(port))
   const [paths] = useState(() => new ManualPaths(port))
+  const [uploads] = useState(() => new PairedUploads(port, uploadPollMs))
   const [questionForms] = useState(() => new QuestionForms())
   const [receiptReads] = useState(() => new ReceiptReads())
   const [lastRights, setLastRights] = useState<readonly ActionRight[] | null>(null)
@@ -300,6 +310,7 @@ export function AppProvider({
       drafts,
       channelMessages,
       paths,
+      uploads,
       questionForms,
       receiptReads,
       lastRights,
@@ -325,6 +336,7 @@ export function AppProvider({
       drafts,
       channelMessages,
       paths,
+      uploads,
       questionForms,
       receiptReads,
       lastRights,

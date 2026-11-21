@@ -33,7 +33,8 @@ import {
   rowKey
 } from '../../src/mobile/model/accessory'
 import {
-  MAX_CONTROL_LANE_UPLOAD_LEN,
+  HANDED_FILE_LIMIT,
+  HOST_FILE_LIMIT,
   admit,
   attributesFor,
   cameraOffer,
@@ -355,35 +356,42 @@ describe('camera, library and file input (KR-REQ-13.17)', () => {
     expect(attributesFor('files').accept).toBe('*/*')
   })
 
-  it('admits an attachment that fits one control frame', () => {
-    const admission = admit({
-      name: 'photo.jpg',
-      mediaType: 'image/jpeg',
-      byteLen: MAX_CONTROL_LANE_UPLOAD_LEN,
-      source: 'camera'
-    })
-    expect(admission.admitted).toBe(true)
+  it('admits a picked file up to the hand-over bound, whatever its size within it', () => {
+    for (const byteLen of [0, 1, 22 * 1024 * 1024, HANDED_FILE_LIMIT]) {
+      expect(
+        admit({ name: 'photo.jpg', mediaType: 'image/jpeg', byteLen, source: 'camera' }),
+        `${byteLen} bytes`
+      ).toEqual({ admitted: true })
+    }
   })
 
-  it('refuses a larger one by name, at the bound, rather than failing on the wire', () => {
-    const admission = admit({
-      name: 'clip.mov',
-      mediaType: 'video/quicktime',
-      byteLen: 22 * 1024 * 1024,
-      source: 'library'
-    })
-    expect(admission.admitted).toBe(false)
-    if (admission.admitted) return
-    expect(admission.code).toBe('TOO_LARGE_FOR_LANE')
-    expect(admission.reason).toContain('clip.mov')
-    expect(admission.reason).toContain('22.0 MB')
-    expect(admission.reason).toContain('1020 KB')
+  it('states the bounds as 64 MiB for the phone and 2 GiB for the host', () => {
+    expect(HANDED_FILE_LIMIT).toBe(64 * 1024 * 1024)
+    expect(HOST_FILE_LIMIT).toBe(2 * 1024 * 1024 * 1024)
+  })
+
+  it('refuses a larger file by name and size, in the approved words, rather than failing on the wire', () => {
+    for (const byteLen of [HANDED_FILE_LIMIT + 1, 22 * 1024 * 1024 * 10, HOST_FILE_LIMIT + 1]) {
+      const admission = admit({
+        name: 'clip.mov',
+        mediaType: 'video/quicktime',
+        byteLen,
+        source: 'library'
+      })
+      expect(admission.admitted, `${byteLen} bytes`).toBe(false)
+      if (admission.admitted) return
+      expect(admission).toEqual({
+        admitted: false,
+        reason: `clip.mov is ${describeBytes(byteLen)}. This phone sends a picked file of at most 64 MB (a host takes up to 2 GB). Choose a smaller file.`
+      })
+    }
   })
 
   it('describes a size the way a person reads one', () => {
     expect(describeBytes(512)).toBe('512 bytes')
     expect(describeBytes(2048)).toBe('2 KB')
     expect(describeBytes(3 * 1024 * 1024)).toBe('3.0 MB')
+    expect(describeBytes(2 * 1024 * 1024 * 1024)).toBe('2.0 GB')
   })
 })
 

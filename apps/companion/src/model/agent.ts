@@ -23,6 +23,7 @@ import type {
 } from '@kalareach/protocol'
 
 import type { Control } from './controls'
+import { NO_RIGHT_TO_SEND } from './transfer-words'
 
 /** One entry of an instance's semantic history, as the conversation holds it. */
 export interface AgentEntry {
@@ -417,6 +418,23 @@ export function attachOffer({ connected, paired, rights }: AttachFacts): Offer {
   }
   if (ATTACH_RIGHTS.some((right) => !rights.has(right))) {
     return { offered: false, reason: 'This device was not granted this.' }
+  }
+  return OFFERED
+}
+
+/**
+ * Whether a file may be sent for a draft from a phone, and why not when it may not.
+ *
+ * Over a host the phone is paired with the file goes to the application, which sends it in chunks and
+ * keeps it across a lost connection and a restart. It needs the connection and the two rights, as
+ * a file for a host on this computer does; without a right the words say whom to ask.
+ */
+export function phoneAttachOffer({ connected, paired, rights }: AttachFacts): Offer {
+  if (!paired) return attachOffer({ connected, paired, rights })
+  if (!connected) return { offered: false, reason: 'Not in contact with this host.' }
+  if (rights === null) return { offered: false, reason: 'This device does not know yet what it may do here.' }
+  if (ATTACH_RIGHTS.some((right) => !rights.has(right))) {
+    return { offered: false, reason: NO_RIGHT_TO_SEND }
   }
   return OFFERED
 }

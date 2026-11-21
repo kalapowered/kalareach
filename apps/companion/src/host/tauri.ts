@@ -350,15 +350,22 @@ export function tauriPort(): HostPort {
         sessionId: subject.sessionId ?? null
       }),
     // The bytes are the call's raw body; the name and the subject travel as its two headers.
-    attachmentUploadBytes: (file, subject) =>
+    attachmentUploadBytes: (file, subject, transferKey) =>
       invoking<AttachmentHandle>('attachment_upload_bytes', file.bytes, {
         headers: {
           'kr-file-name': encodeURIComponent(file.name),
-          'kr-subject': JSON.stringify(subject)
+          'kr-subject': JSON.stringify(subject),
+          // Over a paired host the key names the upload to `uploads_open` and `upload_cancel`.
+          ...(transferKey === undefined ? {} : { 'kr-transfer-key': transferKey })
         }
       }),
     draftAddAttachment: (params, subject) =>
       mutate<Settled>('draft_add_attachment', params, subject),
+    uploadsOpen: () => call('uploads_open', {}),
+    uploadCancel: (transferKey) => call('upload_cancel', { transferKey }),
+    draftEnd: (subject, sessionId) => call('draft_end', { subject, sessionId }),
+    draftSetText: (subject, sessionId, text) =>
+      call('draft_set_text', { subject, sessionId, text }),
 
     historyPage: (params, opening) => readIn('history_page', params, opening),
     actionRead: (params, opening) => readIn('action_read', params, opening),

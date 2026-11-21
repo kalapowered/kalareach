@@ -1,0 +1,121 @@
+/**
+ * What a person is told about a file sent to a host this device is paired with.
+ *
+ * The first group is the application's own words, written in `open_transfers.rs` and
+ * `paired_drafts.rs`: the page shows them as written and recognises a refusal by them, so a case
+ * reads those two files and holds the constants here to them. The second group is the page's own
+ * words for what the host refused and for each state of an upload.
+ */
+
+import { failureCode, failureWords, isHostError } from '../host/port'
+
+/** A third open upload is refused. */
+export const TOO_MANY_OPEN =
+  'two files are being sent to this host already: wait for one to finish, or cancel one'
+
+/** An upload kept from before whose content is gone or changed. */
+export const CANNOT_RESUME =
+  'this file cannot be resumed from where it stopped, because the copy this device kept is gone or has changed: cancel it and send the file again'
+
+/** An upload whose reservation was asked for and never answered before the application stopped. */
+export const UNRECOVERABLE =
+  'the host was asked to take this file and did not answer before this application stopped: it keeps the place for up to 24 hours and then releases it'
+
+/** What the command that waited for an upload is told when the person cancelled it. */
+export const CANCELLED_BEFORE_SENT = 'this file was cancelled before it was sent in full'
+
+/** A cancel of an upload that is already published. */
+export const PUBLISHED_AND_KEPT =
+  'this file was already sent in full and the host keeps it: it was not cancelled'
+
+/** The session or the draft a file was for is gone on the host. */
+export const DRAFT_GONE =
+  'the session or the draft this file was for is gone on the host: the file was not added to it'
+
+/** The session or the draft a message was for is gone on the host. */
+export const DRAFT_GONE_FOR_TEXT =
+  'the session or the draft this message was for is gone on the host: the message was not sent'
+
+/** This device keeps no draft for the session a text was for. */
+export const NO_DRAFT = 'this device keeps no draft for this session: add a file to it first'
+
+/** A host of an earlier build cannot end a draft. */
+export const UPDATE_THE_HOST_TO_END_A_DRAFT =
+  'update the host: it cannot end a draft this device no longer needs'
+
+/** A host that is an earlier build refused a method a file needs. */
+export const EARLIER_HOST =
+  'This host is an earlier version and cannot take files from this device: update the host.'
+
+/** The host's own refusal of an upload for want of a right. */
+export const NO_RIGHT_TO_SEND =
+  "This device may not send files to this host: ask the host's owner to allow it."
+
+/** The host has no room for the file now. No totals are said. */
+export const NO_ROOM =
+  'The host has no room for this file now: wait for other files to finish, or try again later.'
+
+/** The file changed while it was being sent. */
+export const FILE_CHANGED = 'This file changed while it was being sent: choose it again to send it.'
+
+/** The sentence a person reads: the application's words with their first letter capital, and no other change. */
+export function sentence(words: string): string {
+  const first = words.charAt(0)
+  return first.toUpperCase() + words.slice(1)
+}
+
+/** What kind of refusal an upload or a bind met. */
+export type RefusalKind =
+  | 'cancelled'
+  | 'too-many'
+  | 'gone'
+  | 'earlier-host'
+  | 'no-right'
+  | 'no-room'
+  | 'file-changed'
+  | 'other'
+
+/** A refusal, with the words a person reads for it. */
+export interface Refusal {
+  readonly kind: RefusalKind
+  readonly words: string
+}
+
+const APPLICATION_WORDS: readonly (readonly [string, RefusalKind])[] = [
+  [CANCELLED_BEFORE_SENT, 'cancelled'],
+  [TOO_MANY_OPEN, 'too-many'],
+  [DRAFT_GONE, 'gone'],
+  [DRAFT_GONE_FOR_TEXT, 'gone'],
+  [NO_DRAFT, 'gone']
+]
+
+/**
+ * What a refusal of an upload, a bind or a text means to the person, and the words to show.
+ *
+ * The application's own sentences are recognised by their words and shown as written. A host's
+ * refusal is recognised by its protocol code: an earlier build says it does not know the method, a
+ * full staging area says its quota, a changed file says its source changed, and a right the device
+ * lacks is a permission refusal. Anything else is shown in the host's own words.
+ */
+export function refusalOf(failure: unknown): Refusal {
+  const words = failureWords(failure)
+  for (const [known, kind] of APPLICATION_WORDS) {
+    if (words === known) return { kind, words: sentence(known) }
+  }
+  const code = isHostError(failure) ? failureCode(failure) : null
+  switch (code) {
+    case 'UNSUPPORTED_CAPABILITY':
+    case 'UNSUPPORTED_SCHEMA':
+      return { kind: 'earlier-host', words: EARLIER_HOST }
+    case 'QUOTA_EXCEEDED':
+    case 'STORAGE_UNAVAILABLE':
+      return { kind: 'no-room', words: NO_ROOM }
+    case 'ATTACHMENT_INTEGRITY':
+    case 'SOURCE_CHANGED':
+      return { kind: 'file-changed', words: FILE_CHANGED }
+    case 'PERMISSION_DENIED':
+      return { kind: 'no-right', words: NO_RIGHT_TO_SEND }
+    default:
+      return { kind: 'other', words: sentence(words) }
+  }
+}

@@ -45,7 +45,7 @@ interface Anchor {
  * The host answers a binding with every file bound to the draft, each with the preview it carries,
  * and an answer has a size limit; a draft this small stays far inside it.
  */
-const FILES_PER_DRAFT = 8
+export const FILES_PER_DRAFT = 8
 
 const PAIRED_WORDS = 'A host this device is paired with takes no file from it, so this file gets no path here.'
 const OTHER_SESSION_WORDS =
@@ -99,6 +99,22 @@ function readGrant(
   return typeof grant.host_path === 'string' && grant.host_path !== '' && Number.isFinite(expires)
     ? { hostPath: grant.host_path, expiresAtMs: expires }
     : null
+}
+
+/**
+ * What the agent offers for a file: the draft takes it for a person to hand on, which is what the
+ * manual path and a phone's own draft both ask for.
+ */
+export function attachContribution(handle: AttachmentHandle) {
+  return {
+    operation_id: 'attach',
+    accepted_media_types: [handle.declared_media_type],
+    max_byte_len: handle.byte_len,
+    max_count: String(FILES_PER_DRAFT),
+    insertion_method: 'manual_terminal_workflow',
+    external_destination: null,
+    model_media_capability: false
+  } as const
 }
 
 /** The paths of the files this window has asked the host for. */
@@ -202,15 +218,7 @@ export class ManualPaths {
             draft_id: anchor.draftId,
             expected_revision: anchor.revision,
             transfer_id: id,
-            contribution: {
-              operation_id: 'attach',
-              accepted_media_types: [handle.declared_media_type],
-              max_byte_len: handle.byte_len,
-              max_count: String(FILES_PER_DRAFT),
-              insertion_method: 'manual_terminal_workflow',
-              external_destination: null,
-              model_media_capability: false
-            }
+            contribution: attachContribution(handle)
           },
           subject
         )

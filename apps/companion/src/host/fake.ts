@@ -33,6 +33,7 @@ import type {
   Receipt,
   SessionCreateParams,
   SessionCreateResult,
+  AgentPromptParams,
   SessionDescribeResult,
   SessionListResult,
   SessionReadResult,
@@ -131,6 +132,7 @@ import { receivedFailure } from './tauri'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } from './fake-decode'
 import { FakeChannelMessageStore } from './fake-channel-messages'
 import { FakeDraftStore } from './fake-drafts'
+import { FakeUploads } from './fake-uploads'
 import { ScriptedLaunching, type InstalledLaunch, type LaunchScenario } from './fake-launch'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
@@ -713,6 +715,13 @@ export interface FakeHostControls {
   readonly importedImages: string[]
   /** The files the interface sent to the host, in order. */
   readonly uploaded: string[]
+  /**
+   * What the application does with the files a phone sends as a paired device: the upload stays open
+   * until a test moves it on, and the drafts are the device's own. See `FakeUploads`.
+   */
+  readonly pairedUploads: FakeUploads
+  /** The prompts the interface sent, in order, as it sent them. */
+  readonly promptParams: readonly AgentPromptParams[]
   /** The drafts the host holds for files, and what the interface bound to them. */
   readonly hostDrafts: FakeHostDrafts
   /** The action identifiers this host has issued, in order. */
@@ -1605,6 +1614,27 @@ export function fakeHost(
   /** How many times a connection the host withdrew has been replaced. */
   let replacements = 0
   const hostDrafts = scriptedHostDrafts()
+  const promptParams: AgentPromptParams[] = []
+  const pairedUploads = new FakeUploads(
+    (file) => {
+      const name = file.name.split(/[\\/]/).pop()?.trim() || 'attachment'
+      return {
+        transfer_id: nextTransferId(),
+        environment_id: ENVIRONMENT,
+        byte_len: String(file.bytes.length),
+        content_digest: 'b'.repeat(64),
+        declared_media_type: /\.png$/i.test(name) ? 'image/png' : 'application/octet-stream',
+        original_file_name: name,
+        presented_as_image: /\.png$/i.test(name),
+        session_id: null,
+        preview: null,
+        published_at_ms: '1',
+        expires_at_ms: '2',
+        submitted: false
+      }
+    },
+    (failure) => refuse(failure.code, failure.message)
+  )
   const connectionNow = (): ConnectionState =>
     receivedConnection({
       connected,
@@ -2175,7 +2205,10 @@ export function fakeHost(
       requireConnection()
       checkOpening('composerSubmit', params.target.subject.session_id, opening)
       submissions += 1
+      promptParams.push(params)
       const answer = records.prompt(params, false)
+      // A prompt that names the draft a paired device keeps is the session's now.
+      if (pairedDevice && params.draft_id !== null) pairedUploads.sent(params.target.subject.session_id)
       if (nextSendUnconfirmed) {
         nextSendUnconfirmed = false
         return answeredWhenReleased({ ...answer, receipt: null, value: null })
@@ -2244,6 +2277,19 @@ export function fakeHost(
       if (read.environment_id !== hostEnvironment) {
         refuse('INVALID_ARGUMENT', 'This host owns another environment.')
       }
+      // On a host this device is paired with a draft is made at the first bind, so this answers the
+      // one the device keeps for the session.
+      if (pairedDevice) {
+        if (read.session_id === null) {
+          refuse('INVALID_ARGUMENT', 'a draft on a paired host needs a session: open one first')
+        }
+        return Promise.resolve({
+          receipt: null,
+          action_id: null,
+          value: pairedUploads.kept(read.session_id),
+          answer_lost: false
+        })
+      }
       return Promise.resolve(hostDrafts.create(read.session_id, read.application_instance_id))
     },
     attachmentUpload: (path, subject) => {
@@ -2267,9 +2313,16 @@ export function fakeHost(
       hostDrafts.published(handle)
       return Promise.resolve(handle)
     },
-    attachmentUploadBytes: (file, subject) => {
+    attachmentUploadBytes: (file, subject, transferKey) => {
       requireConnection()
       requireWholeSubject(subject)
+      if (pairedDevice) {
+        if (file.bytes.length > MAX_HANDED_BYTES) {
+          refuse('QUOTA_EXCEEDED', 'a pasted or picked file is at most 64 MiB; drop a larger one on the window')
+        }
+        uploaded.push(file.name)
+        return pairedUploads.send(file, subject.sessionId ?? null, transferKey ?? nextTransferId())
+      }
       const unpublished = { session_id: null, preview: null, published_at_ms: '1', expires_at_ms: '2', submitted: false }
       if (file.bytes.length > MAX_HANDED_BYTES) {
         refuse('QUOTA_EXCEEDED', 'a pasted or picked file is at most 64 MiB; drop a larger one on the window')
@@ -2291,9 +2344,29 @@ export function fakeHost(
       hostDrafts.published(handle)
       return Promise.resolve(handle)
     },
+    uploadsOpen: () => {
+      requireConnection()
+      return Promise.resolve(pairedUploads.open())
+    },
+    uploadCancel: (transferKey) => {
+      requireConnection()
+      return pairedUploads.cancel(transferKey)
+    },
+    draftEnd: (subject, sessionId) => {
+      requireConnection()
+      requireWholeSubject(subject)
+      pairedUploads.end(sessionId)
+      return Promise.resolve()
+    },
+    draftSetText: (subject, sessionId, text) => {
+      requireConnection()
+      requireWholeSubject(subject)
+      return Promise.resolve(pairedUploads.setText(sessionId, text))
+    },
     draftAddAttachment: (params, subject) => {
       requireConnection()
       requireWholeSubject(subject)
+      if (pairedDevice) return Promise.resolve(pairedUploads.bind(params as Record<string, unknown>))
       // Native code reads the method's own parameters, the integration's contribution included,
       // before anything reaches a host.
       const read = decodeParams<BindParams>(params, AGENT_DRAFT_ADD_ATTACHMENT_PARAMS)
@@ -3844,6 +3917,8 @@ export function fakeHost(
     openedLinks,
     importedImages,
     uploaded,
+    pairedUploads,
+    promptParams,
     hostDrafts: hostDrafts.controls,
     actions: issuedActions,
     grantPermission(capability) {
