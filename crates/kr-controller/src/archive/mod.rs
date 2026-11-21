@@ -339,8 +339,6 @@ pub struct RecoveryOwnership {
     /// The identity the kernel confirmed had ended, where ownership rests on a death validated
     /// here, and none where it rests on a closure that was recorded for a worker that is gone.
     ended: Option<ProcessStartIdentity>,
-    /// Whether the worker's published endpoint was removed.
-    endpoint_fenced: bool,
     /// When ownership was taken.
     taken_at_ms: TimestampMs,
     _lock: RecoveryLock,
@@ -358,12 +356,6 @@ impl RecoveryOwnership {
     #[must_use]
     pub fn ended(&self) -> Option<&ProcessStartIdentity> {
         self.ended.as_ref()
-    }
-
-    /// Whether the worker's published endpoint was removed.
-    #[must_use]
-    pub fn endpoint_fenced(&self) -> bool {
-        self.endpoint_fenced
     }
 
     /// When ownership was taken.
@@ -593,16 +585,14 @@ impl ArchiveService {
         for _ in 0..DEATH_VALIDATION_ATTEMPTS {
             match kr_ipc::identity::process_state(identity) {
                 kr_ipc::identity::ProcessState::Ended => {
-                    let fenced =
-                        self.fence_endpoint(session_id, display_number)
-                            .map_err(|detail| OwnershipRefusal::Unfenced {
-                                session: session_id.to_string(),
-                                detail,
-                            })?;
+                    self.fence_endpoint(session_id, display_number)
+                        .map_err(|detail| OwnershipRefusal::Unfenced {
+                            session: session_id.to_string(),
+                            detail,
+                        })?;
                     return Ok(RecoveryOwnership {
                         session_id,
                         ended: Some(identity.clone()),
-                        endpoint_fenced: fenced,
                         taken_at_ms: kr_ipc::now_ms(),
                         _lock: lock,
                     });
@@ -651,7 +641,6 @@ impl ArchiveService {
         Ok(RecoveryOwnership {
             session_id,
             ended: None,
-            endpoint_fenced: false,
             taken_at_ms: kr_ipc::now_ms(),
             _lock: lock,
         })
