@@ -729,14 +729,16 @@ fn a_return_type_before_a_body_is_no_struct_value_but_a_name_after_a_macros_arro
          fn l() { value!(a, -> ActionTarget { a: 1 }); }\n\
          fn m() { value!(| -> ActionTarget { a: 1 }); }\n\
          fn n() { value!(fn o() -> ActionTarget { build() }); }\n\
+         fn q() { value!(|x| -> ActionTarget { a: 1 }); }\n\
+         fn r() { value!(for ActionTarget { a: 1 }); }\n\
          fn p() { let _ = ActionTarget { a: 1 }; }\n",
     );
     // A return type before a body is no struct value, qualified or not, in a function, a closure or a
-    // function type. After an arrow that follows no parameters (the arguments of a macro) the same
-    // tokens are a value, and a function written inside a macro's arguments keeps its return type.
+    // function type. Inside the tokens of a macro no syntax rule reads: what looks like a signature, a
+    // closure or an item keyword is what the macro makes of it, so each stays a candidate there.
     assert_eq!(
         found,
-        [9, 10, 11, 12, 13, 15]
+        [9, 10, 11, 12, 13, 14, 15, 16, 17]
             .map(|line| ("ActionTarget {".to_owned(), line))
             .to_vec()
     );

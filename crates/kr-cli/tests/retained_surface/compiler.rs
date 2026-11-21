@@ -1480,7 +1480,8 @@ pub struct Candidate {
 }
 
 /// The keywords that may stand before a stamped type's name and a brace group without the group
-/// being a value of the type.
+/// being a value of the type. They count outside the tokens of a macro only: a macro may read any of
+/// them as it likes.
 const BEFORE_A_BODY: [&str; 6] = ["impl", "for", "struct", "enum", "union", "trait"];
 
 fn decoded(literal: &proc_macro2::Literal) -> Option<String> {
@@ -1680,8 +1681,9 @@ fn walk_tokens(stream: TokenStream, found: &mut Vec<Candidate>, in_macro: bool) 
                     }
                 } else if STAMPED_STRUCTS.iter().any(|(stamped, _)| *stamped == name)
                     && matches!(trees.get(at + 1), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace)
-                    && !matches!(at.checked_sub(1).map(|before| &trees[before]), Some(TokenTree::Ident(before)) if BEFORE_A_BODY.contains(&before.to_string().as_str()))
-                    && !is_return_type(&trees, at)
+                    && (in_macro
+                        || !matches!(at.checked_sub(1).map(|before| &trees[before]), Some(TokenTree::Ident(before)) if BEFORE_A_BODY.contains(&before.to_string().as_str())))
+                    && (in_macro || !is_return_type(&trees, at))
                 {
                     let mut candidate = position(format!("{name} {{"));
                     let after = trees[at + 1].span().end();
