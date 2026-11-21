@@ -1006,6 +1006,14 @@ fn a_step_whose_processes_ignore_the_first_signal_is_ended_with_every_process_of
     let text = timed_plan("", &[timed_step("tree", "build", &command, "timeout = 3")]);
     let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 3);
+    let step = &ran.document.steps[0];
+    assert!(
+        step.seconds < 3 + 30,
+        "the step ran {} s with a limit of 3 s",
+        step.seconds
+    );
+    let left = left_after(&started, Duration::from_secs(10));
+    assert!(left.is_empty(), "processes of the step were left: {left:?}");
     assert_ended_at_its_limit(&ran, 3, &started);
 }
 
@@ -1022,6 +1030,14 @@ fn a_leader_that_ends_when_asked_does_not_leave_the_process_of_its_group_that_ig
     let text = timed_plan("", &[timed_step("tree", "build", &command, "timeout = 3")]);
     let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 3);
+    let step = &ran.document.steps[0];
+    assert!(
+        step.seconds < 3 + 30,
+        "the step ran {} s with a limit of 3 s",
+        step.seconds
+    );
+    let left = left_after(&started, Duration::from_secs(10));
+    assert!(left.is_empty(), "processes of the step were left: {left:?}");
     assert_ended_at_its_limit(&ran, 3, &started);
 }
 
@@ -1063,6 +1079,13 @@ fn a_build_that_does_not_end_is_ended_at_the_steps_limit_with_the_process_it_sta
     let ran = run(&root, &cargo_plan(target.path(), "timeout = 8", &env))
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 1);
+    // The deadline is given to the build: the step does not run to the end of what it waits for.
+    let step = &ran.document.steps[0];
+    assert!(
+        step.seconds < 8 + 30,
+        "the build ran {} s with a limit of 8 s",
+        step.seconds
+    );
     assert_ended_at_its_limit(&ran, 8, &started);
 }
 
@@ -1086,6 +1109,13 @@ fn a_listing_that_does_not_end_is_ended_at_the_steps_limit_with_the_process_it_s
     let ran = run(&root, &cargo_plan(target.path(), "timeout = 8", &env))
         .unwrap_or_else(|stopped| panic!("{stopped:?}"));
     let started = recorded_pids(&pids, 1);
+    // The deadline is given to the listing: the step does not run to the end of what it waits for.
+    let step = &ran.document.steps[0];
+    assert!(
+        step.seconds < 8 + 30,
+        "the listing ran {} s with a limit of 8 s",
+        step.seconds
+    );
     assert_ended_at_its_limit(&ran, 8, &started);
     // What the listing wrote before its time was spent is in the log, before the line that says so.
     let log = std::fs::read_to_string(ran.evidence.path().join(&ran.document.steps[0].log))
@@ -1541,4 +1571,56 @@ fn a_budget_whose_steps_fall_in_more_than_one_part_is_refused() {
             .unwrap_or_else(|stopped| panic!("{stopped:?}"));
         assert!(ran.document.passed(), "{:?}", ran.document.steps);
     }
+}
+
+/// A plan of one step with a `timeout` that writes a mark to `mark`: a run that refuses to start the
+/// step leaves no mark.
+#[cfg(unix)]
+fn marking_plan(mark: &Path) -> String {
+    let command = format!("'bash', '-c', 'printf x > \"$0\"', '{}'", mark.display());
+    timed_plan("", &[timed_step("mark", "exit", &command, "timeout = 5")])
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: on Linux, a run with a time limit under a
+/// parent that ignores `SIGCHLD` is refused before any step, because the system reaps the children
+/// of such a process as they end, and the report's signals at a deadline could then reach a group
+/// that is not the step's. The mark that the step would write is not there. A program whose
+/// `SIGCHLD` is ignored cannot run the other cases of this target, so this one is run by its name,
+/// from a parent that ignores the signal, by the box line of the request; the next case is its
+/// control. On macOS the system does not reap such a child, and the run is not refused.
+#[cfg(unix)]
+#[test]
+#[ignore = "runs only under a parent that ignores SIGCHLD, on Linux, by the box line of the request"]
+fn a_run_with_a_time_limit_is_refused_under_a_parent_that_ignores_sigchld() {
+    let (_directory, root) = copy("time-limits");
+    let place = tempfile::tempdir().expect("a directory for the mark");
+    let mark = place.path().join("mark");
+    let Err(Stopped::Host(words)) = run(&root, &marking_plan(&mark)) else {
+        panic!("the run was not refused");
+    };
+    assert!(
+        words.starts_with(
+            "a step has a time limit, and this process cannot wait for a command it started ("
+        ),
+        "{words}"
+    );
+    assert!(
+        words.ends_with("start kr-conformance from a parent that does not ignore SIGCHLD"),
+        "{words}"
+    );
+    assert!(!mark.exists(), "a step ran");
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the control of the case above: under a
+/// parent that does not ignore `SIGCHLD` the same run starts its step, and the mark is there.
+#[cfg(unix)]
+#[test]
+#[ignore = "the control of the case above, run by the box line of the request"]
+fn a_run_with_a_time_limit_runs_under_a_parent_that_does_not_ignore_sigchld() {
+    let (_directory, root) = copy("time-limits");
+    let place = tempfile::tempdir().expect("a directory for the mark");
+    let mark = place.path().join("mark");
+    let ran = run(&root, &marking_plan(&mark)).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    assert!(ran.document.passed(), "{:?}", ran.document.steps);
+    assert!(mark.exists(), "the step did not run");
 }
