@@ -2,6 +2,7 @@ package to.kala.reach
 
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import androidx.activity.enableEdgeToEdge
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
@@ -24,6 +25,10 @@ class MainActivity : TauriActivity() {
     // The way to ask the provider for its current token, which the platform plugin finds when the
     // application reads the token. Registered here because this module holds the provider's library.
     CurrentTokenHolder.registerOnce { FirebaseCurrentToken() }
+    // A start with no saved state is a new one, and no file chooser is open yet, so a photo left in
+    // the camera's folder was read by an earlier page or abandoned. It is emptied before the web
+    // view exists, so a chooser cannot make a file while this runs.
+    if (savedInstanceState == null) removeCameraPhotos()
     super.onCreate(savedInstanceState)
     // The web view draws behind the system bars and the display cutout, and how much of that a
     // page hears about depends on the web view's version: an older one reports no inset for the
@@ -40,6 +45,16 @@ class MainActivity : TauriActivity() {
       content.setPadding(bars.left, bars.top, bars.right, bars.bottom)
       withoutBars(insets)
     }
+  }
+
+  /**
+   * Removes the photos the web view's camera path leaves behind: it makes a file in this
+   * application's Pictures folder under its external files before the camera opens, and keeps it.
+   * Only the files directly in the folder the platform names are removed, each as the folder lists it.
+   */
+  private fun removeCameraPhotos() {
+    val folder = getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: return
+    folder.listFiles()?.forEach { photo -> if (photo.isFile) photo.delete() }
   }
 
   /** The window's insets with the bars and the cutout taken out, and the keyboard left in. */

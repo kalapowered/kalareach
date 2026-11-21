@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What Android 12 and later copy off the phone, to the cloud or to another phone. Everything is
+  copied as before except the photos the camera path leaves in this application's Pictures folder
+  under its external files.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="external" path="Pictures" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="external" path="Pictures" />
+    </device-transfer>
+</data-extraction-rules>
