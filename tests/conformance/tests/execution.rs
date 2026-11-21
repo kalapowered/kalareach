@@ -1577,7 +1577,7 @@ fn a_budget_whose_steps_fall_in_more_than_one_part_is_refused() {
 /// step leaves no mark.
 #[cfg(unix)]
 fn marking_plan(mark: &Path) -> String {
-    let command = format!("'bash', '-c', 'printf x > \"$0\"', '{}'", mark.display());
+    let command = format!("'bash', 'scripts/mark.sh', '{}'", mark.display());
     timed_plan("", &[timed_step("mark", "exit", &command, "timeout = 5")])
 }
 
