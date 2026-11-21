@@ -64,7 +64,10 @@ async fn main() {
         ),
         // The pinned build, started by hand where no gateway serves it: a composer, and nothing to
         // serve.
-        [] if variants.by_hand && !newer() => by_hand(),
+        [] if variants.by_hand && !newer() => by_hand(None),
+        // The pinned build, started by hand on a saved conversation: its own `resume` or `fork` and
+        // the conversation's identifier. The stand-in saves none, so it only says what it was asked.
+        [word @ ("resume" | "fork"), id] if !newer() => by_hand(Some(format!("{word} {id}"))),
         // The newer build, started as typed (a build outside the package's range is served no
         // gateway, so the shell runs it with nothing after its name): it says so and stays until
         // it is ended, which keeps its image and its place in the process table for a case to look
@@ -105,12 +108,16 @@ const BY_HAND: &str = "codex-stand-in: by hand";
 
 /// What the program does when a person starts it by hand: draws a composer, shows what is typed at
 /// it, says what a typed line or command comes to, and goes on until its input ends or it is ended.
+/// `on` is the saved-conversation command it was started with, where it was.
 #[cfg(unix)]
-fn by_hand() -> ! {
+fn by_hand(on: Option<String>) -> ! {
     use std::io::Read as _;
     let mut screen = keyboard::Screen::open();
     screen.begins();
-    screen.say(BY_HAND);
+    match on {
+        Some(on) => screen.say(format!("{BY_HAND} ({on})")),
+        None => screen.say(BY_HAND),
+    }
     let mut decoder = keyboard::Decoder::default();
     let mut input = std::io::stdin().lock();
     let mut bytes = [0_u8; 256];
