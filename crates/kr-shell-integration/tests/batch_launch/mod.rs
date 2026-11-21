@@ -524,12 +524,10 @@ pub fn assert_a_tilde_program_word_is_found_under_the_home_and_a_tilde_argument_
 }
 
 /// KR-REQ-13.11: a program that names no application or script has no line in PowerShell, whether
-/// no such name exists, a function of the name is all there is, or the path does not exist; and the
-/// refusal the reader gives for a command it has no line for is a draft conflict.
-pub fn assert_a_program_that_names_no_application_has_no_line_and_the_refusal_is_a_draft_conflict(
-    directory: &Path,
-    as_batch: bool,
-) {
+/// no such name exists, a function of the name is all there is, or the path does not exist. This is
+/// the module's decision alone: the refusal the reader gives for a command it has no line for is
+/// the package case's, which drives a real reader.
+pub fn assert_a_program_that_names_no_application_has_no_line(directory: &Path, as_batch: bool) {
     let setup = "function kr-only-function { }\n";
     let cases: Vec<(String, Vec<&str>)> = vec![
         ("kr-no-such-program".to_owned(), vec!["x"]),
@@ -544,9 +542,4 @@ pub fn assert_a_program_that_names_no_application_has_no_line_and_the_refusal_is
             launch.describe()
         );
     }
-    assert_eq!(
-        kr_shell_integration::contract::requests::LaunchRejectionReason::BufferNotEmpty.code(),
-        kr_protocol::error::ErrorCode::DraftConflict,
-        "the reason the reader gives for a command it has no line for"
-    );
 }
