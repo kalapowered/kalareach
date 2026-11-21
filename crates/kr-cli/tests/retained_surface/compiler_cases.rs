@@ -276,11 +276,12 @@ fn forms(root: &Path) {
         "crates/kr-forms/src/orphan.rs",
         "use kr_protocol::method::Method;\n\npub fn orphan() -> Method {\n    Method::AgentTurnCancel\n}\n",
     );
-    // A file the compiler reads through `#[path]` from outside `src`: only the dep-info lists it.
+    // A file the compiler reads through `#[path]` from outside `src`: only the dep-info lists it, and a
+    // report names it with the `..` of the path (`crates/kr-forms/src/../extra/more.rs`).
     write(
         root,
         "crates/kr-forms/extra/more.rs",
-        "pub fn more() -> &'static str {\n    \"agent.prompt.queue\"\n}\n",
+        "use kr_protocol::method::Method;\n\npub fn more() -> &'static str {\n    \"agent.prompt.queue\"\n}\n\npub fn from_more() -> Method {\n    Method::AgentApprovalRespond\n}\n",
     );
     // A file that is no Rust, read through `include_str!` from outside `src`.
     write(
@@ -482,6 +483,7 @@ fn each_way_a_client_names_a_stamped_item_is_read_by_the_compiler_and_the_rest_i
             "kr_forms from_data Names+Unread",
             "kr_forms from_local_macro Names",
             "kr_forms from_macro Names",
+            "kr_forms from_more Names",
             "kr_forms imported Names",
             "kr_forms literal Unread",
             "kr_forms macro:cancel Expands",
@@ -505,6 +507,17 @@ fn each_way_a_client_names_a_stamped_item_is_read_by_the_compiler_and_the_rest_i
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_use_in_a_file_a_path_attribute_loads_from_above_the_crate_is_read_at_its_plain_name() {
+    // The report names the file as `crates/kr-forms/src/../extra/more.rs`: the use in it is a sighting
+    // of its function, not a refusal that no site in the tree holds it.
+    let read = read_forms();
+    assert!(read.is_ok(), "{read:?}");
+    assert!(
+        shown(&read.expect("the forms are read")).contains(&"kr_forms from_more Names".to_owned())
     );
 }
 

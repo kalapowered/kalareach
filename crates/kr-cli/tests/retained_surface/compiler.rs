@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use proc_macro2::{Delimiter, Group, TokenStream, TokenTree};
@@ -1785,17 +1785,27 @@ impl Parsed {
     }
 }
 
-/// The path of a file the way the tree names it: relative to `root`, or none for a file outside it.
+/// The path of a file the way the tree names it: relative to `root`, with each `..` taken out against
+/// the folder before it (rustc names a file that `#[path = "../extra/more.rs"]` loads as
+/// `crates/c/src/../extra/more.rs`), or none for a file outside the tree.
 fn in_tree(root: &Path, file: &str) -> Option<String> {
-    let path = Path::new(file);
+    let mut parts: Vec<Component> = Vec::new();
+    for part in Path::new(file).components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => match parts.pop() {
+                Some(Component::Normal(_)) => {}
+                _ => return None,
+            },
+            other => parts.push(other),
+        }
+    }
+    let path: PathBuf = parts.into_iter().collect();
     let relative = if path.is_absolute() {
         path.strip_prefix(root).ok()?.to_path_buf()
     } else {
-        path.to_path_buf()
+        path
     };
-    if relative.components().any(|part| part.as_os_str() == "..") {
-        return None;
-    }
     Some(relative.display().to_string())
 }
 
