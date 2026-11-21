@@ -10,7 +10,9 @@
  * Every press quotes the prompt generation and the buffer revision of the newest read. A button
  * drawn at one prompt stays disabled after the prompt moved until the person has looked at it. It
  * is disabled while a press waits, and after one has settled until a read that started after it has
- * landed: a read already on its way says nothing of what the press found. The session refuses a
+ * landed: a read already on its way says nothing of what the press found. It is disabled as well while
+ * an input of the person's is held, and until a read that started after the last input settled has
+ * landed. The session refuses a
  * quote that has gone stale before anything is typed, so a button lit a moment too long does no
  * harm.
  */
@@ -61,7 +63,7 @@ export function LaunchSurface({
   readonly press: ((press: LaunchPress) => Promise<ShellLaunchResult>) | null
 }): ReactNode {
   const { say } = useApp()
-  const { reading, unread, number, newest, again } = reads
+  const { reading, unread, number, newest, again, dark } = reads
   const [drawnAt, setDrawnAt] = useState<string | null>(null)
   // Whether a press waits for the session's answer.
   const [pressing, setPressing] = useState(false)
@@ -153,7 +155,9 @@ export function LaunchSurface({
     case 'live': {
       const live = drawn.kind === 'live'
       const stale = live && drawnAt !== null && drawnAt !== drawn.promptGeneration
-      const lit = live && press !== null && connected && !stale && !pressing && readSince
+      // An input the person made, or one still on its way, darkens every button in the frame it
+      // is made in; a read that started after the last input settled lights them again.
+      const lit = live && press !== null && connected && !stale && !pressing && readSince && !dark
       const why = !connected
         ? 'Not in contact with this host, so nothing can be started on it.'
         : drawn.kind === 'not_held_here'
