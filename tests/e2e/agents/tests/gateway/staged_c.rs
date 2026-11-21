@@ -209,6 +209,14 @@ fn starts_by_hand(
                     real.checks_the_route(&ctx.run);
                 },
             );
+            // The driver skips this switch for a start by hand: the build list's request for a
+            // run that stops before any turn is honoured here, with the agent up and nothing
+            // charged.
+            assert!(
+                !real.account.stop_before_turns,
+                "the build list asks to stop before any turn: the agent is up as it asks and no \
+                 turn was started"
+            );
         }
     }
     HandAgent::found(ctx, at.session_id)
