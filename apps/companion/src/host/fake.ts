@@ -666,7 +666,14 @@ export interface FakeHostControls {
    * default, as a guest does). The host tells what the phone is offered and holds, refuses the list
    * of sessions to a pairing with no view of one, and answers it an inbox with nothing in it.
    */
-  reachAsPhone(options?: { readonly rights?: readonly ActionRight[]; readonly host?: string }): void
+  reachAsPhone(options?: {
+    readonly rights?: readonly ActionRight[]
+    readonly host?: string
+    /** Whether the host's grant answers to an organisation: what a phone keeps then belongs to the account. */
+    readonly organisation?: boolean
+  }): void
+  /** Reaches the host on this computer: the window is no longer connected to a host it is paired with. */
+  reachAsOwner(): void
   /**
    * Changes what description setup says, as the host would after something outside this device
    * changed it: its offer, its settings or how a fetch is going.
@@ -1611,6 +1618,7 @@ export function fakeHost(
   let environmentListRefused = false
   /** Whether the host is one this device is paired with, not the one on its own computer. */
   let pairedDevice = false
+  let organisationHost = false
   /** How many times a connection the host withdrew has been replaced. */
   let replacements = 0
   const hostDrafts = scriptedHostDrafts()
@@ -1642,6 +1650,7 @@ export function fakeHost(
       reason: connected ? null : lostBecause,
       rights: connected ? rights : null,
       paired: connected && pairedDevice,
+      organisation: connected && pairedDevice && organisationHost,
       replaced: replacements
     })
   const connectionListeners = new Set<(state: ConnectionState) => void>()
@@ -3806,6 +3815,7 @@ export function fakeHost(
     },
     reachAsPhone(options) {
       pairedDevice = true
+      organisationHost = options?.organisation ?? false
       rights = options?.rights ?? []
       publishPairing({
         hosts: [
@@ -3825,6 +3835,12 @@ export function fakeHost(
       sessionListRefused = !mayView
       attentionReadEmpty = !mayView
       sharing.asPhone()
+      for (const listener of connectionListeners) listener(connectionNow())
+    },
+    reachAsOwner() {
+      pairedDevice = false
+      organisationHost = false
+      connected = true
       for (const listener of connectionListeners) listener(connectionNow())
     },
     changeDescriptionSetup(change) {

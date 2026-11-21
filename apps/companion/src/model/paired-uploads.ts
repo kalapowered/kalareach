@@ -214,6 +214,22 @@ export interface Sending {
 
 const DEFAULT_POLL_MS = 500
 
+/**
+ * What a call of an earlier cycle ends with: the store was reset after the call began, so what it
+ * would have done is no longer wanted. It is not a refusal and is never announced.
+ */
+export class ResetError extends Error {
+  constructor() {
+    super('the files of this window were cleared')
+    this.name = 'ResetError'
+  }
+}
+
+/** Whether `failure` is the end of a call that the store's reset made unwanted. */
+export function isReset(failure: unknown): boolean {
+  return failure instanceof ResetError
+}
+
 export class PairedUploads {
   readonly #port: HostPort
   readonly #pollMs: number
@@ -223,7 +239,10 @@ export class PairedUploads {
   readonly #listeners = new Set<() => void>()
   #cached: ReadonlyMap<string, UploadRow> | null = null
   #timer: ReturnType<typeof setInterval> | null = null
-  #reading = false
+  /** The cycle of the read that is under way, none when no read is. */
+  #reading: number | null = null
+  /** How many times the store was reset: a call that began in an earlier cycle changes nothing. */
+  #cycle = 0
 
   constructor(port: HostPort, pollMs = DEFAULT_POLL_MS) {
     this.#port = port
@@ -244,6 +263,40 @@ export class PairedUploads {
     return this.#cached
   }
 
+  /** How many times the store was reset. */
+  get cycle(): number {
+    return this.#cycle
+  }
+
+  /**
+   * A check for a call to make at each step after it waited: it throws `ResetError` once the store
+   * was reset after this was asked for.
+   */
+  guard(): () => void {
+    const cycle = this.#cycle
+    return () => {
+      if (cycle !== this.#cycle) throw new ResetError()
+    }
+  }
+
+  /**
+   * Forgets every row, every early cancel and the timer, and starts a new cycle: the calls and the
+   * reads that began before it end with `ResetError` and change nothing. Answers how many rows
+   * there were.
+   */
+  reset(): number {
+    const rows = this.#rows.size
+    this.#cycle += 1
+    this.#rows.clear()
+    this.#cancelledEarly.clear()
+    if (this.#timer !== null) {
+      clearInterval(this.#timer)
+      this.#timer = null
+    }
+    this.#changed()
+    return rows
+  }
+
   /**
    * Sends a file and waits for its outcome: the handle once it is published, and then adds it to the
    * draft through `bind`. A file that is published and not added is still the file's outcome, and its
@@ -251,6 +304,7 @@ export class PairedUploads {
    */
   send(input: Sending, bind: Bind): Promise<AttachmentHandle> {
     const { key, sessionId, subject, file } = input
+    const still = this.guard()
     // The person cancelled the file while the page was still reading it: it is never handed over.
     if (this.#cancelledEarly.delete(key)) return Promise.reject(new Error(CANCELLED_BEFORE_SENT))
     this.#put({
@@ -274,10 +328,11 @@ export class PairedUploads {
           awaited: false,
           ...(asked ? { note: sentence(PUBLISHED_AND_KEPT) } : {})
         })
-        await this.#binding(key, handle, bind)
+        await this.#binding(key, handle, bind, still)
         return handle
       },
       async (failure: unknown) => {
+        still()
         const refusal = refusalOf(failure)
         const phase = this.#rows.get(key)?.phase.kind
         // The person's own cancel has said what became of it; a cancel asked is ended only by the
@@ -289,6 +344,7 @@ export class PairedUploads {
             // A reservation the application still keeps stays on the screen with what the application
             // says of it, so that it can be cancelled; only an upload it keeps nothing of is refused.
             const kept = await this.#kept(key)
+            still()
             this.#patch(
               key,
               kept === null
@@ -313,15 +369,20 @@ export class PairedUploads {
 
   /** Adds a published file to the draft again, or for the first time after a restart. */
   async bind(key: string, handle: AttachmentHandle, bind: Bind): Promise<void> {
+    const still = this.guard()
     this.#patch(key, { phase: { kind: 'adding' }, handle })
-    await this.#binding(key, handle, bind)
+    await this.#binding(key, handle, bind, still)
   }
 
-  async #binding(key: string, handle: AttachmentHandle, bind: Bind): Promise<void> {
+  /** Binds `handle` to the draft; a store reset before or during the bind ends it with `ResetError`, bound to nothing. */
+  async #binding(key: string, handle: AttachmentHandle, bind: Bind, still: () => void): Promise<void> {
     try {
+      still()
       await bind(handle)
+      still()
       this.#patch(key, { phase: { kind: 'bound' } })
     } catch (failure) {
+      if (isReset(failure)) throw failure
       this.#patch(key, { phase: { kind: 'kept', words: refusalOf(failure).words } })
     }
   }
@@ -341,9 +402,11 @@ export class PairedUploads {
     }
     if (!canCancel(row.phase)) return
     const before = row.phase
+    const cycle = this.#cycle
     this.#patch(key, { phase: { kind: 'cancelling' }, note: null })
     try {
       const answer = await this.#port.uploadCancel(key)
+      if (cycle !== this.#cycle) return
       if (answer.state === 'published') {
         const handle = answer.handle ?? this.#rows.get(key)?.handle ?? null
         const waiting = this.#rows.get(key)?.awaited === true
@@ -366,6 +429,7 @@ export class PairedUploads {
         awaited: false
       })
     } catch (failure) {
+      if (cycle !== this.#cycle) return
       if (isNoOpenUpload(failure)) {
         // The application holds no such upload: nothing was cancelled, and the file is as it was.
         this.#patch(key, { phase: before, note: refusalOf(failure).words })
@@ -398,10 +462,14 @@ export class PairedUploads {
     this.#changed()
   }
 
-  /** Reads the application's account once, adding the uploads this window did not start. */
-  async restore(): Promise<void> {
-    await this.#read()
+  /**
+   * Reads the application's account once, adding the uploads this window did not start. Answers what
+   * the application listed, or null when it could not be read or another read of this cycle is under way.
+   */
+  async restore(): Promise<readonly OpenUpload[] | null> {
+    const listed = await this.#read()
     this.#poll()
+    return listed
   }
 
   /**
@@ -460,11 +528,14 @@ export class PairedUploads {
     }, this.#pollMs)
   }
 
-  async #read(): Promise<void> {
-    if (this.#reading) return
-    this.#reading = true
+  async #read(): Promise<readonly OpenUpload[] | null> {
+    const cycle = this.#cycle
+    if (this.#reading === cycle) return null
+    this.#reading = cycle
     try {
       const views = await this.#port.uploadsOpen()
+      // A read that was asked for before a reset describes rows that are gone: it makes none.
+      if (cycle !== this.#cycle) return null
       let changed = false
       const set = (row: UploadRow): void => {
         const before = this.#rows.get(row.key)
@@ -522,10 +593,12 @@ export class PairedUploads {
         }
       }
       if (changed) this.#changed()
+      return views
     } catch {
       // Not in contact: the rows stay as they were, and the next interval asks again.
+      return null
     } finally {
-      this.#reading = false
+      if (this.#reading === cycle) this.#reading = null
     }
   }
 }

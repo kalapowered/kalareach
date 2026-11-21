@@ -371,6 +371,7 @@ describe('the desktop port and the connection state', () => {
     reason,
     rights: null,
     paired: false,
+    organisation: false,
     replaced: 0
   })
 
@@ -409,6 +410,7 @@ describe('the desktop port and the connection state', () => {
       reason: null,
       rights: ['session.view', 'agent.prompt'],
       paired: true,
+      organisation: true,
       replaced: 0
     }
     shell.answers.set('connection_state', live)

@@ -100,16 +100,20 @@ describe('the commands that act for an account carry its mark', () => {
     expect(mark.current).toBe('aa')
   })
 
-  it('drops a status read that returns after an event', async () => {
+  it('takes the newest read of the status and drops an older one that answers after it', async () => {
     let answer: (view: AccountView) => void = () => undefined
     const late = new Promise<AccountView>((resolve) => {
       answer = resolve
     })
     const { port, emit } = stubPort(late)
+    // The first read is slow. The event that follows it makes a second read, which says bb.
+    const reads: Promise<AccountView>[] = [late, Promise.resolve(signedIn('bb'))]
+    ;(port as unknown as { accountStatus: () => Promise<AccountView> }).accountStatus = () => reads.shift() ?? late
     const mark = new AccountMark()
     mark.follow(port)
     await vi.waitFor(() => undefined)
     emit(signedIn('bb'))
+    await vi.waitFor(() => expect(mark.current).toBe('bb'))
     answer(signedIn('aa'))
     await late
     await Promise.resolve()

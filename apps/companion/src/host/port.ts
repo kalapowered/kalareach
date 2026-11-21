@@ -186,6 +186,12 @@ export interface ConnectionState {
    */
   readonly paired: boolean
   /**
+   * True while the live connection is to a paired host whose grant answers to an organisation, so
+   * that what this device keeps for it belongs to the account signed in. False for any other host
+   * and when there is no connection. The page clears what an earlier account sent only on such a host.
+   */
+  readonly organisation: boolean
+  /**
    * How many times, since the application started, a connection the host withdrew has been replaced
    * by one it admits. A request refused on the withdrawn connection was answered with a failure just
    * before, so the page says so each time this grows.
