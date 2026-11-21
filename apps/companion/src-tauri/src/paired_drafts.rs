@@ -69,8 +69,9 @@ pub const NO_DRAFT: &str = "this device keeps no draft for this session: add a f
 pub const CHANGED_AGAIN: &str =
     "the draft changed again while the file was being added: the file was not added";
 
-/// What an operation is told when the draft kept for the session is of a later release.
-pub const NEWER_DRAFT: &str = "this device keeps a draft for this session in a format this release does not read: update the application to use it";
+/// What an operation is told when the draft kept for the session cannot be read: a release that
+/// this one does not know wrote it, or it is damaged.
+pub const NEWER_DRAFT: &str = "this device keeps a draft for this session that this release cannot read: another release wrote it, or it is damaged";
 
 /// What an operation is told when the host's answer to the creation of the draft has not been
 /// received and the creation is not known to have failed.
