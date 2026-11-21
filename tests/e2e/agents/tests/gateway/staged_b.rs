@@ -582,6 +582,25 @@ fn race(
     )
 }
 
+/// Whether `result` is the host refusing the request: a failure of the connection, or no answer
+/// within the time asked, is not a refusal, and a request that was carried is not one either.
+fn host_refused<T>(result: &Result<T, RequestError>) -> bool {
+    matches!(result, Err(error) if error.refusal().is_some())
+}
+
+/// Only the host's own refusal counts as the device's answer being refused: a connection that
+/// failed and a request that was not answered do not.
+#[test]
+fn a_connection_that_failed_is_not_a_refusal_in_part_3() {
+    assert!(!host_refused::<()>(&Ok(())));
+    assert!(!host_refused::<()>(&Err(RequestError::Unanswered(
+        "no answer".to_owned()
+    ))));
+    assert!(!host_refused::<()>(&Err(RequestError::Client(
+        kr_client::error::ClientError::ProxyLogin(kr_client::ProxyLoginKind::Needed)
+    ))));
+}
+
 /// How many answers to approvals the agent's record holds after the prompt that holds `mark`, as
 /// the build list's marks count them, waiting until there are at least `least` and the count has
 /// held for a second.
@@ -607,12 +626,19 @@ fn recorded_answers(ctx: &Context, real: &Real, mark: &str, least: usize) -> usi
         std::thread::sleep(Duration::from_millis(200));
         seen = count();
     }
+    // The count must hold for a second; a record that keeps changing past the limit stops the part
+    // with what it counted, and no outcome waits on a count that never settles.
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let again = count();
         if again == seen {
             return seen;
         }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the agent's record of the answers does not settle within {LIVENESS:?}: {seen} and \
+             then {again}"
+        );
         seen = again;
     }
 }
@@ -837,16 +863,16 @@ fn gateway_a_local_and_a_remote_answer_raced_to_one_approval_resolve_it_once() {
                     "the local terminal's refusal closes the second dialog",
                 );
                 let now = ctx.binding(&fresh, session.session_id(), instance);
-                let device_refused = ctx
-                    .answers(
-                        &fresh,
-                        session.session_id(),
-                        instance,
-                        &now,
-                        second_pending.resource_id,
-                        ACCEPT,
-                    )
-                    .is_err();
+                // The device's answer is refused by the host, which says so with a code: an error
+                // of the connection is not the host refusing it.
+                let device_refused = host_refused(&ctx.answers(
+                    &fresh,
+                    session.session_id(),
+                    instance,
+                    &now,
+                    second_pending.resource_id,
+                    ACCEPT,
+                ));
                 let mut second_reader = second_pipe.reader(ctx);
                 until_the_turn_ends(ctx, &fresh, session, instance, &mut second_reader);
                 let control_ran = runs_of(&second_reader, &second).0;
