@@ -763,7 +763,9 @@ impl Standalone {
 
     /// [`Self::kr`] from another installation: the one a case with a stub daemon lays out.
     fn kr_from(&self, installation: &Path, arguments: &[&str]) -> Command {
-        self.kr_at(&installation.join("kr"), arguments)
+        let mut command = self.kr_at(&installation.join("kr"), arguments);
+        command.current_dir(installation);
+        command
     }
 
     /// The `kr` at `program`, which is a copy of the installation's own or one of this test's, against
@@ -783,7 +785,7 @@ impl Standalone {
                 kr_ipc::paths::STATE_DIR_VARIABLE,
                 self.tree.paths().state_root(),
             )
-            .current_dir(installation)
+            .current_dir(installation())
             .stdin(Stdio::null());
         if let Some(temporary) = std::env::var_os("TMPDIR") {
             command.env("TMPDIR", temporary);
@@ -1773,13 +1775,13 @@ fn a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why() {
 }
 
 /// Something that listens on an endpoint, accepts every connection and never says a word.
-struct SilentListener {
+struct SilentEndpointListener {
     accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl SilentListener {
+impl SilentEndpointListener {
     fn on(endpoint: kr_ipc::paths::Endpoint) -> Self {
         let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = std::sync::Arc::clone(&accepted);
@@ -1828,7 +1830,7 @@ impl SilentListener {
     }
 }
 
-impl Drop for SilentListener {
+impl Drop for SilentEndpointListener {
     fn drop(&mut self) {
         drop(self.stop.take());
         if let Some(thread) = self.thread.take() {
@@ -1873,7 +1875,7 @@ fn a_listener_that_accepts_and_stays_silent_does_not_hide_the_end_of_the_daemon(
     // A listener on the endpoint before the command looks would stop its first look; this one
     // comes after the stub has started the daemon, as a daemon that stalls in its start does.
     let control = environment.controller_endpoint().expect("an endpoint");
-    let silent = SilentListener::on(control.clone());
+    let silent = SilentEndpointListener::on(control.clone());
     let begun = Instant::now();
     let _ready = loop {
         match std::os::unix::net::UnixStream::connect(control.as_path()) {
