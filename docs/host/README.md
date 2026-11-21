@@ -2141,9 +2141,9 @@ beside the registry, at format 1, and not in the registry, the configuration doc
 companion's settings file: an earlier release reads those and has no place for it. The file holds the
 format number, the revision and the commands in the order they were first saved, and is written in
 one write, owner only. A host that has saved no command has no file; an emptied list stays a file.
-The revision is a random non-zero 64-bit number made for each change and compared for equality only,
-so a request decided against an old revision writes nothing and a revision never stands for two
-lists.
+The revision is a random non-zero 64-bit number made for each change, different from the one it
+replaces, and compared for equality only. A request decided against an old revision writes
+nothing, and an old revision stands for a later list only by a chance of about one in 2^64.
 
 The host alone decides what a command may hold, in one check that runs when a command is saved and
 again when the file is read (`crates/kr-controller/src/launch_commands.rs`). A label is 1 to 48
