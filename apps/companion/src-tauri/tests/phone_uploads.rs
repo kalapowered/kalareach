@@ -2014,3 +2014,79 @@ async fn kr_req_23_41_a_stop_during_a_bind_leaves_no_falsely_known_revision() {
     assert!(path.exists(), "the new draft is kept");
     adopted.stop().await;
 }
+
+/// KR-REQ-23.41: the wait for a `draft.create` the host may never have got runs to its end. Inside
+/// the window and its margin the bind says the answer has not been received and the request stays
+/// kept; once they have passed the request is known not to have taken effect, it is dropped from the
+/// entry, and the bind makes the draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_the_wait_for_a_lost_create_runs_out_and_the_draft_is_made_anew() {
+    use kr_protocol::ids::ActionId;
+    use kr_protocol::method::Method;
+    use kr_protocol::transfer::DraftCreateParams;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let session = adopted.workers[0].session_id;
+    let paired = paired_of(companion);
+    let target = net_support::on_the_session(&adopted.host, session);
+    // The request was composed and kept, and the host never got it.
+    let composed = paired
+        .session
+        .compose(
+            Method::DraftCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            None,
+            &json!({}),
+            &DraftCreateParams {
+                environment_id: adopted.host.environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session),
+                application_instance_id: Nullable::null(),
+                text: String::new(),
+            },
+            kr_protocol::scalars::DurationMs::new(60_000),
+        )
+        .await
+        .expect("composed");
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    drafts.keep_create_for_test(&paired, session, &target, &composed);
+    let old = Arc::clone(&paired.session);
+    old.transport().close();
+    on_another_connection(companion, &old).await;
+    connected(companion).await;
+    let window = Duration::from_millis(composed.window_valid_for_ms());
+
+    // Inside the wait: the window and the margin of 30 seconds have not passed.
+    drafts.armed_ago_for_test(composed.action_id(), window + Duration::from_secs(20));
+    let refused = bind(companion, session, &handed(companion)).expect_err("inside the wait");
+    assert_eq!(
+        refused["message"],
+        companion_tauri::paired_drafts::CREATE_PENDING,
+        "{refused}"
+    );
+    let (_, kept_bytes) = draft_file(&phone);
+    assert!(
+        String::from_utf8_lossy(&kept_bytes).contains("\"create\":{"),
+        "the request stays kept inside the wait"
+    );
+
+    // Past the wait: nothing was made, and the bind goes on to make the draft.
+    drafts.armed_ago_for_test(composed.action_id(), window + Duration::from_secs(31));
+    let made = bind(companion, session, &handed(companion)).expect("the wait ran out");
+    assert!(made["value"]["draftId"].is_string(), "{made}");
+    let shown = kept(companion, session);
+    assert_eq!(shown["made"], true, "{shown}");
+    assert_eq!(shown["draftId"], made["value"]["draftId"]);
+    let (_, bytes) = draft_file(&phone);
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("\"create\":{"),
+        "the settled request is not kept"
+    );
+    adopted.stop().await;
+}
