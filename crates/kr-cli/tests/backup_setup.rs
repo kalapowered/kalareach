@@ -2898,6 +2898,7 @@ async fn the_kit_is_shown_without_a_staircase_on_a_console_that_does_not_return_
     window.type_line("yes");
     window.wait_for_unwrapped("type the last 8 symbols of its seed line");
     let lines = setup_console::Screen::of(&window.transcript()).lines();
+    assert_the_console_did_not_return_at_the_line_feed(&lines);
     for start in [
         "kalareach-recovery-kit/1",
         "seed: ",
@@ -2923,6 +2924,25 @@ async fn the_kit_is_shown_without_a_staircase_on_a_console_that_does_not_return_
          line end: {shown}"
     );
     window.assert_the_terminal_is_as_found(&shown);
+}
+
+/// The no-staircase case's condition, from the screen it read: the plan's first line, which `kr`
+/// writes before anything else, starts where the observer's line ended, because this console drew
+/// a line feed without a return while the flag was set. Without it a kit at the left edge shows
+/// nothing, and the case would pass with or without the command's clear. The assertion is in a
+/// helper, so that a console that returns at a line feed reads as a set-up fault in the case and
+/// never as the kill of the mutation the case is named for.
+#[cfg(windows)]
+fn assert_the_console_did_not_return_at_the_line_feed(lines: &[String]) {
+    let plan = lines
+        .iter()
+        .find(|line| line.contains("Setting this host's backups up at"))
+        .expect("the plan is shown");
+    assert!(
+        plan.starts_with(' '),
+        "this case could not make its condition: the console returned at a line feed while the \
+         flag was set, so a kit at the left edge shows nothing: {lines:#?}"
+    );
 }
 
 /// An answer longer than the bound ends the dialogue and leaves nothing of it in the console: the
