@@ -80,7 +80,7 @@ export interface LaunchSurfaceReads {
   /**
    * The newest answer to the read of the host's saved launch commands, or null before the first
    * and where there is nothing to read. A host that does not serve the list, and a connection that
-   * may not read it, are remembered until the connection changes and leave the answer as it was.
+   * may not read it, are remembered until the connection changes and clear the answer.
    */
   readonly list: LaunchCommandsReading | null
   /** Why the newest read of the saved launch commands failed, in words, or null. */
@@ -202,7 +202,13 @@ export function useLaunchSurface(
                 if (reading.state === 'served') {
                   newestList.current = { readList, list: reading.list }
                   setList({ readList, reading, unread: null })
-                } else remembered = true
+                } else {
+                  // The host holds no list this connection may use: what was shown is cleared, so
+                  // no saved command stays pressable.
+                  remembered = true
+                  newestList.current = null
+                  setList(null)
+                }
               },
               (failure: unknown) => {
                 // The list as it was stays, and the failure is told beside it.

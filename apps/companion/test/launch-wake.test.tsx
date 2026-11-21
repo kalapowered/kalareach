@@ -331,6 +331,36 @@ describe('when the saved launch commands are read', () => {
     expect(result.current.listUnread).toBeNull()
   })
 
+  it.each(['not_served', 'refused'] as const)(
+    'a_list_answered_%s_after_one_was_served_clears_the_list_the_page_shows_and_presses_against',
+    async (state) => {
+      const surface = held<LaunchSurfaceReading>()
+      const list = held<LaunchCommandsReading>()
+      const { result } = run(surface.read, { wake: 0, readList: list.read })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      await surface.answer(SURFACE)
+      await list.answer(LISTED(['Claude']))
+      expect(result.current.list).toEqual(LISTED(['Claude']))
+      expect(result.current.listNow()).toEqual({
+        revision: '1',
+        commands: [{ label: 'Claude', program: 'claude', arguments: [] }]
+      })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(LAUNCH_SURFACE_CADENCE_MS)
+      })
+      expect(list.started()).toBe(2)
+      await list.answer({ state })
+      // No saved command stays on the page, pressable, after the host said it holds none for this
+      // connection.
+      expect(result.current.list).toBeNull()
+      expect(result.current.listNow()).toBeNull()
+      expect(result.current.listUnread).toBeNull()
+    }
+  )
+
   it('a_list_that_cannot_be_read_keeps_the_last_one_and_says_why_beside_it', async () => {
     const surface = held<LaunchSurfaceReading>()
     let answers = 0
