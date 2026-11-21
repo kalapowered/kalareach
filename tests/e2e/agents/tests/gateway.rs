@@ -3179,8 +3179,9 @@ impl<'a> Session<'a> {
     /// Opens two sessions on one host and one device before anything of the agent starts: the
     /// device's two connections are made first, one for each session, the first person enters, then
     /// the second person enters with the sessions seen before (and so is the session that entry
-    /// added), and both shells' environments are read at their prompts.
-    fn open_two(ctx: &'a Context, variants: &str) -> Self {
+    /// added), and both shells' environments are read at their prompts. `second_variants` are the
+    /// stand-in's variants in the second person's shell.
+    fn open_two(ctx: &'a Context, variants: &str, second_variants: &str) -> Self {
         let host = ctx.host();
         let (device, paired, remote) = ctx.pair(&host);
         let second_remote = ctx
@@ -3191,7 +3192,7 @@ impl<'a> Session<'a> {
         let second = Person::enters(
             ctx,
             &host,
-            &ctx.stand_in_variables("", &[]),
+            &ctx.stand_in_variables(second_variants, &[]),
             &[person.session_id],
         );
         match second.reads_the_environment(&second.expected) {
@@ -4025,8 +4026,37 @@ struct Setup {
     /// serves the launch through a gateway and the host sees the agent as a native terminal.
     manual: bool,
     /// A second person's session is opened beside the first before anything starts, with no newer
-    /// build behind it (the forging session of 8a).
+    /// build behind it (the forging session of 8a, and the second start of 7 and 7f). The agent in
+    /// it is the first's, with the same variants.
     second: bool,
+}
+
+/// The stand-in's variants in a case's second session's shell: the first's where the case has two
+/// sessions of one agent (`second`), so that a start by hand in either is the one the variants
+/// name; none where the second session stands for an upgrade, whose newer build the variants of the
+/// first are not for.
+fn second_session_variants(setup: Setup, variants: &str) -> &str {
+    if setup.second { variants } else { "" }
+}
+
+/// A second session of one agent starts the way the first does, and the upgrade's does not.
+#[test]
+fn a_second_session_of_one_agent_is_given_the_first_ones_variants_and_an_upgrades_is_given_none() {
+    let second = Setup {
+        second: true,
+        ..Setup::default()
+    };
+    let upgrade = Setup {
+        upgrade: true,
+        ..Setup::default()
+    };
+    assert_eq!(second_session_variants(second, "by-hand"), "by-hand");
+    assert_eq!(second_session_variants(upgrade, "by-hand"), "");
+    assert_eq!(
+        second_session_variants(upgrade, "leave-unanswered,two-approvals,stay"),
+        ""
+    );
+    assert_eq!(second_session_variants(Setup::default(), "by-hand"), "");
 }
 
 /// Whether the run is the probe-only run: asked for by [`PROBE_ONLY_VARIABLE`], which only the
@@ -4111,7 +4141,7 @@ fn run_case_in(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.place();
         let session = if setup.upgrade || setup.second {
-            Session::open_two(&ctx, variants)
+            Session::open_two(&ctx, variants, second_session_variants(setup, variants))
         } else if setup.forge {
             // The root every path the forging launcher reads must lie below, given in the
             // environment the session is created with (a name outside the host's reserved prefix).
