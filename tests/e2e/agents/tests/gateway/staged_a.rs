@@ -1485,6 +1485,20 @@ fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer
     const TEST: &str =
         "gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer";
     by_hand_case("14.03a", TEST, Setup::default(), |ctx, session| {
+        // A build that shows no composer before an account is signed in has nothing to type at:
+        // the part is not run, and nothing is started for it.
+        let composer = match &ctx.route {
+            Route::Real(real) => match real.build.composer.clone() {
+                Some(composer) => Some(composer),
+                None => {
+                    return serde_json::json!({
+                        "arm": arm(ctx),
+                        "not_run": "the build shows no composer without an account",
+                    });
+                }
+            },
+            Route::StandIn => None,
+        };
         let session_id = session.session_id();
         let agent = HandAgent::starts(ctx, session);
         let initial = detects(ctx, &session.remote, session_id);
@@ -1507,12 +1521,7 @@ fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer
             .unwrap_or_else(|why| panic!("refused input does not reach the composer: {why}"));
         keys.acquire(&session.remote, &ctx.runtime)
             .unwrap_or_else(|why| panic!("the device takes the input lease: {why}"));
-        if let Route::Real(real) = &ctx.route {
-            let composer = real
-                .build
-                .composer
-                .clone()
-                .expect("the build shows no composer without an account");
+        if let Some(composer) = &composer {
             for prepare in &composer.prepare {
                 let _ = keys
                     .type_text(&session.remote, &ctx.runtime, &prepare.input)
