@@ -943,6 +943,43 @@ fn the_two_approval_markers_are_as_long_as_each_other_and_differ() {
 // Part 4: the device goes after the agent took its prompt and before the reply.
 // ---------------------------------------------------------------------------------------------
 
+/// Why the moment the device went is not shown to lie between the prompt and its reply, where it
+/// is not: a screen the device was sent showed the reply begin, the output bytes it was sent after
+/// the submission hold the code's start or the reply mark, its view was told to resynchronise or
+/// asked for a fresh screen in that time (which may have skipped some), or its reader was not seen
+/// to stop once it disconnected.
+fn cut_unknown(
+    on_a_screen: bool,
+    in_the_output: bool,
+    resynchronised: bool,
+    fresh_screen: bool,
+    reader_stopped: bool,
+) -> Option<&'static str> {
+    if on_a_screen {
+        Some("a screen the device was sent showed the reply begin before it went")
+    } else if in_the_output {
+        Some("the output the device was sent held the start of the reply before it went")
+    } else if resynchronised || fresh_screen {
+        Some("the device was told to resynchronise or asked for a fresh screen before it went")
+    } else if !reader_stopped {
+        Some("the device's reader was not seen to stop once it disconnected")
+    } else {
+        None
+    }
+}
+
+/// The cut is shown only where none of the five conditions holds: each one alone leaves the
+/// boundary unknown.
+#[test]
+fn a_cut_after_which_the_reply_may_have_reached_the_device_is_not_a_shown_boundary() {
+    assert_eq!(cut_unknown(false, false, false, false, true), None);
+    assert!(cut_unknown(true, false, false, false, true).is_some());
+    assert!(cut_unknown(false, true, false, false, true).is_some());
+    assert!(cut_unknown(false, false, true, false, true).is_some());
+    assert!(cut_unknown(false, false, false, true, true).is_some());
+    assert!(cut_unknown(false, false, false, false, false).is_some());
+}
+
 /// Whether the old attachment's input, tried on the device's new connection, was refused by the
 /// host with a code: input that was accepted, or that failed for a reason that is not the host's
 /// refusal (a connection that failed, no answer), does not show that the host dropped the old
@@ -1248,6 +1285,20 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 };
                 let marks_before = reply_marks(&watch.view.rows());
                 let mut reached = false;
+                // What the view was sent before the submission: a resynchronisation or a fresh
+                // screen asked for after it may have skipped some of the reply, and the output
+                // bytes sent after it are searched for the reply's start.
+                let resyncs_of = |watch: &Watch| {
+                    watch
+                        .view
+                        .kinds()
+                        .iter()
+                        .filter(|kind| kind.as_str() == "session.resync")
+                        .count()
+                };
+                let resyncs_before = resyncs_of(&watch);
+                let fresh_before = watch.view.fresh_screens();
+                let sent_from = watch.view.output().len();
                 real.charge(&ctx.run, "4", "a prompt with a slow reply");
                 let started = ctx
                     .prompts(
@@ -1284,8 +1335,27 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 }
                 // The device goes: both its connections close, and what was sent before the cut is
                 // applied and looked at; an event that cannot be applied leaves the boundary unknown.
+                // The view's reader holds one reference to its transport besides the connection's
+                // own and lets go of it only once it has stopped: until it has, something it had
+                // received could still reach the view, so a reader not seen to stop within five
+                // seconds leaves the boundary unknown.
+                let held_with_reader =
+                    std::sync::Arc::strong_count(watch.remote.session().transport());
                 session.remote.close();
                 watch.remote.close();
+                let closing = Instant::now();
+                let reader_stopped = loop {
+                    if held_with_reader >= 2
+                        && std::sync::Arc::strong_count(watch.remote.session().transport())
+                            < held_with_reader
+                    {
+                        break true;
+                    }
+                    if closing.elapsed() >= Duration::from_secs(5) {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
                 loop {
                     match ctx
                         .runtime
@@ -1303,7 +1373,32 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                         }
                     }
                 }
-                if reached {
+                let sent = &watch.view.output()[sent_from..];
+                let holds = |needle: &[u8]| {
+                    !needle.is_empty() && sent.windows(needle.len()).any(|window| window == needle)
+                };
+                let in_the_output = holds(code_start.as_bytes())
+                    || account
+                        .reply_mark
+                        .as_ref()
+                        .is_some_and(|reply_mark| holds(reply_mark.as_bytes()));
+                let resyncs = resyncs_of(&watch).saturating_sub(resyncs_before);
+                let fresh_screens = watch.view.fresh_screens().saturating_sub(fresh_before);
+                let unknown = cut_unknown(
+                    reached,
+                    in_the_output,
+                    resyncs > 0,
+                    fresh_screens > 0,
+                    reader_stopped,
+                );
+                let cutoff = serde_json::json!({
+                    "reader_stopped": reader_stopped,
+                    "fresh_screens": fresh_screens,
+                    "resyncs": resyncs,
+                    "code_or_reply_mark_in_the_output": in_the_output,
+                    "code_on_a_screen": reached,
+                });
+                if let Some(why) = unknown {
                     // Something of the reply reached the device before it went, or whether it had
                     // could not be told: no moment between the prompt and its reply was shown, and
                     // the part is not run. The turn is let finish so that nothing is left running.
@@ -1313,8 +1408,9 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                     }
                     return serde_json::json!({
                         "arm": arm(ctx),
-                        "not_run": "the reply reached the device before the agent recorded the prompt, or whether it had could not be told, so no moment between them was shown",
+                        "not_run": format!("{why}, so no moment between the prompt and its reply was shown"),
                         "code_looked_for": code_start,
+                        "cutoff": cutoff,
                     });
                 }
                 let at_the_drop = counts(&record(ctx, real));
@@ -1377,6 +1473,7 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 serde_json::json!({
                     "arm": arm(ctx),
                     "markers": { "reply_ends": end },
+                    "cutoff": cutoff,
                     "at_the_drop": { "prompts": at_the_drop.0, "finished_replies": at_the_drop.1 },
                     "after_reconnect": { "prompts": prompts, "finished_replies": replies, "shows": end, "screen_rows_holding_it": redrawn_rows.iter().filter(|row| row.contains(&end)).count() },
                     "stale_input": { "refused_with": format!("{stale_code:?}"), "detail": stale.err().map(|refusal| refusal.detail) },
