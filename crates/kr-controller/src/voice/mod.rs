@@ -275,8 +275,9 @@ impl VoiceModule {
     /// privacy mode is on. A device's answer is checked when the read ends and again where the
     /// frame is written, which holds the privacy state the read began under, whether privacy mode
     /// was on or off then: a state that has changed in any way by then, an off and an on again
-    /// among them, replaces the frame with the same refusal ([`CONTEXT_MOVED`]). Once the writer
-    /// has begun a write attempt, a change can end the connection instead. An answer the privacy
+    /// among them, replaces a successful context answer with the same refusal ([`CONTEXT_MOVED`]);
+    /// a refusal the read gave is written as it is. Once the writer has begun a write attempt, a
+    /// change can end the connection instead. An answer the privacy
     /// state keeps moving under is refused for the device to ask again.
     async fn context_unmoved(
         &self,

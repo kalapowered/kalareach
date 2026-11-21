@@ -1173,11 +1173,12 @@ impl EnvironmentPrivacy {
         self.inner().obligations.contains_key(&session_id)
     }
 
-    /// Whether privacy mode is on in `generation` and `session_id` owes no cleanup in it, read under
-    /// one lock of the record.
+    /// Whether privacy mode is on in `generation` and `session_id` has no obligation of any
+    /// generation, read under one lock of the record.
     ///
-    /// A session owes nothing once its worker has said that it applied the generation and that its
-    /// cleanup is complete, so what it answers from then on holds nothing the removal takes. This
+    /// A session has none once its worker has said that it applied the generation and that its
+    /// cleanup is complete, or the archive has removed what its ended worker retained, so what it
+    /// answers from then on holds nothing the removal takes. This
     /// says nothing of another session, nor of what the daemon's own subsystems still hold: that is
     /// [`Self::report_now`], which asks more than the record.
     #[must_use]

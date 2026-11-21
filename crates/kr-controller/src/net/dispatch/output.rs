@@ -122,10 +122,11 @@ impl FrameSink for ControlStream {
 /// read in. One made while privacy mode is on is never released by it: the daemon publishes the mode
 /// before it tells a worker to remove what it retained, so a worker can still answer with output
 /// that is about to go. [`ReadUnder::now_settled`] releases a read of a session's own content made
-/// while the mode is on once that session owes no removal, and [`ReadUnder::now_carrying_none_while_private`] releases one
-/// whose own code carries nothing the removal takes while the mode is on. Both stand only while the
-/// state they began under stands. Output a worker read before privacy mode started is not sent after
-/// it, however long the answer waited to be written.
+/// while the mode is on when that session owed no removal at the read's start, and
+/// [`ReadUnder::now_carrying_none_while_private`] releases one whose own code carries nothing the
+/// removal takes while the mode is on. Both stand only while the state they began under stands.
+/// Output a worker read before privacy mode started is not sent after it, however long the answer
+/// waited to be written.
 #[derive(Clone, Debug)]
 pub(super) struct ReadUnder {
     state: crate::privacy::PrivacyState,
@@ -161,11 +162,12 @@ impl ReadUnder {
     }
 
     /// As [`Self::now`], for a read of what `session_id` retained that is answered while privacy
-    /// mode is on once that session owes no removal.
+    /// mode is on when that session owed no removal at the read's start.
     ///
-    /// The generation and the session's debt are taken at the start of the read, in one reading of
-    /// the environment's privacy record, which the session's worker clears by saying that it applied
-    /// the generation and that its cleanup is complete. A read that began while the session still
+    /// The generation and the session's debt are taken at the start of the read: the generation
+    /// comes first from the published state, and the record's lock then confirms it and gives the
+    /// debt, which the session's worker clears by saying that it applied the generation and that its
+    /// cleanup is complete. A read that began while the session still
     /// owed its removal is never released, even if the removal finishes while the answer waits, and
     /// one that began after is released for as long as the state it began under stands. Another
     /// session's debt does not hold it. A read that names no session is not released.
@@ -721,9 +723,10 @@ impl RemoteOutput {
     /// policy, and an answer cut for one that touched nothing the decision stood on would end a
     /// connection for no refusal. A failure frame is not held, so the device is told why.
     ///
-    /// A page of retained output is held to the privacy state it was read under, `read_under`, in
-    /// the same places: a page that no longer stands before any of it went is decided again, and
-    /// the connection ends once bytes are moving.
+    /// What a read carries of a session's text is held to the privacy state it was read under,
+    /// `read_under`, in the same places: a page, retained entries, a receipt's result, a context for
+    /// a voice call or an answer kept from an earlier submission that no longer stands before any of
+    /// it went is decided again, and the connection ends once bytes are moving.
     pub(super) async fn write_held(
         &self,
         frame: &ControlFrame,
@@ -824,7 +827,7 @@ impl RemoteOutput {
         // Set the first time a byte may have gone. Until then the stream is whole whatever
         // happens to this frame.
         let begun = AtomicBool::new(false);
-        // The privacy state a page was read under is taken for the attempt and kept until the
+        // The privacy state a read was made under is taken for the attempt and kept until the
         // bytes of the attempt are handed over, so a change of privacy mode is published before
         // the check or after the write, and never between them.
         let admits = |attempt: &mut dyn FnMut()| {

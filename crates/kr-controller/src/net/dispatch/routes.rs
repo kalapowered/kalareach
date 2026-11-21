@@ -512,9 +512,9 @@ impl RemoteConnection {
                 // What a call may be told of a session carries what a model wrote and what the
                 // description host observed, so a context is released only under the privacy
                 // state it was read under, taken before it is read. A read begun with privacy mode
-                // on carries neither, and stands only while that same state stands: a mode that
-                // went off and on again moved it, and the context may then hold what a later state
-                // produced.
+                // on carries neither only while the same private state remains throughout the
+                // read, so it stands only while that same state stands: a mode that went off and
+                // on again moved it, and the context may then hold what a later state produced.
                 let read_under = if entry.method == Method::VoiceContext {
                     match super::output::ReadUnder::now_carrying_none_while_private(
                         &self.controller,
@@ -527,6 +527,8 @@ impl RemoteConnection {
                 } else {
                     None
                 };
+                #[cfg(feature = "testing")]
+                self.controller.after_the_voice_state_was_taken.wait().await;
                 let answer = self
                     .controller
                     .voice()
