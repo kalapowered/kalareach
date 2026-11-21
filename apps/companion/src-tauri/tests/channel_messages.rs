@@ -2290,6 +2290,66 @@ fn a_read_that_waited_for_a_set_aside_settles_the_flush_it_owes() {
     assert!(again.is_ok(), "the read answers once the flush is made");
 }
 
+/// KR-REQ-12.26: the same with a folder of messages: a read of the drafts that waited for the
+/// set-aside's locks settles the flush the set-aside owes under the lock it then holds, though it saw
+/// nothing owed when it started.
+#[test]
+fn a_read_with_a_message_folder_that_waited_for_a_set_aside_settles_the_flush_it_owes() {
+    let data = data();
+    let window = Window::over(data.path());
+    // The draft store is open before the refusal is made, so that only the flush the set-aside
+    // owes can refuse the read.
+    window.drafts().expect("the drafts are read once");
+    window
+        .keep(message(9, "so that the folder of messages exists", &[]))
+        .expect("kept");
+    std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
+    let _clock = testing::clock(data.path(), 13);
+    let (hook, reached, release) = a_wait();
+    let _locked = testing::at(data.path(), Point::SetAsideLocked, hook);
+    let slot = Arc::new(Mutex::new(None));
+    let hold_slot = Arc::clone(&slot);
+    let root = data.path().to_path_buf();
+    let _copied = testing::at(data.path(), Point::SetAsideCopied, move || {
+        *hold_slot.lock().expect("a lock") =
+            Some(kr_flush::testing::refuse_flushes_of(root.clone()));
+        Ok(())
+    });
+    let (set_aside_done, set_aside) = mpsc::channel();
+    let (read_done, read) = mpsc::channel();
+    let for_set_aside = window.window.clone();
+    let for_read = window.window.clone();
+    std::thread::spawn(move || {
+        let _ = set_aside_done.send(invoke(
+            &for_set_aside,
+            "device_drafts_ledger_set_aside",
+            json!(null),
+        ));
+    });
+    reached
+        .recv_timeout(WAIT)
+        .expect("the set-aside holds every lock");
+    std::thread::spawn(move || {
+        let _ = read_done.send(invoke(&for_read, "device_drafts", json!(null)));
+    });
+    assert!(
+        read.recv_timeout(SHORT).is_err(),
+        "the read waits for the set-aside"
+    );
+    release.send(()).expect("let the set-aside go");
+    let moved = set_aside.recv_timeout(WAIT).expect("the set-aside ends");
+    assert!(
+        moved.as_ref().is_ok_and(|done| done["confirmed"] == false),
+        "the move is made and its flush is refused: {moved:?}"
+    );
+    let answered = read.recv_timeout(WAIT).expect("the read ends");
+    let refusal = answered.expect_err("the read settles the flush it finds owed");
+    assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    slot.lock().expect("a lock").take();
+    let again = window.drafts();
+    assert!(again.is_ok(), "the read answers once the flush is made");
+}
+
 /// KR-REQ-12.26: a read over a data directory that does not exist yet makes it, as the draft store
 /// does, and answers; the durability proof does not refuse a directory that is only not there yet.
 #[test]
