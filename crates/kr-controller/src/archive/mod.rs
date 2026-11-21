@@ -771,7 +771,7 @@ impl ArchiveService {
         }
     }
 
-    /// Removes the worker's published endpoint and descriptor, and returns whether anything went.
+    /// Removes the worker's published endpoint and descriptor.
     ///
     /// Fencing is not a message to the worker. A worker that has crashed cannot be told anything;
     /// what this does is stop a client finding a socket that no longer has a process behind it,
@@ -785,28 +785,29 @@ impl ArchiveService {
         &self,
         session_id: SessionId,
         display_number: kr_protocol::session::DisplayNumber,
-    ) -> std::result::Result<bool, String> {
-        let remove = |path: &std::path::Path| -> std::result::Result<bool, String> {
+    ) -> std::result::Result<(), String> {
+        let remove = |path: &std::path::Path| -> std::result::Result<(), String> {
             match std::fs::remove_file(path) {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                Err(error) => Err(format!("{}: {error}", path.display())),
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("{}: {error}", path.display()))
+                }
+                _ => Ok(()),
             }
         };
-        let mut fenced = remove(&self.paths.descriptor_file(session_id))?;
+        remove(&self.paths.descriptor_file(session_id))?;
         if let Ok(endpoint) = self.paths.worker_endpoint(display_number) {
             // On Windows the endpoint is the name of a pipe, which has no file to remove and goes
             // with the process that made it.
             #[cfg(unix)]
             {
-                fenced |= remove(endpoint.as_path())?;
+                remove(endpoint.as_path())?;
             }
             #[cfg(not(unix))]
             {
-                fenced |= std::fs::remove_file(endpoint.as_path()).is_ok();
+                let _ = std::fs::remove_file(endpoint.as_path());
             }
         }
-        Ok(fenced)
+        Ok(())
     }
 
     /// Recovers a crashed session's journal, under ownership, without creating one.
