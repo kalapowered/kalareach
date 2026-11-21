@@ -11,6 +11,11 @@ use tauri::test::MockRuntime;
 pub const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Where the bundle's pages are served from.
+/// On Windows the bundle is served from `http://tauri.localhost`; a call from the address the other
+/// platforms use is a call from a remote origin, which the capabilities do not grant.
+#[cfg(windows)]
+pub const BUNDLE: &str = "http://tauri.localhost";
+#[cfg(not(windows))]
 pub const BUNDLE: &str = "tauri://localhost";
 
 /// The page: an application with the question commands, reaching the workers of one host tree, and

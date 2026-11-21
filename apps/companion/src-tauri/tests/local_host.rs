@@ -27,6 +27,11 @@ use tauri::Manager as _;
 use tauri::test::MockRuntime;
 
 /// Where the bundle's pages are served from.
+/// On Windows the bundle is served from `http://tauri.localhost`; a call from the address the other
+/// platforms use is a call from a remote origin, which the capabilities do not grant.
+#[cfg(windows)]
+const BUNDLE: &str = "http://tauri.localhost";
+#[cfg(not(windows))]
 const BUNDLE: &str = "tauri://localhost";
 
 #[path = "../../../../crates/kr-controller/tests/teardown/mod.rs"]

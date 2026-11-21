@@ -7,6 +7,11 @@
 use serde_json::{Value, json};
 use tauri::test::MockRuntime;
 
+/// On Windows the bundle is served from `http://tauri.localhost`; a call from the address the other
+/// platforms use is a call from a remote origin, which the capabilities do not grant.
+#[cfg(windows)]
+const BUNDLE: &str = "http://tauri.localhost";
+#[cfg(not(windows))]
 const BUNDLE: &str = "tauri://localhost";
 
 const SESSION: &str = "8a7b6c50-22bb-4c3d-8e4f-000000000101";
