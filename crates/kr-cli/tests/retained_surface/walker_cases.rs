@@ -1095,6 +1095,40 @@ fn a_request_or_a_target_is_a_sighting_where_a_brace_group_follows_its_name_or_s
 }
 
 #[test]
+fn a_name_in_an_impl_header_an_associated_type_a_module_attribute_or_an_extern_block_is_a_sighting()
+{
+    for (lib, expected) in [
+        (
+            "impl Tr for S { type X = [(); Method::AgentTurnCancel as usize]; }",
+            one("S", SightKind::Names),
+        ),
+        (
+            "impl S where [(); Method::AgentTurnCancel as usize]: Sized {}",
+            one("S", SightKind::Names),
+        ),
+        (
+            "#[serde(rename = \"agent.turn.cancel\")]\nimpl S {}",
+            one("S", SightKind::Names),
+        ),
+        (
+            "#[serde(rename = \"agent.turn.cancel\")]\nmod m {}",
+            one("m", SightKind::Names),
+        ),
+        (
+            "extern \"C\" { fn f(x: [u8; Method::AgentTurnCancel as usize]); }",
+            one("item:lib.rs", SightKind::Names),
+        ),
+        // The header of an impl for one of the two types holds no brace form, and a quiet item none.
+        ("impl Tr for MutationRequest {}", BTreeMap::new()),
+        ("impl S { type X = u8; }", BTreeMap::new()),
+        ("#[derive(Debug)]\nmod m {}", BTreeMap::new()),
+        ("#[doc = \"agent.turn.cancel\"]\nmod m {}", BTreeMap::new()),
+    ] {
+        assert_eq!(kinds_found(lib, &[]), expected, "{lib}");
+    }
+}
+
+#[test]
 fn an_item_keeps_its_written_tokens_and_a_nested_place_no_configuration_builds_gives_no_sighting() {
     let lib = |nested: &str| {
         format!(

@@ -1921,6 +1921,13 @@ impl Scanner {
             let plain = || without_docs(item.to_token_stream());
             match item {
                 syn::Item::Mod(module) => {
+                    // The attributes of the module are its own tokens; its items are read below.
+                    let attributes: TokenStream = module
+                        .attrs
+                        .iter()
+                        .map(|attribute| attribute.to_token_stream())
+                        .collect();
+                    self.body(module.ident.unraw().to_string(), without_docs(attributes));
                     if let Some((_, inner)) = &module.content {
                         self.items(inner, file, under_src)?;
                     }
@@ -1939,6 +1946,21 @@ impl Scanner {
                             _ => None,
                         },
                     );
+                    // The header: the attributes, the generics, the trait and the type, with no body.
+                    let mut header = TokenStream::new();
+                    for attribute in &block.attrs {
+                        attribute.to_tokens(&mut header);
+                    }
+                    block.generics.to_tokens(&mut header);
+                    block.generics.where_clause.to_tokens(&mut header);
+                    if let Some((bang, path, for_token)) = &block.trait_ {
+                        bang.to_tokens(&mut header);
+                        path.to_tokens(&mut header);
+                        for_token.to_tokens(&mut header);
+                    }
+                    block.self_ty.to_tokens(&mut header);
+                    let header = without_docs(header);
+                    self.impl_item(&owner, file, under_src, header.clone(), &header);
                     for inner in &block.items {
                         if !condition::enabled(impl_item_attrs(inner), file)? {
                             continue;
@@ -1961,11 +1983,11 @@ impl Scanner {
                                 let written = without_docs(constant.to_token_stream());
                                 self.impl_item(&owner, file, under_src, tokens, &written);
                             }
-                            syn::ImplItem::Macro(call) => {
-                                let tokens = without_docs(call.to_token_stream());
+                            // A macro call, an associated type, and what syn does not parse.
+                            other => {
+                                let tokens = without_docs(other.to_token_stream());
                                 self.impl_item(&owner, file, under_src, tokens.clone(), &tokens);
                             }
-                            _ => {}
                         }
                     }
                     self.self_kind = outer;
@@ -2034,6 +2056,10 @@ impl Scanner {
                 }
                 syn::Item::Static(definition) => {
                     self.body(definition.ident.to_string(), text()?);
+                }
+                // Items with no name of their own: the file names the sighting, as for a `use`.
+                syn::Item::ForeignMod(_) | syn::Item::TraitAlias(_) | syn::Item::Verbatim(_) => {
+                    self.scan_only_body(format!("item:{under_src}"), file, text()?, &plain());
                 }
                 _ => {}
             }
