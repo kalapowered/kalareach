@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kr_client::chunks::ChunkRoute;
+use kr_client::services::AccountMark;
 use kr_client::uploads::{self, Content, Held, Journal, Progress, Stage, Subject, Upload};
 use kr_client::{ClientError, Session};
 use kr_protocol::envelope::ActionTarget;
@@ -125,6 +126,11 @@ struct UploadFile {
     /// The host's environment and this device's principal on it.
     environment_id: EnvironmentId,
     device_id: DeviceId,
+    /// On a host whose grant answers to an organisation, the account that was signed in when the
+    /// file was kept (the mark of the account, as text): a new sign-in does not change the device's
+    /// principal, so another account's entry is told apart by this. None on a host with no
+    /// organisation.
+    account: Option<String>,
     /// What the upload's calls are made on.
     target: ActionTarget,
     session_id: Option<SessionId>,
@@ -443,8 +449,27 @@ pub struct Paired {
     pub device_id: DeviceId,
     /// The host's environment.
     pub environment_id: EnvironmentId,
+    /// The account signed in, on a host whose grant answers to an organisation; none on another.
+    pub account: Option<AccountMark>,
     /// The connection.
     pub session: Arc<Session>,
+}
+
+impl Paired {
+    /// The account as an entry keeps it.
+    #[must_use]
+    pub fn account_id(&self) -> Option<String> {
+        self.account.map(AccountMark::to_hex)
+    }
+}
+
+impl UploadFile {
+    /// Whether the entry is this device's own on `paired`'s host, kept under the sign-in in force.
+    fn is_of(&self, paired: &Paired) -> bool {
+        self.environment_id == paired.environment_id
+            && self.device_id == paired.device_id
+            && self.account == paired.account_id()
+    }
 }
 
 /// What kept content is a copy of.
@@ -648,6 +673,7 @@ impl Desk {
             key,
             environment_id: paired.environment_id,
             device_id: paired.device_id,
+            account: paired.account_id(),
             target: request.target,
             session_id: request.session_id,
             media_type: request.media_type,
@@ -736,17 +762,12 @@ impl Desk {
             .iter()
             .filter(|(_, live)| {
                 let file = locked(&live.file);
-                file.environment_id == paired.environment_id
-                    && file.device_id == paired.device_id
-                    && file.reached != Reached::Published
+                file.is_of(paired) && file.reached != Reached::Published
             })
             .map(|(key, _)| *key)
             .collect();
         for file in &found.entries {
-            if file.environment_id == paired.environment_id
-                && file.device_id == paired.device_id
-                && file.reached != Reached::Published
-                && !keys.contains(&file.key)
+            if file.is_of(paired) && file.reached != Reached::Published && !keys.contains(&file.key)
             {
                 keys.push(file.key);
             }
@@ -930,14 +951,12 @@ impl Desk {
         live.outcome.send_replace(Some(outcome));
     }
 
-    /// The host was reached on `session`: paused uploads resume on it, and entries kept from before
-    /// are read against the host's own record and resumed or dropped.
-    pub fn host_reached(
-        self: &Arc<Self>,
-        device_id: DeviceId,
-        environment_id: EnvironmentId,
-        session: Arc<Session>,
-    ) {
+    /// The host was reached on `paired`'s connection: paused uploads resume on it, and entries kept
+    /// from before are read against the host's own record and resumed or dropped. What belongs to
+    /// another principal or to another account of this host is stopped and dropped, never resumed.
+    pub fn host_reached(self: &Arc<Self>, paired: Paired) {
+        let (device_id, environment_id) = (paired.device_id, paired.environment_id);
+        let session = Arc::clone(&paired.session);
         locked(&self.sessions).insert((environment_id, device_id), Arc::clone(&session));
         let (paused, other): (Vec<Arc<Live>>, Vec<Arc<Live>>) = {
             let held = locked(&self.live);
@@ -946,7 +965,7 @@ impl Desk {
                 .filter(|live| locked(&live.file).environment_id == environment_id);
             let (mine, other): (Vec<_>, Vec<_>) = in_host
                 .cloned()
-                .partition(|live| locked(&live.file).device_id == device_id);
+                .partition(|live| locked(&live.file).is_of(&paired));
             (
                 mine.into_iter()
                     .filter(|live| *locked(&live.phase) == Phase::Paused)
@@ -954,7 +973,8 @@ impl Desk {
                 other,
             )
         };
-        // An upload of another principal on this host belongs to a sign-in that is not in force.
+        // An upload of another principal or another account on this host belongs to a sign-in that is
+        // not in force.
         for live in &other {
             if let Some(task) = locked(&live.task).take() {
                 task.abort();
@@ -967,13 +987,8 @@ impl Desk {
         for live in &paused {
             if live.file().cancel_asked {
                 let desk = Arc::clone(self);
-                let (live, session) = (Arc::clone(live), Arc::clone(&session));
+                let (live, paired) = (Arc::clone(live), paired.clone());
                 tauri::async_runtime::spawn(async move {
-                    let paired = Paired {
-                        device_id,
-                        environment_id,
-                        session,
-                    };
                     if let Ok(store) = desk.store() {
                         let file = live.file();
                         let _ = desk.finish_cancel(&store, &paired, Some(live), file).await;
@@ -988,12 +1003,7 @@ impl Desk {
         }
         let desk = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            desk.restart(Paired {
-                device_id,
-                environment_id,
-                session,
-            })
-            .await;
+            desk.restart(paired).await;
         });
     }
 
@@ -1024,8 +1034,9 @@ impl Desk {
             {
                 continue;
             }
-            if file.device_id != paired.device_id {
-                // Another principal's: the sign-in it was kept under is not the one in force.
+            if file.device_id != paired.device_id || file.account != paired.account_id() {
+                // Another principal's, or another account's: the sign-in it was kept under is not
+                // the one in force.
                 let _ = store.remove(file.key);
             } else if file.target.environment_id == paired.environment_id {
                 mine.push(file);
@@ -1137,7 +1148,7 @@ impl Desk {
         let live = locked(&self.live).clone();
         for (key, held) in &live {
             let file = held.file();
-            if file.environment_id != paired.environment_id || file.device_id != paired.device_id {
+            if !file.is_of(paired) {
                 continue;
             }
             let progress = *held.progress.borrow();
@@ -1155,10 +1166,7 @@ impl Desk {
             ));
         }
         for file in store.all().entries {
-            if file.environment_id != paired.environment_id
-                || file.device_id != paired.device_id
-                || live.contains_key(&file.key)
-            {
+            if !file.is_of(paired) || live.contains_key(&file.key) {
                 continue;
             }
             let verdict = locked(&self.verdicts).get(&file.key).cloned();
@@ -1203,7 +1211,7 @@ impl Desk {
         let none = || CommandError::invalid("no open upload has that key");
         if let Some(live) = &held {
             let file = live.file();
-            if file.environment_id != paired.environment_id || file.device_id != paired.device_id {
+            if !file.is_of(&paired) {
                 return Err(none());
             }
             let task = locked(&live.task).take();
@@ -1222,7 +1230,7 @@ impl Desk {
                 .find(|file| file.key == key)
                 .ok_or_else(none)?,
         };
-        if file.environment_id != paired.environment_id || file.device_id != paired.device_id {
+        if !file.is_of(&paired) {
             return Err(none());
         }
         if file.reached == Reached::Published {
@@ -1443,6 +1451,7 @@ impl Desk {
 #[cfg(feature = "testing")]
 pub mod testing {
     use super::{Reached, STORE_VERSION, Source, Store, UploadFile};
+    use kr_client::services::AccountMark;
     use kr_protocol::envelope::ActionTarget;
     use kr_protocol::ids::{DeviceId, EnvironmentId, TransferId};
     use kr_protocol::scalars::{Digest256, Uuid};
@@ -1478,6 +1487,7 @@ pub mod testing {
         key: Uuid,
         environment_id: EnvironmentId,
         device_id: DeviceId,
+        account: Option<AccountMark>,
         target: ActionTarget,
         transfer_id: Option<TransferId>,
         got: Got,
@@ -1490,6 +1500,7 @@ pub mod testing {
             key,
             environment_id,
             device_id,
+            account: account.map(AccountMark::to_hex),
             target,
             session_id: None,
             media_type: "application/octet-stream".to_owned(),
@@ -1540,6 +1551,7 @@ mod tests {
             key,
             environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
             device_id: DeviceId::new(kr_ipc::new_uuid()),
+            account: None,
             target: ActionTarget::environment(EnvironmentId::new(kr_ipc::new_uuid())),
             session_id: None,
             media_type: "application/octet-stream".to_owned(),

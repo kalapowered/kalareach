@@ -183,6 +183,9 @@ struct DraftFile {
     version: u32,
     environment_id: EnvironmentId,
     device_id: DeviceId,
+    /// The account signed in when the draft was made, on a host whose grant answers to an
+    /// organisation (the mark of the account, as text); none on a host with no organisation.
+    account: Option<String>,
     session_id: SessionId,
     /// What the draft's calls are made on, as the creation named it.
     target: ActionTarget,
@@ -299,10 +302,15 @@ impl std::fmt::Debug for Drafts {
     }
 }
 
+/// The entry's name: a draft of another account of the same host is another entry, so one account
+/// never reads or extends the draft another left.
 fn key_of(paired: &Paired, session_id: SessionId) -> Uuid {
     let text = format!(
-        "{}|{}|{}",
-        paired.environment_id, paired.device_id, session_id
+        "{}|{}|{}|{}",
+        paired.environment_id,
+        paired.device_id,
+        session_id,
+        paired.account_id().unwrap_or_default()
     );
     let digest = kr_cbor::sha256(text.as_bytes());
     let mut bytes = [0_u8; 16];
@@ -467,6 +475,7 @@ impl Drafts {
             version: DRAFT_VERSION,
             environment_id: paired.environment_id,
             device_id: paired.device_id,
+            account: paired.account_id(),
             session_id,
             target: target.clone(),
             draft_id: None,
@@ -955,9 +964,9 @@ impl Drafts {
         self.sweep(paired, &ids).await;
     }
 
-    /// At each reach: the drafts of another principal on this host are dropped, and the drafts whose
-    /// session the host no longer lists are ended on the target they were made on. A draft the host
-    /// has already ended is harmless to end again.
+    /// At each reach: the drafts of another principal or another account on this host are dropped,
+    /// and the drafts whose session the host no longer lists are ended on the target they were made
+    /// on. A draft the host has already ended is harmless to end again.
     pub async fn sweep(&self, paired: Paired, listed: &[SessionId]) {
         let Ok(root) = self.root() else { return };
         let Ok(listing) = std::fs::read_dir(&root) else {
@@ -977,7 +986,7 @@ impl Drafts {
             if file.version != DRAFT_VERSION || file.environment_id != paired.environment_id {
                 continue;
             }
-            if file.device_id != paired.device_id {
+            if file.device_id != paired.device_id || file.account != paired.account_id() {
                 // Kept under a sign-in that is not the one in force.
                 let _ = crate::drafts::remove_durably(&path);
                 continue;

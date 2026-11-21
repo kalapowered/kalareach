@@ -1278,20 +1278,12 @@ async fn send_prompt(
             });
         if applied
             && !settled.answer_lost
-            && let (Some(draft_id), Ok((device_id, environment_id, session))) =
-                (typed.draft_id.0, state.paired_snapshot())
+            && let Some(draft_id) = typed.draft_id.0
+            && let Ok(paired) = state.paired().await
         {
             state
                 .paired_drafts()
-                .sent(
-                    &crate::open_transfers::Paired {
-                        device_id,
-                        environment_id,
-                        session,
-                    },
-                    typed.target.subject.session_id,
-                    draft_id,
-                )
+                .sent(&paired, typed.target.subject.session_id, draft_id)
                 .await;
         }
         return Ok(settled);
@@ -1831,21 +1823,12 @@ pub async fn draft_set_text(
     let session_id = session_id
         .parse()
         .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
-    let (device_id, environment_id, session) = state.paired_snapshot()?;
-    let target = subject.target(environment_id)?;
+    let paired = state.paired().await?;
+    let target = subject.target(paired.environment_id)?;
     encode(
         &state
             .paired_drafts()
-            .set_text(
-                crate::open_transfers::Paired {
-                    device_id,
-                    environment_id,
-                    session,
-                },
-                target,
-                session_id,
-                text,
-            )
+            .set_text(paired, target, session_id, text)
             .await?,
     )
 }
@@ -1987,20 +1970,13 @@ pub async fn draft_create(
     if state.paired_context().is_some() {
         // A device makes its draft at the first bind and never before: this answers the draft it
         // keeps for the session, or that none is made yet.
-        let (device_id, environment_id, session) = state.paired_snapshot()?;
+        let paired = state.paired().await?;
         let Some(session_id) = typed.session_id.as_ref().copied() else {
             return Err(CommandError::invalid(
                 "a draft on a paired host needs a session: open one first",
             ));
         };
-        let kept = state.paired_drafts().kept(
-            &crate::open_transfers::Paired {
-                device_id,
-                environment_id,
-                session,
-            },
-            session_id,
-        );
+        let kept = state.paired_drafts().kept(&paired, session_id);
         return Ok(Settled {
             receipt: None,
             action_id: None,
@@ -2039,20 +2015,9 @@ pub async fn draft_add_attachment(
         // The draft is this device's to keep: it is made at the first bind and used again after.
         let bind: crate::paired_drafts::Bind = decode(params)?;
         let transfer_id = bind.transfer_id;
-        let (device_id, environment_id, session) = state.paired_snapshot()?;
-        let target = subject.target(environment_id)?;
-        let bound = state
-            .paired_drafts()
-            .bind(
-                crate::open_transfers::Paired {
-                    device_id,
-                    environment_id,
-                    session,
-                },
-                target,
-                bind,
-            )
-            .await?;
+        let paired = state.paired().await?;
+        let target = subject.target(paired.environment_id)?;
+        let bound = state.paired_drafts().bind(paired, target, bind).await?;
         // The upload's entry ends with its binding.
         state.transfers().bound(transfer_id);
         return Ok(Settled {
@@ -2090,20 +2055,9 @@ pub async fn draft_end(
     let session_id = session_id
         .parse()
         .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
-    let (device_id, environment_id, session) = state.paired_snapshot()?;
-    let target = subject.target(environment_id)?;
-    state
-        .paired_drafts()
-        .end(
-            crate::open_transfers::Paired {
-                device_id,
-                environment_id,
-                session,
-            },
-            target,
-            session_id,
-        )
-        .await
+    let paired = state.paired().await?;
+    let target = subject.target(paired.environment_id)?;
+    state.paired_drafts().end(paired, target, session_id).await
 }
 
 session_mutate_command!(
@@ -3102,15 +3056,11 @@ pub async fn attachment_upload(
         ),
     };
     if state.paired_context().is_some() {
-        let (device_id, environment_id, session) = state.paired_snapshot()?;
-        let target = subject.target(environment_id)?;
+        let paired = state.paired().await?;
+        let target = subject.target(paired.environment_id)?;
         let handle = crate::transfers::upload_paired(
             &state.transfers(),
-            crate::open_transfers::Paired {
-                device_id,
-                environment_id,
-                session,
-            },
+            paired,
             transfer_key_of(transfer_key)?,
             target,
             session_id,
@@ -3142,33 +3092,17 @@ fn transfer_key_of(key: Option<String>) -> Result<kr_protocol::scalars::Uuid> {
 /// restart found and could not resume.
 #[tauri::command]
 pub async fn uploads_open(state: State<'_, AppState>) -> Result<Value> {
-    let (device_id, environment_id, session) = state.paired_snapshot()?;
-    encode(&state.transfers().open(&crate::open_transfers::Paired {
-        device_id,
-        environment_id,
-        session,
-    }))
+    let paired = state.paired().await?;
+    encode(&state.transfers().open(&paired))
 }
 
 /// Cancels one upload this device holds open on the host it is paired with, and answers from the
 /// host's own answer: the bytes it released, or that the upload was already published and is kept.
 #[tauri::command]
 pub async fn upload_cancel(state: State<'_, AppState>, transfer_key: String) -> Result<Value> {
-    let (device_id, environment_id, session) = state.paired_snapshot()?;
+    let paired = state.paired().await?;
     let key = transfer_key_of(Some(transfer_key))?;
-    encode(
-        &state
-            .transfers()
-            .cancel(
-                crate::open_transfers::Paired {
-                    device_id,
-                    environment_id,
-                    session,
-                },
-                key,
-            )
-            .await?,
-    )
+    encode(&state.transfers().cancel(paired, key).await?)
 }
 
 /// The header a handed file's name comes in, percent-encoded, because a header carries no other
@@ -3237,15 +3171,11 @@ pub async fn attachment_upload_bytes(
                 })
                 .transpose()?,
         )?;
-        let (device_id, environment_id, session) = state.paired_snapshot()?;
-        let target = subject.target(environment_id)?;
+        let paired = state.paired().await?;
+        let target = subject.target(paired.environment_id)?;
         let handle = crate::transfers::upload_handed_paired(
             &state.transfers(),
-            crate::open_transfers::Paired {
-                device_id,
-                environment_id,
-                session,
-            },
+            paired,
             key,
             target,
             session_id,
