@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::{FlockOperation, OFlags, flock};
 use rustix::io::Errno;
 
 /// How often a live listener sets the times of its lock file.
@@ -41,6 +41,27 @@ pub(super) fn path_of(socket: &Path) -> PathBuf {
     let mut name = socket.as_os_str().to_os_string();
     name.push(".live");
     PathBuf::from(name)
+}
+
+/// Opens the lock file at `path` with `options`, and only if what stands there is a regular file.
+///
+/// A name that anybody who can write the folder can replace is opened as little as possible: the
+/// open does not follow a link, so a link at the name is never the file that is locked or written,
+/// and it does not wait for a peer, so a pipe at the name does not hold the caller. What was opened
+/// is then judged through its own handle, before a lock, a read or a write touches it.
+fn open_regular(options: &mut std::fs::OpenOptions, path: &Path) -> std::io::Result<File> {
+    let flags = (OFlags::NONBLOCK | OFlags::NOFOLLOW).bits();
+    let file = options
+        .custom_flags(i32::try_from(flags).unwrap_or_default())
+        .open(path)?;
+    if file.metadata()?.file_type().is_file() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the lock file is not a regular file",
+        ))
+    }
 }
 
 /// What the lock file says to a bind that met a refused socket.
@@ -180,11 +201,12 @@ fn decimal(text: &str) -> Option<u64> {
 
 /// Reads the lock file of `socket` for a bind that met a refused connect.
 ///
-/// The file is opened without creating it, so a decision never makes one. Its lock is tried and
+/// The file is opened without creating it, so a decision never makes one, and only as a regular
+/// file that is not reached through a link: anything else reads as unreadable. Its lock is tried and
 /// released in this call; the caller holds the endpoint's guard, so no other bind of this release
 /// takes it in between.
 pub(super) fn read(socket: &Path, identity: (u64, u64)) -> Evidence {
-    let file = match File::open(path_of(socket)) {
+    let file = match open_regular(std::fs::OpenOptions::new().read(true), &path_of(socket)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Evidence {
@@ -241,6 +263,14 @@ fn read_open(
     }
 }
 
+/// Whether two handles are the same file.
+fn same_file(first: &File, second: &File) -> bool {
+    match (first.metadata(), second.metadata()) {
+        (Ok(first), Ok(second)) => first.dev() == second.dev() && first.ino() == second.ino(),
+        _ => false,
+    }
+}
+
 /// The most of a lock file's text that is read: a record is under a hundred bytes.
 const RECORD_LIMIT: u64 = 256;
 
@@ -259,16 +289,19 @@ pub(super) struct Hold {
 
 impl Hold {
     /// Opens the lock file, making it when it is not there, and takes a shared lock on it without
-    /// waiting.
+    /// waiting. A name that holds a link, a pipe or anything but a regular file is refused before
+    /// the lock: the file the listener holds is never one that something else stands in for.
     pub(super) fn take(socket: &Path) -> std::io::Result<Self> {
         let path = path_of(socket);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)?;
+        let file = open_regular(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600),
+            &path,
+        )?;
         flock(&file, FlockOperation::NonBlockingLockShared).map_err(std::io::Error::from)?;
         Ok(Self {
             file: Arc::new(file),
@@ -282,9 +315,14 @@ impl Hold {
     ///
     /// A failure to leave the record leaves none and does not fail the bind: a bind with no record
     /// is never replaced silently later, which is the safe side.
+    ///
+    /// The self-test opens the name a second time, and it counts only when that is the file this
+    /// hold has locked: a name that now leads to another file proves nothing about the lock.
     pub(super) fn publish(&mut self, socket: (u64, u64)) {
         let enforced =
-            File::open(&self.path).is_ok_and(|second| lock_is_enforced(&second, try_exclusive));
+            open_regular(std::fs::OpenOptions::new().read(true), &self.path).is_ok_and(|second| {
+                same_file(&second, &self.file) && lock_is_enforced(&second, try_exclusive)
+            });
         self.publish_with(enforced, socket);
     }
 
