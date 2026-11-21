@@ -3089,11 +3089,13 @@ fn transfer_key_of(key: Option<String>) -> Result<kr_protocol::scalars::Uuid> {
 
 /// Reads the uploads this device holds open on the host it is paired with: the ones sending, the
 /// ones waiting for a connection, the published ones not yet bound to a draft, and the ones a
-/// restart found and could not resume.
+/// restart found and could not resume. It answers from what the application holds, with no
+/// connection to the host, so that an upload whose connection ended reads as paused while the host
+/// is out of reach.
 #[tauri::command]
 pub async fn uploads_open(state: State<'_, AppState>) -> Result<Value> {
-    let paired = state.paired().await?;
-    encode(&state.transfers().open(&paired))
+    let who = state.paired_who().await?;
+    encode(&state.transfers().open(&who))
 }
 
 /// Cancels one upload this device holds open on the host it is paired with, and answers from the

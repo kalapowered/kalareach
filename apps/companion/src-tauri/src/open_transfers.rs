@@ -461,14 +461,43 @@ impl Paired {
     pub fn account_id(&self) -> Option<String> {
         self.account.map(AccountMark::to_hex)
     }
+
+    /// Whose uploads this connection reads.
+    #[must_use]
+    pub fn who(&self) -> Who {
+        Who {
+            device_id: self.device_id,
+            environment_id: Some(self.environment_id),
+            account: self.account,
+        }
+    }
+}
+
+/// Whose uploads are read: this device's principal on a host and the account signed in there. A
+/// read needs no connection, so the host's environment, which a connection states, may be unknown.
+#[derive(Clone, Debug)]
+pub struct Who {
+    /// This device's principal on the host.
+    pub device_id: DeviceId,
+    /// The host's environment, when a connection says it.
+    pub environment_id: Option<EnvironmentId>,
+    /// The account signed in, on a host whose grant answers to an organisation; none on another.
+    pub account: Option<AccountMark>,
 }
 
 impl UploadFile {
     /// Whether the entry is this device's own on `paired`'s host, kept under the sign-in in force.
     fn is_of(&self, paired: &Paired) -> bool {
-        self.environment_id == paired.environment_id
-            && self.device_id == paired.device_id
-            && self.account == paired.account_id()
+        self.is_whose(&paired.who())
+    }
+
+    /// Whether the entry is `who`'s.
+    fn is_whose(&self, who: &Who) -> bool {
+        self.device_id == who.device_id
+            && who
+                .environment_id
+                .is_none_or(|environment_id| environment_id == self.environment_id)
+            && self.account == who.account.map(AccountMark::to_hex)
     }
 }
 
@@ -1138,9 +1167,10 @@ impl Desk {
         .flatten()
     }
 
-    /// The open uploads of this device on `paired`'s host.
+    /// The open uploads of `who`, as the desk and the folder hold them: no connection is asked, so a
+    /// host that is out of reach reads as its uploads stand, a paused one as paused.
     #[must_use]
-    pub fn open(&self, paired: &Paired) -> Vec<OpenView> {
+    pub fn open(&self, who: &Who) -> Vec<OpenView> {
         let Ok(store) = self.store() else {
             return Vec::new();
         };
@@ -1148,7 +1178,7 @@ impl Desk {
         let live = locked(&self.live).clone();
         for (key, held) in &live {
             let file = held.file();
-            if !file.is_of(paired) {
+            if !file.is_whose(who) {
                 continue;
             }
             let progress = *held.progress.borrow();
@@ -1166,7 +1196,7 @@ impl Desk {
             ));
         }
         for file in store.all().entries {
-            if !file.is_of(paired) || live.contains_key(&file.key) {
+            if !file.is_whose(who) || live.contains_key(&file.key) {
                 continue;
             }
             let verdict = locked(&self.verdicts).get(&file.key).cloned();

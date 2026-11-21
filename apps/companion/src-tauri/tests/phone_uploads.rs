@@ -2542,7 +2542,7 @@ async fn kr_req_13_12_a_new_sign_in_on_the_same_pairing_drops_what_the_earlier_a
 
     // Before the host is reached again the new account is shown none of it.
     assert!(
-        desk.open(&now).is_empty(),
+        desk.open(&now.who()).is_empty(),
         "the new sign-in is shown nothing of the earlier account's uploads"
     );
     assert!(
@@ -2576,6 +2576,66 @@ async fn kr_req_13_12_a_new_sign_in_on_the_same_pairing_drops_what_the_earlier_a
         "nothing of the earlier account is read from the host or resumed"
     );
     gate.release();
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: while the host is out of reach the application still answers what it holds: an
+/// upload whose connection ended reads as paused, with no connection to ask on, and reads as sent
+/// again once the host is reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_paused_upload_is_read_while_the_host_is_out_of_reach() {
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let paired = paired_of(companion);
+    let (who, session) = (paired.who(), Arc::clone(&paired.session));
+    let sending = {
+        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    gate.reached().await;
+    // The host cannot be reached again while the dials are held.
+    control.hold();
+    session.transport().close();
+    gate.release();
+    tokio::time::timeout(WATCHDOG, async {
+        while companion
+            .call("connection_state", json!({}))
+            .is_ok_and(|state| state["connected"] == true)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the connection ends");
+    // The desk says the upload is paused as soon as its sender sees the end.
+    let desk = desk_of(companion);
+    tokio::time::timeout(WATCHDOG, async {
+        while !desk
+            .open(&who)
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the upload is paused");
+
+    let read = try_open(companion).expect("the application answers while the host is out of reach");
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0]["state"], "paused");
+
+    control.stop_holding();
+    control.release_all();
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the upload resumes once the host is reached")
+        .expect("the task ran")
+        .expect("the upload is published");
     adopted.stop().await;
 }
 

@@ -344,6 +344,33 @@ impl AppState {
         })
     }
 
+    /// Whose uploads and drafts are read on the paired host this application is connected to or was
+    /// told to use. It needs no connection: while the host is out of reach the application still
+    /// says what it holds. An organisation host's account is the one signed in, and when none is
+    /// the answer names no account, which no kept entry has.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::paired_snapshot`] when there is no paired host to read.
+    pub async fn paired_who(&self) -> Result<crate::open_transfers::Who> {
+        match self.paired_parts() {
+            Ok((device_id, environment_id, _, organisation)) => Ok(crate::open_transfers::Who {
+                device_id,
+                environment_id: Some(environment_id),
+                account: self.account_of(organisation).await?,
+            }),
+            Err(error) => {
+                let context = self.paired_context().ok_or(error)?;
+                let organisation = context.host.proposed_grant.organisation.as_ref().is_some();
+                Ok(crate::open_transfers::Who {
+                    device_id: context.host.device_id,
+                    environment_id: None,
+                    account: self.account_of(organisation).await.unwrap_or(None),
+                })
+            }
+        }
+    }
+
     /// The account the records of a paired host are kept for: the account signed in on a host whose
     /// grant answers to an organisation, none on another.
     ///
