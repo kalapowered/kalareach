@@ -52,8 +52,10 @@ The store bundle check then reads the gateway back from the library in the packa
 bundle whose library names one. A builder of an independently signed app does not set the mark.
 
 The official gateway sends through the official Firebase project, so it reaches the apps registered
-in that project and no others. A host that is self-hosted forwards encrypted envelopes through the
-official gateway without a KalaReach account.
+in that project and no others. A gateway for an independently signed app has to send through that
+app's own Firebase project and its own APNs key in the same way; the gateway the official apps use
+holds the official project's credentials and cannot send for another app. A host that is
+self-hosted forwards encrypted envelopes through the official gateway without a KalaReach account.
 
 ## What a host does with a gateway
 
@@ -72,7 +74,8 @@ document into force, which `kr host push-gateways` does at once and a hand edit 
 next time the host reads it (a question about itself, `kr doctor`, or a start). The host stops using
 and renewing every credential issued by that gateway, writes down that it owes the gateway a
 revocation of each authorisation, and then forgets the credentials. It asks for the revocations
-again until the gateway has made them or says it holds no such authorisation.
+again until the gateway has made them or says it holds no such authorisation. If the owner lists the
+gateway again, a debt still owed to it is given up after thirty days, as any other is.
 The device stays paired. Notifications for it are not sent until its app registers a credential from
 a gateway the host allows. A host rolled back to an earlier release asks for the same revocations,
 because the debt is kept in the delivery journal that release reads. `docs/delivery/README.md`
