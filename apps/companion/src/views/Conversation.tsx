@@ -36,7 +36,7 @@ import { Badge, Banner, Button, Card, CommitButton, IconButton } from '../compon
 import { useApp, useSession } from '../app/state'
 import { useSessionAgent } from '../app/agent'
 import { useHeldConnection } from '../app/rights'
-import { useLaunchSurface } from '../app/launch-surface'
+import { useLaunchSurface, useSavedCommandsRead } from '../app/launch-surface'
 import { LaunchSurface } from './LaunchSurface'
 import { AttachmentPaths } from '../components/AttachmentPaths'
 import { AttachmentThumb } from '../components/AttachmentThumb'
@@ -1516,7 +1516,8 @@ function SessionLaunchSurface({
   const { port } = useApp()
   const { rights } = useHeldConnection()
   const read = useCallback(() => port.launchSurface({ session_id: sessionId }), [port, sessionId])
-  const reads = useLaunchSurface(port, read, retried)
+  const readList = useSavedCommandsRead(port, rights)
+  const reads = useLaunchSurface(port, read, retried, { readList })
   return (
     <LaunchSurface
       reads={reads}

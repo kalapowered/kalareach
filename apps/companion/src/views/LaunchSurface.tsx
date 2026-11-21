@@ -15,6 +15,11 @@
  * landed. The session refuses a
  * quote that has gone stale before anything is typed, so a button lit a moment too long does no
  * harm.
+ *
+ * The commands the host saves are drawn in a group of their own under the installed agents, each
+ * with its program, and are pressed by the same rules. The group is drawn from the newest list the
+ * page has read, and a press sends only a vector that list holds: a command removed elsewhere
+ * sends nothing and the group is drawn again.
  */
 
 import { useState, type ReactNode } from 'react'
@@ -26,6 +31,7 @@ import type { LaunchSurfaceReads } from '../app/launch-surface'
 import { Button, CommitButton } from '../components/ui'
 import { failureCode, failureRetry, failureWords, type LaunchPress } from '../host/port'
 import { commandLine } from '../model/command-line'
+import { holds, offersOf, WORDS, type SavedOffer } from '../model/launch-commands'
 import {
   drawing,
   pressRefusal,
@@ -42,6 +48,11 @@ function typed(offer: LaunchOffer, shell: LaunchShell | null): string {
   return shell === null
     ? offer.command.arguments.join(' ')
     : commandLine(offer.command.arguments, shell)
+}
+
+/** The words of a saved command as the person would type them, for the shell the session runs. */
+function typedSaved(offer: SavedOffer, shell: LaunchShell | null): string {
+  return shell === null ? offer.vector.join(' ') : commandLine(offer.vector, shell)
 }
 
 /** The launch surface of one session, as the link it was read on shows it. */
@@ -63,7 +74,7 @@ export function LaunchSurface({
   readonly press: ((press: LaunchPress) => Promise<ShellLaunchResult>) | null
 }): ReactNode {
   const { say } = useApp()
-  const { reading, unread, number, newest, again, dark } = reads
+  const { reading, unread, number, newest, again, dark, list, listUnread } = reads
   const [drawnAt, setDrawnAt] = useState<string | null>(null)
   // Whether a press waits for the session's answer.
   const [pressing, setPressing] = useState(false)
@@ -74,6 +85,17 @@ export function LaunchSurface({
     readonly ended: 'installed' | 'refused' | 'unconfirmed'
   } | null>(null)
   const [shown, setShown] = useState<string | null>(null)
+
+  // The saved commands the newest list holds, in the order the host first saved them; none until a
+  // list has been read, and none from a host that does not serve it or a connection that may not
+  // read it.
+  const named: readonly SavedOffer[] = list?.state === 'served' ? offersOf(list.list) : []
+  const savedUnread =
+    listUnread === null ? null : (
+      <p className="small faint" data-testid="launch-saved-unread">
+        {WORDS.unread}
+      </p>
+    )
 
   const drawn = reading === null ? null : drawing(reading, mayType)
   const generation = drawn?.kind === 'live' ? drawn.promptGeneration : null
@@ -119,7 +141,8 @@ export function LaunchSurface({
       )
     case 'instructions': {
       const offers: LaunchOffers = drawn.offers
-      const chosen = offers.find((offer) => offer.plugin_id === shown) ?? null
+      const chosen = offers.find((offer) => `offer:${offer.plugin_id}` === shown) ?? null
+      const chosenSaved = named.find((offer) => `saved:${offer.label}` === shown) ?? null
       return (
         <section className="launch-surface" data-testid="launch-instructions">
           <p className="eyebrow">Start something here</p>
@@ -129,9 +152,9 @@ export function LaunchSurface({
                 key={offer.plugin_id}
                 data-offer={offer.plugin_id}
                 data-wraps
-                aria-pressed={shown === offer.plugin_id}
+                aria-pressed={shown === `offer:${offer.plugin_id}`}
                 onClick={() => {
-                  setShown(offer.plugin_id)
+                  setShown(`offer:${offer.plugin_id}`)
                 }}
               >
                 {/* One piece of text, so that a label that has to wrap wraps as a line does. */}
@@ -139,13 +162,39 @@ export function LaunchSurface({
               </Button>
             ))}
           </div>
+          {named.length > 0 ? (
+            <div data-testid="launch-saved">
+              <p className="eyebrow">{WORDS.group}</p>
+              <div className="row wrap">
+                {named.map((offer) => (
+                  <Button
+                    key={`saved:${offer.label}`}
+                    data-named={offer.label}
+                    data-wraps
+                    aria-pressed={shown === `saved:${offer.label}`}
+                    onClick={() => {
+                      setShown(`saved:${offer.label}`)
+                    }}
+                  >
+                    <span>{offer.label}</span>
+                    <span className="launch-program">{offer.program}</span>
+                  </Button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {savedUnread}
           <p className="small faint" data-testid="launch-instruction">
-            {chosen === null ? (
-              'This is a stock shell, so nothing is typed into it for you. Choose one to see what to type.'
-            ) : (
+            {chosen !== null ? (
               <>
                 Type this at the prompt: <code>{typed(chosen, drawn.shell)}</code>
               </>
+            ) : chosenSaved !== null ? (
+              <>
+                Type this at the prompt: <code>{typedSaved(chosenSaved, drawn.shell)}</code>
+              </>
+            ) : (
+              'This is a stock shell, so nothing is typed into it for you. Choose one to see what to type.'
             )}
           </p>
         </section>
@@ -173,6 +222,36 @@ export function LaunchSurface({
                 : settled?.ended === 'unconfirmed' && !readSince
                   ? 'The terminal could not confirm the last launch. Reading the prompt again.'
                   : null
+      // Presses a command on the link the surface was read on, and tells how it ended.
+      const start = (label: string, command: LaunchPress['command']): void => {
+        if (!lit || press === null || drawn.kind !== 'live') return
+        setPressing(true)
+        press({
+          command,
+          expected_prompt_generation: drawn.promptGeneration,
+          expected_buffer_revision: drawn.bufferRevision
+        }).then(
+          () => {
+            setPressing(false)
+            setSettled({ after: newest(), ended: 'installed' })
+            say(`Submitted the command for "${label}" at the prompt.`, 'success')
+            again()
+          },
+          (failure: unknown) => {
+            setPressing(false)
+            // A launch the host could not confirm is never called refused, whether the host says
+            // so by the code or by the retry category of its code.
+            const code = failureCode(failure)
+            const unknown = leavesOutcomeUnknown({
+              code: code ?? 'REQUEST_FAILED',
+              retry: failureRetry(failure)
+            })
+            setSettled({ after: newest(), ended: unknown ? 'unconfirmed' : 'refused' })
+            say(pressRefusal(code, failureWords(failure), unknown, drawn.shell), 'danger')
+            again()
+          }
+        )
+      }
       return (
         <section
           className="launch-surface"
@@ -190,33 +269,7 @@ export function LaunchSurface({
                 disabled={!lit}
                 title={why ?? typed(offer, null)}
                 onCommit={() => {
-                  if (!lit || press === null || drawn.kind !== 'live') return
-                  setPressing(true)
-                  press({
-                    command: offer.command,
-                    expected_prompt_generation: drawn.promptGeneration,
-                    expected_buffer_revision: drawn.bufferRevision
-                  }).then(
-                    () => {
-                      setPressing(false)
-                      setSettled({ after: newest(), ended: 'installed' })
-                      say(`Submitted the command for "${offer.label}" at the prompt.`, 'success')
-                      again()
-                    },
-                    (failure: unknown) => {
-                      setPressing(false)
-                      // A launch the host could not confirm is never called refused, whether the
-                      // host says so by the code or by the retry category of its code.
-                      const code = failureCode(failure)
-                      const unknown = leavesOutcomeUnknown({
-                        code: code ?? 'REQUEST_FAILED',
-                        retry: failureRetry(failure)
-                      })
-                      setSettled({ after: newest(), ended: unknown ? 'unconfirmed' : 'refused' })
-                      say(pressRefusal(code, failureWords(failure), unknown, drawn.shell), 'danger')
-                      again()
-                    }
-                  )
+                  start(offer.label, offer.command)
                 }}
               >
                 {/* One piece of text, so that a label that has to wrap wraps as a line does. */}
@@ -224,6 +277,35 @@ export function LaunchSurface({
               </CommitButton>
             ))}
           </div>
+          {named.length > 0 ? (
+            <div data-testid="launch-saved">
+              <p className="eyebrow">{WORDS.group}</p>
+              <div className="row wrap">
+                {named.map((offer) => (
+                  <CommitButton
+                    key={`saved:${offer.label}`}
+                    data-named={offer.label}
+                    data-wraps
+                    disabled={!lit}
+                    title={why ?? offer.vector.join(' ')}
+                    onCommit={() => {
+                      // Only a vector the newest list holds is sent: a command removed or changed
+                      // elsewhere sends nothing, and the group is drawn again from a fresh read.
+                      if (!holds(reads.listNow(), offer.label, offer.vector)) {
+                        reads.listAgain()
+                        return
+                      }
+                      start(offer.label, { arguments: [...offer.vector] })
+                    }}
+                  >
+                    <span>{offer.label}</span>
+                    <span className="launch-program">{offer.program}</span>
+                  </CommitButton>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          {savedUnread}
           {why === null ? (
             <p className="small faint">
               The prompt is empty and verified. A launch installs the command; it never pastes one.

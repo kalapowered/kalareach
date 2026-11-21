@@ -11,6 +11,7 @@ import type { ReactNode } from 'react'
 
 import { useApp } from '../../app/state'
 import { Sheet, ThemeChooser } from '../../components/ui'
+import { LaunchCommands } from '../../views/LaunchCommands'
 
 /** The settings sheet: shown while `open`, and asks to be closed by any of the ways a sheet closes. */
 export function MobileSettings({
@@ -33,6 +34,7 @@ export function MobileSettings({
         <h2>Appearance</h2>
         <p className="muted">Light, dark, or whatever this device is set to.</p>
         <ThemeChooser port={port} />
+        <LaunchCommands place="phone" />
       </div>
     </Sheet>
   )

@@ -51,7 +51,7 @@ import { flushSync } from 'react-dom'
 import type { PaletteState } from '@kalareach/protocol'
 
 import { Badge, Button } from '../components/ui'
-import { useLaunchSurface } from '../app/launch-surface'
+import { useLaunchSurface, useSavedCommandsRead } from '../app/launch-surface'
 import { useHeldConnection } from '../app/rights'
 import { useApp, useKeptPlace } from '../app/state'
 import type { TerminalGrid, TerminalScreen } from '../host/port'
@@ -345,7 +345,12 @@ export function RawTerminal({
   // holds the session's input once the person takes control, so it is the one whose answer can
   // light a button.
   const { rights } = useHeldConnection()
-  const launchReads = useLaunchSurface(port, launch?.read ?? null, retried, { wake: stamp, inputs })
+  const readList = useSavedCommandsRead(port, rights)
+  const launchReads = useLaunchSurface(port, launch?.read ?? null, retried, {
+    wake: stamp,
+    inputs,
+    readList
+  })
   // Taking control or giving it back changes who holds the input, which the surface says: it is
   // read again at once rather than a cadence later.
   const controlState = control?.state ?? null

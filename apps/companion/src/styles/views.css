@@ -695,6 +695,19 @@
   opacity: 0.6;
 }
 
+/* A saved command's button shows its program under its label, in the colour of a note, so that a
+   command labelled like an installed agent is never taken for it. */
+.launch-surface .btn .launch-program {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--faint);
+}
+
+.launch-surface .btn:disabled .launch-program {
+  color: inherit;
+}
+
 /* The command a stock shell's launch button shows. It stands on lines of its own, in the text colour
    rather than the faint one the sentence is in, so that a long one wraps under itself and reads as
    what to type; a word wider than the room, such as a path, is broken as one in a line of text is. */
@@ -1003,14 +1016,43 @@
   overflow-wrap: anywhere;
 }
 
-.settings-content > h2 {
+.settings-content > h2,
+.settings-content > section > h2 {
   margin-bottom: 8px;
 }
 
-.settings-content > p {
+.settings-content > p,
+.settings-content > section > p {
   font-size: 0.75rem;
   color: var(--muted);
   margin-bottom: 20px;
+}
+
+/* The saved launch commands: a list whose rows hold a label and the words a press sends, and a
+   form below it whose fields stand one under another. */
+.settings-content > section {
+  margin-top: 24px;
+}
+
+.settings-content > section .settings-list {
+  list-style: none;
+  margin: 0 0 16px;
+  padding: 0;
+}
+
+.settings-content > section .form-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-content > section fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .settings-row {

@@ -125,6 +125,8 @@ its own link, the one that holds the session's input. A managed shell's launch b
 agent at the prompt once the person has taken control of the terminal and the host has verified the
 prompt empty; a stock shell's show the command to type and start nothing. The conversation shows
 the same surface in words and never lights a button, since the link it reads on holds no input.
+The commands that the host saves are drawn in a group of their own under the installed agents
+(see "Saved launch commands").
 Where the host does not serve the read, the screen says that starting something is not available
 on that host. Attaching, detaching, closing, file transfer, agents and the terminal work in both
 shells. The phone's session screen draws no launch surface at all. The
@@ -953,6 +955,76 @@ It is not possible to make a second invitation to the same session and device, o
 An attempt is said not to have happened, as far as the host shows, only after the bound that the window sets has passed, and an attempt whose outcome cannot be told is shown as unknown. A revocation or a hand-over that the host shows as made, with its answer not read, is not called done: the page says that the host has recorded it and that whether each session worker has stopped acting under it is not known. If the host's result carries something the person is owed (for example, the screen the host kept with a live invitation, or how far the session workers have got with a revocation), the record stays after the attempt ends, and the host can still be asked for the result until the page has shown it, so a restart before the page read it loses nothing.
 
 A hand-over asks the host to describe the plan and put it to the owner devices, and sends nothing that changes who holds the session. The page holds a reference to it, and the plan, the action and the parameters stay in native code. It asks every second whether an owner device has answered, and when one has, native code checks that the plan the host described names the session, the grant and the receiving device that were asked for, and sends the transfer once. The hand-over leaves native code's table in the same step that keeps the record of the transfer, so a cancel either came first and nothing is sent, or comes later and finds nothing to cancel. The panel tells the person how the send went whether or not it is still on screen, and leaving it before the send lets the hand-over go. What the page has been told of a result is kept for as long as the page lives, so leaving the tab does not lose it. A hand-over that has not been answered when its challenge runs out is shown as that, and Ask again starts a new one. If the host does not answer the request for the owner devices' confirmation, only its answer to the first request is final. When the repeats run out, the page says it is not known whether an owner device was asked, and that one can still be shown the request for up to two minutes, though nothing this application sends will hand anything over.
+
+## Saved launch commands
+
+A host keeps a list of launch commands beside the agents it offers: each has a label, a program and
+separate arguments. They are drawn on the launch surface in a group headed "Saved commands" under the
+installed agents, each with its program shown under its label, so a command labelled like an
+installed agent is never taken for it; a saved command whose label equals an agent's is drawn in
+this group with its program. The host keeps the list in a store of its own, `launch-commands.json`
+in the environment's state directory, with a revision that is a random non-zero number made for
+each change. The revision is compared for equality only. A release that does not name the store
+leaves the file alone, so a rollback keeps the list and hides the buttons until the next update.
+
+**What a press sends.** A saved command is pressed by the rules of an installed agent: the button is
+lit only at a verified empty prompt, on the link that holds the session's input, and the press quotes
+the prompt generation and the buffer revision of the newest read. The vector the press sends is the
+program and then the arguments, as saved; it goes through `shell.launch` unchanged. The page draws
+the group from the newest answer to the read of the list, and a press sends only a vector that the
+newest list holds: a command removed or changed elsewhere sends nothing, and the list is read
+again. The list is read on its own cadence, which output on the screen does not wake, when the
+connection changes and on "Try again". A change made in Settings, or elsewhere, reaches the group
+at its next read. A connection without `host.manage` is not
+offered the group and does not read the list, and a host that does not serve the list, or refuses
+the read for a right, is remembered until the connection changes: nothing is drawn or said. A list
+that cannot be read says so ("The saved launch commands could not be read.") beside the installed
+agents.
+
+**Each shell.** The managed integration types every word of the vector in single quotes, so nothing
+is expanded: a leading `~`, a `$VARIABLE`, a zsh global alias at an argument position, a first word
+`X=1` or a reserved word is typed as text. The shell then looks up the program: a function or a
+builtin named like it runs in its place in bash and zsh, an alias and a reserved word never do, and
+in fish an alias is a function, so it runs. A program that cannot be found is the shell's own
+"command not found". PowerShell resolves the program to an application or an external script and
+types its full path, so a shadowing alias or function is bypassed; a program that names no
+application has no line, and a `.cmd` or `.bat` program has none either when an argument is empty,
+holds white space and ends in a backslash, or holds a character that `cmd.exe` reads again, or when
+the program's own path holds `%` or `!`. Nothing changes the directory: the line is typed at the
+prompt where the shell is. For a stock shell the page shows each saved command as the line to type,
+with every word quoted for that shell.
+
+**The Settings section.** Session Settings has a "Launch commands" section, and the phone's
+Settings sheet shows the same list. It opens with whose the list is: the commands are saved as
+written and shown to the host's owner devices, and a secret does not belong in one, since the
+command is typed in the terminal when its button is pressed. Where the connection is the local
+owner's, the section holds a form with a name, a program and one field for each argument, with a
+preview that only shows what would be saved, and a remove control for each saved command. The form
+says before the host is asked what the host would refuse: a control, format, invisible or
+line-break character is named by its code point and its place in the field as typed (the label is
+not trimmed first), a size past a limit says the rule, and a label equal to a saved one in lower
+case says that saving replaces it, in the spelling saved. The check is feedback only. The host is
+the authority, and a refusal that the form did not foresee is shown in the host's words. The list's
+limits are 32 commands, a label of 1 to 48 characters, a program of 1 to 512 bytes, 16 arguments of
+at most 512 bytes each, and 3,072 bytes in all.
+
+**Saving.** The form keeps the revision of the list the person saw when they began to edit, and a
+read that answers while they edit does not change it. A save or a remove names that revision. A
+host whose list has moved on changes nothing and answers with the list as it stands: the form says
+the commands changed while the person was editing and shows the list, and the next save names it,
+so a change made elsewhere is never overwritten unseen. An answer that is lost or unconfirmed is
+told as that, and the list is read again.
+
+**Who may change the list.** The two changes are made through the application's own commands
+`launch_commands_save` and `launch_commands_remove`, which take the list's revision and a label or a
+command and no path or method. They are refused on a host this device is paired with, before
+anything is sent, and the host accepts them from the local socket only, so the paired-device API
+cannot save or remove a command. A paired device that holds `host.manage` can read the list through
+`launch_commands_list`, and the phone shows it and cannot change it; a device that holds a share of
+a session only is refused the read. `kr launch add`, `remove` and `list` refuse inside a session.
+The guard stops an accident and is not isolation: a program under the same account can reach the
+local socket and the file. The host's owner devices receive the exact command lines, so the list is
+not a place for a secret.
 
 ## Settings and settings sync
 
