@@ -14,8 +14,12 @@ configured for.
 
 ## What a builder supplies
 
-- **A Firebase project of its own.** Its configuration file goes into the build as any Firebase app's
-  does: `google-services.json` for Android and `GoogleService-Info.plist` for iOS.
+- **A Firebase project of its own.** Its configuration file reaches the build through a named input,
+  not through its place in the project. An Android build reads the `google-services.json` that the
+  environment variable `KR_GOOGLE_SERVICES_JSON` names, and it must hold a client for the application
+  `to.kala.reach`. An iOS build copies the `GoogleService-Info.plist` that the build setting
+  `KR_GOOGLE_SERVICE_INFO` names. A debug build given none leaves Firebase alone; a release build
+  given none fails, and so does a build told of a path that is not a file.
 - **An APNs authentication key of its own**, uploaded to that Firebase project. Firebase uses it to
   reach iOS devices, so the key is the project's and never the app's.
 - **A gateway origin.** The build input `KR_PUSH_GATEWAY_ORIGIN` names the push gateway the app
