@@ -315,31 +315,72 @@ fn newest_kept_release(
 fn inside_the_level() -> Option<&'static Previous> {
     static INSIDE: OnceLock<Option<Previous>> = OnceLock::new();
     INSIDE
+        .get_or_init(|| built_inside_the_level("", |_| true))
+        .as_ref()
+}
+
+/// The newest release of this build's own level in this commit's history that `accepted` takes,
+/// built, and what was chosen, or that nothing was, printed; `taking` says what `accepted` asks.
+fn built_inside_the_level(
+    taking: &str,
+    accepted: impl Fn(&releases::Release) -> bool,
+) -> Option<Previous> {
+    let level = CompatibilityLevel::of(PACKAGE_VERSION);
+    let Some(release) = newest_kept_release(level, accepted) else {
+        println!(
+            "inside the level: no kept release of level {level}{taking} is in the history of \
+             this commit, so there is no release at this level to update from or roll \
+             back to, and the cases inside the level end here"
+        );
+        return None;
+    };
+    let name = release
+        .tag
+        .strip_prefix("packages/v")
+        .expect("a release tag");
+    println!(
+        "inside the level: the cases update from and roll back to {} ({})",
+        release.tag, release.commit
+    );
+    Some(Previous::built(
+        release.commit.clone(),
+        self::release(name),
+        level,
+    ))
+}
+
+/// The newest release of this build's own level in this commit's history whose committed
+/// `stored-formats.lock` names no store of saved launch commands, built: the release a rollback
+/// leaves the store to, because it never reads it. None where every kept release of the level
+/// names the store, which is the case once a release holds it.
+fn inside_the_level_before_the_launch_commands() -> Option<&'static Previous> {
+    static BEFORE: OnceLock<Option<Previous>> = OnceLock::new();
+    BEFORE
         .get_or_init(|| {
-            let level = CompatibilityLevel::of(PACKAGE_VERSION);
-            let Some(release) = newest_kept_release(level, |_| true) else {
-                println!(
-                    "inside the level: no kept release of level {level} is in the history of \
-                     this commit, so there is no release at this level to update from or roll \
-                     back to, and the cases inside the level end here"
-                );
-                return None;
-            };
-            let name = release
-                .tag
-                .strip_prefix("packages/v")
-                .expect("a release tag");
-            println!(
-                "inside the level: the cases update from and roll back to {} ({})",
-                release.tag, release.commit
-            );
-            Some(Previous::built(
-                release.commit.clone(),
-                self::release(name),
-                level,
-            ))
+            built_inside_the_level(" whose lock names no launch-commands store", |release| {
+                let lock = releases::git_in(
+                    &repository(),
+                    &["show", &format!("{}:stored-formats.lock", release.commit)],
+                )
+                .expect("the lock of a release");
+                !lock.contains("\"store\": \"launch-commands\"")
+            })
         })
         .as_ref()
+}
+
+/// As [`inside_the_level_before_the_launch_commands`], for the case `case`, which says it did not
+/// run when the commit's history holds no such release.
+fn before_the_launch_commands_for(case: &str) -> Option<&'static Previous> {
+    let found = inside_the_level_before_the_launch_commands();
+    if found.is_none() {
+        println!(
+            "skipped: {case} did not run, because no kept release of level {} whose lock names no \
+             launch-commands store is in the history of this commit",
+            CompatibilityLevel::of(PACKAGE_VERSION)
+        );
+    }
+    found
 }
 
 /// As [`inside_the_level`], for the case `case`, which says it did not run when the commit's
@@ -2636,6 +2677,138 @@ async fn inside_the_level_a_rollback_goes_on_beside_a_worker_of_this_build_and_s
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
     drop(owner);
+}
+
+/// KR-REQ-13.11, KR-REQ-26.10: the saved launch commands are one file in the environment's state
+/// directory. A release whose lock names no such store never reads it, so a rollback to it is not
+/// refused for it and leaves the file as it was, and an update to this build again serves the same
+/// list. The release is the newest of the level that does not name the store; the case ends where
+/// every kept release names it. A rollback to the release before the level is the transfers
+/// store's to refuse and is not this case.
+#[tokio::test(flavor = "multi_thread")]
+async fn inside_the_level_a_rollback_leaves_the_launch_commands_store_and_an_update_again_shows_them()
+ {
+    use kr_protocol::launch_commands::{
+        NamedLaunch, ShellLaunchCommandsListParams, ShellLaunchCommandsListResult,
+        ShellLaunchCommandsSaveParams, ShellLaunchCommandsSaveResult,
+    };
+    use kr_protocol::scalars::U64;
+
+    let Some(before) = before_the_launch_commands_for(
+        "inside_the_level_a_rollback_leaves_the_launch_commands_store_and_an_update_again_shows_them",
+    ) else {
+        return;
+    };
+    let updated = Updated::start_on(before, Setup::default()).await;
+    let host = &updated.host;
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let environment_id = host.tree.environment_id();
+    let saved = |label: &str, arguments: &[&str]| NamedLaunch {
+        label: label.to_owned(),
+        program: "claude".to_owned(),
+        arguments: arguments.iter().map(|word| (*word).to_owned()).collect(),
+    };
+
+    // This build saves two commands, each against the revision the list held.
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let mut revision = U64::new(0);
+    let mut commands = Vec::new();
+    for command in [
+        saved("Claude", &["--resume", "two words", ""]),
+        saved("Second", &[]),
+    ] {
+        let answer: ShellLaunchCommandsSaveResult = pairing::mutate_as(
+            environment_id,
+            &mut client,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            Method::ShellLaunchCommandsSave,
+            &ShellLaunchCommandsSaveParams {
+                expected_revision: revision,
+                command,
+            },
+        )
+        .await
+        .expect("this build saves a launch command");
+        assert!(answer.applied && answer.changed, "{answer:?}");
+        revision = answer.revision;
+        commands = answer.commands;
+    }
+    assert_eq!(commands.len(), 2);
+    let file = host
+        .tree
+        .environment()
+        .state_dir()
+        .join(kr_controller::launch_commands::FILE_NAME);
+    let kept = std::fs::read(&file).expect("the store is a file in the state directory");
+    drop(client);
+
+    // A rollback to the release that does not name the store is not refused for it, and leaves it.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a store the release never reads does not refuse the rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.one.name().clone())
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("the store is still there"),
+        kept,
+        "the rollback leaves the file's bytes as they were"
+    );
+
+    // An update again serves the same list at the same revision.
+    let archive = host.scratch("archives").join("again.tar.gz");
+    updated.two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the update goes on: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.two.name()),
+        "the daemon is this build's again"
+    );
+    assert_eq!(std::fs::read(&file).expect("the store"), kept);
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("reaches the daemon");
+    let listed: ShellLaunchCommandsListResult = pairing::read(
+        &mut client,
+        Method::ShellLaunchCommandsList,
+        &ShellLaunchCommandsListParams {},
+    )
+    .await
+    .expect("the owner reads the list");
+    assert_eq!(listed.revision, revision, "the same revision");
+    assert_eq!(listed.commands, commands, "the same commands, in order");
+
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
 }
 
 /// A terminal running `program` with the arguments, as a person's does on this host.

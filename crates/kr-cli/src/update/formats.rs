@@ -1310,6 +1310,94 @@ mod tests {
         assert!(looked(&with).is_empty());
     }
 
+    /// KR-REQ-13.11: a release that names no store of saved launch commands ignores the file, so a
+    /// switch to it is not refused for it, whatever the file holds. A release that names the store
+    /// reads it at the version it writes, and refuses a file above that, so the case would fail if
+    /// the check looked at the store without the target naming it.
+    #[test]
+    fn a_release_that_does_not_name_the_launch_commands_store_ignores_it_and_is_not_refused() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = kr_ipc::install::Store::at(directory.path().join("host"));
+        store.create_directories().expect("the store");
+        let state = directory.path().join("state");
+        let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+        let host =
+            kr_ipc::paths::HostPaths::new(directory.path().join("run"), &state).expect("the roots");
+        let environment = Environment {
+            environment_id,
+            paths: host.environment(environment_id),
+            host,
+        };
+        kr_ipc::paths::create_private_directory(&state).expect("the root");
+        kr_ipc::paths::create_private_directory(&state.join("environments"))
+            .expect("the environments");
+        kr_ipc::paths::create_private_directory(environment.paths.state_dir())
+            .expect("the environment");
+        let writers = store
+            .try_lock_writers()
+            .expect("asks")
+            .expect("no command is writing");
+        let without = target();
+        let with = target_listing(&[(
+            kr_controller::launch_commands::STORE_NAME,
+            "environment",
+            kr_controller::launch_commands::FILE_NAME,
+        )]);
+        let looked = |target: &ReleaseManifest| {
+            check(target, &store, &[&environment], &[], false, &writers).refusals
+        };
+
+        // Two saved commands: the file is at the version the code writes.
+        let command = |label: &str, arguments: &[&str]| kr_protocol::launch_commands::NamedLaunch {
+            label: label.to_owned(),
+            program: "claude".to_owned(),
+            arguments: arguments.iter().map(|word| (*word).to_owned()).collect(),
+        };
+        let first = kr_controller::launch_commands::save(
+            environment.paths.state_dir(),
+            0,
+            &command("Claude", &["--resume"]),
+        )
+        .expect("a first save");
+        kr_controller::launch_commands::save(
+            environment.paths.state_dir(),
+            first.stored.revision,
+            &command("Second", &[]),
+        )
+        .expect("a second save");
+        let file = environment
+            .paths
+            .state_dir()
+            .join(kr_controller::launch_commands::FILE_NAME);
+        assert!(looked(&without).is_empty(), "a release that names no store");
+        assert!(looked(&with).is_empty(), "and one that reads this version");
+
+        // A file at a version above what any release writes: only the release that names the
+        // store looks at it.
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("the file")).expect("a record");
+        assert_eq!(
+            record["version"], 1,
+            "the file states its version as a member"
+        );
+        record["version"] = serde_json::json!(2);
+        kr_ipc::paths::write_owner_only_file(&file, &serde_json::to_vec(&record).expect("bytes"))
+            .expect("a later file");
+        assert!(
+            looked(&without).is_empty(),
+            "a release that names no store is not refused for a file it never reads"
+        );
+        let refused = looked(&with);
+        assert!(
+            matches!(
+                refused.as_slice(),
+                [one] if one.store == kr_controller::launch_commands::STORE_NAME
+                    && one.place == file
+            ),
+            "a release that names the store refuses a version it does not read"
+        );
+    }
+
     fn rusqlite_open(path: &Path) -> rusqlite::Connection {
         rusqlite::Connection::open(path).expect("opens")
     }
