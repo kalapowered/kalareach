@@ -86,6 +86,9 @@ export const WORDS = {
   programNeeded: 'A program is needed.',
   /** The list moved on while the form was being filled in. */
   conflict: 'The launch commands changed while you were editing. Look at the list and save again.',
+  /** A remove made from a list that has changed since it was shown. */
+  removeConflict:
+    'The launch commands changed since this list was shown. Look at the list, then remove the command again if it is still there.',
   /** The host could not say what became of a change. */
   unconfirmed: 'The host could not confirm the change. Look at the list to see what it holds.'
 } as const

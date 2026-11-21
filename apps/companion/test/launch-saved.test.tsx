@@ -521,7 +521,9 @@ describe('the Settings form for the saved commands', () => {
     await person.click(
       within(screen.getByTestId('launch-commands-list')).getByRole('button', { name: 'Remove Claude Code' })
     )
-    expect(await screen.findByTestId('launch-commands-conflict')).toBeInTheDocument()
+    expect(await screen.findByTestId('launch-commands-conflict')).toHaveTextContent(
+      'The launch commands changed since this list was shown. Look at the list, then remove the command again if it is still there.'
+    )
     held.release()
     expect(controls.launchCommands.commands.map((each) => each.label)).toEqual(['Claude Code', 'Codex CLI'])
     expect(controls.launches).toEqual([])
@@ -538,7 +540,9 @@ describe('the Settings form for the saved commands', () => {
     const held = controls.hold('launchCommands')
     controls.launchCommands.changeElsewhere([{ label: 'agent', program: 'agent', arguments: [] }])
     await person.click(within(list).getByRole('button', { name: 'Remove Agent' }))
-    expect(await screen.findByTestId('launch-commands-conflict')).toBeInTheDocument()
+    expect(await screen.findByTestId('launch-commands-conflict')).toHaveTextContent(
+      'The launch commands changed since this list was shown. Look at the list, then remove the command again if it is still there.'
+    )
     expect(screen.getByTestId('said')).not.toHaveTextContent('No launch command is named')
     held.release()
     expect(controls.launchCommands.commands.map((each) => each.label)).toEqual(['agent'])
