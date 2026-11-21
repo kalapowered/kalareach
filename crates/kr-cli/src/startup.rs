@@ -3299,6 +3299,54 @@ mod tests {
         );
     }
 
+    /// KR-REQ-07.12: a wait that is stopped while its attempt is pending returns what stopped it
+    /// and tells that attempt as begun and no more: nothing of it came.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wait_stopped_while_an_attempt_is_pending_tells_the_attempt_as_begun_and_no_more() {
+        let host = kr_ipc::testing::TempHost::create();
+        let endpoint = host
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let _silent = Silent::listen(&endpoint);
+        let told = std::sync::Mutex::new(Vec::new());
+        let seen = |sight| told.lock().expect("the sights").push(sight);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let waited = answered_by(&endpoint, deadline, &[], &seen, || Step::Stop("it ended"))
+            .await
+            .map(|_| ())
+            .expect_err("the check stops the wait");
+        assert!(matches!(waited, Waited::Stopped("it ended")));
+        assert_eq!(told.into_inner().expect("the sights"), [Sight::Began]);
+    }
+
+    /// KR-REQ-07.12: the last look after a stopped wait is told like an attempt of the start: that
+    /// it began, and what it gave where no daemon answered.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_last_look_after_a_stop_is_told_as_an_attempt_of_the_start() {
+        let host = kr_ipc::testing::TempHost::create();
+        let endpoint = host
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let told = std::sync::Mutex::new(Vec::new());
+        let seen = |sight| told.lock().expect("the sights").push(sight);
+        assert!(last_look(&endpoint, &[], &seen).await.is_none());
+        let _silent = Silent::listen(&endpoint);
+        assert!(last_look(&endpoint, &[], &seen).await.is_none());
+        assert_eq!(
+            told.into_inner().expect("the sights"),
+            [
+                Sight::Began,
+                Sight::Gave(Gave::NothingListens),
+                Sight::Began,
+                Sight::Gave(Gave::NothingInTime),
+            ]
+        );
+    }
+
     /// KR-REQ-07.12: with the standalone start chosen, a daemon that is listening and does not
     /// answer is reported as the environment being unavailable, and nothing is started beside it.
     #[cfg(unix)]
@@ -4227,11 +4275,15 @@ mod tests {
             launched.start_made(THE_TASK_START);
             launched
         };
-        let said = |asked: &windows::Asked, launched: &Launching| {
-            match windows::stopped(&environment, asked, &line, &log, launched) {
-                CliError::Unfinished { message, .. } => message.as_str().to_owned(),
-                other => panic!("an unanswered start, not {other:?}"),
-            }
+        let said = |asked: &windows::Asked, launched: &Launching| match windows::stopped(
+            &environment,
+            asked,
+            &line,
+            &log,
+            launched,
+        ) {
+            CliError::Unfinished { message, .. } => message.as_str().to_owned(),
+            other => panic!("an unanswered start, not {other:?}"),
         };
 
         // No folder for the claims: the marker can be neither made nor read.
