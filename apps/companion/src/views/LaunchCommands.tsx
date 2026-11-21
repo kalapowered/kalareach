@@ -241,9 +241,7 @@ export function LaunchCommands({
                   <div>
                     <h3>{command.label}</h3>
                     <p className="mono small">
-                      {[command.program, ...command.arguments]
-                        .map((word) => JSON.stringify(word))
-                        .join(' ')}
+                      {[command.program, ...command.arguments].map((word) => `"${word}"`).join(' ')}
                     </p>
                   </div>
                   {editable ? (
