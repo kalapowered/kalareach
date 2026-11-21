@@ -419,7 +419,7 @@ impl Parsed {
             "--config" => selection.configs.push(value),
             "--features" => selection.features.extend(
                 value
-                    .split([',', ' '])
+                    .split(|one: char| one == ',' || one.is_whitespace())
                     .filter(|item| !item.is_empty())
                     .map(str::to_owned),
             ),
@@ -499,6 +499,7 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
                 (Takes::No, Some(_)) => {
                     return Err(format!("gives `{word}`, but `{flag}` takes no value"));
                 }
+                (Takes::Value, Some("")) if flag == "--features" => String::new(),
                 (Takes::Value, Some("")) => return Err(without_value(flag)),
                 (Takes::Value, Some(held)) => held.to_owned(),
                 (Takes::Value, None) => next_value(&words, &mut at, flag)?,
@@ -520,11 +521,15 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
                     read.give(flag, String::new())?;
                     continue;
                 }
-                let held = rest.strip_prefix('=').unwrap_or(rest);
-                let value = if held.is_empty() {
-                    next_value(&words, &mut at, flag)?
-                } else {
+                // `-F=` gives an empty list of features, and the next word is not its value.
+                let written = rest.strip_prefix('=');
+                let held = written.unwrap_or(rest);
+                let value = if !held.is_empty() || (written.is_some() && flag == "--features") {
                     held.to_owned()
+                } else if written.is_some() {
+                    return Err(without_value(flag));
+                } else {
+                    next_value(&words, &mut at, flag)?
                 };
                 read.give(flag, value)?;
                 break;
@@ -1305,6 +1310,39 @@ mod tests {
             a(&["lib", "d", "f", "fd", "g", "free"])
         );
         assert_eq!(found("cargo test --features b/f"), a(&["lib", "d", "free"]));
+        // Cargo splits a feature list at commas and at any whitespace.
+        for line in [
+            "cargo test --features f\tg",
+            "cargo test --features f\ng",
+            "cargo test --features f,\tg",
+            "cargo test -F f\t\tg",
+        ] {
+            assert_eq!(
+                found(line),
+                a(&["lib", "d", "f", "fd", "g", "free"]),
+                "{line}"
+            );
+        }
+        // An empty list is a list: `--features=` and `-F=` take no word after them, so a word that
+        // follows is the filter that names tests, which selects the library and the tested targets.
+        for line in [
+            "cargo test --features=",
+            "cargo test -F=",
+            "cargo test --features= --no-default-features",
+        ] {
+            let plain = if line.contains("--no-default") {
+                a(&["lib", "free"])
+            } else {
+                a(&["lib", "d", "free"])
+            };
+            assert_eq!(found(line), plain, "{line}");
+        }
+        assert_eq!(found("cargo test -F= f"), a(&["lib", "d", "free"]));
+        assert_eq!(
+            found("cargo test -F= --test f"),
+            a(&["f"]),
+            "the word after an empty list is not its value"
+        );
         assert_eq!(
             found("cargo test --no-default-features"),
             a(&["lib", "free"])
