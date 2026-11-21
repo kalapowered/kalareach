@@ -612,7 +612,7 @@ describe('the commercial surface (KR-REQ-17.32)', () => {
       email: 'sam@example.com',
       name: null,
       usage_readable: true,
-      generation: 'aaaa',
+      generation: 'aaaa', mark: 'ab'.repeat(32),
       outcome: null
     })
     await person.click(await screen.findByRole('button', { name: /^Account/ }))

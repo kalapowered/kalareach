@@ -371,6 +371,64 @@ impl AppState {
         }
     }
 
+    /// Refuses a mark that is not the account's, as [`Self::paired_for`] does, without asking for a
+    /// connection: a command that goes on with none still checks its stamp. A device that is not
+    /// paired, and a host with no organisation, refuse nothing.
+    ///
+    /// # Errors
+    ///
+    /// The sign-in refusal of [`Self::paired_for`].
+    pub async fn check_stamp(&self, mark: Option<&str>) -> Result<()> {
+        let organisation = match self.paired_parts() {
+            Ok((_, _, _, organisation)) => organisation,
+            Err(_) => match self.paired_context() {
+                Some(context) => context.host.proposed_grant.organisation.as_ref().is_some(),
+                None => return Ok(()),
+            },
+        };
+        let account = self.account_of(organisation).await.unwrap_or(None);
+        stamp_matches(organisation, account, mark)
+    }
+
+    /// As [`Self::paired`], for a command the page made under the account that `mark` names. On a host
+    /// whose grant answers to an organisation a mark that is not the account signed in now, and a
+    /// missing mark, are refused with the sign-in words, at the command's entry; on another host
+    /// nothing is compared. The account is read once, so the command goes on under the account it
+    /// was checked against.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::paired`], and the refusal above.
+    pub async fn paired_for(&self, mark: Option<&str>) -> Result<crate::open_transfers::Paired> {
+        let (device_id, environment_id, session, organisation) = self.paired_parts()?;
+        let account = self.account_of(organisation).await?;
+        stamp_matches(organisation, account, mark)?;
+        Ok(crate::open_transfers::Paired {
+            device_id,
+            environment_id,
+            account,
+            session,
+        })
+    }
+
+    /// As [`Self::paired_who`], for a command the page made under the account that `mark` names,
+    /// checked as [`Self::paired_for`] checks it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::paired_who`], and the refusal of [`Self::paired_for`].
+    pub async fn paired_who_for(&self, mark: Option<&str>) -> Result<crate::open_transfers::Who> {
+        let who = self.paired_who().await?;
+        let organisation = match self.paired_parts() {
+            Ok((_, _, _, organisation)) => organisation,
+            Err(_) => self
+                .paired_context()
+                .is_some_and(|context| context.host.proposed_grant.organisation.as_ref().is_some()),
+        };
+        stamp_matches(organisation, who.account, mark)?;
+        Ok(who)
+    }
+
     /// The account the records of a paired host are kept for: the account signed in on a host whose
     /// grant answers to an organisation, none on another.
     ///
@@ -1201,5 +1259,53 @@ mod tests {
             assert!(choosing.join().expect("the choice ended").is_err());
             waiting.await.expect("the task took the gate");
         }
+    }
+}
+
+/// Refuses a command whose mark is not the account's, on a host whose grant answers to an
+/// organisation: a mark of another account, and none at all, are the sign-in refusal. On a host with
+/// no organisation nothing is compared.
+pub(crate) fn stamp_matches(
+    organisation: bool,
+    account: Option<kr_client::services::AccountMark>,
+    mark: Option<&str>,
+) -> Result<()> {
+    if !organisation {
+        return Ok(());
+    }
+    match (account, mark) {
+        (Some(account), Some(mark)) if account.to_hex() == mark => Ok(()),
+        _ => Err(CommandError::refused(
+            kr_client::organisation::LeaseStop::SignIn.to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+    use kr_client::services::AccountMark;
+
+    /// KR-REQ-13.12: on a host that answers to an organisation a command carries the mark of the
+    /// account signed in, and one made under another account's mark or with none is refused in the
+    /// sign-in words; on another host any stamp is accepted.
+    #[test]
+    fn a_stamp_is_checked_on_an_organisation_host_only() {
+        let (a, b) = (
+            AccountMark::from_bytes([1; 32]),
+            AccountMark::from_bytes([2; 32]),
+        );
+        let signed_in = kr_client::organisation::LeaseStop::SignIn.to_string();
+        assert!(stamp_matches(true, Some(b), Some(&b.to_hex())).is_ok());
+        for refused in [
+            stamp_matches(true, Some(b), Some(&a.to_hex())),
+            stamp_matches(true, Some(b), None),
+            stamp_matches(true, None, Some(&a.to_hex())),
+            stamp_matches(true, None, None),
+        ] {
+            assert_eq!(refused.expect_err("refused").message, signed_in);
+        }
+        assert!(stamp_matches(false, None, Some(&a.to_hex())).is_ok());
+        assert!(stamp_matches(false, None, None).is_ok());
     }
 }

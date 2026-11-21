@@ -21,6 +21,7 @@ import type { HeldShare, ShareOffer } from '@kalareach/protocol'
 
 import { readOnCadence, type Cadence } from '../app/cadence'
 import { failureCode, type AttemptView, type Held, type HostPort } from '../host/port'
+import { rootOf } from '../host/stamped'
 import { sessionOfShare } from './shared-with-you'
 import { accessWords } from './sharing'
 
@@ -379,10 +380,10 @@ const books = new WeakMap<HostPort, HeldBook>()
 
 /** The book of a port. */
 export function bookOf(port: HostPort): HeldBook {
-  let book = books.get(port)
+  let book = books.get(rootOf(port))
   if (book === undefined) {
     book = new HeldBook(port)
-    books.set(port, book)
+    books.set(rootOf(port), book)
   }
   return book
 }

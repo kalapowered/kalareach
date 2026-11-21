@@ -2266,9 +2266,14 @@ export interface HostPort {
   composerSubmit(
     params: AgentPromptParams,
     opening?: string,
-    supersedes?: Supersession
+    supersedes?: Supersession,
+    mark?: string
   ): Promise<Settled<AgentMutationResult>>
-  composerQueue(params: AgentPromptParams, opening?: string): Promise<Settled<AgentMutationResult>>
+  composerQueue(
+    params: AgentPromptParams,
+    opening?: string,
+    mark?: string
+  ): Promise<Settled<AgentMutationResult>>
   composerSteer(params: AgentSteerParams, opening?: string): Promise<Settled<AgentMutationResult>>
   composerInterrupt(
     params: AgentCancelParams,
@@ -2330,14 +2335,20 @@ export interface HostPort {
   /** Sets a damaged list of removals aside, as a file of its own, and starts a rebuilt one. */
   deviceDraftsLedgerSetAside(): Promise<LedgerSetAside>
 
-  draftCreate(params: unknown, subject: SessionSubject): Promise<Settled>
+  /**
+   * Every command below that acts for an account (a draft, an upload, a prompt that names a draft)
+   * takes, last, the mark of the account the page acted under, which native code compares with the
+   * account signed in at the command's entry on a host that answers to an organisation. The page
+   * passes it through {@link stampedPort}; a case that drives the port itself may leave it out.
+   */
+  draftCreate(params: unknown, subject: SessionSubject, mark?: string): Promise<Settled>
   /**
    * Sends one dropped file to the host and answers with the verified handle.
    *
    * The page never holds the bytes. The platform gave the backend a path when the person dropped
    * the file on the window; this names that path back, and the backend refuses any other.
    */
-  attachmentUpload(path: string, subject: SessionSubject): Promise<AttachmentHandle>
+  attachmentUpload(path: string, subject: SessionSubject, mark?: string): Promise<AttachmentHandle>
   /**
    * Sends one file the platform gave the page rather than a path, pasted onto the window or
    * picked on a phone, and answers with the verified handle.
@@ -2348,27 +2359,33 @@ export interface HostPort {
   attachmentUploadBytes(
     file: HandedFile,
     subject: SessionSubject,
-    transferKey?: string
+    transferKey?: string,
+    mark?: string
   ): Promise<AttachmentHandle>
-  draftAddAttachment(params: unknown, subject: SessionSubject): Promise<Settled>
+  draftAddAttachment(params: unknown, subject: SessionSubject, mark?: string): Promise<Settled>
   /**
    * The uploads this device holds open on the host it is paired with, read from the application:
    * the ones sending, the ones paused for want of a connection, the published ones not yet bound to
    * a draft, and the ones a restart found. Progress is read by asking again.
    */
-  uploadsOpen(): Promise<readonly OpenUpload[]>
+  uploadsOpen(mark?: string): Promise<readonly OpenUpload[]>
   /**
    * Cancels an open upload by its key, and answers from the host's own answer. An upload the host
    * has published is never cancelled: the answer says it is kept, with its handle.
    */
-  uploadCancel(transferKey: string): Promise<UploadCancelled>
+  uploadCancel(transferKey: string, mark?: string): Promise<UploadCancelled>
   /** Ends the draft this device keeps for the session on a paired host, because its files were dropped. */
-  draftEnd(subject: SessionSubject, sessionId: string): Promise<void>
+  draftEnd(subject: SessionSubject, sessionId: string, mark?: string): Promise<void>
   /**
    * Sets the text of the draft this device keeps for the session on a paired host, which the prompt
    * that names the draft then sends.
    */
-  draftSetText(subject: SessionSubject, sessionId: string, text: string): Promise<PairedText>
+  draftSetText(
+    subject: SessionSubject,
+    sessionId: string,
+    text: string,
+    mark?: string
+  ): Promise<PairedText>
 
   /**
    * One page of a session's retained output, from the cursor and within the byte bound the

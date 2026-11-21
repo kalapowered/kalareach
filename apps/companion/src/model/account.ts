@@ -49,10 +49,17 @@ export type AccountView =
       readonly usage_readable: boolean
       /** Which grant this is: usage read for another grant is never shown for it. */
       readonly generation: string
+      /**
+       * The account, as a digest that says nothing of who it is. It is the same across a renewal and
+       * a later sign-in of the same account; every command that acts for an account carries it.
+       */
+      readonly mark: string
       readonly outcome: AccountOutcome | null
     }
   /** The sign-in ended by itself. */
   | { readonly state: 'ended' }
+  /** The status could not be read: nothing is said of the account, and no change is assumed. */
+  | { readonly state: 'unreadable' }
 
 /** One measured figure. */
 export interface UsageLine {
@@ -99,6 +106,7 @@ export function describeAccount(view: AccountView): string {
   switch (view.state) {
     case 'signed_out':
     case 'unavailable':
+    case 'unreadable':
       return 'No account on this device. Your hosts, sessions and agents work exactly as they do with one.'
     case 'browser_open':
       return `Continue on ${ACCOUNT_HOST}. This screen updates when you finish there.`

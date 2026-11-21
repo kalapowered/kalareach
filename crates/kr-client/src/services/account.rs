@@ -3037,6 +3037,21 @@ impl SignedInAccount {
         Ok(self.read_grant()?.map(|grant| grant.mark_at(origin)))
     }
 
+    /// Where this device stands with an account and the mark of that account at the service at
+    /// `origin`, both from one read of the grant: a caller that reads the status and then the mark
+    /// has read the grant twice, and another sign-in can replace it between the two reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read.
+    pub fn status_marked(&self, origin: &str) -> Result<(AccountStatus, Option<AccountMark>)> {
+        Ok(match self.read_grant()? {
+            Some(grant) => (Self::summary(&grant), Some(grant.mark_at(origin))),
+            None if self.ended.load(Ordering::SeqCst) => (AccountStatus::Ended, None),
+            None => (AccountStatus::SignedOut, None),
+        })
+    }
+
     /// The token for `scope`, with the mark of the account it belongs to at the service at
     /// `origin`, both from one read of the grant. With `renew` the access token is replaced by a
     /// refresh whether or not it is near its end, for a caller whose service refused it as one that

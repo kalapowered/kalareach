@@ -479,6 +479,72 @@ fn a_sign_out_the_store_refuses_says_so_beside_the_signed_in_account() {
     assert_eq!(status["outcome"], "sign_out_failed", "{status}");
 }
 
+/// A store that answers every read once `failing` is set, and otherwise keeps what it is given.
+struct FailingReads {
+    inner: MemoryStore,
+    failing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SecretStore for FailingReads {
+    fn set(&self, name: &kr_crypto::store::SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
+        self.inner.set(name, secret)
+    }
+
+    fn get(
+        &self,
+        name: &kr_crypto::store::SecretName,
+    ) -> kr_crypto::Result<Option<kr_crypto::secret::SecretVec>> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(kr_crypto::CryptoError::SecretStore {
+                message: "the store cannot be read".to_owned(),
+            });
+        }
+        self.inner.get(name)
+    }
+
+    fn delete(&self, name: &kr_crypto::store::SecretName) -> kr_crypto::Result<()> {
+        self.inner.delete(name)
+    }
+
+    fn describe(&self) -> String {
+        "a store that fails to read on demand".to_owned()
+    }
+}
+
+/// The account view carries the mark of the account signed in, a digest that says nothing of who it
+/// is, and a status the store cannot read is its own view: it is not read as a sign-out, which would
+/// clear what the page holds for the account.
+#[test]
+fn the_account_view_carries_the_mark_and_an_unreadable_status_is_not_a_sign_out() {
+    let exchanges = Arc::new(Exchanges::default());
+    let views = Arc::new(Mutex::new(Vec::new()));
+    let carrier: Arc<dyn Carrier> = Arc::new(PhoneSession {
+        redirect: Redirect::AppLink,
+        opened: Arc::new(Mutex::new(Vec::new())),
+    });
+    let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let account = account_in(
+        Arc::new(FailingReads {
+            inner: MemoryStore::new(),
+            failing: Arc::clone(&failing),
+        }),
+        Client::Mobile,
+        carrier,
+        &exchanges,
+        &views,
+    );
+    let signed_in = invoke(Arc::clone(&account), "account_sign_in");
+    assert_eq!(signed_in["state"], "signed_in", "{signed_in}");
+    let mark = signed_in["mark"].as_str().expect("the view carries a mark");
+    assert_eq!(mark.len(), 64, "{signed_in}");
+    assert!(mark.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(invoke(Arc::clone(&account), "account_status")["mark"], mark);
+
+    failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    let unread = invoke(account, "account_status");
+    assert_eq!(unread["state"], "unreadable", "{unread}");
+}
+
 /// A factory of sync clients that records the origins it is asked for and makes the managed client.
 #[derive(Debug)]
 struct Recording {

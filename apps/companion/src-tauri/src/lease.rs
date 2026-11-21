@@ -192,14 +192,10 @@ impl LeaseDesk {
             tracing::warn!(%error, "this device cannot read which account is signed in");
             LeaseStop::Unreachable
         };
-        let sign_in = match tokens.status() {
-            Ok(AccountStatus::SignedIn { generation, .. }) => generation,
+        // The sign-in and the account it marks come from one read of the grant.
+        let (sign_in, mark) = match tokens.status_marked(account.origin().as_str()) {
+            Ok((AccountStatus::SignedIn { generation, .. }, Some(mark))) => (generation, mark),
             Ok(_) => return Err(LeaseStop::SignIn),
-            Err(error) => return Err(unreadable(&error)),
-        };
-        let mark = match tokens.mark(account.origin().as_str()) {
-            Ok(Some(mark)) => mark,
-            Ok(None) => return Err(LeaseStop::SignIn),
             Err(error) => return Err(unreadable(&error)),
         };
         Ok(SignedIn {
