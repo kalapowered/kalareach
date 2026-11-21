@@ -203,3 +203,68 @@ fn the_start_failure_frame_and_the_claim_refuse_each_other() {
         kr_cbor::from_canonical_slice(&bytes, &limits).expect("the failure reads back");
     assert_eq!(read, failure);
 }
+
+/// The members a start failure frame is made of, with the ids of one launch.
+fn the_ids_of_a_launch() -> (
+    kr_protocol::worker::ReservationId,
+    kr_protocol::ids::EnvironmentId,
+) {
+    (
+        kr_protocol::worker::ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+        kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
+    )
+}
+
+/// A start failure frame that carries a member the shape does not name is refused: the shape is
+/// closed, so it cannot be read from a frame that holds more than it.
+#[test]
+fn a_start_failure_frame_with_a_member_it_does_not_name_is_refused() {
+    #[derive(serde::Serialize)]
+    struct WithAnExtraMember {
+        reservation_id: kr_protocol::worker::ReservationId,
+        environment_id: kr_protocol::ids::EnvironmentId,
+        reason: String,
+        extra: u8,
+    }
+    let (reservation_id, environment_id) = the_ids_of_a_launch();
+    let bytes = kr_cbor::to_canonical_vec(&WithAnExtraMember {
+        reservation_id,
+        environment_id,
+        reason: "the plugin host could not start: paths".to_owned(),
+        extra: 1,
+    })
+    .expect("encodes");
+    assert!(
+        kr_cbor::from_canonical_slice::<HostStartFailure>(
+            &bytes,
+            &StreamKind::Control.cbor_limits()
+        )
+        .is_err(),
+        "a frame with a member the shape does not name is not a start failure"
+    );
+}
+
+/// A start failure frame with no reason is refused: a launcher never takes a failure that says
+/// nothing.
+#[test]
+fn a_start_failure_frame_without_its_reason_is_refused() {
+    #[derive(serde::Serialize)]
+    struct WithoutAReason {
+        reservation_id: kr_protocol::worker::ReservationId,
+        environment_id: kr_protocol::ids::EnvironmentId,
+    }
+    let (reservation_id, environment_id) = the_ids_of_a_launch();
+    let bytes = kr_cbor::to_canonical_vec(&WithoutAReason {
+        reservation_id,
+        environment_id,
+    })
+    .expect("encodes");
+    assert!(
+        kr_cbor::from_canonical_slice::<HostStartFailure>(
+            &bytes,
+            &StreamKind::Control.cbor_limits()
+        )
+        .is_err(),
+        "a frame with no reason is not a start failure"
+    );
+}

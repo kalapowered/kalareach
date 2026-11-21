@@ -2280,6 +2280,49 @@ mod tests {
         assert_eq!(failure_reason_line(&"é".repeat(300)).len(), 400);
     }
 
+    /// A host's failure ends the wait at once, whatever waits behind it: a valid claim that is
+    /// queued after the failure is not taken, and the wait does not run on to its deadline.
+    #[tokio::test]
+    async fn a_failure_ends_the_wait_though_a_claim_is_queued_behind_it() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let reservation =
+            HostReservation::open(&environment, HostProtocol::THIS).expect("a reservation");
+        let identity = HostIdentity::generate(environment.environment_id()).expect("an identity");
+        let endpoint = host_endpoint(&environment, &HostProtocol::THIS)
+            .expect("an endpoint")
+            .as_text();
+        let claim = identity
+            .rendezvous(reservation.reservation_id(), &endpoint)
+            .expect("a claim");
+        let (_failing_reader, mut failing_writer) = the_hosts_side(&reservation).await;
+        failing_writer
+            .write_message(&HostStartFailure {
+                reservation_id: reservation.reservation_id(),
+                environment_id: environment.environment_id(),
+                reason: "the plugin host could not listen on /x: a file stands there".to_owned(),
+            })
+            .await
+            .expect("the failure is written");
+        let (_claiming_reader, mut claiming_writer) = the_hosts_side(&reservation).await;
+        claiming_writer
+            .write_message(&claim)
+            .await
+            .expect("the claim is written");
+        let error = reservation
+            .accept(
+                &environment,
+                &this_process(),
+                core::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("the failure ends the wait, and the claim behind it is not taken");
+        assert!(
+            matches!(&error, LaunchError::HostFailed { reason } if reason == "the plugin host could not listen on /x: a file stands there"),
+            "{error:?}"
+        );
+    }
+
     /// A host of the release before sends the claim and nothing else, and the launcher takes it as
     /// it always did.
     #[tokio::test]
