@@ -3764,14 +3764,17 @@ mod tests {
 
     /// KR-REQ-07.12: a wait's one attempt is kept across the ticks that ask whether to go on: a
     /// pending attempt is ended by the tick that says stop and left unfinished, an attempt that
-    /// finishes between ticks gives its answer, and no tick starts a second one.
-    #[tokio::test]
+    /// finishes between ticks gives its answer, and no tick starts a second one. The clock is
+    /// paused, so every tick falls at its own time and the counts do not depend on the scheduler.
+    #[tokio::test(start_paused = true)]
     async fn a_pending_attempt_is_ended_by_the_tick_and_kept_when_the_tick_continues() {
         let tick = Duration::from_millis(20);
 
+        // An attempt that would end by itself after twenty ticks: the third tick says stop, and
+        // the wait ends there with the attempt unfinished.
         let mut asked = 0;
         let started = tokio::time::Instant::now();
-        let ended = until_stopped(tick, std::future::pending::<()>(), &mut || {
+        let ended = until_stopped(tick, tokio::time::sleep(tick * 20), &mut || {
             asked += 1;
             if asked < 3 {
                 Step::Continue
@@ -3782,10 +3785,10 @@ mod tests {
         .await;
         assert_eq!(ended, Err("third"));
         assert_eq!(asked, 3, "asked at each tick the attempt stayed pending");
-        assert!(
-            started.elapsed() >= tick * 3,
-            "the third tick ended it, not an earlier one: {:?}",
-            started.elapsed()
+        assert_eq!(
+            started.elapsed(),
+            tick * 3,
+            "the third tick ended it, not an earlier one"
         );
 
         let mut asked = 0;
@@ -4181,6 +4184,96 @@ mod tests {
             assert_eq!(launched.made(), Some(started));
             assert!(launched.may_still_start());
         }
+    }
+
+    /// KR-REQ-07.12: a Windows start that stopped on a refused bind says what became of its
+    /// request, each of the three ways it can have ended: the request was withdrawn before a
+    /// starter took it, a starter took it first, and neither could be told.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_start_that_stopped_on_a_refused_bind_says_what_became_of_its_request() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        environment.create().expect("the environment's folders");
+        let line = ListenLine {
+            role: ListenRole::Control,
+            refusal: ListenRefusal::Held { pid: None },
+            path: endpoint_of(&environment, ListenRole::Control)
+                .expect("an endpoint")
+                .as_text(),
+            daemon: 4242,
+        };
+        let log = Log {
+            file: std::fs::File::create(host.root().join("daemon.log")).expect("a log"),
+            path: host.root().join("daemon.log"),
+            from: 0,
+        };
+        let asked = || windows::Asked {
+            request: kr_ipc::new_uuid(),
+            session: None,
+            run: windows::Run::Confirmed,
+        };
+        let launching = || {
+            let launched = Launching::default();
+            launched.start_made(THE_TASK_START);
+            launched
+        };
+        let said = |asked: &windows::Asked, launched: &Launching| {
+            match windows::stopped(&environment, asked, &line, &log, launched) {
+                CliError::Unfinished { message, .. } => message.as_str().to_owned(),
+                other => panic!("an unanswered start, not {other:?}"),
+            }
+        };
+
+        // No folder for the claims: the marker can be neither made nor read.
+        let launched = launching();
+        let untold = said(&asked(), &launched);
+        assert!(
+            untold.contains("whether its starter took the request cannot be told")
+                && untold.contains("could not listen on its control endpoint"),
+            "{untold}"
+        );
+        assert!(
+            launched.made().is_some() && launched.may_still_start(),
+            "a request whose taking cannot be told may have started a daemon"
+        );
+
+        // The claims folder is there and nobody took the request: it is withdrawn.
+        let claims = environment.start_claims_dir();
+        kr_ipc::paths::create_private_tree(environment.runtime_root(), &claims)
+            .expect("the claims folder");
+        let launched = launching();
+        let withdrawn = said(&asked(), &launched);
+        assert!(
+            withdrawn.contains(
+                "did not take the request to start the control daemon, so the request was withdrawn"
+            ) && withdrawn.contains("could not listen on its control endpoint"),
+            "{withdrawn}"
+        );
+        assert!(
+            launched.made().is_none() && !launched.may_still_start(),
+            "no start was made, and no requested daemon may still start"
+        );
+
+        // A starter took the request first: its marker holds nothing of a withdrawal.
+        let taken = asked();
+        kr_ipc::paths::create_new_owner_only_file(
+            &claims.join(format!("{}.taken", taken.request)),
+            b"",
+        )
+        .expect("a starter's marker");
+        let launched = launching();
+        let took = said(&taken, &launched);
+        assert!(
+            took.contains("took the request to start the control daemon for environment")
+                && took.contains("the daemon did not answer")
+                && !took.contains("withdrawn"),
+            "{took}"
+        );
+        assert!(
+            launched.made().is_some() && launched.may_still_start(),
+            "a request a starter took may have started the daemon"
+        );
     }
 
     /// KR-REQ-07.12: a failure after a run the Task Scheduler confirmed says it was asked to run
