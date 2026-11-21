@@ -16,7 +16,7 @@
 
 import { useId, useState, type ReactNode } from 'react'
 
-import type { NamedLaunch, ShellLaunchCommandsListResult } from '@kalareach/protocol'
+import type { LaunchShell, NamedLaunch, ShellLaunchCommandsListResult } from '@kalareach/protocol'
 
 import { useHeldConnection } from '../app/rights'
 import { useSavedCommands } from '../app/launch-commands'
@@ -49,8 +49,17 @@ function holdsAsWritten(commands: readonly NamedLaunch[], command: NamedLaunch):
   )
 }
 
-/** The launch commands section of Settings. */
-export function LaunchCommands({ place }: { readonly place: LaunchCommandsPlace }): ReactNode {
+/**
+ * The launch commands section of Settings. `shell` is the shell the session it is opened from runs,
+ * where the host said which, and decides how the words are said to be passed.
+ */
+export function LaunchCommands({
+  place,
+  shell = null
+}: {
+  readonly place: LaunchCommandsPlace
+  readonly shell?: LaunchShell | null
+}): ReactNode {
   const { port, say } = useApp()
   const { rights, paired } = useHeldConnection()
   const mayRead = rights?.includes('host.manage') === true
@@ -190,7 +199,7 @@ export function LaunchCommands({ place }: { readonly place: LaunchCommandsPlace 
             {WORDS.press} {WORDS.shell}
           </p>
           <p className="muted" data-testid="launch-commands-passed">
-            {WORDS.passed}
+            {shell === 'powershell' ? WORDS.passedInPowerShell : WORDS.passed}
           </p>
           <p className="muted" data-testid="launch-commands-batch">
             {WORDS.batch}
