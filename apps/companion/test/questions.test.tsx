@@ -63,15 +63,19 @@ describe('the inbox lists a session’s questions once', () => {
     const doubled: HostPort = {
       ...port,
       attentionRead: async (params) => {
-        const read = await port.attentionRead(params)
+        const answered = await port.attentionRead(params)
+        const read = answered.value
         const asked = read.items.find((item) => item.rule === 'attention.pending_input')
-        if (asked === undefined) return read
+        if (asked === undefined) return answered
         return {
-          ...read,
-          items: [
-            ...read.items,
-            { ...asked, key: `${asked.key}|idle`, rule: 'attention.input_idle_reminder' as const }
-          ]
+          key: answered.key,
+          value: {
+            ...read,
+            items: [
+              ...read.items,
+              { ...asked, key: `${asked.key}|idle`, rule: 'attention.input_idle_reminder' as const }
+            ]
+          }
         }
       }
     }

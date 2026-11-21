@@ -10,6 +10,8 @@ import { describe, expect, it } from 'vitest'
 
 import type { AttentionItem, AttentionReadResult, Receipt } from '@kalareach/protocol'
 
+import { type Keyed, READ_SUPERSEDED, type ReadKey, supersededRead } from '../../src/host/port'
+
 import { connectionLost, edit, startDraft, type Draft } from '../../src/model/drafts'
 import { ReceiptReads, supersessionFor } from '../../src/model/receipt-reads'
 import { queued, sent, unresolved, type Submission } from '../../src/model/receipts'
@@ -109,6 +111,8 @@ const INBOX = inbox([
   item({ rule: 'attention.pending_approval', level: 'urgent', last_seen_ms: String(NOW - 2000) })
 ])
 
+const KEY: ReadKey = { host: { kind: 'local' }, epoch: 1, link: 1 }
+
 describe('reading the whole inbox (KR-REQ-13.09)', () => {
   /** An inbox of `total` items, served `size` at a time, oldest first, as the host pages it. */
   function paged(total: number, size: number) {
@@ -116,19 +120,20 @@ describe('reading the whole inbox (KR-REQ-13.09)', () => {
       item({ rule: 'attention.application_notice', key: `k-${String(index).padStart(4, '0')}` })
     )
     const asked: (string | null)[] = []
-    const read = (after: string | null): Promise<AttentionReadResult> => {
+    const read = (after: string | null): Promise<Keyed<AttentionReadResult>> => {
       asked.push(after)
       const start = after === null ? 0 : all.findIndex((each) => each.key === after) + 1
-      return Promise.resolve(
-        inbox(all.slice(start, start + size), { more: start + size < total })
-      )
+      return Promise.resolve({
+        key: KEY,
+        value: inbox(all.slice(start, start + size), { more: start + size < total })
+      })
     }
     return { read, asked }
   }
 
   it('follows the pages until the host has no more', async () => {
     const { read, asked } = paged(450, 200)
-    const whole = await readWholeInbox(read)
+    const whole = (await readWholeInbox(read)).value
     expect(whole.items).toHaveLength(450)
     expect(whole.more).toBe(false)
     expect(asked).toEqual([null, 'k-0199', 'k-0399'])
@@ -136,7 +141,7 @@ describe('reading the whole inbox (KR-REQ-13.09)', () => {
 
   it('stops at its bound and says the host holds more', async () => {
     const { read, asked } = paged(MAX_INBOX_PAGES * 10 + 5, 10)
-    const whole = await readWholeInbox(read)
+    const whole = (await readWholeInbox(read)).value
     expect(asked).toHaveLength(MAX_INBOX_PAGES)
     expect(whole.more).toBe(true)
     expect(inboxNotes(whole)).toContain('The host holds more items than this list shows.')
@@ -149,14 +154,41 @@ describe('reading the whole inbox (KR-REQ-13.09)', () => {
       if (after !== null && reads === 2) {
         return Promise.reject({ code: 'DRAFT_CONFLICT', message: 'gone', user_action: 'retry' })
       }
-      return Promise.resolve(
-        inbox([item({ rule: 'attention.review_ready', key: after === null ? 'a' : 'b' })], {
+      return Promise.resolve({
+        key: KEY,
+        value: inbox([item({ rule: 'attention.review_ready', key: after === null ? 'a' : 'b' })], {
           more: after === null
         })
-      )
+      })
     })
     expect(reads).toBe(4)
-    expect(whole.items.map((each) => each.key)).toEqual(['a', 'b'])
+    expect(whole.value.items.map((each) => each.key)).toEqual(['a', 'b'])
+    expect(whole.key).toEqual(KEY)
+  })
+
+  it('fails with READ_SUPERSEDED when a later page carries another key or is superseded', async () => {
+    const moved: ReadKey = { ...KEY, epoch: 2 }
+    const second = (key: ReadKey) => (after: string | null) =>
+      Promise.resolve({
+        key: after === null ? KEY : key,
+        value: inbox([item({ rule: 'attention.review_ready', key: after === null ? 'a' : 'b' })], {
+          more: after === null
+        })
+      })
+    await expect(readWholeInbox(second(moved))).rejects.toMatchObject({ code: READ_SUPERSEDED })
+    // The same key on every page is the whole inbox, under that key.
+    await expect(readWholeInbox(second(KEY))).resolves.toMatchObject({ key: KEY })
+    // A page that was superseded fails the whole read, and the read is not repeated.
+    let reads = 0
+    await expect(
+      readWholeInbox((after) => {
+        reads += 1
+        return after === null
+          ? Promise.resolve({ key: KEY, value: inbox([item({ rule: 'attention.review_ready', key: 'a' })], { more: true }) })
+          : Promise.reject(supersededRead())
+      })
+    ).rejects.toMatchObject({ code: READ_SUPERSEDED })
+    expect(reads).toBe(2)
   })
 })
 

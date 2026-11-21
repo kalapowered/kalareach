@@ -29,6 +29,8 @@ import type {
   ConnectionState,
   DroppedFile,
   GrantNotices,
+  Keyed,
+  ReadKey,
   HostEvent,
   HostPort,
   ImportedImage,
@@ -67,7 +69,13 @@ import type {
   VoiceScope,
   Written
 } from './port'
-import { failureWords, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
+import {
+  failureWords,
+  receivedConnection,
+  supersededRead,
+  viewMoveArguments,
+  viewSizeArguments
+} from './port'
 import { createConnectionFeed } from './connection-feed'
 
 /** The event the backend publishes each host notification on. */
@@ -337,6 +345,18 @@ export function tauriPort(): HostPort {
 
   const read = <T,>(command: string, params: unknown): Promise<T> => call<T>(command, { params })
 
+  /**
+   * What native code answers a read of the owner's authority with: the answer under its key, or that
+   * the read was superseded, which is a value of that command and fails here with the page's own
+   * code and no data.
+   */
+  type KeyedReply<T> = { readonly key: ReadKey; readonly result: T } | { readonly key: ReadKey; readonly superseded: true }
+  const keyed = async <T,>(reply: Promise<KeyedReply<T>>): Promise<Keyed<T>> => {
+    const answered = await reply
+    if ('superseded' in answered) throw supersededRead()
+    return { key: answered.key, value: answered.result }
+  }
+
   const mutate = <T,>(command: string, params: unknown, subject: SessionSubject): Promise<T> =>
     call<T>(command, { params, subject })
 
@@ -447,7 +467,8 @@ export function tauriPort(): HostPort {
     actionRead: (params, opening) => readIn('action_read', params, opening),
     settleAction: (params, opening) => readIn<void>('agent_action_settle', params, opening),
     // Attention and review belong to the environment, so an acknowledgement names no session.
-    attentionRead: (params) => read('attention_read', params),
+    attentionRead: (params) => keyed(read('attention_read', params)),
+    sessionNumbers: () => keyed(call('session_numbers', {})),
     attentionAcknowledge: (params) => mutate('attention_acknowledge', params, {}),
     reviewRead: (params) => read('review_read', params),
     reviewAcknowledge: (params) => mutate('review_acknowledge', params, {}),

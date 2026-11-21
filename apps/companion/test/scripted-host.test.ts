@@ -225,12 +225,14 @@ describe('the scripted host and attention, review and sharing', () => {
       items: [{ key: failure.key, revision: failure.revision }]
     })
     expect(seen.value?.acknowledged).toEqual([failure.key])
-    const inbox = await port.attentionRead({
-      session_id: null,
-      include_acknowledged: false,
-      max_items: '200',
-      after: null
-    })
+    const inbox = (
+      await port.attentionRead({
+        session_id: null,
+        include_acknowledged: false,
+        max_items: '200',
+        after: null
+      })
+    ).value
     expect(inbox.items.map((item) => item.key)).not.toContain(failure.key)
   })
 
@@ -257,22 +259,44 @@ describe('the scripted host and attention, review and sharing', () => {
     expect(again.value?.review).toMatchObject({ acknowledged_version: '2', outstanding: false })
   })
 
+  it('answers the inbox and the numbers under the one key the owner reads under, in the shape native code answers', async () => {
+    const { port, controls } = fakeHost()
+    const params = { session_id: null, include_acknowledged: false, max_items: '200', after: null }
+    const inbox = await port.attentionRead(params)
+    const numbers = await port.sessionNumbers()
+    expect(Object.keys(inbox.key).sort()).toEqual(['epoch', 'host', 'link'])
+    expect(inbox.key.host).toEqual({ kind: 'local' })
+    expect(numbers.key).toEqual(inbox.key)
+    expect(numbers.value.sessions.length).toBeGreaterThan(0)
+    // Held at the answer, the inbox still names the key it began under, and the numbers that were
+    // answered first name the same one.
+    const held = controls.hold('attentionRead')
+    const slow = port.attentionRead(params)
+    const quick = await port.sessionNumbers()
+    held.release()
+    expect((await slow).key).toEqual(quick.key)
+  })
+
   it('pages the inbox and review state, and refuses a page after something it does not hold', async () => {
     const { port } = fakeHost()
-    const first = await port.attentionRead({
-      session_id: null,
-      include_acknowledged: false,
-      max_items: '2',
-      after: null
-    })
+    const first = (
+      await port.attentionRead({
+        session_id: null,
+        include_acknowledged: false,
+        max_items: '2',
+        after: null
+      })
+    ).value
     expect(first.items).toHaveLength(2)
     expect(first.more).toBe(true)
-    const second = await port.attentionRead({
-      session_id: null,
-      include_acknowledged: false,
-      max_items: '2',
-      after: first.items[1]?.key ?? null
-    })
+    const second = (
+      await port.attentionRead({
+        session_id: null,
+        include_acknowledged: false,
+        max_items: '2',
+        after: first.items[1]?.key ?? null
+      })
+    ).value
     expect(second.items.map((item) => item.key)).not.toContain(first.items[0]?.key)
     await expect(
       port.attentionRead({

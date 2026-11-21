@@ -67,6 +67,8 @@ import type {
   HostInbox,
   HostError,
   HostPort,
+  Keyed,
+  ReadKey,
   ImportedImage,
   KeyAction,
   KeypadCode,
@@ -1055,6 +1057,7 @@ export type HeldRead =
   | 'connectionState'
   | 'accountStatus'
   | 'attentionRead'
+  | 'sessionNumbers'
   | 'questionRead'
   | 'sessionRead'
   | 'launchSurface'
@@ -1766,6 +1769,36 @@ export function fakeHost(
    * holds this kind of read. A refusal is kept as the answer too, and arrives as a rejection then,
    * as a refusal from native code does.
    */
+  /** What a host answers a request to list its sessions with. */
+  const listSessions = (params: unknown): SessionListResult => {
+    requireConnection()
+    // A host holds the operation to the parameters it names, and refuses a call that leaves one
+    // out: a screen that asks for fewer is one that no session list reaches.
+    const given = (params ?? {}) as { environment_id?: unknown; include_closed?: unknown }
+    if (!('environment_id' in given)) refuse('INVALID_ARGUMENT', 'missing field `environment_id`')
+    if (typeof given.include_closed !== 'boolean') refuse('INVALID_ARGUMENT', 'missing field `include_closed`')
+    if (sessionListFailure !== null) {
+      const words = sessionListFailure
+      sessionListFailure = null
+      refuse('UPSTREAM_UNAVAILABLE', words)
+    }
+    if (sessionListRefused) {
+      refuse('PERMISSION_DENIED', 'This device may not list the sessions of this host.')
+    }
+    return { sessions: anotherHost ? [] : listed() }
+  }
+  /** The key the owner reads under now: the host in use, its epoch and the connection's number. */
+  const keyedNow = <T,>(value: T): Keyed<T> => {
+    const body = connectionBody()
+    const host: ReadKey['host'] =
+      body.host === null
+        ? null
+        : body.host.kind === 'local'
+          ? { kind: 'local' }
+          : { kind: 'paired', reference: body.host.reference }
+    return { key: { host, epoch: body.inbox_epoch, link: body.link }, value }
+  }
+
   const reading = <T,>(read: HeldRead, answer: () => T): Promise<T> => {
     const waiting = holds.get(read)
     if (waiting === undefined) return Promise.resolve(answer())
@@ -2053,24 +2086,9 @@ export function fakeHost(
         return environments(hostEnvironment, anotherHost ? 'another host · Linux' : null)
       }),
 
-    sessionList: (params) =>
-      reading('sessionList', () => {
-        requireConnection()
-        // A host holds the operation to the parameters it names, and refuses a call that leaves one
-        // out: a screen that asks for fewer is one that no session list reaches.
-        const given = (params ?? {}) as { environment_id?: unknown; include_closed?: unknown }
-        if (!('environment_id' in given)) refuse('INVALID_ARGUMENT', 'missing field `environment_id`')
-        if (typeof given.include_closed !== 'boolean') refuse('INVALID_ARGUMENT', 'missing field `include_closed`')
-        if (sessionListFailure !== null) {
-          const words = sessionListFailure
-          sessionListFailure = null
-          refuse('UPSTREAM_UNAVAILABLE', words)
-        }
-        if (sessionListRefused) {
-          refuse('PERMISSION_DENIED', 'This device may not list the sessions of this host.')
-        }
-        return { sessions: anotherHost ? [] : listed() }
-      }),
+    sessionList: (params) => reading('sessionList', () => listSessions(params)),
+    sessionNumbers: () =>
+      reading('sessionNumbers', () => keyedNow(listSessions({ environment_id: null, include_closed: false }))),
     sessionRead: (params) =>
       reading('sessionRead', () => {
         requireConnection()
@@ -2438,7 +2456,7 @@ export function fakeHost(
         requireConnection()
         // A device whose pairing holds no view of a session is answered an inbox with nothing in it.
         if (attentionReadEmpty) {
-          return {
+          return keyedNow({
             dropped: '0',
             gaps: [],
             items: [],
@@ -2446,9 +2464,9 @@ export function fakeHost(
             quiet_hours: null,
             quiet_hours_provable: true,
             quiet_now: false
-          }
+          })
         }
-        return records.attentionRead(params)
+        return keyedNow(records.attentionRead(params))
       }),
     attentionAcknowledge: (params) => {
       requireConnection()

@@ -119,6 +119,46 @@ import type {
 import type { Supersession } from '../model/receipt-reads'
 
 /**
+ * What the owner says an answer is valid under: the host in use when the read began (null when none
+ * was), that host's epoch, and the number of the connection the read went over. The page keeps an
+ * answer only under the key it still holds, so no read gives itself an authority of its own.
+ */
+export interface ReadKey {
+  readonly host: { readonly kind: 'local' } | { readonly kind: 'paired'; readonly reference: string } | null
+  readonly epoch: number
+  readonly link: number
+}
+
+/** An answer read under the owner's authority, with the key it holds under. */
+export interface Keyed<T> {
+  readonly key: ReadKey
+  readonly value: T
+}
+
+/**
+ * The code of the failure a read ends with when the choice, the connection or the host's record
+ * it began under changed while the host was asked. It belongs to the page: it is never sent over
+ * the wire, which has no such code, and a read that fails with it carries no data.
+ */
+export const READ_SUPERSEDED = 'READ_SUPERSEDED'
+
+/** The failure of a read that was superseded. */
+export function supersededRead(): HostError {
+  return {
+    code: READ_SUPERSEDED,
+    message: 'The host changed while it was asked, so this answer is not used.',
+    retry: 'transient'
+  }
+}
+
+/** Whether two keys name one authority. */
+export function sameKey(a: ReadKey, b: ReadKey): boolean {
+  const host = (key: ReadKey): string =>
+    key.host === null ? 'none' : key.host.kind === 'local' ? 'local' : `paired:${key.host.reference}`
+  return host(a) === host(b) && a.epoch === b.epoch && a.link === b.link
+}
+
+/**
  * A failure the page holds, as `receivedFailure` (`./tauri`) makes it from what native code
  * answered with. It has no member for what a person can do about it: the line the page shows
  * already says that where the words do not, and nothing past the boundary can say it a second time.
@@ -2214,7 +2254,17 @@ export interface HostPort {
    * nothing releases what it can never settle. The opening is the one the action's call used.
    */
   settleAction(params: ActionSettleParams, opening?: string): Promise<void>
-  attentionRead(params: AttentionReadParams): Promise<AttentionReadResult>
+  /**
+   * One page of the host's inbox, under the key of the owner that read it. It fails with
+   * `READ_SUPERSEDED` when the choice, the connection or the host's record changed while the host
+   * was asked, and then carries no data.
+   */
+  attentionRead(params: AttentionReadParams): Promise<Keyed<AttentionReadResult>>
+  /**
+   * The numbers of the host's sessions, under the key of the owner that read them. It takes no
+   * parameters and writes nothing of contact. It fails with `READ_SUPERSEDED` as `attentionRead` does.
+   */
+  sessionNumbers(): Promise<Keyed<SessionListResult>>
   /** Records that items were seen, each at the revision shown. An environment's, not a session's. */
   attentionAcknowledge(params: AttentionAcknowledgeParams): Promise<Settled<AttentionAcknowledgeResult>>
   /** Which completed turns and change sets wait for review, at which versions. */

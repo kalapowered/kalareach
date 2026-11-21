@@ -90,9 +90,9 @@ export function Attention(): ReactNode {
         })
       )
     )
-      .then((result) => {
+      .then((answer) => {
         if (!current()) return
-        setInbox(result)
+        setInbox(answer.value)
         setReadAtMs(Date.now())
         setFailure(null)
       })
@@ -101,10 +101,10 @@ export function Attention(): ReactNode {
         setFailure(failureMessage(error))
       })
     // Only for the words: an inbox read without them names a session by nothing but the item.
-    const numbersRead = ask(() => port.sessionList({ environment_id: null, include_closed: false }))
-      .then((list) => {
+    const numbersRead = ask(() => port.sessionNumbers())
+      .then((answer) => {
         if (!current()) return
-        setNumbers(new Map(list.sessions.map((session) => [session.session_id, session.display_number])))
+        setNumbers(new Map(answer.value.sessions.map((session) => [session.session_id, session.display_number])))
       })
       .catch(() => undefined)
     return Promise.all([inboxRead, numbersRead]).then(() => undefined)

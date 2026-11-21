@@ -15,7 +15,15 @@
 
 import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 
-import { failureCode, failureMessage, type HostError, type RefusedRequest } from '../host/port'
+import {
+  failureCode,
+  failureMessage,
+  type HostError,
+  type Keyed,
+  type RefusedRequest,
+  sameKey,
+  supersededRead
+} from '../host/port'
 
 /**
  * How long after one read of the inbox the next starts while it is shown.
@@ -38,8 +46,8 @@ export const MAX_INBOX_PAGES = 16
  * the inbox is then read again from its start, once.
  */
 export async function readWholeInbox(
-  read: (after: string | null) => Promise<AttentionReadResult>
-): Promise<AttentionReadResult> {
+  read: (after: string | null) => Promise<Keyed<AttentionReadResult>>
+): Promise<Keyed<AttentionReadResult>> {
   try {
     return await followPages(read)
   } catch (failure: unknown) {
@@ -49,17 +57,21 @@ export async function readWholeInbox(
 }
 
 async function followPages(
-  read: (after: string | null) => Promise<AttentionReadResult>
-): Promise<AttentionReadResult> {
-  let page = await read(null)
+  read: (after: string | null) => Promise<Keyed<AttentionReadResult>>
+): Promise<Keyed<AttentionReadResult>> {
+  const first = await read(null)
+  let page = first.value
   const items = [...page.items]
   for (let pages = 1; page.more && pages < MAX_INBOX_PAGES; pages += 1) {
     const last = page.items.at(-1)
     if (last === undefined) break
-    page = await read(last.key)
+    const next = await read(last.key)
+    // A page read under another authority is not a page of this inbox.
+    if (!sameKey(next.key, first.key)) throw supersededRead()
+    page = next.value
     items.push(...page.items)
   }
-  return { ...page, items }
+  return { key: first.key, value: { ...page, items } }
 }
 
 /** What an item is asking for, as the inbox tells them apart. */

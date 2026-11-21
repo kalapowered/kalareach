@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { GrantCreateParams, RoleSelection, SessionCreateParams } from '@kalareach/protocol'
 
-import type { ConnectionState } from '../src/host/port'
+import { READ_SUPERSEDED, type ConnectionState } from '../src/host/port'
 import {
   CONNECTION_EVENT,
   HOST_EVENT,
@@ -221,6 +221,23 @@ describe('the desktop port and the published methods', () => {
     ])
   })
 
+  it('reads the inbox and the numbers under the key native code answered with, and fails a superseded read with the page’s own code and no data', async () => {
+    const port = tauriPort()
+    const key = { host: { kind: 'paired', reference: 'studio' }, epoch: 3, link: 2 }
+    const params = { session_id: null, after: null, include_acknowledged: false, max_items: '200' }
+    shell.answers.set('attention_read', { key, result: { items: [], more: false } })
+    await expect(port.attentionRead(params)).resolves.toEqual({ key, value: { items: [], more: false } })
+    shell.answers.set('session_numbers', { key, result: { sessions: [] } })
+    await expect(port.sessionNumbers()).resolves.toEqual({ key, value: { sessions: [] } })
+    expect(shell.invoked.at(-1)?.command).toBe('session_numbers')
+    shell.answers.set('attention_read', { key, superseded: true })
+    const inbox = await port.attentionRead(params).catch((failure: unknown) => failure)
+    expect(inbox).toMatchObject({ code: READ_SUPERSEDED })
+    expect(inbox).not.toHaveProperty('value')
+    shell.answers.set('session_numbers', { key, superseded: true })
+    await expect(port.sessionNumbers()).rejects.toMatchObject({ code: READ_SUPERSEDED })
+  })
+
   it('sends attention, review, sharing, packages and change sets to their own commands', async () => {
     const port = tauriPort()
     const environment = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
@@ -246,6 +263,7 @@ describe('the desktop port and the published methods', () => {
       subject: { change_set: { session_id: SESSION, change_set_id: 'change-1' } },
       version: '2'
     }
+    shell.answers.set('attention_read', { key: { host: null, epoch: 0, link: 1 }, result: {} })
     await port.attentionRead({
       session_id: null,
       after: null,

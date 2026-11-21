@@ -180,7 +180,7 @@ export function Inbox({
       .then(async (answer) => {
         const [before, after] = [await began, await using()]
         if (!current() || before !== after) return
-        setInbox({ reference: after, result: answer, atMs: Date.now() })
+        setInbox({ reference: after, result: answer.value, atMs: Date.now() })
         setError(null)
       })
       .catch((failure: unknown) => {
@@ -189,10 +189,10 @@ export function Inbox({
         // It is never a claim that anything on it failed.
         setError(failureMessage(failure))
       })
-    const numbersRead = ask(() => port.sessionList({ environment_id: null, include_closed: false }))
-      .then((list) => {
+    const numbersRead = ask(() => port.sessionNumbers())
+      .then((answer) => {
         if (!current()) return
-        setNumbers(new Map(list.sessions.map((session) => [session.session_id, session.display_number])))
+        setNumbers(new Map(answer.value.sessions.map((session) => [session.session_id, session.display_number])))
       })
       .catch(() => undefined)
     return Promise.all([inboxRead, numbersRead]).then(() => {
