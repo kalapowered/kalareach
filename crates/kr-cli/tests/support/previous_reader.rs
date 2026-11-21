@@ -118,17 +118,34 @@ pub fn git(repository: &Path, arguments: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Whether the commit holds the release matrix program.
-pub fn has_reader(repository: &Path, commit: &str) -> bool {
+/// Whether the commit holds the release matrix program. The commit is verified and its tree is
+/// read before an absent crate counts as no reader, so a commit this checkout does not hold, or a
+/// tree that cannot be read, is a refusal and never a release that has no reader.
+pub fn has_reader(repository: &Path, commit: &str) -> Result<bool, String> {
     git(
         repository,
-        &[
-            "cat-file",
-            "-e",
-            &format!("{commit}:{READER_CRATE}/Cargo.toml"),
-        ],
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
     )
-    .is_ok()
+    .map_err(|why| {
+        if why.starts_with("git did not start") {
+            why
+        } else {
+            format!(
+                "The commit {commit} is not in this checkout. Fetch it, then run the readers again."
+            )
+        }
+    })?;
+    let listed = git(
+        repository,
+        &[
+            "ls-tree",
+            "--name-only",
+            commit,
+            "--",
+            &format!("{READER_CRATE}/Cargo.toml"),
+        ],
+    )?;
+    Ok(!listed.trim().is_empty())
 }
 
 /// The commit's tree as the repository holds it, extracted once under the cache and kept
