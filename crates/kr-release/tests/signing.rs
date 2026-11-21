@@ -590,3 +590,137 @@ fn the_development_root_gives_each_role_a_key_of_its_own() {
         written
     );
 }
+
+/// A signature listed twice is refused as that, in a manifest and in a root, and a root with no
+/// role to check a document by is refused as that: neither is called a signature short of the
+/// threshold, which is what the control shows when the document does fall short.
+#[test]
+fn a_signature_listed_twice_and_a_missing_role_are_refused_as_those() {
+    let signer = pair();
+    let written = members("kalareach-release");
+    let targets_root = root_with(&[tuf_key(&signer)], 1);
+
+    // The manifest's one signature, listed twice. Each listing is the key's own, and the threshold
+    // is one, so what the document lacks is not signatures.
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&signed_by(&written, &[&signer])).expect("JSON");
+    let listed = manifest["signatures"][0].clone();
+    manifest["signatures"]
+        .as_array_mut()
+        .expect("signatures")
+        .push(listed);
+    let error = verify_manifest(&targets_root, manifest.to_string().as_bytes())
+        .expect_err("a signature listed twice");
+    assert!(matches!(error, VerifyError::DuplicateSignature), "{error}");
+    assert_eq!(error.to_string(), "it lists the signature of one key twice");
+
+    // A root with no targets role names no keys for a manifest to be signed by.
+    let once = signed_by(&written, &[&signer]);
+    let rootless_of_targets = root_of(&[
+        (RoleType::Root, vec![tuf_key(&pair())], 1),
+        (RoleType::Snapshot, vec![tuf_key(&pair())], 1),
+        (RoleType::Timestamp, vec![tuf_key(&pair())], 1),
+    ]);
+    let error = verify_manifest(&rootless_of_targets, once.as_bytes())
+        .expect_err("a root with no targets role");
+    assert!(
+        matches!(error, VerifyError::MissingRole { role: "targets" }),
+        "{error}"
+    );
+    assert_eq!(error.to_string(), "the root has no targets role");
+
+    // A root signed by its own key, the signature listed twice.
+    let root_signer = pair();
+    let roles = |root: Option<&Ed25519KeyPair>| {
+        let mut named = vec![
+            (RoleType::Targets, vec![tuf_key(&pair())], 1),
+            (RoleType::Snapshot, vec![tuf_key(&pair())], 1),
+            (RoleType::Timestamp, vec![tuf_key(&pair())], 1),
+        ];
+        if let Some(root) = root {
+            named.push((RoleType::Root, vec![tuf_key(root)], 1));
+        }
+        root_of(&named)
+    };
+    let mut twice = signed_root(roles(Some(&root_signer)), &root_signer);
+    let again = twice.signatures[0].clone();
+    twice.signatures.push(again);
+    let error = verify_root_itself(&twice).expect_err("a root signed twice by its own key");
+    assert!(matches!(error, VerifyError::DuplicateSignature), "{error}");
+
+    // The same root, offered as the successor of a root that names the same root key.
+    let error = verify_root_by(&roles(Some(&root_signer)), &twice)
+        .expect_err("a successor that lists a signature twice");
+    assert!(matches!(error, VerifyError::DuplicateSignature), "{error}");
+
+    // A root with no root role names no keys to sign it, whoever signed it.
+    let rootless = signed_root(roles(None), &root_signer);
+    let error = verify_root_itself(&rootless).expect_err("a root with no root role");
+    assert!(
+        matches!(error, VerifyError::MissingRole { role: "root" }),
+        "{error}"
+    );
+    assert_eq!(error.to_string(), "the root has no root role");
+    let error = verify_root_by(
+        &rootless.signed,
+        &signed_root(roles(Some(&root_signer)), &root_signer),
+    )
+    .expect_err("a trusted root with no root role");
+    assert!(
+        matches!(error, VerifyError::MissingRole { role: "root" }),
+        "{error}"
+    );
+
+    // The control: a root signed once by its own key, and a manifest signed once, short of nothing.
+    verify_root_itself(&signed_root(roles(Some(&root_signer)), &root_signer))
+        .expect("signed once by its own key");
+    assert_eq!(
+        verify_manifest(&targets_root, once.as_bytes()).expect("signed once"),
+        written
+    );
+    let alone = signed_by(&written, &[&pair()]);
+    assert!(matches!(
+        verify_manifest(&targets_root, alone.as_bytes()),
+        Err(VerifyError::Threshold)
+    ));
+}
+
+/// A root or a manifest with a member that has no canonical form, here a number with a fraction, is
+/// refused as that and not as a signature short of the threshold: no signature can be made over, or
+/// checked against, a form it does not have.
+#[test]
+fn a_member_with_no_canonical_form_is_refused_as_that() {
+    let signer = pair();
+    let written = members("kalareach-release");
+    let targets_root = root_with(&[tuf_key(&signer)], 1);
+
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&signed_by(&written, &[&signer])).expect("JSON");
+    manifest["signed"]["ratio"] = serde_json::json!(1.5);
+    let error = verify_manifest(&targets_root, manifest.to_string().as_bytes())
+        .expect_err("a manifest with a member that has no canonical form");
+    assert!(matches!(error, VerifyError::NoCanonicalForm(_)), "{error}");
+    assert!(
+        error.to_string().starts_with("it has no canonical form: "),
+        "{error}"
+    );
+
+    let root_signer = pair();
+    let mut root = signed_root(
+        root_of(&[
+            (RoleType::Root, vec![tuf_key(&root_signer)], 1),
+            (RoleType::Targets, vec![tuf_key(&pair())], 1),
+            (RoleType::Snapshot, vec![tuf_key(&pair())], 1),
+            (RoleType::Timestamp, vec![tuf_key(&pair())], 1),
+        ]),
+        &root_signer,
+    );
+    verify_root_itself(&root).expect("the root, before a member is added, is signed by its key");
+    root.signed
+        ._extra
+        .insert("ratio".to_owned(), serde_json::json!(1.5));
+    let error = verify_root_itself(&root).expect_err("a root with a member that has no form");
+    assert!(matches!(error, VerifyError::NoCanonicalForm(_)), "{error}");
+    let error = verify_root_by(&root.signed, &root).expect_err("the same, as a successor");
+    assert!(matches!(error, VerifyError::NoCanonicalForm(_)), "{error}");
+}
