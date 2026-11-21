@@ -24,6 +24,7 @@ const SIGNED_IN = {
   name: null,
   usage_readable: false,
   generation: 'aaaa',
+  mark: 'ab'.repeat(32),
   outcome: null
 } as const
 

@@ -24,6 +24,7 @@ import type { HostPort, StoredHold, TerminalPlace } from '../host/port'
 import { AnnouncementScope } from '../components/announcements'
 import { closeSheets, type ToastAction, type ToastMessage } from '../components/ui'
 import { ChannelShelf } from '../model/channel-messages'
+import { AccountMark, stampedPort } from '../host/stamped'
 import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
 import { PairedUploads } from '../model/paired-uploads'
@@ -127,7 +128,7 @@ const CONFIRMATIONS_TOPIC = 'owner-confirmations'
 
 /** Provides the port and the place to everything under it. */
 export function AppProvider({
-  port,
+  port: hostPort,
   children,
   initialPlace = { view: 'attention' },
   uploadPollMs
@@ -138,6 +139,12 @@ export function AppProvider({
   /** How often the application is asked how far the open uploads are. A case asks often. */
   readonly uploadPollMs?: number
 }): ReactNode {
+  // The account the window acts under: every command that acts for an account carries its mark,
+  // which native code compares with the account signed in at the command's entry.
+  const [accountMark] = useState(() => new AccountMark())
+  const markNow = accountMark.read
+  const port = useMemo(() => stampedPort(hostPort, markNow), [hostPort, markNow])
+  useEffect(() => accountMark.follow(hostPort), [hostPort, accountMark])
   const [place, setPlace] = useState<Place>(initialPlace)
   const [toast, setToast] = useState<ToastMessage | null>(null)
   const [tabs, setTabs] = useState<readonly string[]>([])

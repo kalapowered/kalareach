@@ -25,6 +25,7 @@ const SIGNED_IN = {
   name: null,
   usage_readable: false,
   generation: 'aaaa',
+  mark: 'ab'.repeat(32),
   outcome: null
 } as const
 
@@ -163,7 +164,7 @@ describe('recovery', () => {
     await person.click(within(recovery).getByTestId('recovery-sign-in'))
     expect(controls.recovery.signedInForRecovery).toBe(1)
     act(() => {
-      controls.account.finishSignIn({ ...SIGNED_IN, generation: 'bbbb' })
+      controls.account.finishSignIn({ ...SIGNED_IN, generation: 'bbbb', mark: 'ab'.repeat(32) })
       controls.recovery.set({ blocker: null })
     })
     await waitFor(() => {
@@ -181,7 +182,7 @@ describe('recovery', () => {
       controls.recovery.set({
         blocker: { reason: 'wrong_service', sync_service: 'sync.example', account: 'reach.kala.to' }
       })
-      controls.account.set({ ...SIGNED_IN, generation: 'cccc' })
+      controls.account.set({ ...SIGNED_IN, generation: 'cccc', mark: 'ab'.repeat(32) })
     })
     await waitFor(() => {
       expect(within(recovery).getByTestId('recovery-blocker')).toHaveAttribute(

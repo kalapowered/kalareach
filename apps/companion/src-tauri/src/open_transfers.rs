@@ -1989,6 +1989,24 @@ impl Desk {
         }
     }
 
+    /// Whether `transfer_id` names an upload that another account of this device holds on this host:
+    /// the host knows the device and not the account, so a read of its status for `who` is refused
+    /// here when it is not `who`'s.
+    #[must_use]
+    pub fn is_another_accounts(&self, who: &Who, transfer_id: TransferId) -> bool {
+        let lives: Vec<Arc<Live>> = locked(&self.registry).held.values().cloned().collect();
+        let held = lives
+            .iter()
+            .any(|live| live.transfer() == Some(transfer_id) && !live.owner.is_whose(who));
+        held || self.store().is_ok_and(|store| {
+            store
+                .all()
+                .entries
+                .iter()
+                .any(|file| file.transfer_id == Some(transfer_id) && !file.is_whose(who))
+        })
+    }
+
     /// The handle of the published upload `transfer_id` was bound to a draft by `who`: that
     /// account's entry for it ends, in its key's turn, and read again under the turn. Another
     /// account's entry is never removed here.

@@ -60,7 +60,7 @@ describe('signing in hands the ceremony to the system browser (KR-REQ-17.19)', (
         email: 'sam@example.com',
         name: null,
         usage_readable: true,
-        generation: 'aaaa',
+        generation: 'aaaa', mark: 'ab'.repeat(32),
         outcome: null
       })
     })

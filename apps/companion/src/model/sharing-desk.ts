@@ -15,6 +15,7 @@
  */
 
 import type { HostPort } from '../host/port'
+import { rootOf } from '../host/stamped'
 
 /** A revocation the page has been told of, kept because the host's list drops resolved grants. */
 export interface Revoked {
@@ -204,10 +205,10 @@ const desks = new WeakMap<HostPort, SharingDesk>()
 
 /** The desk of a port. */
 export function deskOf(port: HostPort): SharingDesk {
-  let desk = desks.get(port)
+  let desk = desks.get(rootOf(port))
   if (desk === undefined) {
     desk = new SharingDesk()
-    desks.set(port, desk)
+    desks.set(rootOf(port), desk)
   }
   return desk
 }

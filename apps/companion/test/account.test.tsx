@@ -58,7 +58,7 @@ describe('the desktop Account sheet', () => {
         email: 'sam@example.com',
         name: null,
         usage_readable: false,
-        generation: 'aaaa',
+        generation: 'aaaa', mark: 'ab'.repeat(32),
         outcome: null
       })
     })
@@ -75,7 +75,7 @@ describe('the desktop Account sheet', () => {
       email,
       name: null,
       usage_readable: true,
-      generation,
+      generation, mark: 'ab'.repeat(32),
       outcome: null
     })
     const line = (generation: string, used: number) => ({
@@ -146,7 +146,7 @@ describe('the desktop Account sheet', () => {
         email: 'sam@example.com',
         name: null,
         usage_readable: false,
-        generation: 'aaaa',
+        generation: 'aaaa', mark: 'ab'.repeat(32),
         outcome: null
       })
     })
@@ -173,7 +173,7 @@ describe('the desktop Account sheet', () => {
         email: 'sam@example.com',
         name: 'Sam',
         usage_readable: false,
-        generation: 'aaaa',
+        generation: 'aaaa', mark: 'ab'.repeat(32),
         outcome: 'sign_out_failed'
       },
       { state: 'ended' },
@@ -256,7 +256,7 @@ describe('where the device stands is read once the panel is listening (KR-REQ-13
     email: 'sam@example.com',
     name: null,
     usage_readable: false,
-    generation: 'aaaa',
+    generation: 'aaaa', mark: 'ab'.repeat(32),
     outcome: null
   }
 

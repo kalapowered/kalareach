@@ -37,7 +37,7 @@ const SIGNED_IN: AccountView = {
   email: 'sam@example.com',
   name: null,
   usage_readable: false,
-  generation: 'aaaa',
+  generation: 'aaaa', mark: 'ab'.repeat(32),
   outcome: null
 }
 

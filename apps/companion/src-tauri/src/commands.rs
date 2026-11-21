@@ -1229,6 +1229,7 @@ async fn send_prompt(
     opening: Option<&str>,
     method: Method,
     supersedes: Option<&Supersedes>,
+    mark: Option<&str>,
 ) -> Result<Settled> {
     let typed: kr_protocol::agent::AgentPromptParams = decode(params)?;
     typed.validate().map_err(CommandError::invalid)?;
@@ -1238,6 +1239,9 @@ async fn send_prompt(
         // The account the prompt was made under is read once, before it is sent: the record of the
         // draft it used is ended for that account, whatever the sign-in has become since.
         let paired = if state.paired_context().is_some() {
+            // A mark that is not the account's is refused here, at the command's entry; a host that
+            // cannot be reached is not (the prompt goes on the session's own link).
+            state.check_stamp(mark).await?;
             state.paired().await.ok()
         } else {
             None
@@ -1292,6 +1296,7 @@ pub async fn agent_prompt_submit(
     params: Value,
     opening: Option<String>,
     supersedes: Option<Supersedes>,
+    mark: Option<String>,
 ) -> Result<Settled> {
     send_prompt(
         &state,
@@ -1300,6 +1305,7 @@ pub async fn agent_prompt_submit(
         opening.as_deref(),
         Method::AgentPromptSubmit,
         supersedes.as_ref(),
+        mark.as_deref(),
     )
     .await
 }
@@ -1313,6 +1319,7 @@ pub async fn agent_prompt_queue(
     links: State<'_, crate::agent::WorkerLinks>,
     params: Value,
     opening: Option<String>,
+    mark: Option<String>,
 ) -> Result<Settled> {
     send_prompt(
         &state,
@@ -1321,6 +1328,7 @@ pub async fn agent_prompt_queue(
         opening.as_deref(),
         Method::AgentPromptQueue,
         None,
+        mark.as_deref(),
     )
     .await
 }
@@ -1785,11 +1793,30 @@ pub async fn history_page(
         };
     encode(&page)
 }
-read_command!(
-    /// Reads how much of an upload the host already holds.
-    attachment_upload_status, Method::UploadStatus,
-    kr_protocol::transfer::UploadStatusParams => kr_protocol::transfer::UploadStatusResult
-);
+/// Reads how much of an upload the host already holds. On a host this device is paired with the
+/// host knows the device and not the account, so the account is checked here: the mark is the
+/// account's, and the upload is not one that another account of this device holds.
+#[tauri::command]
+pub async fn attachment_upload_status(
+    state: State<'_, AppState>,
+    params: Value,
+    mark: Option<String>,
+) -> Result<Value> {
+    let typed: kr_protocol::transfer::UploadStatusParams = decode(params)?;
+    if state.paired_context().is_some() {
+        let who = state.paired_who_for(mark.as_deref()).await?;
+        if state
+            .transfers()
+            .is_another_accounts(&who, typed.transfer_id)
+        {
+            return Err(CommandError::invalid(crate::open_transfers::NO_OPEN_UPLOAD));
+        }
+    }
+    let session = state.session()?;
+    let answer: kr_protocol::transfer::UploadStatusResult =
+        session.read(Method::UploadStatus, &typed).await?;
+    encode(&answer)
+}
 
 mutate_result_command!(
     /// Creates a session, and answers with the method's own result: the page names the new session
@@ -1805,11 +1832,12 @@ pub async fn draft_set_text(
     subject: Subject,
     session_id: String,
     text: String,
+    mark: Option<String>,
 ) -> Result<Value> {
     let session_id = session_id
         .parse()
         .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
-    let paired = state.paired().await?;
+    let paired = state.paired_for(mark.as_deref()).await?;
     let target = subject.target(paired.environment_id)?;
     encode(
         &state
@@ -1883,12 +1911,13 @@ pub async fn draft_create(
     state: State<'_, AppState>,
     subject: Subject,
     params: Value,
+    mark: Option<String>,
 ) -> Result<Settled> {
     let typed: kr_protocol::transfer::DraftCreateParams = decode(params)?;
     if state.paired_context().is_some() {
         // A device makes its draft at the first bind and never before: this answers the draft it
         // keeps for the session, or that none is made yet.
-        let paired = state.paired().await?;
+        let paired = state.paired_for(mark.as_deref()).await?;
         let Some(session_id) = typed.session_id.as_ref().copied() else {
             return Err(CommandError::invalid(
                 "a draft on a paired host needs a session: open one first",
@@ -1928,12 +1957,13 @@ pub async fn draft_add_attachment(
     state: State<'_, AppState>,
     subject: Subject,
     params: Value,
+    mark: Option<String>,
 ) -> Result<Settled> {
     if state.paired_context().is_some() {
         // The draft is this device's to keep: it is made at the first bind and used again after.
         let bind: crate::paired_drafts::Bind = decode(params)?;
         let transfer_id = bind.transfer_id;
-        let paired = state.paired().await?;
+        let paired = state.paired_for(mark.as_deref()).await?;
         let who = paired.who();
         let target = subject.target(paired.environment_id)?;
         let bound = state.paired_drafts().bind(paired, target, bind).await?;
@@ -1970,11 +2000,12 @@ pub async fn draft_end(
     state: State<'_, AppState>,
     subject: Subject,
     session_id: String,
+    mark: Option<String>,
 ) -> Result<()> {
     let session_id = session_id
         .parse()
         .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
-    let paired = state.paired().await?;
+    let paired = state.paired_for(mark.as_deref()).await?;
     let target = subject.target(paired.environment_id)?;
     state.paired_drafts().end(paired, target, session_id).await
 }
@@ -2875,13 +2906,17 @@ pub async fn attachment_upload(
     path: String,
     session_id: Option<String>,
     transfer_key: Option<String>,
+    mark: Option<String>,
 ) -> Result<Value> {
-    let key = if state.paired_context().is_some() {
+    let (key, entered) = if state.paired_context().is_some() {
+        // The stamp is checked at the entry, before the file's path is taken or anything is read;
+        // the connection read here is the one the upload goes on.
+        let entered = state.paired_for(mark.as_deref()).await?;
         let key = transfer_key_of(transfer_key)?;
         refuse_cancelled(&state, key)?;
-        Some(key)
+        (Some(key), Some(entered))
     } else {
-        None
+        (None, None)
     };
     // Only a file this window was actually given. The platform hands the backend a path when a
     // person drops something on the window, and that path is spent by one upload. A path the page
@@ -2895,8 +2930,7 @@ pub async fn attachment_upload(
                 .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
         ),
     };
-    if let Some(key) = key {
-        let paired = state.paired().await?;
+    if let (Some(key), Some(paired)) = (key, entered) {
         let target = subject.target(paired.environment_id)?;
         let handle = crate::transfers::upload_paired(
             &state.transfers(),
@@ -2942,23 +2976,29 @@ fn transfer_key_of(key: Option<String>) -> Result<kr_protocol::scalars::Uuid> {
 /// connection to the host, so that an upload whose connection ended reads as paused while the host
 /// is out of reach.
 #[tauri::command]
-pub async fn uploads_open(state: State<'_, AppState>) -> Result<Value> {
-    let who = state.paired_who().await?;
+pub async fn uploads_open(state: State<'_, AppState>, mark: Option<String>) -> Result<Value> {
+    let who = state.paired_who_for(mark.as_deref()).await?;
     encode(&state.transfers().open(&who))
 }
 
 /// Cancels one upload this device holds open on the host it is paired with, and answers from the
 /// host's own answer: the bytes it released, or that the upload was already published and is kept.
 #[tauri::command]
-pub async fn upload_cancel(state: State<'_, AppState>, transfer_key: String) -> Result<Value> {
+pub async fn upload_cancel(
+    state: State<'_, AppState>,
+    transfer_key: String,
+    mark: Option<String>,
+) -> Result<Value> {
     let key = transfer_key_of(Some(transfer_key))?;
     // The cancel needs no connection: with none it is kept and finished at the next reach, and the
-    // application says whose uploads it reads from the host it is paired with.
-    let paired = state.paired().await.ok();
-    let who = match &paired {
-        Some(paired) => paired.who(),
-        None => state.paired_who().await?,
-    };
+    // application says whose uploads it reads from the host it is paired with. The mark is checked
+    // first, whether or not there is a connection.
+    let who = state.paired_who_for(mark.as_deref()).await?;
+    let paired = state
+        .paired()
+        .await
+        .ok()
+        .filter(|paired| paired.account == who.account);
     let answer = state.transfers().cancel(who, paired, key).await?;
     if answer.state != "asked" {
         return encode(&answer);
@@ -2977,6 +3017,9 @@ pub const HANDED_NAME_HEADER: &str = "kr-file-name";
 
 /// The header the key a handed file's upload is named by comes in: a UUID the page chooses.
 pub const HANDED_KEY_HEADER: &str = "kr-transfer-key";
+
+/// The header the mark of the account the page acted under comes in, on a handed file's upload.
+pub const HANDED_MARK_HEADER: &str = "kr-mark";
 
 /// The header the subject of a handed file's upload comes in, as the JSON a subject takes.
 pub const HANDED_SUBJECT_HEADER: &str = "kr-subject";
@@ -3015,7 +3058,20 @@ pub async fn attachment_upload_bytes(
         )
         .map_err(|error| CommandError::invalid(format!("that is not a subject: {error}")))?,
     };
-    let key = if state.paired_context().is_some() {
+    let mark = request
+        .headers()
+        .get(HANDED_MARK_HEADER)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| CommandError::invalid("the account's mark is not header text"))
+        })
+        .transpose()?;
+    let (key, entered) = if state.paired_context().is_some() {
+        // The stamp is checked at the entry, before the file is made of the bytes; the connection
+        // read here is the one the upload goes on.
+        let entered = state.paired_for(mark.as_deref()).await?;
         let key = transfer_key_of(
             request
                 .headers()
@@ -3029,9 +3085,9 @@ pub async fn attachment_upload_bytes(
                 .transpose()?,
         )?;
         refuse_cancelled(&state, key)?;
-        Some(key)
+        (Some(key), Some(entered))
     } else {
-        None
+        (None, None)
     };
     let file = crate::transfers::HandedFile::new(bytes.clone(), &name)?;
     let session_id = match subject.session_id.as_deref() {
@@ -3042,8 +3098,7 @@ pub async fn attachment_upload_bytes(
                 .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
         ),
     };
-    if let Some(key) = key {
-        let paired = state.paired().await?;
+    if let (Some(key), Some(paired)) = (key, entered) {
         let target = subject.target(paired.environment_id)?;
         let handle = crate::transfers::upload_handed_paired(
             &state.transfers(),

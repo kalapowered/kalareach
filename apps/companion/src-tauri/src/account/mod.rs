@@ -105,11 +105,17 @@ pub enum AccountView {
         usage_readable: bool,
         /// Which grant this is, so usage read for another is never shown for it.
         generation: String,
+        /// The account, as the hex digest the records of an account are kept under. It says nothing
+        /// of who the account is, and it is the same across a renewal and a later sign-in of the
+        /// same account.
+        mark: String,
         /// How the last sign-out ended, when it left the account signed in.
         outcome: Option<Outcome>,
     },
     /// The sign-in on this device ended by itself.
     Ended,
+    /// The status could not be read: nothing is said of the account, and no change is assumed.
+    Unreadable,
 }
 
 /// One usage line, in words and figures for a meter.
@@ -299,24 +305,30 @@ impl Account {
                 Phase::Idle => {}
             }
         }
-        match self.signed_in.status() {
-            Ok(AccountStatus::SignedIn {
-                email,
-                name,
-                scopes,
-                generation,
-            }) => AccountView::SignedIn {
+        // The status and the mark come from one read of the grant.
+        match self.signed_in.status_marked(self.origin.as_str()) {
+            Ok((
+                AccountStatus::SignedIn {
+                    email,
+                    name,
+                    scopes,
+                    generation,
+                },
+                Some(mark),
+            )) => AccountView::SignedIn {
                 email,
                 name,
                 usage_readable: scopes.iter().any(|scope| scope == USAGE_SCOPE),
                 generation,
+                mark: mark.to_hex(),
                 // Only a sign-out that failed leaves an outcome beside a signed-in account.
                 outcome: self
                     .outcome()
                     .filter(|outcome| *outcome == Outcome::SignOutFailed),
             },
-            Ok(AccountStatus::Ended) => AccountView::Ended,
-            Ok(AccountStatus::SignedOut) | Err(_) => match self.carrier.plan().await {
+            Ok((AccountStatus::SignedIn { .. }, None)) | Err(_) => AccountView::Unreadable,
+            Ok((AccountStatus::Ended, _)) => AccountView::Ended,
+            Ok((AccountStatus::SignedOut, _)) => match self.carrier.plan().await {
                 Err(Unavailable::NoReturningBrowser) => AccountView::Unavailable {
                     reason: UnavailableReason::NoReturningBrowser,
                 },

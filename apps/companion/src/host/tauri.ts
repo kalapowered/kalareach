@@ -249,8 +249,12 @@ export function tauriPort(): HostPort {
 
   const read = <T,>(command: string, params: unknown): Promise<T> => call<T>(command, { params })
 
-  const mutate = <T,>(command: string, params: unknown, subject: SessionSubject): Promise<T> =>
-    call<T>(command, { params, subject })
+  const mutate = <T,>(
+    command: string,
+    params: unknown,
+    subject: SessionSubject,
+    extra: Record<string, unknown> = {}
+  ): Promise<T> => call<T>(command, { params, subject, ...extra })
 
   // A command about a session also names the opening of the screen making it. An opening that is
   // left out is no opening: native code serves the call over a link kept for calls made outside
@@ -320,9 +324,10 @@ export function tauriPort(): HostPort {
     agentSnapshot: (params, opening) => readIn('agent_snapshot', params, opening),
     agentCommands: (params, opening) => readIn('agent_commands', params, opening),
     approvalInspect: (params, opening) => readIn('agent_approval_inspect', params, opening),
-    composerSubmit: (params, opening, supersedes) =>
-      call('agent_prompt_submit', { params, opening, supersedes }),
-    composerQueue: (params, opening) => call('agent_prompt_queue', { params, opening }),
+    composerSubmit: (params, opening, supersedes, mark) =>
+      call('agent_prompt_submit', { params, opening, supersedes, mark }),
+    composerQueue: (params, opening, mark) =>
+      call('agent_prompt_queue', { params, opening, mark }),
     composerSteer: (params, opening) => call('agent_turn_steer', { params, opening }),
     composerInterrupt: (params, opening) => call('agent_turn_cancel', { params, opening }),
     approvalRespond: (params, opening) => call('agent_approval_respond', { params, opening }),
@@ -340,32 +345,36 @@ export function tauriPort(): HostPort {
     deviceChannelHoldUpdate: (request) => read('device_channel_hold_update', request),
     deviceChannelHoldClear: (request) => read('device_channel_hold_clear', request),
     deviceDraftsLedgerSetAside: () => call('device_drafts_ledger_set_aside', {}),
-    draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
+    draftCreate: (params, subject, mark) =>
+      mutate<Settled>('draft_create', params, subject, { mark }),
     // The upload belongs to the same session the subject names; sending the subject without it
     // would reserve the transfer against no session while the action targeted one.
-    attachmentUpload: (path, subject) =>
+    attachmentUpload: (path, subject, mark) =>
       call<AttachmentHandle>('attachment_upload', {
         path,
         subject,
-        sessionId: subject.sessionId ?? null
+        sessionId: subject.sessionId ?? null,
+        mark
       }),
     // The bytes are the call's raw body; the name and the subject travel as its two headers.
-    attachmentUploadBytes: (file, subject, transferKey) =>
+    attachmentUploadBytes: (file, subject, transferKey, mark) =>
       invoking<AttachmentHandle>('attachment_upload_bytes', file.bytes, {
         headers: {
           'kr-file-name': encodeURIComponent(file.name),
           'kr-subject': JSON.stringify(subject),
           // Over a paired host the key names the upload to `uploads_open` and `upload_cancel`.
-          ...(transferKey === undefined ? {} : { 'kr-transfer-key': transferKey })
+          ...(transferKey === undefined ? {} : { 'kr-transfer-key': transferKey }),
+          // The account the page acted under: native code refuses it when it is not the account's.
+          ...(mark === undefined ? {} : { 'kr-mark': mark })
         }
       }),
-    draftAddAttachment: (params, subject) =>
-      mutate<Settled>('draft_add_attachment', params, subject),
-    uploadsOpen: () => call('uploads_open', {}),
-    uploadCancel: (transferKey) => call('upload_cancel', { transferKey }),
-    draftEnd: (subject, sessionId) => call('draft_end', { subject, sessionId }),
-    draftSetText: (subject, sessionId, text) =>
-      call('draft_set_text', { subject, sessionId, text }),
+    draftAddAttachment: (params, subject, mark) =>
+      mutate<Settled>('draft_add_attachment', params, subject, { mark }),
+    uploadsOpen: (mark) => call('uploads_open', { mark }),
+    uploadCancel: (transferKey, mark) => call('upload_cancel', { transferKey, mark }),
+    draftEnd: (subject, sessionId, mark) => call('draft_end', { subject, sessionId, mark }),
+    draftSetText: (subject, sessionId, text, mark) =>
+      call('draft_set_text', { subject, sessionId, text, mark }),
 
     historyPage: (params, opening) => readIn('history_page', params, opening),
     actionRead: (params, opening) => readIn('action_read', params, opening),
