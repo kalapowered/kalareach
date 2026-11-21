@@ -29,7 +29,6 @@ use kr_protocol::launch_commands::{
 };
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{OrganisationListParams, OrganisationListResult};
-use kr_protocol::scalars::U64;
 
 use crate::cli::{
     EnvironmentSelector, LaunchAddArguments, LaunchCommand, LaunchListArguments,
@@ -323,10 +322,6 @@ fn quoted(word: &str) -> String {
     quoted
 }
 
-fn revision(revision: U64) -> u64 {
-    u64::from(revision)
-}
-
 /// `NamedLaunch`, in the shape the protocol answers it.
 fn command_document(command: &NamedLaunch) -> Document {
     Document::new()
@@ -351,7 +346,7 @@ fn list_document(value: &ShellLaunchCommandsListResult) -> Document {
     Document::new()
         .with("commands", commands_document(&value.commands))
         .with("ok", true)
-        .with("revision", revision(value.revision))
+        .with("revision", value.revision)
 }
 
 /// `ShellLaunchCommandsSaveResult`, in the shape the protocol answers it.
@@ -362,7 +357,7 @@ fn save_document(value: &ShellLaunchCommandsSaveResult) -> Document {
         .with("commands", commands_document(&value.commands))
         .with("ok", true)
         .with("replaced", value.replaced)
-        .with("revision", revision(value.revision))
+        .with("revision", value.revision)
 }
 
 /// `ShellLaunchCommandsRemoveResult`, in the shape the protocol answers it.
@@ -372,12 +367,13 @@ fn remove_document(value: &ShellLaunchCommandsRemoveResult) -> Document {
         .with("commands", commands_document(&value.commands))
         .with("ok", true)
         .with("removed", value.removed)
-        .with("revision", revision(value.revision))
+        .with("revision", value.revision)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::scalars::U64;
 
     /// KR-REQ-13.11: a word is shown in double quotes with a backslash and a double quote escaped,
     /// so a line says each word of a command exactly and an empty argument is visible.
@@ -439,6 +435,37 @@ mod tests {
             ),
             "the host's words stand alone"
         );
+    }
+
+    /// KR-REQ-13.11: a revision above 2^53 is written as the protocol writes a `U64`, a decimal
+    /// string, in the list and in both answers to a change, so that a reader that holds a JSON
+    /// number as a double does not round it.
+    #[test]
+    fn a_revision_above_2_pow_53_is_written_as_a_decimal_string_in_every_document() {
+        let revision = U64::new(9_007_199_254_740_993);
+        let listed = list_document(&ShellLaunchCommandsListResult {
+            revision,
+            commands: Vec::new(),
+        });
+        let saved = save_document(&ShellLaunchCommandsSaveResult {
+            applied: true,
+            changed: true,
+            replaced: false,
+            revision,
+            commands: Vec::new(),
+        });
+        let removed = remove_document(&ShellLaunchCommandsRemoveResult {
+            applied: true,
+            removed: true,
+            revision,
+            commands: Vec::new(),
+        });
+        for document in [listed, saved, removed] {
+            assert_eq!(
+                document.json()["revision"],
+                serde_json::Value::String("9007199254740993".to_owned())
+            );
+        }
     }
 
     /// KR-REQ-23.25: planted text in a launch command shows only where the person asked for it: the

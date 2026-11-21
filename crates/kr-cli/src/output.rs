@@ -539,6 +539,14 @@ impl From<u64> for Held {
     }
 }
 
+/// A counter the protocol writes in JSON, as it writes it: a decimal string, so that a reader that
+/// holds a number as a double does not round it.
+impl From<kr_protocol::scalars::U64> for Held {
+    fn from(counter: kr_protocol::scalars::U64) -> Self {
+        Self::plain(serde_json::Value::String(counter.to_string()))
+    }
+}
+
 impl From<usize> for Held {
     fn from(number: usize) -> Self {
         Self::plain(serde_json::Value::from(number))
