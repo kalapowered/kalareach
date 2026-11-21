@@ -269,6 +269,14 @@ fn an_agent_named_for_reduced_ownership_is_reported_as_read_by_no_launch() {
         );
     }
     let chosen = lines_of(&document);
+    assert_eq!(
+        chosen
+            .iter()
+            .filter(|line| line.trim_start().starts_with("agents "))
+            .count(),
+        2,
+        "{chosen:?}"
+    );
     for package in ["kalareach/codex", "kalareach/qoder-cli"] {
         assert!(
             chosen.iter().any(|line| line.trim_start()
