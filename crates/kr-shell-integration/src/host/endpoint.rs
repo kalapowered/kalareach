@@ -469,8 +469,13 @@ mod tests {
         );
 
         let first = HostEndpoint::open_for_session(root.path(), &runtime, first_id).expect("binds");
-        let second =
-            HostEndpoint::open_for_session(root.path(), &runtime, second_id).expect("binds too");
+        let second = HostEndpoint::open_for_session(root.path(), &runtime, second_id);
+        assert!(
+            second.is_ok(),
+            "the second session is given another name: {:?}",
+            second.as_ref().err().map(ToString::to_string)
+        );
+        let second = second.expect("binds too");
         assert_ne!(first.address().path, second.address().path);
         assert_eq!(second.address().validate(), Ok(()));
         assert_eq!(second.session_id(), second_id);
