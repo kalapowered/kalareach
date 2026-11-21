@@ -255,6 +255,13 @@ export class FakeUploads {
     live.reject(failure)
   }
 
+  /** The command fails and the application keeps the upload, paused: a failed journal write does this. */
+  refuseRetaining(key: string, failure: ScriptedFailure): void {
+    const live = this.#need(key)
+    live.state = 'paused'
+    live.reject(failure)
+  }
+
   refuseNext(failure: ScriptedFailure): void {
     this.#refuseNext = failure
   }

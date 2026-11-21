@@ -140,6 +140,21 @@ describe('the store reads the application, and the application is the one that s
     return { uploads, scripted: controls.pairedUploads }
   }
 
+  it('keeps a file the application still holds, with Cancel, when its command failed', async () => {
+    const { uploads, scripted } = reached()
+    const sent = uploads.send({ key: 'k-9', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    const failed = sent.catch(() => undefined)
+    await wait(() => scripted.started.length === 1)
+    scripted.refuseRetaining('k-9', {
+      code: 'RESOURCE_UNAVAILABLE',
+      message: 'this device could not keep a record of the upload: disk full'
+    })
+    await failed
+    const phase = uploads.snapshot().get('k-9')?.phase
+    expect(phase?.kind).not.toBe('refused')
+    expect(phase !== undefined && canCancel(phase)).toBe(true)
+  })
+
   it('shows the file at once, follows its chunks by asking again, and stops asking when it is done', async () => {
     const { uploads, scripted } = reached()
     const sent = uploads.send({ key: 'k-1', sessionId: 's-1', subject, file }, () => Promise.resolve())
