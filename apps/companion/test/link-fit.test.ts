@@ -84,6 +84,13 @@ describe('the room beside a link', () => {
     expect(room.right).toBeGreaterThanOrEqual(17)
   })
 
+  it('ignores a box whose words lie over this one’s across and reach out to its left, as it does one that reaches out to its right', () => {
+    const over: Neighbour = { box: row(50, 120, 120), shares: false }
+    const room = besideOf(row(100, 110), LEAST, [over], column)
+    expect(room.left).toBeGreaterThanOrEqual(17)
+    expect(room.right).toBeGreaterThanOrEqual(17)
+  })
+
   it('does not go past a column that a link already lies outside of', () => {
     const room = besideOf(row(400, 410), LEAST, [], column)
     expect(room.right).toBe(0)
