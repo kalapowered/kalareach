@@ -23,7 +23,7 @@ use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use serde_json::json;
 use support::{
-    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, hosts_of, inbox_read,
+    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, contact_of, hosts_of, inbox_read,
     next_read_hold, pair, phone_paired_with, reference_for, unpaired_phone_controlled,
 };
 use tauri::Manager as _;
@@ -559,20 +559,25 @@ async fn the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use() 
     // the same moment at the next visit.
     control.unreachable(true);
     let visited = companion.call("inbox_hosts", json!({})).expect("a visit");
-    assert_eq!(visited.as_array().map(Vec::len), Some(1), "{visited}");
-    assert_eq!(visited[0]["reference"], other.as_str());
-    assert_eq!(visited[0]["state"], "out_of_contact", "{visited}");
-    assert!(visited[0]["result"].is_null(), "{visited}");
-    let since = visited[0]["lost_since_ms"].as_u64().expect("since when");
-    let again = companion.call("inbox_hosts", json!({})).expect("a visit");
-    assert_eq!(again[0]["lost_since_ms"].as_u64(), Some(since), "{again}");
+    assert_eq!(hosts_of(&visited).len(), 1, "{visited}");
+    assert_eq!(hosts_of(&visited)[0]["reference"], other.as_str());
+    let lost = contact_of(companion, &other);
+    assert_eq!(lost["state"], "out_of_contact", "{lost}");
+    assert!(hosts_of(&visited)[0]["result"].is_null(), "{visited}");
+    let since = lost["since_ms"].as_u64().expect("since when");
+    companion.call("inbox_hosts", json!({})).expect("a visit");
+    assert_eq!(
+        contact_of(companion, &other)["since_ms"].as_u64(),
+        Some(since)
+    );
 
     // It can be reached: its inbox is read, and the loss is gone.
     control.unreachable(false);
     let read = companion.call("inbox_hosts", json!({})).expect("a visit");
-    assert_eq!(read[0]["state"], "read", "{read}");
-    assert!(read[0]["lost_since_ms"].is_null(), "{read}");
-    let mut found = rules(&read[0]);
+    let contact = contact_of(companion, &other);
+    assert_eq!(contact["state"], "in_contact", "{contact}");
+    assert!(hosts_of(&read)[0]["result"].is_object(), "{read}");
+    let mut found = rules(&hosts_of(&read)[0]);
     found.sort();
     assert_eq!(
         found,
@@ -585,20 +590,20 @@ async fn the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use() 
         .call("hosts_use", json!({ "reference": other }))
         .expect("the host is chosen");
     let after = companion.call("inbox_hosts", json!({})).expect("a visit");
-    assert_eq!(after.as_array().map(Vec::len), Some(1), "{after}");
-    assert_ne!(after[0]["reference"], other.as_str(), "{after}");
-    assert_eq!(after[0]["state"], "read");
-
-    // Forgetting the other leaves nothing to visit.
-    let remaining = after[0]["reference"]
+    assert_eq!(hosts_of(&after).len(), 1, "{after}");
+    assert_ne!(hosts_of(&after)[0]["reference"], other.as_str(), "{after}");
+    let remaining = hosts_of(&after)[0]["reference"]
         .as_str()
         .expect("a reference")
         .to_owned();
+    assert_eq!(contact_of(companion, &remaining)["state"], "in_contact");
+
+    // Forgetting the other leaves nothing to visit.
     companion
         .call("hosts_forget", json!({ "reference": remaining }))
         .expect("the host is forgotten");
     let none = companion.call("inbox_hosts", json!({})).expect("a visit");
-    assert_eq!(none.as_array().map(Vec::len), Some(0), "{none}");
+    assert_eq!(hosts_of(&none).len(), 0, "{none}");
     first.stop().await;
     second.stop().await;
 }
@@ -622,29 +627,33 @@ async fn a_host_that_refuses_the_visit_is_in_contact_and_listed_as_having_refuse
     // Out of contact first, with a moment it was lost.
     control.unreachable(true);
     let lost = companion.call("inbox_hosts", json!({})).expect("a visit");
-    assert_eq!(lost[0]["state"], "out_of_contact", "{lost}");
-    assert!(lost[0]["lost_since_ms"].is_u64(), "{lost}");
-    assert!(lost[0]["refusal"].is_null(), "{lost}");
+    let other = hosts_of(&lost)[0]["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned();
+    let contact = contact_of(companion, &other);
+    assert_eq!(contact["state"], "out_of_contact", "{contact}");
+    assert!(contact["since_ms"].is_u64(), "{contact}");
+    assert!(contact["refusal"].is_null(), "{contact}");
 
     // The host answers and refuses: it is in contact, and the refusal is the host's own.
     control.unreachable(false);
     control.refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
     let refused = companion.call("inbox_hosts", json!({})).expect("a visit");
-    assert_eq!(refused.as_array().map(Vec::len), Some(1), "{refused}");
-    assert_eq!(refused[0]["state"], "refused", "{refused}");
-    assert_eq!(
-        refused[0]["refusal"]["code"], "PERMISSION_DENIED",
-        "{refused}"
-    );
-    assert!(refused[0]["lost_since_ms"].is_null(), "{refused}");
-    assert!(refused[0]["result"].is_null(), "{refused}");
-    assert_eq!(refused[0]["sessions"], json!([]), "{refused}");
+    assert_eq!(hosts_of(&refused).len(), 1, "{refused}");
+    let contact = contact_of(companion, &other);
+    assert_eq!(contact["state"], "refused", "{contact}");
+    assert_eq!(contact["refusal"]["code"], "PERMISSION_DENIED", "{contact}");
+    assert!(contact["since_ms"].is_null(), "{contact}");
+    assert!(hosts_of(&refused)[0]["result"].is_null(), "{refused}");
+    assert_eq!(hosts_of(&refused)[0]["sessions"], json!([]), "{refused}");
 
     // It stops refusing: its inbox is read.
     control.refuse(None);
     let read = companion.call("inbox_hosts", json!({})).expect("a visit");
-    assert_eq!(read[0]["state"], "read", "{read}");
-    assert!(read[0]["refusal"].is_null(), "{read}");
+    let contact = contact_of(companion, &other);
+    assert_eq!(contact["state"], "in_contact", "{contact}");
+    assert!(hosts_of(&read)[0]["result"].is_object(), "{read}");
 
     first.stop().await;
     second.stop().await;
@@ -672,8 +681,13 @@ async fn a_visit_says_which_request_the_host_refused() {
     let lapsed = Refusal::BehindItsFeed.to_protocol_error();
     let visit = |what: &str| {
         let visit = companion.call("inbox_hosts", json!({})).expect("a visit");
-        assert_eq!(visit.as_array().map(Vec::len), Some(1), "{what}: {visit}");
-        visit
+        assert_eq!(hosts_of(&visit).len(), 1, "{what}: {visit}");
+        contact_of(
+            companion,
+            hosts_of(&visit)[0]["reference"]
+                .as_str()
+                .expect("a reference"),
+        )
     };
     // Each request, refused with the words a host under a lapsed bound gives all three. A refused
     // visit keeps no connection, so each of the first three is made over a fresh one.
@@ -684,38 +698,36 @@ async fn a_visit_says_which_request_the_host_refused() {
     ] {
         control.refuse_request(Some((method, lapsed.clone())));
         let refused = visit(asked);
-        assert_eq!(refused[0]["state"], "refused", "{asked}: {refused}");
-        assert_eq!(refused[0]["refused_request"], asked, "{refused}");
+        assert_eq!(refused["state"], "refused", "{asked}: {refused}");
+        assert_eq!(refused["request"], asked, "{refused}");
         assert!(
-            refused[0]["refusal"]["message"]
+            refused["refusal"]["message"]
                 .as_str()
                 .is_some_and(|said| said.ends_with(lapsed.message.as_str())),
             "{asked}: the host's own words: {refused}"
         );
-        assert!(refused[0]["lost_since_ms"].is_null(), "{asked}: {refused}");
+        assert!(refused["since_ms"].is_null(), "{asked}: {refused}");
     }
 
     // The inbox refused over a connection the host answered on before is the inbox's refusal too.
     control.refuse_request(None);
     let read = visit("read");
-    assert_eq!(read[0]["state"], "read", "{read}");
-    assert!(read[0]["refused_request"].is_null(), "{read}");
+    assert_eq!(read["state"], "in_contact", "{read}");
     control.refuse_request(Some((Method::AttentionRead, lapsed.clone())));
     let kept = visit("kept");
-    assert_eq!(kept[0]["state"], "refused", "{kept}");
-    assert_eq!(kept[0]["refused_request"], "attention_read", "{kept}");
+    assert_eq!(kept["state"], "refused", "{kept}");
+    assert_eq!(kept["request"], "attention_read", "{kept}");
 
     // A host that refuses the connection before any request is told apart from all of them.
     control.refuse_request(None);
     control.refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
     let connection_refused = visit("connection");
-    assert_eq!(connection_refused[0]["state"], "refused");
-    assert_eq!(connection_refused[0]["refused_request"], "connection");
+    assert_eq!(connection_refused["state"], "refused");
+    assert_eq!(connection_refused["request"], "connection");
 
     control.refuse(None);
     let read = visit("read again");
-    assert_eq!(read[0]["state"], "read", "{read}");
-    assert!(read[0]["refused_request"].is_null(), "{read}");
+    assert_eq!(read["state"], "in_contact", "{read}");
 
     first.stop().await;
     second.stop().await;

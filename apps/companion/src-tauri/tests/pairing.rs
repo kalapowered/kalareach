@@ -911,7 +911,8 @@ async fn a_silent_host_holds_up_no_other_hosts_confirmations() {
 /// host is listed out of contact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_silent_host_holds_up_no_other_hosts_inbox() {
-    use companion_tauri::inbox::{HostInboxState, InboxDesk, VISIT_WITHIN};
+    use companion_tauri::inbox::testing::HostInboxState;
+    use companion_tauri::inbox::{InboxDesk, VISIT_WITHIN};
 
     let owner_keys = DeviceKeys::generate().expect("keys");
     let host = Host::start(&owner_keys).await;
@@ -927,13 +928,14 @@ async fn a_silent_host_holds_up_no_other_hosts_inbox() {
 
     let visits = tokio::time::timeout(VISIT_WITHIN * 2, desk.visit(&device))
         .await
-        .expect("the visit does not wait on the silent host past its bound");
+        .expect("the visit does not wait on the silent host past its bound")
+        .hosts;
     silent.accepted(1).await;
     let state_of = |name: &str| {
         visits
             .iter()
             .find(|each| each.name == name)
-            .map(|each| each.state)
+            .map(|each| desk.seen(each).state)
     };
     assert_eq!(visits.len(), 2);
     assert_eq!(state_of("the test host"), Some(HostInboxState::Read));

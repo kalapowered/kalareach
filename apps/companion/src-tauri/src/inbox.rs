@@ -7,23 +7,24 @@
 //! session numbers the rows are named by, and ends within [`VISIT_WITHIN`], so a host that takes the
 //! connection and answers nothing is out of contact for that pass and holds up no other.
 //!
-//! What a host answers is shown as the host's. A host that cannot be reached, or does not answer
-//! in time, is out of contact: that says nothing of what its sessions are doing, and the answer
-//! carries only since when contact has been lost, which this device noted itself. A host that
-//! answers and refuses is in contact, and is not that: it is shown as having refused, with the
-//! request of the visit it refused (the connection, who it is, the opening of its session, or its
-//! inbox) and the refusal it sent, and no loss of contact is noted for it. A host that is out of
-//! its offline-validity bound refuses all of them alike, so the words it gives cannot say which.
-//! So is a host of a member's device that
-//! cannot be given the lease its organisation signs for it, because the device is signed out or is
-//! not a member: the refusal is the reason in words, and the host is asked nothing.
+//! What a visit finds is the owner's ([`crate::contact`]): the contact with each host, since when
+//! contact was lost, the inbox last read and the connection it was read over are held there, and
+//! each visit commits its outcome as it ends. A host that cannot be reached, or does not answer in
+//! time, is out of contact: that says nothing of what its sessions are doing, and the loss has the
+//! moment this device noted it. A host that answers and refuses is in contact, and is not that: it
+//! is shown as having refused, with the request of the visit it refused (the connection, who it is,
+//! the opening of its session, or its inbox) and the refusal it sent, and no loss of contact is
+//! noted for it. A host that is out of its offline-validity bound refuses all of them alike, so the
+//! words it gives cannot say which. So is a host of a member's device that cannot be given the lease
+//! its organisation signs for it, because the device is signed out or is not a member: the refusal
+//! is the reason in words, and the host is asked nothing.
 //!
-//! Nothing is written to disk. Which connections are open and since when contact was lost are the
-//! memory of this run; a run that has just started has no loss to report, and says only that
-//! contact is not there.
+//! A pass answers with what the owner holds of each host it visited, read together, and checks the
+//! account each read was made for. Nothing is written to disk: a run that has just started has no
+//! loss to report, and says only that contact is not there.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::ClientError;
@@ -37,10 +38,13 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::{DisplayNumber, SessionListParams, SessionListResult};
 use serde::Serialize;
+use serde::ser::SerializeStruct as _;
 
 use crate::connection::{Asked, Connection, Unanswered, Unopened};
+use crate::contact::{
+    Admit, Begin, Committed, ContactOwner, Found, Outcome, Row, StoredRead, VisitTicket,
+};
 use crate::device::Device;
-use crate::device::hosts::{UNNAMED_HOST, reference_of};
 use crate::error::CommandError;
 
 /// How long one visit to a host may take, from connecting to the end of its answer. A host that has
@@ -53,17 +57,9 @@ const PAGE_ITEMS: u64 = 200;
 /// The most pages one read of an inbox follows: sixteen pages hold every item a host retains.
 const MAX_PAGES: usize = 16;
 
-/// Where one host stood when it was last visited.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostInboxState {
-    /// The host answered, and the result is its inbox.
-    Read,
-    /// The host answered and refused. It is in contact: the refusal is what it said.
-    Refused,
-    /// The host could not be reached or did not answer in time.
-    OutOfContact,
-}
+/// How many times a pass retires the reads whose account has left and looks again before it hands
+/// on a row with its read left out.
+const RETIREMENTS: usize = 3;
 
 /// A session of a host, by the number the host gives it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -74,64 +70,132 @@ pub struct NumberedSession {
     pub display_number: DisplayNumber,
 }
 
-/// What a visit to one host found.
-#[derive(Clone, Debug, Serialize)]
+/// What a pass found of one host: the inbox the owner holds of it, when it holds one. How contact
+/// with the host stands is the owner's publication's, in `others`.
+#[derive(Clone, Debug)]
 pub struct HostInbox {
     /// The host, by the reference the pairing screen lists it under.
     pub reference: String,
     /// The name the host gives people.
     pub name: String,
-    /// Where the host stood.
-    pub state: HostInboxState,
-    /// When the inbox was read, as this device's clock says, when it was.
-    pub read_at_ms: Option<u64>,
-    /// Since when this device has not been in contact with the host, as its own clock says, when it
-    /// was not at this visit.
-    pub lost_since_ms: Option<u64>,
-    /// What the host refused with, when it answered and refused.
-    pub refusal: Option<CommandError>,
-    /// What the visit asked when the host refused, when it did.
-    pub refused_request: Option<Asked>,
-    /// The host's inbox, when it was read.
-    pub result: Option<AttentionReadResult>,
-    /// The host's sessions by number, when its inbox was read.
-    pub sessions: Vec<NumberedSession>,
+    /// The page may show an inbox of this host only under this epoch.
+    pub inbox_epoch: u64,
+    read: Option<Arc<StoredRead>>,
 }
 
-/// The connections kept to the hosts visited, and since when contact with each has been lost.
-#[derive(Debug, Default)]
+impl HostInbox {
+    fn of(row: &Row) -> Self {
+        Self {
+            reference: row.reference.clone(),
+            name: row.name.clone(),
+            inbox_epoch: row.inbox_epoch,
+            read: row.read.clone(),
+        }
+    }
+
+    /// The order the inbox was read in, among every read of every host.
+    #[must_use]
+    pub fn read_serial(&self) -> Option<u64> {
+        self.read.as_ref().map(|read| read.serial())
+    }
+
+    /// When the inbox was read, as this device's clock says, when it was.
+    #[must_use]
+    pub fn read_at_ms(&self) -> Option<u64> {
+        self.read.as_ref().map(|read| read.read_at_ms())
+    }
+
+    /// The host's inbox, when it was read.
+    #[must_use]
+    pub fn result(&self) -> Option<&AttentionReadResult> {
+        self.read.as_ref().map(|read| read.result())
+    }
+
+    /// The host's sessions by number, when its inbox was read.
+    #[must_use]
+    pub fn sessions(&self) -> &[NumberedSession] {
+        self.read.as_ref().map_or(&[], |read| read.sessions())
+    }
+}
+
+impl Serialize for HostInbox {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut row = serializer.serialize_struct("HostInbox", 7)?;
+        row.serialize_field("reference", &self.reference)?;
+        row.serialize_field("name", &self.name)?;
+        row.serialize_field("inbox_epoch", &self.inbox_epoch)?;
+        row.serialize_field("read_serial", &self.read_serial())?;
+        row.serialize_field("read_at_ms", &self.read_at_ms())?;
+        row.serialize_field("result", &self.result())?;
+        row.serialize_field("sessions", self.sessions())?;
+        row.end()
+    }
+}
+
+/// What a pass answers: the rows, and the revision of the owner they were read at.
+#[derive(Clone, Debug, Serialize)]
+pub struct InboxHosts {
+    /// The revision the owner stood at when the rows were read.
+    pub revision: u64,
+    /// One row for each host visited that is still one of the others, in the order the pairing
+    /// screen lists them.
+    pub hosts: Vec<HostInbox>,
+}
+
+/// Visits the hosts this device is paired with and is not using, and answers with what the owner
+/// holds of each.
+#[derive(Debug)]
 pub struct InboxDesk {
-    kept: Mutex<BTreeMap<DeviceId, Kept>>,
+    owner: Arc<ContactOwner>,
     /// Where a suite has paused the desk's passes and visits.
     #[cfg(feature = "testing")]
     pauses: testing::Pauses,
 }
 
-/// What is kept of one host between visits.
-#[derive(Debug, Default)]
-struct Kept {
-    /// One visit to the host at a time: a visit that starts while another is under way waits for
-    /// it, and then reads over the connection it kept.
-    gate: Arc<tokio::sync::Mutex<()>>,
-    /// The connection to the host, while it answers.
-    connection: Option<Arc<Connection>>,
-    /// Since when contact has been lost, while it is.
-    lost_since_ms: Option<u64>,
+/// A desk of an owner of its own: the seam of a suite that builds the desk itself. The application's
+/// desk is made with the owner its state holds.
+#[cfg(feature = "testing")]
+impl Default for InboxDesk {
+    fn default() -> Self {
+        Self::with_owner(Arc::new(ContactOwner::new()))
+    }
 }
 
-/// The result of one successful visit: the connection that answered, the inbox and the numbers.
-type Read = (Arc<Connection>, AttentionReadResult, Vec<NumberedSession>);
+/// A connection a visit holds. It closes its session when it is dropped, whether the visit ended,
+/// failed or was cut off by [`VISIT_WITHIN`]: the record is another owner of a read's origin, so
+/// dropping the future that holds a connection would not release it. Only an accepted commit gives
+/// the connection to the record.
+struct VisitConnection(Option<Arc<Connection>>);
 
-/// A host's row, with the connection its inbox was read over when the row carries a read.
-struct Found {
-    inbox: HostInbox,
-    read_over: Option<Arc<Connection>>,
+impl VisitConnection {
+    fn new(connection: Arc<Connection>) -> Self {
+        Self(Some(connection))
+    }
+
+    fn connection(&self) -> &Arc<Connection> {
+        self.0.as_ref().expect("a held connection is present")
+    }
+
+    /// The record has the connection: it is no longer this guard's to close.
+    fn handed_over(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for VisitConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take() {
+            connection.session().close();
+        }
+    }
 }
 
 /// What one visit to a host came to.
 enum Visited {
     /// The host answered with its inbox.
-    Read(Read),
+    Read(VisitConnection, AttentionReadResult, Vec<NumberedSession>),
+    /// The host answered, and a second page conflict left no complete inbox.
+    Answered(VisitConnection),
     /// The host answered and refused the request named.
     Refused(Asked, CommandError),
     /// The host could not be reached or did not answer.
@@ -148,16 +212,9 @@ enum Missed {
 
 impl From<Unopened> for Missed {
     fn from(unopened: Unopened) -> Self {
-        match unopened {
-            Unopened::Refused(asked, refusal) => Self::Refused(asked, refusal),
-            // No room for another connection is an answer, the host's or this computer's own: the
-            // visit is refused in the cause's words, and the next visit asks again.
-            Unopened::HostFull | Unopened::BudgetFull => {
-                Self::Refused(Asked::Connection, unopened.into_error())
-            }
-            // A connection that the host refused at its admission is lost, as a host that did not
-            // answer is: the next visit asks again.
-            Unopened::NotAdmitted(_) | Unopened::Unreached(_) => Self::Unreached,
+        match Outcome::of(&unopened) {
+            Outcome::Refused { refusal, request } => Self::Refused(request, refusal),
+            Outcome::InContact | Outcome::Lost => Self::Unreached,
         }
     }
 }
@@ -172,176 +229,194 @@ impl From<Missed> for Visited {
 }
 
 impl InboxDesk {
-    /// Visits every paired host that is not the one in use, all at once, and answers with what each
-    /// said, in the order the pairing screen lists them. A host this device forgot, or began to use,
-    /// while it was visited is not among them, and neither is a host whose inbox was read for an
-    /// account that has left by the time the answer is ready.
-    pub async fn visit(self: &Arc<Self>, device: &Arc<Device>) -> Vec<HostInbox> {
-        let in_use = device.host_in_use().map(|host| host.host_device_id);
-        let hosts: Vec<PairedHost> = device
-            .pairing()
-            .hosts
-            .list()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|host| Some(host.host_device_id) != in_use)
-            .collect();
-        // A host this device forgot, or began to use, keeps no connection here.
-        let present: BTreeSet<DeviceId> = hosts.iter().map(|host| host.host_device_id).collect();
-        let gone: Vec<Kept> = {
-            let mut kept = self.kept();
-            let left: Vec<DeviceId> = kept
-                .keys()
-                .filter(|host| !present.contains(host))
-                .copied()
-                .collect();
-            left.iter().filter_map(|host| kept.remove(host)).collect()
-        };
-        for each in gone {
-            if let Some(connection) = each.connection {
-                connection.session().close();
-            }
+    /// A desk that keeps what its visits find in `owner`.
+    #[must_use]
+    pub fn with_owner(owner: Arc<ContactOwner>) -> Self {
+        Self {
+            owner,
+            #[cfg(feature = "testing")]
+            pauses: testing::Pauses::default(),
         }
+    }
+
+    /// Visits every paired host that is not the one in use, all at once, each over a connection of
+    /// its own, and answers with what the owner holds of each, in the order the pairing screen lists
+    /// them. A host this device forgot, or began to use, while it was visited is not among them. A
+    /// read made for an account that has left by the time the answer is ready is retired, and not
+    /// handed on.
+    pub async fn visit(self: &Arc<Self>, device: &Arc<Device>) -> InboxHosts {
+        let Ok(listed) = device.pairing().hosts.list() else {
+            return InboxHosts {
+                revision: self.owner.revision(),
+                hosts: Vec::new(),
+            };
+        };
+        let in_use = device.host_in_use().map(|host| host.host_device_id);
+        let hosts: Vec<PairedHost> = listed
+            .iter()
+            .filter(|host| Some(host.host_device_id) != in_use)
+            .cloned()
+            .collect();
+        self.reconcile(device, &listed);
         #[cfg(feature = "testing")]
         self.at_the_pass().await;
         let visits: Vec<_> = hosts
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|host| {
                 let (desk, device) = (Arc::clone(self), Arc::clone(device));
                 tauri::async_runtime::spawn(async move { desk.visit_one(&device, &host).await })
             })
             .collect();
-        let mut found = Vec::new();
         for visit in visits {
-            if let Ok(Some(each)) = visit.await {
-                found.push(each);
+            let _ = visit.await;
+        }
+        let ids: Vec<DeviceId> = hosts.iter().map(|host| host.host_device_id).collect();
+        self.answer(&ids).await
+    }
+
+    /// Lets go of the record of a host that is no longer listed, once the pairing it belongs to is
+    /// found to be gone. A record that changed meanwhile, or is the one in use, is left alone. A
+    /// pairing that cannot be read now decides nothing.
+    fn reconcile(&self, device: &Device, listed: &[PairedHost]) {
+        let present: BTreeSet<DeviceId> = listed.iter().map(|host| host.host_device_id).collect();
+        for record in self.owner.paired_records() {
+            if present.contains(&record.host) {
+                continue;
+            }
+            if let Ok(now) = device.paired_as(record.host)
+                && now != Some(record.pairing)
+            {
+                drop(self.owner.remove_record(&record));
             }
         }
-        // The answer waits for the slowest host, so an account may have left since the pass that
-        // read a host ended. What was read for it is not handed on.
-        let read: Vec<HostInbox> = found
-            .into_iter()
-            .filter(|each| {
-                each.read_over
-                    .as_ref()
-                    .is_none_or(|connection| connection.ended_by_this_device().is_none())
-            })
-            .map(|each| each.inbox)
-            .collect();
-        Self::settled(device, read)
     }
 
-    /// The answers of a pass that are still for one of the other hosts when the pass ends.
-    ///
-    /// Each visit asked about its own host when it ended, and a slower visit has run since: a host
-    /// this device forgot, or began to use, in the meantime is not reported either. A list that
-    /// cannot be read now decides nothing, and the answers stand as each visit left them.
-    fn settled(device: &Device, found: Vec<HostInbox>) -> Vec<HostInbox> {
-        let Ok(listed) = device.pairing().hosts.list() else {
-            return found;
-        };
-        let in_use = device.host_in_use().map(|host| host.host_device_id);
-        let others: BTreeSet<String> = listed
-            .iter()
-            .filter(|host| Some(host.host_device_id) != in_use)
-            .map(reference_of)
-            .collect();
-        found
-            .into_iter()
-            .filter(|each| others.contains(&each.reference))
-            .collect()
-    }
-
-    /// Lets go of the connection kept to `host`, because this device no longer pairs with it.
-    pub fn forgotten(&self, host: DeviceId) {
-        let dropped = self.kept().remove(&host);
-        if let Some(connection) = dropped.and_then(|kept| kept.connection) {
-            connection.session().close();
+    /// What the owner holds of `hosts` now, with every read checked against the account it was made
+    /// for. A read whose connection this device ended is retired, and the owner is read again; after
+    /// three rounds a row that still fails is handed on without its read: an unchecked read is never
+    /// returned.
+    async fn answer(&self, hosts: &[DeviceId]) -> InboxHosts {
+        let mut records = self.owner.records(hosts);
+        for round in 0..=RETIREMENTS {
+            let failing: Vec<(usize, CommandError)> = records
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(at, row)| {
+                    let read = row.read.as_ref()?;
+                    read.origin()
+                        .ended_by_this_device()
+                        .map(|refusal| (at, refusal))
+                })
+                .collect();
+            if failing.is_empty() {
+                break;
+            }
+            #[cfg(feature = "testing")]
+            if round == 0 {
+                self.at_the_check().await;
+            }
+            if round == RETIREMENTS {
+                for (at, _) in failing {
+                    records.rows[at].clear_read();
+                }
+                break;
+            }
+            for (at, refusal) in failing {
+                drop(self.owner.retire_read(&records.rows[at], refusal));
+            }
+            records = self.owner.records(hosts);
+        }
+        InboxHosts {
+            revision: records.revision,
+            hosts: records.rows.iter().map(HostInbox::of).collect(),
         }
     }
 
-    /// One visit to `host`. `None` when this device forgot the host, or began to use it, while it
-    /// was visited: it is no longer a host to report.
-    async fn visit_one(&self, device: &Arc<Device>, host: &PairedHost) -> Option<Found> {
-        let gate = Arc::clone(&self.kept().entry(host.host_device_id).or_default().gate);
+    /// One visit to `host`. It writes nothing unless the owner takes it in as a visit to a host that
+    /// is one of the others and is still the pairing it was listed under, at its start and just
+    /// before its commit.
+    async fn visit_one(&self, device: &Arc<Device>, host: &PairedHost) {
+        let fence = self.owner.fence();
+        if !still_paired_as(device, host.host_device_id, host.device_id) {
+            return;
+        }
+        let target = crate::hosts::target_of(host);
+        let (ticket, gate) = match self.owner.admit(&target, fence).value {
+            Admit::Admitted { ticket, gate } => (ticket, gate),
+            Admit::Stale => return,
+            Admit::Mismatch { ticket } => {
+                // The record is of another pairing: it is replaced only when the pairing the host
+                // was listed under is still the one this device has.
+                if !still_paired_as(device, host.host_device_id, host.device_id) {
+                    return;
+                }
+                #[cfg(feature = "testing")]
+                self.at_the_replace(host.host_device_id).await;
+                match self.owner.replace(&ticket, &target, fence).value {
+                    Admit::Admitted { ticket, gate } => (ticket, gate),
+                    Admit::Mismatch { .. } | Admit::Stale => return,
+                }
+            }
+        };
         let _turn = gate.lock().await;
-        let now = device.pairing().clock.wall_clock_ms();
-        let held = self
-            .kept()
-            .entry(host.host_device_id)
-            .or_default()
-            .connection
-            .take();
-        let outcome = tokio::time::timeout(VISIT_WITHIN, read_host(device, host, held))
-            .await
-            .unwrap_or(Visited::Unreached);
+        let retained = match self.owner.begin_visit(&ticket).value {
+            Begin::Go(retained) => retained,
+            Begin::Refused => return,
+        };
+        let visited = tokio::time::timeout(
+            VISIT_WITHIN,
+            read_host(device, host, retained.map(VisitConnection::new)),
+        )
+        .await
+        .unwrap_or(Visited::Unreached);
         #[cfg(feature = "testing")]
         self.at_the_visit(host.host_device_id).await;
-        let mut found = HostInbox {
-            reference: reference_of(host),
-            name: host.name.clone().unwrap_or_else(|| UNNAMED_HOST.to_owned()),
-            state: HostInboxState::OutOfContact,
-            read_at_ms: None,
-            lost_since_ms: None,
-            refusal: None,
-            refused_request: None,
-            result: None,
-            sessions: Vec::new(),
-        };
-        let mut read_over = None;
-        // A host this device forgot, or began to use, while it was visited is let go of, and keeps
-        // nothing here.
-        let in_use = device.host_in_use().map(|using| using.host_device_id);
-        let paired = device
-            .pairing()
-            .hosts
-            .list()
-            .unwrap_or_default()
-            .iter()
-            .any(|each| each.host_device_id == host.host_device_id);
-        let mut kept = self.kept();
-        if !paired || in_use == Some(host.host_device_id) {
-            if let Visited::Read((connection, ..)) = outcome {
-                connection.session().close();
-            }
-            kept.remove(&host.host_device_id);
-            return None;
+        // A re-pair after the first check and before this one can still commit one read over the old
+        // pairing; the next visit finds another pairing and replaces the record.
+        if !still_paired_as(device, host.host_device_id, host.device_id) {
+            drop(visited);
+            drop(self.owner.discard(&ticket));
+            return;
         }
-        let entry = kept.entry(host.host_device_id).or_default();
-        match outcome {
-            Visited::Read((connection, result, sessions)) => {
-                entry.connection = Some(Arc::clone(&connection));
-                read_over = Some(connection);
-                entry.lost_since_ms = None;
-                found.state = HostInboxState::Read;
-                found.read_at_ms = Some(now);
-                found.result = Some(result);
-                found.sessions = sessions;
-            }
-            Visited::Refused(asked, refusal) => {
-                // The host answered, so contact is not lost, and the connection it refused is not
-                // kept: the next visit asks again from the start.
-                entry.connection = None;
-                entry.lost_since_ms = None;
-                found.state = HostInboxState::Refused;
-                found.refusal = Some(refusal);
-                found.refused_request = Some(asked);
-            }
-            Visited::Unreached => {
-                // The connection that failed, or that the bound cut short, is not kept.
-                entry.connection = None;
-                found.lost_since_ms = Some(*entry.lost_since_ms.get_or_insert(now));
-            }
-        }
-        Some(Found {
-            inbox: found,
-            read_over,
-        })
+        self.commit(&ticket, visited);
     }
 
-    fn kept(&self) -> MutexGuard<'_, BTreeMap<DeviceId, Kept>> {
-        self.kept.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Hands what a visit found to the owner. The connection a visit holds goes to the record only
+    /// when the owner accepts the commit; otherwise it closes with the guard.
+    fn commit(&self, ticket: &VisitTicket, visited: Visited) {
+        let (found, held) = match visited {
+            Visited::Read(connection, result, sessions) => (
+                Found::Inbox {
+                    connection: Arc::clone(connection.connection()),
+                    result,
+                    sessions,
+                },
+                Some(connection),
+            ),
+            Visited::Answered(connection) => (
+                Found::Answered {
+                    connection: Arc::clone(connection.connection()),
+                },
+                Some(connection),
+            ),
+            Visited::Refused(request, refusal) => (Found::Refused { refusal, request }, None),
+            Visited::Unreached => (Found::Lost, None),
+        };
+        let committed = self.owner.commit_visit(ticket, found);
+        if matches!(committed.value, Committed::Accepted)
+            && let Some(connection) = held
+        {
+            connection.handed_over();
+        }
     }
+}
+
+/// Whether this device is paired with `host` as `pairing` now. A pairing list that cannot be read
+/// verifies nothing.
+fn still_paired_as(device: &Device, host: DeviceId, pairing: DeviceId) -> bool {
+    device.paired_as(host).ok().flatten() == Some(pairing)
 }
 
 /// Reads `host`'s inbox over the connection held, or over a fresh one when there is none or it no
@@ -365,37 +440,33 @@ impl InboxDesk {
 async fn read_host(
     device: &Arc<Device>,
     host: &PairedHost,
-    held: Option<Arc<Connection>>,
+    held: Option<VisitConnection>,
 ) -> Visited {
-    if let Some(connection) = held {
-        let read = read_kept(device, host, &connection).await;
-        if connection.ended_by_this_device().is_none() {
+    if let Some(held) = held {
+        let read = read_kept(device, host, held.connection()).await;
+        if held.connection().ended_by_this_device().is_none() {
             match read {
-                Ok((result, sessions)) => return Visited::Read((connection, result, sessions)),
-                Err(Missed::Refused(asked, refusal)) => {
-                    connection.session().close();
-                    return Visited::Refused(asked, refusal);
-                }
+                Ok(Some((result, sessions))) => return Visited::Read(held, result, sessions),
+                Ok(None) => return Visited::Answered(held),
+                // The connection held closes with its guard.
+                Err(Missed::Refused(asked, refusal)) => return Visited::Refused(asked, refusal),
                 Err(Missed::Unreached) => {}
             }
         }
-        connection.session().close();
+        drop(held);
     }
     let connection = match Connection::visited(device, host).await {
-        Ok(connection) => Arc::new(connection),
+        Ok(connection) => VisitConnection::new(Arc::new(connection)),
         Err(unopened) => return Missed::from(unopened).into(),
     };
-    let read = read_over(&connection).await;
-    if let Some(refusal) = connection.ended_by_this_device() {
-        connection.session().close();
+    let read = read_over(connection.connection()).await;
+    if let Some(refusal) = connection.connection().ended_by_this_device() {
         return Visited::Refused(Asked::Connection, refusal);
     }
     match read {
-        Ok((result, sessions)) => Visited::Read((connection, result, sessions)),
-        Err(missed) => {
-            connection.session().close();
-            missed.into()
-        }
+        Ok(Some((result, sessions))) => Visited::Read(connection, result, sessions),
+        Ok(None) => Visited::Answered(connection),
+        Err(missed) => missed.into(),
     }
 }
 
@@ -404,7 +475,7 @@ async fn read_kept(
     device: &Arc<Device>,
     host: &PairedHost,
     connection: &Connection,
-) -> Result<(AttentionReadResult, Vec<NumberedSession>), Missed> {
+) -> Result<Option<(AttentionReadResult, Vec<NumberedSession>)>, Missed> {
     present(device, host, connection, Presentation::IfDue).await?;
     match read_over(connection).await {
         Err(Missed::Refused(_, refusal)) if lease_is_refused(refusal.code, &refusal.message) => {
@@ -450,15 +521,20 @@ async fn present(
         })
 }
 
-/// Reads the whole inbox and the session numbers over `connection`.
+/// Reads the whole inbox and the session numbers over `connection`. `Ok(None)` when the host
+/// answered and an item went between two pages twice: there is no complete inbox, and the host is in
+/// contact.
 async fn read_over(
     connection: &Connection,
-) -> Result<(AttentionReadResult, Vec<NumberedSession>), Missed> {
+) -> Result<Option<(AttentionReadResult, Vec<NumberedSession>)>, Missed> {
     let session = connection.session();
     let result = match pages(&session).await? {
         Some(result) => result,
         // An item went between two pages: the inbox is read again from its start, once.
-        None => pages(&session).await?.ok_or(Missed::Unreached)?,
+        None => match pages(&session).await? {
+            Some(result) => result,
+            None => return Ok(None),
+        },
     };
     // A host that answers its inbox and refuses its session list (a guest's grant may) still gave
     // its inbox: the rows then say "a session" for want of its number.
@@ -488,7 +564,7 @@ async fn read_over(
             Ok(silence) => return Err(Unopened::lost(silence).into()),
         },
     };
-    Ok((result, sessions))
+    Ok(Some((result, sessions)))
 }
 
 /// One walk over the inbox's pages, each continuing after the last item of the one before, until
@@ -541,6 +617,37 @@ pub mod testing {
     use tokio::sync::{mpsc, oneshot};
 
     use super::InboxDesk;
+    use crate::connection::Asked;
+    use crate::contact::{ContactOwner, HostContact};
+    use crate::error::CommandError;
+    use crate::inbox::HostInbox;
+    use std::sync::Arc;
+
+    /// Where a host stood when it was last visited, by the one mapping every case reads: an inbox
+    /// that was read is `Read` (in contact, with a result), a refusal is `Refused`, and a loss is
+    /// `OutOfContact`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HostInboxState {
+        /// The host answered, and the result is its inbox.
+        Read,
+        /// The host answered and refused. It is in contact: the refusal is what it said.
+        Refused,
+        /// The host could not be reached or did not answer in time.
+        OutOfContact,
+    }
+
+    /// What the owner holds of the contact with a host, in the terms of [`HostInboxState`].
+    #[derive(Clone, Debug)]
+    pub struct Seen {
+        /// Where the host stood.
+        pub state: HostInboxState,
+        /// What the host refused with, when it did.
+        pub refusal: Option<CommandError>,
+        /// What the visit asked when the host refused, when it did.
+        pub refused_request: Option<Asked>,
+        /// Since when this device has not been in contact with the host, when it has not.
+        pub lost_since_ms: Option<u64>,
+    }
 
     /// A pass held after it listed the hosts and before it began a visit to any of them, until it is
     /// released.
@@ -572,11 +679,43 @@ pub mod testing {
         }
     }
 
+    /// A pass held after it read the owner's records and found a read to retire, before it retires
+    /// any, until it is released.
+    #[derive(Debug)]
+    pub struct CheckHold {
+        release: oneshot::Sender<()>,
+    }
+
+    impl CheckHold {
+        /// Lets the pass go on.
+        pub fn release(self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    /// A visit held after the host's record was found to be of another pairing and verified again,
+    /// before it is replaced, until it is released.
+    #[derive(Debug)]
+    pub struct ReplaceHold {
+        /// The host the visit is to.
+        pub host: DeviceId,
+        release: oneshot::Sender<()>,
+    }
+
+    impl ReplaceHold {
+        /// Lets the visit go on.
+        pub fn release(self) {
+            let _ = self.release.send(());
+        }
+    }
+
     /// Every place a task of the desk can be paused at.
     #[derive(Debug, Default)]
     pub(super) struct Pauses {
         passes: Mutex<Option<mpsc::UnboundedSender<PassHold>>>,
         visits: Mutex<Option<mpsc::UnboundedSender<VisitHold>>>,
+        checks: Mutex<Option<mpsc::UnboundedSender<CheckHold>>>,
+        replaces: Mutex<Option<mpsc::UnboundedSender<ReplaceHold>>>,
     }
 
     impl InboxDesk {
@@ -605,6 +744,104 @@ pub mod testing {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(watching);
             visits
+        }
+
+        /// Hands every pass that found a read to retire to the returned receiver, held before it
+        /// retires any, until it is released.
+        #[must_use]
+        pub fn watch_checks(&self) -> mpsc::UnboundedReceiver<CheckHold> {
+            let (watching, checks) = mpsc::unbounded_channel();
+            *self
+                .pauses
+                .checks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(watching);
+            checks
+        }
+
+        /// Hands every visit that found a record of another pairing to the returned receiver, held
+        /// after it verified the pairing again and before it replaces the record, until it is
+        /// released.
+        #[must_use]
+        pub fn watch_replaces(&self) -> mpsc::UnboundedReceiver<ReplaceHold> {
+            let (watching, replaces) = mpsc::unbounded_channel();
+            *self
+                .pauses
+                .replaces
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(watching);
+            replaces
+        }
+
+        pub(super) async fn at_the_check(&self) {
+            let watching = self
+                .pauses
+                .checks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(watching) = watching {
+                let (release, released) = oneshot::channel();
+                if watching.send(CheckHold { release }).is_ok() {
+                    let _ = released.await;
+                }
+            }
+        }
+
+        pub(super) async fn at_the_replace(&self, host: DeviceId) {
+            let watching = self
+                .pauses
+                .replaces
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(watching) = watching {
+                let (release, released) = oneshot::channel();
+                if watching.send(ReplaceHold { host, release }).is_ok() {
+                    let _ = released.await;
+                }
+            }
+        }
+
+        /// The owner the desk keeps what its visits find in.
+        #[must_use]
+        pub fn owner(&self) -> &Arc<ContactOwner> {
+            &self.owner
+        }
+
+        /// What the desk's owner holds of the contact with the host a row is of, as a suite reads it.
+        #[must_use]
+        pub fn seen(&self, row: &HostInbox) -> Seen {
+            let contact = self
+                .owner
+                .snapshot()
+                .others
+                .iter()
+                .find(|other| other.reference == row.reference)
+                .map(|other| other.contact.clone());
+            match contact {
+                Some(HostContact::InContact) if row.result().is_some() => Seen {
+                    state: HostInboxState::Read,
+                    refusal: None,
+                    refused_request: None,
+                    lost_since_ms: None,
+                },
+                Some(HostContact::Refused { refusal, request }) => Seen {
+                    state: HostInboxState::Refused,
+                    refusal: Some(refusal),
+                    refused_request: Some(request),
+                    lost_since_ms: None,
+                },
+                Some(HostContact::OutOfContact { since_ms, .. }) => Seen {
+                    state: HostInboxState::OutOfContact,
+                    refusal: None,
+                    refused_request: None,
+                    lost_since_ms: Some(since_ms),
+                },
+                other => {
+                    panic!("a host a pass answered for holds an outcome a case knows: {other:?}")
+                }
+            }
         }
 
         pub(super) async fn at_the_pass(&self) {

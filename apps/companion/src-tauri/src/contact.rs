@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kr_client::Session;
+use kr_protocol::attention::AttentionReadResult;
 use kr_protocol::attention_rule::HOST_CONTACT_ESCALATION_MS;
 use kr_protocol::envelope::Notification;
 use kr_protocol::ids::DeviceId;
@@ -26,6 +27,7 @@ use tokio::sync::{Notify, broadcast, watch};
 
 use crate::connection::{Asked, CONNECTION_EVENT, Connection, ConnectionState, Unopened};
 use crate::error::CommandError;
+use crate::inbox::NumberedSession;
 use crate::state::AppState;
 
 /// How many published changes are kept for a page that missed some, besides the ones not yet told.
@@ -152,7 +154,7 @@ impl Disposal {
     /// What one record held that is not its facts.
     fn record(&mut self, record: Record) {
         self.reads.extend(record.read);
-        self.visits.extend(record.visit);
+        self.visits.extend(record.visit.connection);
     }
 }
 
@@ -183,11 +185,55 @@ pub struct Applied<T> {
 /// A host's inbox as this device last read it, and the connection it was read over.
 pub struct StoredRead {
     /// The order reads were made in, owner-wide.
-    #[allow(dead_code, reason = "the visits that store a read write and check it")]
     serial: u64,
+    /// When the inbox was read, as this device's clock said at the commit that stored it.
+    read_at_ms: u64,
+    result: AttentionReadResult,
+    sessions: Vec<NumberedSession>,
     /// The connection the read came from, kept for the check of the account it was opened under.
-    #[allow(dead_code, reason = "the visits that store a read write and check it")]
     origin: Held<Arc<Connection>>,
+}
+
+impl StoredRead {
+    /// The order this read was made in among every read of every host.
+    #[must_use]
+    pub const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// When the inbox was read, by this device's clock.
+    #[must_use]
+    pub const fn read_at_ms(&self) -> u64 {
+        self.read_at_ms
+    }
+
+    /// The host's inbox.
+    #[must_use]
+    pub const fn result(&self) -> &AttentionReadResult {
+        &self.result
+    }
+
+    /// The host's sessions by number.
+    #[must_use]
+    pub fn sessions(&self) -> &[NumberedSession] {
+        &self.sessions
+    }
+
+    /// The connection the inbox was read over.
+    #[must_use]
+    pub fn origin(&self) -> &Arc<Connection> {
+        self.origin.get()
+    }
+}
+
+impl std::fmt::Debug for StoredRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredRead")
+            .field("serial", &self.serial)
+            .field("read_at_ms", &self.read_at_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A replacement connection the keeper has not taken up yet, and the receiver of its events that
@@ -412,6 +458,19 @@ fn system_clock() -> Clock {
     })
 }
 
+/// What the visits to one host share: the turn they take, and the connection the last one kept.
+#[derive(Default)]
+struct VisitSlot {
+    /// One visit to the host at a time: a visit that begins while another is under way waits for
+    /// it. The turn is awaited outside the owner.
+    gate: Gate,
+    /// The connection the last visit kept, while it answers.
+    connection: Option<Held<Arc<Connection>>>,
+}
+
+/// The turn the visits to one host take.
+pub type Gate = Arc<tokio::sync::Mutex<()>>;
+
 struct Record {
     /// Taken from the owner's counter: a new pairing with the same host is a new record.
     generation: u64,
@@ -422,8 +481,8 @@ struct Record {
     inbox_epoch: u64,
     /// The last complete inbox of another host.
     read: Option<Arc<StoredRead>>,
-    /// The connection the last visit kept.
-    visit: Option<Held<Arc<Connection>>>,
+    /// What the visits to the host share.
+    visit: VisitSlot,
     /// The order the reads that write contact began in.
     active_serial: u64,
     /// The serial of the newest of those reads whose outcome was applied.
@@ -508,7 +567,7 @@ impl State {
             contact: HostContact::Unknown,
             inbox_epoch: epoch,
             read: None,
-            visit: None,
+            visit: VisitSlot::default(),
             active_serial: 0,
             active_applied: 0,
         }
@@ -609,9 +668,13 @@ impl State {
 
     /// Applies what an attempt to reach the host in use came to.
     fn apply(&mut self, outcome: Outcome) {
-        let Some(key) = self.in_use else {
-            return;
-        };
+        if let Some(key) = self.in_use {
+            self.apply_to(key, outcome);
+        }
+    }
+
+    /// Applies what an attempt to reach the host `key` came to.
+    fn apply_to(&mut self, key: HostKey, outcome: Outcome) {
         let now = (self.clock)();
         let local = key == HostKey::Local;
         let ever_reached = self.ever_reached;
@@ -783,6 +846,136 @@ pub enum Adopt {
     },
 }
 
+/// What a visit holds from the moment the owner admitted it: the record's generation and epoch,
+/// checked again at each later step.
+#[derive(Clone, Debug)]
+pub struct VisitTicket {
+    key: HostKey,
+    generation: u64,
+    epoch: u64,
+    pairing: Option<DeviceId>,
+}
+
+impl VisitTicket {
+    /// The identity the host gave this device in the pairing the ticket is for.
+    #[must_use]
+    pub const fn pairing(&self) -> Option<DeviceId> {
+        self.pairing
+    }
+}
+
+/// What the owner answers a visit that asks to be admitted.
+pub enum Admit {
+    /// The visit may take its turn on the record, which holds no other pairing.
+    Admitted {
+        /// What the visit holds.
+        ticket: VisitTicket,
+        /// The turn the visits to the host take, awaited outside the owner.
+        gate: Gate,
+    },
+    /// The record is of another pairing, and is replaced only by [`ContactOwner::replace`].
+    Mismatch {
+        /// What the record holds now.
+        ticket: VisitTicket,
+    },
+    /// A forget happened since the fence was read, or the host is the one in use: nothing changed.
+    Stale,
+}
+
+/// What the owner answers a visit that begins.
+pub enum Begin {
+    /// The visit may go on, over the connection the last visit kept when there is one.
+    Go(Option<Arc<Connection>>),
+    /// The record is gone, changed, or is the one in use: nothing is taken.
+    Refused,
+}
+
+/// What a visit found, as the owner is told it.
+pub enum Found {
+    /// The host answered with its whole inbox.
+    Inbox {
+        /// The connection the inbox was read over, kept for the next visit.
+        connection: Arc<Connection>,
+        /// The inbox.
+        result: AttentionReadResult,
+        /// The sessions by number.
+        sessions: Vec<NumberedSession>,
+    },
+    /// The host answered, and no complete inbox came of it.
+    Answered {
+        /// The connection that answered, kept for the next visit.
+        connection: Arc<Connection>,
+    },
+    /// The host refused.
+    Refused {
+        /// What the host said.
+        refusal: CommandError,
+        /// What it refused.
+        request: Asked,
+    },
+    /// The host was not reached, or did not answer in time.
+    Lost,
+}
+
+impl Found {
+    fn into_connection(self) -> Option<Arc<Connection>> {
+        match self {
+            Self::Inbox { connection, .. } | Self::Answered { connection } => Some(connection),
+            Self::Refused { .. } | Self::Lost => None,
+        }
+    }
+}
+
+/// What the owner answers a visit that commits.
+pub enum Committed {
+    /// The outcome is applied, and a connection it carried is the record's now.
+    Accepted,
+    /// The record is not the one the visit began on: nothing is written, and the connection the
+    /// outcome carried is given back to be closed.
+    Rejected(Option<Arc<Connection>>),
+}
+
+/// One host's record, as a pass reads it.
+pub struct Row {
+    key: HostKey,
+    /// What the page names the host by.
+    pub reference: String,
+    /// What people call the host.
+    pub name: String,
+    generation: u64,
+    /// The page may show an inbox of this host only under this epoch.
+    pub inbox_epoch: u64,
+    /// What was last read of the host, when something was.
+    pub read: Option<Arc<StoredRead>>,
+}
+
+impl Row {
+    /// Takes the read out of the row.
+    pub fn clear_read(&mut self) {
+        self.read = None;
+    }
+}
+
+/// The records of some hosts, read together, and the revision they were read at.
+pub struct Records {
+    /// The revision the owner stood at.
+    pub revision: u64,
+    /// The record of each host asked about that is held and is not the one in use, in the order
+    /// asked.
+    pub rows: Vec<Row>,
+}
+
+/// A record of another host, as a reconcile reads it.
+pub struct Listed {
+    /// The identity the host has.
+    pub host: DeviceId,
+    /// The identity the host gave this device in the pairing the record belongs to.
+    pub pairing: DeviceId,
+    key: HostKey,
+    generation: u64,
+    epoch: u64,
+}
+
 /// The choice in force and the connection held when they were read together.
 pub struct Stand {
     /// The number of the choice.
@@ -886,7 +1079,7 @@ impl ContactOwner {
                 if let Some(record) = state.hosts.get_mut(&each) {
                     record.inbox_epoch = epoch;
                     disposal.reads.extend(record.read.take());
-                    disposal.visits.extend(record.visit.take());
+                    disposal.visits.extend(record.visit.connection.take());
                     // Only a loss is kept of a host.
                     if !matches!(record.contact, HostContact::OutOfContact { .. }) {
                         record.contact = HostContact::Unknown;
@@ -1187,6 +1380,255 @@ impl ContactOwner {
         })
     }
 
+    // The visits.
+
+    /// Admits a visit to `target`, which was listed while the fence stood at `fence`. A record of
+    /// the host is made when there is none (it holds no outcome, so the page does not see it); a
+    /// record of another pairing is answered and left as it is.
+    pub fn admit(&self, target: &Target, fence: u64) -> Applied<Admit> {
+        self.commit(|state, _| {
+            let key = target.key();
+            if key == HostKey::Local || state.fence != fence || state.in_use == Some(key) {
+                return Admit::Stale;
+            }
+            match state.hosts.get(&key) {
+                Some(record) if record.pairing != target.pairing() => Admit::Mismatch {
+                    ticket: ticket_of(key, record),
+                },
+                Some(record) => Admit::Admitted {
+                    ticket: ticket_of(key, record),
+                    gate: Arc::clone(&record.visit.gate),
+                },
+                None => {
+                    let (generation, epoch) = (state.next(), state.next());
+                    let record = State::record_of(target, generation, epoch);
+                    let admitted = Admit::Admitted {
+                        ticket: ticket_of(key, &record),
+                        gate: Arc::clone(&record.visit.gate),
+                    };
+                    state.hosts.insert(key, record);
+                    admitted
+                }
+            }
+        })
+    }
+
+    /// Replaces the record `ticket` names, which holds another pairing, with one for `target`. It is
+    /// accepted only while the record has the generation and epoch of the ticket and is still one of
+    /// the other hosts, and the fence is still `fence`; what the old record held goes with it.
+    pub fn replace(&self, ticket: &VisitTicket, target: &Target, fence: u64) -> Applied<Admit> {
+        self.commit(|state, disposal| {
+            let key = target.key();
+            let unchanged = state.hosts.get(&key).is_some_and(|record| {
+                record.generation == ticket.generation && record.inbox_epoch == ticket.epoch
+            });
+            if key != ticket.key || state.fence != fence || state.in_use == Some(key) || !unchanged
+            {
+                return Admit::Stale;
+            }
+            if let Some(old) = state.hosts.remove(&key) {
+                disposal.record(old);
+            }
+            let (generation, epoch) = (state.next(), state.next());
+            let record = State::record_of(target, generation, epoch);
+            let admitted = Admit::Admitted {
+                ticket: ticket_of(key, &record),
+                gate: Arc::clone(&record.visit.gate),
+            };
+            state.hosts.insert(key, record);
+            admitted
+        })
+    }
+
+    /// A visit that holds its turn begins: the record must still be the one it was admitted on and
+    /// not the one in use. The connection the last visit kept is taken.
+    pub fn begin_visit(&self, ticket: &VisitTicket) -> Applied<Begin> {
+        self.commit(|state, _| {
+            let in_use = state.in_use == Some(ticket.key);
+            match state.hosts.get_mut(&ticket.key) {
+                Some(record)
+                    if !in_use
+                        && record.generation == ticket.generation
+                        && record.inbox_epoch == ticket.epoch =>
+                {
+                    Begin::Go(record.visit.connection.take().map(Held::into_inner))
+                }
+                _ => Begin::Refused,
+            }
+        })
+    }
+
+    /// A visit that ends without writing anything lets go of its record, when the record is the one
+    /// it was admitted on and holds no outcome, no read and no connection. It makes no event.
+    pub fn discard(&self, ticket: &VisitTicket) -> Applied<()> {
+        self.commit(|state, disposal| {
+            let bare = state.hosts.get(&ticket.key).is_some_and(|record| {
+                record.generation == ticket.generation
+                    && record.contact == HostContact::Unknown
+                    && record.read.is_none()
+                    && record.visit.connection.is_none()
+            });
+            if bare && let Some(record) = state.hosts.remove(&ticket.key) {
+                disposal.record(record);
+            }
+        })
+    }
+
+    /// A visit has found what it found. It is accepted only while the record has the generation and
+    /// epoch the visit was admitted on and is not the one in use, and then it is applied in one
+    /// step: the contact, the read it stored (dated and numbered here), and the connection it kept.
+    pub fn commit_visit(&self, ticket: &VisitTicket, found: Found) -> Applied<Committed> {
+        self.commit(|state, disposal| {
+            let key = ticket.key;
+            let current = state.in_use != Some(key)
+                && state.hosts.get(&key).is_some_and(|record| {
+                    record.generation == ticket.generation && record.inbox_epoch == ticket.epoch
+                });
+            if !current {
+                return Committed::Rejected(found.into_connection());
+            }
+            let now = (state.clock)();
+            match found {
+                Found::Inbox {
+                    connection,
+                    result,
+                    sessions,
+                } => {
+                    state.apply_to(key, Outcome::InContact);
+                    let serial = state.next();
+                    if let Some(record) = state.hosts.get_mut(&key) {
+                        disposal
+                            .reads
+                            .extend(record.read.replace(Arc::new(StoredRead {
+                                serial,
+                                read_at_ms: now,
+                                result,
+                                sessions,
+                                origin: Held::new(Arc::clone(&connection)),
+                            })));
+                        disposal
+                            .visits
+                            .extend(record.visit.connection.replace(Held::new(connection)));
+                    }
+                }
+                Found::Answered { connection } => {
+                    state.apply_to(key, Outcome::InContact);
+                    if let Some(record) = state.hosts.get_mut(&key) {
+                        disposal
+                            .visits
+                            .extend(record.visit.connection.replace(Held::new(connection)));
+                    }
+                }
+                Found::Refused { refusal, request } => {
+                    state.apply_to(key, Outcome::Refused { refusal, request });
+                    if let Some(record) = state.hosts.get_mut(&key) {
+                        disposal.reads.extend(record.read.take());
+                        disposal.visits.extend(record.visit.connection.take());
+                    }
+                }
+                Found::Lost => state.apply_to(key, Outcome::Lost),
+            }
+            Committed::Accepted
+        })
+    }
+
+    /// The records of `hosts`, read together: each one that is held and is not the one in use, in
+    /// the order asked, with the revision they were read at. A read is a pointer, not its items.
+    #[must_use]
+    pub fn records(&self, hosts: &[DeviceId]) -> Records {
+        let state = self.lock();
+        let rows = hosts
+            .iter()
+            .filter_map(|host| {
+                let key = HostKey::Paired(*host);
+                if state.in_use == Some(key) {
+                    return None;
+                }
+                state.hosts.get(&key).map(|record| Row {
+                    key,
+                    reference: record.reference.clone().unwrap_or_default(),
+                    name: record.name.clone(),
+                    generation: record.generation,
+                    inbox_epoch: record.inbox_epoch,
+                    read: record.read.clone(),
+                })
+            })
+            .collect();
+        Records {
+            revision: state.revision,
+            rows,
+        }
+    }
+
+    /// Retires what was read of a host over a connection that this device ended: the contact becomes
+    /// the refusal, the read and the connection kept go, and the epoch moves under its rule. It is
+    /// accepted only while the record has the row's generation and still holds a read over the same
+    /// connection. The answer is whether it was.
+    pub fn retire_read(&self, row: &Row, refusal: CommandError) -> Applied<bool> {
+        self.commit(|state, disposal| {
+            let current = state.in_use != Some(row.key)
+                && state.hosts.get(&row.key).is_some_and(|record| {
+                    record.generation == row.generation
+                        && match (&record.read, &row.read) {
+                            (Some(held), Some(seen)) => Arc::ptr_eq(held.origin(), seen.origin()),
+                            _ => false,
+                        }
+                });
+            if !current {
+                return false;
+            }
+            state.apply_to(
+                row.key,
+                Outcome::Refused {
+                    refusal,
+                    request: Asked::Connection,
+                },
+            );
+            if let Some(record) = state.hosts.get_mut(&row.key) {
+                disposal.reads.extend(record.read.take());
+                disposal.visits.extend(record.visit.connection.take());
+            }
+            true
+        })
+    }
+
+    /// The records of the other hosts, for a pass that reconciles them with the pairing list.
+    #[must_use]
+    pub fn paired_records(&self) -> Vec<Listed> {
+        let state = self.lock();
+        state
+            .hosts
+            .iter()
+            .filter(|(key, _)| state.in_use != Some(**key))
+            .filter_map(|(key, record)| match (key, record.pairing) {
+                (HostKey::Paired(host), Some(pairing)) => Some(Listed {
+                    host: *host,
+                    pairing,
+                    key: *key,
+                    generation: record.generation,
+                    epoch: record.inbox_epoch,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Removes a record the pass found to be of a pairing that no longer exists. It is accepted only
+    /// while the record is unchanged and is not the one in use; its read and its connection go, and
+    /// the removal is published. The answer is whether it was.
+    pub fn remove_record(&self, listed: &Listed) -> Applied<bool> {
+        self.commit(|state, disposal| {
+            let current = state.in_use != Some(listed.key)
+                && state.hosts.get(&listed.key).is_some_and(|record| {
+                    record.generation == listed.generation && record.inbox_epoch == listed.epoch
+                });
+            if current && let Some(record) = state.hosts.remove(&listed.key) {
+                disposal.record(record);
+            }
+            current
+        })
+    }
+
     // The readers of the slot.
 
     /// The connection held.
@@ -1310,8 +1752,9 @@ impl ContactOwner {
         STATE_FIRST_WITHIN
     }
 
-    /// The seam of a suite: the owner's fence.
-    #[cfg(feature = "testing")]
+    /// The lifecycle fence: every forget adds one, whether or not a record exists. A visit takes it
+    /// before it verifies the pairing it was listed under, and is admitted only while it is still
+    /// the same.
     #[must_use]
     pub fn fence(&self) -> u64 {
         self.lock().fence
@@ -1321,6 +1764,15 @@ impl ContactOwner {
 impl Drop for ContactOwner {
     fn drop(&mut self) {
         self.wake.notify_one();
+    }
+}
+
+fn ticket_of(key: HostKey, record: &Record) -> VisitTicket {
+    VisitTicket {
+        key,
+        generation: record.generation,
+        epoch: record.inbox_epoch,
+        pairing: record.pairing,
     }
 }
 
@@ -1369,7 +1821,8 @@ pub mod testing {
     use tokio::sync::{mpsc, oneshot};
 
     use super::{
-        Adoption, Arc, Connection, ContactOwner, DROPPED_UNDER_GUARD, Held, HostKey, StoredRead,
+        Adoption, Arc, AttentionReadResult, Connection, ContactOwner, DROPPED_UNDER_GUARD, Held,
+        HostKey, StoredRead,
     };
 
     /// How many resources the calling thread has dropped while it held the owner's mutex.
@@ -1596,9 +2049,20 @@ pub mod testing {
             if let Some(record) = state.hosts.get_mut(&HostKey::Paired(host)) {
                 record.read = Some(Arc::new(StoredRead {
                     serial: 0,
+                    read_at_ms: 0,
+                    result: AttentionReadResult {
+                        items: Vec::new(),
+                        more: false,
+                        dropped: kr_protocol::scalars::U64::new(0),
+                        gaps: Vec::new(),
+                        quiet_hours: kr_protocol::scalars::Nullable::null(),
+                        quiet_now: false,
+                        quiet_hours_provable: false,
+                    },
+                    sessions: Vec::new(),
                     origin: Held::new(Arc::new(read)),
                 }));
-                record.visit = Some(Held::new(Arc::new(visit)));
+                record.visit.connection = Some(Held::new(Arc::new(visit)));
             }
         }
 
@@ -1638,7 +2102,7 @@ pub mod testing {
             self.lock()
                 .hosts
                 .get(&HostKey::Paired(host))
-                .is_some_and(|record| record.read.is_some() || record.visit.is_some())
+                .is_some_and(|record| record.read.is_some() || record.visit.connection.is_some())
         }
     }
 }
@@ -2749,5 +3213,392 @@ mod tests {
         );
         let counted = dropped_under_the_guard(|| drop(ticket));
         assert_eq!(counted, 0, "the caller drops it outside the guard");
+    }
+
+    // The visits.
+
+    fn empty_inbox() -> AttentionReadResult {
+        AttentionReadResult {
+            items: Vec::new(),
+            more: false,
+            dropped: kr_protocol::scalars::U64::new(0),
+            gaps: Vec::new(),
+            quiet_hours: kr_protocol::scalars::Nullable::null(),
+            quiet_now: false,
+            quiet_hours_provable: false,
+        }
+    }
+
+    /// A visit that found a whole inbox over the connection `byte`.
+    fn inbox_over(byte: u8) -> (Found, Arc<Connection>) {
+        let connection = Arc::new(connection(byte).0);
+        (
+            Found::Inbox {
+                connection: Arc::clone(&connection),
+                result: empty_inbox(),
+                sessions: Vec::new(),
+            },
+            connection,
+        )
+    }
+
+    /// Admits a visit to `target` and begins it: the ticket and the turn's gate.
+    fn begun(owner: &ContactOwner, target: &Target) -> VisitTicket {
+        let fence = owner.fence();
+        let Admit::Admitted { ticket, .. } = owner.admit(target, fence).value else {
+            panic!("the visit is admitted");
+        };
+        assert!(matches!(owner.begin_visit(&ticket).value, Begin::Go(_)));
+        ticket
+    }
+
+    /// A visit to `target` that found a whole inbox over the connection `byte`, committed.
+    fn read_of(owner: &ContactOwner, target: &Target, byte: u8) -> VisitTicket {
+        let ticket = begun(owner, target);
+        let (found, _) = inbox_over(byte);
+        let committed = owner.commit_visit(&ticket, found);
+        assert!(matches!(committed.value, Committed::Accepted));
+        ticket
+    }
+
+    fn rows(owner: &ContactOwner, byte: u8) -> Vec<Row> {
+        owner.records(&[host(byte)]).rows
+    }
+
+    #[tokio::test]
+    async fn a_read_does_not_survive_a_role_change_or_an_active_refusal() {
+        let owner = ContactOwner::new();
+        let (a, b) = (paired(5, 6), paired(7, 8));
+        read_of(&owner, &a, 10);
+        assert!(rows(&owner, 5)[0].read.is_some(), "the visit stored a read");
+        // The host is chosen: what was read of it goes, and it is no longer one of the others.
+        drop(owner.choose(&a, "using"));
+        assert!(!owner.holds_resources_of(host(5)));
+        assert!(rows(&owner, 5).is_empty());
+        // An active read of it is refused, and then another host is chosen: A is left behind with
+        // no read, no connection and no read time.
+        let (choice, _) = reaching_paired(&owner, 5);
+        let _ = choice;
+        let ticket = owner.read_started(ReadKind::Contact).expect("held");
+        drop(owner.read_finished(&ticket, refused_read()));
+        drop(ticket);
+        drop(owner.choose(&b, "another"));
+        assert!(!owner.holds_resources_of(host(5)));
+        let left = rows(&owner, 5);
+        assert!(left[0].read.is_none(), "a host left behind holds no read");
+        // A new visit that stores a read is the only way back to one.
+        read_of(&owner, &a, 11);
+        assert!(rows(&owner, 5)[0].read.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_commit_with_another_generation_or_role_or_epoch_is_refused() {
+        let owner = ContactOwner::new();
+        let a = paired(5, 6);
+        // Another generation: the host was forgotten and paired again.
+        let old = begun(&owner, &a);
+        drop(owner.forget(host(5), "forgotten"));
+        let new = begun(&owner, &a);
+        let (found, connection) = inbox_over(10);
+        let committed = owner.commit_visit(&old, found);
+        assert!(matches!(committed.value, Committed::Rejected(Some(_))));
+        drop(committed);
+        drop(connection);
+        assert!(rows(&owner, 5)[0].read.is_none());
+        assert_eq!(rows(&owner, 5)[0].generation, new.generation);
+        // Another role: the host is the one in use.
+        drop(owner.choose(&a, "using"));
+        let committed = owner.commit_visit(&new, Found::Lost);
+        assert!(matches!(committed.value, Committed::Rejected(None)));
+        drop(committed);
+        // Another epoch: the host was used and left again, which moves its epoch and keeps the record.
+        drop(owner.choose(&paired(7, 8), "another"));
+        let committed = owner.commit_visit(&new, Found::Lost);
+        assert!(matches!(committed.value, Committed::Rejected(None)));
+        drop(committed);
+        assert_eq!(
+            rows(&owner, 5)[0].read.is_none(),
+            true,
+            "nothing was written"
+        );
+        let fresh = begun(&owner, &a);
+        assert!(matches!(
+            owner.commit_visit(&fresh, Found::Lost).value,
+            Committed::Accepted
+        ));
+    }
+
+    #[tokio::test]
+    async fn admit_never_replaces_and_a_mismatch_carries_generation_epoch_and_role() {
+        let owner = ContactOwner::new();
+        let first = begun(&owner, &paired(5, 6));
+        let before = owner.generation_of(host(5));
+        let Admit::Mismatch { ticket } = owner.admit(&paired(5, 7), owner.fence()).value else {
+            panic!("a record of another pairing is a mismatch");
+        };
+        assert_eq!(ticket.generation, first.generation);
+        assert_eq!(ticket.epoch, first.epoch);
+        assert_eq!(ticket.pairing(), Some(host(6)));
+        assert_eq!(owner.generation_of(host(5)), before, "nothing was replaced");
+        // The host in use is not one to visit.
+        drop(owner.choose(&paired(5, 6), "using"));
+        assert!(matches!(
+            owner.admit(&paired(5, 6), owner.fence()).value,
+            Admit::Stale
+        ));
+    }
+
+    #[tokio::test]
+    async fn replace_needs_the_generation_the_epoch_the_other_role_and_the_fence() {
+        let owner = ContactOwner::new();
+        let (a, again) = (paired(5, 6), paired(5, 7));
+        let mismatch = |owner: &ContactOwner| {
+            let Admit::Mismatch { ticket } = owner.admit(&again, owner.fence()).value else {
+                panic!("a mismatch");
+            };
+            ticket
+        };
+        read_of(&owner, &a, 10);
+        // The fence moved.
+        let ticket = mismatch(&owner);
+        let fence = owner.fence();
+        drop(owner.forget(host(9), "another host"));
+        assert!(matches!(
+            owner.replace(&ticket, &again, fence).value,
+            Admit::Stale
+        ));
+        // The epoch moved: the host was used and left again.
+        read_of(&owner, &a, 11);
+        let ticket = mismatch(&owner);
+        drop(owner.choose(&a, "using"));
+        drop(owner.choose(&paired(9, 10), "another"));
+        assert!(matches!(
+            owner.replace(&ticket, &again, owner.fence()).value,
+            Admit::Stale
+        ));
+        // The role: the host is in use.
+        let ticket = mismatch(&owner);
+        drop(owner.choose(&a, "using"));
+        assert!(matches!(
+            owner.replace(&ticket, &again, owner.fence()).value,
+            Admit::Stale
+        ));
+        drop(owner.choose(&paired(9, 10), "another"));
+        // The generation: the host was forgotten and paired again.
+        let ticket = mismatch(&owner);
+        drop(owner.forget(host(5), "forgotten"));
+        drop(begun(&owner, &a));
+        assert!(matches!(
+            owner.replace(&ticket, &again, owner.fence()).value,
+            Admit::Stale
+        ));
+        // All four hold: the old record goes with what it held.
+        read_of(&owner, &a, 12);
+        let ticket = mismatch(&owner);
+        let before = owner.generation_of(host(5));
+        let replaced = owner.replace(&ticket, &again, owner.fence());
+        assert!(matches!(replaced.value, Admit::Admitted { .. }));
+        assert_ne!(owner.generation_of(host(5)), before);
+        assert!(!owner.holds_resources_of(host(5)));
+    }
+
+    #[tokio::test]
+    async fn a_stale_admit_with_a_moved_fence_changes_nothing() {
+        let owner = ContactOwner::new();
+        let fence = owner.fence();
+        let revision = owner.revision();
+        drop(owner.forget(host(9), "a host with no record"));
+        assert!(
+            owner.fence() > fence,
+            "a forget moves the fence with no record"
+        );
+        assert!(matches!(
+            owner.admit(&paired(5, 6), fence).value,
+            Admit::Stale
+        ));
+        assert_eq!(owner.generation_of(host(5)), None);
+        assert_eq!(owner.revision(), revision);
+    }
+
+    #[tokio::test]
+    async fn a_record_made_by_admit_is_not_in_others_and_discard_makes_no_event() {
+        let owner = ContactOwner::new();
+        let revision = owner.revision();
+        let ticket = begun(&owner, &paired(5, 6));
+        assert!(owner.snapshot().others.is_empty());
+        assert_eq!(owner.revision(), revision);
+        drop(owner.discard(&ticket));
+        assert_eq!(owner.generation_of(host(5)), None);
+        assert_eq!(owner.revision(), revision);
+        // A record that holds an outcome is not discarded.
+        let ticket = begun(&owner, &paired(5, 6));
+        assert!(matches!(
+            owner.commit_visit(&ticket, Found::Lost).value,
+            Committed::Accepted
+        ));
+        drop(owner.discard(&ticket));
+        assert!(owner.generation_of(host(5)).is_some());
+    }
+
+    #[tokio::test]
+    async fn retire_read_needs_the_generation_and_the_origin() {
+        let owner = ContactOwner::new();
+        let a = paired(5, 6);
+        read_of(&owner, &a, 10);
+        let first = rows(&owner, 5).remove(0);
+        // Another visit replaced the read: it is over another connection.
+        read_of(&owner, &a, 11);
+        assert!(
+            !owner
+                .retire_read(&first, CommandError::refused("signed out"))
+                .value
+        );
+        assert!(rows(&owner, 5)[0].read.is_some());
+        // The record is another generation.
+        let second = rows(&owner, 5).remove(0);
+        drop(owner.forget(host(5), "forgotten"));
+        read_of(&owner, &a, 12);
+        assert!(
+            !owner
+                .retire_read(&second, CommandError::refused("signed out"))
+                .value
+        );
+        // The generation and the origin are the row's: the contact is the refusal, the read and the
+        // connection go, and the epoch moves.
+        let third = rows(&owner, 5).remove(0);
+        let epoch = third.inbox_epoch;
+        let retired = owner.retire_read(&third, CommandError::refused("signed out"));
+        assert!(retired.value);
+        drop(retired);
+        let after = rows(&owner, 5).remove(0);
+        assert!(after.read.is_none());
+        assert!(after.inbox_epoch > epoch);
+        assert!(!owner.holds_resources_of(host(5)));
+        let others = owner.snapshot().visible.others;
+        assert!(matches!(
+            others[0].contact,
+            HostContact::Refused {
+                request: Asked::Connection,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_record_needs_the_generation_the_epoch_and_the_other_role() {
+        let owner = ContactOwner::new();
+        let a = paired(5, 6);
+        let listed = |owner: &ContactOwner| owner.paired_records().remove(0);
+        // The role: the host is in use.
+        read_of(&owner, &a, 10);
+        let seen = listed(&owner);
+        assert_eq!((seen.host, seen.pairing), (host(5), host(6)));
+        drop(owner.choose(&a, "using"));
+        assert!(
+            owner.paired_records().is_empty(),
+            "the host in use is not listed"
+        );
+        assert!(!owner.remove_record(&seen).value);
+        // The epoch: the host was used and left again.
+        drop(owner.choose(&paired(7, 8), "another"));
+        assert!(!owner.remove_record(&seen).value);
+        // The generation: the host was forgotten and paired again.
+        let seen = listed(&owner);
+        drop(owner.forget(host(5), "forgotten"));
+        read_of(&owner, &a, 11);
+        assert!(!owner.remove_record(&seen).value);
+        // Unchanged and one of the others: the record goes, with its read and connection, and its
+        // row leaves `others`.
+        let seen = owner
+            .paired_records()
+            .into_iter()
+            .find(|each| each.host == host(5))
+            .expect("listed");
+        let before = owner.snapshot().revision;
+        let removed = owner.remove_record(&seen);
+        assert!(removed.value);
+        assert!(removed.revision > before, "the removal is published");
+        drop(removed);
+        assert_eq!(owner.generation_of(host(5)), None);
+        assert!(
+            owner
+                .snapshot()
+                .others
+                .iter()
+                .all(|other| other.reference != "reference-5")
+        );
+    }
+
+    #[tokio::test]
+    async fn records_copies_a_pointer_not_the_items() {
+        let owner = ContactOwner::new();
+        let a = paired(5, 6);
+        read_of(&owner, &a, 10);
+        let (first, second) = (rows(&owner, 5), rows(&owner, 5));
+        let (first, second) = (
+            first[0].read.as_ref().expect("a read"),
+            second[0].read.as_ref().expect("a read"),
+        );
+        assert!(Arc::ptr_eq(first, second), "the read is shared, not copied");
+    }
+
+    #[tokio::test]
+    async fn a_read_serial_comes_from_the_owner_wide_counter() {
+        let owner = ContactOwner::new();
+        read_of(&owner, &paired(5, 6), 10);
+        read_of(&owner, &paired(7, 8), 11);
+        read_of(&owner, &paired(5, 6), 12);
+        let serial = |byte| {
+            rows(&owner, byte)[0]
+                .read
+                .as_ref()
+                .expect("a read")
+                .serial()
+        };
+        let (a, b) = (serial(5), serial(7));
+        assert!(a > b, "the later read of A is newer than B's: {a} and {b}");
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+    }
+
+    #[tokio::test]
+    async fn every_resource_a_visit_removes_is_dropped_after_the_guard_is_released() {
+        // E9: replacing a stored read and a kept connection, a refusal that clears them, a
+        // retirement, a removal, a replacement of a record, and a rejected commit.
+        let counted = dropped_under_the_guard(|| {
+            let owner = ContactOwner::new();
+            let a = paired(5, 6);
+            read_of(&owner, &a, 10);
+            read_of(&owner, &a, 11);
+            let ticket = begun(&owner, &a);
+            let (found, _) = inbox_over(12);
+            drop(owner.commit_visit(&ticket, found));
+            let ticket = begun(&owner, &a);
+            drop(owner.commit_visit(
+                &ticket,
+                Found::Refused {
+                    refusal: CommandError::refused("no"),
+                    request: Asked::AttentionRead,
+                },
+            ));
+            read_of(&owner, &a, 13);
+            let row = rows(&owner, 5).remove(0);
+            drop(owner.retire_read(&row, CommandError::refused("out")));
+            read_of(&owner, &a, 14);
+            let again = paired(5, 7);
+            let Admit::Mismatch { ticket } = owner.admit(&again, owner.fence()).value else {
+                panic!("a mismatch");
+            };
+            drop(owner.replace(&ticket, &again, owner.fence()));
+            read_of(&owner, &again, 15);
+            let listed = owner.paired_records().remove(0);
+            drop(owner.remove_record(&listed));
+            // A rejected commit gives the connection back.
+            let ticket = begun(&owner, &a);
+            drop(owner.forget(host(5), "forgotten"));
+            let (found, _) = inbox_over(16);
+            drop(owner.commit_visit(&ticket, found));
+        });
+        assert_eq!(counted, 0, "E9");
     }
 }

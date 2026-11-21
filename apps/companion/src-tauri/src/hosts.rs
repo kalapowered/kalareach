@@ -87,7 +87,7 @@ fn unfinished(error: &tauri::Error) -> CommandError {
 
 /// The host a choice names, as the owner holds it: the identity the host has, the one it gave this
 /// device in the pairing, what the page names it by and what people call it.
-fn target_of(host: &PairedHost) -> Target {
+pub(crate) fn target_of(host: &PairedHost) -> Target {
     Target::Paired {
         host: host.host_device_id,
         pairing: host.device_id,
@@ -102,7 +102,7 @@ fn target_of(host: &PairedHost) -> Target {
 /// A local action. It reaches no host, so it works for one that no longer answers, among them one
 /// that revoked this computer. When `host` is the one in use its connection ends and none is in
 /// use until the person chooses another; any other host's connection is left as it is. What the
-/// push desk and the inbox keep of the host goes with it. The device's one endpoint then forgets
+/// push desk keeps of the host goes with it, and the owner has let go of what it held of the host. The device's one endpoint then forgets
 /// the host: its address lookups and the relays that no other host names. That is the last step,
 /// and it runs to its end in a task of its own, so a command that stops waiting for it, or an
 /// application that ends in it, leaves nothing else of the forgetting undone, and the host is not
@@ -138,7 +138,6 @@ pub async fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> R
     if let Some(desk) = state.push() {
         desk.forgotten(host.host_device_id);
     }
-    state.inbox().forgotten(host.host_device_id);
     let (link, forgotten) = (Arc::clone(&device.pairing().link), host.clone());
     // A task that panics has left nothing to wait for, and the person's forgetting has been done.
     let _ = tauri::async_runtime::spawn(async move { link.forget_host(&forgotten).await }).await;

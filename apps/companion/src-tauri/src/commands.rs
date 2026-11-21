@@ -3131,11 +3131,13 @@ fn unavailable_push_view() -> crate::push::PushView {
 /// The attention inboxes of the hosts this device is paired with and is not using.
 ///
 /// The inbox is one across hosts, so each of the others is visited over a connection of its own,
-/// all at once and each within a bound, and the page is given what each said: its inbox and its
-/// sessions' numbers, that the host answered and refused (with the refusal it sent), or that the
-/// device is out of contact with it and since when. The page names no host and no parameter.
+/// all at once and each within a bound, and the page is given what the owner holds of each when
+/// they end: its inbox and its sessions' numbers, with the revision they were read at. How contact
+/// with each stands (answered, refused with the host's words, or out of contact since when) is in
+/// the connection's state, which each visit changes as it ends. The page names no host and no
+/// parameter.
 #[tauri::command]
-pub async fn inbox_hosts(state: State<'_, AppState>) -> Result<Vec<crate::inbox::HostInbox>> {
+pub async fn inbox_hosts(state: State<'_, AppState>) -> Result<crate::inbox::InboxHosts> {
     let device = state.device()?;
     Ok(state.inbox().visit(&device).await)
 }

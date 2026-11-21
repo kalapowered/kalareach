@@ -81,8 +81,10 @@ impl AppState {
     /// Builds the state of an application that has not connected to anything yet.
     #[must_use]
     pub fn new() -> Self {
+        let contact = Arc::new(ContactOwner::new());
         Self {
-            contact: Arc::new(ContactOwner::new()),
+            inbox: Arc::new(crate::inbox::InboxDesk::with_owner(Arc::clone(&contact))),
+            contact,
             choice_gate: Mutex::new(()),
             device: OnceLock::new(),
             records_failure: RwLock::new(None),
@@ -94,7 +96,6 @@ impl AppState {
             sync_clients: OnceLock::new(),
             recovery: OnceLock::new(),
             push: OnceLock::new(),
-            inbox: Arc::new(crate::inbox::InboxDesk::default()),
             mailbox: OnceLock::new(),
             settings: OnceLock::new(),
             drafts: Arc::new(crate::drafts::DraftDesk::default()),

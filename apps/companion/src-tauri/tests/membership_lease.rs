@@ -83,7 +83,8 @@ use std::time::Duration;
 
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
-use companion_tauri::inbox::{HostInbox, HostInboxState, InboxDesk};
+use companion_tauri::inbox::testing::HostInboxState;
+use companion_tauri::inbox::{HostInbox, InboxDesk};
 use companion_tauri::lease::LeaseDesk;
 use companion_tauri::owner::Owner;
 use kr_client::Session;
@@ -746,11 +747,11 @@ impl Rig {
 
     /// The row the inbox shows for the member host when the device visits it, as it does a host it
     /// is not using.
-    async fn inbox_of(&self, desk: &Arc<InboxDesk>) -> HostInbox {
+    async fn inbox_of(&self, desk: &Arc<InboxDesk>) -> Found {
         let device = self.companion().device();
-        let mut rows = desk.visit(&device).await;
+        let mut rows = desk.visit(&device).await.hosts;
         assert_eq!(rows.len(), 1, "the member host is the one host visited");
-        rows.remove(0)
+        Found::of(desk, rows.remove(0))
     }
 
     /// The device reads the host, as a page does.
@@ -1933,8 +1934,37 @@ fn inbox_sent(kind: &str) -> serde_json::Value {
     golden_sent("inbox", kind)
 }
 
+/// A row a pass answered with, and where the desk's owner says the contact with its host stands.
+#[derive(Debug)]
+struct Found {
+    row: HostInbox,
+    state: HostInboxState,
+    refusal: Option<companion_tauri::error::CommandError>,
+    lost_since_ms: Option<u64>,
+}
+
+impl Found {
+    fn of(desk: &InboxDesk, row: HostInbox) -> Self {
+        let seen = desk.seen(&row);
+        Self {
+            row,
+            state: seen.state,
+            refusal: seen.refusal,
+            lost_since_ms: seen.lost_since_ms,
+        }
+    }
+}
+
+impl std::ops::Deref for Found {
+    type Target = HostInbox;
+
+    fn deref(&self) -> &HostInbox {
+        &self.row
+    }
+}
+
 /// The failure the inbox's row holds, as the page is sent it: its code, its words and its action.
-fn as_sent(row: &HostInbox) -> serde_json::Value {
+fn as_sent(row: &Found) -> serde_json::Value {
     let refusal = serde_json::to_value(row.refusal.as_ref().expect("the reason")).expect("a value");
     json!({
         "code": refusal["code"],
@@ -2315,7 +2345,7 @@ async fn a_visit_that_presented_for_one_account_reads_nothing_when_another_has_s
     });
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
     assert!(
-        row.result.is_none(),
+        row.result().is_none(),
         "nothing was read under the first account"
     );
     let said = row.refusal.expect("the reason").message;
@@ -2941,7 +2971,7 @@ async fn a_pass_whose_account_leaves_while_the_host_is_asked(method: Method) {
         rig.control.release_request();
     });
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
-    assert!(row.result.is_none(), "nothing was published: {row:?}");
+    assert!(row.result().is_none(), "nothing was published: {row:?}");
     let refusal = row.refusal.expect("the reason");
     assert!(refusal.message.contains("sign in"), "{}", refusal.message);
     // The words say what to do, so the page adds no line of its own after them.
@@ -2990,14 +3020,15 @@ async fn a_kept_visit_whose_account_leaves_before_its_session_list_publishes_not
         rig.control.release_request();
     });
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
-    assert!(row.result.is_none(), "nothing was published: {row:?}");
+    assert!(row.result().is_none(), "nothing was published: {row:?}");
     let said = row.refusal.expect("the reason").message;
     assert!(said.contains("sign in"), "{said}");
 }
 
 /// KR-REQ-17.53: the inbox answers for all the hosts at once and waits for the slowest. When the
 /// account signs out after the member host's pass ended and before a slow host answers, the answer
-/// has nothing of the member host: what it read was read for an account that has left.
+/// publishes nothing read for the account that left: the member host is listed with the account's
+/// refusal and its row holds no read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_inbox_answer_a_slow_host_holds_has_nothing_of_a_host_whose_account_signed_out() {
     let rig = Rig::start().await;
@@ -3024,12 +3055,28 @@ async fn an_inbox_answer_a_slow_host_holds_has_nothing_of_a_host_whose_account_s
         rig.control.release_all();
     });
     let member = rig.member_reference();
+    let rows = rows.hosts;
+    let listed = rows
+        .iter()
+        .find(|row| row.reference == member)
+        .expect("the member host is listed");
     assert!(
-        rows.iter().all(|row| row.reference != member),
-        "nothing read for the account that left is published: {rows:?}"
+        listed.result().is_none()
+            && listed.sessions().is_empty()
+            && listed.read_at_ms().is_none()
+            && listed.read_serial().is_none(),
+        "nothing read for the account that left is published: {listed:?}"
     );
-    assert_eq!(rows.len(), 1, "the slow host answered: {rows:?}");
-    assert_eq!(rows[0].state, HostInboxState::Read, "{rows:?}");
+    let seen = desk.seen(listed);
+    assert_eq!(seen.state, HostInboxState::Refused, "{seen:?}");
+    let said = seen.refusal.expect("the account's reason").message;
+    assert!(said.contains("sign in"), "{said}");
+    assert_eq!(rows.len(), 2, "the slow host answered: {rows:?}");
+    let slow = rows
+        .iter()
+        .find(|row| row.reference != member)
+        .expect("the slow host is listed");
+    assert_eq!(desk.seen(slow).state, HostInboxState::Read, "{rows:?}");
 }
 
 /// KR-REQ-17.53: when the service turns a token back while the service is held off for a minute

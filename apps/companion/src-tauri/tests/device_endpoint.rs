@@ -18,7 +18,7 @@ use std::sync::Arc;
 use companion_platform::notify::{Permission, PreviewKeys};
 use companion_platform::push::PendingRegistration;
 use companion_tauri::AppState;
-use companion_tauri::inbox::{HostInbox, InboxDesk};
+use companion_tauri::inbox::{InboxDesk, InboxHosts};
 use companion_tauri::push::{HostLine, Native, PushDesk, PushFuture, Reach, Registrar, Wiring};
 use companion_tauri::settings::Hosts as _;
 use companion_tauri::settings::connected::ConnectedHosts;
@@ -598,7 +598,7 @@ fn record_of(device: &companion_tauri::device::Device, host: &Host) -> PairedHos
 fn visit_started(
     desk: &Arc<InboxDesk>,
     device: &Arc<companion_tauri::device::Device>,
-) -> tokio::task::JoinHandle<Vec<HostInbox>> {
+) -> tokio::task::JoinHandle<InboxHosts> {
     let (desk, device) = (Arc::clone(desk), Arc::clone(device));
     tokio::spawn(async move { desk.visit(&device).await })
 }
@@ -663,7 +663,7 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     control.release_all();
     let found = visit.await.expect("the visit ran");
     assert!(
-        found.is_empty(),
+        found.hosts.is_empty(),
         "the forgotten host is not reported: {found:?}"
     );
     assert!(
@@ -704,7 +704,7 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     forget(&second);
     let found = visit.await.expect("the visit ran");
     assert!(
-        found.is_empty(),
+        found.hosts.is_empty(),
         "the forgotten host is not reported: {found:?}"
     );
     assert_eq!(
@@ -736,7 +736,7 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     control.release_dialled();
     let found = visit.await.expect("the visit ran");
     assert!(
-        found.is_empty(),
+        found.hosts.is_empty(),
         "the forgotten host is not reported: {found:?}"
     );
     assert_eq!(

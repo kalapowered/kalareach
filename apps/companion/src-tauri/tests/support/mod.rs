@@ -2928,7 +2928,27 @@ pub fn reference_for(companion: &Companion, host: &Host) -> String {
 
 /// The hosts a pass of the inbox answered with.
 pub fn hosts_of(reply: &serde_json::Value) -> &Vec<serde_json::Value> {
-    reply.as_array().expect("a pass answers with its hosts")
+    assert!(
+        reply["revision"].is_u64(),
+        "a pass answers with the revision its rows were read at: {reply}"
+    );
+    reply["hosts"]
+        .as_array()
+        .expect("a pass answers with its hosts")
+}
+
+/// How the owner says contact with the other host `reference` stands: its entry in `others` in the
+/// connection's state, or null when the owner holds no outcome of it.
+pub fn contact_of(companion: &Companion, reference: &str) -> serde_json::Value {
+    let state = companion
+        .call("connection_state", json!({}))
+        .expect("the connection's state");
+    state["others"]
+        .as_array()
+        .expect("the other hosts")
+        .iter()
+        .find(|other| other["reference"] == reference)
+        .map_or(serde_json::Value::Null, |other| other["contact"].clone())
 }
 
 impl Companion {
