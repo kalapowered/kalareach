@@ -1471,3 +1471,97 @@ fn a_forged_channel_that_declares_a_capability_or_writes_after_a_stop_fails_the_
         judges_a_channel_answer(&answer(0, "", "could not be reached"), Some("could not")).is_err()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Part 14.03a: a path typed from a device is terminal input.
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-14.03, part 14.03a: a path typed at the agent's composer from a paired device is
+/// terminal input, every byte of it forwarded to the terminal and shown by the agent's own
+/// composer, and the host announces nothing about it. The control is the same input from an
+/// attachment that holds no lease, which the host refuses and the composer never shows.
+#[test]
+fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
+    const TEST: &str =
+        "gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer";
+    by_hand_case("14.03a", TEST, Setup::default(), |ctx, session| {
+        let session_id = session.session_id();
+        let agent = HandAgent::starts(ctx, session);
+        let initial = detects(ctx, &session.remote, session_id);
+        ctx.work
+            .as_ref()
+            .expect("the working directory was recorded")
+            .create_new(ctx.run.root(), ctx.run.pin(), SHOT, PNG)
+            .unwrap_or_else(|why| panic!("the image: {why}"));
+        let typed = ctx.run.work().join(SHOT).display().to_string();
+
+        // The control first: the same input from the device's keyboard before it holds the lease
+        // is refused, and the composer does not show it.
+        let mut keys = keyboard(ctx, session, false);
+        let control = match keys.type_text(&session.remote, &ctx.runtime, &typed) {
+            Err(refusal) if refusal.code == Some(ErrorCode::LeaseLost) => refusal.detail,
+            Err(refusal) => panic!("input without the lease is refused with LEASE_LOST: {refusal}"),
+            Ok(written) => panic!("input without the lease is refused: {written:?}"),
+        };
+        shows_no_trace(&session.person.window.screen(), SHOT)
+            .unwrap_or_else(|why| panic!("refused input does not reach the composer: {why}"));
+        keys.acquire(&session.remote, &ctx.runtime)
+            .unwrap_or_else(|why| panic!("the device takes the input lease: {why}"));
+        if let Route::Real(real) = &ctx.route {
+            let composer = real
+                .build
+                .composer
+                .clone()
+                .expect("the build shows no composer without an account");
+            for prepare in &composer.prepare {
+                let _ = keys
+                    .type_text(&session.remote, &ctx.runtime, &prepare.input)
+                    .unwrap_or_else(|why| panic!("{why}"));
+                let _ = session
+                    .person
+                    .sees(&prepare.shows, "the agent reaches its composer");
+            }
+        }
+        let written = keys
+            .type_text(&session.remote, &ctx.runtime, &typed)
+            .unwrap_or_else(|why| panic!("{why}"));
+        forwarded_whole(written.forwarded_bytes.get(), &typed)
+            .unwrap_or_else(|why| panic!("every byte of the path is forwarded: {why}"));
+        let rows = shows_across_rows(&session.person, SHOT);
+        // The host announces nothing about the typed path: the instance and its revision as they
+        // were before it was typed, and no resource.
+        let after = shown_now(ctx, &session.remote, session_id);
+        check_unchanged(Held::of(&initial), &after)
+            .unwrap_or_else(|why| panic!("the typed path changes nothing the host shows: {why}"));
+        let (offered, _) = surface(ctx, session, &session.remote, session_id, &after);
+        check_observation_only(&offered).unwrap_or_else(|why| {
+            panic!("with the path typed, only observation and the terminal are offered: {why}")
+        });
+        let resources = events_snapshot(&session.remote, &ctx.runtime, session_id).agent_resources;
+        assert!(
+            resources.resources.is_empty() && resources.continue_after.0.is_none(),
+            "the typed path makes no resource"
+        );
+        agent
+            .runs()
+            .unwrap_or_else(|why| panic!("the agent goes on: {why}"));
+        serde_json::json!({
+            "arm": arm(ctx),
+            "typed": typed,
+            "forwarded_bytes": written.forwarded_bytes.get(),
+            "composer_rows": rows,
+            "detection": initial.detection.evidence(),
+            "announced": after.detection.evidence(),
+            "surface": offered.evidence(),
+            "control": { "what": "the same input without the lease", "breaks_property": true, "refused": control },
+        })
+    });
+}
+
+/// A path of which only part was forwarded fails the check of 14.03a.
+#[test]
+fn a_path_of_which_only_part_reached_the_terminal_fails_the_check_of_14_03a() {
+    assert!(forwarded_whole(18, "kalareach-shot.png").is_ok());
+    assert!(forwarded_whole(17, "kalareach-shot.png").is_err());
+    assert!(forwarded_whole(19, "kalareach-shot.png").is_err());
+}
