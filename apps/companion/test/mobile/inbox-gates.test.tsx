@@ -479,6 +479,22 @@ describe('what another host shows is cached by epoch and serial', () => {
     expect(rowsOf('laptop')).toHaveLength(0)
   })
 
+  // A cache is shown only while the state gives the host the epoch it was read under: the state moved
+  // to another, and no pass has read the host since.
+  it('a_cache_of_another_epoch_than_the_hosts_shows_nothing', async () => {
+    const { controls } = start()
+    await shown('laptop')
+    act(() => {
+      controls.setOtherHosts([laptopOther(5)])
+    })
+    await settle()
+    expect(rowsOf('laptop')).toHaveLength(0)
+    act(() => {
+      controls.setOtherHosts([laptopOther(3)])
+    })
+    await shown('laptop')
+  })
+
   it('a_forgotten_host_leaves_no_cache_after_a_repair', async () => {
     const { controls } = start()
     await shown('laptop')
