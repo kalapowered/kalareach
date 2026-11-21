@@ -111,7 +111,7 @@ async fn add(paths: &HostPaths, arguments: LaunchAddArguments, json: bool) -> Re
     let (mut daemon, file) = open(paths, &arguments.selector).await?;
     let read = read_list(&mut daemon, &file).await?;
     let saved: ShellLaunchCommandsSaveResult = daemon
-        .mutate(
+        .mutate_unconfirmable(
             Method::ShellLaunchCommandsSave,
             &ShellLaunchCommandsSaveParams {
                 expected_revision: read.revision,
@@ -162,7 +162,7 @@ async fn remove(
     let (mut daemon, file) = open(paths, &arguments.selector).await?;
     let read = read_list(&mut daemon, &file).await?;
     let removed: ShellLaunchCommandsRemoveResult = daemon
-        .mutate(
+        .mutate_unconfirmable(
             Method::ShellLaunchCommandsRemove,
             &ShellLaunchCommandsRemoveParams {
                 expected_revision: read.revision,

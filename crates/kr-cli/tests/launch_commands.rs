@@ -8,7 +8,7 @@
 //! refusal here is the host's own sentence. The suite runs on Unix and on Windows; the two differ
 //! only in the environment `kr` is given and the directory it runs in.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
@@ -16,6 +16,7 @@ use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::endpoint::Listener;
+use kr_ipc::paths::Endpoint;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::ids::BuildId;
 use serde_json::Value;
@@ -55,6 +56,8 @@ impl WorkerSupervisor for NoWorkers {
 struct Host {
     controller: Arc<Controller>,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    /// The relay between `kr` and the daemon, where a case loses a reply.
+    relay: Option<tokio::task::JoinHandle<()>>,
     // Declared last: the directory is removed after every field above has let go of its files.
     temp: kr_ipc::testing::TempHost,
 }
@@ -62,11 +65,70 @@ struct Host {
 impl Drop for Host {
     fn drop(&mut self) {
         self.clients.abort();
+        if let Some(relay) = &self.relay {
+            relay.abort();
+        }
+    }
+}
+
+/// Carries one connection between `kr` and the daemon in both directions, and cuts it, both ways,
+/// at the first thing the daemon sends after the file of saved commands changed: the change is on
+/// disk, and its reply never reaches `kr`.
+async fn carry(
+    client: tokio::net::UnixStream,
+    daemon: &Path,
+    file: &Path,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = tokio::net::UnixStream::connect(daemon).await?;
+    let (mut from_client, mut to_client) = client.into_split();
+    let (mut from_server, mut to_server) = server.into_split();
+    let up = tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut from_client, &mut to_server).await;
+    });
+    let mut seen = std::fs::read(file).ok();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let carried = loop {
+        let read = match from_server.read(&mut buffer).await {
+            Ok(0) | Err(_) => break Ok(()),
+            Ok(read) => read,
+        };
+        let now = std::fs::read(file).ok();
+        if now != seen {
+            break Ok(());
+        }
+        seen = now;
+        if let Err(error) = to_client.write_all(&buffer[..read]).await {
+            break Err(error);
+        }
+    };
+    up.abort();
+    carried
+}
+
+/// Accepts connections on `front` and carries each to `daemon`.
+async fn relay(front: tokio::net::UnixListener, daemon: PathBuf, file: PathBuf) {
+    while let Ok((client, _)) = front.accept().await {
+        let (daemon, file) = (daemon.clone(), file.clone());
+        tokio::spawn(async move {
+            let _ = carry(client, &daemon, &file).await;
+        });
     }
 }
 
 impl Host {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// A host whose clients reach it through a relay that loses the reply to a change once the
+    /// change is in the file.
+    async fn start_behind_a_relay_that_loses_a_reply() -> Self {
+        Self::start_with(true).await
+    }
+
+    async fn start_with(lossy: bool) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -93,12 +155,31 @@ impl Host {
         .await
         .expect("the daemon starts");
         let endpoint = environment.controller_endpoint().expect("an endpoint");
-        let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+        let file = environment
+            .state_dir()
+            .join(kr_controller::launch_commands::FILE_NAME);
+        // Behind a relay the daemon listens beside the endpoint `kr` finds, and the relay listens
+        // on that one.
+        let (served, relay) = if lossy {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let daemon = Endpoint::from_path(endpoint.as_path().with_file_name("daemon.sock"))
+                .expect("an endpoint");
+            let front = tokio::net::UnixListener::bind(endpoint.as_path()).expect("the relay binds");
+            std::fs::set_permissions(endpoint.as_path(), std::fs::Permissions::from_mode(0o600))
+                .expect("an owner-only relay");
+            let relay = tokio::spawn(relay(front, daemon.as_path().to_path_buf(), file));
+            (daemon, Some(relay))
+        } else {
+            (endpoint, None)
+        };
+        let listener = Listener::bind(&served).expect("binds the endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
         Self {
             temp,
             controller,
             clients,
+            relay,
         }
     }
 
@@ -683,3 +764,33 @@ async fn a_revision_is_written_as_the_protocols_decimal_string_in_every_document
     assert!(removed["revision"].is_string(), "{removed}");
 }
 
+/// KR-REQ-13.11: a reply lost after the host saved the change leaves the outcome unconfirmed: `kr`
+/// says so in the one sentence for it, exits 8 with `OUTCOME_UNKNOWN`, and does not say that the
+/// host could not be reached (exit 3). The relay cuts the link at the daemon's first word after the
+/// file changed, so the change is on disk each time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_lost_after_the_host_saved_the_change_is_an_unconfirmed_outcome_and_exits_8() {
+    let host = Host::start_behind_a_relay_that_loses_a_reply().await;
+    let unconfirmed =
+        "The host could not confirm the change. Run kr launch list to check the current list.";
+
+    // The control: a read that changes nothing goes through the relay.
+    assert_eq!(labels(&host.listed()), Vec::<String>::new());
+
+    let (status, text, said) = host.said(&["launch", "add", "Claude", "--", "claude"]);
+    assert_eq!(status, Some(8), "{text}{said}");
+    assert!(said.contains(unconfirmed), "{said}");
+    assert_eq!(labels(&host.listed()), ["Claude"], "the change was saved");
+
+    let (status, document) = host.json(&["launch", "remove", "Claude"]);
+    assert_eq!(status, Some(8), "{document}");
+    assert_eq!(document["code"], "OUTCOME_UNKNOWN", "{document}");
+    assert_eq!(document["exit_code"], 8, "{document}");
+    assert!(
+        document["message"]
+            .as_str()
+            .is_some_and(|message| message.ends_with(unconfirmed)),
+        "{document}"
+    );
+    assert_eq!(labels(&host.listed()), Vec::<String>::new(), "the removal was saved");
+}
