@@ -3527,6 +3527,60 @@ fn run_may_be_read(writers_ended: bool) -> Result<(), Stop> {
     }
 }
 
+/// How a case that came back with `shows` and no panic is recorded, once the end has read what it
+/// reads and found `stops`.
+#[derive(Debug, PartialEq, Eq)]
+enum Filed {
+    /// A probe-only run: it started no agent and says nothing of the case itself.
+    ProbeOnly,
+    /// The body ran nothing and said why (a `not_run` in what it returned): the part has no result,
+    /// whatever else the end found nothing wrong with.
+    NotRun(String),
+    /// The case showed what it was to, and the end found nothing.
+    Passed,
+    /// The end found something after the case showed what it was to.
+    Failed,
+}
+
+/// Chooses how a returned case is recorded. A body that returns `not_run` is never recorded as
+/// passed: a record that is empty because nothing ran agrees with every count the end makes.
+fn recorded_as(shows: &serde_json::Value, stops: &[Stop], probe_only: bool) -> Filed {
+    if !stops.is_empty() {
+        return Filed::Failed;
+    }
+    if probe_only {
+        return Filed::ProbeOnly;
+    }
+    match shows.get("not_run") {
+        None | Some(serde_json::Value::Null) => Filed::Passed,
+        Some(serde_json::Value::String(why)) => Filed::NotRun(why.clone()),
+        Some(other) => Filed::NotRun(other.to_string()),
+    }
+}
+
+/// A body that returns `not_run` is recorded as not run and never as passed, whatever its reason
+/// says; a case the end stopped is recorded failed in either case, and a probe-only run is recorded
+/// as one.
+#[test]
+fn a_body_that_returns_not_run_is_recorded_not_run_and_never_passed() {
+    let ran = serde_json::json!({ "arm": "stand-in" });
+    let not_run =
+        serde_json::json!({ "arm": "pinned build", "not_run": "the entry names no fork" });
+    assert_eq!(recorded_as(&ran, &[], false), Filed::Passed);
+    assert_eq!(
+        recorded_as(&not_run, &[], false),
+        Filed::NotRun("the entry names no fork".to_owned())
+    );
+    assert!(matches!(
+        recorded_as(&serde_json::json!({ "not_run": true }), &[], false),
+        Filed::NotRun(_)
+    ));
+    let stops = [("uncharged_turns", "a turn went uncharged".to_owned())];
+    assert_eq!(recorded_as(&ran, &stops, false), Filed::Failed);
+    assert_eq!(recorded_as(&not_run, &stops, false), Filed::Failed);
+    assert_eq!(recorded_as(&ran, &[], true), Filed::ProbeOnly);
+}
+
 fn ends(
     route: Route,
     run: Option<Run>,
@@ -3735,29 +3789,36 @@ fn ends(
         .collect();
     let probe_only = matches!(&route, Route::Real(real) if real.probe_only);
     match result {
-        // A probe-only run starts no agent, so it says nothing of the case itself: it is a run
-        // that was not made, with what it recorded.
-        Ok(shows) if stops.is_empty() && probe_only => {
-            evidence["shows"] = shows;
-            record(Outcome::not_run(
-                case,
-                test,
-                "a probe-only run: the newer build's probes were recorded and no agent was started",
-                evidence,
-            ));
-        }
-        Ok(shows) if stops.is_empty() => {
-            evidence["shows"] = shows;
-            record(Outcome::passed(case, test, evidence));
-        }
-        Ok(shows) => {
-            evidence["shows"] = shows;
-            record(Outcome::failed(case, test, &stopped.join("; "), evidence));
-            panic!(
-                "the case showed what it was to, and then: {}",
-                stopped.join("; ")
-            );
-        }
+        Ok(shows) => match recorded_as(&shows, &stops, probe_only) {
+            Filed::ProbeOnly => {
+                // A probe-only run starts no agent, so it says nothing of the case itself: it is a
+                // run that was not made, with what it recorded.
+                evidence["shows"] = shows;
+                record(Outcome::not_run(
+                    case,
+                    test,
+                    "a probe-only run: the newer build's probes were recorded and no agent was \
+                     started",
+                    evidence,
+                ));
+            }
+            Filed::NotRun(why) => {
+                evidence["shows"] = shows;
+                record(Outcome::not_run(case, test, &why, evidence));
+            }
+            Filed::Passed => {
+                evidence["shows"] = shows;
+                record(Outcome::passed(case, test, evidence));
+            }
+            Filed::Failed => {
+                evidence["shows"] = shows;
+                record(Outcome::failed(case, test, &stopped.join("; "), evidence));
+                panic!(
+                    "the case showed what it was to, and then: {}",
+                    stopped.join("; ")
+                );
+            }
+        },
         Err(panic) => {
             let said = kept_panic_text(&panic_text(&*panic));
             let reason = if stopped.is_empty() {
