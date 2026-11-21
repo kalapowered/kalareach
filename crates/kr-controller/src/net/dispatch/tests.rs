@@ -2660,18 +2660,20 @@ async fn a_voice_context_is_refused_when_privacy_mode_starts_before_it_is_sent()
     world.serving.abort();
 }
 
-/// Privacy mode on at the daemon, with the session's worker told and its cleanup complete, so that
-/// privacy mode can be turned off again.
+/// Privacy mode on at the daemon, and the daemon's record saying that the session's worker was told
+/// the generation in force and said its cleanup is complete, so that privacy mode can be turned off
+/// again.
 async fn privacy_mode_is_on_and_settled(
     controller: &crate::service::Controller,
     session_id: SessionId,
 ) {
     privacy_mode_is_turned_on(controller).await;
-    the_session_has_removed_what_privacy_mode_takes(controller, session_id);
+    the_record_says_the_session_removed_what_privacy_mode_takes(controller, session_id);
 }
 
-/// The session's worker has been told the generation in force and has said its cleanup is complete.
-fn the_session_has_removed_what_privacy_mode_takes(
+/// The daemon's record says that the session's worker was told the generation in force and said its
+/// cleanup is complete. The worker itself is told nothing here.
+fn the_record_says_the_session_removed_what_privacy_mode_takes(
     controller: &crate::service::Controller,
     session_id: SessionId,
 ) {
@@ -2774,8 +2776,8 @@ async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes
 }
 
 /// KR-REQ-24.28: a context read while privacy mode is on is not sent when privacy mode has gone off
-/// and on again before the write: a context of the state between, which the second removal took, is
-/// not sent after it.
+/// and on again before the write: the state at the write is not the state the read began under, and
+/// the case reads nothing between the two changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes_off_and_on_again_before_it_is_sent()
  {
@@ -2805,6 +2807,69 @@ async fn a_voice_context_read_with_privacy_mode_on_is_refused_when_the_mode_goes
     world.serving.abort();
 }
 
+/// KR-REQ-24.28: a context read while privacy mode is on that is stopped once its state was taken
+/// is not sent when privacy mode goes off and the context is read in that state, and goes on again
+/// before the answer is written: the context holds what the later state produced, which the second
+/// removal takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_context_read_in_the_state_between_two_changes_is_refused_when_the_mode_is_on_again_before_it_is_sent()
+ {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    let world = worker_for_a_voice_call().await;
+    let controller = &world.controller;
+    privacy_mode_is_on_and_settled(controller, world.session_id).await;
+    let (connection, kept) = voicing_connection(controller, 80);
+    let call = a_voice_call_over(controller, &connection, world.session_id).await;
+    let (arrived, go) = controller.after_the_voice_state_was_taken.arm();
+    let (answer, ()) = tokio::join!(
+        a_voice_context_read_waiting_to_be_written(&connection, call, world.session_id),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+                .await
+                .expect("the read reaches the place it is stopped at")
+                .expect("the pause is armed");
+            privacy_mode_is_turned_off(controller).await;
+            go.send(()).expect("the read goes on");
+        }
+    );
+    assert!(
+        answer
+            .asked
+            .as_ref()
+            .is_some_and(|asked| asked.read_under.is_some()),
+        "the read is held to the state it began under: {:?}",
+        answer.frame
+    );
+    assert!(
+        matches!(
+            &answer.frame,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "the context is read in the state between the two changes: {:?}",
+        answer.frame
+    );
+    let frame = a_voice_context_written_after(&connection, &kept, answer, || {
+        privacy_mode_is_turned_on(controller)
+    })
+    .await;
+    assert!(
+        matches!(
+            &frame,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(_),
+                ..
+            })
+        ),
+        "no context goes once privacy mode has moved: {frame:?}"
+    );
+    a_context_refused_as_moved(&frame);
+    world.serving.abort();
+}
+
 /// A daemon whose session's worker answers a read of an action's receipt with a result.
 async fn worker_answering_a_receipt() -> crate::service::a_close_a_worker_never_answers::Silent {
     use std::sync::Arc;
@@ -2815,8 +2880,9 @@ async fn worker_answering_a_receipt() -> crate::service::a_close_a_worker_never_
     let world = answering_worker(
         Arc::new(move |request: &kr_protocol::envelope::Request| {
             match request.method.method()? {
-                // The case answers with an empty value: the daemon passes a worker's answer on as
-                // it came, and an answer with no receipt member is not changed by the removal.
+                // The case answers with an empty value. The daemon's narrowing in `answer_shown`
+                // reads only a `receipt` member, so it does not change this answer. Privacy mode's
+                // removal changes the worker's journal, not answers.
                 Method::ActionRead => Some(ParamsValue::empty()),
                 _ => None,
             }
@@ -2963,7 +3029,8 @@ async fn a_receipt_is_refused_when_privacy_mode_starts_before_it_is_sent() {
 /// KR-REQ-24.28: a receipt read while privacy mode is on is written when its own session owed no
 /// removal when the read began.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_receipt_read_after_its_session_removed_what_privacy_mode_takes_is_written() {
+async fn a_receipt_read_after_the_record_says_its_session_removed_what_privacy_mode_takes_is_written()
+ {
     use kr_protocol::envelope::{ControlFrame, Outcome};
 
     let world = worker_answering_a_receipt().await;
@@ -3035,7 +3102,8 @@ async fn a_receipt_read_while_another_session_owes_its_removal_is_written() {
 /// when the read began is refused, though the removal finishes while the answer waits: a worker's
 /// answer made before it was told may still hold what the removal takes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_receipt_read_before_its_session_removed_what_privacy_mode_takes_is_refused() {
+async fn a_receipt_read_before_the_record_says_its_session_removed_what_privacy_mode_takes_is_refused()
+ {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 
     let world = worker_answering_a_receipt().await;
@@ -3054,7 +3122,7 @@ async fn a_receipt_read_before_its_session_removed_what_privacy_mode_takes_is_re
     );
     let (connection, kept) = describing_connection(controller, 74);
     let frame = a_receipt_read_then(&world, &connection, &kept, || async {
-        the_session_has_removed_what_privacy_mode_takes(controller, world.session_id);
+        the_record_says_the_session_removed_what_privacy_mode_takes(controller, world.session_id);
         assert!(
             privacy_mode_has_reported_complete(controller),
             "the removal has reported complete once the read is made"

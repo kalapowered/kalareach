@@ -51,12 +51,14 @@ pub(super) struct Asked {
     /// holds ([`Answers::Conflict`]).
     admitted: Option<Footing>,
     /// For a page of retained output, an agent's retained entries, a context for a voice call, a
-    /// receipt's result, or an answer with text a model wrote, the privacy state it was read under,
-    /// which the answer is released under ([`RemoteConnection::write_answer`]). A page and a
-    /// snapshot read while privacy mode is on are never released; a receipt read then is released
-    /// if its own session owed no removal when the read began; a voice context read then
-    /// is released only while that same state stands, and any change of it gives the refusal a
-    /// context read that privacy mode moved under is given.
+    /// receipt's result, an answer kept from an earlier submission, or an answer with text a model
+    /// wrote, the privacy state it was read under, which the answer is released under
+    /// ([`RemoteConnection::write_answer`]). A page and a snapshot read while privacy mode is on
+    /// are never released; a receipt, or an answer kept from an earlier submission, read then is
+    /// released if its own session owed no removal when the read began, and is refused, or told as
+    /// an outcome not shown, once the state has moved; a voice context read then is released only
+    /// while that same state stands, and any change of it gives the refusal a context read that
+    /// privacy mode moved under is given.
     pub(super) read_under: Option<ReadUnder>,
     /// For an answer with text a model wrote, the same answer without it, which is written in its
     /// place once `read_under` no longer stands.
@@ -222,10 +224,15 @@ impl RemoteConnection {
                 &asked.decision.decided.permitted.rights,
                 &asked.acting.grant.history,
             );
-            // A page of retained output, or an agent's retained entries, goes only under the
-            // privacy state it was read under. Once that has moved it goes with none of its text,
-            // and says the range it covered is gone, as privacy mode left it. An answer with text a
-            // model wrote goes the same way: the answer without that text is written in its place.
+            // A page of retained output, an agent's retained entries, a receipt's result, a
+            // context for a voice call or an answer kept from an earlier submission goes only
+            // under the privacy state it was read under. Once that has moved, a page or a
+            // snapshot goes with none of its text and says the range it covered is gone, as
+            // privacy mode left it; an answer with text a model wrote is replaced by the answer
+            // without that text; a successful context is replaced by the refusal a read that
+            // privacy mode moved under is given; a receipt's result is refused as one that cannot
+            // be shown; and an answer kept from an earlier submission is told as an outcome not
+            // shown.
             let (shown, read_under) = match asked.read_under.as_ref() {
                 Some(read_under) if !read_under.stands() => {
                     let held_back = match asked.withheld.as_ref() {
@@ -241,7 +248,8 @@ impl RemoteConnection {
                         .into_owned(),
                         // An answer kept from an earlier submission carries the result of an
                         // action. A device that is not shown it is told that the outcome is not
-                        // shown: a refusal of a page would tell it that the action did not happen.
+                        // shown, as every refusal of a kept answer is ([`Answers::refusing`]): a
+                        // page's refusal names a read the device did not make.
                         None => match asked.answers(&frame) {
                             Answers::Kept(_) => failure(request_id, super::outcome_not_shown()),
                             _ => without_its_output(&shown, asked.shown_as),
