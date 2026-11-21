@@ -2816,15 +2816,12 @@ async fn told_connection(
     ))
 }
 
-/// What a case does to the dials the keeper makes: holds them, fails them, and counts them. It also
-/// holds the opening of the replacement the keeper makes when the host withdraws a connection, so
-/// that the replacement cannot come before what a case waits for.
+/// What a case does to the dials the keeper makes: holds them, fails them, and counts them.
 #[derive(Default)]
 struct Dials {
     held: std::sync::atomic::AtomicBool,
     failing: std::sync::atomic::AtomicBool,
     made: std::sync::atomic::AtomicUsize,
-    reopen_held: std::sync::atomic::AtomicBool,
 }
 
 impl Dials {
@@ -2839,12 +2836,6 @@ impl Dials {
     fn fail(&self, failing: bool) {
         self.failing
             .store(failing, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Holds the opening of the next replacement until it is released with `false`.
-    fn hold_the_reopen(&self, held: bool) {
-        self.reopen_held
-            .store(held, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2890,17 +2881,10 @@ async fn keeper_with<'r>(
             // come while it is being opened meet a question that is already out.
             let reopen: companion_tauri::connection::Reopen = Arc::new({
                 let endpoint = endpoint.clone();
-                let dials = dials.clone();
                 move || {
                     let endpoint = endpoint.clone();
-                    let dials = dials.clone();
                     reopens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Box::pin(async move {
-                        if let Some(dials) = &dials {
-                            while dials.reopen_held.load(std::sync::atomic::Ordering::SeqCst) {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                            }
-                        }
                         tokio::time::sleep(Duration::from_millis(300)).await;
                         local_connection(&endpoint)
                             .await
@@ -4098,9 +4082,17 @@ async fn a_replaced_connection<'r>(
     (keeper, first, second)
 }
 
-/// Waits until what the page was told satisfies `wanted`, and returns what it was told.
-async fn told_until(rig: &Rig, wanted: impl Fn(&[Value]) -> bool) -> Vec<Value> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+/// How long a case waits for the page to be told what it expects.
+const TOLD_WITHIN: Duration = Duration::from_secs(30);
+
+/// Waits until what the page was told satisfies `wanted`, and returns what it was told, or `None`
+/// when `limit` passes first.
+async fn told_within(
+    rig: &Rig,
+    limit: Duration,
+    wanted: impl Fn(&[Value]) -> bool,
+) -> Option<Vec<Value>> {
+    tokio::time::timeout(limit, async {
         loop {
             let told = rig.app.told_connection();
             if wanted(&told) {
@@ -4110,7 +4102,14 @@ async fn told_until(rig: &Rig, wanted: impl Fn(&[Value]) -> bool) -> Vec<Value> 
         }
     })
     .await
-    .expect("the page is told what the case waits for")
+    .ok()
+}
+
+/// Waits until what the page was told satisfies `wanted`, and returns what it was told.
+async fn told_until(rig: &Rig, wanted: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    told_within(rig, TOLD_WITHIN, wanted)
+        .await
+        .expect("the page is told what the case waits for")
 }
 
 /// The state the page was told, without its revision: two told states that differ in nothing the
@@ -4553,29 +4552,31 @@ async fn a_read_refused_on_a_withdrawn_connection_is_cleared_by_the_replacement(
     let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _keeper = keeper_with(&rig, reopens, None, Some(Arc::clone(&dials))).await;
     rig.app.told_everything().await;
-    // The replacement is not opened until the refusal is told, so the read finishes over the
-    // connection that is still the one held, however long the call takes.
-    dials.hold_the_reopen(true);
+    // The replacement is held before it asks the host or opens another connection, so the read
+    // finishes over the connection that is still the one held, however long the call takes, and
+    // no time the replacement is given runs while the case waits.
+    let replacement = rig.app.app.state::<AppState>().hold_before_replacement();
     the_host_narrows_its_rights_ceiling(&rig).await;
 
     rig.app
         .call("attention_read", support::inbox_read())
         .expect_err("the host refuses what a withdrawn connection asks");
-    told_until(&rig, |told| {
+    let refusal = told_within(&rig, TOLD_WITHIN, |told| {
         told.iter()
             .any(|state| state["contact"]["state"] == "refused")
     })
     .await;
-    dials.hold_the_reopen(false);
+    replacement.release();
+    assert!(
+        refusal.is_some(),
+        "the refusal of the inbox is told: {:?}",
+        rig.app.told_connection()
+    );
     let told = told_until(&rig, |told| told.iter().any(|state| state["replaced"] == 1)).await;
     let refused = told
         .iter()
-        .position(|state| state["contact"]["state"] == "refused");
-    assert!(
-        refused.is_some(),
-        "the refusal of the inbox is told: {told:?}"
-    );
-    let refused = refused.expect("a position");
+        .position(|state| state["contact"]["state"] == "refused")
+        .expect("the refusal is among what the page was told");
     let replaced = told
         .iter()
         .position(|state| state["replaced"] == 1)

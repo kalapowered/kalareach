@@ -253,6 +253,8 @@ impl AppState {
         if Arc::ptr_eq(&connection.session(), session)
             && matches!(connection.standing(), Standing::Owner)
         {
+            #[cfg(feature = "testing")]
+            self.pauses.before_replacement.wait();
             crate::settings::connected::listed_replacing(&connection, &self.replacer()).await;
         }
     }
@@ -836,6 +838,7 @@ pub mod testing {
         pub(super) before_gate: Place,
         pub(super) before_start: Place,
         pub(super) before_cleanup: Place,
+        pub(super) before_replacement: Place,
         pub(super) after_replacement: Place,
     }
 
@@ -857,6 +860,15 @@ pub mod testing {
         #[must_use]
         pub fn hold_the_device_read(&self) -> Hold {
             self.pauses.device_read.set()
+        }
+
+        /// Pauses the next question of whether a connection was withdrawn before the host is asked
+        /// over it, and so before another connection is opened. The question and the opening are
+        /// each given a time to answer in, and neither has begun at this pause, so a suite can hold
+        /// the replacement here for as long as what it waits for takes.
+        #[must_use]
+        pub fn hold_before_replacement(&self) -> Hold {
+            self.pauses.before_replacement.set()
         }
 
         /// Pauses the next replacement of a withdrawn connection once the replacer has put the new
