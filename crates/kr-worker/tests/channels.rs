@@ -2662,6 +2662,27 @@ fn paired_device() -> kr_worker::broker::Caller {
     }
 }
 
+/// The operating-system account the host runs as, sending from the host itself: the sender a
+/// channel stands behind besides a paired device.
+fn local_owner() -> kr_worker::broker::Caller {
+    kr_worker::broker::Caller {
+        actor_id: ActorId::new("local:501").expect("valid"),
+        grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
+    }
+}
+
+/// A second paired device under a grant of its own.
+fn second_device() -> kr_worker::broker::Caller {
+    kr_worker::broker::Caller {
+        actor_id: ActorId::new("device-2").expect("valid"),
+        grant_id: Some(kr_protocol::ids::GrantId::new(Uuid::from_bytes([10; 16]))),
+        ingress: kr_protocol::actor::ActorIngress::PairedDevice,
+        device_id: Some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([11; 16]))),
+    }
+}
+
 /// `agent.prompt.queue` for one instance, with `text` inline.
 fn queued(number: u8, text: &str) -> kr_protocol::agent::AgentPromptParams {
     kr_protocol::agent::AgentPromptParams {
@@ -2787,6 +2808,60 @@ async fn kr_req_12_26_a_queued_prompt_goes_out_naming_its_verified_sender() {
         Some(message_frame(claiming, "paired_device", "03204de92e11fc8c")),
         "the sender is the caller's verified facts, whatever the text says"
     );
+}
+
+/// KR-REQ-12.26: each message on one channel names its own sender. The sender is the verified
+/// facts of the caller who sent that message, not something the channel holds: a paired device, the
+/// local account, a second paired device and the first device again, one after another on one
+/// channel, are written as `paired_device`, `local_user`, `paired_device` and `paired_device`, with
+/// the identifier of each actor: the first and last are the same sender, the other two differ from
+/// it and from each other, and a frame holds `sender` and `sender_id` and nothing that names the
+/// room.
+#[tokio::test]
+async fn kr_req_12_26_each_message_on_one_channel_names_its_own_sender() {
+    let broker = memory_broker();
+    let (_package, mut channel, _resource) = channel_with_a_relayed_approval(&broker).await;
+
+    let senders: [(&str, kr_worker::broker::Caller, &str, &str); 4] = [
+        (
+            "first message",
+            paired_device(),
+            "paired_device",
+            "03204de92e11fc8c",
+        ),
+        (
+            "second message",
+            local_owner(),
+            "local_user",
+            "0f53af7cc7638743",
+        ),
+        (
+            "third message",
+            second_device(),
+            "paired_device",
+            "588605bf5362e8b7",
+        ),
+        (
+            "fourth message",
+            paired_device(),
+            "paired_device",
+            "03204de92e11fc8c",
+        ),
+    ];
+    for (number, (text, sender, kind, identifier)) in (5..).zip(&senders) {
+        let ended = broker
+            .agent_prompt(sender, &queued(2, text), true, TimestampMs::new(number))
+            .await
+            .expect_err("the channel confirms nothing");
+        assert_eq!(ended.code(), ErrorCode::OutcomeUnknown, "{text}");
+        assert_eq!(
+            channel.next().await,
+            Some(message_frame(text, kind, identifier)),
+            "the {text} names the sender who sent it"
+        );
+    }
+    channel.close().await;
+    assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }
 
 /// KR-REQ-12.26: an actor the host cannot name a sender for has no message written. Each
