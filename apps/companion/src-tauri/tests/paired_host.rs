@@ -3716,3 +3716,172 @@ async fn a_host_replaced_at_the_same_endpoint_loses_its_row_cache_and_connection
     assert!(v.control.closed() > closed, "A's connection was closed");
     v.stop().await;
 }
+
+/// A visit that found the host's record to be of another pairing, and verified the listing again,
+/// is held before it replaces the record while the host is chosen and reached under the pairing it
+/// was listed with: the replace is refused, and nothing changes: not the record, not the
+/// revision, and not the live connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replace_after_the_host_was_chosen_and_reached_changes_nothing() {
+    let v = visiting().await;
+    // The owner holds a record of A under another pairing: the device was listing A so when a pass
+    // visited it, and nothing told the owner when the listing went back to the pairing it holds.
+    let device = v.companion().device();
+    let held = device.host_by_reference(&v.a_ref).expect("A is listed");
+    let other = kr_client::pairing::paired::PairedHost {
+        device_id: kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+        ..held.clone()
+    };
+    device
+        .pairing()
+        .hosts
+        .record(other)
+        .expect("A is listed under another pairing");
+    v.pass().await.expect("ran").expect("answered");
+    device
+        .pairing()
+        .hosts
+        .record(held)
+        .expect("A is listed under the pairing the device holds");
+    let mut replaces = v.companion().inbox().watch_replaces();
+    let pass = v.pass();
+    let a = v.id_of(&v.a_ref);
+    let hold = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let hold = replaces.recv().await.expect("a visit reaches the hold");
+            if hold.host == a {
+                return hold;
+            }
+            hold.release();
+        }
+    })
+    .await
+    .expect("the visit finds the record to be of another pairing");
+
+    // The host is chosen under the pairing the device holds, and reached, while the visit is held.
+    v.companion()
+        .call("hosts_use", json!({ "reference": v.a_ref }))
+        .expect("A is chosen");
+    let state = connection(v.companion(), true).await;
+    assert_eq!(state["host"]["reference"], v.a_ref.as_str(), "{state}");
+    let told = v.companion().told_connection().len();
+    let closed = v.control.closed();
+    let app_state = v.companion().app.state::<companion_tauri::AppState>();
+    let owner = app_state.contact_owner();
+    let revision = owner.revision();
+
+    hold.release();
+    drop(replaces);
+    let answered = pass.await.expect("ran").expect("answered");
+    assert!(
+        row_of(&answered, &v.a_ref).is_none(),
+        "A is the host in use, not one of the others: {answered}"
+    );
+    assert_eq!(
+        owner.revision(),
+        revision,
+        "the refused replace made no revision"
+    );
+    assert_eq!(
+        v.companion().told_connection().len(),
+        told,
+        "the refused replace told nothing"
+    );
+    assert!(
+        owner.records(&[a]).rows.is_empty(),
+        "no record of A as another host"
+    );
+    assert_eq!(
+        v.control.closed(),
+        closed,
+        "the live connection was not closed"
+    );
+    let after = v
+        .companion()
+        .call("connection_state", json!({}))
+        .expect("the connection's state");
+    assert_eq!(after["connected"], true, "{after}");
+    assert_eq!(after["host"], state["host"], "{after}");
+    v.stop().await;
+}
+
+/// A choice made from a listing whose pairing is no longer the one this computer holds, of a host
+/// that is one of the others and was read, changes nothing of its record: the read, the retained
+/// connection and the revision stand, and the next visit reads over the same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_choice_leaves_the_current_pairings_record_read_and_connection_alone() {
+    let v = visiting().await;
+    v.pass().await.expect("ran").expect("answered");
+    let a = v.id_of(&v.a_ref);
+    let state = v.companion().app.state::<companion_tauri::AppState>();
+    let owner = state.contact_owner();
+    let serial = owner.records(&[a]).rows[0]
+        .read
+        .as_ref()
+        .expect("A was read")
+        .serial();
+    let revision = owner.revision();
+    let endpoint = v.a.network().endpoint_id();
+    let asked = v.control.asked_of(&endpoint);
+    let closed = v.control.closed();
+
+    let mut stale = v
+        .companion()
+        .device()
+        .host_by_reference(&v.a_ref)
+        .expect("A is listed");
+    stale.device_id =
+        kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([42; 16]));
+    let refused = companion_tauri::hosts::use_host(v.companion().app.handle(), stale).await;
+    assert!(refused.is_err(), "the stale choice is refused");
+
+    assert_eq!(owner.revision(), revision, "no revision");
+    assert_eq!(
+        owner.records(&[a]).rows[0]
+            .read
+            .as_ref()
+            .map(|read| read.serial()),
+        Some(serial),
+        "A's read stands"
+    );
+    assert!(owner.holds_resources_of(a), "A's connection is retained");
+    assert_eq!(v.control.closed(), closed, "nothing was closed");
+    assert_eq!(contact_of(v.companion(), &v.a_ref)["state"], "in_contact");
+    v.pass().await.expect("ran").expect("answered");
+    assert_eq!(
+        v.control.asked_of(&endpoint),
+        asked,
+        "the next visit read over the connection that was kept"
+    );
+    v.stop().await;
+}
+
+/// A visit over the connection the last visit kept, that stalls past its bound, leaves the old read
+/// as it was, begins the host's loss, and closes the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timed_out_visit_over_a_reused_connection_keeps_the_old_read_and_closes_the_connection() {
+    let v = visiting().await;
+    v.companion()
+        .call("hosts_forget", json!({ "reference": v.c_ref }))
+        .expect("C is forgotten");
+    let first = v.pass().await.expect("ran").expect("answered");
+    let seeded = row_of(&first, &v.a_ref).expect("A's row");
+    let (serial, read_at) = (seeded["read_serial"].clone(), seeded["read_at_ms"].clone());
+    assert!(serial.is_u64() && read_at.is_u64(), "A was read: {seeded}");
+    let closed = v.control.closed();
+    v.control.hold_next_request(Method::AttentionRead);
+    let second = v.pass().await.expect("ran").expect("answered");
+    v.control.release_request();
+    let kept = row_of(&second, &v.a_ref).expect("A's row");
+    assert_eq!(kept["read_serial"], serial, "the old read stands: {kept}");
+    assert_eq!(kept["read_at_ms"], read_at, "{kept}");
+    assert_eq!(
+        contact_of(v.companion(), &v.a_ref)["state"],
+        "out_of_contact"
+    );
+    assert!(
+        v.control.closed() > closed,
+        "the connection the visit stalled on was closed"
+    );
+    v.stop().await;
+}

@@ -3079,6 +3079,68 @@ async fn an_inbox_answer_a_slow_host_holds_has_nothing_of_a_host_whose_account_s
     assert_eq!(desk.seen(slow).state, HostInboxState::Read, "{rows:?}");
 }
 
+/// KR-REQ-17.53: an account that leaves while a slow host holds a pass invalidates what the page
+/// read of the member host earlier: the pass answers for the member host with the account's refusal,
+/// no read, and an epoch that moved, so the page's older cache of the host is not shown again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_that_left_invalidates_the_hosts_earlier_cache() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _in_use = rig.uses_another_host().await;
+    let member = rig.member_reference();
+    let earlier = rig
+        .companion()
+        .call("inbox_hosts", json!({}))
+        .expect("the first pass answered");
+    let seeded = support::hosts_of(&earlier)
+        .iter()
+        .find(|row| row["reference"] == member.as_str())
+        .expect("the member host was read");
+    assert!(
+        seeded["result"].is_object(),
+        "a cache to invalidate: {seeded}"
+    );
+    let epoch = seeded["inbox_epoch"].as_u64().expect("an epoch");
+
+    // A second plain host is visited too and held; the member host's kept connection answers at
+    // once, and the account leaves after that and before the slow host answers.
+    let _slow = rig.pairs_another_host().await;
+    rig.control.hold();
+    let asked = rig.control.asked_if_ended();
+    let pass = rig.companion().start_call("inbox_hosts", json!({}));
+    rig.control.until_asked_if_ended(asked + 1).await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
+    rig.control.stop_holding();
+    rig.control.release_all();
+    let answered = pass
+        .await
+        .expect("the pass ran")
+        .expect("the pass answered");
+    let listed = support::hosts_of(&answered)
+        .iter()
+        .find(|row| row["reference"] == member.as_str())
+        .expect("the member host is listed");
+    assert!(
+        listed["result"].is_null() && listed["read_serial"].is_null(),
+        "nothing read for the account that left is published: {listed}"
+    );
+    assert!(
+        listed["inbox_epoch"].as_u64().expect("an epoch") > epoch,
+        "the epoch moved: {listed}"
+    );
+    let said = support::contact_of(rig.companion(), &member);
+    assert_eq!(said["state"], "refused", "{said}");
+    assert!(
+        said["refusal"]["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("sign in")),
+        "{said}"
+    );
+}
+
 /// KR-REQ-17.53: when the service turns a token back while the service is held off for a minute
 /// because another caller gave up on a request, the request that replaces the token waits out the
 /// minute with the rest: nothing is sent, the token is not replaced, and the connection is told the
