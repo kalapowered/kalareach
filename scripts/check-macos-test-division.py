@@ -63,6 +63,33 @@ def job_text(workflow):
     return lines[start:end]
 
 
+def decode(value):
+    """The name a matrix value gives, as GitHub reads it: a plain or a quoted scalar, a comment after
+    it left off, in lower case because GitHub compares and matches `startsWith` without regard to
+    case. `None` for any other form, an expression among them."""
+    value = re.sub(r"\s+#.*$", "", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value.lower() if re.fullmatch(r"[A-Za-z0-9_-]+", value) else None
+
+
+def unreadable(workflow):
+    """The lines of the job that name a part or open an entry in a form this does not read: an
+    entry written as a flow mapping or a flow sequence, and a part that is not a name."""
+    odd = []
+    for line in job_text(workflow):
+        text = line.strip()
+        if text.startswith("#"):
+            continue
+        if re.match(r"-\s+[{\[]", text):
+            odd.append(text)
+        elif re.search(r"\bpart:", text):
+            matched = re.match(r"(?:-\s+)?part:\s*(.*)$", text)
+            if not matched or decode(matched.group(1)) is None:
+                odd.append(text)
+    return odd
+
+
 def entries(workflow):
     """The matrix entries of the job, in order, as (part, words of its `packages` value or None)."""
     lines = job_text(workflow)
@@ -71,11 +98,13 @@ def entries(workflow):
     while at < len(lines):
         line = lines[at]
         at += 1
-        matched = re.match(r"\s+part:\s*(\S+)\s*$", line)
-        if matched:
-            found.append([matched.group(1), None])
+        if line.lstrip().startswith("#"):
             continue
-        matched = re.match(r"(\s+)packages:\s*(>-|>|\|-|\||)\s*(.*)$", line)
+        matched = re.match(r"\s+(?:-\s+)?part:\s*(.*)$", line)
+        if matched:
+            found.append([decode(matched.group(1)) or "", None])
+            continue
+        matched = re.match(r"(\s+)(?:-\s+)?packages:\s*(>-|>|\|-|\||)\s*(.*)$", line)
         if not matched or not found:
             continue
         indent = len(matched.group(1))
@@ -111,9 +140,14 @@ def packages_of(words):
 
 def problems(workflow, members):
     """What is wrong with the division of `members` in `workflow`, one sentence for each fault."""
-    faults = []
+    faults = [
+        f"the matrix has a line in a form the check does not read: {text}"
+        for text in unreadable(workflow)
+    ]
     parts = [part for part, _ in entries(workflow)]
-    for part in sorted({part for part in parts if part.startswith("tests") and part not in LEGS}):
+    for part in sorted(
+        {part for part in parts if part.lower().startswith("tests") and part not in LEGS}
+    ):
         faults.append(f"the matrix has a test leg {part}, which the check does not hold to the workspace")
     for leg in LEGS:
         if parts.count(leg) == 0:
@@ -287,7 +321,7 @@ def features():
     return 1 if failed else 0
 
 
-def fixture(first, second, extra=()):
+def fixture(first, second, extra=(), raw=""):
     """A workflow with a `macos` job whose two legs name these packages, and a job before and after it."""
 
     def entry(part, names):
@@ -316,6 +350,7 @@ def fixture(first, second, extra=()):
         + (entry("tests-1", first) if first is not None else "")
         + (entry("tests-2", second) if second is not None else "")
         + "".join(entry(part, names) for part, names in extra)
+        + raw
         + "          - name: macos-demonstrations\n"
         "            part: demonstrations\n"
         "  after:\n"
@@ -373,6 +408,54 @@ def self_test():
             "an extra test leg that would run packages again",
             fixture(["alpha", "beta"], ["gamma", "delta"], [("tests-3", ["alpha"])]),
             ["a test leg tests-3"],
+        ),
+        (
+            "an extra test leg in single quotes, which GitHub reads as the same name",
+            fixture(["alpha", "beta"], ["gamma", "delta"], [("'tests-3'", ["alpha"])]),
+            ["a test leg tests-3"],
+        ),
+        (
+            "an extra test leg in double quotes",
+            fixture(["alpha", "beta"], ["gamma", "delta"], [('"tests-3"', ["alpha"])]),
+            ["a test leg tests-3"],
+        ),
+        (
+            "an extra test leg whose name differs only in case, which `startsWith` ignores",
+            fixture(["alpha", "beta"], ["gamma", "delta"], [("Tests-3", ["alpha"])]),
+            ["a test leg tests-3"],
+        ),
+        (
+            "an extra test leg with a comment after its name",
+            fixture(["alpha", "beta"], ["gamma", "delta"], [("tests-3 # more", ["alpha"])]),
+            ["a test leg tests-3"],
+        ),
+        (
+            "a second tests-1 in quotes",
+            fixture(["alpha", "beta"], ["gamma", "delta"], [("'tests-1'", ["alpha"])]),
+            ["the tests-1 leg 2 times"],
+        ),
+        (
+            "a second tests-1 that differs in case",
+            fixture(["alpha", "beta"], ["gamma", "delta"], [("Tests-1", ["alpha"])]),
+            ["the tests-1 leg 2 times"],
+        ),
+        (
+            "a leg written as a flow mapping, which the check does not read",
+            fixture(
+                ["alpha", "beta"],
+                ["gamma", "delta"],
+                raw="          - {name: macos-tests-3, part: tests-3, packages: -p alpha}\n",
+            ),
+            ["a form the check does not read"],
+        ),
+        (
+            "a part that is an expression, which the check does not read",
+            fixture(
+                ["alpha", "beta"],
+                ["gamma", "delta"],
+                raw="          - name: x\n            part: ${{ inputs.part }}\n",
+            ),
+            ["a form the check does not read"],
         ),
         (
             "an empty list, which `cargo test` takes as every member",
