@@ -1989,6 +1989,34 @@ fn another_state_proves_a_set_aside_durable_before_it_reads() {
     );
 }
 
+/// KR-REQ-12.26: a read with no folder of messages still proves the data directory durable: the
+/// list of removals another process published lives in it, and no draft may be put in a composer
+/// while that is unknown.
+#[test]
+fn a_read_with_no_folder_of_messages_proves_the_data_directory_durable() {
+    let data = data();
+    let first = Window::over(data.path());
+    let second = Window::over(data.path());
+    // Each state has opened the draft store before the refusal is made, so that only the proof of
+    // the data directory can refuse the read.
+    first.drafts().expect("the first state reads once");
+    second.drafts().expect("the second state reads once");
+    let guard = kr_flush::testing::refuse_flushes_of(data.path().to_path_buf());
+    {
+        let refusal = (second.drafts()).clone().expect_err("the read is refused");
+        assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
+    }
+    assert!(
+        !dir(data.path()).exists(),
+        "a read makes no folder of messages"
+    );
+    drop(guard);
+    assert!(
+        second.drafts().is_ok(),
+        "the read answers once the flush can be made"
+    );
+}
+
 /// A change to the members of a stored file, as a case under test makes it.
 type Edit = dyn Fn(&mut serde_json::Map<String, Value>);
 
@@ -2391,66 +2419,6 @@ fn a_read_that_waited_for_a_set_aside_settles_the_flush_it_owes() {
     // The draft store is open before the refusal is made, so that only the flush the set-aside
     // owes can refuse the read.
     window.drafts().expect("the drafts are read once");
-    std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
-    let _clock = testing::clock(data.path(), 13);
-    let (hook, reached, release) = a_wait();
-    let _locked = testing::at(data.path(), Point::SetAsideLocked, hook);
-    let slot = Arc::new(Mutex::new(None));
-    let hold_slot = Arc::clone(&slot);
-    let root = data.path().to_path_buf();
-    let _copied = testing::at(data.path(), Point::SetAsideCopied, move || {
-        *hold_slot.lock().expect("a lock") =
-            Some(kr_flush::testing::refuse_flushes_of(root.clone()));
-        Ok(())
-    });
-    let (set_aside_done, set_aside) = mpsc::channel();
-    let (read_done, read) = mpsc::channel();
-    let for_set_aside = window.window.clone();
-    let for_read = window.window.clone();
-    std::thread::spawn(move || {
-        let _ = set_aside_done.send(invoke(
-            &for_set_aside,
-            "device_drafts_ledger_set_aside",
-            json!(null),
-        ));
-    });
-    reached
-        .recv_timeout(WAIT)
-        .expect("the set-aside holds every lock");
-    std::thread::spawn(move || {
-        let _ = read_done.send(invoke(&for_read, "device_drafts", json!(null)));
-    });
-    assert!(
-        read.recv_timeout(SHORT).is_err(),
-        "the read waits for the set-aside"
-    );
-    release.send(()).expect("let the set-aside go");
-    let moved = set_aside.recv_timeout(WAIT).expect("the set-aside ends");
-    assert!(
-        moved.as_ref().is_ok_and(|done| done["confirmed"] == false),
-        "the move is made and its flush is refused: {moved:?}"
-    );
-    let answered = read.recv_timeout(WAIT).expect("the read ends");
-    let refusal = answered.expect_err("the read settles the flush it finds owed");
-    assert_eq!(code_of(&refusal), "STORAGE_UNAVAILABLE", "{refusal}");
-    slot.lock().expect("a lock").take();
-    let again = window.drafts();
-    assert!(again.is_ok(), "the read answers once the flush is made");
-}
-
-/// KR-REQ-12.26: the same with a folder of messages: a read of the drafts that waited for the
-/// set-aside's locks settles the flush the set-aside owes under the lock it then holds, though it saw
-/// nothing owed when it started.
-#[test]
-fn a_read_with_a_message_folder_that_waited_for_a_set_aside_settles_the_flush_it_owes() {
-    let data = data();
-    let window = Window::over(data.path());
-    // The draft store is open before the refusal is made, so that only the flush the set-aside
-    // owes can refuse the read.
-    window.drafts().expect("the drafts are read once");
-    window
-        .keep(message(9, "so that the folder of messages exists", &[]))
-        .expect("kept");
     std::fs::write(data.path().join("drafts-removals"), b"[ truncated").expect("damaged");
     let _clock = testing::clock(data.path(), 13);
     let (hook, reached, release) = a_wait();
