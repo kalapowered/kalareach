@@ -391,6 +391,35 @@ fn a_tree_the_stamp_cannot_mark_in_each_place_is_refused_with_the_text() {
     );
     assert!(error.contains("and finds 2"), "{error}");
 
+    let none = tempfile::tempdir().expect("a folder");
+    protocol(none.path());
+    let method = none.path().join("crates/kr-protocol/src/method.rs");
+    let text = std::fs::read_to_string(&method).expect("the file");
+    std::fs::write(&method, text.replace("$variant,", "$variant ,")).expect("the file");
+    let error = compiler::stamp(none.path()).expect_err("no line");
+    assert!(
+        error.contains("the stamp needs one line `$variant,`"),
+        "{error}"
+    );
+    assert!(error.contains("and finds 0"), "{error}");
+
+    let twice = tempfile::tempdir().expect("a folder");
+    protocol(twice.path());
+    let method = twice.path().join("crates/kr-protocol/src/method.rs");
+    let text = std::fs::read_to_string(&method).expect("the file");
+    let line = "pub fn from_wire(value: &str) -> Option<Self> {";
+    std::fs::write(
+        &method,
+        text.replace(line, &format!("{line}\n    }}\n    {line}")),
+    )
+    .expect("the file");
+    let error = compiler::stamp(twice.path()).expect_err("two accessor lines");
+    assert!(
+        error.contains(&format!("the stamp needs at most one line `{line}`")),
+        "{error}"
+    );
+    assert!(error.contains("and finds 2"), "{error}");
+
     let without = tempfile::tempdir().expect("a folder");
     protocol(without.path());
     write(
@@ -607,7 +636,9 @@ fn refused(
     required: &[&str],
     allowed: &[&str],
 ) -> Vec<String> {
-    compiler::merge(root, meta, platforms, required, allowed).expect_err("the reading is refused")
+    compiler::merge(root, meta, platforms, required, allowed)
+        .err()
+        .unwrap_or_else(|| vec!["the reading is not refused".to_owned()])
 }
 
 #[test]
@@ -653,6 +684,20 @@ fn each_refusal_of_the_reading_has_the_text_the_lead_approved() {
                 "{host}: the configuration windows was not built, so the reading is not complete"
             ),
         ]
+    );
+    // A build that ended with exit 0 and did not finish.
+    let mut unfinished = platform.clone();
+    unfinished
+        .builds
+        .iter_mut()
+        .find(|(name, _, _)| name == "host")
+        .expect("a build")
+        .2 = false;
+    assert_eq!(
+        refused(root.path(), &meta, &[unfinished], &[host], &[]),
+        [format!(
+            "{host}: the build of host failed (exit 0), so the compiler read nothing for it"
+        )]
     );
     // A canary that failed.
     let mut canary = platform.clone();
@@ -727,19 +772,25 @@ fn a_report_inside_a_use_that_renames_or_a_type_alias_is_refused_where_it_stands
     write(
         root.path(),
         "crates/kr-forms/src/lib.rs",
-        "use kr_protocol::method::Method::AgentTurnCancel as Cancel;\ntype Number = [u8; { let _ = 0; 1 }];\n",
+        "use kr_protocol::method::Method::AgentTurnCancel as Cancel;\ntype Number = [u8; { let _ = 0; 1 }];\nfn f() {}\n",
     );
     let file = "crates/kr-forms/src/lib.rs";
     let mut read = platform.clone();
     read.reports = vec![
         report_at(file, 1, 36, 52, "agent.turn.cancel"),
         report_at(file, 2, 28, 29, "agent.turn.steer"),
+        // The place that holds the use is the rename, and the use is told elsewhere.
+        Report {
+            here: report_at(file, 1, 36, 52, "agent.turn.steer").here,
+            ..report_at(file, 3, 1, 10, "agent.turn.steer")
+        },
     ];
     let problems = refused(root.path(), &meta, &[read], &[compiler::host_name()], &[]);
     assert_eq!(
         problems,
         [
             "crates/kr-forms/src/lib.rs:1: the compiler reports agent.turn.cancel in a use that renames, which gives the name another name that the reading does not follow".to_owned(),
+            "crates/kr-forms/src/lib.rs:1: the compiler reports agent.turn.steer in a use that renames, which gives the name another name that the reading does not follow".to_owned(),
             "crates/kr-forms/src/lib.rs:2: the compiler reports agent.turn.steer in a type alias, which gives the name another name that the reading does not follow".to_owned(),
         ]
     );
@@ -925,6 +976,10 @@ fn a_shard_takes_the_tags_whose_place_is_its_number_modulo_the_count() {
     );
     assert_eq!(
         compiler::select_tags(&all, None, Some("1/y")),
+        Err("KR_COMPILER_SHARD is <k>/<n>".to_owned())
+    );
+    assert_eq!(
+        compiler::select_tags(&all, None, Some("0/0")),
         Err("KR_COMPILER_SHARD is <k>/<n>".to_owned())
     );
 }
