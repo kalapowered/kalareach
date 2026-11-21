@@ -129,13 +129,20 @@ stops, so a limit that a part has is written in that part's own document.
   another application the same way, and the broker in each worker holds each binding,
   the evidence for what it can do, and the approvals. Typed requests to submit or queue a prompt,
   steer or cancel a turn and answer an approval act only where a binding has evidence for them, so
-  what an agent offers depends on its package and its build. The Claude Code and Gemini CLI
+  what an agent offers depends on its package and its build. A bundled agent always runs in its own
+  terminal, as the agent draws it. Unless its package declares a command integration and its owner
+  has turned that on with `kr plugin integration enable`, the command starts as typed. The Codex,
+  Claude Code, Gemini CLI and Qoder CLI packages declare a command integration, the OpenCode and
+  Kimi packages do not. On macOS and Linux, if a program is started another way, it will be adopted
+  as a native terminal and will not be given a gateway afterwards. Where two packages recognise a
+  program equally well, as the two OpenCode packages do for `opencode`, the worker adopts it bound
+  to neither, and its announcement names both. The Claude Code and Gemini CLI
   bridges are applied only where a signed index names a qualified build of the agent's executable,
   and no index names one yet. The host applies no bridge to an executable that is a script, and the
   `gemini` that npm installs is one, so a signed index cannot make the Gemini CLI bridge apply to that
   distribution. Where a bridge applies, Claude Code's approvals are answered over its bridge channel and
-  Gemini CLI's hooks reach the worker. The Qoder CLI package reports an agent's hooks to the worker
-  with no bridge. An approval is only ever created from the agent's own protocol: [the
+  Gemini CLI's hooks reach the worker. The Qoder CLI package reports an agent's hooks to the worker,
+  with no bridge, in a session its command integration launched. An approval is only ever created from the agent's own protocol: [the
   broker](host/README.md#the-broker), [the bridges](bridges/claude-code/README.md) and
   [plugins](plugins/README.md).
 - **Attaching from elsewhere.** `kr attach` in an ordinary terminal, and the companion application
