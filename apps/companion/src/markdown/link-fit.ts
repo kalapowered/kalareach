@@ -17,16 +17,22 @@
  * another and no link lies over another's words). A group that is not a row (a link over another, or lines
  * that do not all reach one another) is packed line by line, twice: first against the middle of the gap to
  * another line's short link (or the edge of its wide link), then again, in the order of the lines' tops,
- * against the other lines' current boxes; a short link there can stay short where a joint packing of the
- * group would complete it, and is never narrower than the line-by-line packing gives it.
+ * against the other lines' current boxes. The second pass completes no fewer of a line's links than the
+ * first. It can complete another link of the line in place of one that the first completed, and a link that
+ * stays short can end narrower than the first pass made it. A short link there can stay short where a joint
+ * packing of the group would complete it, and a line packed earlier keeps its slack, so a later line's link
+ * can stay short by less than that slack.
  *
  * In a row the packing completes as many short links as any assignment of such boxes can (the proof is a
  * case that compares it with an exhaustive search over many small random rows of one and of two lines). A
- * completed link has the least size, plus up to `SLACK` on a side from room that nothing else uses; it has
- * what it lacks centred on its words where the neighbours allow it. A completed link takes the least from
- * the side whose neighbour is a short link that cannot be completed, and the rest from the other side, so
- * that the neighbour keeps the gap. A link that cannot be completed has all the room that the completed
- * links leave it, shared in halves with a short neighbour that cannot be completed either.
+ * completed link has the least size, plus up to `SLACK` on a side from room that nothing else in its row or
+ * line uses; it has what it lacks centred on its words where the neighbours allow it. Where only one of a
+ * completed link's neighbours in its line (in a row, in the row) is a short link that cannot be completed,
+ * the completed link takes the least from that side and the rest from the other, so that the neighbour
+ * keeps the gap. With such a neighbour on each side, it is centred where the room allows. A short link of
+ * another line, in a group that is not a row, is a wall, not such a neighbour. A link that cannot be
+ * completed has all the room that the completed links leave it, shared in halves with a short neighbour
+ * that cannot be completed either.
  *
  * In a row, a link left narrower than the least size is one that no assignment of non-overlapping boxes
  * completes together with the links the packing completes; it has all the room that those leave it, shared
