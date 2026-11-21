@@ -331,6 +331,7 @@ something the installation no longer touches at all cannot be resolved by instal
 installation stays open, `kr skill install` lists it under `unresolved`, `kr skill status` repeats
 it and says the installation did not finish, and `kr skill remove` leaves it alone. Removing the
 installation clears the record, after which a fresh installation starts from nothing.
+If a removal keeps an entry because its document changed, the record is kept too, until the removal runs again.
 
 ## What contact is not
 
