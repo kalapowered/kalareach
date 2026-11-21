@@ -219,7 +219,17 @@ pub async fn send_image(
     let mut plan = Upload::new(subject, Box::new(Held::new(bytes)));
     // The driver reports its progress on a channel; nothing here watches it.
     let progress = tokio::sync::watch::channel(uploads::Progress::default()).0;
-    match uploads::send(session, route, target, &mut plan, REQUESTED_TTL, &progress).await {
+    match uploads::send(
+        session,
+        route,
+        target,
+        &mut plan,
+        REQUESTED_TTL,
+        &progress,
+        &uploads::NoJournal,
+    )
+    .await
+    {
         Ok(handle) => Transfer::Sent(Box::new(handle)),
         Err(error) => {
             // What the plan holds says how far the host got: no transfer yet, so the reservation;
