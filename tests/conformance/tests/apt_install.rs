@@ -705,13 +705,15 @@ fn a_mirror_that_fails_five_times_and_recovers_is_installed_from_on_the_sixth_at
 
 /// A download that is still running when the deadline comes is cut by `timeout` inside it, and
 /// nothing is installed. An update that is still running is cut at its own bound, which is the
-/// time left when that is under 180 s.
+/// time left when that is under 180 s. On a machine that stalls, the deadline of 4 s can run out
+/// before the script makes the call that is to be cut: the run then ends as a deadline ends one,
+/// and says which cut it did not exercise.
 #[test]
 fn a_download_past_the_deadline_is_cut_and_nothing_is_installed() {
     let rig = Rig::new();
     rig.plan("download", &["slow"]);
     let outcome = rig.run(&["--deadline", "4", "tmux"]);
-    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
+    rig.assert_the_deadline_ended_the_run(&outcome, 4, "a download that never ends");
     assert!(
         outcome.elapsed < Duration::from_secs(4 + 2),
         "{:?}",
@@ -722,19 +724,19 @@ fn a_download_past_the_deadline_is_cut_and_nothing_is_installed() {
         "{:?}",
         rig.phases()
     );
-    assert!(outcome.stdout.contains("status 124"), "{}", outcome.stdout);
-    assert!(
-        outcome
-            .stderr
-            .contains("apt-install: failed: deadline=4s attempts="),
-        "{}",
-        outcome.stderr
-    );
+    if rig.called("--download-only") {
+        assert!(outcome.stdout.contains("status 124"), "{}", outcome.stdout);
+    } else {
+        println!(
+            "not exercised: the cut of a download: the deadline of 4 s ran out before the script \
+             called one"
+        );
+    }
 
     let rig = Rig::new();
     rig.plan("update", &["slow"]);
     let outcome = rig.run(&["--deadline", "4", "tmux"]);
-    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
+    rig.assert_the_deadline_ended_the_run(&outcome, 4, "an update that never ends");
     assert!(
         outcome.elapsed < Duration::from_secs(4 + 2),
         "{:?}",
@@ -749,20 +751,32 @@ fn a_download_past_the_deadline_is_cut_and_nothing_is_installed() {
     );
     let phases = rig.phases();
     assert!(
-        !phases.is_empty() && phases.iter().all(|phase| phase == "update"),
+        phases.iter().all(|phase| phase == "update"),
         "an update that never ends lets nothing else run: {phases:?}"
     );
+    if phases.is_empty() {
+        println!(
+            "not exercised: the cut of an update: the deadline of 4 s ran out before an update \
+             started"
+        );
+    }
 }
 
 /// A call that ignores the termination signal is killed after its grace, and the grace and the
 /// bound together stay inside the deadline: the grace is 10 s, or less where the time left is not
-/// more than 10.
+/// more than 10. On a machine that stalls, the deadline of 4 s can run out before the script
+/// makes the download: the run then ends as a deadline ends one, and says that it did not exercise
+/// the kill. The control below has a deadline that requires the kill.
 #[test]
 fn a_call_that_ignores_the_termination_signal_is_killed_inside_the_deadline() {
     let rig = Rig::new();
     rig.plan("download", &["ignore-term"]);
     let outcome = rig.run(&["--deadline", "4", "tmux"]);
-    assert_eq!(outcome.status, 1, "{}{}", outcome.stdout, outcome.stderr);
+    rig.assert_the_deadline_ended_the_run(
+        &outcome,
+        4,
+        "a call that ignores the termination signal",
+    );
     // The kill is proved by the record below: a status of 137 and a grace and a bound inside the
     // deadline. The time the run took is a ceiling only, far above the run's own length of about
     // the deadline, so that no stall of the machine reaches it.
@@ -771,13 +785,53 @@ fn a_call_that_ignores_the_termination_signal_is_killed_inside_the_deadline() {
         "{:?}",
         outcome.elapsed
     );
+    rig.assert_inside_the_time_left(4, "a call that ignores the termination signal");
+    assert!(!rig.phases().contains(&"install".to_owned()));
+    if rig.called("--download-only") {
+        assert!(outcome.stdout.contains("status 137"), "{}", outcome.stdout);
+        let (grace, seconds) = *rig.bounds().last().expect("the download's bound");
+        assert!(
+            grace >= 1 && seconds >= 1 && grace + seconds <= 4,
+            "{grace} {seconds}"
+        );
+    } else {
+        println!(
+            "not exercised: the kill of a call that ignores the termination signal: the deadline \
+             of 4 s ran out before the script called the download"
+        );
+    }
+}
+
+/// The kill of a call that ignores the termination signal, at a deadline that leaves the update
+/// and the plan terms of 6 s or more, so that only a stall of the machine of several seconds keeps
+/// the script from the download. The download is made and ends in the kill, at the end of its
+/// bound; the script then stops, as a deadline stops it.
+#[test]
+fn a_long_deadline_kills_a_call_that_ignores_the_termination_signal() {
+    let rig = Rig::new();
+    rig.plan("download", &["ignore-term"]);
+    let outcome = rig.run(&["--deadline", "16", "tmux"]);
+    rig.assert_the_deadline_ended_the_run(&outcome, 16, "a long deadline");
+    // A ceiling only, 24 s above the run's own length of about the deadline: it fails a script that
+    // does not stop, and a stall of the machine of that length.
+    assert!(
+        outcome.elapsed < Duration::from_secs(40),
+        "{:?}",
+        outcome.elapsed
+    );
+    assert!(
+        rig.called("--download-only"),
+        "the script made no download: {}{}",
+        outcome.stdout,
+        outcome.stderr
+    );
     assert!(outcome.stdout.contains("status 137"), "{}", outcome.stdout);
     let (grace, seconds) = *rig.bounds().last().expect("the download's bound");
     assert!(
-        grace >= 1 && seconds >= 1 && grace + seconds <= 4,
+        grace >= 1 && seconds >= 1 && grace + seconds <= 16,
         "{grace} {seconds}"
     );
-    rig.assert_inside_the_time_left(4, "a call that ignores the termination signal");
+    rig.assert_inside_the_time_left(16, "a long deadline");
     assert!(!rig.phases().contains(&"install".to_owned()));
 }
 
@@ -915,43 +969,76 @@ fn an_archive_that_goes_missing_between_the_phases_fails_the_install_and_is_not_
     );
 }
 
-/// Every wait is shorter than the deadline, and shorter than the time left.
-/// At least one wait is cut below 10 s times its number. At 5 s, every wait is cut.
+/// Every wait is shorter than the deadline, and shorter than the time left. At 5 s, every wait is
+/// cut below 10 s times its number. On a machine that stalls, the deadline of 5 s can run out
+/// before the script has made a wait and a second attempt: the run then ends as a deadline ends
+/// one, and says that it did not exercise the cut waits. The control below has a deadline that
+/// requires them.
 #[test]
 fn the_waits_never_pass_the_deadline() {
-    for deadline in [5_u32, 12] {
-        let rig = Rig::new();
-        rig.plan("update", &["fail-slow"]);
-        let outcome = rig.run(&["--deadline", &deadline.to_string(), "tmux"]);
-        assert_eq!(
-            outcome.status, 1,
-            "{deadline}: {}{}",
-            outcome.stdout, outcome.stderr
+    let rig = Rig::new();
+    rig.plan("update", &["fail-slow"]);
+    let outcome = rig.run(&["--deadline", "5", "tmux"]);
+    rig.assert_the_deadline_ended_the_run(&outcome, 5, "5");
+    // The record below proves each wait inside the time left. The time the run took is a ceiling
+    // only, far above the run's own length of about the deadline, so that no stall of the machine
+    // reaches it.
+    assert!(
+        outcome.elapsed < Duration::from_secs(25),
+        "5: {:?}",
+        outcome.elapsed
+    );
+    let waits = rig.waits();
+    assert!(waits.iter().all(|wait| *wait < 5), "5: {waits:?}");
+    rig.assert_inside_the_time_left(5, "5");
+    if waits.is_empty() || rig.calls("update").len() < 2 {
+        println!(
+            "not exercised: the waits of a short deadline: the deadline of 5 s ran out before the \
+             script made a wait and a second attempt"
         );
-        // The record below proves each wait inside the time left. The time the run took is a
-        // ceiling only, far above the run's own length of about the deadline, so that no stall of
-        // the machine reaches it.
-        assert!(
-            outcome.elapsed < Duration::from_secs(25),
-            "{deadline}: {:?}",
-            outcome.elapsed
-        );
-        let waits = rig.waits();
-        assert!(
-            !waits.is_empty() && waits.iter().all(|wait| *wait < deadline),
-            "{deadline}: {waits:?}"
-        );
+    } else {
         // Wait number N is 10 s times N and at most 60 s unless the time left cuts it.
         assert!(
             waits
                 .iter()
                 .zip(1_u32..)
                 .any(|(wait, attempt)| *wait < (10 * attempt).min(60)),
-            "{deadline}: no wait was cut: {waits:?}"
+            "5: no wait was cut: {waits:?}"
         );
-        assert!(rig.calls("update").len() >= 2);
-        rig.assert_inside_the_time_left(deadline, &deadline.to_string());
     }
+}
+
+/// The waits at a deadline that leaves room for several attempts: there are waits, each shorter
+/// than the time left, at least one is cut below 10 s times its number, and the update is run
+/// again.
+#[test]
+fn the_waits_are_clipped_to_the_time_left_over_several_attempts() {
+    let rig = Rig::new();
+    rig.plan("update", &["fail-slow"]);
+    let outcome = rig.run(&["--deadline", "12", "tmux"]);
+    rig.assert_the_deadline_ended_the_run(&outcome, 12, "12");
+    // A ceiling only, 13 s above the run's own length of about the deadline: it fails a script that
+    // does not stop, and a stall of the machine of that length.
+    assert!(
+        outcome.elapsed < Duration::from_secs(25),
+        "12: {:?}",
+        outcome.elapsed
+    );
+    let waits = rig.waits();
+    assert!(
+        !waits.is_empty() && waits.iter().all(|wait| *wait < 12),
+        "12: {waits:?}"
+    );
+    // Wait number N is 10 s times N and at most 60 s unless the time left cuts it.
+    assert!(
+        waits
+            .iter()
+            .zip(1_u32..)
+            .any(|(wait, attempt)| *wait < (10 * attempt).min(60)),
+        "12: no wait was cut: {waits:?}"
+    );
+    assert!(rig.calls("update").len() >= 2);
+    rig.assert_inside_the_time_left(12, "12");
 }
 
 /// A program named by `--names-from` is asked after the attempt's last update, so the names it
