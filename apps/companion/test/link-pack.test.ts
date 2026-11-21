@@ -5,7 +5,9 @@
  * every assignment of boxes to a small random line (whole pixels, a least size of 10): a box holds its
  * link's words, stays in the column, and keeps off every other link's box and every control. The packing
  * must complete as many links as the best assignment does, and its boxes must not cross one another, a
- * control or the column. The seeds are fixed, so a failure names its line.
+ * control or the column. Where a group is not a row, each of its lines must complete no fewer links than a
+ * search of that line alone against the middles of the gaps to the other lines' links does. The seeds are
+ * fixed, so a failure names its line.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -63,27 +65,31 @@ function lineOf(seed: number, rows = 1): Line {
 const related = (a: Item, b: Item): boolean =>
   a.box.bottom > b.box.top && a.box.top < b.box.bottom && (a.box.right <= b.box.left || b.box.right <= a.box.left)
 
-/** Whether every group of links whose heights reach one another is a row: every two of them have to keep apart. */
-function allRows(items: readonly Item[]): boolean {
-  const links = items.filter((item) => item.link)
-  const seen = new Set<Item>()
+/** The groups of links whose heights reach one another (by index), and whether each is a row (every two of its links must keep apart). */
+function groupsOf(items: readonly Item[]): { links: number[]; row: boolean }[] {
+  const links = items.flatMap((item, index) => (item.link ? [index] : []))
+  const seen = new Set<number>()
+  const groups: { links: number[]; row: boolean }[] = []
   for (const start of links) {
     if (seen.has(start)) continue
     const group = [start]
     seen.add(start)
     for (let next = 0; next < group.length; next += 1) {
       for (const other of links) {
-        const at = group[next]
-        if (!seen.has(other) && other.box.bottom > at.box.top && other.box.top < at.box.bottom) {
+        const at = items[group[next]].box
+        if (!seen.has(other) && items[other].box.bottom > at.top && items[other].box.top < at.bottom) {
           seen.add(other)
           group.push(other)
         }
       }
     }
-    if (!group.every((a) => group.every((b) => a === b || related(a, b)))) return false
+    groups.push({ links: group, row: group.every((a) => group.every((b) => a === b || related(items[a], items[b]))) })
   }
-  return true
+  return groups
 }
+
+/** Whether every group of links whose heights reach one another is a row. */
+const allRows = (items: readonly Item[]): boolean => groupsOf(items).every((group) => group.row)
 
 /** Lines of links laid out each on its own, 24 px apart (the boxes are 10 high: neighbouring lines reach one another, lines two apart do not), so that links can lie over one another. */
 function layoutOf(seed: number, rows: number): Line {
@@ -103,9 +109,12 @@ function layoutOf(seed: number, rows: number): Line {
   return { column, items }
 }
 
-/** The most links that any assignment of non-overlapping boxes completes, by trying all of them. */
-function bestCount(line: Line): number {
-  const links = line.items.flatMap((item, index) => (item.link ? [index] : []))
+/**
+ * The most links that any assignment of non-overlapping boxes completes, by trying all of them. `scope` is the items that take part (all
+ * of them by default) and `walls` an extra bound on each link's box (none by default).
+ */
+function bestCount(line: Line, scope: readonly number[] = line.items.map((_, index) => index), walls?: (index: number) => { left: number; right: number }): number {
+  const links = scope.filter((index) => line.items[index].link)
   const need = (index: number): number => Math.max(0, LEAST - ((line.items[index]).box.right - (line.items[index]).box.left))
   const shortLinks = links.filter((index) => need(index) > 0)
   let best = 0
@@ -117,16 +126,19 @@ function bestCount(line: Line): number {
       if (at === chosen.length) return true
       const index = chosen[at]
       const own = (line.items[index]).box
+      const wall = walls?.(index) ?? { left: -Infinity, right: Infinity }
       for (let left = 0; left <= need(index); left += 1) {
         const box = { left: own.left - left, right: own.right + (need(index) - left) }
         if (box.left < Math.min(line.column.left, own.left) || box.right > Math.max(line.column.right, own.right)) continue
+        if (box.left < wall.left || box.right > wall.right) continue
         let clear = true
-        line.items.forEach((other, otherIndex) => {
-          if (otherIndex === index) return
+        for (const otherIndex of scope) {
+          if (otherIndex === index) continue
+          const other = line.items[otherIndex]
           const against = grown.get(otherIndex) ?? other.box
-          if (!related(line.items[index], other)) return
+          if (!related(line.items[index], other)) continue
           if (box.left < against.right && against.left < box.right) clear = false
-        })
+        }
         if (!clear) continue
         grown.set(index, box)
         if (settle(at + 1)) return true
@@ -139,8 +151,34 @@ function bestCount(line: Line): number {
   return best
 }
 
+/**
+ * What a line-by-line packing gives the lines of a group that is not a row, by a search of each line on its own: its links keep off the
+ * links of the group's other lines at the middle of the gap to a short one, or at the edge of a wide one. A line is the links that
+ * share a top. Returns, for each line, the links it has and the most of them that any such assignment completes.
+ */
+function lineByLine(line: Line, group: readonly number[]): { own: number[]; best: number }[] {
+  const need = (index: number): number => Math.max(0, LEAST - ((line.items[index]).box.right - (line.items[index]).box.left))
+  const tops = [...new Set(group.map((index) => line.items[index].box.top))]
+  return tops.map((top) => {
+    const own = group.filter((index) => line.items[index].box.top === top)
+    const walls = (index: number): { left: number; right: number } => {
+      const item = line.items[index]
+      let left = -Infinity
+      let right = Infinity
+      for (const other of group) {
+        const box = line.items[other].box
+        if (own.includes(other) || box.bottom <= item.box.top || box.top >= item.box.bottom) continue
+        if (box.right <= item.box.left) left = Math.max(left, need(other) > 0 ? (box.right + item.box.left) / 2 : box.right)
+        else if (box.left >= item.box.right) right = Math.min(right, need(other) > 0 ? (item.box.right + box.left) / 2 : box.left)
+      }
+      return { left, right }
+    }
+    return { own, best: bestCount(line, own, walls) }
+  })
+}
+
 /** Packs `line` and checks it against the search: no box past the column or across another, and as many completed as the best assignment completes. */
-function verify(line: Line, label: string, slack = 0): { completed: number; best: number; shortLinks: number } {
+function verify(line: Line, label: string, slack = 0): { completed: number; best: number; shortLinks: number; compared: number; gained: number } {
   const rooms = packRooms(line.items, LEAST, slack)
   const boxes = line.items.map((item, index) => {
     const room = rooms[index] ?? { left: 0, right: 0 }
@@ -161,14 +199,28 @@ function verify(line: Line, label: string, slack = 0): { completed: number; best
       expect(a.right <= b.left || b.right <= a.left, `${where}: boxes ${String(first)} and ${String(second)} cross`).toBe(true)
     }
   }
-  const completed = line.items.filter((item, index) => {
+  const done = (index: number): boolean => {
     const box = boxes[index]
+    const item = line.items[index]
     return item.link && box.right - box.left >= LEAST && item.box.right - item.box.left < LEAST
-  }).length
+  }
+  const completed = line.items.filter((_, index) => done(index)).length
   const best = bestCount(line)
   // A group that is not a row is packed line by line, so its count is held to the best only where every group is a row.
   if (allRows(line.items)) expect(completed, `${where}: links completed by the packing, against the most that any assignment completes`).toBe(best)
-  return { completed, best, shortLinks: line.items.filter((item) => item.link && item.box.right - item.box.left < LEAST).length }
+  // Elsewhere each line completes no fewer links than the line-by-line packing does, by a search of the line against the middles of the gaps.
+  let compared = 0
+  let gained = 0
+  for (const group of groupsOf(line.items)) {
+    if (group.row) continue
+    for (const { own, best: first } of lineByLine(line, group.links)) {
+      const completedOn = own.filter(done).length
+      expect(completedOn, `${where}: links completed on the line at ${String(line.items[own[0]].box.top)}, against the line-by-line packing`).toBeGreaterThanOrEqual(first)
+      if (first > 0) compared += 1
+      if (completedOn > first) gained += 1
+    }
+  }
+  return { completed, best, shortLinks: line.items.filter((item) => item.link && item.box.right - item.box.left < LEAST).length, compared, gained }
 }
 
 /** A line of links at `words` (left, right), in a column. */
@@ -201,17 +253,23 @@ describe('the packing of a line', () => {
     expect(across, 'layouts that have links on both lines').toBeGreaterThan(200)
   })
 
-  it('keeps boxes apart, and in the column, in 600 layouts of two and 600 of three lines each laid out on its own, and completes the most where every group is a row', () => {
+  it('keeps boxes apart, and in the column, in 600 layouts of two and 600 of three lines each laid out on its own, completes the most where every group is a row, and elsewhere completes on each line no fewer than the line-by-line packing does', () => {
     let notRows = 0
+    let compared = 0
+    let gained = 0
     for (let seed = 1; seed <= 600; seed += 1) {
       for (const rows of [2, 3]) {
         const line = layoutOf(seed + 20_000 * rows, rows)
-        verify(line, `layout ${String(seed)} of ${String(rows)} lines`)
+        const result = verify(line, `layout ${String(seed)} of ${String(rows)} lines`)
         if (!allRows(line.items)) notRows += 1
+        compared += result.compared
+        gained += result.gained
       }
     }
     // The case is vacuous unless many layouts have a group that is not a row (a link over another, or lines that do not all reach one another).
     expect(notRows, 'layouts that have a group that is not a row').toBeGreaterThan(300)
+    expect(compared, 'lines of those layouts where the line-by-line packing completes a link').toBeGreaterThan(1000)
+    expect(gained, 'lines where the second pass completes more links than the line-by-line packing').toBeGreaterThan(10)
   })
 
   it.each([
