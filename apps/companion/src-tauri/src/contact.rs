@@ -2709,11 +2709,11 @@ mod tests {
         let contact = owner.read_started(ReadKind::Contact).expect("held");
         let neutral = owner.read_started(ReadKind::Neutral).expect("held");
         // The neutral read answers first, as a list of the sessions does while the inbox is read.
+        let before = owner.revision();
         assert_eq!(
             owner.read_finished(&neutral, ReadOutcome::Nothing).value,
             Finish::Finished
         );
-        let before = owner.revision();
         assert_eq!(owner.revision(), before, "a neutral read makes no event");
         assert_eq!(
             owner.read_finished(&contact, refused_read()).value,
