@@ -239,18 +239,31 @@ fn retained_level() -> &'static kr_protocol::retained::RetainedLevel {
         .expect("a level is retained")
 }
 
-/// The commits of the trees the cases of a run build: the release before this one, and the newest
-/// kept release of this build's own level. Each is kept when another is built.
+/// The commits of the trees the cases of a run build: the release before this one, the newest kept
+/// release of this build's own level, and the newest of that level whose lock names no store of
+/// saved launch commands. Each is kept when another is built.
 fn trees_a_run_builds() -> Vec<String> {
     let level = retained_level();
+    let own = CompatibilityLevel::of(PACKAGE_VERSION);
     [
         Some(recorded(level.release, "commit")),
-        newest_kept_release(CompatibilityLevel::of(PACKAGE_VERSION), |_| true)
-            .map(|release| release.commit),
+        newest_kept_release(own, |_| true).map(|release| release.commit),
+        newest_kept_release(own, lock_names_no_launch_commands).map(|release| release.commit),
     ]
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// Whether the committed `stored-formats.lock` of `release` names no store of saved launch
+/// commands, which makes a rollback to it leave that store alone.
+fn lock_names_no_launch_commands(release: &releases::Release) -> bool {
+    let lock = releases::git_in(
+        &repository(),
+        &["show", &format!("{}:stored-formats.lock", release.commit)],
+    )
+    .expect("the lock of a release");
+    !lock.contains("\"store\": \"launch-commands\"")
 }
 
 /// The release before this one, built once for the whole run.
@@ -357,14 +370,10 @@ fn inside_the_level_before_the_launch_commands() -> Option<&'static Previous> {
     static BEFORE: OnceLock<Option<Previous>> = OnceLock::new();
     BEFORE
         .get_or_init(|| {
-            built_inside_the_level(" whose lock names no launch-commands store", |release| {
-                let lock = releases::git_in(
-                    &repository(),
-                    &["show", &format!("{}:stored-formats.lock", release.commit)],
-                )
-                .expect("the lock of a release");
-                !lock.contains("\"store\": \"launch-commands\"")
-            })
+            built_inside_the_level(
+                " whose lock names no launch-commands store",
+                lock_names_no_launch_commands,
+            )
         })
         .as_ref()
 }
