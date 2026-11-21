@@ -4031,12 +4031,16 @@ struct Setup {
     second: bool,
 }
 
-/// The stand-in's variants in a case's second session's shell: the first's where the case has two
-/// sessions of one agent (`second`), so that a start by hand in either is the one the variants
-/// name; none where the second session stands for an upgrade, whose newer build the variants of the
-/// first are not for.
+/// The stand-in's variants in a case's second session's shell: none where the second session
+/// stands for an upgrade (`upgrade`), whose newer build the variants of the first are not for,
+/// whatever else the run asks for; otherwise the first's where the case has two sessions of one
+/// agent (`second`), so that a start by hand in either is the one the variants name.
 fn second_session_variants(setup: Setup, variants: &str) -> &str {
-    if setup.second { variants } else { "" }
+    if setup.second && !setup.upgrade {
+        variants
+    } else {
+        ""
+    }
 }
 
 /// A second session of one agent starts the way the first does, and the upgrade's does not.
@@ -4057,6 +4061,13 @@ fn a_second_session_of_one_agent_is_given_the_first_ones_variants_and_an_upgrade
         ""
     );
     assert_eq!(second_session_variants(Setup::default(), "by-hand"), "");
+    // An upgrade's second session is the upgrade's whichever else the run asks for.
+    let both = Setup {
+        second: true,
+        upgrade: true,
+        ..Setup::default()
+    };
+    assert_eq!(second_session_variants(both, "by-hand"), "");
 }
 
 /// Whether the run is the probe-only run: asked for by [`PROBE_ONLY_VARIABLE`], which only the
