@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use proc_macro2::{TokenStream, TokenTree};
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
 use syn::ext::IdentExt as _;
 use syn::visit::Visit;
 
@@ -207,6 +207,27 @@ fn provided(name: &str, provider: &str) -> bool {
         .any(|(accepted, providers, _)| *accepted == name && providers.contains(&provider))
 }
 
+/// How much of what the inventory refuses applies to a crate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Rules {
+    /// Every refusal: the crate is one the scan reads for sightings.
+    All,
+    /// Only the renames of a name the scan reads and the aliases of the two types (R1 and R2): a crate
+    /// that the scan does not read for sightings is still one that a crate it reads may reach a type
+    /// through, by a `pub use` or a `pub type`.
+    Renames,
+}
+
+/// The refusal of a `use`, an `extern crate` or a run of tokens that gives `old` the name `new`.
+pub(super) fn rename_refusal(at: &str, old: &str, new: &str) -> String {
+    format!("{at}: the scan does not read {old} under another name (as {new})")
+}
+
+/// The refusal of a `type` alias of `target`, one of the two types.
+fn alias_refusal(at: &str, target: &str, alias: &str) -> String {
+    format!("{at}: the scan does not read a type alias of {target} ({alias})")
+}
+
 /// What the product code of a crate is made of.
 pub struct Inventory {
     /// The product files in path order, by canonical path.
@@ -244,8 +265,14 @@ fn is_file(path: &Path) -> Result<bool, String> {
 }
 
 /// Reads the inventory of the crate `krate`, which Cargo builds from the source files `roots`, inside
-/// the tree at `root`.
-pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, String> {
+/// the tree at `root`, holding it to the refusals `rules` names. The module walk's own refusals (a
+/// link, a module that is at no file or at two, a `#[path]` that is not one string) hold for both.
+pub fn read(
+    krate: &str,
+    roots: &[PathBuf],
+    root: &Path,
+    rules: Rules,
+) -> Result<Inventory, String> {
     if roots.is_empty() {
         return Err(format!("{krate}: no library or binary target"));
     }
@@ -310,6 +337,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
             imports: Imports::new(),
             module_names: Vec::new(),
             renamed: Vec::new(),
+            all: rules == Rules::All,
             error: None,
         };
         reader.visit_file(&parsed);
@@ -367,7 +395,7 @@ pub fn read(krate: &str, roots: &[PathBuf], root: &Path) -> Result<Inventory, St
     // R3: a macro called at item position or in a transcriber is the crate's own, a macro of the
     // standard library or one the scan lists, each by its written path. The first refused, by name.
     let mut unaccepted: BTreeMap<String, (String, Position)> = BTreeMap::new();
-    for (at, imports, found) in &calls {
+    for (at, imports, found) in calls.iter().filter(|_| rules == Rules::All) {
         for (position, path) in found {
             if !path.is_empty() && !accepts(path, imports, &defined, &module_set) {
                 unaccepted
@@ -408,6 +436,8 @@ struct Reader<'a> {
     module_names: Vec<String>,
     /// The names a `use` or an `extern crate` gives another name: the name it came as, and its own.
     renamed: Vec<(String, String)>,
+    /// Whether every refusal applies, and not R1 and R2 only.
+    all: bool,
     error: Option<String>,
 }
 
@@ -494,10 +524,7 @@ impl Reader<'_> {
     fn note_renames(&mut self, found: Vec<(String, String)>) {
         for (old, new) in found {
             if self.error.is_none() && (read_by_name(&old) || read_by_name(&new)) {
-                self.error = Some(format!(
-                    "{}: the scan does not read {old} under another name (as {new})",
-                    self.at
-                ));
+                self.error = Some(rename_refusal(self.at, &old, &new));
             }
             self.renamed.push((old, new));
         }
@@ -506,7 +533,7 @@ impl Reader<'_> {
     /// Refuses a definition named `ActionRight`: the scan leaves out `ActionRight::<Variant>` as the
     /// right of that name, so a crate that defines the name another way hides a variant.
     fn refuse_definition(&mut self, name: &syn::Ident, kind: &str) {
-        if self.error.is_none() && name.unraw() == "ActionRight" {
+        if self.all && self.error.is_none() && name.unraw() == "ActionRight" {
             self.error = Some(format!(
                 "{}: the scan does not read a {kind} named ActionRight",
                 self.at
@@ -528,11 +555,10 @@ impl Reader<'_> {
             && let Some(last) = path.path.segments.last()
             && (last.ident.unraw() == "MutationRequest" || last.ident.unraw() == "ActionTarget")
         {
-            self.error = Some(format!(
-                "{}: the scan does not read a type alias of {} ({})",
+            self.error = Some(alias_refusal(
                 self.at,
-                last.ident.unraw(),
-                alias.unraw()
+                &last.ident.unraw().to_string(),
+                &alias.unraw().to_string(),
             ));
         }
     }
@@ -581,7 +607,7 @@ impl<'ast> Visit<'ast> for Reader<'_> {
     fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
         if self.enter(&node.attrs) {
             // A `#[macro_use]` on `extern crate` brings the macros of that crate in by name (R4).
-            if self.carries(&node.attrs, "macro_use") {
+            if self.all && self.carries(&node.attrs, "macro_use") {
                 self.error.get_or_insert(format!(
                     "{}: the scan does not read #[macro_use] on extern crate",
                     self.at
@@ -739,27 +765,28 @@ impl<'ast> Visit<'ast> for Reader<'_> {
                 .last()
                 .map(|segment| segment.ident.unraw().to_string())
                 .unwrap_or_default();
-            if name == "include" {
+            if self.all && name == "include" {
                 self.error = Some(format!("{}: the scan does not read include!", self.at));
             } else {
-                match form_in(&node.tokens) {
-                    Some(Form::Include) => {
-                        self.error = Some(format!("{}: the scan does not read include!", self.at));
+                let mut forms = Vec::new();
+                forms_in(&node.tokens, &mut forms);
+                // The first form that applies, in the order the tokens give them.
+                self.error = forms.into_iter().find_map(|form| match form {
+                    Form::Include if self.all => {
+                        Some(format!("{}: the scan does not read include!", self.at))
                     }
-                    Some(Form::Module(module)) => {
-                        self.error = Some(format!(
-                            "{}: the scan does not read a module declared in a macro (mod {module}; in the tokens of {name}!)",
-                            self.at
-                        ));
-                    }
-                    Some(Form::Rules(rules)) => {
-                        self.error = Some(format!(
-                            "{}: the scan does not read a macro_rules! written in the tokens of another macro (macro_rules! {rules} in the tokens of {name}!)",
-                            self.at
-                        ));
-                    }
-                    None => {}
-                }
+                    Form::Module(module) if self.all => Some(format!(
+                        "{}: the scan does not read a module declared in a macro (mod {module}; in the tokens of {name}!)",
+                        self.at
+                    )),
+                    Form::Rules(rules) if self.all => Some(format!(
+                        "{}: the scan does not read a macro_rules! written in the tokens of another macro (macro_rules! {rules} in the tokens of {name}!)",
+                        self.at
+                    )),
+                    Form::Rename(old, new) => Some(rename_refusal(self.at, &old, &new)),
+                    Form::Alias(target, alias) => Some(alias_refusal(self.at, &target, &alias)),
+                    _ => None,
+                });
             }
         }
         syn::visit::visit_macro(self, node);
@@ -823,24 +850,62 @@ enum Form {
     Module(String),
     /// A `macro_rules!` definition, with its name.
     Rules(String),
+    /// `<name> as <name>` where one is a name the scan reads and the other is no primitive type: a
+    /// `use` or an `extern crate` that renames it (R1), as the item form is.
+    Rename(String, String),
+    /// `type <alias> = <path>;` where the path ends in `MutationRequest` or `ActionTarget` (R2): the
+    /// type and the alias.
+    Alias(String, String),
 }
 
-/// The first form the inventory refuses in some tokens, in a macro's arguments or in its
-/// definition, at any depth.
-fn form_in(tokens: &TokenStream) -> Option<Form> {
+/// The primitive types a name is cast to: `<name> as u8` is no rename.
+const PRIMITIVES: &[&str] = &[
+    "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "str", "u8", "u16",
+    "u32", "u64", "u128", "usize",
+];
+
+/// Each form the inventory refuses in some tokens, in a macro's arguments or in its definition, at
+/// any depth, in the order the tokens give them.
+fn forms_in(tokens: &TokenStream, found: &mut Vec<Form>) {
     let flat: Vec<TokenTree> = tokens.clone().into_iter().collect();
     for (at, tree) in flat.iter().enumerate() {
         match tree {
-            TokenTree::Group(group) => {
-                if let Some(found) = form_in(&group.stream()) {
-                    return Some(found);
-                }
-            }
+            TokenTree::Group(group) => forms_in(&group.stream(), found),
             TokenTree::Ident(word) if word.unraw() == "include" => {
                 if matches!(flat.get(at + 1), Some(TokenTree::Punct(bang)) if bang.as_char() == '!')
                     && matches!(flat.get(at + 2), Some(TokenTree::Group(_)))
                 {
-                    return Some(Form::Include);
+                    found.push(Form::Include);
+                }
+            }
+            TokenTree::Ident(word) if word == "as" => {
+                if let (Some(TokenTree::Ident(old)), Some(TokenTree::Ident(new))) = (
+                    at.checked_sub(1).and_then(|before| flat.get(before)),
+                    flat.get(at + 1),
+                ) {
+                    let (old, new) = (old.unraw().to_string(), new.unraw().to_string());
+                    if new != "_"
+                        && ((read_by_name(&old) && !PRIMITIVES.contains(&new.as_str()))
+                            || read_by_name(&new))
+                    {
+                        found.push(Form::Rename(old, new));
+                    }
+                }
+            }
+            TokenTree::Ident(word) if word == "type" => {
+                if let (Some(TokenTree::Ident(alias)), Some(TokenTree::Punct(equals))) =
+                    (flat.get(at + 1), flat.get(at + 2))
+                    && equals.as_char() == '='
+                {
+                    let end = flat[at + 3..]
+                        .iter()
+                        .position(
+                            |tree| matches!(tree, TokenTree::Punct(end) if end.as_char() == ';'),
+                        )
+                        .map_or(flat.len(), |end| at + 3 + end);
+                    if let Some(target) = aliased_type(&flat[at + 3..end]) {
+                        found.push(Form::Alias(target, alias.unraw().to_string()));
+                    }
                 }
             }
             TokenTree::Ident(word) if word.unraw() == "macro_rules" => {
@@ -851,7 +916,7 @@ fn form_in(tokens: &TokenStream) -> Option<Form> {
                 ) = (flat.get(at + 1), flat.get(at + 2), flat.get(at + 3))
                     && bang.as_char() == '!'
                 {
-                    return Some(Form::Rules(name.unraw().to_string()));
+                    found.push(Form::Rules(name.unraw().to_string()));
                 }
             }
             TokenTree::Ident(word) if word == "mod" => {
@@ -876,13 +941,38 @@ fn form_in(tokens: &TokenStream) -> Option<Form> {
                     _ => None,
                 };
                 if let Some(name) = named {
-                    return Some(Form::Module(name));
+                    found.push(Form::Module(name));
                 }
             }
             _ => {}
         }
     }
-    None
+}
+
+/// The name of the type of the two that `run` is a path to, as `Type::Path` of `refuse_alias` reads
+/// it: identifiers joined by `::`, in one pair of parentheses or invisible groups or not.
+fn aliased_type(run: &[TokenTree]) -> Option<String> {
+    if let [TokenTree::Group(group)] = run
+        && matches!(group.delimiter(), Delimiter::Parenthesis | Delimiter::None)
+    {
+        let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+        return aliased_type(&inner);
+    }
+    let path = run.iter().all(|tree| match tree {
+        TokenTree::Ident(_) => true,
+        TokenTree::Punct(colon) => colon.as_char() == ':',
+        _ => false,
+    });
+    match run.last() {
+        Some(TokenTree::Ident(last))
+            if path
+                && ["MutationRequest", "ActionTarget"]
+                    .contains(&last.unraw().to_string().as_str()) =>
+        {
+            Some(last.unraw().to_string())
+        }
+        _ => None,
+    }
 }
 
 /// The macros the tokens of a transcriber call, at any depth, each as the path it is written with.

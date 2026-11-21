@@ -36,7 +36,7 @@ use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
 use super::condition;
-use super::inventory::{self, Inventory};
+use super::inventory::{self, Inventory, Rules, rename_refusal};
 
 /// A source tree: the repository, or a checkout of a release.
 pub struct Tree {
@@ -365,7 +365,12 @@ impl Tree {
             .manifests
             .get(krate)
             .ok_or_else(|| format!("{krate} is no crate of this workspace"))?;
-        let found = Rc::new(inventory::read(krate, &manifest.roots, &self.root)?);
+        let found = Rc::new(inventory::read(
+            krate,
+            &manifest.roots,
+            &self.root,
+            Rules::All,
+        )?);
         self.inventories
             .borrow_mut()
             .insert(krate.to_owned(), Rc::clone(&found));
@@ -1644,8 +1649,17 @@ impl Tree {
         }
     }
 
-    /// The sightings of the crates `include` accepts, outside `#[cfg(test)]` and outside `tests/`.
+    /// The sightings of the crates `include` accepts, outside `#[cfg(test)]` and outside `tests/`. A
+    /// crate that `include` leaves out is read for the renames and aliases that hide a name the scan
+    /// reads (R1 and R2): a crate it accepts may reach a type through a `pub use` or a `pub type` of
+    /// that crate.
     pub fn sightings(&self, include: &dyn Fn(&str) -> bool) -> Result<Vec<Sighting>, String> {
+        for (krate, manifest) in &self.manifests {
+            if !include(krate) && !manifest.proc_macro {
+                let found = inventory::read(krate, &manifest.roots, &self.root, Rules::Renames)?;
+                self.hidden_macro_rename(&found, include)?;
+            }
+        }
         let marked = self.marked(include);
         let mut all = Vec::new();
         for krate in self.crates.keys().filter(|krate| include(krate)) {
@@ -1741,17 +1755,7 @@ impl Tree {
         }
         let scan = self.scan(krate)?;
         let imported = self.inventory(krate)?;
-        // A rename of the name of a macro that a crate in scope defines hides the macro from the scan.
-        for (file, old, new) in &imported.renames {
-            for other in self.crates.keys().filter(|other| include(other)) {
-                let defined = &self.inventory(other)?.defined;
-                if defined.contains(old) || defined.contains(new) {
-                    return Err(format!(
-                        "{file}: the scan does not read {old} under another name (as {new})"
-                    ));
-                }
-            }
-        }
+        self.hidden_macro_rename(&imported, include)?;
         // A marked macro that calls another through a metavariable (R4) cannot be followed.
         let marked = self.marked(include);
         if let Some(name) = scan
@@ -1765,6 +1769,24 @@ impl Tree {
             ));
         }
         Ok(scan)
+    }
+
+    /// A rename of the name of a macro that a crate `include` accepts defines hides the macro from the
+    /// scan.
+    fn hidden_macro_rename(
+        &self,
+        imported: &Inventory,
+        include: &dyn Fn(&str) -> bool,
+    ) -> Result<(), String> {
+        for (file, old, new) in &imported.renames {
+            for other in self.crates.keys().filter(|other| include(other)) {
+                let defined = &self.inventory(other)?.defined;
+                if defined.contains(old) || defined.contains(new) {
+                    return Err(rename_refusal(file, old, new));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn scan(&self, krate: &str) -> Result<Rc<CrateScan>, String> {

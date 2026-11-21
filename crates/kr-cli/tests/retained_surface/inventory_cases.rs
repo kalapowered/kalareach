@@ -1679,3 +1679,169 @@ fn a_definition_named_action_right_is_refused_in_a_crate_the_scan_reads_where_a_
         assert!(read_names(&format!("{lib}\n"), &[]).is_ok(), "{lib}");
     }
 }
+
+#[test]
+fn a_rename_or_an_alias_written_in_the_tokens_of_a_macro_is_refused_and_a_cast_is_not() {
+    let at = "crates/kr-sender/src/lib.rs";
+    let renamed = |old: &str, new: &str| {
+        format!("{at}: the scan does not read {old} under another name (as {new})")
+    };
+    let aliased = |target: &str, alias: &str| {
+        format!("{at}: the scan does not read a type alias of {target} ({alias})")
+    };
+    // The macro the calls are made to: it defines itself, so that the call is the crate's own.
+    let with_macro = |lib: &str| format!("macro_rules! m {{ ($($t:tt)*) => {{}}; }}\n{lib}\n");
+    for (lib, expected) in [
+        (
+            "macro_rules! n { () => { use kr_protocol::MutationRequest as R; }; }",
+            renamed("MutationRequest", "R"),
+        ),
+        (
+            "m! { use kr_protocol::Method as r#M; }",
+            renamed("Method", "M"),
+        ),
+        (
+            "m! { use kr_protocol::r#Method as M; }",
+            renamed("Method", "M"),
+        ),
+        (
+            "m! { use something as Method; }",
+            renamed("something", "Method"),
+        ),
+        (
+            "m! { use kr_protocol::AgentTurnCancel as Cancel; }",
+            renamed("AgentTurnCancel", "Cancel"),
+        ),
+        (
+            "m! { use schemars::json_schema as js; }",
+            renamed("json_schema", "js"),
+        ),
+        (
+            "m! { use { x, kr_protocol::ActionRight as Right }; }",
+            renamed("ActionRight", "Right"),
+        ),
+        (
+            "macro_rules! n { () => { type R = kr_protocol::ActionTarget; }; }",
+            aliased("ActionTarget", "R"),
+        ),
+        (
+            "m! { type R = (MutationRequest); }",
+            aliased("MutationRequest", "R"),
+        ),
+        (
+            "m! { type r#R = ((kr_protocol::r#ActionTarget)); }",
+            aliased("ActionTarget", "R"),
+        ),
+        (
+            "m! { fn f() { type R = MutationRequest; } }",
+            aliased("MutationRequest", "R"),
+        ),
+    ] {
+        let lib = if lib.starts_with("macro_rules!") {
+            format!("{lib}\n")
+        } else {
+            with_macro(lib)
+        };
+        let (scan, lookup) = scanned(&lib, &[]);
+        assert_eq!(scan, Err(expected.clone()), "{lib}");
+        assert_eq!(lookup, Lookup::Failed(expected), "{lib}");
+    }
+    // A cast to a primitive type, a rename of a name the scan does not read, a type that is no plain
+    // path, and a matcher that only has the word, are no rename or alias.
+    for lib in [
+        "m! { let _ = Method::AgentTurnCancel as usize; let _ = Method::AgentTurnSteer as u8; }",
+        "m! { let _ = kr_protocol::Method::AgentPromptQueue as i64; }",
+        "m! { use kr_protocol::other as o; }",
+        "m! { use kr_protocol::Method as _; }",
+        "m! { type R = Vec<MutationRequest>; }",
+        "m! { type R = fn() -> MutationRequest; }",
+        "m! { type R = &ActionTarget; }",
+        "m! { type R = Other; }",
+        "macro_rules! n { ($a:ident as $b:ident) => {}; }",
+    ] {
+        let lib = if lib.starts_with("macro_rules!") {
+            format!("{lib}\n")
+        } else {
+            with_macro(lib)
+        };
+        let scan = read_names(&lib, &[]);
+        assert!(scan.is_ok(), "{lib}: {scan:?}");
+    }
+}
+
+#[test]
+fn a_crate_the_scan_does_not_read_is_read_for_the_renames_and_aliases_that_hide_a_name_only() {
+    let sender = "pub fn f() { let _ = Method::AgentTurnCancel; let _ = kr_protocol::Request { x: 1 }; }\nmacro_rules! mine { () => {}; }\n";
+    let sightings = |protocol: &str, worker: &str, scope: &dyn Fn(&str) -> bool| {
+        let folder = small_tree(sender);
+        write(folder.path(), "crates/kr-protocol/src/lib.rs", protocol);
+        write(folder.path(), "crates/kr-worker/src/lib.rs", worker);
+        let tree = tree_at(folder.path()).expect("the tree");
+        tree.sightings(scope)
+            .map(|found| found.into_iter().map(|one| one.name).collect::<Vec<_>>())
+    };
+    let sender_only = |krate: &str| krate == "kr_sender";
+    let protocol = "crates/kr-protocol/src/lib.rs";
+    let worker = "crates/kr-worker/src/lib.rs";
+    let quiet = "pub fn worker() {}\n";
+    // A `pub use` or a `pub type` of the crate the scan does not read hides the type from it.
+    for (protocol_text, worker_text, expected) in [
+        (
+            "pub use envelope::MutationRequest as Request;\n",
+            quiet,
+            format!(
+                "{protocol}: the scan does not read MutationRequest under another name (as Request)"
+            ),
+        ),
+        (
+            "pub type Request = MutationRequest;\n",
+            quiet,
+            format!("{protocol}: the scan does not read a type alias of MutationRequest (Request)"),
+        ),
+        (
+            "pub enum Method {}\n",
+            "macro_rules! m { () => { use kr_protocol::envelope::MutationRequest as R; }; }\n",
+            format!("{worker}: the scan does not read MutationRequest under another name (as R)"),
+        ),
+        (
+            "pub enum Method {}\n",
+            "macro_rules! m { () => { type R = kr_protocol::ActionTarget; }; }\n",
+            format!("{worker}: the scan does not read a type alias of ActionTarget (R)"),
+        ),
+        // A name that gives a macro of a crate the scan reads another name hides the macro.
+        (
+            "use kr_sender::mine as other;\n",
+            quiet,
+            format!("{protocol}: the scan does not read mine under another name (as other)"),
+        ),
+    ] {
+        assert_eq!(
+            sightings(protocol_text, worker_text, &sender_only),
+            Err(expected),
+            "{protocol_text} {worker_text}"
+        );
+    }
+    // The crate's other forms are not read for this, and no refusal of them holds: the scan gives the
+    // sender's own sightings.
+    let loose = "include!(\"x.rs\");\nforeign::generate!();\n#[macro_use]\nextern crate core;\nenum ActionRight { A }\nmacro_rules! inner { () => { macro_rules! nested { () => {}; } }; }\nmacro_rules! viainc { () => { include!(\"y.rs\"); }; }\nmacro_rules! viamod { () => { mod generated; }; }\n";
+    assert_eq!(
+        sightings("pub enum Method {}\n", loose, &sender_only),
+        Ok(vec!["f".to_owned()])
+    );
+    // A refusal that applies is found after a form that does not: an `include!` comes first here.
+    assert_eq!(
+        sightings(
+            "pub enum Method {}\n",
+            "macro_rules! m { () => { include!(\"x\"); use kr_protocol::MutationRequest as R; }; }\n",
+            &sender_only
+        ),
+        Err(format!(
+            "{worker}: the scan does not read MutationRequest under another name (as R)"
+        ))
+    );
+    // A scan that does take the crate in holds it to all of them.
+    assert_eq!(
+        sightings("pub enum Method {}\n", loose, &|_| true),
+        Err(format!("{worker}: the scan does not read include!"))
+    );
+}
