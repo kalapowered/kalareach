@@ -1635,12 +1635,14 @@ impl<'a> Resolver<'a> {
         }
         let mut words = vec!["cargo".to_owned(), "test".to_owned(), "--locked".to_owned()];
         let mut test_arguments: Vec<String> = Vec::new();
+        let mut package_named = false;
         if let Some(step) = step {
             for (variable, value) in &step.env {
                 if !step.placeholder_env.contains(variable) {
                     line.push_str(&format!("{variable}={} ", plan::quote(value)));
                 }
             }
+            test_arguments = test_options(step);
             if let (Ok(selection), Some(package)) = (
                 coverage::parse(&step.command),
                 self.map
@@ -1648,12 +1650,19 @@ impl<'a> Resolver<'a> {
                     .iter()
                     .find(|package| package.name == target.package),
             ) {
-                words.extend(selection.reproduce(package));
+                let members: Vec<&Package> = self
+                    .map
+                    .packages
+                    .iter()
+                    .filter(|member| member.workspace == package.workspace)
+                    .collect();
+                words.extend(selection.reproduce(package, &members, &step.placeholder_words));
+                package_named = true;
             }
-            test_arguments = test_options(step);
         }
-        words.push("-p".to_owned());
-        words.push(target.package.clone());
+        if !package_named {
+            words.extend(["-p".to_owned(), target.package.clone()]);
+        }
         words.extend(
             target
                 .kind

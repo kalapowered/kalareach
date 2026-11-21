@@ -1626,6 +1626,7 @@ mod tests {
             workspace_default_members: Vec::new(),
             registry_crates: registry.iter().map(|name| (*name).to_owned()).collect(),
             dependency_names: dependencies.iter().map(|name| (*name).to_owned()).collect(),
+            dependency_aliases: std::collections::BTreeMap::new(),
         }
     }
 

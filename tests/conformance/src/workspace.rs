@@ -127,6 +127,8 @@ pub struct Package {
     /// The names its dependencies are known by in its source: a rename where the manifest gives
     /// one, the package's name otherwise.
     pub dependency_names: BTreeSet<String>,
+    /// The name a dependency that the manifest renames is known by, by the name of its package.
+    pub dependency_aliases: BTreeMap<String, String>,
     /// The directory of its workspace's root, relative to the tested root, as Cargo's path for it
     /// resolves: `.` for the root.
     pub workspace: String,
@@ -478,6 +480,15 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
             .filter(|name| !renamed.contains(name))
             .map(str::to_owned)
             .collect();
+        let dependency_aliases = dependencies
+            .iter()
+            .filter_map(|dependency| {
+                Some((
+                    dependency["name"].as_str()?.to_owned(),
+                    dependency["rename"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
         let dependency_names = dependencies
             .iter()
             .filter_map(|dependency| {
@@ -518,6 +529,7 @@ pub fn parse(value: &Value) -> Result<Vec<Package>, String> {
             manifest,
             registry_crates,
             dependency_names,
+            dependency_aliases,
             workspace: String::new(),
             workspace_members: Vec::new(),
             workspace_default_members: Vec::new(),
