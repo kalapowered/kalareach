@@ -453,7 +453,7 @@ impl ListenLine {
                     ]
                     .into_iter()
                     .find(|step| step.word() == op)?,
-                    os: optional(os)?.and_then(|os| i32::try_from(os).ok()),
+                    os: optional(os)?.map(i32::try_from).transpose().ok()?,
                 }
             }
             _ => return None,
@@ -773,6 +773,24 @@ mod tests {
         ] {
             assert_eq!(ListenLine::parse(&bad), None, "{bad}");
         }
+        // A system code that does not fit the type that holds it is not a code: the line is out of
+        // the grammar and is not read as one that has none.
+        let other = ListenLine {
+            role: ListenRole::Control,
+            refusal: ListenRefusal::Other {
+                operation: ListenStep::Bind,
+                os: Some(98),
+            },
+            path: "/c.sock".to_owned(),
+            daemon: 1,
+        }
+        .written("tail")
+        .expect("a line");
+        assert!(ListenLine::parse(&other).is_some());
+        assert_eq!(
+            ListenLine::parse(&other.replacen("os=98", "os=2147483648", 1)),
+            None
+        );
         // The tail is for a person and is not read.
         assert!(ListenLine::parse(&good.replace(" -- tail", "")).is_some());
         assert_eq!(
@@ -790,11 +808,12 @@ mod tests {
             path: "/t.sock".to_owned(),
             daemon: 1,
         }
-        .written(&format!("{}\r\n", "\u{e9}".repeat(300)))
+        .written(&format!("first\r\nsecond{}", "\u{e9}".repeat(300)))
         .expect("a line");
         let tail = line.split_once(" -- ").expect("a tail").1;
+        assert!(tail.len() <= 200, "{tail:?}");
         assert!(
-            tail.len() <= 200 && !tail.contains(['\r', '\n']),
+            tail.starts_with("first  second") && !tail.contains(['\r', '\n']),
             "{tail:?}"
         );
     }
