@@ -247,11 +247,16 @@ fn a_commit_that_cannot_be_written_publishes_no_standing() {
 /// KR-REQ-24.15: a feed refusal raised while an establishment of the clock is on its way, a policy
 /// commit that waits for the directory, and that establishment do not wait for one another in a
 /// ring. The establishment stops before it takes anything of its own. A policy commit then holds
-/// the policy's lock, and the raise holds the registration hold for writing and waits for the
-/// policy's lock. The establishment is let go: it takes the registration hold, the clock's state
-/// and the directory's connection in the crate's order, so it waits behind the raise only, and the
-/// commit's wait for the connection ends. All three finish, and the establishment's answer is the
-/// established result (the connection is a local one, which the raise does not refuse).
+/// the policy's lock, and the raise holds the registration hold for writing, stopped before it
+/// asks for the policy's lock. A raise that waited for the policy's lock holding the hold would
+/// wait for the commit, which waits for the directory's connection, which an establishment holds
+/// while it waits for the hold. The raise only tries the policy's lock while it holds the hold,
+/// so where the commit holds it, the raise lets go of the hold and waits for the lock holding
+/// nothing: the hold is free again while the commit still holds the policy's lock. The
+/// establishment is let go: it takes the registration hold, the clock's state and the directory's
+/// connection in the crate's order, and the commit's wait for the connection ends. All three
+/// finish, and the establishment's answer is the established result (the connection is a local
+/// one, which the raise does not refuse).
 #[test]
 fn a_feed_raise_a_policy_commit_and_a_clock_establishment_do_not_wait_in_a_ring() {
     let rig = Rig::new(async {
@@ -309,7 +314,9 @@ fn a_feed_raise_a_policy_commit_and_a_clock_establishment_do_not_wait_in_a_ring(
         .recv_timeout(BOUND)
         .expect("the policy commit holds the policy's lock");
 
-    // The raise holds the registration hold for writing and waits for the policy's lock.
+    // The raise holds the registration hold for writing, and stops there before it asks for the
+    // policy's lock.
+    let (holding, let_the_raise_go) = controller.after_the_hold_of_a_feed_refusal.arm();
     {
         let (controller, done_tx) = (Arc::clone(&controller), done_tx.clone());
         rig.runtime.spawn(async move {
@@ -317,16 +324,13 @@ fn a_feed_raise_a_policy_commit_and_a_clock_establishment_do_not_wait_in_a_ring(
             let _ = done_tx.send(("the feed's raise", true));
         });
     }
-    let deadline = Instant::now() + BOUND;
-    while controller.withdrawals_waiting.load(Ordering::SeqCst) == 0
-        || controller.commit_hold.try_read().is_ok()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the raise did not take the registration hold for writing"
-        );
-        std::thread::yield_now();
-    }
+    holding
+        .recv_timeout(BOUND)
+        .expect("the raise holds the registration hold");
+    assert!(
+        controller.commit_hold.try_read().is_err(),
+        "the raise holds the registration hold for writing"
+    );
 
     // The establishment goes on to the stop that stands before the registration hold. At the base
     // of the cure it holds the clock's state and the directory's connection there; after it, it
@@ -336,6 +340,22 @@ fn a_feed_raise_a_policy_commit_and_a_clock_establishment_do_not_wait_in_a_ring(
     wait(
         at_the_hold,
         "the establishment reached the registration hold",
+    );
+
+    // The raise asks for the policy's lock, which the policy commit holds, and lets go of the
+    // registration hold to wait for it: the hold is free while the lock is still held.
+    let_the_raise_go.send(()).expect("the raise goes on");
+    let deadline = Instant::now() + BOUND;
+    while controller.commit_hold.try_read().is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the raise did not let go of the registration hold to wait for the policy's lock"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "none of the three has finished while the policy commit holds the policy's lock"
     );
     release_tx.send(()).expect("the policy commit goes on");
     go_to_the_hold
@@ -348,9 +368,9 @@ fn a_feed_raise_a_policy_commit_and_a_clock_establishment_do_not_wait_in_a_ring(
         names.contains(&"the establishment")
             && names.contains(&"the policy commit")
             && names.contains(&"the feed's raise"),
-        "the raise holds the registration hold and waits for the policy's lock, the commit holds \
-         the policy's lock and waits for the directory's connection, and the establishment holds \
-         the connection and waits for the registration hold; finished: {names:?}"
+        "the raise lets go of the registration hold and waits for the policy's lock, the commit \
+         holds the policy's lock and waits for the directory's connection, and the establishment \
+         takes the registration hold the raise let go of; finished: {names:?}"
     );
     assert!(
         heard.iter().all(|(_, ok)| *ok),

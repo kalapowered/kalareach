@@ -579,6 +579,10 @@ fn a_launch_names_the_hook_events_its_package_declares_in_its_registration() {
         serde_json::from_value::<kr_plugin_sdk::hook_events::HookEvents>(declared)
             .expect("the declared events read"),
     );
+    // One placed program is held at a time, so the first shell is let go of before the second is
+    // placed.
+    drop(launcher);
+    drop(shell);
 
     let plain = Shell::new();
     let answer = plain.establish();
