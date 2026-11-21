@@ -584,6 +584,7 @@ impl Restart {
     }
 
     /// Whether a delay was set, by a failure or by a pace.
+    #[cfg(any(test, feature = "testing"))]
     const fn waiting(&self) -> bool {
         self.not_before_ms != 0
     }
@@ -904,6 +905,7 @@ impl DescriptionService {
     }
 
     /// Returns the handle that cancels the job the process is running.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub const fn running_job(&self) -> &RunningJob {
         &self.running
@@ -980,6 +982,7 @@ impl DescriptionService {
 
     /// Returns the next load's earliest time after a failure, when one is waiting. The wait before
     /// the next job after one that passed its deadline is not in it.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub const fn restart_not_before_ms(&self) -> Option<u64> {
         if self.restart.waiting() {

@@ -310,6 +310,7 @@ impl Scheduler {
     }
 
     /// Returns the measured service time.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub const fn service_time(&self) -> ServiceTime {
         self.service_time
