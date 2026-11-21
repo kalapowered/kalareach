@@ -68,6 +68,7 @@ export class FakeUploads {
   readonly #make: (file: HandedFile) => AttachmentHandle
   readonly #throw: (failure: ScriptedFailure) => never
   #left: OpenUpload[] = []
+  #endRefused = false
   #refuseNext: ScriptedFailure | null = null
   #bindRefusal: ScriptedFailure | null = null
   #cancelState: UploadCancelled['state'] = 'cancelled'
@@ -194,7 +195,16 @@ export class FakeUploads {
     return { draftId: draft.draftId, revision: String(draft.revision), text }
   }
 
+  /** The next end of a draft fails, as one does when the host is out of contact. */
+  refuseNextEnd(): void {
+    this.#endRefused = true
+  }
+
   end(sessionId: string): void {
+    if (this.#endRefused) {
+      this.#endRefused = false
+      this.#throw({ code: 'HOST_NOT_CONFIGURED', message: 'the host is not connected' })
+    }
     this.ended.push(sessionId)
     this.#drafts.delete(sessionId)
   }

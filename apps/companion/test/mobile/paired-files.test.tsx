@@ -359,6 +359,24 @@ describe('the files on the draft go with the prompt that names it', () => {
     expect(controls.pairedUploads.texts).toEqual([])
   })
 
+  it('keeps the bound files on the composer when the draft could not be ended, so none goes with a later prompt unseen', async () => {
+    const { controls, person } = await open()
+    await pick(person, 'one.pdf')
+    const first = await started(controls)
+    act(() => {
+      controls.pairedUploads.finish(first)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+    })
+    controls.pairedUploads.refuseNextEnd()
+    await person.click(screen.getByRole('button', { name: /^Remove one.pdf/ }))
+    await waitFor(() => {
+      expect(controls.pairedUploads.ended).toEqual([])
+    })
+    expect(screen.getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+  })
+
   it('ends the draft when a bound file is removed, and takes every file bound to it off the composer', async () => {
     const { controls, person } = await open()
     await pick(person, 'one.pdf')

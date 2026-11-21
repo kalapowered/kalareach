@@ -255,12 +255,20 @@ export function usePairedFiles({
         // The host keeps one draft for the session and no way to take one file off it, so the draft
         // ends and every file bound to it leaves the composer.
         const gone = new Set(files.filter(onDraft).map((each) => each.localId))
-        void nameSession().then((subject) => port.draftEnd(subject, sessionId)).catch(() => undefined)
-        for (const each of gone) {
-          removed.current.add(each)
-          uploads.forget(each)
-        }
-        changeFiles((current) => current.filter((each) => !gone.has(each.localId)))
+        // The files leave the composer only once the draft is ended: while it cannot be, they stay
+        // on the screen, and a later prompt does not carry files the person no longer sees.
+        void nameSession()
+          .then((subject) => port.draftEnd(subject, sessionId))
+          .then(() => {
+            for (const each of gone) {
+              removed.current.add(each)
+              uploads.forget(each)
+            }
+            changeFiles((current) => current.filter((each) => !gone.has(each.localId)))
+          })
+          .catch(() => {
+            removed.current.delete(key)
+          })
         return
       }
       uploads.forget(key)
