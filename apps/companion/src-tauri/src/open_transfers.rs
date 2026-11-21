@@ -37,9 +37,9 @@
 //!   before this one leaves the folder alone; the host ends what it holds after its own
 //!   twenty-four hours.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kr_client::chunks::ChunkRoute;
@@ -212,6 +212,11 @@ impl Store {
         self.remove_copy(key)
     }
 
+    /// The entry of `key`, when there is one of this layout.
+    fn entry(&self, key: Uuid) -> Option<UploadFile> {
+        read_entry(&self.path(key, UPLOAD_EXTENSION), key)
+    }
+
     fn all(&self) -> Found {
         let mut found = Found {
             entries: Vec::new(),
@@ -316,15 +321,58 @@ enum Outcome {
     Cancelled,
 }
 
-/// Whether the upload's send is running or waits for a connection.
+/// Where an upload stands in the desk: admitted and waiting for its first start, sending, or
+/// waiting for a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
+    /// Held by the desk, no sender yet, and no entry written.
+    Admitted,
     Sending,
+    /// Its sender was stopped and its owner has not yet ended it or removed its entry. No start is
+    /// accepted from here, so a reach between the stop and the removal cannot send what is being
+    /// removed. A cancel that cannot be finished sets `Paused` again; its key is cancelled, so
+    /// nothing starts from there either.
+    Stopping,
     Paused,
+}
+
+/// Whose an upload is, fixed when it is admitted, so that the gate reads it without taking the
+/// entry the sender is writing.
+struct Owner {
+    device_id: DeviceId,
+    environment_id: EnvironmentId,
+    account: Option<String>,
+}
+
+impl Owner {
+    fn of(file: &UploadFile) -> Self {
+        Self {
+            device_id: file.device_id,
+            environment_id: file.environment_id,
+            account: file.account.clone(),
+        }
+    }
+
+    fn is_whose(&self, who: &Who) -> bool {
+        owned_by(
+            self.device_id,
+            self.environment_id,
+            self.account.as_deref(),
+            who,
+        )
+    }
 }
 
 /// One upload this process holds.
 struct Live {
+    key: Uuid,
+    owner: Owner,
+    /// Whether the entry says the handle is published; kept in step with it by [`Live::change`]
+    /// and [`Live::adopt`], so that the gate reads it without taking the entry.
+    published: AtomicBool,
+    /// How many senders this upload has had. A sender ends or pauses the upload only while the
+    /// number is the one it was started under; a stop moves it on.
+    generation: AtomicU64,
     file: Mutex<UploadFile>,
     content: Mutex<Arc<dyn Content>>,
     progress: watch::Sender<Progress>,
@@ -346,12 +394,16 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Live {
     fn new(file: UploadFile, content: Arc<dyn Content>, beginning_kept: bool) -> Arc<Self> {
         Arc::new(Self {
+            key: file.key,
+            owner: Owner::of(&file),
+            published: AtomicBool::new(file.reached == Reached::Published),
+            generation: AtomicU64::new(0),
             file: Mutex::new(file),
             content: Mutex::new(content),
             progress: watch::channel(Progress::default()).0,
             outcome: watch::channel(None).0,
             task: Mutex::new(None),
-            phase: Mutex::new(Phase::Sending),
+            phase: Mutex::new(Phase::Admitted),
             beginning_kept: AtomicBool::new(beginning_kept),
             issued: Mutex::new(None),
             journal_failed: AtomicBool::new(false),
@@ -372,8 +424,17 @@ impl Live {
         let mut next = file.clone();
         change(&mut next);
         store.write(&next)?;
+        self.published
+            .store(next.reached == Reached::Published, Ordering::Release);
         *file = next;
         Ok(())
+    }
+
+    /// Takes `next` as the entry, as it was written by the one that holds the key's turn.
+    fn adopt(&self, next: UploadFile) {
+        self.published
+            .store(next.reached == Reached::Published, Ordering::Release);
+        *locked(&self.file) = next;
     }
 }
 
@@ -408,6 +469,11 @@ impl Kept {
 
 impl Journal for Kept {
     fn beginning(&self) -> kr_client::Result<()> {
+        #[cfg(feature = "testing")]
+        testing::pause(
+            self.live.key,
+            testing::Point::Writing(testing::Step::Beginning),
+        );
         self.kept(|file| file.reached = Reached::Beginning)?;
         self.live.beginning_kept.store(true, Ordering::Release);
         Ok(())
@@ -416,6 +482,8 @@ impl Journal for Kept {
     fn begun(&self, transfer_id: TransferId) -> kr_client::Result<()> {
         // The host's answer is held first: a write that fails loses nothing the host holds.
         *locked(&self.live.issued) = Some(transfer_id);
+        #[cfg(feature = "testing")]
+        testing::pause(self.live.key, testing::Point::Writing(testing::Step::Begun));
         self.kept(|file| {
             file.transfer_id = Some(transfer_id);
             file.reached = Reached::Begun;
@@ -423,6 +491,11 @@ impl Journal for Kept {
     }
 
     fn finishing(&self, transfer_id: TransferId) -> kr_client::Result<()> {
+        #[cfg(feature = "testing")]
+        testing::pause(
+            self.live.key,
+            testing::Point::Writing(testing::Step::Finishing),
+        );
         self.kept(|file| {
             file.transfer_id = Some(transfer_id);
             file.reached = Reached::Finishing;
@@ -493,12 +566,27 @@ impl UploadFile {
 
     /// Whether the entry is `who`'s.
     fn is_whose(&self, who: &Who) -> bool {
-        self.device_id == who.device_id
-            && who
-                .environment_id
-                .is_none_or(|environment_id| environment_id == self.environment_id)
-            && self.account == who.account.map(AccountMark::to_hex)
+        owned_by(
+            self.device_id,
+            self.environment_id,
+            self.account.as_deref(),
+            who,
+        )
     }
+}
+
+/// Whether an upload kept for `device_id` on `environment_id` under `account` is `who`'s.
+fn owned_by(
+    device_id: DeviceId,
+    environment_id: EnvironmentId,
+    account: Option<&str>,
+    who: &Who,
+) -> bool {
+    device_id == who.device_id
+        && who
+            .environment_id
+            .is_none_or(|wanted| wanted == environment_id)
+        && account == who.account.map(AccountMark::to_hex).as_deref()
 }
 
 /// What kept content is a copy of.
@@ -617,18 +705,110 @@ impl Work {
     }
 }
 
+/// What the gate guards: the uploads this process holds, the keys the person cancelled, and the
+/// turns of the keys.
+#[derive(Default)]
+struct Registry {
+    held: HashMap<Uuid, Arc<Live>>,
+    /// Every key the person cancelled in this process. A key is never taken out: each costs sixteen
+    /// bytes, and a cancel stays authoritative for every send, restart or resume that can still
+    /// arrive for the key.
+    cancelled: HashSet<Uuid>,
+    /// The turn of each key this process has acted on.
+    turns: HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl Registry {
+    /// Records that the person cancelled `key`: from now on no sender is started for it.
+    fn record_cancel(&mut self, key: Uuid) {
+        self.cancelled.insert(key);
+    }
+
+    /// Admits `live`: a key the person cancelled, a key in use and a third open upload are refused,
+    /// and otherwise the upload is held, in `Admitted`, before any copy is written or any
+    /// reservation is asked for.
+    fn admit(&mut self, store: &Store, live: &Arc<Live>, who: &Who) -> Result<()> {
+        if self.cancelled.contains(&live.key) {
+            return Err(CommandError::refused(CANCELLED));
+        }
+        let found = store.all();
+        if self.held.contains_key(&live.key) || found.holds(live.key) {
+            return Err(CommandError::refused(KEY_IN_USE));
+        }
+        if self.open_count(&found, who) >= MOST_OPEN {
+            return Err(CommandError::refused(TOO_MANY_OPEN));
+        }
+        self.held.insert(live.key, Arc::clone(live));
+        Ok(())
+    }
+
+    /// Holds `live`, made from an entry a restart found, unless the person cancelled its key since
+    /// the entry was read or it is held already.
+    fn admit_restarted(&mut self, live: &Arc<Live>) -> bool {
+        if self.cancelled.contains(&live.key) || self.held.contains_key(&live.key) {
+            return false;
+        }
+        self.held.insert(live.key, Arc::clone(live));
+        true
+    }
+
+    /// The open uploads of `who`: the ones this process holds and the ones kept from before whose
+    /// upload is not published.
+    fn open_count(&self, found: &Found, who: &Who) -> usize {
+        let mut keys: Vec<Uuid> = self
+            .held
+            .iter()
+            .filter(|(_, live)| live.owner.is_whose(who) && !live.published.load(Ordering::Acquire))
+            .map(|(key, _)| *key)
+            .collect();
+        for file in &found.entries {
+            if file.is_whose(who) && file.reached != Reached::Published && !keys.contains(&file.key)
+            {
+                keys.push(file.key);
+            }
+        }
+        keys.len()
+    }
+}
+
+/// One key's turn: the right to rewrite or remove its entry and copy, and to stop and wait for its
+/// sender. An operation holds it for the whole of its work, and holds no other key's; a helper that
+/// needs it is handed the one its caller holds, and never takes a turn itself.
+struct Turn {
+    key: Uuid,
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
 /// The state of every upload this device sends to a paired host.
+///
+/// **Locks, in order.** `registry` (the gate); inside it only `Live.task`, `Live.phase`,
+/// `Live.generation`, the immutable `Live.owner` and `Live.key`, and the atomic `Live.published`;
+/// then `sessions`, `verdicts` and `root`. No helper takes the gate again when its caller holds it:
+/// it is handed the guard. `Live.file` is never taken under the gate and the gate is never taken
+/// inside [`Live::change`], so the gate reads `owner` and `published`, not the entry. The gate is
+/// held across no `.await` and across no write of an entry; it covers a read of the folder, which
+/// admission needs to be one step with the count, and the removal of the orphaned copies that
+/// `restart` makes (each a flush), which is what stops `restart` from removing the copy a send has
+/// just made.
+///
+/// **Turns.** A key's turn is a `tokio` mutex, found or made under the gate and awaited outside
+/// every lock. No operation holds two turns, so two operations that want two keys cannot wait for
+/// each other. Inside a turn the sender is stopped and awaited first, and only then is the entry
+/// read or written, so no writer of the key runs beside the one that holds its turn.
 #[derive(Default)]
 pub struct Desk {
     root: Mutex<Option<PathBuf>>,
     /// The tasks the desk started for itself and has not seen end.
     work: Arc<Work>,
-    live: Mutex<HashMap<Uuid, Arc<Live>>>,
+    registry: Mutex<Registry>,
     /// What a restart or a failure found of entries it could not resume.
     verdicts: Mutex<HashMap<Uuid, Verdict>>,
     /// The newest connection of each host's device, so that an upload whose connection ended while
     /// a newer one was coming up goes on at once.
     sessions: Mutex<HashMap<(EnvironmentId, DeviceId), Arc<Session>>>,
+    /// What a suite holds a send at, before it is admitted.
+    #[cfg(feature = "testing")]
+    before_admission: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// What a suite holds a send at, once the copy of its content is written.
     #[cfg(feature = "testing")]
     after_copy: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -638,7 +818,7 @@ impl std::fmt::Debug for Desk {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Desk")
-            .field("open", &locked(&self.live).len())
+            .field("open", &locked(&self.registry).held.len())
             .finish_non_exhaustive()
     }
 }
@@ -708,6 +888,47 @@ impl Desk {
             })
     }
 
+    /// Takes the turn of `key`, waiting for whoever holds it. The wait is outside every lock.
+    async fn turn(&self, key: Uuid) -> Turn {
+        let turn = Arc::clone(locked(&self.registry).turns.entry(key).or_default());
+        Turn {
+            key,
+            _held: turn.lock_owned().await,
+        }
+    }
+
+    /// Takes the sender of the key's upload, under the gate, and moves its generation on, so that
+    /// the sender ends and pauses nothing if it is still running. The upload is not cancelled: a
+    /// restart of a stored upload still resumes it. Until its owner has ended it or set it paused
+    /// again the upload is `Stopping`, and no start is accepted for it.
+    fn stop(registry: &Registry, key: Uuid) -> Option<tauri::async_runtime::JoinHandle<()>> {
+        let live = registry.held.get(&key)?;
+        live.generation.fetch_add(1, Ordering::AcqRel);
+        *locked(&live.phase) = Phase::Stopping;
+        locked(&live.task).take()
+    }
+
+    /// Stops the sender of the turn's key and waits until it is over, so that what it kept is final
+    /// when the entry is read. There is no timeout: a wait must not end while a writer is active.
+    async fn stopped(&self, turn: &Turn) {
+        let handle = Self::stop(&locked(&self.registry), turn.key);
+        if let Some(handle) = handle {
+            handle.abort();
+            #[cfg(feature = "testing")]
+            testing::note(turn.key, testing::Point::CancelWaiting);
+            let _ = handle.await;
+        }
+        #[cfg(feature = "testing")]
+        testing::pause(turn.key, testing::Point::Stopped);
+    }
+
+    /// Whether the person cancelled the upload `key` in this process: the commands look before they
+    /// copy a file. It is a saving of work and no gate.
+    #[must_use]
+    pub fn is_cancelled(&self, key: Uuid) -> bool {
+        locked(&self.registry).cancelled.contains(&key)
+    }
+
     /// Sends one file to the paired host and answers with the verified handle.
     ///
     /// The upload belongs to the desk, not to this call: dropping the call leaves it running, and a
@@ -715,8 +936,8 @@ impl Desk {
     ///
     /// # Errors
     ///
-    /// Refuses a key that is in use and a third open upload, and returns the host's refusal or the
-    /// reason this device ended the connection.
+    /// Refuses a key the person cancelled, a key that is in use and a third open upload, and returns
+    /// the host's refusal or the reason this device ended the connection.
     pub async fn send(
         self: &Arc<Self>,
         paired: Paired,
@@ -724,6 +945,13 @@ impl Desk {
     ) -> Result<AttachmentHandle> {
         let store = self.store()?;
         let key = request.key;
+        #[cfg(feature = "testing")]
+        {
+            let gate = locked(&self.before_admission).clone();
+            if let Some(gate) = gate {
+                let _ = gate.acquire().await;
+            }
+        }
         let source = match &request.keeping {
             Keeping::Copy(_) => Source::Copy,
             Keeping::Path(path) => Source::Path { path: path.clone() },
@@ -747,19 +975,10 @@ impl Desk {
             cancel_asked: false,
         };
         let live = Live::new(file, request.content, false);
-        // The place and the key are taken together, here and before any await: no other send can
-        // pass the count or use the key until this one is in the map.
-        {
-            let mut held = locked(&self.live);
-            let found = store.all();
-            if held.contains_key(&key) || found.holds(key) {
-                return Err(CommandError::refused(KEY_IN_USE));
-            }
-            if Self::open_count(&held, &found, &paired) >= MOST_OPEN {
-                return Err(CommandError::refused(TOO_MANY_OPEN));
-            }
-            held.insert(key, Arc::clone(&live));
-        }
+        // The place and the key are taken together, here and before any await: a key the person
+        // cancelled, a key in use and a third open upload are refused under the gate, so no copy is
+        // written and no reservation is asked for.
+        locked(&self.registry).admit(&store, &live, &paired.who())?;
         if let Keeping::Copy(bytes) = request.keeping {
             let copied = store.clone();
             let written =
@@ -774,7 +993,7 @@ impl Desk {
                         })
                     });
             if let Err(error) = written {
-                locked(&self.live).remove(&key);
+                locked(&self.registry).held.remove(&key);
                 let _ = store.remove_copy(key);
                 return Err(error);
             }
@@ -786,17 +1005,21 @@ impl Desk {
                 let _ = gate.acquire().await;
             }
         }
-        // A cancel that came while the copy was written found no sender to stop: the upload does not
-        // start, and its copy goes.
-        if live.file().cancel_asked || !locked(&self.live).contains_key(&key) {
+        // The check and the start are one section under the gate. A cancel that came while the copy
+        // was written has recorded the key, or has ended this upload, and the start refuses; one that
+        // comes after finds the sender's handle stored.
+        let started = {
+            let registry = locked(&self.registry);
+            locked(&self.sessions).insert(
+                (paired.environment_id, paired.device_id),
+                Arc::clone(&paired.session),
+            );
+            self.start_under(&registry, &live, paired.session, false)
+        };
+        if !started {
             let _ = store.remove_copy(key);
             return Err(CommandError::refused(CANCELLED));
         }
-        locked(&self.sessions).insert(
-            (paired.environment_id, paired.device_id),
-            Arc::clone(&paired.session),
-        );
-        self.start(&live, paired.session, false);
         Self::outcome_of(&live).await
     }
 
@@ -815,45 +1038,56 @@ impl Desk {
         }
     }
 
-    /// The open uploads of this device on this host: the ones this process holds and the ones kept
-    /// from before whose upload is not published.
-    fn open_count(held: &HashMap<Uuid, Arc<Live>>, found: &Found, paired: &Paired) -> usize {
-        let mut keys: Vec<Uuid> = held
-            .iter()
-            .filter(|(_, live)| {
-                let file = locked(&live.file);
-                file.is_of(paired) && file.reached != Reached::Published
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        for file in &found.entries {
-            if file.is_of(paired) && file.reached != Reached::Published && !keys.contains(&file.key)
-            {
-                keys.push(file.key);
-            }
+    /// Starts the send of `live` on `session`, under the gate, and says whether it started. A
+    /// resume of a file read from where it is reads it again first, and sends nothing when it is not
+    /// the one declared.
+    ///
+    /// It starts only an upload that this desk holds (by identity), whose key the person did not
+    /// cancel, and that has no sender: a second caller that holds a stale list finds the upload
+    /// sending and is refused, so an upload has one task. The task and its handle are made here, in
+    /// one step under the gate, so a stop finds the handle.
+    fn start_under(
+        self: &Arc<Self>,
+        registry: &Registry,
+        live: &Arc<Live>,
+        session: Arc<Session>,
+        verify: bool,
+    ) -> bool {
+        let current = registry
+            .held
+            .get(&live.key)
+            .is_some_and(|held| Arc::ptr_eq(held, live));
+        if !current || registry.cancelled.contains(&live.key) {
+            return false;
         }
-        keys.len()
-    }
-
-    /// Starts the send of `live` on `session`. A resume of a file read from where it is reads it
-    /// again first, and sends nothing when it is not the one declared.
-    fn start(self: &Arc<Self>, live: &Arc<Live>, session: Arc<Session>, verify: bool) {
-        *locked(&live.phase) = Phase::Sending;
+        {
+            let mut phase = locked(&live.phase);
+            if !matches!(*phase, Phase::Admitted | Phase::Paused) {
+                return false;
+            }
+            *phase = Phase::Sending;
+        }
+        let generation = live.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let desk = Arc::clone(self);
         let running = Arc::clone(live);
         let task = tauri::async_runtime::spawn(async move {
-            if verify && !desk.is_the_content(&running).await {
+            #[cfg(feature = "testing")]
+            testing::at_sender_start(running.key).await;
+            if verify && !desk.is_the_content(&running, generation).await {
                 return;
             }
             let result = desk.send_once(&running, &session).await;
-            desk.settle(&running, &session, result);
+            desk.settle(&running, &session, generation, result);
         });
         *locked(&live.task) = Some(task);
+        #[cfg(feature = "testing")]
+        testing::pause(live.key, testing::Point::Started);
+        true
     }
 
     /// Whether the content of an upload that resumes is the one declared; when it is not, the upload
     /// ends and its entry says it cannot resume.
-    async fn is_the_content(&self, live: &Arc<Live>) -> bool {
+    async fn is_the_content(&self, live: &Arc<Live>, generation: u64) -> bool {
         let file = live.file();
         if live.transfer().is_none() || file.source == Source::Copy {
             return true;
@@ -866,7 +1100,11 @@ impl Desk {
             return true;
         }
         locked(&self.verdicts).insert(file.key, Verdict::CannotResume);
-        self.end(live, Outcome::Failed(CommandError::refused(CANNOT_RESUME)));
+        self.end_as(
+            live,
+            generation,
+            Outcome::Failed(CommandError::refused(CANNOT_RESUME)),
+        );
         false
     }
 
@@ -923,24 +1161,32 @@ impl Desk {
         self: &Arc<Self>,
         live: &Arc<Live>,
         session: &Arc<Session>,
+        generation: u64,
         result: kr_client::Result<AttachmentHandle>,
     ) {
         // A sign-out gives the transport's reason, which the driver returns in place of the plain
         // end; what this device ended is never waited out.
         let by_this_device = session.transport().ended_by_this_device().is_some();
-        self.settle_as(live, Some(session), by_this_device, result);
+        self.settle_as(live, Some(session), generation, by_this_device, result);
     }
 
     fn settle_as(
         self: &Arc<Self>,
         live: &Arc<Live>,
         session: Option<&Arc<Session>>,
+        generation: u64,
         by_this_device: bool,
         result: kr_client::Result<AttachmentHandle>,
     ) {
+        // A sender that a stop took over has no say in how the upload ends.
+        if live.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
         let file = live.file();
         let error = match result {
-            Ok(handle) => return self.end(live, Outcome::Published(Box::new(handle))),
+            Ok(handle) => {
+                return self.end_as(live, generation, Outcome::Published(Box::new(handle)));
+            }
             Err(error) => error,
         };
         if by_this_device {
@@ -949,22 +1195,23 @@ impl Desk {
             if let Ok(store) = self.store() {
                 let _ = store.remove(file.key);
             }
-            return self.end(live, Outcome::Failed(CommandError::from(error)));
+            return self.end_as(live, generation, Outcome::Failed(CommandError::from(error)));
         }
         let transfer = live.transfer();
         if live.journal_failed.load(Ordering::Acquire) {
             if transfer.is_some() {
                 // The host holds what this device could not write down: it stays here, paused, and
                 // the next send keeps the identifier before anything else.
-                *locked(&live.phase) = Phase::Paused;
-                live.outcome
-                    .send_replace(Some(Outcome::Failed(CommandError::from(error))));
+                if self.pause_as(live, generation) {
+                    live.outcome
+                        .send_replace(Some(Outcome::Failed(CommandError::from(error))));
+                }
             } else {
                 // Nothing was asked of the host.
                 if let Ok(store) = self.store() {
                     let _ = store.remove(file.key);
                 }
-                self.end(live, Outcome::Failed(CommandError::from(error)));
+                self.end_as(live, generation, Outcome::Failed(CommandError::from(error)));
             }
             return;
         }
@@ -976,15 +1223,19 @@ impl Desk {
             _ => false,
         };
         if resumable {
-            *locked(&live.phase) = Phase::Paused;
             let newest = locked(&self.sessions)
                 .get(&(file.environment_id, file.device_id))
                 .cloned();
+            let registry = locked(&self.registry);
+            if live.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            *locked(&live.phase) = Phase::Paused;
             if let (Some(newest), Some(failed)) = (newest, session)
                 && !Arc::ptr_eq(&newest, failed)
             {
                 // The connection that came up first is the one this upload goes on, at once.
-                self.start(live, newest, true);
+                self.start_under(&registry, live, newest, true);
             }
             return;
         }
@@ -1001,14 +1252,43 @@ impl Desk {
                 locked(&self.verdicts).insert(file.key, Verdict::Failed(words));
             }
         }
-        self.end(live, Outcome::Failed(failure));
+        self.end_as(live, generation, Outcome::Failed(failure));
     }
 
-    /// Ends the hold on `live` and tells whoever waits.
+    /// Ends the hold on `live` and tells whoever waits. Only the sender of the generation in force,
+    /// or an operation that holds the key's turn, ends an upload.
     fn end(&self, live: &Arc<Live>, outcome: Outcome) {
-        let key = locked(&live.file).key;
-        locked(&self.live).remove(&key);
+        Self::end_under(&mut locked(&self.registry), live, outcome);
+    }
+
+    /// As [`Self::end`], for the sender of `generation`: it ends nothing once a stop took over.
+    fn end_as(&self, live: &Arc<Live>, generation: u64, outcome: Outcome) {
+        let mut registry = locked(&self.registry);
+        if live.generation.load(Ordering::Acquire) == generation {
+            Self::end_under(&mut registry, live, outcome);
+        }
+    }
+
+    fn end_under(registry: &mut Registry, live: &Arc<Live>, outcome: Outcome) {
+        if registry
+            .held
+            .get(&live.key)
+            .is_some_and(|held| Arc::ptr_eq(held, live))
+        {
+            registry.held.remove(&live.key);
+        }
         live.outcome.send_replace(Some(outcome));
+    }
+
+    /// Pauses `live` for the sender of `generation`, and says whether it did: a sender that a stop
+    /// took over pauses nothing.
+    fn pause_as(&self, live: &Arc<Live>, generation: u64) -> bool {
+        let _registry = locked(&self.registry);
+        if live.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        *locked(&live.phase) = Phase::Paused;
+        true
     }
 
     /// The host was reached on `paired`'s connection: paused uploads resume on it, and entries kept
@@ -1018,44 +1298,50 @@ impl Desk {
         let (device_id, environment_id) = (paired.device_id, paired.environment_id);
         let session = Arc::clone(&paired.session);
         locked(&self.sessions).insert((environment_id, device_id), Arc::clone(&session));
-        let (paused, other): (Vec<Arc<Live>>, Vec<Arc<Live>>) = {
-            let held = locked(&self.live);
-            let in_host = held
+        let who = paired.who();
+        let (paused, other) = {
+            let registry = locked(&self.registry);
+            let (mine, other): (Vec<_>, Vec<_>) = registry
+                .held
                 .values()
-                .filter(|live| locked(&live.file).environment_id == environment_id);
-            let (mine, other): (Vec<_>, Vec<_>) = in_host
+                .filter(|live| live.owner.environment_id == environment_id)
                 .cloned()
-                .partition(|live| locked(&live.file).is_of(&paired));
-            (
-                mine.into_iter()
-                    .filter(|live| *locked(&live.phase) == Phase::Paused)
-                    .collect(),
-                other,
-            )
+                .partition(|live| live.owner.is_whose(&who));
+            let paused: Vec<(Arc<Live>, bool)> = mine
+                .into_iter()
+                .filter(|live| *locked(&live.phase) == Phase::Paused)
+                .map(|live| {
+                    let cancelled = registry.cancelled.contains(&live.key);
+                    (live, cancelled)
+                })
+                .collect();
+            (paused, other)
         };
         // An upload of another principal or another account on this host belongs to a sign-in that is
-        // not in force.
-        for live in &other {
-            if let Some(task) = locked(&live.task).take() {
-                task.abort();
-            }
-            if let Ok(store) = self.store() {
-                let _ = store.remove(locked(&live.file).key);
-            }
-            self.end(live, Outcome::Cancelled);
+        // not in force: it stops, and its entry goes, in its key's turn.
+        for live in other {
+            let desk = Arc::clone(self);
+            self.work.spawn(async move {
+                let turn = desk.turn(live.key).await;
+                desk.stopped(&turn).await;
+                if let Ok(store) = desk.store() {
+                    let _ = store.remove(live.key);
+                }
+                desk.end(&live, Outcome::Cancelled);
+            });
         }
-        for live in &paused {
-            if live.file().cancel_asked {
+        for (live, cancelled) in paused {
+            if cancelled || live.file().cancel_asked {
                 let desk = Arc::clone(self);
-                let (live, paired) = (Arc::clone(live), paired.clone());
+                let paired = paired.clone();
                 self.work.spawn(async move {
-                    if let Ok(store) = desk.store() {
-                        let file = live.file();
-                        let _ = desk.finish_cancel(&store, &paired, Some(live), file).await;
-                    }
+                    let _ = desk.finish_asked(&paired, live.key).await;
                 });
             } else {
-                self.start(live, Arc::clone(&session), true);
+                #[cfg(feature = "testing")]
+                testing::pause(live.key, testing::Point::Claiming);
+                let registry = locked(&self.registry);
+                self.start_under(&registry, &live, Arc::clone(&session), true);
             }
         }
         if locked(&self.root).is_none() {
@@ -1077,9 +1363,9 @@ impl Desk {
         {
             // Copies that no entry names, that are over, or that a stopped process left half
             // written. A copy a send has just made is its key's in the map and is left.
-            let held = locked(&self.live);
+            let registry = locked(&self.registry);
             for key in found.orphans.iter().chain(&found.spent) {
-                if !held.contains_key(key) {
+                if !registry.held.contains_key(key) {
                     let _ = store.remove_copy(*key);
                 }
             }
@@ -1090,7 +1376,7 @@ impl Desk {
         let mut mine = Vec::new();
         for file in found.entries {
             if file.environment_id != paired.environment_id
-                || locked(&self.live).contains_key(&file.key)
+                || locked(&self.registry).held.contains_key(&file.key)
             {
                 continue;
             }
@@ -1127,6 +1413,8 @@ impl Desk {
         }
     }
 
+    /// Acts on one entry a restart read, in its key's turn. The entry is read again under the turn:
+    /// a cancel or a cleanup that came since the restart read it has ended it or marked it.
     async fn act_on(
         self: &Arc<Self>,
         store: &Store,
@@ -1135,8 +1423,14 @@ impl Desk {
         status: Option<kr_client::Result<UploadStatusResult>>,
     ) {
         let key = file.key;
-        if file.cancel_asked {
-            let _ = self.finish_cancel(store, paired, None, file).await;
+        let turn = self.turn(key).await;
+        let Some(file) = store.entry(key) else {
+            return;
+        };
+        if file.cancel_asked || self.is_cancelled(key) {
+            // A key the person cancelled is finished, whether or not the record of it could be
+            // written.
+            let _ = self.finish_cancel(&turn, store, paired, None, file).await;
             return;
         }
         let Some(status) = status else { return };
@@ -1162,10 +1456,19 @@ impl Desk {
                     let publishing = read.state == UploadState::Publishing;
                     match self.source_of(store, &file).await {
                         Some(content) => {
+                            #[cfg(feature = "testing")]
+                            testing::pause(key, testing::Point::Reading);
                             locked(&self.verdicts).remove(&key);
                             let live = Live::new(file, content, true);
-                            locked(&self.live).insert(key, Arc::clone(&live));
-                            self.start(&live, Arc::clone(&paired.session), false);
+                            let mut registry = locked(&self.registry);
+                            if registry.admit_restarted(&live) {
+                                self.start_under(
+                                    &registry,
+                                    &live,
+                                    Arc::clone(&paired.session),
+                                    false,
+                                );
+                            }
                         }
                         // A publication in progress needs no content: the entry stays, and the host is
                         // read again at the next reach.
@@ -1206,7 +1509,7 @@ impl Desk {
             return Vec::new();
         };
         let mut views = Vec::new();
-        let live = locked(&self.live).clone();
+        let live = locked(&self.registry).held.clone();
         for (key, held) in &live {
             let file = held.file();
             if !file.is_whose(who) {
@@ -1214,7 +1517,7 @@ impl Desk {
             }
             let progress = *held.progress.borrow();
             let state = match *locked(&held.phase) {
-                Phase::Sending => OpenState::Sending,
+                Phase::Admitted | Phase::Sending | Phase::Stopping => OpenState::Sending,
                 Phase::Paused => OpenState::Paused,
             };
             views.push(view_of(
@@ -1258,9 +1561,11 @@ impl Desk {
     /// Cancels the upload `key`, after the host's record of it is read, and answers from the host's
     /// own answer. An upload the host has published is never cancelled.
     ///
-    /// The send is stopped and waited for first, so that what it kept is final when it is read. A
-    /// cancel that cannot be finished is recorded in the entry and finished at the next reach, and
-    /// the upload is never sent on.
+    /// The key is recorded as cancelled first, so no sender is started for it from then on, whatever
+    /// holds it or nothing does. Then the cancel takes the key's turn, stops the sender and waits
+    /// for it, so that what the sender kept is final when it is read. A cancel that cannot be
+    /// finished is recorded in the entry and finished at the next reach, and the upload is never sent
+    /// on.
     ///
     /// # Errors
     ///
@@ -1268,32 +1573,38 @@ impl Desk {
     /// leaves the cancel to be finished: the host's record says what became of it.
     pub async fn cancel(self: &Arc<Self>, paired: Paired, key: Uuid) -> Result<Cancelled> {
         let store = self.store()?;
-        let held = locked(&self.live).get(&key).cloned();
+        let who = paired.who();
         let none = || CommandError::invalid("no open upload has that key");
-        if let Some(live) = &held {
-            let file = live.file();
-            if !file.is_of(&paired) {
-                return Err(none());
-            }
-            let task = locked(&live.task).take();
-            if let Some(task) = task {
-                task.abort();
-                // Whatever the sender was doing is over before the entry is read.
-                let _ = task.await;
-            }
-        }
-        let file = match &held {
-            Some(live) => live.file(),
-            None => store
-                .all()
-                .entries
-                .into_iter()
-                .find(|file| file.key == key)
-                .ok_or_else(none)?,
-        };
-        if !file.is_of(&paired) {
+        #[cfg(feature = "testing")]
+        testing::note(key, testing::Point::CancelBegun);
+        // Step 0. A stored entry of another account or principal is never marked.
+        if store.entry(key).is_some_and(|file| !file.is_whose(&who)) {
             return Err(none());
         }
+        {
+            let mut registry = locked(&self.registry);
+            if registry
+                .held
+                .get(&key)
+                .is_some_and(|live| !live.owner.is_whose(&who))
+            {
+                return Err(none());
+            }
+            registry.record_cancel(key);
+        }
+        // Steps 1 and 2. Once the turn is held and the sender is over, nothing else writes this key.
+        let turn = self.turn(key).await;
+        self.stopped(&turn).await;
+        // Step 3.
+        let held = locked(&self.registry).held.get(&key).cloned();
+        let file = match &held {
+            Some(live) => live.file(),
+            None => match store.entry(key) {
+                Some(file) if file.is_whose(&who) => file,
+                Some(_) => return Err(none()),
+                None => return Ok(Self::said(key, "forgotten", None, None)),
+            },
+        };
         if file.reached == Reached::Published {
             return Ok(Self::said(key, "published", None, file.handle));
         }
@@ -1320,7 +1631,7 @@ impl Desk {
                 ..file
             },
         };
-        self.finish_cancel(&store, &paired, held, file).await
+        self.finish_cancel(&turn, &store, &paired, held, file).await
     }
 
     fn said(
@@ -1337,9 +1648,43 @@ impl Desk {
         }
     }
 
-    /// The host's record is read, and then the upload is cancelled unless it is published.
+    /// Finishes the cancel of `key` on `paired`'s connection, in the key's turn: the sender is
+    /// stopped and waited for, the upload or the entry is read again, and the cancel is finished
+    /// only when the key is still held or kept and was cancelled. A key already gone answers
+    /// `forgotten`, so a second finisher never cancels again.
+    async fn finish_asked(self: &Arc<Self>, paired: &Paired, key: Uuid) -> Result<Cancelled> {
+        let store = self.store()?;
+        let turn = self.turn(key).await;
+        self.stopped(&turn).await;
+        let held = locked(&self.registry).held.get(&key).cloned();
+        let file = match &held {
+            Some(live) => live.file(),
+            None => match store.entry(key) {
+                Some(file) => file,
+                None => return Ok(Self::said(key, "forgotten", None, None)),
+            },
+        };
+        if !file.is_of(paired) {
+            return Err(CommandError::invalid("no open upload has that key"));
+        }
+        if file.reached == Reached::Published {
+            return Ok(Self::said(key, "published", None, file.handle));
+        }
+        if !file.cancel_asked && !self.is_cancelled(key) {
+            return Err(CommandError::invalid("no open upload has that key"));
+        }
+        let file = UploadFile {
+            cancel_asked: true,
+            ..file
+        };
+        self.finish_cancel(&turn, &store, paired, held, file).await
+    }
+
+    /// The host's record is read, and then the upload is cancelled unless it is published. The
+    /// caller holds the key's turn and has stopped the sender.
     async fn finish_cancel(
         self: &Arc<Self>,
+        _turn: &Turn,
         store: &Store,
         paired: &Paired,
         held: Option<Arc<Live>>,
@@ -1396,7 +1741,7 @@ impl Desk {
             }
             let _ = store.remove_copy(key);
             if let Some(live) = &held {
-                *locked(&live.file) = kept;
+                live.adopt(kept);
                 self.end(live, Outcome::Published(Box::new(handle.clone())));
             }
             return Ok(Self::said(key, "published", None, Some(handle)));
@@ -1445,26 +1790,35 @@ impl Desk {
     }
 
     /// The host this device knows as `device_id` was forgotten: what is sent to it stops, and every
-    /// entry and copy kept for it goes.
-    pub fn forgotten(&self, device_id: DeviceId) {
-        let sending: Vec<Arc<Live>> = locked(&self.live)
-            .values()
-            .filter(|live| locked(&live.file).device_id == device_id)
-            .cloned()
-            .collect();
-        for live in &sending {
-            if let Some(task) = locked(&live.task).take() {
-                task.abort();
+    /// entry and copy kept for it goes. Each key is taken in its turn, in a task of the desk's own.
+    pub fn forgotten(self: &Arc<Self>, device_id: DeviceId) {
+        let desk = Arc::clone(self);
+        self.work.spawn(async move {
+            let sending: Vec<Arc<Live>> = locked(&desk.registry)
+                .held
+                .values()
+                .filter(|live| live.owner.device_id == device_id)
+                .cloned()
+                .collect();
+            let store = desk.store().ok();
+            for live in sending {
+                let turn = desk.turn(live.key).await;
+                desk.stopped(&turn).await;
+                locked(&desk.verdicts).remove(&live.key);
+                if let Some(store) = &store {
+                    let _ = store.remove(live.key);
+                }
+                desk.end(&live, Outcome::Cancelled);
             }
-            self.end(live, Outcome::Cancelled);
-        }
-        let Ok(store) = self.store() else { return };
-        for file in store.all().entries {
-            if file.device_id == device_id {
-                locked(&self.verdicts).remove(&file.key);
-                let _ = store.remove(file.key);
+            let Some(store) = store else { return };
+            for file in store.all().entries {
+                if file.device_id == device_id {
+                    let _turn = desk.turn(file.key).await;
+                    locked(&desk.verdicts).remove(&file.key);
+                    let _ = store.remove(file.key);
+                }
             }
-        }
+        });
     }
 }
 
@@ -1506,6 +1860,23 @@ impl Desk {
         }
     }
 
+    /// Holds every send at the top of `send`, before it is admitted, until the returned gate is
+    /// given a permit.
+    pub fn hold_before_admission_for_test(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *locked(&self.before_admission) = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// How many senders the upload `key` has had, while the desk holds it.
+    #[must_use]
+    pub fn generation_for_test(&self, key: Uuid) -> Option<u64> {
+        locked(&self.registry)
+            .held
+            .get(&key)
+            .map(|live| live.generation.load(Ordering::Acquire))
+    }
+
     /// Holds every send after its copy is written until the returned gate is given a permit.
     pub fn hold_after_copy_for_test(&self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1522,7 +1893,8 @@ impl Desk {
     }
 }
 
-/// What a suite keeps in the folder to stand for an upload that an earlier process left.
+/// What a suite keeps in the folder to stand for an upload that an earlier process left, and the
+/// places in the desk's code where it can stop a thread to put two operations in an order.
 #[cfg(feature = "testing")]
 pub mod testing {
     use super::{Reached, STORE_VERSION, Source, Store, UploadFile};
@@ -1530,7 +1902,130 @@ pub mod testing {
     use kr_protocol::envelope::ActionTarget;
     use kr_protocol::ids::{DeviceId, EnvironmentId, TransferId};
     use kr_protocol::scalars::{Digest256, Uuid};
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
+
+    /// The write of the journal a sender makes before a call to the host.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Step {
+        /// The reservation is about to be asked for.
+        Beginning,
+        /// The host's identifier is about to be kept.
+        Begun,
+        /// The finish is about to be sent.
+        Finishing,
+    }
+
+    /// A place in the desk's code, for the upload of one key.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Point {
+        /// A cancel began, before it takes the gate. Noted, never held.
+        CancelBegun,
+        /// A cancel waits for the sender it stopped. Noted, never held.
+        CancelWaiting,
+        /// A caller is about to claim the upload for a new sender, before it takes the gate.
+        Claiming,
+        /// A sender was started and its handle stored, still under the gate.
+        Started,
+        /// A sender task is at its first line, before it asks the host for anything. Held, the task
+        /// goes no further until released, and one that was stopped meanwhile never goes on.
+        SenderStarting,
+        /// A sender is inside the write of the journal's step.
+        Writing(Step),
+        /// A restart read an entry's content and has not yet admitted the upload.
+        Reading,
+        /// An operation stopped the sender of the key and waited for it, and has not yet touched the
+        /// entry.
+        Stopped,
+    }
+
+    /// The threads that came to a [`Point`], and whether they may go on.
+    #[derive(Default)]
+    pub struct Hold {
+        state: Mutex<(usize, bool)>,
+        changed: Condvar,
+    }
+
+    impl Hold {
+        fn arrive(&self, wait: bool) {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.0 += 1;
+            self.changed.notify_all();
+            while wait && !state.1 {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+
+        /// How many threads came to the point.
+        #[must_use]
+        pub fn passed(&self) -> usize {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner).0
+        }
+
+        /// Waits until `count` threads have come to the point.
+        pub async fn until_passed(&self, count: usize) {
+            while self.passed() < count {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Lets every thread at the point go on, and every one that comes later.
+        pub fn release(&self) {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    type Holds = HashMap<(Uuid, Point), Arc<Hold>>;
+
+    static HOLDS: LazyLock<Mutex<Holds>> = LazyLock::new(Mutex::default);
+
+    /// Stops every thread that comes to `point` for the upload `key` until the hold is released, and
+    /// counts it.
+    pub fn hold_at(key: Uuid, point: Point) -> Arc<Hold> {
+        let hold = Arc::new(Hold::default());
+        HOLDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((key, point), Arc::clone(&hold));
+        hold
+    }
+
+    fn at(key: Uuid, point: Point) -> Option<Arc<Hold>> {
+        HOLDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(key, point))
+            .cloned()
+    }
+
+    /// Stops the calling thread at `point` while a hold is set for `key`.
+    pub(super) fn pause(key: Uuid, point: Point) {
+        if let Some(hold) = at(key, point) {
+            hold.arrive(true);
+        }
+    }
+
+    /// Holds a sender task at its first line while a hold is set for `key`, and then gives the
+    /// runtime a turn, so that a stop that came during the hold takes effect before the task asks
+    /// the host for anything.
+    pub(super) async fn at_sender_start(key: Uuid) {
+        if let Some(hold) = at(key, Point::SenderStarting) {
+            hold.arrive(true);
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Counts the calling thread at `point` while a hold is set for `key`, and lets it go on.
+    pub(super) fn note(key: Uuid, point: Point) {
+        if let Some(hold) = at(key, point) {
+            hold.arrive(false);
+        }
+    }
 
     /// How far the upload the entry stands for got.
     #[derive(Clone, Copy, Debug)]
@@ -1657,7 +2152,7 @@ mod tests {
         store.write(&entry).expect("the entry");
         store.write_copy(key, b"mine").expect("the copy");
         let live = Live::new(entry, Arc::new(Held::new(vec![1; 4])), true);
-        locked(&desk.live).insert(key, Arc::clone(&live));
+        locked(&desk.registry).held.insert(key, Arc::clone(&live));
         (dir, desk, live, store)
     }
 
@@ -1666,6 +2161,67 @@ mod tests {
             code,
             "the host's words",
         )))
+    }
+
+    /// KR-REQ-13.12: a key the person cancelled stays cancelled however many other keys are cancelled
+    /// after it, and each other refusal at admission has its own words.
+    #[test]
+    fn a_cancelled_key_is_refused_after_any_number_of_other_cancels() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let store = Store {
+            root: dir.path().join("open-transfers"),
+        };
+        let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+        let who = Who {
+            device_id: DeviceId::new(kr_ipc::new_uuid()),
+            environment_id: Some(environment_id),
+            account: None,
+        };
+        let mine = |key| {
+            let entry = UploadFile {
+                device_id: who.device_id,
+                environment_id,
+                ..file(key, None, Reached::Beginning)
+            };
+            Live::new(entry, Arc::new(Held::new(vec![1; 4])), false)
+        };
+        let mut registry = Registry::default();
+
+        let cancelled = kr_ipc::new_uuid();
+        registry.record_cancel(cancelled);
+        for _ in 0..10_000 {
+            registry.record_cancel(kr_ipc::new_uuid());
+        }
+        let refused = registry
+            .admit(&store, &mine(cancelled), &who)
+            .expect_err("a cancelled key is refused");
+        assert_eq!(refused.message, CANCELLED);
+
+        let first = kr_ipc::new_uuid();
+        registry
+            .admit(&store, &mine(first), &who)
+            .expect("admitted");
+        let refused = registry
+            .admit(&store, &mine(first), &who)
+            .expect_err("a held key is refused");
+        assert_eq!(refused.message, KEY_IN_USE);
+
+        let kept = kr_ipc::new_uuid();
+        store
+            .write(&file(kept, None, Reached::Beginning))
+            .expect("an entry");
+        let refused = registry
+            .admit(&store, &mine(kept), &who)
+            .expect_err("a key an entry names is refused");
+        assert_eq!(refused.message, KEY_IN_USE);
+
+        registry
+            .admit(&store, &mine(kr_ipc::new_uuid()), &who)
+            .expect("the second open upload");
+        let refused = registry
+            .admit(&store, &mine(kr_ipc::new_uuid()), &who)
+            .expect_err("a third open upload is refused");
+        assert_eq!(refused.message, TOO_MANY_OPEN);
     }
 
     /// KR-REQ-13.12: only the host's own words for an unknown transfer say it knows nothing of the
@@ -1725,12 +2281,13 @@ mod tests {
         desk.settle_as(
             &live,
             None,
+            0,
             false,
             Err(not_kept(&std::io::Error::other("disk full"))),
         );
         assert_eq!(*locked(&live.phase), Phase::Paused);
         assert!(
-            locked(&desk.live).contains_key(&live.file().key),
+            locked(&desk.registry).held.contains_key(&live.file().key),
             "still held"
         );
 
@@ -1774,23 +2331,23 @@ mod tests {
     fn a_send_ends_as_what_the_host_and_the_connection_said() {
         // The connection ended before the reservation left: paused, to ask again.
         let (_dir, desk, live, _store) = held(None, Reached::Beginning);
-        desk.settle_as(&live, None, false, Err(ClientError::ConnectionEnded));
+        desk.settle_as(&live, None, 0, false, Err(ClientError::ConnectionEnded));
         assert_eq!(*locked(&live.phase), Phase::Paused);
-        assert!(locked(&desk.live).contains_key(&live.file().key));
+        assert!(locked(&desk.registry).held.contains_key(&live.file().key));
 
         // The reservation may have been made and its answer is lost: the entry stays.
         let (_dir, desk, live, store) = held(None, Reached::Beginning);
         let lost = ClientError::SubmissionUncertain {
             action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
         };
-        desk.settle_as(&live, None, false, Err(lost));
-        assert!(!locked(&desk.live).contains_key(&live.file().key));
+        desk.settle_as(&live, None, 0, false, Err(lost));
+        assert!(!locked(&desk.registry).held.contains_key(&live.file().key));
         assert!(store.path(live.file().key, UPLOAD_EXTENSION).exists());
 
         // The host refused for good while it holds the reservation: a failed upload, entry kept.
         let (_dir, desk, live, store) =
             held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
-        desk.settle_as(&live, None, false, refused(ErrorCode::QuotaExceeded));
+        desk.settle_as(&live, None, 0, false, refused(ErrorCode::QuotaExceeded));
         assert_eq!(
             locked(&desk.verdicts).get(&live.file().key),
             Some(&Verdict::Failed("the host's words".to_owned()))
@@ -1799,14 +2356,14 @@ mod tests {
 
         // The host refused the reservation: nothing is left.
         let (_dir, desk, live, store) = held(None, Reached::Beginning);
-        desk.settle_as(&live, None, false, refused(ErrorCode::QuotaExceeded));
+        desk.settle_as(&live, None, 0, false, refused(ErrorCode::QuotaExceeded));
         assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
         assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
 
         // The sign-in it was sent under ended: it stops for good, with its copy.
         let (_dir, desk, live, store) =
             held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
-        desk.settle_as(&live, None, true, Err(ClientError::ConnectionEnded));
+        desk.settle_as(&live, None, 0, true, Err(ClientError::ConnectionEnded));
         assert!(!store.path(live.file().key, UPLOAD_EXTENSION).exists());
         assert!(!store.path(live.file().key, COPY_EXTENSION).exists());
     }

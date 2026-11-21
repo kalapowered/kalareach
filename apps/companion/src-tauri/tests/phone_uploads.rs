@@ -495,7 +495,7 @@ async fn left_by_a_first_process(
     control: &LinkControl,
     bytes: &[u8],
     keeping: Keeping,
-    before_the_host_is_reached: impl FnOnce(),
+    before_the_host_is_reached: impl FnOnce(Uuid),
 ) -> Uuid {
     let companion = &phone.companion;
     let first = Arc::new(Desk::default());
@@ -513,7 +513,7 @@ async fn left_by_a_first_process(
     session.transport().close();
     gate.release();
     drop(release);
-    before_the_host_is_reached();
+    before_the_host_is_reached(key);
     control.stop_holding();
     control.release_all();
     assert!(
@@ -537,7 +537,7 @@ async fn kr_req_13_12_a_restart_resumes_an_upload_whose_content_is_kept() {
         &control,
         &bytes,
         Keeping::Copy(bytes.clone()),
-        || {
+        |_| {
             assert_eq!(
                 copies_in(&folder(&phone)),
                 1,
@@ -570,7 +570,7 @@ async fn kr_req_13_12_a_restart_says_that_an_upload_with_no_content_cannot_resum
         &control,
         &bytes,
         Keeping::Copy(bytes.clone()),
-        || {
+        |_| {
             let copy = folder(&phone).join(format!("{}.bytes", {
                 let mut name = String::new();
                 for item in std::fs::read_dir(folder(&phone))
@@ -627,7 +627,7 @@ async fn kr_req_13_12_a_restart_does_not_send_a_file_whose_digest_changed() {
         &control,
         &bytes,
         Keeping::Path(path.clone()),
-        || {
+        |_| {
             let mut changed = bytes.clone();
             changed[3] ^= 0xff;
             std::fs::write(&path, changed).expect("the file changes");
@@ -1625,6 +1625,8 @@ async fn kr_req_13_12_forgetting_a_host_removes_its_uploads_copies_and_drafts() 
         .await
         .expect("the host is forgotten");
     gate.release();
+    // The removal waits for the sender it stopped; it is over before the folder is read.
+    desk_of(companion).idle().await;
 
     assert_eq!(everything(), 0, "nothing is kept for the forgotten host");
     let told = tokio::time::timeout(WATCHDOG, sending)
@@ -2588,6 +2590,8 @@ async fn kr_req_13_12_a_new_sign_in_on_the_same_pairing_drops_what_the_earlier_a
     // The host is reached under the new account.
     desk.host_reached(now.clone());
     drafts.sweep_after_reach(now.clone()).await;
+    // The upload of the earlier account is stopped and waited for: its content is let go.
+    gate.release();
 
     let stopped = tokio::time::timeout(WATCHDOG, running)
         .await
@@ -2782,5 +2786,560 @@ async fn paired_of_waits_for_a_connection_that_is_being_taken_up_again() {
         !Arc::ptr_eq(&paired.session, &old),
         "the connection it returns is the new one"
     );
+    adopted.stop().await;
+}
+
+/// The transfers the host holds open, as the requests this phone made say: reservations asked for,
+/// less the ones cancelled or finished.
+fn host_open(control: &LinkControl) -> usize {
+    use kr_protocol::method::Method;
+
+    control
+        .sent(Method::UploadBegin)
+        .saturating_sub(control.sent(Method::UploadCancel) + control.sent(Method::UploadFinish))
+}
+
+/// Waits, for at most the watchdog, until `done` holds.
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    tokio::time::timeout(WATCHDOG, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// KR-REQ-13.12: a cancel that comes before the key is registered, while the bytes still go to the
+/// application, is recorded: the send that follows is refused, and nothing is copied or asked of the
+/// host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cancel_before_the_key_is_registered_refuses_the_send_and_nothing_begins() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let gate = desk.hold_before_admission_for_test();
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    let paired = paired_of(companion).await;
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    let answer = desk
+        .cancel(paired, key)
+        .await
+        .expect("a cancel of a key nothing holds is answered");
+    assert_eq!(answer.state, "forgotten");
+    gate.add_permits(1);
+
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends")
+        .expect("the task ran")
+        .expect_err("a key the person cancelled is refused");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    desk.idle().await;
+    assert_eq!(control.sent(Method::UploadBegin), 0, "nothing was begun");
+    assert_eq!(entries_in(&folder(&phone)), 0, "no entry");
+    assert_eq!(copies_in(&folder(&phone)), 0, "no copy");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: a cancel that comes while the sender is being started, inside the one section that
+/// checks and starts it, waits for that section and then finds the sender: it stops the sender
+/// before the sender asks the host for anything, so the host is never asked and holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cancel_that_comes_while_the_sender_starts_leaves_the_host_holding_nothing()
+{
+    use kr_protocol::method::Method;
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let started = testing::hold_at(key, Point::Started);
+    let first_line = testing::hold_at(key, Point::SenderStarting);
+    let began = testing::hold_at(key, Point::CancelBegun);
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let paired = paired_of(companion).await;
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    // The send is inside the section that starts the sender, and the sender is at its first line.
+    started.until_passed(1).await;
+    first_line.until_passed(1).await;
+    let cancelling = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.cancel(paired, key).await })
+    };
+    began.until_passed(1).await;
+    started.release();
+    // The cancel finds the sender and waits for it, or, without the cure, is over already.
+    until("the cancel waits for the sender or ends", || {
+        waiting.passed() >= 1 || cancelling.is_finished()
+    })
+    .await;
+    first_line.release();
+    gate.release();
+    let answer = cancelling
+        .await
+        .expect("the task ran")
+        .expect("the cancel is answered");
+
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends")
+        .expect("the task ran")
+        .expect_err("the upload the person cancelled ends cancelled");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    desk.idle().await;
+    // A sender that was not stopped goes on at once when released; give it the time it needs.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !gate.reached.load(Ordering::Acquire),
+        "the sender went on to read the file"
+    );
+    assert_eq!(
+        control.sent(Method::UploadBegin),
+        0,
+        "the sender was stopped before it asked the host for anything"
+    );
+    assert_eq!(
+        answer.state, "forgotten",
+        "the host holds nothing to cancel"
+    );
+    assert_eq!(host_open(&control), 0, "the host holds nothing");
+    assert_eq!(entries_in(&folder(&phone)), 0, "no entry");
+    assert_eq!(copies_in(&folder(&phone)), 0, "no copy");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: the sender's handle is stored in the section that starts it, so a cancel that waits
+/// for that section finds the handle and waits for the sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_handle_is_stored_before_the_cancel_can_take_it() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let started = testing::hold_at(key, Point::Started);
+    let began = testing::hold_at(key, Point::CancelBegun);
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let paired = paired_of(companion).await;
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    started.until_passed(1).await;
+    let cancelling = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.cancel(paired, key).await })
+    };
+    began.until_passed(1).await;
+    started.release();
+    // The cancel took the handle of the sender that the section started, and waits for it.
+    until("the cancel finds the sender or ends", || {
+        waiting.passed() >= 1 || cancelling.is_finished()
+    })
+    .await;
+    assert_eq!(
+        waiting.passed(),
+        1,
+        "the cancel found the handle the section stored"
+    );
+    gate.release();
+    cancelling
+        .await
+        .expect("the task ran")
+        .expect("the cancel is answered");
+    let _ = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends");
+    desk.idle().await;
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: cancels and sends that start together never leave work behind. A probe: the end
+/// state of each round is read once both have ended and the desk's tasks are over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cancel_and_a_send_started_together_never_leave_work_behind() {
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let paired = paired_of(companion).await;
+    let mut forgotten_cancels = 0;
+    for round in 0..200_usize {
+        let key = kr_ipc::new_uuid();
+        let sending = {
+            let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+            let (desk, paired) = (Arc::clone(&desk), paired.clone());
+            tokio::spawn(async move { desk.send(paired, sent).await })
+        };
+        for _ in 0..round % 7 {
+            tokio::task::yield_now().await;
+        }
+        let answer = desk
+            .cancel(paired.clone(), key)
+            .await
+            .expect("the cancel is answered");
+        let told = tokio::time::timeout(WATCHDOG, sending)
+            .await
+            .expect("the send ends")
+            .expect("the task ran");
+        desk.idle().await;
+        let entry = folder(&phone).join(format!("{key}.upload"));
+        let copy = folder(&phone).join(format!("{key}.bytes"));
+        match told {
+            Ok(_) => {
+                assert_eq!(answer.state, "published", "round {round}");
+                assert!(
+                    !copy.exists(),
+                    "round {round}: a published upload keeps no copy"
+                );
+                // Published entries end when bound; this probe leaves none behind.
+                let _ = std::fs::remove_file(&entry);
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.message,
+                    companion_tauri::open_transfers::CANCELLED,
+                    "round {round}"
+                );
+                assert!(!entry.exists(), "round {round}: no entry is left");
+                assert!(!copy.exists(), "round {round}: no copy is left");
+                if answer.state == "forgotten" {
+                    forgotten_cancels += 1;
+                }
+            }
+        }
+    }
+    // A cancel that came before the host's answer to the reservation names no transfer, and the host
+    // may hold what it could not be told to cancel; every other cancelled round holds nothing.
+    assert!(
+        host_open(&control) <= forgotten_cancels,
+        "the host holds {} open, {forgotten_cancels} cancels named no transfer",
+        host_open(&control)
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: a restart that is reading an entry's content when the person cancels it does not
+/// start the upload: the cancel is finished against the host, and no sender is ever started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_restart_does_not_start_an_upload_cancelled_while_its_content_is_read() {
+    use kr_protocol::method::Method;
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let reading = Arc::new(std::sync::Mutex::new(None));
+    let started = Arc::new(std::sync::Mutex::new(None));
+    let key = left_by_a_first_process(
+        &adopted,
+        &phone,
+        &control,
+        &bytes,
+        Keeping::Copy(bytes.clone()),
+        |key| {
+            // The restart that the reach makes is held once it has read the content.
+            *reading.lock().expect("the slot") = Some(testing::hold_at(key, Point::Reading));
+            let counting = testing::hold_at(key, Point::Started);
+            counting.release();
+            *started.lock().expect("the slot") = Some(counting);
+        },
+    )
+    .await;
+    let reading = reading.lock().expect("the slot").clone().expect("armed");
+    let started = started.lock().expect("the slot").clone().expect("armed");
+    reading.until_passed(1).await;
+
+    let cancelling = {
+        let (desk, paired) = (Arc::clone(&desk), paired_of(companion).await);
+        tokio::spawn(async move { desk.cancel(paired, key).await })
+    };
+    until("the key is recorded as cancelled", || {
+        desk.is_cancelled(key)
+    })
+    .await;
+    reading.release();
+    let answer = cancelling
+        .await
+        .expect("the task ran")
+        .expect("the cancel is answered");
+    assert_eq!(answer.state, "cancelled");
+    desk.idle().await;
+    assert_eq!(started.passed(), 0, "no sender was started for the key");
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host was asked once"
+    );
+    assert_eq!(host_open(&control), 0, "the host holds nothing");
+    assert_eq!(entries_in(&folder(&phone)), 0, "no entry is rewritten");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: a cancel waits for a sender that is inside a blocking write of its journal; the
+/// sender's write is not the last, and the entry is gone when the cancel answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cancel_waits_for_a_sender_that_is_inside_a_blocking_write() {
+    use testing::{Point, Step};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    let writing = testing::hold_at(key, Point::Writing(Step::Begun));
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let paired = paired_of(companion).await;
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    // The host gave its identifier, and the sender is inside the write that keeps it.
+    writing.until_passed(1).await;
+    let cancelling = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.cancel(paired, key).await })
+    };
+    // The cancel is in its step 2, waiting for the sender; it is not ready while the sender is held.
+    waiting.until_passed(1).await;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !cancelling.is_finished(),
+            "the cancel answered while the sender was inside a write"
+        );
+    }
+    writing.release();
+    let answer = cancelling
+        .await
+        .expect("the task ran")
+        .expect("the cancel is answered");
+    assert_eq!(answer.state, "cancelled");
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends")
+        .expect("the task ran")
+        .expect_err("cancelled");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    desk.idle().await;
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "the sender's write was not the last"
+    );
+    assert_eq!(host_open(&control), 0, "the host holds nothing");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: two callers that start the same paused upload together, each from a list it read
+/// while the upload was paused, start one sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_two_starts_of_one_upload_run_one_task() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    // Every start of the upload is counted: the hold is let go at once.
+    let started = testing::hold_at(key, Point::Started);
+    started.release();
+    let claiming = testing::hold_at(key, Point::Claiming);
+    let first = paired_of(companion).await;
+    let session = Arc::clone(&first.session);
+    let who = first.who();
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(first, sent).await })
+    };
+    gate.reached().await;
+    control.hold();
+    session.transport().close();
+    gate.release();
+    until("the upload is paused", || {
+        desk.open(&who)
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
+    })
+    .await;
+    // The connection comes back: the application's own reach claims the upload, and a second reach
+    // from the same list does too. Both are held at the claim, and let go together.
+    control.stop_holding();
+    control.release_all();
+    let again = on_another_connection(companion, &session).await;
+    let second = {
+        let desk = Arc::clone(&desk);
+        tokio::task::spawn_blocking(move || desk.host_reached(again))
+    };
+    claiming.until_passed(2).await;
+    claiming.release();
+    second.await.expect("the second reach ran");
+    let handle = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the upload ends")
+        .expect("the task ran")
+        .expect("the upload is published");
+    assert_eq!(handle.byte_len.get(), bytes.len() as u64);
+    desk.idle().await;
+    assert_eq!(
+        started.passed(),
+        2,
+        "the send started one sender and the two claims started one more"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: a second cancel waits for the first and finds the key gone: the host is asked once,
+/// and no entry is written after the removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_second_cancel_waits_for_the_first_and_does_not_rewrite_the_entry() {
+    use kr_protocol::method::Method;
+    use testing::{Point, Step};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    let writing = testing::hold_at(key, Point::Writing(Step::Begun));
+    let began = testing::hold_at(key, Point::CancelBegun);
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let paired = paired_of(companion).await;
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    // The host gave its identifier, and the sender is inside the write that keeps it.
+    writing.until_passed(1).await;
+    let first = {
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.cancel(paired, key).await })
+    };
+    waiting.until_passed(1).await;
+    let second = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.cancel(paired, key).await })
+    };
+    began.until_passed(2).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    writing.release();
+    let first = first
+        .await
+        .expect("the task ran")
+        .expect("the first cancel is answered");
+    let second = second
+        .await
+        .expect("the task ran")
+        .expect("the second cancel is answered");
+    assert_eq!(first.state, "cancelled");
+    assert_eq!(
+        second.state, "forgotten",
+        "the key was gone when its turn came"
+    );
+    let _ = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends");
+    desk.idle().await;
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host was asked once"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 0, "no entry is rewritten");
+    assert_eq!(copies_in(&folder(&phone)), 0, "no copy");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: a reach that comes between the stop of a paused upload and the removal of its entry
+/// starts no sender, and no entry is written after the removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reach_between_a_stop_and_a_removal_starts_no_sender() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    // Every start of the upload is counted: the hold is let go at once.
+    let started = testing::hold_at(key, Point::Started);
+    started.release();
+    let stopped = testing::hold_at(key, Point::Stopped);
+    let first = paired_of(companion).await;
+    let (session, who, device_id) = (Arc::clone(&first.session), first.who(), first.device_id);
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(first, sent).await })
+    };
+    gate.reached().await;
+    control.hold();
+    session.transport().close();
+    gate.release();
+    until("the upload is paused", || {
+        desk.open(&who)
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
+    })
+    .await;
+
+    // The host is forgotten: the upload is stopped, and its removal is held.
+    desk.forgotten(device_id);
+    stopped.until_passed(1).await;
+    // The connection comes back and the host is reached, twice, before the removal.
+    control.stop_holding();
+    control.release_all();
+    let again = on_another_connection(companion, &session).await;
+    desk.host_reached(again);
+    stopped.release();
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends")
+        .expect("the task ran")
+        .expect_err("the upload of a forgotten host ends cancelled");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    desk.idle().await;
+    assert_eq!(started.passed(), 1, "no sender was started after the stop");
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "no entry is written after the removal"
+    );
+    assert_eq!(copies_in(&folder(&phone)), 0, "no copy is left");
     adopted.stop().await;
 }

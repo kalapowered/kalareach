@@ -2868,6 +2868,13 @@ pub async fn attachment_upload(
     session_id: Option<String>,
     transfer_key: Option<String>,
 ) -> Result<Value> {
+    let key = if state.paired_context().is_some() {
+        let key = transfer_key_of(transfer_key)?;
+        refuse_cancelled(&state, key)?;
+        Some(key)
+    } else {
+        None
+    };
     // Only a file this window was actually given. The platform hands the backend a path when a
     // person drops something on the window, and that path is spent by one upload. A path the page
     // names is refused, so this command is not a general file read.
@@ -2880,13 +2887,13 @@ pub async fn attachment_upload(
                 .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
         ),
     };
-    if state.paired_context().is_some() {
+    if let Some(key) = key {
         let paired = state.paired().await?;
         let target = subject.target(paired.environment_id)?;
         let handle = crate::transfers::upload_paired(
             &state.transfers(),
             paired,
-            transfer_key_of(transfer_key)?,
+            key,
             target,
             session_id,
             path,
@@ -2900,6 +2907,15 @@ pub async fn attachment_upload(
     let handle =
         crate::transfers::upload(&session, target, environment_id, session_id, path).await?;
     encode(&handle)
+}
+
+/// Refuses a file whose key the person cancelled, before anything is copied or digested for it.
+fn refuse_cancelled(state: &AppState, key: kr_protocol::scalars::Uuid) -> Result<()> {
+    if state.transfers().is_cancelled(key) {
+        Err(CommandError::refused(crate::open_transfers::CANCELLED))
+    } else {
+        Ok(())
+    }
 }
 
 /// The key a page names an upload by, or a new one when it names none.
@@ -2976,16 +2992,7 @@ pub async fn attachment_upload_bytes(
         )
         .map_err(|error| CommandError::invalid(format!("that is not a subject: {error}")))?,
     };
-    let file = crate::transfers::HandedFile::new(bytes.clone(), &name)?;
-    let session_id = match subject.session_id.as_deref() {
-        None => None,
-        Some(value) => Some(
-            value
-                .parse()
-                .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
-        ),
-    };
-    if state.paired_context().is_some() {
+    let key = if state.paired_context().is_some() {
         let key = transfer_key_of(
             request
                 .headers()
@@ -2998,6 +3005,21 @@ pub async fn attachment_upload_bytes(
                 })
                 .transpose()?,
         )?;
+        refuse_cancelled(&state, key)?;
+        Some(key)
+    } else {
+        None
+    };
+    let file = crate::transfers::HandedFile::new(bytes.clone(), &name)?;
+    let session_id = match subject.session_id.as_deref() {
+        None => None,
+        Some(value) => Some(
+            value
+                .parse()
+                .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
+        ),
+    };
+    if let Some(key) = key {
         let paired = state.paired().await?;
         let target = subject.target(paired.environment_id)?;
         let handle = crate::transfers::upload_handed_paired(
