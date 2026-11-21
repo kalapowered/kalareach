@@ -207,7 +207,7 @@ export class FakeChannelMessageStore {
     try {
       draftStore.replaceRemovals(referencesOf(this.#entries.values()))
     } catch (failure) {
-      refuse('LOCAL_FAILURE', `${NOT_SET_ASIDE} ${failureMessage(failure)}`)
+      refuse('RESOURCE_UNAVAILABLE', `${NOT_SET_ASIDE} ${failureMessage(failure)}`)
     }
     this.#ledger = 'ok'
     const confirmed = !this.#setAsideUnconfirmed
@@ -219,7 +219,7 @@ export class FakeChannelMessageStore {
 
   /** A removal recorded by the page, as native code records one: over a list that cannot be read it fails. */
   markRemoval(request: DraftDiscardRequest, draftStore: FakeDraftStore): void {
-    if (this.#ledger !== 'ok') refuse('LOCAL_FAILURE', LEDGER_UNREADABLE)
+    if (this.#ledger !== 'ok') refuse('RESOURCE_UNAVAILABLE', LEDGER_UNREADABLE)
     draftStore.markRemoval(request)
   }
 
@@ -301,7 +301,7 @@ export class FakeChannelMessageStore {
     }
     // Every keep, a resume and one with no references included, takes the ledger step: one change
     // that names all the drafts or none. A list that cannot be read is never written over.
-    if (this.#ledger !== 'ok') refuse('LOCAL_FAILURE', LEDGER_UNREADABLE)
+    if (this.#ledger !== 'ok') refuse('RESOURCE_UNAVAILABLE', LEDGER_UNREADABLE)
     try {
       draftStore.markRemovals(request.drafts)
     } catch (failure) {

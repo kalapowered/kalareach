@@ -116,7 +116,7 @@ describe('the scripted store of channel messages keeps the native rules', () => 
       const store = new FakeChannelMessageStore()
       store.damageLedger(state)
       const named = { id: 'a', expectedRevision: '1' }
-      expect(refusal(() => store.keep(request({ drafts: [named] }), drafts))).toBe('LOCAL_FAILURE')
+      expect(refusal(() => store.keep(request({ drafts: [named] }), drafts))).toBe('RESOURCE_UNAVAILABLE')
       expect(store.all()).toHaveLength(1)
       expect(drafts.pendingRemovals()).toEqual([])
       // Readable again, the same keep is a resume that finishes the step.
@@ -148,7 +148,7 @@ describe('the scripted store of channel messages keeps the native rules', () => 
 })
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
-const refused = { code: 'LOCAL_FAILURE', message: 'This device could not read or write its list of removals. disk full' }
+const refused = { code: 'RESOURCE_UNAVAILABLE', message: 'This device could not read or write its list of removals. disk full' }
 
 /** A draft in a store, as a person's composer saved it. */
 function stored(drafts: FakeDraftStore, text: string): { id: string; expectedRevision: string } {
@@ -207,7 +207,7 @@ describe('the scripted store counts and changes the list of removals as native c
     const a = stored(drafts, 'a')
     const b = stored(drafts, 'b')
     drafts.refuseMarks(refused)
-    expect(refusal(() => store.keep(request({ drafts: [a, b] }), drafts))).toBe('LOCAL_FAILURE')
+    expect(refusal(() => store.keep(request({ drafts: [a, b] }), drafts))).toBe('RESOURCE_UNAVAILABLE')
     expect(store.all()).toEqual([])
     expect(drafts.pendingRemovals()).toEqual([])
     // The refusal was one: the same keep now names both drafts in one change.
@@ -215,7 +215,7 @@ describe('the scripted store counts and changes the list of removals as native c
     expect(drafts.pendingRemovals()).toHaveLength(2)
     // A resume whose change is refused leaves the entry it resumes.
     drafts.refuseMarks(refused)
-    expect(refusal(() => store.keep(request({ drafts: [a, b] }), drafts))).toBe('LOCAL_FAILURE')
+    expect(refusal(() => store.keep(request({ drafts: [a, b] }), drafts))).toBe('RESOURCE_UNAVAILABLE')
     expect(store.all()).toHaveLength(1)
   })
 
@@ -226,7 +226,7 @@ describe('the scripted store counts and changes the list of removals as native c
     const b = stored(drafts, 'b')
     drafts.markRemoval(a)
     drafts.refuseMarks(refused)
-    expect(refusal(() => store.keep(request({ drafts: [a, b] }), drafts))).toBe('LOCAL_FAILURE')
+    expect(refusal(() => store.keep(request({ drafts: [a, b] }), drafts))).toBe('RESOURCE_UNAVAILABLE')
     expect(store.all()).toHaveLength(1)
     expect(drafts.pendingRemovals()).toEqual([a])
   })
@@ -269,7 +269,7 @@ describe('the scripted store counts and changes the list of removals as native c
     const read = store.drafts(drafts)
     expect(read.ledger).toBe('unreadable')
     expect(read.pendingRemovals).toEqual([a])
-    expect(refusal(() => store.markRemoval(b, drafts))).toBe('LOCAL_FAILURE')
+    expect(refusal(() => store.markRemoval(b, drafts))).toBe('RESOURCE_UNAVAILABLE')
     expect(drafts.pendingRemovals()).toEqual([a])
     store.damageLedger('ok')
     expect(refusal(() => store.markRemoval(b, drafts))).toBeNull()
