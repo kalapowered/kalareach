@@ -129,7 +129,13 @@ import type {
   Written
 } from './port'
 import { createConnectionFeed } from './connection-feed'
-import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
+import {
+  MAX_HANDED_BYTES,
+  receivedConnection,
+  supersededRead,
+  viewMoveArguments,
+  viewSizeArguments
+} from './port'
 import { codeComplete } from '../pairing/words'
 import { openedMode } from '../theme-init'
 import { scriptedHostDrafts, type BindParams, type FakeHostDrafts } from './fake-host-drafts'
@@ -647,6 +653,18 @@ export interface FakeHostControls {
    * tells the page each held change, in order.
    */
   holdPublications(): () => void
+  /**
+   * Has the host fail every read of the connection's state with `words` until it is called with
+   * null, as a host does that cannot say: the replay and the events go on as they were.
+   */
+  failConnectionReads(words: string | null): void
+  /**
+   * Has the next `count` reads of the inbox answer that the choice, the connection or the host's
+   * record moved while the host was asked, as native code does: the failure carries no data.
+   */
+  supersedeNextInboxReads(count: number): void
+  /** Has the host answer the inbox `items` at a time, so a read of it takes more than one page; null for as many as asked. */
+  pageInboxBy(items: number | null): void
   /**
    * Has the connection go to another host, as choosing one does: the environment the connection
    * belongs to changes and is told, the host lists no sessions of the earlier one, and reads of its
@@ -1678,6 +1696,17 @@ export function fakeHost(
   /** Whether changes of the connection are kept from the page, and the newest revision it was told. */
   let publicationsHeld = false
   let toldThrough = 1
+  /** When the host in use was last heard to stop answering, by this device's clock; null while it answers. */
+  let lostAt: number | null = null
+  /** How many reads of the inbox are still to be answered as superseded, and how many items a page holds. */
+  let supersededInboxReads = 0
+  let connectionReadFailure: string | null = null
+  let inboxPageItems: number | null = null
+  /** How long a loss lasts before it reaches its next level, as the host's rules say. */
+  const ESCALATION_MS = 60_000
+  /** Whether a paired host is listed by the pairing screen and is not the one in use. */
+  const listedAsOther = (reference: string): boolean =>
+    pairing.hosts.some((host) => host.reference === reference && !host.in_use)
   const connectionBody = (): Omit<ConnectionState, 'revision'> => ({
     connected,
     environment_id: connected ? hostEnvironment : null,
@@ -1696,9 +1725,13 @@ export function fakeHost(
       statedContact ??
       (connected
         ? { state: 'in_contact' }
-        : { state: 'out_of_contact', since_ms: 0, escalates_at_ms: 0 }),
+        : {
+            state: 'out_of_contact',
+            since_ms: lostAt ?? 0,
+            escalates_at_ms: (lostAt ?? 0) + ESCALATION_MS
+          }),
     inbox_epoch: namedEpoch ?? (pairedDevice ? 1 : 0),
-    others: otherHosts
+    others: namedHost === undefined ? otherHosts : otherHosts.filter((each) => listedAsOther(each.reference))
   })
   const connectionNow = (): ConnectionState =>
     receivedConnection({ ...connectionBody(), revision: connectionRevision })
@@ -1725,15 +1758,20 @@ export function fakeHost(
     for (const listener of connectionListeners) listener(state)
   }
   /** The newest state the page may be told: the host's own, or what was told before a hold. */
-  const publishedNow = (): ConnectionState =>
+  const publishedState = (): ConnectionState =>
     publicationsHeld
       ? (connectionLog.find((state) => state.revision === toldThrough) ?? connectionNow())
       : connectionNow()
+  /** What a read of the connection's state answers: the newest state the page may be told. */
+  const publishedNow = (): ConnectionState => {
+    if (connectionReadFailure !== null) refuse('PERMISSION_DENIED', connectionReadFailure)
+    return publishedState()
+  }
   const connectionSinceNow = (after: number): ConnectionSince => {
     const oldest = connectionLog[0]?.revision ?? connectionRevision
     const through = publicationsHeld ? toldThrough : connectionRevision
     if (after + 1 < oldest || after > through) {
-      return { revision: through, states: [publishedNow()], resync: true }
+      return { revision: through, states: [publishedState()], resync: true }
     }
     return {
       revision: through,
@@ -2548,7 +2586,17 @@ export function fakeHost(
             quiet_now: false
           })
         }
-        return keyedNow(records.attentionRead(params))
+        if (supersededInboxReads > 0) {
+          supersededInboxReads -= 1
+          // eslint-disable-next-line @typescript-eslint/only-throw-error -- a superseded read fails as data, as a command's failure does
+          throw supersededRead()
+        }
+        const asked = params as { readonly max_items?: unknown }
+        const page =
+          inboxPageItems === null
+            ? params
+            : { ...params, max_items: String(Math.min(Number(asked.max_items), inboxPageItems)) }
+        return keyedNow(records.attentionRead(page))
       }),
     attentionAcknowledge: (params) => {
       requireConnection()
@@ -2877,8 +2925,10 @@ export function fakeHost(
     inboxHosts: () =>
       holdingInboxHosts.then(() => ({
         revision: connectionRevision,
-        hosts: inboxHosts.filter(
-          (each) => !pairing.hosts.some((host) => host.reference === each.reference && host.in_use)
+        hosts: inboxHosts.filter((each) =>
+          namedHost === undefined
+            ? !pairing.hosts.some((host) => host.reference === each.reference && host.in_use)
+            : listedAsOther(each.reference)
         )
       })),
     hostsForget: (reference) => {
@@ -3822,6 +3872,7 @@ export function fakeHost(
     setConnected(next, reason = UNREACHABLE) {
       connected = next
       lostBecause = reason
+      lostAt = next ? null : (lostAt ?? Date.now())
       // An opening that could not reach the host is taken up again once the host can be reached.
       if (next) {
         for (const [sessionId, held] of openings) {
@@ -3858,6 +3909,15 @@ export function fakeHost(
     setInboxEpoch(epoch) {
       namedEpoch = epoch
       publishConnection()
+    },
+    failConnectionReads(words) {
+      connectionReadFailure = words
+    },
+    supersedeNextInboxReads(count) {
+      supersededInboxReads = count
+    },
+    pageInboxBy(items) {
+      inboxPageItems = items
     },
     holdPublications() {
       publicationsHeld = true
@@ -4192,6 +4252,16 @@ export function fakeHost(
     },
     setPairing(change) {
       publishPairing(change)
+      // A host the test named follows the pairing: another host in use is a choice, and a host the
+      // pairing no longer lists is not one of the others.
+      if (namedHost === undefined || change.hosts === undefined) return
+      const using = pairing.hosts.find((host) => host.in_use)
+      const named = namedHost
+      if (using !== undefined && !(named?.kind === 'paired' && named.reference === using.reference)) {
+        namedHost = { kind: 'paired', reference: using.reference, name: using.name }
+        namedEpoch = (namedEpoch ?? 0) + 1
+      }
+      publishConnection()
     },
     setPush(view) {
       publishPush(view)
