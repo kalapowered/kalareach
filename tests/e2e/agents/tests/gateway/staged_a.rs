@@ -1341,6 +1341,8 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
             // What the host shows before any forgery: the agent's instance, and none in the
             // forging session. Each forgery must leave it exactly so.
             let initial = detects(ctx, &session.remote, session_id);
+            check_detected(&launched(&agent), &initial)
+                .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
             let held = Held::of(&initial);
             let unchanged = |what: &str| {
                 let now = shown_now(ctx, &session.remote, session_id);
@@ -1752,6 +1754,8 @@ fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer
         let session_id = session.session_id();
         let agent = HandAgent::starts(ctx, session);
         let initial = detects(ctx, &session.remote, session_id);
+        check_detected(&launched(&agent), &initial)
+            .unwrap_or_else(|why| panic!("the host did not detect the manual launch: {why}"));
         ctx.work
             .as_ref()
             .expect("the working directory was recorded")
