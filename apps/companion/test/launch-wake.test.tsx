@@ -314,6 +314,38 @@ describe('when the saved launch commands are read', () => {
     expect(result.current.reading).toEqual(SURFACE)
   })
 
+  it('a_list_answer_for_another_host_environment_or_connection_is_discarded', async () => {
+    const surface = held<LaunchSurfaceReading>()
+    const first = held<LaunchCommandsReading>()
+    const second = held<LaunchCommandsReading>()
+    const { result, options } = run(surface.read, { wake: 0, readList: first.read })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    await surface.answer(SURFACE)
+    await first.answer(LISTED(['Claude']))
+    expect(result.current.listNow()?.commands.map((each) => each.label)).toEqual(['Claude'])
+
+    // The page now reads another host's list (another environment, or the same host over another
+    // connection), and the answer of the old reader, still out, arrives.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(LAUNCH_SURFACE_CADENCE_MS)
+    })
+    expect(first.started()).toBe(2)
+    options({ wake: 0, readList: second.read })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(second.started()).toBe(1)
+    await first.answer(LISTED(['Removed']))
+    expect(result.current.list).toBeNull()
+    expect(result.current.listNow()).toBeNull()
+
+    await second.answer(LISTED(['Codex']))
+    expect(result.current.list).toEqual(LISTED(['Codex']))
+    expect(result.current.listNow()?.commands.map((each) => each.label)).toEqual(['Codex'])
+  })
+
   it('a_host_that_does_not_serve_the_list_is_asked_no_more_and_nothing_is_said', async () => {
     const surface = held<LaunchSurfaceReading>()
     const list = held<LaunchCommandsReading>()
