@@ -163,6 +163,26 @@ export function sameKey(a: ReadKey, b: ReadKey): boolean {
   return host(a) === host(b) && a.epoch === b.epoch && a.link === b.link
 }
 
+/** The key a read made now is valid under: the host in use, its epoch and the connection's number. */
+export function keyOfState(state: ConnectionState): ReadKey {
+  const host = state.host
+  return {
+    host: host === null ? null : host.kind === 'local' ? { kind: 'local' } : { kind: 'paired', reference: host.reference },
+    epoch: state.inbox_epoch,
+    link: state.link
+  }
+}
+
+/**
+ * Whether what was read under `key` is still the host in use's to show: the host and its epoch hold.
+ * The connection's number is not part of it, so a reconnection keeps what was read and a
+ * replacement, which moves the epoch, hides it.
+ */
+export function holdsFor(key: ReadKey, state: ConnectionState): boolean {
+  const now = keyOfState(state)
+  return sameKey({ ...key, link: now.link }, now)
+}
+
 /**
  * A failure the page holds, as `receivedFailure` (`./tauri`) makes it from what native code
  * answered with. It has no member for what a person can do about it: the line the page shows

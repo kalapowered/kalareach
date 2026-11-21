@@ -164,6 +164,7 @@ function refusingLaptop(
 function start(): { controls: FakeHostControls } {
   const { port, controls } = fakeHost()
   controls.setPairing({ hosts: [STUDIO, LAPTOP] })
+  controls.setHostInUse({ kind: 'paired', reference: STUDIO.reference, name: 'studio' })
   find(controls, [laptopRead()])
   render(
     <AppProvider port={port}>
@@ -536,7 +537,10 @@ describe('the inbox of a phone paired with two hosts', () => {
     })
     // The laptop's rows are listed, so the list is not empty; with them gone it would not say it is
     // empty either, since the host in use has not been heard.
-    find(controls, [{ ...laptopRead(), row: { ...laptopRows(), result: inboxOf([]), sessions: [] } }])
+    // The next read of the laptop takes the next place in the order of reads.
+    find(controls, [
+      { ...laptopRead(), row: { ...laptopRows(), read_serial: 8, result: inboxOf([]), sessions: [] } }
+    ])
     readNow()
     await waitFor(() => {
       expect(rowsOf('laptop')).toHaveLength(0)

@@ -120,10 +120,7 @@ export function MobileApp({
     readonly reason: string | null
     readonly rights: readonly ActionRight[] | null
     readonly paired: boolean
-    /** When this window heard that contact was lost, while it is lost. */
-    readonly lostSinceMs: number | null
   } | null>(null)
-  const lostSince = useRef<number | null>(null)
   const [actionable, setActionable] = useState(0)
   const lifecycle = useLifecycle(storage)
   useRebind(connection?.connected === true, lifecycle)
@@ -206,26 +203,21 @@ export function MobileApp({
       port.watchConnection(
         (state) => {
           if (state.connected && state.rights !== null) rememberRights(state.rights)
-          // Contact lost is noted at the moment it is heard, and kept until it is back.
-          lostSince.current = state.connected ? null : (lostSince.current ?? Date.now())
           setConnection({
             connected: state.connected,
             environmentId: state.environment_id,
             reason: state.reason,
             rights: state.connected ? state.rights : null,
-            paired: state.connected && state.paired,
-            lostSinceMs: lostSince.current
+            paired: state.connected && state.paired
           })
         },
         (failure) => {
-          lostSince.current ??= Date.now()
           setConnection({
             connected: false,
             environmentId: null,
             reason: failureMessage(failure),
             rights: null,
-            paired: false,
-            lostSinceMs: lostSince.current
+            paired: false
           })
         }
       ),
@@ -359,14 +351,6 @@ export function MobileApp({
         {place.tab === 'attention' ? (
           <Inbox
             surface={resolved}
-            connection={
-              connection === null
-                ? null
-                : {
-                    connected: connection.connected,
-                    lostSinceMs: connection.lostSinceMs
-                  }
-            }
             onOpenSession={openSession}
             onCounts={setActionable}
           />

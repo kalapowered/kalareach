@@ -23,13 +23,19 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import type { AttentionReadResult } from '@kalareach/protocol'
 
-import { Banner, Button, Sheet } from '../../components/ui'
+import { Badge, Banner, Button, Sheet } from '../../components/ui'
 import { readOnCadence } from '../../app/cadence'
 import { useApp } from '../../app/state'
 import {
+  failureCode,
   failureMessage,
+  holdsFor,
+  keyOfState,
+  READ_SUPERSEDED,
+  sameKey,
   watch,
   type HostError,
+  type ReadKey,
   type RefusedRequest,
   type Watch
 } from '../../host/port'
@@ -80,19 +86,13 @@ const FILTERS: readonly { readonly id: AttentionFilter; readonly label: string }
 /** The largest page of the inbox one read asks for. */
 const PAGE_ITEMS = '200'
 
-/** What the shell knows of the connection to the host in use. */
-export interface InboxConnection {
-  /** Whether the host in use answers, or null before anything has said. */
-  readonly connected: boolean | null
-  /** When this window heard that contact was lost, while it is. */
-  readonly lostSinceMs: number | null
-}
-
 /** A host that does not answer, as the inbox draws it. */
 interface Contact {
   readonly host: HostTag
-  /** Since when contact has been lost, when this device noted it. */
+  /** Since when contact has been lost, by this device's clock, when it is known. */
   readonly sinceMs: number | null
+  /** When the loss reaches its next level, by this device's clock. */
+  readonly escalatesAtMs: number | null
   /** When the rows listed for this host were read, while any are. */
   readonly rowsReadAtMs: number | null
 }
@@ -105,6 +105,9 @@ interface Refusal {
   /** What the host refused with. */
   readonly refusal: HostError | null
 }
+
+/** No session numbers: a row then says "A session". */
+const NO_NUMBERS: ReadonlyMap<string, string> = new Map()
 
 /** No counts. */
 const NOTHING: AttentionCounts = {
@@ -119,29 +122,31 @@ const NOTHING: AttentionCounts = {
 /** The inbox screen. */
 export function Inbox({
   surface,
-  connection = null,
   onOpenSession,
   onCounts
 }: {
   readonly surface: Surface
-  /** What the shell knows of the host in use; null before it has said anything. */
-  readonly connection?: InboxConnection | null
   readonly onOpenSession: (sessionId: string) => void
   readonly onCounts?: (actionable: number) => void
 }): ReactNode {
   const { port, say } = useApp()
-  // What the host in use said, with the host it said it for: a read that answers after the phone
-  // went to another host is that host's no longer, and is not shown as the new one's.
+  // What the host in use said, under the key the owner said it holds under: a read is stored only
+  // while that is the key of the connection's latest state, and shown while the host and its epoch
+  // still hold.
   const [inbox, setInbox] = useState<{
-    readonly reference: string | null
+    readonly key: ReadKey
     readonly result: AttentionReadResult
     readonly atMs: number
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [chosen, setChosen] = useState<AttentionFilter>('all')
   const [open, setOpen] = useState<HostedRow | null>(null)
-  // Each session's display number, by its identifier, as the host in use listed them.
-  const [numbers, setNumbers] = useState<ReadonlyMap<string, string>>(new Map())
+  // Each session's display number, by its identifier, as the host in use listed them, under a key of
+  // their own: a failed or differently keyed read of them leaves the inbox as it is.
+  const [numbers, setNumbers] = useState<{
+    readonly key: ReadKey
+    readonly named: ReadonlyMap<string, string>
+  } | null>(null)
   const [nowMs, setNowMs] = useState(() => Date.now())
   const others = useOtherHosts()
   const { again: seeOthersAgain } = others
@@ -156,49 +161,64 @@ export function Inbox({
   const reads = useRef<Watch | null>(null)
   const again = useRef<() => void>(() => undefined)
 
-  const load = useCallback((): Promise<void> => {
-    const current = reads.current?.read() ?? null
-    if (current === null) return Promise.resolve()
-    // The host in use as this read begins and as it ends: one that changed in between is not the
-    // host the answer is of.
-    const using = () =>
-      port
-        .pairingView()
-        .then((view) => view.hosts.find((each) => each.in_use)?.reference ?? null)
-        .catch(() => null)
-    const began = using()
-    const inboxRead = ask(() =>
-      readWholeInbox((after) =>
-        port.attentionRead({
-          session_id: null,
-          include_acknowledged: false,
-          max_items: PAGE_ITEMS,
-          after
-        })
+  // One read of the inbox and of the numbers. What it read is kept only under the key of the
+  // connection's latest state at the moment it completes: the answer's own key is the owner's, and the
+  // page gives no read an authority of its own. A dropped read (superseded, or under another key) says
+  // so, and the next read waits for the cadence, a connection change or one more attempt.
+  const readOnce = useCallback(
+    (current: () => boolean): Promise<boolean> => {
+      const inboxRead = ask(() =>
+        readWholeInbox((after) =>
+          port.attentionRead({
+            session_id: null,
+            include_acknowledged: false,
+            max_items: PAGE_ITEMS,
+            after
+          })
+        )
+      ).then(
+        (answer) => {
+          if (!current()) return false
+          const now = port.connectionLatest()
+          if (now === null || !sameKey(answer.key, keyOfState(now))) return true
+          setInbox({ key: answer.key, result: answer.value, atMs: Date.now() })
+          setError(null)
+          return false
+        },
+        (failure: unknown) => {
+          if (!current()) return false
+          if (failureCode(failure) === READ_SUPERSEDED) return true
+          // A host that cannot be read is a host out of contact, which is a state the inbox has.
+          // It is never a claim that anything on it failed.
+          setError(failureMessage(failure))
+          return false
+        }
       )
-    )
-      .then(async (answer) => {
-        const [before, after] = [await began, await using()]
-        if (!current() || before !== after) return
-        setInbox({ reference: after, result: answer.value, atMs: Date.now() })
-        setError(null)
-      })
-      .catch((failure: unknown) => {
-        if (!current()) return
-        // A host that cannot be read is a host out of contact, which is a state the inbox has.
-        // It is never a claim that anything on it failed.
-        setError(failureMessage(failure))
-      })
-    const numbersRead = ask(() => port.sessionNumbers())
-      .then((answer) => {
-        if (!current()) return
-        setNumbers(new Map(answer.value.sessions.map((session) => [session.session_id, session.display_number])))
-      })
-      .catch(() => undefined)
-    return Promise.all([inboxRead, numbersRead]).then(() => {
-      if (current()) setNowMs(Date.now())
-    })
-  }, [port])
+      const numbersRead = ask(() => port.sessionNumbers()).then(
+        (answer) => {
+          if (!current()) return
+          const now = port.connectionLatest()
+          if (now === null || !sameKey(answer.key, keyOfState(now))) return
+          setNumbers({
+            key: answer.key,
+            named: new Map(answer.value.sessions.map((session) => [session.session_id, session.display_number]))
+          })
+        },
+        () => undefined
+      )
+      return Promise.all([inboxRead, numbersRead]).then(([dropped]) => dropped)
+    },
+    [port]
+  )
+
+  const load = useCallback(async (): Promise<void> => {
+    const current = reads.current?.read() ?? null
+    if (current === null) return
+    // A read that is dropped makes one new read from the connection's state as it stands then; a
+    // second one that is dropped waits for the cadence.
+    if (await readOnce(current)) await readOnce(current)
+    if (current()) setNowMs(Date.now())
+  }, [readOnce])
 
   // The inbox is read once the connection listener is registered, so no change of connection falls
   // between the read and it, and read again on the cadence and on each change of connection.
@@ -217,11 +237,18 @@ export function Inbox({
     }
   }, [port, load])
 
-  // The host in use's rows are those read for the host in use now.
+  // The host in use's rows are those read under the host and epoch the connection holds now, and a
+  // host that refused shows none.
+  const latest = others.latest
   const here =
-    inbox !== null && inbox.reference === (others.paired?.inUseReference ?? null) ? inbox : null
-  const inUseName = others.paired?.inUseName ?? null
-  const several = (others.paired?.count ?? 1) > 1
+    inbox !== null && latest !== null && holdsFor(inbox.key, latest) && latest.contact.state !== 'refused'
+      ? inbox
+      : null
+  const numbered: ReadonlyMap<string, string> =
+    numbers !== null && latest !== null && holdsFor(numbers.key, latest) ? numbers.named : NO_NUMBERS
+  // Only a paired host in use has a name and a row of contact: the host on this computer has none.
+  const inUseName = latest?.host?.kind === 'paired' ? latest.host.name : null
+  const several = others.contacts.length > 0 || (others.hosts?.length ?? 0) > 0
   const inUse: HostTag = useMemo(
     () => ({ reference: null, name: inUseName ?? 'This host' }),
     [inUseName]
@@ -231,7 +258,7 @@ export function Inbox({
   const hosted = useMemo<readonly HostedRow[]>(() => {
     const rows: HostedRow[] = []
     if (here !== null) {
-      for (const row of order(here.result, here.atMs)) rows.push({ row, host: inUse, numbers })
+      for (const row of order(here.result, here.atMs)) rows.push({ row, host: inUse, numbers: numbered })
     }
     for (const visit of others.hosts ?? []) {
       if (visit.result === null) continue
@@ -242,16 +269,17 @@ export function Inbox({
       }
     }
     return orderAcrossHosts(rows)
-  }, [here, inUse, numbers, others.hosts, nowMs])
+  }, [here, inUse, numbered, others.hosts, nowMs])
 
-  // The hosts that do not answer: the host in use, by what the shell heard, and the others, by
-  // what their visits found.
+  // The hosts that do not answer, and the hosts that answered and refused, both from the connection's
+  // state: the host in use by its own contact, the others by the state's other hosts.
   const contacts = useMemo<readonly Contact[]>(() => {
     const lost: Contact[] = []
-    if (connection?.connected === false && inUseName !== null) {
+    if (latest !== null && inUseName !== null && latest.contact.state === 'out_of_contact') {
       lost.push({
         host: inUse,
-        sinceMs: connection.lostSinceMs,
+        sinceMs: latest.contact.since_ms,
+        escalatesAtMs: latest.contact.escalates_at_ms,
         rowsReadAtMs: here?.atMs ?? null
       })
     }
@@ -260,30 +288,48 @@ export function Inbox({
       lost.push({
         host: { reference: other.reference, name: other.name },
         sinceMs: other.contact.since_ms,
+        escalatesAtMs: other.contact.escalates_at_ms,
         rowsReadAtMs:
           others.hosts?.find((visit) => visit.reference === other.reference)?.read_at_ms ?? null
       })
     }
     return lost
-  }, [connection, inUseName, inUse, here, others.hosts, others.contacts])
+  }, [latest, inUseName, inUse, here, others.hosts, others.contacts])
 
-  // The hosts that answered and refused: they are in contact, so they are not among the hosts out
-  // of contact, and nothing of what they held before is listed.
-  const refusals = useMemo<readonly Refusal[]>(
-    () =>
-      others.contacts.flatMap((other) =>
-        other.contact.state === 'refused'
-          ? [
-              {
-                host: { reference: other.reference, name: other.name },
-                request: other.contact.request,
-                refusal: other.contact.refusal
-              }
-            ]
-          : []
-      ),
-    [others.contacts]
-  )
+  // The level a loss has reached moves at the instant its state says, by one timer for each row.
+  useEffect(() => {
+    const timers = contacts.flatMap((each) => {
+      if (each.escalatesAtMs === null) return []
+      const wait = each.escalatesAtMs - Date.now()
+      if (wait <= 0) return []
+      return [
+        setTimeout(() => {
+          setNowMs(Date.now())
+        }, wait)
+      ]
+    })
+    return () => {
+      for (const timer of timers) clearTimeout(timer)
+    }
+  }, [contacts])
+
+  // A host that answered and refused is in contact, so it is not among the hosts out of contact, and
+  // nothing of what it held before is listed.
+  const refusals = useMemo<readonly Refusal[]>(() => {
+    const refused: Refusal[] = []
+    if (latest !== null && inUseName !== null && latest.contact.state === 'refused') {
+      refused.push({ host: inUse, request: latest.contact.request, refusal: latest.contact.refusal })
+    }
+    for (const other of others.contacts) {
+      if (other.contact.state !== 'refused') continue
+      refused.push({
+        host: { reference: other.reference, name: other.name },
+        request: other.contact.request,
+        refusal: other.contact.refusal
+      })
+    }
+    return refused
+  }, [latest, inUseName, inUse, others.contacts])
 
   const counts = useMemo(() => {
     let total = here === null ? NOTHING : count(here.result)
@@ -331,7 +377,9 @@ export function Inbox({
     [port, say, seeOthersAgain, onOpenSession]
   )
   // The generic words for a host that could not be read give way to the row that says it better.
-  const inUseOut = contacts.some((each) => each.host.reference === null)
+  const inUseOut =
+    contacts.some((each) => each.host.reference === null) ||
+    refusals.some((each) => each.host.reference === null)
 
   return (
     <div ref={content}>
@@ -382,12 +430,16 @@ export function Inbox({
                 className="m-row"
                 data-tone="muted"
                 data-kind="disconnected"
+                data-level={each.escalatesAtMs !== null && nowMs >= each.escalatesAtMs ? 'urgent' : 'notable'}
                 data-host={each.host.name}
                 data-testid="inbox-contact"
                 style={{ minBlockSize: target }}
               >
                 <span className="m-row-head">
                   <span className="m-row-kind">{KIND_LABEL.disconnected}</span>
+                  {each.escalatesAtMs !== null && nowMs >= each.escalatesAtMs ? (
+                    <Badge tone="danger">Urgent</Badge>
+                  ) : null}
                   <span className="m-row-where">{each.host.name}</span>
                 </span>
                 <span className="m-row-title">{each.host.name} is out of contact</span>
@@ -406,7 +458,7 @@ export function Inbox({
       {showRefusals ? (
         <ul className="m-list" data-testid="inbox-refusals">
           {refusals.map((each) => (
-            <li key={each.host.reference}>
+            <li key={each.host.reference ?? 'in-use'}>
               <div
                 className="m-row"
                 data-tone="muted"
