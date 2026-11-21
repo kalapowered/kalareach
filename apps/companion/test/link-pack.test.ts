@@ -178,7 +178,7 @@ function lineByLine(line: Line, group: readonly number[]): { own: number[]; best
 }
 
 /** Packs `line` and checks it against the search: no box past the column or across another, and as many completed as the best assignment completes. */
-function verify(line: Line, label: string, slack = 0): { completed: number; best: number; shortLinks: number; compared: number; gained: number } {
+function verify(line: Line, label: string, slack = 0): { completed: number; best: number; shortLinks: number; lines: { label: string; completed: number; first: number }[] } {
   const rooms = packRooms(line.items, LEAST, slack)
   const boxes = line.items.map((item, index) => {
     const room = rooms[index] ?? { left: 0, right: 0 }
@@ -209,18 +209,14 @@ function verify(line: Line, label: string, slack = 0): { completed: number; best
   // A group that is not a row is packed line by line, so its count is held to the best only where every group is a row.
   if (allRows(line.items)) expect(completed, `${where}: links completed by the packing, against the most that any assignment completes`).toBe(best)
   // Elsewhere each line completes no fewer links than the line-by-line packing does, by a search of the line against the middles of the gaps.
-  let compared = 0
-  let gained = 0
+  const lines: { label: string; completed: number; first: number }[] = []
   for (const group of groupsOf(line.items)) {
     if (group.row) continue
     for (const { own, best: first } of lineByLine(line, group.links)) {
-      const completedOn = own.filter(done).length
-      expect(completedOn, `${where}: links completed on the line at ${String(line.items[own[0]].box.top)}, against the line-by-line packing`).toBeGreaterThanOrEqual(first)
-      if (first > 0) compared += 1
-      if (completedOn > first) gained += 1
+      lines.push({ label: `${where}: links completed on the line at ${String(line.items[own[0]].box.top)}, against the line-by-line packing`, completed: own.filter(done).length, first })
     }
   }
-  return { completed, best, shortLinks: line.items.filter((item) => item.link && item.box.right - item.box.left < LEAST).length, compared, gained }
+  return { completed, best, shortLinks: line.items.filter((item) => item.link && item.box.right - item.box.left < LEAST).length, lines }
 }
 
 /** A line of links at `words` (left, right), in a column. */
@@ -262,8 +258,11 @@ describe('the packing of a line', () => {
         const line = layoutOf(seed + 20_000 * rows, rows)
         const result = verify(line, `layout ${String(seed)} of ${String(rows)} lines`)
         if (!allRows(line.items)) notRows += 1
-        compared += result.compared
-        gained += result.gained
+        for (const entry of result.lines) {
+          expect(entry.completed, entry.label).toBeGreaterThanOrEqual(entry.first)
+          if (entry.first > 0) compared += 1
+          if (entry.completed > entry.first) gained += 1
+        }
       }
     }
     // The case is vacuous unless many layouts have a group that is not a row (a link over another, or lines that do not all reach one another).
