@@ -23,7 +23,7 @@ import type { SessionListResult } from '@kalareach/protocol'
 import { useChannelMessages, useChannelShelf } from '../app/channel-messages'
 import { useBook, useDraftBook } from '../app/drafts'
 import { useApp } from '../app/state'
-import { Banner, Button, CommitButton } from '../components/ui'
+import { Banner, Button, CommitButton, TwoPressButton } from '../components/ui'
 import { failureMessage, watch, type StoredChannelMessage, type StoredHold, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import { MANY_HOLDS, nearlyFull, type ShelfSnapshot } from '../model/channel-messages'
@@ -460,9 +460,10 @@ function LedgerSetAside({ onSetAside }: { readonly onSetAside: () => Promise<{ r
         list is kept in a file of its own, not deleted.
       </p>
       <div className="row wrap">
-        <CommitButton
+        <TwoPressButton
           tone="quiet"
           data-testid="ledger-set-aside-button"
+          armedLabel="Press again to set the list aside"
           disabled={busy}
           onCommit={() => {
             setBusy(true)
@@ -482,7 +483,7 @@ function LedgerSetAside({ onSetAside }: { readonly onSetAside: () => Promise<{ r
           }}
         >
           Set the list aside
-        </CommitButton>
+        </TwoPressButton>
       </div>
       {note === null ? null : (
         <p className="small" role="alert" data-testid="ledger-set-aside-note">
@@ -546,16 +547,17 @@ function ChannelGroup({
                 {messages.length > 1 ? (
                   <div className="row wrap">
                     <p className="eyebrow">{homeLine(sessions, sessionId)}</p>
-                    <CommitButton
+                    <TwoPressButton
                       tone="quiet"
                       data-testid="channel-session-remove-all"
+                      armedLabel="Press again to remove all"
                       disabled={busy === `session-${sessionId}`}
                       onCommit={() => {
                         onRemove(`session-${sessionId}`, { sessionId })
                       }}
                     >
                       Remove all
-                    </CommitButton>
+                    </TwoPressButton>
                   </div>
                 ) : null}
                 <ul>
@@ -606,16 +608,17 @@ function ChannelGroup({
                   message to a channel session. Removing it sends nothing.
                 </p>
                 <div className="row wrap">
-                  <CommitButton
+                  <TwoPressButton
                     tone="quiet"
                     data-testid="channel-hold-damaged-remove"
+                    armedLabel="Press again to remove"
                     disabled={busy === `hold-${name}`}
                     onCommit={() => {
                       onClearHold(name)
                     }}
                   >
                     Remove
-                  </CommitButton>
+                  </TwoPressButton>
                 </div>
               </li>
             ))}
@@ -662,9 +665,15 @@ function ChannelMessageRow({
         </p>
       ) : null}
       <div className="row wrap">
-        <CommitButton tone="quiet" data-testid="channel-message-remove" disabled={busy} onCommit={onRemove}>
+        <TwoPressButton
+          tone="quiet"
+          data-testid="channel-message-remove"
+          armedLabel="Press again to remove"
+          disabled={busy}
+          onCommit={onRemove}
+        >
           Remove
-        </CommitButton>
+        </TwoPressButton>
       </div>
     </li>
   )
@@ -690,9 +699,15 @@ function ChannelHoldRow({
         sends nothing.
       </p>
       <div className="row wrap">
-        <CommitButton tone="quiet" data-testid="channel-hold-remove" disabled={busy} onCommit={onClear}>
+        <TwoPressButton
+          tone="quiet"
+          data-testid="channel-hold-remove"
+          armedLabel="Press again to remove"
+          disabled={busy}
+          onCommit={onClear}
+        >
           Remove
-        </CommitButton>
+        </TwoPressButton>
       </div>
     </li>
   )

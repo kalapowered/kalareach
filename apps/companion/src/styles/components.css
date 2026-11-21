@@ -308,6 +308,19 @@ main {
   border-color: var(--danger-line);
 }
 
+/* A control that commits on its second press: the first press arms it, in the danger colours. */
+.btn[data-armed='true'] {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: var(--danger-line);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn[data-armed] {
+    transition: none;
+  }
+}
+
 .btn-quiet {
   background: transparent;
   border-color: transparent;
