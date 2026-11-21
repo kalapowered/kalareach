@@ -256,21 +256,6 @@ impl RegisteredTask {
         }
     }
 
-    /// Whether this is `expected`'s environment's task: the account it runs as is `expected`'s,
-    /// and its description carries that environment's full identity.
-    ///
-    /// `sid_of` resolves an account's name to its identifier, for an export that names the
-    /// account rather than giving its identifier.
-    #[cfg(test)]
-    #[must_use]
-    pub fn belongs_to(
-        &self,
-        expected: &TaskDefinition,
-        sid_of: impl Fn(&str) -> Option<String>,
-    ) -> bool {
-        self.whose(expected, sid_of).is_none()
-    }
-
     /// Why this is not `expected`'s environment's task, or `None` when it is: another account's
     /// task, or this account's task for another environment.
     ///
@@ -2970,7 +2955,7 @@ mod tests {
         let host = TempHost::create();
         let definition = TaskDefinition::for_setup(USER, &host.environment(), &starter(&host));
         let read = RegisteredTask::parse(&definition.xml());
-        assert!(read.belongs_to(&definition, |_| None));
+        assert_eq!(read.whose(&definition, |_| None), None);
         assert_eq!(read.differences(&definition), Vec::<Difference>::new());
         assert_eq!(read.logon, Some(LogonType::InteractiveToken));
     }
@@ -3008,11 +2993,11 @@ mod tests {
         let read = RegisteredTask::parse(&exported);
         let resolve = |name: &str| (name == "HOST\\me").then(|| USER.to_owned());
         assert!(
-            read.belongs_to(&definition, resolve),
+            read.whose(&definition, resolve).is_none(),
             "the named account is this user"
         );
         assert!(
-            !read.belongs_to(&definition, |_| None),
+            read.whose(&definition, |_| None).is_some(),
             "an account nothing resolves is not"
         );
         assert_eq!(
@@ -3039,7 +3024,10 @@ mod tests {
         };
         for other in [theirs_account, theirs_environment] {
             let read = RegisteredTask::parse(&other.xml());
-            assert!(!read.belongs_to(&ours, |_| None), "{other:?} is not ours");
+            assert!(
+                read.whose(&ours, |_| None).is_some(),
+                "{other:?} is not ours"
+            );
         }
     }
 
