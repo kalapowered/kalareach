@@ -102,7 +102,7 @@ use kr_e2e_agents::held::{
     kept_panic_text, new_turns, other_agent_processes, other_agents_refusal, panic_text,
     person_home, read_record, turns_recorded, unchanged_before_the_charge,
 };
-use kr_e2e_agents::outcome::Outcome;
+use kr_e2e_agents::outcome::{Failure, Outcome};
 use kr_e2e_agents::session_environment::{self, Expected};
 use kr_e2e_agents::stage::{
     Installation, PlacedProgram, closed_port, inode_of, scan_rules, session_variables, text_image,
@@ -3617,6 +3617,49 @@ fn a_body_that_returns_not_run_is_recorded_not_run_and_never_passed() {
     assert_eq!(recorded_as(&ran, &[], true), Filed::ProbeOnly);
 }
 
+/// The outcome of a real route that ended with `stops` (a key found in the run's directory before
+/// the charge, a turn that was not charged, a run left in place), marked so that the harness stops
+/// the agent here: `stop_agent` in its evidence and an `agent_stops` code of each stop's class. An
+/// outcome with no stop, and one of the stand-in route, which has no account to protect, is left as
+/// it is.
+fn with_agent_stops(mut outcome: Outcome, real_route: bool, stops: &[Stop]) -> Outcome {
+    if !real_route || stops.is_empty() {
+        return outcome;
+    }
+    if !outcome.evidence.is_object() {
+        outcome.evidence = serde_json::json!({});
+    }
+    outcome.evidence["stop_agent"] = serde_json::json!(true);
+    let codes: Vec<Failure> = stops
+        .iter()
+        .map(|(class, _)| Failure::AgentStops(class))
+        .collect();
+    outcome.with_failures(&codes)
+}
+
+/// A real route's outcome with a stop stops the agent, under the stop's class; one with no stop, and
+/// one of the stand-in route, does not.
+#[test]
+fn a_real_route_outcome_with_a_stop_stops_the_agent_under_the_stops_class() {
+    let stops = [(
+        "provider_key_found",
+        "a key was found in the run's directory".to_owned(),
+    )];
+    let failed = || Outcome::failed("7", "a test", "why", serde_json::json!({ "turns": 0 }));
+    let stopped = with_agent_stops(failed(), true, &stops);
+    assert_eq!(stopped.evidence["stop_agent"], true);
+    assert_eq!(
+        stopped.evidence["failure_codes"],
+        serde_json::json!([{ "code": "agent_stops", "class": "provider_key_found" }])
+    );
+    assert_eq!(stopped.evidence["turns"], 0);
+    let unmarked = with_agent_stops(failed(), true, &[]);
+    assert!(unmarked.evidence.get("stop_agent").is_none());
+    let stand_in = with_agent_stops(failed(), false, &stops);
+    assert!(stand_in.evidence.get("stop_agent").is_none());
+    assert!(stand_in.evidence.get("failure_codes").is_none());
+}
+
 fn ends(
     route: Route,
     run: Option<Run>,
@@ -3824,6 +3867,7 @@ fn ends(
         .map(|(class, why)| format!("{class}: {why}"))
         .collect();
     let probe_only = matches!(&route, Route::Real(real) if real.probe_only);
+    let real_route = matches!(&route, Route::Real(_));
     match result {
         Ok(shows) => match recorded_as(&shows, &stops, probe_only) {
             Filed::ProbeOnly => {
@@ -3848,7 +3892,11 @@ fn ends(
             }
             Filed::Failed => {
                 evidence["shows"] = shows;
-                record(Outcome::failed(case, test, &stopped.join("; "), evidence));
+                record(with_agent_stops(
+                    Outcome::failed(case, test, &stopped.join("; "), evidence),
+                    real_route,
+                    &stops,
+                ));
                 panic!(
                     "the case showed what it was to, and then: {}",
                     stopped.join("; ")
@@ -3862,7 +3910,11 @@ fn ends(
             } else {
                 format!("{said}; {}", stopped.join("; "))
             };
-            record(Outcome::failed(case, test, &reason, evidence));
+            record(with_agent_stops(
+                Outcome::failed(case, test, &reason, evidence),
+                real_route,
+                &stops,
+            ));
             for line in &stopped {
                 eprintln!("{line}");
             }
