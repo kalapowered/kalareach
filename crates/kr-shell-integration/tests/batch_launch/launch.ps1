@@ -24,7 +24,9 @@ param(
     # A directory put in front of the search path, for a program named without a path.
     [string]$SearchDirectory,
     # Treats every program as a batch file, for a platform that has none.
-    [switch]$AsBatch
+    [switch]$AsBatch,
+    # A file of PowerShell run before the cases, in this scope: an alias or a function a case needs, or a changed home.
+    [string]$Setup
 )
 
 Set-StrictMode -Version 3.0
@@ -59,6 +61,8 @@ function Write-Report {
 if ($SearchDirectory) {
     $env:PATH = $SearchDirectory + [System.IO.Path]::PathSeparator + $env:PATH
 }
+
+if ($Setup) { . $Setup }
 
 $list = @(ConvertFrom-Json ([System.IO.File]::ReadAllText($Cases, [System.Text.Encoding]::UTF8)) -NoEnumerate)
 $number = 0
