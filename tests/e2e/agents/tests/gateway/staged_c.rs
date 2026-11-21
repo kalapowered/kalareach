@@ -1379,9 +1379,54 @@ fn isolated(first: &[String], second: &[String], marker: &str) -> Result<(), Str
     Ok(())
 }
 
+/// Whether the shell's prompt is back below the typed line: a row below the last row that shows the
+/// line `typed` is the prompt alone. The prompt that stood on the screen before the line's echo
+/// came back is no end, and neither is the echo with nothing below it.
+fn prompt_back(rows: &[String], typed: &str) -> bool {
+    rows.iter()
+        .rposition(|row| row.contains(typed))
+        .is_some_and(|echo| {
+            rows[echo + 1..]
+                .iter()
+                .any(|row| row.trim() == PROMPT.trim())
+        })
+}
+
+/// The prompt that stood on the screen before the typed line's echo came back is no end of the
+/// start, nor is the echo with nothing below it; the prompt below the echo is.
+#[test]
+fn the_old_shell_prompt_is_no_end_of_the_second_start_and_the_prompt_below_the_echo_is() {
+    let typed = "codex resume 0123-4567";
+    let screen = |rows: &[&str]| rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
+    assert!(
+        !prompt_back(&screen(&["kr-session$ "]), typed),
+        "the prompt that was on the screen before the echo came back is no end"
+    );
+    assert!(
+        !prompt_back(&screen(&["kr-session$ codex resume 0123-4567"]), typed),
+        "the echo with nothing below it is no end"
+    );
+    assert!(
+        prompt_back(
+            &screen(&[
+                "kr-session$ codex resume 0123-4567",
+                "no such conversation",
+                "kr-session$ "
+            ]),
+            typed
+        ),
+        "the prompt below the echo is an end"
+    );
+}
+
 /// Waits for the second start to end one way or the other, and says how: the composer, one of the
-/// refusal texts, or the shell's prompt back below the typed command.
-fn second_start(person: &Person, composer: &str, refusals: &[String]) -> (Started, Option<String>) {
+/// refusal texts, or the shell's prompt back below the typed line `typed`.
+fn second_start(
+    person: &Person,
+    typed: &str,
+    composer: &str,
+    refusals: &[String],
+) -> (Started, Option<String>) {
     let started = Instant::now();
     loop {
         let rows = person.window.screen();
@@ -1394,8 +1439,7 @@ fn second_start(person: &Person, composer: &str, refusals: &[String]) -> (Starte
         {
             return (Started::Refused, Some(text.clone()));
         }
-        let last = rows.iter().rev().find(|row| !row.trim().is_empty());
-        if last.is_some_and(|row| row.trim() == PROMPT.trim()) {
+        if prompt_back(&rows, typed) {
             return (Started::Ended, None);
         }
         assert!(
@@ -1538,8 +1582,10 @@ fn second_process(
     b.person.clears_the_screen();
     ctx.checks_the_placed_files();
     real.checks_the_route(&ctx.run);
-    b.person.types(&real.typed(&extra));
-    let (started, refusal) = second_start(b.person, &account.composer, &account.resume_refused);
+    let line = real.typed(&extra);
+    b.person.types(&line);
+    let (started, refusal) =
+        second_start(b.person, &line, &account.composer, &account.resume_refused);
     let first_after = shown_now(ctx, &a);
     check_unchanged(Held::of(&shown_a), &first_after)
         .unwrap_or_else(|why| panic!("session A's instance and revision are as they were: {why}"));
