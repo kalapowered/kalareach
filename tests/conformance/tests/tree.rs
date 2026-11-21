@@ -378,3 +378,32 @@ fn a_command_that_writes_a_great_deal_to_both_pipes_ends_in_its_time_with_all_it
         (3_000_000, 3_000_000)
     );
 }
+
+/// The trial that asks whether this process can wait for a command it started, under a parent that
+/// ignores `SIGCHLD`. On Linux the system reaps the children of such a process as they end, so the
+/// wait fails with `ECHILD` and the trial gives the wait's error; on macOS it does not, and the
+/// trial passes. The case is run by its name on Linux, from a parent that ignores the signal, by the
+/// box line of the request: a program that ignores `SIGCHLD` cannot run the other cases of this
+/// target, and a run of the report under it stops at its first wait, so only the trial is asked
+/// here. The words of the refusal that the report makes of the trial's error are the unit's.
+#[test]
+#[ignore = "runs only under a parent that ignores SIGCHLD, on Linux, by the box line of the request"]
+fn the_trial_of_the_host_gives_the_wait_error_under_a_parent_that_ignores_sigchld() {
+    match tree::waits_for_its_commands() {
+        Err(tree::Trial::Wait(error)) => assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error()),
+            "{error:?}"
+        ),
+        other => panic!("the trial did not give the wait's error: {other:?}"),
+    }
+}
+
+/// The control of the case above: under a parent that does not ignore `SIGCHLD` the same trial
+/// passes.
+#[test]
+#[ignore = "the control of the case above, run by the box line of the request"]
+fn the_trial_of_the_host_passes_under_a_parent_that_does_not_ignore_sigchld() {
+    let trial = tree::waits_for_its_commands();
+    assert!(trial.is_ok(), "{trial:?}");
+}
