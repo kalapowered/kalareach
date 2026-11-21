@@ -1129,6 +1129,8 @@ mod tests {
                 .map(ToString::to_string)
                 .collect()
         };
+        let read = parse(&words("cargo test --all-targets"));
+        assert!(read.is_ok(), "{read:?}");
         let all = found("cargo test --all-targets");
         assert_eq!(all, ["a --lib", "a --test t", "a --bench nb"]);
         for line in [
@@ -1138,9 +1140,13 @@ mod tests {
             "cargo test --all-targets --test ***",
             "cargo test --bench *** --all-targets",
         ] {
+            let read = parse(&words(line));
+            assert!(read.is_ok(), "{line}: {read:?}");
             assert_eq!(found(line), all, "{line}");
         }
         // Without it, a singular flag takes its target whatever its manifest says.
+        let read = parse(&words("cargo test --test off"));
+        assert!(read.is_ok(), "{read:?}");
         assert_eq!(found("cargo test --test off"), ["a --test off"]);
     }
 
@@ -1373,6 +1379,8 @@ mod tests {
             "cargo test --features f,\tg",
             "cargo test -F f\t\tg",
         ] {
+            let read = parse(&words(line));
+            assert!(read.is_ok(), "{line}: {read:?}");
             assert_eq!(
                 found(line),
                 a(&["lib", "d", "f", "fd", "g", "free"]),
@@ -1386,12 +1394,18 @@ mod tests {
             "cargo test -F=",
             "cargo test --features= --no-default-features",
         ] {
+            let read = parse(&words(line));
+            assert!(read.is_ok(), "{line}: {read:?}");
             let plain = if line.contains("--no-default") {
                 a(&["lib", "free"])
             } else {
                 a(&["lib", "d", "free"])
             };
             assert_eq!(found(line), plain, "{line}");
+        }
+        for line in ["cargo test -F= f", "cargo test -F= --test f"] {
+            let read = parse(&words(line));
+            assert!(read.is_ok(), "{line}: {read:?}");
         }
         assert_eq!(found("cargo test -F= f"), a(&["lib", "d", "free"]));
         assert_eq!(
