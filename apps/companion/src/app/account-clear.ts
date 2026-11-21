@@ -40,8 +40,9 @@ export function followAccountChange({
 }): () => void {
   let stopped = false
   const stopAccount = mark.follow(port, () => {
-    if (stopped || host.organisation === null) return
-    const cleared = uploads.reset() + drafts.dropUploads()
+    const environment = host.organisation
+    if (stopped || environment === null) return
+    const cleared = uploads.reset() + drafts.dropUploads(environment)
     if (cleared > 0) say(FILES_OF_EARLIER_SIGN_IN_REMOVED, 'neutral')
   })
   return () => {

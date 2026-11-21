@@ -40,10 +40,10 @@ async function answered(status: MockInstance<HostPort['accountStatus']>): Promis
   await tick()
 }
 
-function handleOf(id: string): AttachmentHandle {
+function handleOf(id: string, environment = 'env'): AttachmentHandle {
   return {
     transfer_id: id,
-    environment_id: 'env',
+    environment_id: environment,
     byte_len: '10',
     content_digest: 'b'.repeat(64),
     declared_media_type: 'application/pdf',
@@ -96,13 +96,14 @@ async function following(options: { organisation: boolean; first?: AccountView }
   const host = new ConnectedHost()
   const screens = stampedPort(port, mark.read, host.note)
   await screens.onConnection(() => undefined)
-  await screens.connectionState()
+  const environment = (await screens.connectionState()).environment_id ?? ''
   const stop = followAccountChange({ port, mark, host, uploads, drafts, say: (text) => said.push(text) })
   await answered(status)
   await tick()
   return {
     port,
     screens,
+    environment,
     controls,
     status,
     mark,
@@ -122,7 +123,7 @@ async function following(options: { organisation: boolean; first?: AccountView }
 describe('the files of an earlier sign-in at a change of the account', () => {
   it('takes the rows and the files off the composers, keeps the text, discards nothing and says so once', async () => {
     const window = await following({ organisation: true, first: signedIn('aa') })
-    const { uploads, drafts, port, said, controls } = window
+    const { uploads, drafts, port, said, controls, environment } = window
     const discard = vi.spyOn(port, 'deviceDraftDiscard')
     const end = vi.spyOn(port, 'draftEnd')
     const bind = vi.fn(() => Promise.resolve())
@@ -132,7 +133,8 @@ describe('the files of an earlier sign-in at a change of the account', () => {
       ...edit(draft, 'my own words', Date.now()),
       attachments: [
         card('going', { upload: 'uploading' }),
-        card('sent', { handle: handleOf('t-1'), transferId: 't-1' }),
+        card('sent', { handle: handleOf('t-1', environment), transferId: 't-1' }),
+        card('other-host', { handle: handleOf('t-2', 'another-host'), transferId: 't-2' }),
         card('failed', { upload: 'failed' })
       ]
     }))
@@ -141,7 +143,8 @@ describe('the files of an earlier sign-in at a change of the account', () => {
     await window.change(signedIn('bb'))
 
     expect(uploads.snapshot().size).toBe(0)
-    expect(drafts.draft(SESSION).attachments.map((each) => each.localId)).toEqual(['failed'])
+    // A file of another host the window holds is not the organisation host's, and stays.
+    expect(drafts.draft(SESSION).attachments.map((each) => each.localId)).toEqual(['other-host', 'failed'])
     expect(drafts.draft(SESSION).text).toBe('my own words')
     expect(said).toEqual([FILES_OF_EARLIER_SIGN_IN_REMOVED])
     expect(discard).not.toHaveBeenCalled()
@@ -227,7 +230,7 @@ describe('the files of an earlier sign-in at a change of the account', () => {
     window.uploads.send({ key: 'k-1', sessionId: SESSION, subject, file }, () => Promise.resolve()).catch(() => undefined)
     window.drafts.update(SESSION, (draft) => ({
       ...draft,
-      attachments: [card('sent', { handle: handleOf('t-1'), transferId: 't-1' })]
+      attachments: [card('sent', { handle: handleOf('t-1', window.environment), transferId: 't-1' })]
     }))
     await window.change(signedIn('bb'))
     await window.change(SIGNED_OUT)
@@ -254,7 +257,7 @@ describe('the files of an earlier sign-in at a change of the account', () => {
     window.uploads.send({ key: 'k-1', sessionId: SESSION, subject, file }, () => Promise.resolve()).catch(() => undefined)
     window.drafts.update(SESSION, (draft) => ({
       ...edit(draft, 'on this computer', Date.now()),
-      attachments: [card('sent', { handle: handleOf('t-1'), transferId: 't-1' })]
+      attachments: [card('sent', { handle: handleOf('t-1', window.environment), transferId: 't-1' })]
     }))
     window.controls.reachAsOwner()
     await tick()
@@ -341,17 +344,20 @@ describe('what an earlier cycle was waiting for changes nothing after the clear'
     await drafts.hydrate()
     drafts.update(SESSION, (draft) => ({
       ...edit(draft, 'read this', Date.now()),
-      attachments: [card('sent', { handle: handleOf('t-1'), transferId: 't-1' })]
+      attachments: [
+        card('sent', { handle: handleOf('t-1'), transferId: 't-1' }),
+        card('other', { handle: handleOf('t-9', 'another-host'), transferId: 't-9' })
+      ]
     }))
     await drafts.settled()
     const token = drafts.beginSend(SESSION)
     // The composer clears when the person presses Send; then the account changes.
     drafts.update(SESSION, (draft) => ({ ...edit(draft, '', Date.now()), attachments: [] }))
-    expect(drafts.dropUploads()).toBe(0)
+    expect(drafts.dropUploads('env')).toBe(0)
     drafts.endSend(token, 'refused')
     await drafts.settled()
-    // The text comes back; the file of the earlier sign-in does not.
+    // The text comes back; the file of the earlier sign-in does not, and a file of another host does.
     expect(drafts.draft(SESSION).text).toBe('read this')
-    expect(drafts.draft(SESSION).attachments).toEqual([])
+    expect(drafts.draft(SESSION).attachments.map((each) => each.localId)).toEqual(['other'])
   })
 })
