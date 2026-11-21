@@ -2243,3 +2243,122 @@ async fn kr_req_13_12_a_reconnect_before_the_driver_fails_resumes_the_upload_on_
     );
     adopted.stop().await;
 }
+
+/// How many draft creations and discards the client's book still holds as unresolved on `session`.
+async fn draft_actions_in_the_book(session: &kr_client::Session) -> usize {
+    use kr_protocol::method::Method;
+
+    session
+        .submitted_actions()
+        .await
+        .iter()
+        .filter(|action| matches!(action.method, Method::DraftCreate | Method::DraftDiscard))
+        .count()
+}
+
+/// KR-REQ-23.41: a draft creation or discard the host has answered leaves the client's book of
+/// unresolved actions, whether it was answered at once or from the host's record after a lost answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_an_answered_draft_action_leaves_the_clients_book() {
+    use kr_protocol::ids::ActionId;
+    use kr_protocol::method::Method;
+    use kr_protocol::transfer::{DraftCreateParams, DraftDiscardParams};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let session = adopted.workers[0].session_id;
+    let target = net_support::on_the_session(&adopted.host, session);
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let end = || {
+        companion
+            .call(
+                "draft_end",
+                json!({ "subject": on_session(session), "sessionId": session.to_string() }),
+            )
+            .expect("the draft ends")
+    };
+
+    // A creation and a discard answered at once.
+    bind(companion, session, &handed(companion)).expect("the draft is made");
+    let connection = paired_of(companion).session;
+    assert_eq!(draft_actions_in_the_book(&connection).await, 0, "creation");
+    end();
+    assert_eq!(draft_actions_in_the_book(&connection).await, 0, "discard");
+
+    // A creation whose answer was lost, answered from the host's record on the next connection.
+    let paired = paired_of(companion);
+    let composed = paired
+        .session
+        .compose(
+            Method::DraftCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            None,
+            &json!({}),
+            &DraftCreateParams {
+                environment_id: adopted.host.environment_id,
+                device_id: Nullable::null(),
+                session_id: Nullable::some(session),
+                application_instance_id: Nullable::null(),
+                text: String::new(),
+            },
+            kr_protocol::scalars::DurationMs::new(60_000),
+        )
+        .await
+        .expect("composed");
+    paired
+        .session
+        .send(&composed)
+        .await
+        .expect("the host made the draft");
+    drafts.keep_create_for_test(&paired, session, &target, &composed);
+    let old = Arc::clone(&paired.session);
+    old.transport().close();
+    let next = on_another_connection(companion, &old).await;
+    connected(companion).await;
+    let made = bind(companion, session, &handed(companion)).expect("the host's record answers");
+    assert_eq!(
+        draft_actions_in_the_book(&next.session).await,
+        0,
+        "the repeated creation"
+    );
+
+    // A discard whose answer was lost, answered from the host's record on the next connection.
+    let draft_id: kr_protocol::ids::DraftId =
+        serde_json::from_value(made["value"]["draftId"].clone()).expect("a draft id");
+    let revision: kr_protocol::ids::DraftRevision =
+        serde_json::from_value(made["value"]["revision"].clone()).expect("a revision");
+    let discard = next
+        .session
+        .compose(
+            Method::DraftDiscard,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            None,
+            &json!({}),
+            &DraftDiscardParams { draft_id },
+            kr_protocol::scalars::DurationMs::new(60_000),
+        )
+        .await
+        .expect("composed");
+    next.session
+        .send(&discard)
+        .await
+        .expect("the host ended the draft");
+    drafts.keep_discard_for_test(&next, session, &target, draft_id, revision, &discard);
+    let old = Arc::clone(&next.session);
+    old.transport().close();
+    let last = on_another_connection(companion, &old).await;
+    connected(companion).await;
+    end();
+    assert_eq!(
+        draft_actions_in_the_book(&last.session).await,
+        0,
+        "the repeated discard"
+    );
+    adopted.stop().await;
+}
