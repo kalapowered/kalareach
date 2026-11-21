@@ -41,8 +41,8 @@ rusqlite = { workspace = true, features = ["bundled"] }
 schemars.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
-# The qualified available-memory signal the reserve is checked against, and the description
-# process's resident set.
+# The qualified available-memory signal the reserve is checked against, the description process's
+# resident set, and a disk's free space off Unix.
 sysinfo.workspace = true
 thiserror.workspace = true
 # Background scheduling for the inference thread on Linux and the other Unix systems, through the one
