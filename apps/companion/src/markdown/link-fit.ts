@@ -10,21 +10,23 @@
  * button has no hit of its own, so a tap beside the words is on the text there and `useLinkPress` says
  * which link's it is.
  *
- * The room is one packing of each line's links (`packRooms`). The boxes of a line are intervals that
- * hold their links' words, stay in the message's column (or in the box that clips the link, where one
- * does: a scroller inside a message keeps the box in its own scrolled content), and keep off one another
- * and off the controls beside them. A link that lacks room takes it from the gaps beside it, and the
- * packing completes as many of a line's short links as any assignment of such boxes can: a link is left
- * under the least size only where no assignment gives it the least size together with the other links
- * that the packing completes (the proof is a case that compares the packing with an exhaustive search
- * over many small random lines). A link that is completed has the room it lacks, centred on its words
- * where the neighbours allow it; a link that cannot be completed has all the room that is left, shared in
- * halves with a short neighbour that cannot be completed either.
+ * The room is one packing of a row of links (`packRooms`). The boxes of a row are intervals that hold their
+ * links' words, stay in the message's column (or in the box that clips the link, where one does: a scroller
+ * inside a message keeps the box in its own scrolled content), and keep off one another and off the controls
+ * beside them. A row is a line, or two neighbouring lines whose links stand apart (their heights reach one
+ * another, and no link lies over another's words). The packing completes as many of a row's short links as any
+ * assignment of such boxes can (the proof is a case that compares it with an exhaustive search over many
+ * small random rows of one and of two lines). A completed link has exactly the least size, plus up to
+ * `SLACK` on a side from room that nothing else uses; it has what it lacks centred on its words where the
+ * neighbours allow it, and takes it from the side whose neighbour cannot be completed last. A link that
+ * cannot be completed has all the room that the completed links leave it, shared in halves with a short
+ * neighbour that cannot be completed either.
  *
- * Links on neighbouring lines whose boxes reach each other's height are kept off one another by the
- * middle of the gap between their words (and off a link that is wide enough or a control by its edge):
- * that part is not packed, so a short link beside another line's short link can stay under the least
- * size where a packing of both lines together would give it the least size.
+ * A link left under the least size is therefore one that no assignment completes together with the links
+ * that the packing completes; it is as wide as the room beside it allows. The exception is a group of links
+ * that stand over one another (a table's cells) or on lines three apart: each of its lines is packed alone,
+ * with the middle of the gap to a short link of another line, or the edge of another line's wide link, as the
+ * wall, so a short link there can stay short where a joint packing would complete it.
  *
  * Which link opens is not decided here. The padding is measured from the words' own box, which the
  * padding does not move, so a measure of a measured link gives the same answer and a change that adds
