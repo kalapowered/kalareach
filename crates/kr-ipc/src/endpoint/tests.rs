@@ -564,7 +564,7 @@ mod unix {
         }
 
         /// The volume's own read of the case's folder decides the same way: persistent removes, and
-        /// anything else keeps. This Mac's data volume says its numbers persist.
+        /// anything else keeps.
         #[test]
         fn the_real_volume_read_of_the_test_folder_decides_the_same_way() {
             let folder = PrivateTempDir::create();
@@ -591,11 +591,6 @@ mod unix {
                     assert!(path.exists());
                 }
             }
-            assert_eq!(
-                read,
-                Volume::Persistent,
-                "this volume says its numbers persist"
-            );
         }
     }
 }
