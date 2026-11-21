@@ -296,6 +296,16 @@ fn refused(flag: &str, written: &str) -> Result<(), String> {
     }
 }
 
+/// What the words of `flag`, the first of its spellings, are.
+fn part_of(flag: &str) -> Part {
+    match flag {
+        "--no-run" => Part::NoRun,
+        "--lib" | "--bins" | "--bin" | "--examples" | "--example" | "--tests" | "--test"
+        | "--benches" | "--bench" | "--all-targets" => Part::Targets,
+        _ => Part::Other,
+    }
+}
+
 /// The value of `flag` in the word at `at`, which no `-` begins: `--jobs` also takes a negative number.
 fn next_value(words: &[&str], at: &mut usize, flag: &str) -> Result<String, String> {
     match words.get(*at) {
@@ -318,6 +328,28 @@ fn next_value(words: &[&str], at: &mut usize, flag: &str) -> Result<String, Stri
 struct Given {
     value: String,
     word: usize,
+}
+
+/// What the words of a command hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    /// `--no-run`.
+    NoRun,
+    /// A flag that names targets, with its value.
+    Targets,
+    /// A word that filters the tests by name.
+    Name,
+    /// Any other flag, with its value.
+    Other,
+}
+
+/// One flag with its value, or one test name: the words `first` to `last` of the command, by their
+/// index in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Span {
+    first: usize,
+    last: usize,
+    part: Part,
 }
 
 /// What a command's package flags select.
@@ -376,6 +408,8 @@ pub struct Selection {
     /// Each `--target`: Cargo builds for every one.
     targets: Vec<Given>,
     configs: Vec<Given>,
+    /// Every flag and test name before `--`, in the order the command gave them.
+    spans: Vec<Span>,
 }
 
 /// The words read so far.
@@ -481,6 +515,7 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
             profile: None,
             targets: Vec::new(),
             configs: Vec::new(),
+            spans: Vec::new(),
         },
         named: Vec::new(),
         excluded: Vec::new(),
@@ -500,6 +535,11 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
         if !word.starts_with('-') || word == "-" {
             // A word that is no flag is the name that filters the tests.
             test_name = true;
+            read.selection.spans.push(Span {
+                first: here,
+                last: here,
+                part: Part::Name,
+            });
         } else if let Some(long) = word.strip_prefix("--") {
             let (name, held) = match long.split_once('=') {
                 Some((name, held)) => (name, Some(held)),
@@ -526,11 +566,17 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
                     value
                 }
             };
+            read.selection.spans.push(Span {
+                first: here,
+                last: at_word,
+                part: part_of(flag),
+            });
             read.give(flag, value, at_word)?;
         } else {
             // Short flags may be written together, as `-qp a`: each takes the next letter, until one
             // takes a value, which is the rest of the word or, with none, the next word.
             let mut rest = &word[1..];
+            let mut last = here;
             while let Some(letter) = rest.chars().next() {
                 let spelling = format!("-{letter}");
                 let Some((spellings, takes)) = flag(&spelling) else {
@@ -556,9 +602,15 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
                     at_word = at + 1;
                     value
                 };
+                last = at_word;
                 read.give(flag, value, at_word)?;
                 break;
             }
+            read.selection.spans.push(Span {
+                first: here,
+                last,
+                part: Part::Other,
+            });
         }
     }
     if !read.excluded.is_empty() && !read.workspace {
@@ -608,80 +660,70 @@ pub fn parse(command: &[String]) -> Result<Selection, String> {
 }
 
 impl Selection {
-    /// The words of a command for `package` that give what the step's command gave: the profile, each
-    /// target, each configuration, the features and the package flags. `members` are the packages of
-    /// the workspace, and `held` the words of the step's command whose value holds a placeholder,
-    /// which the run gives and which are left out.
+    /// The words of a command that runs one test of `target` with the build that `command` made, as
+    /// `cargo test` takes them before `--`: the command's own words, as written and in order, less
+    /// `--no-run` and each word that holds a placeholder with its flag (`held` lists their indexes in
+    /// `command`). Where `built`, the targets that the command's build made, holds `target` and every
+    /// target that the test's own flag names in the selected packages among `packages`, that flag
+    /// replaces the command's target flags and test names. Otherwise they stay.
     ///
-    /// Cargo builds the selected packages together and turns on, in each package, the features that
-    /// any of them asks for, and the selection cannot say which selected packages reach `package`.
-    /// A step that selects no package but `package` gives `-p <package>`. A step that selects another
-    /// package keeps its own package flags (`--workspace`, `--exclude`, each `-p`). The features,
-    /// `--all-features` and `--no-default-features` are the step's own in both.
+    /// Cargo reads features from the whole set of packages and flags, so no other word changes. It
+    /// applies a singular target flag to each selected package and refuses it for a target whose
+    /// features are off, so the test's flag replaces the command's only for targets that the build
+    /// made.
     #[must_use]
-    pub fn reproduce(
+    pub fn test_words(
         &self,
-        package: &Package,
-        members: &[&Package],
+        command: &[String],
         held: &[usize],
+        target: &TargetId,
+        packages: &[&Package],
+        built: &[TargetId],
     ) -> Vec<String> {
-        let kept = |given: &&Given| !held.contains(&given.word);
+        let narrowed = self.names_only_built(target, packages, built);
         let mut words = Vec::new();
-        if self.release {
-            words.push("--release".to_owned());
+        for span in &self.spans {
+            let left_out = match span.part {
+                Part::NoRun => true,
+                Part::Targets | Part::Name => narrowed,
+                Part::Other => false,
+            };
+            if left_out || (span.first..=span.last).any(|index| held.contains(&index)) {
+                continue;
+            }
+            words.extend(command[span.first..=span.last].iter().cloned());
         }
-        if let Some(profile) = self.profile.iter().find(kept) {
-            words.extend(["--profile".to_owned(), profile.value.clone()]);
-        }
-        for target in self.targets.iter().filter(kept) {
-            words.extend(["--target".to_owned(), target.value.clone()]);
-        }
-        for config in self.configs.iter().filter(kept) {
-            words.extend(["--config".to_owned(), config.value.clone()]);
-        }
-        let features: Vec<&str> = self
-            .features
-            .iter()
-            .filter(kept)
-            .map(|item| item.value.as_str())
-            .collect();
-        if !features.is_empty() {
-            words.extend(["--features".to_owned(), features.join(",")]);
-        }
-        if self.all_features {
-            words.push("--all-features".to_owned());
-        }
-        if self.no_default_features {
-            words.push("--no-default-features".to_owned());
-        }
-        let others = members
-            .iter()
-            .any(|other| other.name != package.name && self.selects_package(other));
-        if others {
-            words.extend(self.package_words());
-        } else {
-            words.extend(["-p".to_owned(), package.name.clone()]);
+        if narrowed {
+            words.extend(
+                target
+                    .kind
+                    .selector(&target.name)
+                    .split(' ')
+                    .map(str::to_owned),
+            );
         }
         words
     }
 
-    /// The package flags of the command, as it gave them.
-    fn package_words(&self) -> Vec<String> {
-        let each = |flag: &str, specs: &[Pattern]| -> Vec<String> {
-            specs
+    /// Whether `built` holds `target` and every target that the flag naming it names in the selected
+    /// packages among `packages`: `--lib` names each package's library, and `--bin`, `--example`,
+    /// `--test` and `--bench` the targets of their kind that bear the name.
+    fn names_only_built(
+        &self,
+        target: &TargetId,
+        packages: &[&Package],
+        built: &[TargetId],
+    ) -> bool {
+        built.contains(target)
+            && packages
                 .iter()
-                .flat_map(|spec| [flag.to_owned(), spec.text.clone()])
-                .collect()
-        };
-        match &self.packages {
-            Packages::Default => Vec::new(),
-            Packages::Named(specs) => each("-p", specs),
-            Packages::Workspace(excluded) => {
-                let mut words = vec!["--workspace".to_owned()];
-                words.extend(each("--exclude", excluded));
-                words
-            }
-        }
+                .filter(|package| self.selects_package(package))
+                .flat_map(|package| &package.targets)
+                .filter(|named| {
+                    named.id.kind == target.kind
+                        && (target.kind == TargetKind::Lib || named.id.name == target.name)
+                })
+                .all(|named| built.contains(&named.id))
     }
 
     /// The targets of `packages`, which are the members of one workspace, that the command selects.
@@ -1607,149 +1649,155 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    #[test]
-    fn a_command_repeats_the_profile_the_targets_the_configuration_and_the_features_of_its_step() {
-        let one = package("a", Vec::new(), &["a"]);
-        let two = package("b", Vec::new(), &["a"]);
-        let members = [&one, &two];
-        let reproduced = |line: &str, package: &Package| {
-            parse(&words(line))
-                .expect("a command")
-                .reproduce(package, &members, &[])
-        };
-        // A step that selects no package but `a` gives `-p a`, with the step's own flags and features.
-        assert_eq!(
-            reproduced(
-                "cargo test --locked -p a --release --features f,a/g,dep/x --all-features --no-default-features --target t --target u --config c=1 --config d=2 -j 2 -- --nocapture",
-                &one
-            ),
-            [
-                "--release",
-                "--target",
-                "t",
-                "--target",
-                "u",
-                "--config",
-                "c=1",
-                "--config",
-                "d=2",
-                "--features",
-                "f,a/g,dep/x",
-                "--all-features",
-                "--no-default-features",
-                "-p",
-                "a"
-            ]
-        );
-        assert_eq!(
-            reproduced("cargo test -F a/f -r", &one),
-            ["--release", "--features", "a/f", "-p", "a"]
-        );
-        assert_eq!(
-            reproduced("cargo test -p b -qr", &two),
-            ["--release", "-p", "b"]
-        );
-        for line in [
-            "cargo test -p a --all-features",
-            "cargo test --workspace --exclude b --all-features",
-        ] {
-            assert_eq!(
-                reproduced(line, &one),
-                ["--all-features", "-p", "a"],
-                "{line}"
-            );
+    fn id(package: &str, kind: TargetKind, name: &str) -> TargetId {
+        TargetId {
+            package: package.to_owned(),
+            kind,
+            name: name.to_owned(),
         }
-        // A step that selects another package keeps its own package flags, because Cargo turns on, in
-        // the package's build, the features that the other packages ask for: its features stay as it
-        // gave them, whatever package they name.
-        for (line, expected) in [
-            (
-                "cargo test --workspace --features a/f,b/h,g,h,dep?/x --profile ci",
-                &[
-                    "--profile",
-                    "ci",
-                    "--features",
-                    "a/f,b/h,g,h,dep?/x",
-                    "--workspace",
-                ][..],
-            ),
-            ("cargo test --workspace --locked", &["--workspace"][..]),
-            (
-                "cargo test --workspace --features f",
-                &["--features", "f", "--workspace"][..],
-            ),
-            (
-                "cargo test --workspace --exclude c* --features b/h",
-                &["--features", "b/h", "--workspace", "--exclude", "c*"][..],
-            ),
-            (
-                "cargo test -p a -p b --features b/h",
-                &["--features", "b/h", "-p", "a", "-p", "b"][..],
-            ),
-            (
-                "cargo test --workspace --all-features",
-                &["--all-features", "--workspace"][..],
-            ),
-            (
-                "cargo test -p a -p b --all-features --no-default-features",
-                &[
-                    "--all-features",
-                    "--no-default-features",
-                    "-p",
-                    "a",
-                    "-p",
-                    "b",
-                ][..],
-            ),
-        ] {
-            assert_eq!(reproduced(line, &one), expected, "{line}");
-        }
-        // The default members of a workspace with several packages are several packages.
-        let first = package("a", Vec::new(), &["a", "b"]);
-        let second = package("b", Vec::new(), &["a", "b"]);
-        let defaults = [&first, &second];
-        let found = parse(&words("cargo test --features f"))
-            .expect("a command")
-            .reproduce(&first, &defaults, &[]);
-        assert_eq!(found, ["--features", "f"]);
     }
 
-    #[test]
-    fn a_flag_whose_value_holds_a_placeholder_is_left_out_of_the_command() {
-        let one = package("a", Vec::new(), &["a"]);
-        let members = [&one];
-        let line = "cargo test -p a --target {s}/t --target u --config=c={s} --config d=2 --profile {s} --features {s},f";
+    /// The words of a test of `target` for the command `line`, whose words at the `held` places hold
+    /// a placeholder, where the targets the command built are `built`.
+    fn test_words_of(
+        line: &str,
+        held: &[&str],
+        packages: &[&Package],
+        target: &TargetId,
+        built: &[TargetId],
+    ) -> Vec<String> {
         let command = words(line);
-        let held: Vec<usize> = ["{s}/t", "--config=c={s}", "{s}", "{s},f"]
+        let held: Vec<usize> = held
             .iter()
             .map(|word| command.iter().position(|one| one == word).expect("a word"))
             .collect();
-        let found = parse(&command)
-            .expect("a command")
-            .reproduce(&one, &members, &held);
-        assert_eq!(found, ["--target", "u", "--config", "d=2", "-p", "a"]);
-        // With none held, every value stays.
-        let found = parse(&command)
-            .expect("a command")
-            .reproduce(&one, &members, &[]);
+        parse(&command)
+            .unwrap_or_else(|why| panic!("{line}: {why}"))
+            .test_words(&command, &held, target, packages, built)
+    }
+
+    /// A command's words stay as it wrote them and in order, less `--no-run`, each word that holds a
+    /// placeholder with its flag, and its target flags and test names, which the test's own flag
+    /// replaces. Nothing is added, `--locked` included.
+    #[test]
+    fn a_tests_words_are_the_commands_own_less_its_target_flags_names_and_placeholders() {
+        use TargetKind::Lib;
+        let one = package("a", vec![target("a", Lib, "a", true)], &["a"]);
+        let packages = [&one];
+        let a = id("a", Lib, "a");
+        let built = [a.clone()];
+        for (line, expected) in [
+            // A short group stays whole, and so does a pattern as written.
+            (
+                "cargo test -qp a* --release -F f,a/g --features=h --no-run foo --lib --bins -j 2 --all-targets",
+                "-qp a* --release -F f,a/g --features=h -j 2 --lib",
+            ),
+            (
+                "cargo test --locked --offline --config=c=1 --target t --frozen --message-format short",
+                "--locked --offline --config=c=1 --target t --frozen --message-format short --lib",
+            ),
+            // `--locked` is the step's own, or it is not there.
+            ("cargo test -p a", "-p a --lib"),
+            ("cargo test -r --bin x --example y", "-r --lib"),
+        ] {
+            assert_eq!(
+                test_words_of(line, &[], &packages, &a, &built).join(" "),
+                expected,
+                "{line}"
+            );
+        }
+        // A word that holds a placeholder goes with its flag, and each other word stays.
+        let line = "cargo test -p a --target {s}/t --target u --config=c={s} --config d=2 --profile {s} --features {s},f --test {s}";
+        let held = ["{s}/t", "--config=c={s}", "{s}", "{s},f"];
         assert_eq!(
-            found,
-            [
-                "--profile",
-                "{s}",
-                "--target",
-                "{s}/t",
-                "--target",
-                "u",
-                "--config",
-                "c={s}",
-                "--config",
-                "d=2",
-                "--features",
-                "{s},f",
-                "-p",
-                "a"
-            ]
+            test_words_of(line, &held, &packages, &a, &built).join(" "),
+            "-p a --target u --config d=2 --lib"
         );
+        assert_eq!(
+            test_words_of(line, &[], &packages, &a, &built).join(" "),
+            "-p a --target {s}/t --target u --config=c={s} --config d=2 --profile {s} --features {s},f --lib"
+        );
+    }
+
+    /// The test's own flag stands for the command's target flags only where the build made every
+    /// target that flag names in the selected packages; where it did not, the command's own target
+    /// flags and test names stay. The packages that the command does not select count for nothing.
+    #[test]
+    fn a_tests_own_flag_stands_for_the_target_flags_only_where_the_build_made_every_target_it_names()
+     {
+        use TargetKind::{Lib, Test};
+        let a = package(
+            "a",
+            vec![target("a", Lib, "a", true), target("a", Test, "t", true)],
+            &["a", "b"],
+        );
+        let b = package(
+            "b",
+            vec![target("b", Lib, "b", true), target("b", Test, "t", true)],
+            &["a", "b"],
+        );
+        let c = package("c", vec![target("c", Test, "t", true)], &["a", "b"]);
+        let packages = [&a, &b, &c];
+        let (a_lib, b_lib) = (id("a", Lib, "a"), id("b", Lib, "b"));
+        let (a_t, b_t, c_t) = (id("a", Test, "t"), id("b", Test, "t"), id("c", Test, "t"));
+        for (line, target, built, expected) in [
+            // Each target the flag names is built: the flag stands.
+            (
+                "cargo test --workspace foo",
+                &a_t,
+                vec![a_t.clone(), b_t.clone(), c_t.clone()],
+                "--workspace --test t",
+            ),
+            (
+                "cargo test --workspace --lib",
+                &a_lib,
+                vec![a_lib.clone(), b_lib.clone()],
+                "--workspace --lib",
+            ),
+            // A package the command does not select counts for nothing.
+            (
+                "cargo test -p a -p b --tests",
+                &a_t,
+                vec![a_t.clone(), b_t.clone()],
+                "-p a -p b --test t",
+            ),
+            (
+                "cargo test --workspace --exclude c --test t",
+                &a_t,
+                vec![a_t.clone(), b_t.clone()],
+                "--workspace --exclude c --test t",
+            ),
+            // The default members are `a` and `b`, so `c` counts for nothing here too.
+            (
+                "cargo test",
+                &b_t,
+                vec![a_t.clone(), b_t.clone()],
+                "--test t",
+            ),
+            // One of them is not built: the command's own flags and test names stay.
+            (
+                "cargo test --workspace foo",
+                &a_t,
+                vec![a_t.clone(), b_t.clone()],
+                "--workspace foo",
+            ),
+            (
+                "cargo test --workspace --all-targets",
+                &a_lib,
+                vec![a_lib.clone()],
+                "--workspace --all-targets",
+            ),
+            (
+                "cargo test --workspace --tests --no-run",
+                &a_t,
+                vec![b_t.clone(), c_t.clone()],
+                "--workspace --tests",
+            ),
+            // The step built nothing the test is: the command's own flags stay.
+            ("cargo test -p a --tests", &a_t, Vec::new(), "-p a --tests"),
+        ] {
+            let rows = test_words_of(line, &[], &packages, target, &built);
+            assert_eq!(rows.join(" "), expected, "{line}");
+        }
     }
 }

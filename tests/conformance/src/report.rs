@@ -1552,61 +1552,69 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// The command that reproduces a Rust test: the step that ran it, or the first that selects its
-    /// target where none did, narrowed to the test's target and the test, and to its package where the
-    /// step selects no other package. It runs in the directory of the package's workspace, with the
-    /// variables the step sets that hold no placeholder, the step's features and profile, and the
-    /// options the step passes the test binary.
+    /// The command that runs one Rust test with the build of its step: the step that ran it, or the
+    /// first that selects its target where none did. The line begins `cd <directory> && ` for a
+    /// workspace that is not the root, then the step's variables that hold no placeholder. Then come
+    /// `cargo test` and the step's own words, with the test's own flag in place of the step's target
+    /// flags where the step's build holds every target that flag names (see
+    /// [`coverage::Selection::test_words`]), the options the step passes the test binary, and the
+    /// test's name. A test that no step selects gets `--locked`, `-p <package>` and its target's flag.
     fn rust_command(&self, target: &TargetId, name: &str, runs: &[RunRecord]) -> String {
-        let step = self.reproducing_step(target, runs).map(|done| &done.step);
-        let mut line = String::new();
-        if let Some(directory) = self
+        let done = self.reproducing_step(target, runs);
+        let package = self
             .map
             .packages
             .iter()
-            .find(|package| package.name == target.package)
+            .find(|package| package.name == target.package);
+        let mut line = String::new();
+        if let Some(directory) = package
             .map(|package| package.workspace.as_str())
             .filter(|directory| !matches!(*directory, "" | "."))
         {
             line.push_str(&format!("cd {} && ", plan::quote(directory)));
         }
-        let mut words = vec!["cargo".to_owned(), "test".to_owned(), "--locked".to_owned()];
         let mut test_arguments: Vec<String> = Vec::new();
-        let mut package_named = false;
-        if let Some(step) = step {
+        let mut words = vec!["cargo".to_owned(), "test".to_owned()];
+        let mut by_step = None;
+        if let Some(done) = done {
+            let step = &done.step;
             for (variable, value) in &step.env {
                 if !step.placeholder_env.contains(variable) {
                     line.push_str(&format!("{variable}={} ", plan::quote(value)));
                 }
             }
             test_arguments = test_options(step);
-            if let (Ok(selection), Some(package)) = (
-                coverage::parse(&step.command),
-                self.map
-                    .packages
-                    .iter()
-                    .find(|package| package.name == target.package),
-            ) {
+            if let (Ok(selection), Some(package)) = (coverage::parse(&step.command), package) {
                 let members: Vec<&Package> = self
                     .map
                     .packages
                     .iter()
                     .filter(|member| member.workspace == package.workspace)
                     .collect();
-                words.extend(selection.reproduce(package, &members, &step.placeholder_words));
-                package_named = true;
+                by_step = Some(selection.test_words(
+                    &step.command,
+                    &step.placeholder_words,
+                    target,
+                    &members,
+                    &done.built,
+                ));
             }
         }
-        if !package_named {
-            words.extend(["-p".to_owned(), target.package.clone()]);
-        }
-        words.extend(
-            target
-                .kind
-                .selector(&target.name)
-                .split(' ')
-                .map(str::to_owned),
-        );
+        words.extend(by_step.unwrap_or_else(|| {
+            let mut own = vec![
+                "--locked".to_owned(),
+                "-p".to_owned(),
+                target.package.clone(),
+            ];
+            own.extend(
+                target
+                    .kind
+                    .selector(&target.name)
+                    .split(' ')
+                    .map(str::to_owned),
+            );
+            own
+        }));
         words.push("--".to_owned());
         words.extend(test_arguments);
         words.push("--exact".to_owned());
