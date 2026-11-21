@@ -399,15 +399,6 @@ pub fn base64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// The generic alert text a device shows when it cannot open a preview.
-///
-/// It is here so that nothing in this crate has to build one: a producer chooses a [`PushAlert`]
-/// and the sentence comes from the protocol.
-#[must_use]
-pub const fn generic_text(alert: PushAlert) -> &'static str {
-    alert.generic_text()
-}
-
 /// Mints a notification identifier, with nothing of the work in it.
 ///
 /// It is a version-four UUID: 122 random bits inside a 128-bit value, drawn from the operating
@@ -750,7 +741,7 @@ mod tests {
     #[test]
     fn the_generic_alert_names_no_session_project_host_or_command() {
         for alert in PushAlert::ALL {
-            let text = generic_text(alert);
+            let text = alert.generic_text();
             assert!(text.starts_with('A') || text.starts_with("Several"));
             assert!(
                 text.contains("KalaReach"),
