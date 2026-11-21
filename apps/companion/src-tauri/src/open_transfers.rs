@@ -1127,6 +1127,8 @@ impl Desk {
             }
             let freed_before = desk.places_freed.load(Ordering::Acquire);
             let mut result = desk.send_once(&running, &session).await;
+            #[cfg(feature = "testing")]
+            testing::pause(running.key, testing::Point::Refused);
             // The host holds the device's places for every account of the device, and another account
             // cannot see its own. A refusal for the count of open transfers frees the places other
             // accounts' uploads hold, once, and the begin is tried once more. A freeing that another
@@ -2174,6 +2176,9 @@ pub mod testing {
         /// A sender task is at its first line, before it asks the host for anything. Held, the task
         /// goes no further until released, and one that was stopped meanwhile never goes on.
         SenderStarting,
+        /// A sender's first call to the host has answered, before it decides whether the answer asks
+        /// for the places other accounts' uploads hold to be freed. Held.
+        Refused,
         /// A sender is inside the write of the journal's step.
         Writing(Step),
         /// A restart read an entry's content and has not yet admitted the upload.
