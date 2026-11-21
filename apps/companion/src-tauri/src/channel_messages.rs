@@ -451,10 +451,10 @@ const HOLD_SUFFIX: &str = ".held";
 /// What a name that a write staged under holds.
 const STAGED_MARK: &str = ".staged-";
 /// What a person reads when the store's folder or lock cannot be used. The cause follows it.
-const STORE: &str = "This device could not read or write its channel messages";
+const STORE: &str = "This device could not read or write its channel messages.";
 /// What a person reads when the list of removals could not be set aside. The cause follows it.
 const NOT_SET_ASIDE: &str =
-    "This device could not set the list aside. The original list is still in place";
+    "This device could not set the list aside. The original list is still in place.";
 /// The layout of both kinds of file.
 const VERSION: u32 = 1;
 const MAX_DRAFT_REFERENCES: usize = 2;
@@ -571,11 +571,11 @@ fn valid_id(id: &str) -> bool {
 }
 
 fn storage(what: &str, error: &std::io::Error) -> CommandError {
-    CommandError::new(ErrorCode::StorageUnavailable, format!("{what}: {error}"))
+    CommandError::new(ErrorCode::StorageUnavailable, format!("{what} {error}"))
 }
 
 fn failed(what: &str, error: &std::io::Error) -> CommandError {
-    CommandError::local_failure(format!("{what}: {error}"))
+    CommandError::local_failure(format!("{what} {error}"))
 }
 
 /// Whether two lists name the same drafts, as sets: an order or a repeat makes no difference.
@@ -848,7 +848,7 @@ impl ChannelDesk {
                 Ok(_) => {
                     return Err(storage(
                         STORE,
-                        &std::io::Error::new(ErrorKind::NotADirectory, "it is not a directory"),
+                        &std::io::Error::new(ErrorKind::NotADirectory, "It is not a directory."),
                     ));
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -923,7 +923,7 @@ impl ChannelDesk {
             self.make_durable(&held)?;
         } else {
             flush_directory(&self.data()?, NameKind::Directory)
-                .map_err(|error| storage(STORE, &error))?;
+                .map_err(|error| crate::drafts::ledger_storage(&error))?;
         }
         held.sweep();
         let mut stored = drafts.read()?;
@@ -1240,7 +1240,7 @@ impl ChannelDesk {
             Vec::new()
         };
         let bytes = std::fs::read(locked.file())
-            .map_err(|error| failed("This device could not read its list of removals", &error))?;
+            .map_err(|error| failed("This device could not read its list of removals.", &error))?;
         // Owed before anything moves: a flush that fails from here on is finished by the next read
         // of the drafts or change of the ledger, whichever comes first.
         drafts.owe_flush();
