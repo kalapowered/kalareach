@@ -363,10 +363,13 @@ async function busyAtPointerUp(page: Page, milliseconds: number, where: 'before'
 async function pressPage(
   page: Page,
   surface: 'ios' | 'android',
-  options: { shipped?: boolean; extra?: readonly string[]; only?: readonly string[]; scale?: number; width?: number } = {}
+  options: { shipped?: boolean; extra?: readonly string[]; only?: readonly string[]; scale?: number; width?: number; style?: string } = {}
 ): Promise<void> {
   if (options.scale !== undefined) await withTextScale(page, options.scale)
   await openSession(page, surface, options.width)
+  // A style that moves a line's words is in the page before the messages, as the harness page has its own: the page measures
+  // the room of a link where its words lie when it is shown, and a case that moves them afterwards leaves the room stale.
+  if (options.style !== undefined) await page.addStyleTag({ content: options.style })
   await page.evaluate(
     ({ messages, session, shipped }) => {
       for (const message of messages) window.krTestHost?.records.appendEntry(session, 'message', message)
@@ -833,6 +836,34 @@ const placedNow = (page: Page): Promise<Placed> =>
     return { messages, words, across: [pane.scrollWidth, pane.clientWidth] }
   })
 
+/** The end of the conversation: how far the pane scrolls, and where the last link's words and box lie against the pane's bottom and the last message's, with the pane scrolled to its end. */
+interface Ending {
+  readonly scroll: number
+  readonly room: number
+  readonly overhang: number
+  readonly line: number
+}
+
+const endingNow = (page: Page): Promise<Ending> =>
+  page.evaluate(() => {
+    const pane = document.querySelector<HTMLElement>('.m-pane')
+    const link = Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link')).pop()
+    const label = link?.querySelector('.md-link-label')
+    const message = link?.closest('.m-node')
+    if (!pane || !link || !label || !message) throw new Error('the page has no link at its end')
+    pane.scrollTop = pane.scrollHeight
+    const range = document.createRange()
+    range.selectNodeContents(label)
+    const words = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0).pop()
+    if (!words) throw new Error('the last link has no words')
+    return {
+      scroll: pane.scrollHeight,
+      room: pane.getBoundingClientRect().bottom - words.bottom,
+      overhang: link.getBoundingClientRect().bottom - message.getBoundingClientRect().bottom,
+      line: parseFloat(getComputedStyle(link).lineHeight)
+    }
+  })
+
 /** The first difference between two lists of rectangles beyond a layout's rounding, or null. */
 function firstDifference(what: string, before: readonly number[][], after: readonly number[][]): string | null {
   if (before.length !== after.length) return `${what}: ${String(before.length)} rectangles, then ${String(after.length)}`
@@ -845,6 +876,9 @@ function firstDifference(what: string, before: readonly number[][], after: reado
 }
 
 const AT_END = 'https://example.org/at-end'
+
+/** The style that justifies every line of the paragraph with the link `href`, so that the words of a link at its end run to the pane's right edge, as a full line's last word does. */
+const justifiedAt = (href: string): string => `.m-node p:has(.md-link[title='${href}']) { text-align: justify; text-align-last: justify; }`
 
 /** Three short links with no word between them: the one in the middle has a box beside it on each side, so its box has no room to grow into. */
 const HEMMED = 'Hemmed in: [m](https://example.org/hem-1)[n](https://example.org/hem-2)[o](https://example.org/hem-3) end of the line.'
@@ -938,6 +972,27 @@ test.describe('the box of a link in a message', () => {
         expect(boxed.across, 'the pane’s scroll width and client width').toEqual(bare.across)
       })
 
+      test(`lets the pane scroll no further at the end of the conversation than the box of the last link reaches past its message, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio, only: [...Array.from({ length: 14 }, () => PLAIN), LAST_LINE] })
+        const boxed = await endingNow(page)
+        await page.addStyleTag({ content: '.m-node .md-link { padding: 0 !important; margin: 0 !important; }' })
+        const bare = await endingNow(page)
+        const grown = boxed.scroll - bare.scroll
+        const lack = Math.max(0, FINGER[surface] - boxed.line)
+        test.info().annotations.push({
+          type: 'end',
+          description: `scroll range +${String(grown)} px (box ${String(boxed.overhang)} px past the last message; the line lacks ${String(lack)} px of the least size); room under the last words ${String(boxed.room)} px, ${String(bare.room)} px with no box`
+        })
+        console.log(`end ${surface} ${size}: scroll +${String(grown)}, overhang ${String(boxed.overhang)}, lack ${String(lack)}, room ${String(boxed.room)} (${String(bare.room)} with no box)`)
+        expect(grown, 'how far the pane scrolls further with the box than with none').toBeGreaterThanOrEqual(0)
+        // The engine rounds a scroll range to a whole pixel: a pixel more than the box reaches is the rounding's.
+        expect(grown, 'the growth of the pane’s scroll range, which is no more than the box reaches past the last message').toBeLessThanOrEqual(Math.max(0, boxed.overhang) + 1)
+        expect(grown, 'the growth of the pane’s scroll range, which is no more than half of what the line lacks of the least size').toBeLessThanOrEqual(lack / 2 + 1)
+        expect(boxed.room - bare.room, 'the room under the last words, which the pane’s scroll range sets').toBeCloseTo(grown, 1)
+      })
+
       test(`gives the words of every link their own tap though a box of a link on the next line lies over them, on ${surface} at ${size} text size`, async ({
         page
       }) => {
@@ -978,8 +1033,7 @@ test.describe('the box of a link in a message', () => {
     }
 
     test(`opens the link whose words end at the pane's right edge, from its middle and from 2 px inside its end, on ${surface}`, async ({ page }) => {
-      await pressPage(page, surface, { only: [...EDGES[1][2]] })
-      await page.addStyleTag({ content: ".m-node p:has(.md-link[title$='at-end']) { text-align: justify; text-align-last: justify; }" })
+      await pressPage(page, surface, { only: [...EDGES[1][2]], style: justifiedAt(AT_END) })
       const words = await wordsOf(page, AT_END)
       const pane = await paneBox(page)
       expect(pane.right - words.right, 'the gap between the words’ end and the pane’s right edge').toBeLessThan(1)
@@ -1234,8 +1288,8 @@ test.describe('a tap on the plain text near a link of a message', () => {
 
     test(`shows the look of a mouse press on a link's own element only while the pointer lies in the element, and adds no click for a release on plain text just past it, on ${surface}`, async ({ page }) => {
       await pressPage(page, surface, { extra: TEXT_AFTER_LINK })
-      await wordsOf(page, DOCS)
-      const box = await boxOf(page, DOCS)
+      // The words are the link's own element for a pointer: the padded box of the button takes no hit.
+      const box = await wordsOf(page, DOCS)
       const y = (box.top + box.bottom) / 2
       await page.mouse.move(box.right - 2, y)
       await page.mouse.down()
@@ -1437,11 +1491,8 @@ test.describe('a tap on the plain text near a link of a message', () => {
     }) => {
       await pressPage(page, surface, { only: [...Array.from({ length: 14 }, () => PLAIN), LAST_LINE] })
       await wordsOf(page, LAST)
-      await page.evaluate(() => {
-        const pane = document.querySelector<HTMLElement>('.m-pane')
-        if (pane) pane.scrollTop = pane.scrollHeight
-      })
-      const words = await wordsOf(page, LAST)
+      await endWithRoom(page, LAST, EDGE_ROOM)
+      const words = await wordsNow(page, LAST)
       const pane = await paneBox(page)
       // Points below the pane's bottom edge at which the page's hit test names something outside the pane: the grid's gap between
       // the pane and the row below it.
@@ -2360,17 +2411,12 @@ test.describe('the area in which a tap opens a link', () => {
 
       for (const [where, href, markdown] of EDGES) {
         test(`is the least size for a link ${where}, where the pane's edge cuts one side, on ${surface} at ${size} text size`, async ({ page }) => {
-          await pressPage(page, surface, { scale: ratio, only: [PLAIN, PLAIN, ...markdown, PLAIN, PLAIN] })
-          if (where === 'at the end of a line') {
-            // Every line of the paragraph runs to the pane's right edge, as a full line does: the link's words end at the edge.
-            await page.evaluate((target) => {
-              const paragraph = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)?.closest('p')
-              if (paragraph) {
-                paragraph.style.textAlign = 'justify'
-                paragraph.style.textAlignLast = 'justify'
-              }
-            }, href)
-          }
+          // Every line of the paragraph of a link at the end runs to the pane's right edge, as a full line does: the link's words end at the edge.
+          await pressPage(page, surface, {
+            scale: ratio,
+            only: [PLAIN, PLAIN, ...markdown, PLAIN, PLAIN],
+            ...(where === 'at the end of a line' ? { style: justifiedAt(href) } : {})
+          })
           const words = await wordsOf(page, href)
           const pane = await paneBox(page)
           const size = FINGER[surface]
@@ -2402,14 +2448,11 @@ test.describe('the area in which a tap opens a link', () => {
       }) => {
         await pressPage(page, surface, { scale: ratio, only: [...Array.from({ length: 14 }, () => PLAIN), LAST_LINE] })
         const words = await wordsOf(page, LAST)
-        await page.evaluate(() => {
-          const pane = document.querySelector<HTMLElement>('.m-pane')
-          if (pane) pane.scrollTop = pane.scrollHeight
-        })
-        const settled = await wordsOf(page, LAST)
+        await endWithRoom(page, LAST, EDGE_ROOM)
+        const settled = await wordsNow(page, LAST)
         const pane = await paneBox(page)
         const size = FINGER[surface]
-        expect(settled.top, 'the last line has not moved when the pane is scrolled to its end').toBeGreaterThanOrEqual(words.top - 1)
+        expect(settled.top, 'the last line has not moved up when the pane is scrolled to its end and back by the room below it').toBeGreaterThanOrEqual(words.top - 1)
         // Where the area reaches below the words (the words are shorter than the least size) the pane's bottom cuts it.
         if (settled.bottom - settled.top < size) {
           expect(pane.bottom - settled.bottom, 'the room under the words of the conversation’s last line').toBeLessThan((size - (settled.bottom - settled.top)) / 2)
@@ -2607,6 +2650,31 @@ test.describe('the area in which a tap opens a link', () => {
     }
   }
 })
+
+/**
+ * The room below the last words of a conversation for the cases of the pane's bottom edge cutting a link's area: the pane's end now
+ * gives the last link's box its room (the case of the pane's scroll range), so these cases scroll the pane up from its end to a room
+ * that cuts the area below the words and lies within the engines' touch adjustment (about 8 px) of a tap in the gap below the pane.
+ */
+const EDGE_ROOM = 5
+
+/** Scrolls the pane to its end and then up, so that `room` px of the pane lie below the last words of the link `href`. */
+async function endWithRoom(page: Page, href: string, room: number): Promise<void> {
+  await page.evaluate(
+    ({ target, left }) => {
+      const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
+      const pane = document.querySelector<HTMLElement>('.m-pane')
+      if (!link || !pane) throw new Error(`the page shows no link ${target}`)
+      pane.scrollTop = pane.scrollHeight
+      const range = document.createRange()
+      range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
+      const words = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0).pop()
+      if (!words) throw new Error(`the link ${target} has no words`)
+      pane.scrollTop -= Math.round(Math.max(0, pane.getBoundingClientRect().bottom - words.bottom - left))
+    },
+    { target: href, left: room }
+  )
+}
 
 /** Reads the rectangle of a link's first line of words where the page has it now, with no scrolling. */
 async function wordsNow(page: Page, href: string, line = 0): Promise<Words> {

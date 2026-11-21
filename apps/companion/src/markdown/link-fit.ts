@@ -161,24 +161,18 @@ export function fitLinks(pane: HTMLElement, messages: readonly Element[]): void 
   const neighbours: Neighbour[] = boxes
     .filter(({ box }) => box.right > box.left)
     .map(({ box, link }) => ({ box, shares: link && box.right - box.left < least }))
-  const columns = new Map<Element, Column>()
   const writes: { link: HTMLElement; room: Beside }[] = []
   for (const { element, box, link, message } of boxes) {
     if (!link || !mine.has(message)) continue
-    let room = NONE
-    if (box.right > box.left) {
-      let column = columns.get(element)
-      if (column === undefined) {
-        column = columnOf(element, message)
-        columns.set(element, column)
-      }
-      room = besideOf(
-        box,
-        least,
-        neighbours.filter((other) => other.box !== box),
-        column
-      )
-    }
+    const room =
+      box.right > box.left
+        ? besideOf(
+            box,
+            least,
+            neighbours.filter((other) => other.box !== box),
+            columnOf(element, message)
+          )
+        : NONE
     const now = givenTo(element)
     if (Math.abs(room.left - now.left) > 1 / GRID || Math.abs(room.right - now.right) > 1 / GRID) writes.push({ link: element, room })
   }
