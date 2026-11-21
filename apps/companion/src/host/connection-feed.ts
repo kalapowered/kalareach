@@ -56,7 +56,11 @@ export function triggerKey(state: ConnectionState): string {
 }
 
 export interface ConnectionFeed {
-  /** Calls `show` with the latest state once there is one, then every revision, each once. */
+  /**
+   * Calls `show` with the latest state once there is one, then every revision, each once. `failed` is
+   * told only while the feed has no state and cannot get one: a request that fails once it has a
+   * state changes nothing the views show, and is asked again by the next catch-up.
+   */
   readonly watch: (
     show: (state: ConnectionState, resynced: boolean) => void,
     failed: (failure: unknown) => void
@@ -198,10 +202,10 @@ export function createConnectionFeed(source: FeedSource): ConnectionFeed {
         drain()
         if (buffer.size > 0 && cursor > from) fill()
       },
-      (failure: unknown) => {
+      () => {
+        // The feed has a state, and a request that failed says nothing of it: the views keep what they
+        // were shown, and the next catch-up asks again.
         filling = false
-        if (stage === 'stopped') return
-        fail(failure)
       }
     )
   }
@@ -234,7 +238,8 @@ export function createConnectionFeed(source: FeedSource): ConnectionFeed {
       },
       (failure: unknown) => {
         reading = false
-        if (stage === 'stopped') return
+        // An event heard meanwhile may have given the base: a failure to read one is then no answer.
+        if (stage !== 'unbased') return
         fail(failure)
       }
     )

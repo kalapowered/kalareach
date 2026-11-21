@@ -794,6 +794,31 @@ describe('the desktop port and a host that changed', () => {
     expect(heard).toEqual(['2'])
   })
 
+  it('tells the views no failure when a replay of what they missed cannot be read', async () => {
+    const port = tauriPort()
+    const shown: number[] = []
+    const failures: unknown[] = []
+    shell.answers.set('connection_state', published('env-a', 1))
+    port.watchConnection(
+      (state) => shown.push(state.revision),
+      (failure) => failures.push(failure)
+    )
+    await settle()
+    let fail: (failure: unknown) => void = () => undefined
+    shell.answers.set(
+      'connection_since',
+      new Promise((_, reject) => {
+        fail = reject
+      })
+    )
+    shell.handlers.get(CONNECTION_EVENT)?.({ payload: published('env-a', 3) })
+    await settle()
+    fail(new Error('the replay could not be read'))
+    await settle()
+    expect(shown).toEqual([1])
+    expect(failures).toEqual([])
+  })
+
   it('holds the host events that are ahead of the feed and asks it to catch up', async () => {
     const { heard } = await following()
     shell.answers.set('connection_since', { revision: 3, resync: false, states: [] })

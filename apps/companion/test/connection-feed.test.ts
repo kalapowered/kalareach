@@ -273,7 +273,7 @@ describe('the feed that orders the connection’s states', () => {
     feed.stop()
   })
 
-  it('a failed fill goes to failed and is retried', async () => {
+  it('a failed fill tells no failure, keeps the state the feed has and is retried', async () => {
     vi.useFakeTimers()
     const script = scripted()
     const feed = createConnectionFeed(script.source)
@@ -289,14 +289,40 @@ describe('the feed that orders the connection’s states', () => {
     await vi.advanceTimersByTimeAsync(0)
     script.asked[0]?.reject(new Error('the replay could not be read'))
     await vi.advanceTimersByTimeAsync(0)
-    expect(failures).toHaveLength(1)
+    // The state the views were shown is still the connection's: a request that failed says nothing of it.
+    expect(failures).toEqual([])
     expect(shown).toEqual([1])
+    expect(feed.latest()?.revision).toBe(1)
     // The next tail asks again, and this time it is answered.
     await vi.advanceTimersByTimeAsync(TAIL_MS)
     expect(script.asked).toHaveLength(2)
     script.asked[1]?.resolve(since(3, [state(2), state(3)]))
     await vi.advanceTimersByTimeAsync(0)
     expect(shown).toEqual([1, 2, 3])
+    expect(failures).toEqual([])
+    feed.stop()
+  })
+
+  it('a base read that fails after an event gave the base tells no failure', async () => {
+    const script = scripted()
+    const feed = createConnectionFeed(script.source)
+    const shown: number[] = []
+    const failures: unknown[] = []
+    feed.watch(
+      (each) => shown.push(each.revision),
+      (failure) => failures.push(failure)
+    )
+    await settle()
+    // The read is still out when the first event is heard, and the event is the base.
+    script.tell(state(7))
+    await settle()
+    expect(shown).toEqual([7])
+    script.reads[0]?.reject(new Error('no state could be read'))
+    await settle()
+    expect(failures).toEqual([])
+    expect(feed.latest()?.revision).toBe(7)
+    // The base is not asked for again.
+    expect(script.reads).toHaveLength(1)
     feed.stop()
   })
 
