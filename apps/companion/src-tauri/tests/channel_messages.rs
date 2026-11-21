@@ -2211,11 +2211,15 @@ fn a_keep_that_has_staged_the_ledger_makes_a_repair_and_a_set_aside_wait() {
     // ledger's: a repair that did not take the folder's lock would run here and name the draft.
     let (hook, reached, release) = a_wait();
     let _at = testing::at(dir(data.path()), Point::AfterEntry, hook);
-    // The keep's ledger step is then refused, once: the entry is undone, and nothing may have named
-    // the draft between the refusal and the undo.
+    // The keep's ledger step then stops at its first write, where it holds the ledger's lock too, and
+    // is refused once the test lets it go: the entry is undone, and nothing may have named the draft
+    // between the refusal and the undo. A keep that had let go of the folder's lock before this step
+    // would let a repair scan the entry here, and name the draft when the ledger's lock is free.
+    let (ledger_wait, ledger_reached, ledger_release) = a_wait();
     let first = std::sync::atomic::AtomicBool::new(true);
     let _refused = testing::at(data.path(), Point::LedgerBeforeRename, move || {
         if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = ledger_wait();
             Err(io_fault("the ledger is refused"))
         } else {
             Ok(())
@@ -2241,6 +2245,18 @@ fn a_keep_that_has_staged_the_ledger_makes_a_repair_and_a_set_aside_wait() {
         "a set-aside waits for a keep that holds the folder's lock"
     );
     release.send(()).expect("let the keep go");
+    ledger_reached
+        .recv_timeout(WAIT)
+        .expect("the keep is at its ledger step");
+    assert!(
+        repair.recv_timeout(SHORT).is_err(),
+        "a repair still waits while the keep is at its ledger step"
+    );
+    assert!(
+        set_aside.recv_timeout(SHORT).is_err(),
+        "a set-aside still waits while the keep is at its ledger step"
+    );
+    ledger_release.send(()).expect("let the ledger step go");
     let kept = keep.recv_timeout(WAIT).expect("the keep ends");
     assert!(kept.is_err(), "the keep fails at its ledger step: {kept:?}");
     let read = repair.recv_timeout(WAIT).expect("the repair ends");
