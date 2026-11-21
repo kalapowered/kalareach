@@ -9,6 +9,7 @@
 //! drawn at; the session is the view's own and no other.
 
 use kr_protocol::ids::SessionId;
+use kr_protocol::launch_commands::ShellLaunchCommandsListResult;
 use kr_protocol::root::{
     EditorBufferRevision, LaunchCommand, PromptGeneration, ShellLaunchParams,
     ShellLaunchSurfaceResult,
@@ -34,6 +35,43 @@ impl From<kr_client::LaunchSurfaceRead> for LaunchSurfaceAnswer {
             kr_client::LaunchSurfaceRead::Served(surface) => Self::Served { surface },
             kr_client::LaunchSurfaceRead::NotServed => Self::NotServed,
         }
+    }
+}
+
+/// What a read of the host's saved launch commands came to, as the page is told.
+///
+/// The answer holds the commands, which may name a secret, so it has no `Debug` that shows them.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LaunchCommandsAnswer {
+    /// The host served the list.
+    Served {
+        /// The list as the host holds it, and its revision.
+        list: ShellLaunchCommandsListResult,
+    },
+    /// The host is of a release that does not serve the list.
+    NotServed,
+    /// This connection does not hold the right to read the list.
+    Refused,
+}
+
+impl From<kr_client::LaunchCommandsRead> for LaunchCommandsAnswer {
+    fn from(read: kr_client::LaunchCommandsRead) -> Self {
+        match read {
+            kr_client::LaunchCommandsRead::Served(list) => Self::Served { list },
+            kr_client::LaunchCommandsRead::NotServed => Self::NotServed,
+            kr_client::LaunchCommandsRead::Refused => Self::Refused,
+        }
+    }
+}
+
+impl std::fmt::Debug for LaunchCommandsAnswer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Served { .. } => "LaunchCommandsAnswer::Served",
+            Self::NotServed => "LaunchCommandsAnswer::NotServed",
+            Self::Refused => "LaunchCommandsAnswer::Refused",
+        })
     }
 }
 

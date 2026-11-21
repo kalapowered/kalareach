@@ -656,6 +656,60 @@ fn session_descriptions_are_reached_through_four_named_commands_and_no_more() {
     }
 }
 
+/// KR-REQ-13.11: the host's saved launch commands are reached through three named commands, each
+/// of which performs the one method it names, and through no other: a name, a program and
+/// arguments, and the revision of the list the person saw, never a path or another method.
+#[test]
+fn the_saved_launch_commands_are_reached_through_three_named_commands_and_no_more() {
+    use kr_protocol::method::Method;
+
+    let expected = [
+        ("launch_commands_list", Method::ShellLaunchCommandsList),
+        ("launch_commands_save", Method::ShellLaunchCommandsSave),
+        ("launch_commands_remove", Method::ShellLaunchCommandsRemove),
+    ];
+    let performing: Vec<&str> = NAMED_COMMANDS
+        .iter()
+        .filter(|(_, method)| expected.iter().any(|(_, wanted)| *method == Some(*wanted)))
+        .map(|(command, _)| *command)
+        .chain(
+            NATIVE_METHODS
+                .iter()
+                .filter(|(_, methods)| {
+                    methods
+                        .iter()
+                        .any(|method| expected.iter().any(|(_, wanted)| method == wanted))
+                })
+                .map(|(command, _)| *command),
+        )
+        .collect();
+    let named_for_them: Vec<&str> = NAMED_COMMANDS
+        .iter()
+        .map(|(command, _)| *command)
+        .filter(|command| command.starts_with("launch_commands"))
+        .collect();
+    let three: Vec<&str> = expected.iter().map(|(command, _)| *command).collect();
+    assert_eq!(
+        performing, three,
+        "only these three commands perform a saved launch command method"
+    );
+    assert_eq!(
+        named_for_them, three,
+        "the saved launch commands are reached through these three commands and no others"
+    );
+    for (command, method) in expected {
+        let named = NAMED_COMMANDS
+            .iter()
+            .find(|(name, _)| *name == command)
+            .expect("the command is named");
+        assert_eq!(
+            named.1,
+            Some(method),
+            "{command} performs one operation and names it"
+        );
+    }
+}
+
 #[test]
 fn a_settings_pane_is_opened_by_name_and_never_by_an_address_the_page_supplies() {
     for pane in companion_tauri::setup::settings::PANES {
