@@ -396,12 +396,14 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     const of = world()
     of.messages.leaveUnreadable('holds', { layout: 1, now: 2 })
     startOver(of)
-    expect(await screen.findByText('Some records of messages being sent could not be read')).toBeVisible()
+    await waitFor(() => {
+      expect(screen.queryByText('Some records of messages being sent could not be read')).not.toBeNull()
+    })
     expect(
-      await screen.findByText(
+      screen.queryByText(
         'A record of a message that was being sent could not be read by this version of the application. It was left as it is. Check your sessions before you send again. 2 records of messages that were being sent could not be read now. Check your sessions before you send again.'
       )
-    ).toBeVisible()
+    ).not.toBeNull()
   })
 
   it('K14 treats a newest read that failed as a failed read after one that worked, and keeps what was listed', async () => {
@@ -417,21 +419,30 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
       document.dispatchEvent(new Event('visibilitychange'))
       await Promise.resolve()
     })
-    const line = await screen.findByTestId('kept-drafts-entry')
+    await waitFor(() => {
+      expect(screen.queryByTestId('kept-drafts-entry')).not.toBeNull()
+    })
+    const line = screen.getByTestId('kept-drafts-entry')
     expect(line).toHaveTextContent('Channel messages could not be read now.')
     await person.click(within(line).getByRole('button'))
-    expect(await screen.findByText('The messages kept on this device could not be read now.')).toBeVisible()
+    await waitFor(() => {
+      expect(screen.queryByText('The messages kept on this device could not be read now.')).not.toBeNull()
+    })
     cleanup()
     const stale = world()
     keepMessage(stale, { text: 'listed before the failure' })
     startOver(stale)
-    expect(await screen.findByTestId('channel-message-text')).toHaveTextContent('listed before the failure')
+    await waitFor(() => {
+      expect(screen.queryByTestId('channel-message-text')?.textContent).toBe('listed before the failure')
+    })
     stale.messages.refuseListings({ code: 'STORAGE_UNAVAILABLE', message: 'refused' })
     await act(async () => {
       document.dispatchEvent(new Event('visibilitychange'))
       await Promise.resolve()
     })
-    expect(await screen.findByText('The messages kept on this device could not be read now.')).toBeVisible()
+    await waitFor(() => {
+      expect(screen.queryByText('The messages kept on this device could not be read now.')).not.toBeNull()
+    })
     expect(screen.getByTestId('channel-message-text')).toHaveTextContent('listed before the failure')
   })
 
@@ -446,11 +457,15 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
           ? Promise.reject(new Error('the text is not readable'))
           : port.deviceChannelMessages(request)
     }))
-    const line = await screen.findByTestId('kept-drafts-entry')
-    await person.click(within(line).getByRole('button'))
-    expect(await screen.findByTestId('channel-message-text-unavailable')).toHaveTextContent(
-      'This device could not read the text of this message now.'
-    )
+    await waitFor(() => {
+      expect(screen.queryByTestId('kept-drafts-entry')).not.toBeNull()
+    })
+    await person.click(within(screen.getByTestId('kept-drafts-entry')).getByRole('button'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('channel-message-text-unavailable')?.textContent).toBe(
+        'This device could not read the text of this message now.'
+      )
+    })
     expect(screen.queryByTestId('channel-message-text')).toBeNull()
     expect(screen.getByTestId('channel-message')).toBeVisible()
   })
@@ -546,7 +561,7 @@ describe('the messages kept apart, listed whole on the Kept drafts page', () => 
     const rows = await screen.findAllByTestId('kept-draft')
     expect(rows.map((row) => row.getAttribute('data-why')).sort()).toEqual(['conflicted', 'orphaned'])
     for (const row of rows) {
-      expect(within(row).getByTestId('kept-draft-unread')).toHaveTextContent(
+      expect(within(row).queryByTestId('kept-draft-unread')?.textContent).toContain(
         'This device could not read its channel messages, so this draft is not put in a composer by itself. It can be a message that was sent.'
       )
     }

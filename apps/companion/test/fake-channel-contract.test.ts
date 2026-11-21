@@ -301,16 +301,15 @@ describe('the scripted store counts and changes the list of removals as native c
     drafts.markRemoval(b)
     store.damageLedger('damaged')
     drafts.refuseMarks(refused)
-    expect(
-      (() => {
-        try {
-          store.setAside(drafts)
-          return null
-        } catch (failure) {
-          return failureMessage(failure)
-        }
-      })()
-    ).toBe(`This device could not set the list aside. The original list is still in place. ${refused.message}`)
+    const said = (() => {
+      try {
+        store.setAside(drafts)
+        return null
+      } catch (failure) {
+        return failureMessage(failure)
+      }
+    })()
+    expect(said).toBe(`This device could not set the list aside. The original list is still in place. ${refused.message}`)
     // Nothing moved: the list is still the damaged one, with what it named.
     expect(store.drafts(drafts).ledger).toBe('damaged')
     expect(drafts.pendingRemovals()).toEqual([a, b])
