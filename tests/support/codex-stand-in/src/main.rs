@@ -62,6 +62,9 @@ async fn main() {
                 contract::RELEASE
             }
         ),
+        // The pinned build, started by hand where no gateway serves it: a composer, and nothing to
+        // serve.
+        [] if variants.by_hand && !newer() => by_hand(),
         // The newer build, started as typed (a build outside the package's range is served no
         // gateway, so the shell runs it with nothing after its name): it says so and stays until
         // it is ended, which keeps its image and its place in the process table for a case to look
@@ -92,6 +95,36 @@ async fn main() {
                  [words]` only"
             );
             std::process::exit(2);
+        }
+    }
+}
+
+/// What the line says when a program started by hand is up: the screen shows it before any key.
+#[cfg(unix)]
+const BY_HAND: &str = "codex-stand-in: by hand";
+
+/// What the program does when a person starts it by hand: draws a composer, shows what is typed at
+/// it, says what a typed line or command comes to, and goes on until its input ends or it is ended.
+#[cfg(unix)]
+fn by_hand() -> ! {
+    use std::io::Read as _;
+    let mut screen = keyboard::Screen::open();
+    screen.begins();
+    screen.say(BY_HAND);
+    let mut decoder = keyboard::Decoder::default();
+    let mut input = std::io::stdin().lock();
+    let mut bytes = [0_u8; 256];
+    loop {
+        match input.read(&mut bytes) {
+            Ok(count) if count > 0 => {
+                for key in decoder.keys(&bytes[..count]) {
+                    if let Some(typed) = screen.key(key) {
+                        screen.say(format!("by hand: took {typed:?}"));
+                    }
+                }
+                screen.redraw();
+            }
+            _ => std::process::exit(0),
         }
     }
 }

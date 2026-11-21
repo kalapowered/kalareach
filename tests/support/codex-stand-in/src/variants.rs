@@ -45,6 +45,9 @@ pub const LEAVE_VARIABLE: &str = "STAND_IN_LEAVE";
 /// The ways a run can differ from the default.
 #[derive(Clone, Debug, Default)]
 pub struct Variants {
+    /// The program, run with nothing after its name, is an agent a person started by hand where no
+    /// gateway serves it: it draws its composer, says so, and goes on until it is ended.
+    pub by_hand: bool,
     /// The server does not end when its input ends.
     pub ignore_eof: bool,
     /// The server does not end when it is asked to terminate.
@@ -162,6 +165,7 @@ impl Variants {
             .filter(|name| !name.is_empty())
         {
             match name {
+                "by-hand" => variants.by_hand = true,
                 "ignore-eof" => variants.ignore_eof = true,
                 "ignore-term" => variants.ignore_term = true,
                 "command-shares-group" => variants.command_shares_group = true,
