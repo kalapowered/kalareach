@@ -6,9 +6,11 @@
 //! session. `kr` is the real binary, copied to the internal disk and run with that tree's
 //! directories on plain pipes. The host decides every rule of a command; `kr` holds none, so each
 //! refusal here is the host's own sentence. The suite runs on Unix and on Windows; the two differ
-//! only in the environment `kr` is given and the directory it runs in.
+//! only in the environment `kr` is given and the directory it runs in, and in two cases that need a
+//! Unix socket or file modes (a reply lost by a relay, a state directory that cannot be written),
+//! which run on Unix only.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
@@ -16,7 +18,6 @@ use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::endpoint::Listener;
-use kr_ipc::paths::Endpoint;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::ids::BuildId;
 use serde_json::Value;
@@ -74,7 +75,12 @@ impl Drop for Host {
 /// Carries one connection between `kr` and the daemon in both directions, and cuts it, both ways,
 /// at the first thing the daemon sends after the file of saved commands changed: the change is on
 /// disk, and its reply never reaches `kr`.
-async fn carry(client: tokio::net::UnixStream, daemon: &Path, file: &Path) -> std::io::Result<()> {
+#[cfg(unix)]
+async fn carry(
+    client: tokio::net::UnixStream,
+    daemon: &std::path::Path,
+    file: &std::path::Path,
+) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let server = tokio::net::UnixStream::connect(daemon).await?;
@@ -104,6 +110,7 @@ async fn carry(client: tokio::net::UnixStream, daemon: &Path, file: &Path) -> st
 }
 
 /// Accepts connections on `front` and carries each to `daemon`.
+#[cfg(unix)]
 async fn relay(front: tokio::net::UnixListener, daemon: PathBuf, file: PathBuf) {
     while let Ok((client, _)) = front.accept().await {
         let (daemon, file) = (daemon.clone(), file.clone());
@@ -120,6 +127,7 @@ impl Host {
 
     /// A host whose clients reach it through a relay that loses the reply to a change once the
     /// change is in the file.
+    #[cfg(unix)]
     async fn start_behind_a_relay_that_loses_a_reply() -> Self {
         Self::start_with(true).await
     }
@@ -151,16 +159,19 @@ impl Host {
         .await
         .expect("the daemon starts");
         let endpoint = environment.controller_endpoint().expect("an endpoint");
-        let file = environment
-            .state_dir()
-            .join(kr_controller::launch_commands::FILE_NAME);
         // Behind a relay the daemon listens beside the endpoint `kr` finds, and the relay listens
         // on that one.
+        #[cfg(unix)]
         let (served, relay) = if lossy {
             use std::os::unix::fs::PermissionsExt as _;
 
-            let daemon = Endpoint::from_path(endpoint.as_path().with_file_name("daemon.sock"))
-                .expect("an endpoint");
+            let file = environment
+                .state_dir()
+                .join(kr_controller::launch_commands::FILE_NAME);
+            let daemon = kr_ipc::paths::Endpoint::from_path(
+                endpoint.as_path().with_file_name("daemon.sock"),
+            )
+            .expect("an endpoint");
             let front =
                 tokio::net::UnixListener::bind(endpoint.as_path()).expect("the relay binds");
             std::fs::set_permissions(endpoint.as_path(), std::fs::Permissions::from_mode(0o600))
@@ -169,6 +180,11 @@ impl Host {
             (daemon, Some(relay))
         } else {
             (endpoint, None)
+        };
+        #[cfg(not(unix))]
+        let (served, relay) = {
+            assert!(!lossy, "only a Unix host puts a relay before its daemon");
+            (endpoint, None::<tokio::task::JoinHandle<()>>)
         };
         let listener = Listener::bind(&served).expect("binds the endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
@@ -674,8 +690,10 @@ async fn kr_launch_add_remove_and_list_are_refused_inside_a_session_and_change_n
 /// A state directory that is read-only for as long as it lives: the file in it can be read, and
 /// nothing can be written beside it. The mode is put back when it is dropped, so the test tree can
 /// be removed.
+#[cfg(unix)]
 struct ReadOnly(PathBuf);
 
+#[cfg(unix)]
 impl ReadOnly {
     fn new(directory: PathBuf) -> Self {
         use std::os::unix::fs::PermissionsExt as _;
@@ -686,6 +704,7 @@ impl ReadOnly {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ReadOnly {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt as _;
@@ -699,6 +718,7 @@ impl Drop for ReadOnly {
 /// at the list, advises no removal, exits 8, and the list is as it was. A list that is unreadable
 /// is the case above, and its words are unchanged. The control is the unreadable file, whose
 /// words stay.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_change_the_host_could_not_write_is_not_told_as_an_unreadable_file_and_the_list_stands() {
     let host = Host::start().await;
@@ -771,6 +791,7 @@ async fn a_revision_is_written_as_the_protocols_decimal_string_in_every_document
 /// says so in the one sentence for it, exits 8 with `OUTCOME_UNKNOWN`, and does not say that the
 /// host could not be reached (exit 3). The relay cuts the link at the daemon's first word after the
 /// file changed, so the change is on disk each time.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reply_lost_after_the_host_saved_the_change_is_an_unconfirmed_outcome_and_exits_8() {
     let host = Host::start_behind_a_relay_that_loses_a_reply().await;
