@@ -73,6 +73,7 @@ pub mod hold;
 pub mod host_restart;
 pub mod host_stop;
 pub mod import;
+pub mod launch;
 pub mod login_item;
 pub mod machine;
 pub mod mouse;

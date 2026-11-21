@@ -44,6 +44,7 @@ worker directly for what a session owns.
 | `kr pair [invite/confirm/cancel/status]` | `kr p` | Pair a device: issue an invitation, approve the device that answers it, withdraw one, or read one |
 | `kr project [list/init/clone/adopt]` | — | An environment's source repositories: list them, create one, clone one, or register a checkout that exists |
 | `kr workspace [list/create/remove]` | — | The shared or isolated working copies of a repository. A live session is never moved |
+| `kr launch [list/add/remove]` | — | The commands the launch buttons offer beside the installed agents: list them, save one, or remove one |
 | `kr changeset [capture/read/test-reports/materialize]` | — | Capture an exact version of a workspace's work, read one, read the test reports of its runs, or write one out on its own |
 | `kr diff [read/apply/revert]` | — | Read changes, or apply or revert a change-set version at a destination you name |
 | `kr workflow rearm <causal-root> --grant <id>` | — | Give a causal chain of automation workflows whose budget ran out a new budget, and continue it |
@@ -2017,6 +2018,76 @@ the preview cannot promise.
 A removal keeps what the workspace still holds, which is its uncommitted work, the change sets
 pinned against it and review evidence. It lists them and leaves the workspace waiting, and
 `--remove-retained` removes them too. The tree of a shared workspace is never removed.
+
+## `kr launch`
+
+| Command | What it does |
+| --- | --- |
+| `kr launch list` | Lists the launch commands saved on this host |
+| `kr launch add <label> -- <program> [arguments...]` | Saves a launch command, or replaces the command that has the same label |
+| `kr launch remove <label>` | Removes the launch command with this label |
+
+A saved launch command is a label, a program and its arguments. The control daemon keeps the list
+of an environment in `launch-commands.json` in that environment's state directory, and the
+companion shows each command as a button under "Saved commands", beside the installed agents. A
+button never starts anything by itself: pressing it types the command at the session's prompt, and
+only where the prompt is verified and empty and the person holds the keys.
+
+The host decides every rule, and `kr` prints the host's sentence as the host wrote it. A label has
+1 to 48 characters. A program has 1 to 512 bytes. A command has at most 16 arguments of at most 512
+bytes each, and an argument may be empty. A command may use at most 3,072 bytes in all, label
+included, and a host holds 32 commands. No field may hold a control, format, invisible or
+line-break character; the refusal names the first one by its position and its code point, for
+example `Character 3 of the label is U+202E, which is not allowed.` A label is unique without
+regard to case: saving a label that exists replaces that command in its place and keeps the new
+spelling.
+
+The program and each argument are kept and typed exactly as written. They are never joined into
+one string, and a leading `~`, a `$VARIABLE`, a pipe or a redirection is not expanded. On bash,
+zsh, fish and sh every word is single-quoted when it is typed, so the shell finds the program
+itself and the arguments reach it as they were saved. POSIX shells split the words, so the vector
+is exact. On Windows a program parses its own command line, and Windows PowerShell 5.1 drops an
+empty argument and changes quotes inside an argument; the companion's form shows what it will
+type.
+
+A command is saved as written and shown to this host's owner devices. Do not put a secret in one:
+when its button is pressed the command is typed in the terminal, where anyone who can see that
+terminal or its history can read it.
+
+`list`, `add` and `remove` refuse inside a session, because the list is typed into a terminal later
+and what `list` prints goes into a session's output, which its worker keeps and an agent in it can
+read. The guard stops an accident. It is not isolation from other code that runs as this account,
+which can reach the daemon's local socket and the file.
+
+A write reads the list and sends its change with the revision it read, and `kr` never sends it
+again by itself:
+
+- A confirmed save or removal exits 0, including a save that asks for what the list already holds
+  (`The launch command "x" is already saved as written.`) and a removal of a label that is not
+  there (`No launch command is named "x".`).
+- A write that the host did not apply because the list moved prints
+  `The saved launch commands changed before this request could apply. Run the command again.`,
+  with the list as it now stands, and exits 8. Nothing was applied. Running the command again
+  applies it against the new list.
+- A write whose outcome the host could not confirm prints
+  `The host could not confirm the change. Run kr launch list to check the current list.` and exits
+  8. It says nothing of what the list holds now.
+- A rule the host refuses, a refusal of the host, and the refusal inside a session exit 8. A
+  usage mistake exits 2, and a host that is not running exits 3.
+- A file the host cannot read stops all three commands, never replaces the file, and names it:
+  `The saved launch commands could not be read: <path>. Move that file away, then add the commands
+  again.`
+
+`kr launch list` prints a line for each command, `label: "program" "argument 1" ...`, each word in
+double quotes with `\` and `"` escaped. `--json` prints `{ "ok": true, "revision": <number>,
+"commands": [ { "label", "program", "arguments" } ] }`. For `add` and `remove` it prints the answer
+as the host wrote it: `applied`, `changed` and `replaced` for `add`, `applied` and `removed` for
+`remove`, then `revision` and `commands`. A stale or unconfirmed write also carries `ok: false`,
+`code` (`RESYNC_REQUIRED` or `OUTCOME_UNKNOWN`), `message` and `exit_code`.
+
+A paired device with `host.manage` may list; saving and removing are possible only on the local
+connection. A rollback to a release that does not know the list leaves the file as it is and hides
+the buttons until the next update.
 
 ## `kr changeset` and `kr diff`
 
