@@ -425,6 +425,24 @@ describe('the files on the draft go with the prompt that names it', () => {
       expect(controls.pairedUploads.ended).toEqual([])
     })
     expect(screen.getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+    // The person is told, in the application's own words, that it was not removed.
+    expect(await screen.findByText('The host is not connected')).toBeInTheDocument()
+  })
+
+  it('says the file was not removed when the refusal of the end carries no words', async () => {
+    const { controls, person } = await open()
+    await pick(person, 'one.pdf')
+    const first = await started(controls)
+    act(() => {
+      controls.pairedUploads.finish(first)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+    })
+    controls.pairedUploads.refuseNextEnd({ code: 'HOST_NOT_CONFIGURED', message: '' })
+    await person.click(screen.getByRole('button', { name: /^Remove one.pdf/ }))
+    expect(await screen.findByText('one.pdf was not removed.')).toBeInTheDocument()
+    expect(screen.getByTestId('upload-line')).toHaveTextContent('Added to this draft')
   })
 
   it('ends the draft when a bound file is removed, and takes every file bound to it off the composer', async () => {

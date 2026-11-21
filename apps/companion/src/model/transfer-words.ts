@@ -45,6 +45,13 @@ export const DRAFT_GONE_FOR_TEXT =
 /** This device keeps no draft for the session a text was for. */
 export const NO_DRAFT = 'this device keeps no draft for this session: add a file to it first'
 
+/**
+ * What the application says when the draft the device keeps for a session cannot be read. It comes
+ * with the code of a missing right, so it is shown in its own words and not as a right the device lacks.
+ */
+export const DRAFT_UNREADABLE =
+  'this device keeps a draft for this session that this release cannot read: another release wrote it, or it is damaged'
+
 /** The draft this device kept for the session is of a later release. */
 export const NEWER_DRAFT =
   'this device keeps a draft for this session in a format this release does not read: update the application to use it'
@@ -116,7 +123,8 @@ const APPLICATION_WORDS: readonly (readonly [string, RefusalKind])[] = [
   [CHANGED_AGAIN, 'other'],
   [CREATE_PENDING, 'other'],
   [DISCARD_PENDING, 'other'],
-  [UPDATE_THE_HOST_TO_END_A_DRAFT, 'other']
+  [UPDATE_THE_HOST_TO_END_A_DRAFT, 'other'],
+  [DRAFT_UNREADABLE, 'other']
 ]
 
 /**
@@ -153,6 +161,12 @@ export function refusalOf(failure: unknown): Refusal {
     default:
       return { kind: 'other', words: sentence(words) }
   }
+}
+
+/** The words a failure carries, or none where it carries only the generic ones every failure gets. */
+export function wordsOf(failure: unknown): string {
+  const refusal = refusalOf(failure)
+  return refusal.kind === 'other' && refusal.words === sentence(failureWords(undefined)) ? '' : refusal.words
 }
 
 /** Said once when the sign-in changed and the files this window held for the earlier one were taken off the screen. */
