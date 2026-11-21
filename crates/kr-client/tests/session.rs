@@ -453,7 +453,42 @@ fn answer_read(request: &kr_protocol::envelope::Request) -> ParamsValue {
     if request.method.as_str() == kr_protocol::method::Method::ShellLaunchSurface.entry().name {
         return ParamsValue::from_typed(&launch_surface()).expect("a result");
     }
+    if request.method.as_str()
+        == kr_protocol::method::Method::ShellLaunchCommandsList
+            .entry()
+            .name
+    {
+        return ParamsValue::from_typed(&launch_commands()).expect("a result");
+    }
+    if request.method.as_str() == kr_protocol::method::Method::OrganisationList.entry().name {
+        return ParamsValue::from_typed(&kr_protocol::organisation::OrganisationListResult {
+            enrolments: Vec::new(),
+            effective_adapter_allowlist: Nullable::null(),
+            adapter_allowlist_in_force: Nullable::null(),
+            exclusive: false,
+            clock_trusted: true,
+            exclusive_events: Vec::new(),
+            host_device: kr_protocol::organisation::HostDeviceView {
+                device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([9; 16])),
+                authorisation_key: kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]),
+            },
+            workers_without_local_enforcement: Vec::new(),
+        })
+        .expect("a result");
+    }
     ParamsValue::from_typed(&SessionList { count: 2 }).expect("a result")
+}
+
+/// The launch commands a host that serves them answers with.
+fn launch_commands() -> kr_protocol::launch_commands::ShellLaunchCommandsListResult {
+    kr_protocol::launch_commands::ShellLaunchCommandsListResult {
+        revision: U64::new(41),
+        commands: vec![kr_protocol::launch_commands::NamedLaunch {
+            label: "Claude".to_owned(),
+            program: "claude".to_owned(),
+            arguments: vec!["--resume".to_owned(), String::new()],
+        }],
+    }
 }
 
 /// The session `session.read` answers about: live, with nothing set that a read here decides on.
@@ -1540,6 +1575,162 @@ async fn a_launch_surface_refused_as_unsupported_is_not_served_and_any_other_ref
         before + 1,
         "a refusal that is not about the method is not probed"
     );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a host that serves the saved launch commands answers the read, and no probe is
+/// made for it.
+#[tokio::test]
+async fn a_host_that_serves_the_launch_commands_answers_them_and_is_not_probed() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    assert_eq!(
+        session
+            .read_launch_commands()
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchCommandsRead::Served(launch_commands())
+    );
+    assert_eq!(
+        script.reads.load(Ordering::Acquire),
+        1,
+        "one read, no probe"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a host that does not list the method refuses it as not permitted while it answers
+/// the host-level read under the same right. The commands are then not served, the first read was
+/// asked once more, and nothing is raised to the holder: the connection was not withdrawn.
+#[tokio::test]
+async fn a_host_that_does_not_list_the_launch_commands_does_not_serve_them_and_raises_nothing() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_method_with.lock().await = Some((
+        kr_protocol::method::Method::ShellLaunchCommandsList,
+        ErrorCode::PermissionDenied,
+    ));
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    assert_eq!(
+        session
+            .read_launch_commands()
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchCommandsRead::NotServed
+    );
+    assert_eq!(
+        script.reads.load(Ordering::Acquire),
+        3,
+        "the read, the probe, and the read once more"
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
+            .await
+            .is_err(),
+        "a host too old for the method did not withdraw the connection"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a connection without the right is refused the commands and the host-level read
+/// alike. That is the connection's own refusal, told as refused and never as an old host, and it
+/// raises nothing: a device that holds a share only is refused every time it asks.
+#[tokio::test]
+async fn a_connection_without_the_right_is_refused_the_launch_commands_and_not_told_the_host_is_old()
+ {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::PermissionDenied, 2));
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    assert_eq!(
+        session
+            .read_launch_commands()
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchCommandsRead::Refused
+    );
+    assert_eq!(
+        script.reads.load(Ordering::Acquire),
+        2,
+        "the read and the probe"
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, session.standing_in_doubt())
+            .await
+            .is_err(),
+        "a refusal of a right the connection never held raises nothing"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: a host that refuses the commands once and then answers is served: the first
+/// refusal was not about the method.
+#[tokio::test]
+async fn launch_commands_refused_once_and_then_answered_are_served() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::PermissionDenied, 1));
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    assert_eq!(
+        session
+            .read_launch_commands()
+            .await
+            .expect("the read is answered"),
+        kr_client::LaunchCommandsRead::Served(launch_commands())
+    );
+    assert_eq!(
+        script.reads.load(Ordering::Acquire),
+        3,
+        "the read, the probe, and the read once more"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-13.11: any other refusal is returned as it is, and no probe is made for it.
+#[tokio::test]
+async fn a_refusal_of_the_launch_commands_that_is_not_about_the_right_is_returned_unprobed() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_method_with.lock().await = Some((
+        kr_protocol::method::Method::ShellLaunchCommandsList,
+        ErrorCode::InvalidArgument,
+    ));
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    let refused = session
+        .read_launch_commands()
+        .await
+        .expect_err("the host refuses for another reason");
+    assert!(
+        matches!(&refused, ClientError::Host(error) if error.code == ErrorCode::InvalidArgument),
+        "{refused:?}"
+    );
+    assert_eq!(script.reads.load(Ordering::Acquire), 1, "no probe");
 
     session.close();
     serving.abort();

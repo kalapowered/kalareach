@@ -838,6 +838,10 @@ pub struct Controller {
     /// the thread. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     inside_the_launch_commands_commit: crate::attention::Pause,
+    /// How many reads of the saved launch commands this daemon has answered, which a test waits on
+    /// to know that a client has read the list. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    launch_commands_listed: std::sync::atomic::AtomicU64,
     /// Where this host's own tests stop an environment refresh once the platform has answered and
     /// the record has taken the answer in, before the admission is asked again to open a bridge,
     /// so that a fence can land in between. The pause holds the thread. Compiled away in every
