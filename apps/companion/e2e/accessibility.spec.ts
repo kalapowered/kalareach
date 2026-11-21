@@ -378,11 +378,6 @@ async function pressPage(
     { messages: options.only ?? [...PRESS_MESSAGES, ...(options.extra ?? [])], session: SESSION, shipped: options.shipped ?? false }
   )
   await page.locator('.m-node .md-link').last().waitFor({ state: 'attached' })
-  // iOS and Android draw a scroll indicator over the content and give it no taps. The desktop engine's
-  // overlay scroll bar keeps a strip at the pane's right edge that takes the hit and sends no click (a tap
-  // there gets none whichever listeners the page has), and no property of the pane tells the page where
-  // it is, so the cases show the page without it.
-  await page.addStyleTag({ content: '.m-pane { scrollbar-width: none; }' })
   await watchClicks(page)
 }
 
@@ -716,6 +711,194 @@ test.describe('the links and the controls of a message in the pane', () => {
         await page.waitForTimeout(400)
         await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
         await expect(page.getByTestId('terminal-ended')).toHaveCount(0)
+      })
+    }
+  }
+})
+
+/** Where every line and word of a conversation lies, in the pane's own coordinates, and how far the pane scrolls sideways. */
+interface Placed {
+  readonly messages: number[][]
+  readonly words: number[][]
+  readonly across: number[]
+}
+
+const placedNow = (page: Page): Promise<Placed> =>
+  page.evaluate(() => {
+    const pane = document.querySelector<HTMLElement>('.m-pane')
+    if (!pane) throw new Error('the page has no pane')
+    const room = pane.getBoundingClientRect()
+    const at = (rect: DOMRect): number[] => [rect.left - room.left, rect.top - room.top + pane.scrollTop, rect.width, rect.height]
+    const messages = Array.from(document.querySelectorAll('.m-node')).map((node) => at(node.getBoundingClientRect()))
+    const words = Array.from(document.querySelectorAll('.m-node .md-link-label')).flatMap((label) => {
+      const range = document.createRange()
+      range.selectNodeContents(label)
+      return Array.from(range.getClientRects()).map(at)
+    })
+    return { messages, words, across: [pane.scrollWidth, pane.clientWidth] }
+  })
+
+/** The first difference between two lists of rectangles beyond a layout's rounding, or null. */
+function firstDifference(what: string, before: readonly number[][], after: readonly number[][]): string | null {
+  if (before.length !== after.length) return `${what}: ${String(before.length)} rectangles, then ${String(after.length)}`
+  for (let index = 0; index < before.length; index += 1) {
+    const a = before[index] ?? []
+    const b = after[index] ?? []
+    if (a.some((value, place) => Math.abs(value - (b[place] ?? NaN)) > 0.05)) return `${what} ${String(index)}: [${a.join(', ')}], then [${b.join(', ')}]`
+  }
+  return null
+}
+
+const AT_END = 'https://example.org/at-end'
+
+// KR-REQ-13.19: the box that a screen reader reads for a link of a message is the least size high, and the
+// message lies where it would with no box: the room around the words takes no tap, so a link beside or
+// above another keeps its own taps, and the pane the words end at has no scroll bar over them.
+test.describe('the box of a link in a message', () => {
+  test.use({ hasTouch: true })
+  for (const surface of SURFACES) {
+    for (const [size, ratio] of SIZES) {
+      test(`is at least the least size high for every link, and no more than the page gives it, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio })
+        const boxes = await page.evaluate(() =>
+          Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link')).map((link) => {
+            const box = link.getBoundingClientRect()
+            return { href: link.title, width: box.width, height: box.height }
+          })
+        )
+        expect(boxes.length, 'links on the page').toBeGreaterThan(20)
+        const least = FINGER[surface]
+        expect(
+          boxes.filter((box) => box.height < least - 0.01),
+          `links whose box is under ${String(least)} px high`
+        ).toEqual([])
+        // The width of a link narrower than the least size is its words': room beside them would scroll the pane sideways.
+        test.info().annotations.push({ type: 'narrow', description: boxes.filter((box) => box.width < least).map((box) => `${box.href} ${String(Math.round(box.width))}`).join(', ') })
+      })
+
+      test(`leaves every message, line and word, and the pane’s sideways scroll, where a button with no box has them, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio })
+        const boxed = await placedNow(page)
+        await page.addStyleTag({ content: '.m-node .md-link { padding: 0 !important; margin: 0 !important; }' })
+        const bare = await placedNow(page)
+        expect(boxed.words.length, 'lines of words on the page').toBeGreaterThan(20)
+        expect(firstDifference('message', boxed.messages, bare.messages), 'a message that moved').toBeNull()
+        expect(firstDifference('words', boxed.words, bare.words), 'words that moved').toBeNull()
+        expect(boxed.across, 'the pane’s scroll width and client width').toEqual(bare.across)
+      })
+
+      test(`gives the words of every link their own tap though a box of a link on the next line lies over them, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio })
+        const found = await page.evaluate(() => {
+          let covered = 0
+          const lost: string[] = []
+          const links = Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link'))
+          const room = (document.querySelector('.m-pane') ?? document.body).getBoundingClientRect()
+          for (const own of links) {
+            own.scrollIntoView({ block: 'center' })
+            const range = document.createRange()
+            range.selectNodeContents(own.querySelector('.md-link-label') ?? own)
+            // A link of many lines is taller than the pane: only the lines that the pane shows have a point to hit.
+            const shown = Array.from(range.getClientRects()).filter(
+              (each) => each.width > 0 && each.height > 0 && each.top >= room.top && each.bottom <= room.bottom
+            )
+            for (const rect of shown) {
+              // The middle of the words, and their lower part, which the padded box of a link on the next line reaches.
+              for (const y of [rect.top + rect.height / 2, rect.bottom - 2]) {
+                const x = rect.left + rect.width / 2
+                for (const other of links) {
+                  if (other === own) continue
+                  const box = other.getBoundingClientRect()
+                  if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) covered += 1
+                }
+                const hit = document.elementFromPoint(x, y)
+                if (hit?.closest('.md-link') !== own) lost.push(`${own.title} at ${String(Math.round(x))},${String(Math.round(y))}: ${hit ? `${hit.tagName.toLowerCase()}.${String(hit.className)}` : 'nothing'}`)
+              }
+            }
+          }
+          return { covered, lost }
+        })
+        // At the largest text size a line is higher than the least size and no box reaches past it: nothing lies over.
+        if (ratio === 1) expect(found.covered, 'words that the box of another link lies over: the case is vacuous where none does').toBeGreaterThan(0)
+        expect(found.lost, 'words whose point does not hit their own link').toEqual([])
+      })
+    }
+
+    test(`opens the link whose words end at the pane's right edge, from its middle and from 2 px inside its end, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: [...EDGES[1][2]] })
+      await page.addStyleTag({ content: ".m-node p:has(.md-link[title$='at-end']) { text-align: justify; text-align-last: justify; }" })
+      const words = await wordsOf(page, AT_END)
+      const pane = await paneBox(page)
+      expect(pane.right - words.right, 'the gap between the words’ end and the pane’s right edge').toBeLessThan(1)
+      for (const [where, x] of [
+        ['the middle', words.x],
+        ['2 px inside the end', words.right - 2]
+      ] as const) {
+        expect((await tapAndRead(page, x, words.y)).opened, `links opened by a tap on ${where} of the words`).toEqual([AT_END])
+      }
+    })
+
+    for (const theme of ['light', 'dark'] as const) {
+      test(`rings the words of a link the keyboard has, in the accent and 3:1 to its surface, in the ${theme} theme on ${surface}`, async ({ page }) => {
+        await pressPage(page, surface, {})
+        await page.evaluate((value) => {
+          document.documentElement.dataset.theme = value
+        }, theme)
+        // The keyboard has the page's focus: a key goes first, so that the script's focus below is the keyboard's
+        // (WebKit's Tab does not stop on a button, and a script's focus shows the ring only after a key).
+        await page.keyboard.press('Tab')
+        await page.evaluate(() => {
+          document.querySelector<HTMLElement>('.m-node .md-link')?.focus()
+        })
+        const ring = await page.evaluate(() => {
+          const link = document.activeElement
+          const label = link?.querySelector('.md-link-label')
+          if (!(link instanceof HTMLElement) || !label) throw new Error('no link has the focus')
+          const parse = (color: string): number[] => (color.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number)
+          const luminance = (rgb: number[]): number => {
+            const [r = 0, g = 0, b = 0] = rgb.map((value) => {
+              const unit = value / 255
+              return unit <= 0.03928 ? unit / 12.92 : ((unit + 0.055) / 1.055) ** 2.4
+            })
+            return 0.2126 * r + 0.7152 * g + 0.0722 * b
+          }
+          const probe = document.createElement('span')
+          probe.style.color = 'var(--accent)'
+          document.body.append(probe)
+          const accent = getComputedStyle(probe).color
+          probe.remove()
+          let surface = 'rgba(0, 0, 0, 0)'
+          for (let up: Element | null = label; up; up = up.parentElement) {
+            const color = getComputedStyle(up).backgroundColor
+            if (!/rgba\(.*,\s*0\)$/.test(color) && color !== 'transparent') {
+              surface = color
+              break
+            }
+          }
+          const lighter = Math.max(luminance(parse(accent)), luminance(parse(surface)))
+          const darker = Math.min(luminance(parse(accent)), luminance(parse(surface)))
+          const own = getComputedStyle(link)
+          const words = getComputedStyle(label)
+          return {
+            padded: own.outlineStyle,
+            style: words.outlineStyle,
+            width: words.outlineWidth,
+            color: words.outlineColor,
+            accent,
+            contrast: (lighter + 0.05) / (darker + 0.05)
+          }
+        })
+        expect(ring.padded, 'the outline of the padded box').toBe('none')
+        expect(ring.style, 'the outline of the words').toBe('solid')
+        expect(ring.width, 'the width of the ring').toBe('2px')
+        expect(ring.color, 'the colour of the ring').toBe(ring.accent)
+        expect(ring.contrast, 'the ring’s contrast to the surface under it').toBeGreaterThanOrEqual(3)
       })
     }
   }

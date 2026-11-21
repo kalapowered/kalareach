@@ -603,10 +603,21 @@
   justify-content: center;
 }
 
+/*
+ * The conversation scrolls inside its pane, and the pane shows no scroll bar. A bar that is drawn over the
+ * content keeps a strip at the pane's right edge that takes the hit of a touch and sends no click, so a
+ * tap on words that end at the edge (a link's, flush with it) opens nothing. The other scrollers of this
+ * sheet hide theirs for the same reason; the page needs no bar to scroll with a finger.
+ */
 .m-pane {
   overflow-y: auto;
   overscroll-behavior-y: contain;
   min-block-size: 0;
+  scrollbar-width: none;
+}
+
+.m-pane::-webkit-scrollbar {
+  display: none;
 }
 
 /*
@@ -693,6 +704,42 @@
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--faint);
+}
+
+/*
+ * The box of a link, as high as the least size (`--target`, 44 points on iOS and 48 dp on Android): the
+ * bounds that VoiceOver and TalkBack read for the link are the button's own box, and a link's words are
+ * about a line high. The button is padded out above and below by half of what its line lacks of the least
+ * size (and a twentieth of a pixel, so that an engine's rounding to 1/64 px never leaves the box under it),
+ * and the margin takes the same room back, so the line, the words and the paragraph lie where they would
+ * with no padding. Beside the words there is no padding: a box that reaches past the end of a line scrolls
+ * the pane sideways, and a message's own wide content (a table, a long word) already does, so the width of a
+ * link narrower than the least size is the words' width.
+ *
+ * The padded room takes no tap: the button has no hit of its own and its words, the label, have theirs.
+ * A box that took taps would lie over the link on the line above it, and the later link would win a tap on
+ * the lower part of the earlier one's words. A tap on the room goes to the text under it, and `useLinkPress`
+ * says which link's it is, by the nearest words. The ring that shows the focus is drawn round the words, not
+ * the padded box, which would lie over the lines above and below.
+ */
+.m-node .md-link {
+  --md-link-pad: max(0px, calc((var(--target) - 1lh) / 2 + 0.05px));
+  padding-block: var(--md-link-pad);
+  margin-block: calc(-1 * var(--md-link-pad));
+  pointer-events: none;
+}
+
+.m-node .md-link-label {
+  pointer-events: auto;
+}
+
+.m-node .md-link:focus-visible {
+  outline: none;
+}
+
+.m-node .md-link:focus-visible .md-link-label {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /*
