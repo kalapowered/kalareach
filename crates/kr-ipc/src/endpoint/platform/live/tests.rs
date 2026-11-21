@@ -2,7 +2,7 @@
 //! removed, and that a live listener keeps the file fresh.
 
 use std::fs::File;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::time::{Duration, SystemTime};
 
 use rustix::io::Errno;
@@ -235,5 +235,185 @@ async fn a_live_listener_keeps_its_lock_file_fresh() {
     assert!(
         modified > Duration::from_secs(3 * 24 * 60 * 60),
         "no refresh after the listener ended: {modified:?}"
+    );
+}
+
+/// Makes a named pipe at `path`.
+fn make_pipe(path: &std::path::Path) {
+    let status = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(path)
+        .status()
+        .expect("mkfifo starts");
+    assert!(status.success(), "a named pipe is made");
+}
+
+/// Runs `call` on a thread of its own and gives what it returned, or `None` when it did not return
+/// within five seconds. A call that waits for a peer of the pipe at `pipe` is released from here,
+/// by opening the pipe's other end, and its thread is collected before this returns.
+fn returns<T: Send + 'static>(
+    pipe: &std::path::Path,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let _ = sender.send(call());
+    });
+    let value = receiver.recv_timeout(Duration::from_secs(5)).ok();
+    let _peer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).unwrap_or_default())
+        .open(pipe);
+    thread.join().expect("the call's thread");
+    value
+}
+
+/// Puts a link at `link` that leads to `target`.
+fn link(target: &std::path::Path, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).expect("a link");
+}
+
+/// A pipe where the lock file belongs is not read, and the read does not wait for anybody: it
+/// says the lock cannot be read.
+#[test]
+fn a_pipe_at_the_lock_file_is_unreadable_and_the_read_does_not_wait() {
+    let folder = PrivateTempDir::create();
+    let socket = folder.path().join("a.sock");
+    let lock = super::path_of(&socket);
+    make_pipe(&lock);
+    let evidence = returns(&lock, move || super::read(&socket, (1, 2)));
+    assert_eq!(
+        evidence,
+        Some(Evidence {
+            lock: Lock::Unreadable,
+            record_matches: false
+        })
+    );
+}
+
+/// A link where the lock file belongs is not followed: a record in the file it leads to, that names
+/// the socket and the file it is in, is not read as this socket's record.
+#[test]
+fn a_link_at_the_lock_file_is_unreadable_and_is_not_followed() {
+    let folder = PrivateTempDir::create();
+    let socket = folder.path().join("a.sock");
+    let target = folder.path().join("target");
+    let file = file_in(&folder, "target");
+    let record = Record {
+        socket: (1, 2),
+        file_inode: file.metadata().expect("metadata").ino(),
+    };
+    std::fs::write(&target, record.text()).expect("a record");
+    link(&target, &super::path_of(&socket));
+    assert_eq!(
+        super::read(&socket, (1, 2)),
+        Evidence {
+            lock: Lock::Unreadable,
+            record_matches: false
+        }
+    );
+}
+
+/// A listener does not take a lock file that is a pipe, and does not wait for anybody to do so.
+#[test]
+fn a_pipe_at_the_lock_file_is_refused_to_a_listener_without_waiting() {
+    let folder = PrivateTempDir::create();
+    let socket = folder.path().join("a.sock");
+    let lock = super::path_of(&socket);
+    make_pipe(&lock);
+    let taken = returns(&lock, move || {
+        Hold::take(&socket)
+            .map(|_| ())
+            .map_err(|error| error.kind())
+    });
+    assert_eq!(taken, Some(Err(std::io::ErrorKind::InvalidInput)));
+}
+
+/// A listener does not take a link as its lock file: the file the link leads to keeps its text and
+/// is not locked, and a link that leads nowhere makes no file.
+#[test]
+fn a_link_at_the_lock_file_is_refused_to_a_listener_and_leaves_its_target_alone() {
+    let folder = PrivateTempDir::create();
+    let socket = folder.path().join("a.sock");
+    let target = folder.path().join("target");
+    std::fs::write(&target, "unrelated\n").expect("a file");
+    link(&target, &super::path_of(&socket));
+    assert!(Hold::take(&socket).is_err(), "a link is not the lock file");
+    assert_eq!(std::fs::read(&target).expect("the target"), b"unrelated\n");
+    let other = file_in(&folder, "other");
+    assert!(
+        rustix::fs::flock(&other, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok(),
+        "nothing locked another file"
+    );
+
+    let dangling = folder.path().join("b.sock");
+    let nowhere = folder.path().join("nowhere");
+    link(&nowhere, &super::path_of(&dangling));
+    assert!(
+        Hold::take(&dangling).is_err(),
+        "a link to nothing is not made good"
+    );
+    assert!(!nowhere.exists(), "no file was made behind the link");
+}
+
+/// A pipe put where the lock file was, after the listener took it, does not hold the record's
+/// self-test, and no record is left.
+#[tokio::test]
+async fn a_pipe_put_at_the_lock_file_after_the_lock_is_taken_leaves_no_record_and_no_wait() {
+    let folder = PrivateTempDir::create();
+    let socket = folder.path().join("a.sock");
+    let mut hold = Hold::take(&socket).expect("a lock");
+    let lock = super::path_of(&socket);
+    make_pipe(&folder.path().join("pipe"));
+    std::fs::rename(folder.path().join("pipe"), &lock).expect("the pipe replaces the file");
+    let handle = tokio::runtime::Handle::current();
+    let published = returns(&lock, move || {
+        let _entered = handle.enter();
+        hold.publish((1, 2));
+        hold
+    });
+    assert!(
+        published.is_some(),
+        "the publish waited for a peer of the pipe"
+    );
+    let hold = published.expect("the publish returned");
+    assert_eq!(
+        hold.file.read_at(&mut [0_u8; 8], 0).expect("a read"),
+        0,
+        "no record"
+    );
+}
+
+/// A link put where the lock file was, that leads to the very file the listener holds, is not the
+/// listener's lock: the self-test does not follow it and no record is left.
+#[tokio::test]
+async fn a_link_put_at_the_lock_file_after_the_lock_is_taken_leaves_no_record() {
+    let folder = PrivateTempDir::create();
+    let socket = folder.path().join("a.sock");
+    let mut hold = Hold::take(&socket).expect("a lock");
+    let lock = super::path_of(&socket);
+    let moved = folder.path().join("moved");
+    std::fs::rename(&lock, &moved).expect("the file moves");
+    link(&moved, &lock);
+    hold.publish((1, 2));
+    assert_eq!(std::fs::read(&moved).expect("the file"), b"", "no record");
+}
+
+/// A name that now leads to another file that somebody holds is not the listener's lock either:
+/// the self-test counts only the file the listener itself locked.
+#[tokio::test]
+async fn a_name_that_leads_to_another_held_file_is_not_this_listeners_self_test() {
+    let folder = PrivateTempDir::create();
+    let socket = folder.path().join("a.sock");
+    let mut hold = Hold::take(&socket).expect("a lock");
+    let other = file_in(&folder, "other");
+    rustix::fs::flock(&other, rustix::fs::FlockOperation::NonBlockingLockShared)
+        .expect("a lock held by another file");
+    std::fs::rename(folder.path().join("other"), super::path_of(&socket)).expect("the swap");
+    hold.publish((1, 2));
+    assert_eq!(
+        hold.file.read_at(&mut [0_u8; 8], 0).expect("a read"),
+        0,
+        "no record"
     );
 }
