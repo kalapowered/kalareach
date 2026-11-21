@@ -91,7 +91,7 @@ function groupsOf(items: readonly Item[]): { links: number[]; row: boolean }[] {
 /** Whether every group of links whose heights reach one another is a row. */
 const allRows = (items: readonly Item[]): boolean => groupsOf(items).every((group) => group.row)
 
-/** Lines of links laid out each on its own, 24 px apart (the boxes are 10 high: neighbouring lines reach one another, lines two apart do not), so that links can lie over one another. */
+/** Lines of links laid out each on its own, 6 px apart (the boxes are 10 high: neighbouring lines reach one another, lines two apart do not), so that links can lie over one another. */
 function layoutOf(seed: number, rows: number): Line {
   const next = generator(seed)
   const between = (low: number, high: number): number => low + Math.floor(next() * (high - low + 1))

@@ -128,7 +128,7 @@ export function packRooms(items: readonly Item[], least: number, slack: number =
     for (const index of [...others, ...controls]) {
       const other = items[index]
       if (index === at || !reach(other.box, item.box)) continue
-      // The box of a link of another line as it is now, or the middle of the gap to its words where it is short and not yet packed.
+      // The box of a link of another line as it is now (the second pass), or, in the first pass, the middle of the gap to its words where it is short, packed or not.
       const middle = !current && other.link && short(index)
       const grown = current && other.link ? rooms[index] : NONE
       if (other.box.right <= item.box.left) left = Math.max(left, middle ? (other.box.right + item.box.left) / 2 : other.box.right + grown.right)
