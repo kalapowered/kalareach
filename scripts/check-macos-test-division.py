@@ -217,37 +217,151 @@ def check(locked):
     return 0
 
 
-# The packages a leg's build gives other features than the one step that ran the whole workspace
-# gave them, each with the reason, keyed by package and leg. A leg builds with the features its own
-# packages ask for: a feature only a package of the other leg asks for is left out of the build, as
-# it is of the product's own programs. A package of the leg that relied on a feature it does not ask
-# for would not build, so a difference below changes what a case does only where the feature gates
-# code that a case turns on, and the first-party ones are read for that.
-FEATURE_DIFFERENCES = {
-    ("kr-crypto", "tests-2"): "`testing` is asked for by kr-controller's tests only; it adds a stand-in that acts only where a case installs it",
-    ("kr-protocol", "tests-2"): "`testing` is asked for by kr-controller's and kr-ipc's tests only; it adds two items in retained.rs that only those tests call",
-    ("kr-transfer", "tests-2"): "`testing` is turned on by kr-transfer's own tests, which are `tests-1`'s; it adds seams that act only where a case sets them",
-    ("kr-changeset", "tests-2"): "`fault-injection` is turned on by kr-changeset's own tests and kr-controller's, both `tests-1`'s; its hooks act only where a case arms them",
-    ("kr-client", "tests-2"): "`default` (`terminal`) is asked for by kr-controller only; a `tests-2` package that uses the terminal projection asks for `terminal` itself",
-    ("kr-plugin-sdk", "tests-1"): "`testing` is turned on by kr-plugin-sdk's own tests, which are `tests-2`'s; it adds one item in validate.rs that only those tests call",
-    ("kr-shell-integration", "tests-1"): "`testing` is asked for by kr-cli's tests only; it adds seams in the terminal profile code that act only where a case sets them",
-}
-_THIRD_PARTY = (
-    "a third-party crate whose extra features only packages of the other leg ask for; no package "
-    "of this leg's own graph asks for them"
+# What a leg's build has less of than the one step that ran the whole workspace: each feature, keyed
+# by package, leg, direction (`less`, which is all there is today) and feature, with the reason that
+# it does not change what a case does. A leg builds with the features of its own packages'
+# dependency graph, so a feature that only the other leg's packages ask for is left out of it, as it
+# is of the product's own programs. The reasons say what was read: a feature that only adds items
+# cannot change a case of a package that does not name them, and the ones that can change behaviour
+# without changing an item are named one by one, with the part of the leg that answers for them.
+# A difference with no entry here fails `features`; an entry that no longer differs is noted.
+OTHER = (
+    'asked for only by packages of the other leg; a leg package that used an item it gates would not compile, so for a feature that only adds items nothing changes; an effect on behaviour that leaves the interface alone was not traced'
 )
-for _leg, _packages in {
-    "tests-1": """bindgen bit-set bitflags block2 bumpalo dispatch2 foldhash hashbrown icu_properties
-        num-rational objc2 objc2-core-foundation object proc-macro2 regex regex-syntax rgb rmcp rustix
-        serde_json simdutf8 smallvec stable_deref_trait ureq uuid zlib-rs""",
-    "tests-2": """chrono displaydoc form_urlencoded hyper-util iroh iroh-metrics iroh-relay nom noq
-        noq-proto rcgen reqwest ring simdutf8 tower""",
-}.items():
-    for _package in _packages.split():
-        FEATURE_DIFFERENCES[(_package, _leg)] = _THIRD_PARTY
+MERGED = (
+    "the difference is in the merged view only: the target-only view shows none, so the leg's target copy has the features the whole workspace's has, and the difference is in a host copy (a build script's or a procedural macro's dependency) or in a copy that this leg does not build; not traced further"
+)
+OBJC2_ITEMS = (
+    'adds standard-library support or Objective-C exception catching to items that only a caller naming objc2 uses, and no package of tests-1 names objc2 in its manifest'
+)
+OBJECT_FORMATS = (
+    "readers and writers for other object file formats; the only reader in tests-1 (kr-project's boundary/macho.rs) gives every file that is not Mach-O, and every parse error, the same answer with or without them"
+)
+SERDE_CORE = (
+    "in the target-only view only: tests-2's target copy of serde_core lacks `default` (standard-library support the whole workspace turns on through a tests-1 package); the host copy has it, and nothing in tests-2 asks for an item that it gates"
+)
+
+FEATURE_ROWS = [
+    ('tests-1', 'bindgen', 'default logging prettyplease',
+     MERGED),
+    ('tests-1', 'bit-set', 'default',
+     MERGED),
+    ('tests-1', 'bitflags', 'serde serde_core',
+     OTHER),
+    ('tests-1', 'block2', 'default std',
+     OTHER),
+    ('tests-1', 'bumpalo', 'allocator-api2',
+     MERGED),
+    ('tests-1', 'dispatch2', 'block2 default libc std',
+     OTHER),
+    ('tests-1', 'foldhash', 'default std',
+     'decides how the hasher takes its seed; the order of a hash map is unspecified either way'),
+    ('tests-1', 'hashbrown', 'serde',
+     OTHER),
+    ('tests-1', 'icu_properties', 'default',
+     OTHER),
+    ('tests-1', 'kr-plugin-sdk', 'testing',
+     "turned on by kr-plugin-sdk's own tests, which are tests-2's; it adds one item in validate.rs that only those tests call"),
+    ('tests-1', 'kr-shell-integration', 'testing',
+     "asked for by kr-cli's tests only, which are tests-2's; it adds seams in the terminal profile code that act only where a case sets them"),
+    ('tests-1', 'num-rational', 'num-bigint-std',
+     OTHER),
+    ('tests-1', 'objc2', 'default exception',
+     OBJC2_ITEMS),
+    ('tests-1', 'objc2', 'disable-encoding-assertions',
+     "without it objc2 keeps its run-time check of a message's encoding, which can only panic in a `msg_send` call, and no package of tests-1 names objc2 in its manifest"),
+    ('tests-1', 'objc2-core-foundation', 'CFBase',
+     OTHER),
+    ('tests-1', 'object', 'coff elf pe write write_core write_std xcoff',
+     OBJECT_FORMATS),
+    ('tests-1', 'proc-macro2', 'span-locations',
+     "gives a macro's spans line and column numbers, which only a macro's diagnostics read, and no tests-1 case prints one"),
+    ('tests-1', 'regex', 'default perf perf-backtrack perf-cache perf-dfa perf-inline perf-literal perf-onepass unicode unicode-age unicode-bool unicode-case unicode-gencat unicode-script unicode-segment',
+     MERGED),
+    ('tests-1', 'regex-syntax', 'default',
+     OTHER),
+    ('tests-1', 'rgb', 'argb as-bytes bytemuck default grb',
+     OTHER),
+    ('tests-1', 'rmcp', 'client transport-child-process',
+     OTHER),
+    ('tests-1', 'rustix', 'pipe stdio',
+     OTHER),
+    ('tests-1', 'serde_json', 'float_roundtrip',
+     'only jsonschema asks for it, and only kr-codex-stand-in, a tests-2 package, pulls that in; without it tests-1 parses floats with the faster parser, which can differ from the exact one in the last place for some long inputs, and tests-1 parses only short decimals (0.0 and 2.5 in session_export.rs, two-decimal elapsed times in the Go report), which both read exactly'),
+    ('tests-1', 'serde_json', 'unbounded_depth',
+     'only cargo_metadata asks for it, through tauri-utils, a tests-2 dependency; it adds a method that lifts the depth limit where a caller calls it, no tests-1 code calls it, and the default limit of 128 holds either way'),
+    ('tests-1', 'simdutf8', 'public_imp',
+     OTHER),
+    ('tests-1', 'smallvec', 'serde',
+     'adds serialisation items that only a caller naming them uses, and no tests-1 case names them'),
+    ('tests-1', 'smallvec', 'union',
+     'changes how a small vector is laid out in memory, and no tests-1 case asserts the size of a type'),
+    ('tests-1', 'stable_deref_trait', 'alloc default std',
+     MERGED),
+    ('tests-1', 'ureq', '_ring _rustls _tls rustls rustls-no-provider rustls-webpki-roots',
+     MERGED),
+    ('tests-1', 'uuid', 'serde',
+     OTHER),
+    ('tests-1', 'zlib-rs', 'std',
+     MERGED),
+    ('tests-2', 'chrono', 'clock iana-time-zone winapi windows-link',
+     OTHER),
+    ('tests-2', 'displaydoc', 'default std',
+     MERGED),
+    ('tests-2', 'form_urlencoded', 'default',
+     OTHER),
+    ('tests-2', 'hyper-util', 'server service',
+     OTHER),
+    ('tests-2', 'iroh', 'test-utils',
+     OTHER),
+    ('tests-2', 'iroh-metrics', 'service',
+     OTHER),
+    ('tests-2', 'iroh-relay', 'server test-utils',
+     OTHER),
+    ('tests-2', 'kr-changeset', 'fault-injection',
+     "turned on by kr-changeset's own tests and kr-controller's, which are tests-1's; its hooks act only where a case arms them"),
+    ('tests-2', 'kr-client', 'default',
+     'tests-1 selects kr-client as a package, which gives it its default features; tests-2 selects other packages, and nothing there asks for `default`; the only feature `default` holds is `terminal`, which tests-2 still has, so nothing changes'),
+    ('tests-2', 'kr-crypto', 'testing',
+     "asked for by kr-controller's tests only, which are tests-1's; it adds a stand-in for the key store that acts only where a case installs it"),
+    ('tests-2', 'kr-protocol', 'testing',
+     "asked for by kr-controller's and kr-ipc's tests only, which are tests-1's; it adds two items in retained.rs that only those tests call"),
+    ('tests-2', 'kr-transfer', 'testing',
+     "turned on by kr-transfer's own tests, which are tests-1's; it adds seams that act only where a case sets them"),
+    ('tests-2', 'nom', 'default',
+     OTHER),
+    ('tests-2', 'noq', 'platform-verifier',
+     OTHER),
+    ('tests-2', 'noq-proto', 'platform-verifier',
+     OTHER),
+    ('tests-2', 'rcgen', 'x509-parser',
+     OTHER),
+    ('tests-2', 'reqwest', 'json',
+     OTHER),
+    ('tests-2', 'ring', 'std',
+     OTHER),
+    ('tests-2', 'serde_core', 'default',
+     SERDE_CORE),
+    ('tests-2', 'simdutf8', 'default',
+     OTHER),
+    ('tests-2', 'tower', 'log',
+     'emits log events, which show only where a case installs a subscriber; not traced for such a case'),
+    ('tests-2', 'tower', 'make',
+     OTHER),
+    ('tests-2', 'tower', 'tracing',
+     'emits tracing events, which show only where a case installs a subscriber; not traced for such a case'),
+]
+FEATURE_DIFFERENCES = {
+    (package, leg, "less", feature): reason
+    for leg, package, names, reason in FEATURE_ROWS
+    for feature in names.split()
+}
 
 TARGET = "aarch64-apple-darwin"
-TREE = ["cargo", "tree", "--locked", "-e", "normal,build,dev", "--target", TARGET, "--prefix", "none", "-f", "{p} {f}"]
+# The two views of the graph, each as `cargo tree` takes its edges. The first merges the host and the
+# target copies of a package, as the whole workspace's one step built them; the second is the target
+# build alone, so that a merge cannot hide a difference of the copy a case runs against.
+VIEWS = {"merged": "normal,build,dev", "target": "normal,dev,no-proc-macro"}
 NODE = re.compile(r"^(\S+) v(\S+)(?: \(([^)]*)\))?(?: (\S+))?$")
 
 
@@ -282,12 +396,14 @@ def feature_differences(whole, leg):
 
 
 def unlisted(differences, leg, allowed):
-    """The differences of `leg` whose package `allowed` does not name for that leg."""
-    return [d for d in differences if (d[0], leg) not in allowed]
+    """The differences of `leg`, as (package, leg, direction, feature), that `allowed` does not name."""
+    return [(package, leg, direction, feature) for package, direction, feature in differences
+            if (package, leg, direction, feature) not in allowed]
 
 
-def tree(arguments):
-    answer = subprocess.run(TREE + arguments, capture_output=True, text=True, check=False)
+def tree(edges, arguments):
+    command = ["cargo", "tree", "--locked", "-e", edges, "--target", TARGET, "--prefix", "none", "-f", "{p} {f}"]
+    answer = subprocess.run(command + arguments, capture_output=True, text=True, check=False)
     if answer.returncode != 0:
         sys.stderr.write(answer.stderr)
         raise SystemExit("cargo tree failed")
@@ -298,26 +414,30 @@ def features():
     with open(WORKFLOW, encoding="utf-8") as file:
         workflow = file.read()
     found = lists(workflow)
-    whole = unified_features(tree(["--workspace", "--exclude", LEFT_OUT]))
+    whole = {
+        view: unified_features(tree(edges, ["--workspace", "--exclude", LEFT_OUT]))
+        for view, edges in VIEWS.items()
+    }
     failed = False
     seen = set()
     for leg in LEGS:
         names, _ = packages_of(found[leg])
         arguments = [word for name in names for word in ("-p", name)]
-        differences = feature_differences(whole, unified_features(tree(arguments)))
-        for package, _, _ in differences:
-            seen.add((package, leg))
-        for package, direction, feature in unlisted(differences, leg, FEATURE_DIFFERENCES):
+        differences = set()
+        for view, edges in VIEWS.items():
+            differences.update(feature_differences(whole[view], unified_features(tree(edges, arguments))))
+        seen.update((package, leg, direction, feature) for package, direction, feature in differences)
+        for package, _, direction, feature in unlisted(sorted(differences), leg, FEATURE_DIFFERENCES):
             failed = True
             print(
                 f"check-macos-test-division: {leg} builds {package} with {feature} {direction} than the whole "
-                f"workspace's one step, and FEATURE_DIFFERENCES names no reason for it for {leg}",
+                f"workspace's one step, and FEATURE_DIFFERENCES has no entry for it",
                 file=sys.stderr,
             )
     for entry in sorted(set(FEATURE_DIFFERENCES) - seen):
         print(f"note: FEATURE_DIFFERENCES names {entry}, which no longer differs; remove it")
     if not failed:
-        print(f"every feature the legs build with differently is named, {len(FEATURE_DIFFERENCES)} in all")
+        print(f"every feature the legs build with differently has an entry with its reason, {len(FEATURE_DIFFERENCES)} in all")
     return 1 if failed else 0
 
 
@@ -485,10 +605,25 @@ def self_test():
     found = feature_differences(whole, leg)
     cases = [
         ("a feature the leg lacks is found", found == [("alpha", "less", "testing")]),
-        ("it is refused when no reason names it", unlisted(found, "tests-1", {}) == found),
-        ("it is accepted when its package is named for the leg", unlisted(found, "tests-1", {("alpha", "tests-1"): "x"}) == []),
-        ("it is refused for another leg", unlisted(found, "tests-2", {("alpha", "tests-1"): "x"}) == found),
+        ("it is refused when no reason names it", unlisted(found, "tests-1", {}) == [("alpha", "tests-1", "less", "testing")]),
+        ("it is accepted when its feature is named for the leg", unlisted(found, "tests-1", {("alpha", "tests-1", "less", "testing"): "x"}) == []),
+        ("it is refused for another leg", unlisted(found, "tests-2", {("alpha", "tests-1", "less", "testing"): "x"}) == [("alpha", "tests-2", "less", "testing")]),
         ("a package only the whole run has is no difference", feature_differences(whole, {}) == []),
+        (
+            "a new feature of a package that is named for another feature is refused",
+            unlisted(
+                feature_differences(
+                    whole | {("beta", "1.0.0"): {"x", "y"}},
+                    leg | {("beta", "1.0.0"): set()},
+                ),
+                "tests-1",
+                {
+                    ("alpha", "tests-1", "less", "testing"): "named",
+                    ("beta", "tests-1", "less", "x"): "x is named, y is not",
+                },
+            )
+            == [("beta", "tests-1", "less", "y")],
+        ),
     ]
     for what, ok in cases:
         if not ok:
