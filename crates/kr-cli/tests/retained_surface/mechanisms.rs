@@ -1,8 +1,9 @@
 //! The mechanism table: one fixture for each way Rust can give a name to another name, to a macro
 //! or to a place, with the exact sightings the scan gives it or the exact text it refuses it with.
-//! The scan never decides what a name stands for, so a mechanism is either read by its names
-//! wherever they stand or refused; the table shows which, and a new variant of [`Mechanism`] is a
-//! compile error until the table holds a fixture for it.
+//! The scan never decides what a name stands for, so a mechanism is read by its names wherever
+//! they stand, refused, or a stated limit that the fixture shows (a name the scan cannot join from
+//! pieces); the table shows which, and a new variant of [`Mechanism`] is a compile error until the
+//! table holds a fixture for it.
 
 use super::walker_cases::{small_tree, tree_at, write};
 

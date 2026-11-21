@@ -6,7 +6,7 @@
 //! `not(not(test))` are skipped, and `any(test, feature = "testing")`, `not(test)` and `windows` are
 //! read. An unknown predicate reads as product code: the rule adds a sighting where a configuration
 //! may not build it, and never drops one. A predicate that does not parse, and a `cfg_attr` that
-//! would add a `path`, is an error and is never skipped.
+//! would add a `path`, is an error, unless a `cfg` on the same place is false: that place is skipped.
 
 use quote::ToTokens as _;
 use syn::parse::ParseStream;
