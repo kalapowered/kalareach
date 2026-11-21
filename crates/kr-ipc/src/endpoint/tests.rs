@@ -149,6 +149,22 @@ mod unix {
         }
     }
 
+    /// Whether the lock is free once it has had up to `limit` to be.
+    ///
+    /// A program that another case starts while the lock file is open holds a copy of the open
+    /// file until that program executes its own, so a lock that has ended can read as held for
+    /// that short span.
+    fn lock_is_free_within(path: &Path, limit: std::time::Duration) -> bool {
+        let begun = std::time::Instant::now();
+        while lock_is_held(path) {
+            if begun.elapsed() >= limit {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
     /// A socket that listens with a queue of one and does not accept.
     fn listen_with_a_queue_of_one(path: &Path) -> OwnedFd {
         let socket = crate::endpoint::stream_socket().expect("a socket");
@@ -527,7 +543,10 @@ mod unix {
         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
     }
 
-    /// A program the listener's process starts after the bind does not keep the lock.
+    /// A program the listener's process starts after the bind does not keep the lock. The wait
+    /// is for a program that another case starts in the same moment, which holds the lock until
+    /// its exec. The case's own program has executed when its start returns, so a lock it kept
+    /// would still be held when the wait ends.
     #[tokio::test]
     async fn a_child_started_after_the_bind_does_not_keep_the_lock() {
         let folder = PrivateTempDir::create();
@@ -539,10 +558,10 @@ mod unix {
             .spawn()
             .expect("a program that waits");
         drop(live);
-        let held = lock_is_held(path);
+        let free = lock_is_free_within(path, std::time::Duration::from_secs(2));
         child.kill().expect("the child ends");
         child.wait().expect("the child is gone");
-        assert!(!held, "the child inherited the lock");
+        assert!(free, "the child inherited the lock");
     }
 
     /// What the volume says decides a removal on macOS, where a refused connect cannot show that
