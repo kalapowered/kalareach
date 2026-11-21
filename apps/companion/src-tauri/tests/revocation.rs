@@ -2816,12 +2816,15 @@ async fn told_connection(
     ))
 }
 
-/// What a case does to the dials the keeper makes: holds them, fails them, and counts them.
+/// What a case does to the dials the keeper makes: holds them, fails them, and counts them. It also
+/// holds the opening of the replacement the keeper makes when the host withdraws a connection, so
+/// that the replacement cannot come before what a case waits for.
 #[derive(Default)]
 struct Dials {
     held: std::sync::atomic::AtomicBool,
     failing: std::sync::atomic::AtomicBool,
     made: std::sync::atomic::AtomicUsize,
+    reopen_held: std::sync::atomic::AtomicBool,
 }
 
 impl Dials {
@@ -2836,6 +2839,12 @@ impl Dials {
     fn fail(&self, failing: bool) {
         self.failing
             .store(failing, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Holds the opening of the next replacement until it is released with `false`.
+    fn hold_the_reopen(&self, held: bool) {
+        self.reopen_held
+            .store(held, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2881,10 +2890,20 @@ async fn keeper_with<'r>(
             // come while it is being opened meet a question that is already out.
             let reopen: companion_tauri::connection::Reopen = Arc::new({
                 let endpoint = endpoint.clone();
+                let dials = dials.clone();
                 move || {
                     let endpoint = endpoint.clone();
+                    let dials = dials.clone();
                     reopens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     Box::pin(async move {
+                        if let Some(dials) = &dials {
+                            while dials
+                                .reopen_held
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
                         tokio::time::sleep(Duration::from_millis(300)).await;
                         local_connection(&endpoint)
                             .await
@@ -4535,13 +4554,22 @@ async fn a_read_refused_on_a_withdrawn_connection_is_cleared_by_the_replacement(
     let dials = Arc::new(Dials::default());
     rig.host_polls().await;
     let reopens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let _keeper = keeper_with(&rig, reopens, None, Some(dials)).await;
+    let _keeper = keeper_with(&rig, reopens, None, Some(Arc::clone(&dials))).await;
     rig.app.told_everything().await;
+    // The replacement is not opened until the refusal is told, so the read finishes over the
+    // connection that is still the one held, however long the call takes.
+    dials.hold_the_reopen(true);
     the_host_narrows_its_rights_ceiling(&rig).await;
 
     rig.app
         .call("attention_read", support::inbox_read())
         .expect_err("the host refuses what a withdrawn connection asks");
+    told_until(&rig, |told| {
+        told.iter()
+            .any(|state| state["contact"]["state"] == "refused")
+    })
+    .await;
+    dials.hold_the_reopen(false);
     let told = told_until(&rig, |told| told.iter().any(|state| state["replaced"] == 1)).await;
     let refused = told
         .iter()
