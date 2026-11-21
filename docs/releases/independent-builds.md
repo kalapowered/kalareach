@@ -84,16 +84,22 @@ describes the retirement and its limits.
 ## What the repository holds
 
 No official credential: no Firebase configuration file, no APNs key, no service-account document, no
-provisioning profile and no key store. `scripts/check-release-secrets.py` refuses each of them, by
-what it contains and by what it is called (`google-services.json`, `GoogleService-Info.plist`,
-`AuthKey_*.p8`, a PKCS #12 or Java key store), in the tracked files of a checkout, in a release tree
-and in a release archive. `release-checks.yml` runs it over the tracked files, and the jobs that
-build a release tree run it over the tree and the archive, after running its self-test. The self-test
-plants private keys, an APNs key, both Firebase configuration files, a Google API key and a
-service-account document, and finds each. It plants no key store and no provisioning profile, which
-the scan refuses by name all the same.
+provisioning profile and no key store. `scripts/check-release-secrets.py` looks for them, in the
+forms it knows, in the tracked files of a checkout, in a release tree and in a release archive. By
+file name it refuses, among others, `google-services.json` and `GoogleService-Info.plist` (the
+Firebase configuration files), `AuthKey_*.p8` and any other `.p8` (an APNs key), `.mobileprovision`
+and `.provisionprofile` (a provisioning profile), and `.p12`, `.pfx`, `.jks` and `.keystore` (a key
+store). By contents it refuses a service-account document, a Google API key, a PEM private key, a
+private JSON Web Key and a file that is only a key seed. A key store or a provisioning profile is
+therefore found by its name alone: one under another name passes, and so does a key in a binary
+encoding such as DER. `release-checks.yml` runs it over the tracked files, and the jobs that build a
+release tree run it over the tree and the archive, after running its self-test. The self-test plants
+PEM private keys, private JSON Web Keys, key seeds, an APNs key, both Firebase configuration files, a
+Google API key and a service-account document, and finds each. It plants no key store and no
+provisioning profile, which the scan refuses by name all the same.
 
 A package built from the source is read as raw bytes by the same scan when it is given one (`.apk`,
-`.aab` and `.ipa` are not opened): a credential written into it in the clear is found, and one inside
-its compressed entries is not. The builder's own configuration file is therefore a file of the
-builder's checkout and never of this repository.
+`.aab` and `.ipa` are not opened). A PEM private key, a Google API key or another form that the scan
+finds by contents is found there only where it sits uncompressed, and one inside a compressed entry
+is not. The builder's own configuration file is therefore a file of the builder's checkout and never
+of this repository.
