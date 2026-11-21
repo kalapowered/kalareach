@@ -725,3 +725,188 @@ fn the_survival_check_of_5a_fails_for_a_process_that_ended() {
     let failed = all_run(&[("the sleeper", &identity)]);
     assert!(failed.is_err_and(|why| why.contains("the sleeper")));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Part 6a: an upgrade leaves a running agent its build; the newer build is on the terminal route.
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-12.32, case 6, part 6a (KR-REQ-12.15): with an agent running, the installed agent is
+/// upgraded to a newer build; the running process keeps its program image and still takes input,
+/// its instance and revision come through as they were, and the newer build, outside the range the
+/// package is qualified for, is on the terminal route with its own profile. The control relaunches
+/// the agent in the first session after the upgrade, and "the process runs the build it started
+/// with" must then fail. No login and no turn: the approval a charged turn holds is 6b's.
+#[test]
+fn gateway_a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route()
+ {
+    const TEST: &str = "gateway_a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_the_terminal_route";
+    by_hand_case(
+        "6a",
+        TEST,
+        Setup {
+            upgrade: true,
+            ..Setup::default()
+        },
+        |ctx, session| {
+            let second = session.second.as_ref().expect("two sessions");
+            let first_session = session.session_id();
+            let second_session = second.person.session_id;
+            let pinned_inode = inode_of(&ctx.executable);
+            let newer_inode = inode_of(&ctx.newer.as_ref().expect("a newer build").0);
+            let newer_prefix = ctx.newer_prefix.clone().expect("the newer build's prefix");
+            let installation = ctx.installation.as_ref().expect("an installation");
+            let workers = [
+                u32::try_from(ctx.run.worker_of(&first_session.to_string()).pid.get())
+                    .expect("a pid"),
+                u32::try_from(ctx.run.worker_of(&second_session.to_string()).pid.get())
+                    .expect("a pid"),
+            ];
+            let mut servers: Vec<ProcessStartIdentity> = Vec::new();
+
+            // The first agent starts on the pinned build, and what runs is recorded.
+            let first = HandAgent::starts(ctx, session);
+            let first_pid = u32::try_from(first.agent.pid.get()).expect("a pid");
+            image_is_pinned(&text_image(first_pid).map(|(_, inode)| inode), pinned_inode)
+                .unwrap_or_else(|why| panic!("the first agent runs the pinned build: {why}"));
+            let shown_first = detects(ctx, &session.remote, first_session);
+
+            // The installation is upgraded through the held handle.
+            installation
+                .upgrade(&ctx.run, &newer_prefix)
+                .unwrap_or_else(|why| panic!("the upgrade through the held handle: {why}"));
+
+            // The second shell types the agent's name, with the route checked right before.
+            ctx.checks_the_placed_files();
+            installation
+                .names(&ctx.run, &newer_prefix)
+                .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+            if let Route::Real(real) = &ctx.route {
+                real.checks_the_newer_route(
+                    &ctx.run,
+                    ctx.newer_placed
+                        .as_ref()
+                        .expect("the newer build was placed"),
+                );
+            }
+            let (typed, shows) = match &ctx.route {
+                Route::StandIn => ("codex".to_owned(), RAN_AS_TYPED.to_owned()),
+                Route::Real(real) => (
+                    real.typed(&[]),
+                    real.build
+                        .newer
+                        .as_ref()
+                        .expect("the entry names a newer build")
+                        .ready
+                        .clone(),
+                ),
+            };
+            second.person.types(&typed);
+            let launch = launch_within(
+                &second.person,
+                workers[1],
+                newer_inode,
+                &shows,
+                &workers,
+                &mut servers,
+            );
+            assert!(
+                launch.process.is_ok() && launch.ready.is_ok(),
+                "the second program runs as typed: {:?} {:?}",
+                launch.process,
+                launch.ready
+            );
+            let shown_second = detects(ctx, &second.remote, second_session);
+            let second_instance = shown_second.detection.only().unwrap_or_else(|| {
+                panic!(
+                    "the newer build is announced: {:?}",
+                    shown_second.detection.evidence()
+                )
+            });
+            assert_eq!(
+                second_instance.mode,
+                kr_protocol::broker::IntegrationMode::NativeTerminal,
+                "the newer build runs as a native terminal"
+            );
+
+            // The first agent runs the build it started with, takes input, and its instance and
+            // revision come through the upgrade as they were.
+            first
+                .runs()
+                .unwrap_or_else(|why| panic!("the first agent through the upgrade: {why}"));
+            image_is_pinned(&text_image(first_pid).map(|(_, inode)| inode), pinned_inode)
+                .unwrap_or_else(|why| panic!("the first agent through the upgrade: {why}"));
+            let (input, input_shows) = harmless(ctx);
+            session.person.window.type_text(input.as_bytes());
+            let _ = session.person.sees(
+                &input_shows,
+                "the first agent takes input after the upgrade",
+            );
+            let first_after = shown_now(ctx, &session.remote, first_session);
+            check_unchanged(Held::of(&shown_first), &first_after)
+                .unwrap_or_else(|why| panic!("the first agent through the upgrade: {why}"));
+            let (offered, _) = surface(ctx, session, &second.remote, second_session, &shown_second);
+            check_observation_only(&offered).unwrap_or_else(|why| {
+                panic!("the newer build is offered only observation and the terminal: {why}")
+            });
+            let first_summary = shown_first.detection.only().expect("the first instance");
+            assert!(
+                first_summary.profile_id.0.is_some() && second_instance.profile_id.0.is_some(),
+                "both instances hold a profile"
+            );
+            assert_ne!(
+                first_summary.profile_id, second_instance.profile_id,
+                "each process's binding names its own launch profile"
+            );
+
+            // The control: the property broken on purpose. The first agent is ended and typed
+            // again in the same session, which now resolves the newer build, and "the process
+            // runs the pinned build" must fail for the process that session now runs.
+            first.ends();
+            session.person.clears_the_screen();
+            session.person.types(&typed);
+            let relaunched = launch_within(
+                &session.person,
+                workers[0],
+                newer_inode,
+                &shows,
+                &workers,
+                &mut servers,
+            );
+            let relaunched_pid = relaunched
+                .process
+                .as_ref()
+                .map(|identity| u32::try_from(identity.pid.get()).expect("a pid"))
+                .unwrap_or_else(|why| panic!("the relaunched program runs: {why}"));
+            let control = image_is_pinned(
+                &text_image(relaunched_pid).map(|(_, inode)| inode),
+                pinned_inode,
+            );
+            assert!(
+                control.is_err(),
+                "the check fails for the relaunched agent because it runs the newer build"
+            );
+            serde_json::json!({
+                "arm": arm(ctx),
+                "first_agent_image_unchanged": true,
+                "first_detection": shown_first.detection.evidence(),
+                "first_after_upgrade": first_after.detection.evidence(),
+                "second_detection": shown_second.detection.evidence(),
+                "second_surface": offered.evidence(),
+                "control": {
+                    "what": "the agent typed again in the first session after the upgrade",
+                    "breaks_property": true,
+                    "check": control.err(),
+                },
+            })
+        },
+    );
+}
+
+/// A process that maps another image than the pinned build's, or whose image was not read, is not
+/// known to run the pinned build.
+#[test]
+fn a_process_that_runs_another_image_than_the_pinned_builds_fails_the_check_of_6a() {
+    assert!(image_is_pinned(&Ok(7), 7).is_ok());
+    assert!(image_is_pinned(&Ok(8), 7).is_err());
+    assert!(image_is_pinned(&Err("no such process".to_owned()), 7).is_err());
+}
