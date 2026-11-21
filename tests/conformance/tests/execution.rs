@@ -951,18 +951,15 @@ fn alive(pid: &str) -> bool {
 }
 
 /// The processes of `pids` that still exist `within` a time after the call, looked at every tenth of
-/// a second. A case that fails ends them, so that it leaves none.
+/// a second. A look sends nothing and leads to no action: by then a number can be another process's,
+/// and the case fails for it, which does no harm. What a failed case leaves ends by itself, for
+/// every process of a fixture waits 61 s at most.
 #[cfg(unix)]
 fn left_after(pids: &[String], within: Duration) -> Vec<String> {
     let until = Instant::now() + within;
     loop {
         let left: Vec<String> = pids.iter().filter(|pid| alive(pid)).cloned().collect();
         if left.is_empty() || Instant::now() >= until {
-            for pid in &left {
-                let _ = Command::new("sh")
-                    .args(["-c", &format!("kill -9 {pid} 2>/dev/null")])
-                    .status();
-            }
             return left;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -982,7 +979,7 @@ fn assert_ended_at_its_limit(ran: &Ran, seconds: u64, pids: &[String]) {
         "{step:?}"
     );
     // An order, with the slack a loaded host needs: the limit and the wait that ends the group, and
-    // not the 300 seconds the step's processes wait for.
+    // not the 61 seconds the step's processes wait for.
     assert!(
         step.seconds < seconds + 30,
         "the step ran {} s with a limit of {seconds} s",

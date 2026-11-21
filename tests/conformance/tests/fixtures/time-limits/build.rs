@@ -1,7 +1,8 @@
 //! Waits when a case asks it to: while the step builds (`KR_BLOCK=build`), while it lists its
 //! tests (`KR_BLOCK=listing`), or in each of the two (`KR_BLOCK=both`). It records its pid in the
-//! file `KR_BLOCK_PIDS` names, and waits with `sleep` for `KR_BLOCK_SECONDS` seconds, or for 300
-//! when that is not set. The step's run waits in the test of `tests/passes.rs`.
+//! file `KR_BLOCK_PIDS` names, and waits with `sleep` for `KR_BLOCK_SECONDS` seconds, or for 61
+//! when that is not set, so that it ends by itself. The step's run waits in the test of
+//! `tests/passes.rs`.
 
 fn main() {
     println!("cargo:rerun-if-env-changed=KR_BLOCK");
@@ -23,6 +24,6 @@ fn main() {
     let seconds = std::env::var("KR_BLOCK_SECONDS")
         .ok()
         .and_then(|text| text.parse().ok())
-        .unwrap_or(300);
+        .unwrap_or(61);
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 }
