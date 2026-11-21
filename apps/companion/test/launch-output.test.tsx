@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { App } from '../src/App'
@@ -19,6 +19,9 @@ import { fakeHost } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+/** The real timer, taken before any case installs the fake ones: it measures the stall a case makes. */
+const realSetTimeout = globalThis.setTimeout
 
 const SAVED = [
   { label: 'Claude Code', program: '/usr/local/bin/claude', arguments: ['--resume'] },
@@ -100,8 +103,12 @@ async function lit() {
 describe('what output and a silent change do to the launch buttons', () => {
   it('output_alone_does_not_darken_profile_or_named_buttons_and_a_new_generation_still_needs_the_look', async () => {
     try {
-      const { person, controls, view } = await lit()
+      const { controls, view } = await lit()
       const reads = controls.hold('launchSurface')
+      // The page is set up and settled. From here the clock moves only where the test moves it, so
+      // that no stall of real time can start the surface's own cadence read ahead of a step.
+      vi.useRealTimers()
+      vi.useFakeTimers()
 
       // Output streams. Each state the view publishes wakes a read of the surface, at most one in
       // each wake gap. The gap has passed when the state is published, so the read starts in the
@@ -122,6 +129,13 @@ describe('what output and a silent change do to the launch buttons', () => {
         everyLit()
       }
 
+      // A stall of real time between two steps, longer than the surface's own cadence: it moves
+      // the test's clock only where the test moves it, so no read of the surface's own starts in
+      // it and the read the next step wakes is the one that names the new prompt.
+      await new Promise<void>((resolve) => {
+        realSetTimeout(resolve, LAUNCH_SURFACE_CADENCE_MS + 250)
+      })
+
       // The prompt moves on and its output is drawn. The read it wakes starts in that frame and is
       // on its way, and the buttons are lit until it has answered: output alone says nothing of
       // the prompt.
@@ -137,11 +151,9 @@ describe('what output and a silent change do to the launch buttons', () => {
       // saved command's, stays dark until the person has looked at it.
       await act(async () => {
         reads.answer(3)
-        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(0)
       })
-      await waitFor(() => {
-        expect(screen.getByTestId('launch-stale')).toHaveTextContent('The prompt changed')
-      })
+      expect(screen.getByTestId('launch-stale')).toHaveTextContent('The prompt changed')
       everyDark()
       act(() => {
         vi.advanceTimersByTime(LAUNCH_SURFACE_WAKE_GAP_MS)
@@ -151,7 +163,8 @@ describe('what output and a silent change do to the launch buttons', () => {
       everyDark()
       expect(screen.getByTestId('launch-refresh')).toHaveTextContent('I have looked at the prompt')
 
-      await person.click(screen.getByTestId('launch-refresh'))
+      // The press is not the person's: user-event waits on a timer that this clock never fires.
+      fireEvent.click(screen.getByTestId('launch-refresh'))
       everyLit()
     } finally {
       vi.useRealTimers()
