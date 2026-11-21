@@ -1235,6 +1235,13 @@ async fn send_prompt(
     let target = typed.target;
     let expected = PromptPreconditions(supersedes);
     if typed.draft_id.is_present() {
+        // The account the prompt was made under is read once, before it is sent: the record of the
+        // draft it used is ended for that account, whatever the sign-in has become since.
+        let paired = if state.paired_context().is_some() {
+            state.paired().await.ok()
+        } else {
+            None
+        };
         let settled = if state.paired_context().is_some() {
             // A host this device is paired with serves a route to a worker only on a connection
             // scoped to the session, and refuses it on the connection the application keeps for the
@@ -1258,11 +1265,11 @@ async fn send_prompt(
         if applied
             && !settled.answer_lost
             && let Some(draft_id) = typed.draft_id.0
-            && let Ok(paired) = state.paired().await
+            && let Some(paired) = &paired
         {
             state
                 .paired_drafts()
-                .sent(&paired, typed.target.subject.session_id, draft_id)
+                .sent(paired, typed.target.subject.session_id, draft_id)
                 .await;
         }
         return Ok(settled);
@@ -1927,10 +1934,11 @@ pub async fn draft_add_attachment(
         let bind: crate::paired_drafts::Bind = decode(params)?;
         let transfer_id = bind.transfer_id;
         let paired = state.paired().await?;
+        let who = paired.who();
         let target = subject.target(paired.environment_id)?;
         let bound = state.paired_drafts().bind(paired, target, bind).await?;
         // The upload's entry ends with its binding.
-        state.transfers().bound(transfer_id);
+        state.transfers().bound(&who, transfer_id).await;
         return Ok(Settled {
             receipt: None,
             action_id: None,

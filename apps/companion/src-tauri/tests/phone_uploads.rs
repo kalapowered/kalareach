@@ -2512,48 +2512,43 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
     adopted.stop().await;
 }
 
-/// KR-REQ-13.12, KR-REQ-23.41: a new sign-in on the same pairing. A host that answers to an
-/// organisation sees one principal whoever is signed in, so what is kept is told apart by the
-/// account: the new account is shown nothing of the earlier one's and reads none of its draft, and
-/// when the host is reached under the new account an upload still sent under the earlier one is
-/// stopped with its copy, and an entry, a copy and a draft the earlier account left are dropped.
-/// Nothing of the earlier account is read from the host or resumed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_13_12_a_new_sign_in_on_the_same_pairing_drops_what_the_earlier_account_kept() {
-    use kr_client::services::AccountMark;
-    use kr_protocol::method::Method;
+/// What an account left on a paired host: a published upload, an entry of an upload the host never
+/// answered, a draft, and an upload still held by the desk and paused. All of it is the account's.
+struct Left {
+    handle: kr_protocol::transfer::AttachmentHandle,
+    sending:
+        tokio::task::JoinHandle<companion_tauri::Result<kr_protocol::transfer::AttachmentHandle>>,
+    live_key: Uuid,
+    entry_key: Uuid,
+    /// The connection that replaced the one the account's upload was sent on.
+    newer: Paired,
+}
 
-    let adopted = Adopted::start(1).await;
-    let (phone, control) = phone_for(&adopted).await;
+/// Leaves the work of `earlier` on the host and then replaces the connection, so that an account that
+/// signed in since finds it on a connection of its own.
+async fn left_by(adopted: &Adopted, phone: &Phone, desk: &Arc<Desk>, earlier: &Paired) -> Left {
     let companion = &phone.companion;
-    let desk = desk_of(companion);
-    let paired = paired_of(companion).await;
     let session = adopted.workers[0].session_id;
-    // The same device on the same host: only the sign-in differs.
-    let earlier = Paired {
-        account: Some(AccountMark::from_bytes([1; 32])),
-        ..paired.clone()
-    };
-    let now = Paired {
-        account: Some(AccountMark::from_bytes([2; 32])),
-        ..paired.clone()
-    };
-
-    // An upload still sent under the earlier account, held in its content.
-    let bytes = pattern(5);
-    let (content, gate, _release) = gated(&bytes);
-    let running = {
-        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
-        let (desk, earlier) = (Arc::clone(&desk), earlier.clone());
-        tokio::spawn(async move { desk.send(earlier, sent).await })
-    };
-    gate.reached().await;
-    // What a process under the earlier account left: an entry with its copy, and a draft.
+    // A published upload whose entry is kept until it is bound.
+    let published = pattern(3);
+    let handle = desk
+        .send(
+            earlier.clone(),
+            request(
+                adopted,
+                &published,
+                Arc::new(Held::new(published.clone())),
+                kr_ipc::new_uuid(),
+            ),
+        )
+        .await
+        .expect("the upload is published");
+    // An entry for an upload the host never answered, with its copy.
     let left = vec![9_u8; 16];
-    let key = kr_ipc::new_uuid();
+    let entry_key = kr_ipc::new_uuid();
     testing::keep(
-        &folder(&phone),
-        key,
+        &folder(phone),
+        entry_key,
         earlier.environment_id,
         earlier.device_id,
         earlier.account,
@@ -2564,60 +2559,257 @@ async fn kr_req_13_12_a_new_sign_in_on_the_same_pairing_drops_what_the_earlier_a
         Held::new(left.clone()).digest(),
         testing::Where::Copy,
     );
-    testing::keep_copy(&folder(&phone), key, &left);
+    testing::keep_copy(&folder(phone), entry_key, &left);
+    // A draft.
+    companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts()
+        .keep_for_test(
+            earlier,
+            session,
+            &net_support::on_the_session(&adopted.host, session),
+            Some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid())),
+            Some(kr_protocol::ids::DraftRevision::new(1)),
+        );
+    // An upload still sent when its connection ends and another comes up: it is paused, because the
+    // connection that came up is not its account's.
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let live_key = kr_ipc::new_uuid();
+    let sending = {
+        let sent = request(adopted, &bytes, content, live_key);
+        let (desk, earlier) = (Arc::clone(desk), earlier.clone());
+        tokio::spawn(async move { desk.send(earlier, sent).await })
+    };
+    gate.reached().await;
+    earlier.session.transport().close();
+    let newer = on_another_connection(companion, &earlier.session).await;
+    until("the desk is told of the new connection", || {
+        desk.holds_newest_for_test(&newer)
+    })
+    .await;
+    gate.release();
+    until("the upload is paused", || {
+        desk.open(&earlier.who())
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
+    })
+    .await;
+    Left {
+        handle,
+        sending,
+        live_key,
+        entry_key,
+        newer,
+    }
+}
+
+/// KR-REQ-13.12, KR-REQ-23.41: what one account left on a paired host is neither shown to nor acted
+/// on for another account. The host sees one principal whoever is signed in, so the application tells
+/// the accounts apart, and every desk and drafts operation acts on the account of the connection it
+/// is given: the other account's uploads, copies and drafts stay on disk, hidden, and no call is made
+/// to the host for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_another_accounts_entries_are_neither_shown_nor_acted_on() {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let paired = paired_of(companion).await;
+    let session = adopted.workers[0].session_id;
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let left = left_by(&adopted, &phone, &desk, &earlier).await;
+    let now = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..left.newer.clone()
+    };
     let drafts = companion
         .app
         .state::<companion_tauri::AppState>()
         .paired_drafts();
-    drafts.keep_for_test(
-        &earlier,
-        session,
-        &net_support::on_the_session(&adopted.host, session),
-        Some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid())),
-        Some(kr_protocol::ids::DraftRevision::new(1)),
-    );
-    assert_eq!(entries_in(&folder(&phone)), 2);
-    assert_eq!(copies_in(&folder(&phone)), 2);
-    assert_eq!(drafts_in(&folder(&phone)), 1);
+    let held = |when: &str| {
+        let (entries, copies, kept) = (
+            entries_in(&folder(&phone)),
+            copies_in(&folder(&phone)),
+            drafts_in(&folder(&phone)),
+        );
+        assert_eq!(
+            (entries, copies, kept),
+            (3, 2, 1),
+            "{when}: the published entry, the hidden entry and the paused upload's entry, their two copies and the draft are all kept"
+        );
+    };
+    held("before");
+    let reads = control.sent(Method::UploadStatus);
+    let begins = control.sent(Method::UploadBegin);
 
-    // Before the host is reached again the new account is shown none of it.
+    // Nothing of the earlier account is shown to the new one, nor to a sign-in with no account.
+    assert!(desk.open(&now.who()).is_empty(), "no upload is shown");
     assert!(
-        desk.open(&now.who()).is_empty(),
-        "the new sign-in is shown nothing of the earlier account's uploads"
+        desk.open(&left.newer.who()).is_empty(),
+        "an organisation host with no account signed in shows nothing"
     );
-    assert!(
-        !drafts.kept(&now, session).made,
-        "the new sign-in does not read the earlier account's draft"
-    );
-    let status_reads = control.sent(Method::UploadStatus);
-
-    // The host is reached under the new account.
+    assert!(!drafts.kept(&now, session).made, "no draft is read");
+    // A cancel finds no upload and records no key, for a held upload and for a kept entry.
+    for key in [left.live_key, left.entry_key] {
+        let refused = desk
+            .cancel(now.who(), Some(now.clone()), key)
+            .await
+            .expect_err("no upload of the new account has that key");
+        assert_eq!(
+            refused.message,
+            companion_tauri::open_transfers::NO_OPEN_UPLOAD
+        );
+        assert!(!desk.is_cancelled(key), "the key is not recorded");
+    }
+    // The host is reached under the new account, and the entries are read again.
     desk.host_reached(now.clone());
+    desk.idle().await;
+    desk.restart(now.clone()).await;
     drafts.sweep_after_reach(now.clone()).await;
-    // The upload of the earlier account is stopped and waited for: its content is let go.
-    gate.release();
-
-    let stopped = tokio::time::timeout(WATCHDOG, running)
-        .await
-        .expect("the upload of the earlier account ends")
-        .expect("the task ran")
-        .expect_err("an upload of another account is not sent on");
-    assert_eq!(stopped.message, companion_tauri::open_transfers::CANCELLED);
-    tokio::time::timeout(WATCHDOG, async {
-        while entries_in(&folder(&phone)) + copies_in(&folder(&phone)) + drafts_in(&folder(&phone))
-            > 0
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("every entry, copy and draft of the earlier account is dropped");
+    // The upload's handle is bound to a draft by the new account: the earlier account's entry stays.
+    desk.bound(&now.who(), left.handle.transfer_id).await;
+    held("after");
     assert_eq!(
         control.sent(Method::UploadStatus),
-        status_reads,
-        "nothing of the earlier account is read from the host or resumed"
+        reads,
+        "nothing of the earlier account is read from the host"
     );
+    assert_eq!(control.sent(Method::UploadBegin), begins);
+    assert!(
+        !left.sending.is_finished(),
+        "the paused upload was not ended"
+    );
+    assert!(
+        drafts.kept(&earlier, session).made,
+        "the earlier account's draft is still its own"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12, KR-REQ-23.41: an account that signs in again finds what it left: the upload that was
+/// paused goes on and is published, and the draft is read again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_an_account_sees_its_own_entries_and_drafts_again_when_it_signs_in_again() {
+    use kr_client::services::AccountMark;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let paired = paired_of(companion).await;
+    let session = adopted.workers[0].session_id;
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let left = left_by(&adopted, &phone, &desk, &earlier).await;
+    let now = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..left.newer.clone()
+    };
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    // The other account reaches the host: nothing of the earlier account moves.
+    desk.host_reached(now.clone());
+    drafts.sweep_after_reach(now.clone()).await;
+    desk.idle().await;
+    assert!(!left.sending.is_finished());
+
+    // The earlier account reaches the host again: its upload goes on and is published, and its
+    // draft is read again.
+    let again = Paired {
+        account: earlier.account,
+        ..left.newer.clone()
+    };
+    desk.host_reached(again.clone());
+    let handle = tokio::time::timeout(WATCHDOG, left.sending)
+        .await
+        .expect("the upload goes on when its account reaches the host")
+        .expect("the task ran")
+        .expect("the upload is published");
+    assert_eq!(handle.byte_len.get(), pattern(5).len() as u64);
+    assert!(drafts.kept(&again, session).made, "the draft is read again");
+    assert!(
+        desk.open(&again.who())
+            .iter()
+            .any(|view| view.handle.is_some()),
+        "the published upload is shown again"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12: an upload whose connection ended while another account's connection came up goes on
+/// for no connection but its own account's: the sender that sees the end settles as paused, and the
+/// connection that came up first is not used for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_send_is_not_resumed_on_a_connection_of_another_account() {
+    use kr_client::services::AccountMark;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let paired = paired_of(companion).await;
+    let earlier = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let sending = {
+        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let (desk, earlier) = (Arc::clone(&desk), earlier.clone());
+        tokio::spawn(async move { desk.send(earlier, sent).await })
+    };
+    gate.reached().await;
+    // The connection ends, and the phone makes another that is not the account's, while the content
+    // still holds the driver.
+    earlier.session.transport().close();
+    let newer = on_another_connection(companion, &earlier.session).await;
+    until("the desk is told of the new connection", || {
+        desk.holds_newest_for_test(&newer)
+    })
+    .await;
+    let chunks = control.sent(kr_protocol::method::Method::UploadChunk);
     gate.release();
+    until("the upload is paused", || {
+        desk.open(&earlier.who())
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
+    })
+    .await;
+    desk.idle().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !sending.is_finished(),
+        "the upload was not sent on the other account's connection"
+    );
+    assert_eq!(
+        control.sent(kr_protocol::method::Method::UploadChunk),
+        chunks,
+        "the host was sent no more of the upload"
+    );
+
+    // Its own account's connection takes it up.
+    desk.host_reached(Paired {
+        account: earlier.account,
+        ..newer
+    });
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the upload goes on under its own account")
+        .expect("the task ran")
+        .expect("the upload is published");
     adopted.stop().await;
 }
 

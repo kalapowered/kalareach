@@ -964,9 +964,10 @@ impl Drafts {
         self.sweep(paired, &ids).await;
     }
 
-    /// At each reach: the drafts of another principal or another account on this host are dropped,
-    /// and the drafts whose session the host no longer lists are ended on the target they were made
-    /// on. A draft the host has already ended is harmless to end again.
+    /// At each reach: the drafts of another principal on this host are dropped, and the drafts of this
+    /// account whose session the host no longer lists are ended on the target they were made on. A
+    /// draft of another account is left alone. A draft the host has already ended is harmless to end
+    /// again.
     pub async fn sweep(&self, paired: Paired, listed: &[SessionId]) {
         let Ok(root) = self.root() else { return };
         let Ok(listing) = std::fs::read_dir(&root) else {
@@ -986,9 +987,14 @@ impl Drafts {
             if file.version != DRAFT_VERSION || file.environment_id != paired.environment_id {
                 continue;
             }
-            if file.device_id != paired.device_id || file.account != paired.account_id() {
-                // Kept under a sign-in that is not the one in force.
+            if file.device_id != paired.device_id {
+                // Kept for a pairing that is not the one in force.
                 let _ = crate::drafts::remove_durably(&path);
+                continue;
+            }
+            if file.account != paired.account_id() {
+                // Another account's: hidden, left as it is, and found again when its account reaches
+                // the host.
                 continue;
             }
             if listed.contains(&file.session_id) {
