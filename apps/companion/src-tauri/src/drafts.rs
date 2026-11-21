@@ -64,6 +64,18 @@ fn removals_file(data: &Path) -> PathBuf {
     data.join("drafts-removals")
 }
 
+/// What a person reads when the list of removals, or the folder that holds it, cannot be read or
+/// written. The cause follows it, after a space.
+pub(crate) const LEDGER_STORE: &str = "This device could not read or write its list of removals.";
+
+/// The error for a flush of the ledger's folder that was refused.
+pub(crate) fn ledger_storage(error: &std::io::Error) -> CommandError {
+    CommandError::new(
+        ErrorCode::StorageUnavailable,
+        format!("{LEDGER_STORE} {error}"),
+    )
+}
+
 /// Held while the ledger is changed, so that two windows of one process never change it at once,
 /// whether or not the file lock tells one handle of a process from another.
 static LEDGER_GATE: Mutex<()> = Mutex::new(());
@@ -432,12 +444,7 @@ impl DraftDesk {
         let Some(data) = self.data() else {
             return Ok(());
         };
-        flush_directory(&data, NameKind::File).map_err(|error| {
-            CommandError::new(
-                ErrorCode::StorageUnavailable,
-                format!("This device could not read or write its channel messages: {error}"),
-            )
-        })?;
+        flush_directory(&data, NameKind::File).map_err(|error| ledger_storage(&error))?;
         self.flush_owed.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -446,14 +453,11 @@ impl DraftDesk {
     /// at once, and the file lock, which tells another process from this one. The owed flush is made
     /// first.
     pub(crate) fn lock_ledger(&self) -> Result<LedgerLocked<'_>> {
-        let data = self.data().ok_or_else(|| {
-            CommandError::unsupported("This device could not read or write its channel messages")
-        })?;
-        let unavailable = |error: std::io::Error| {
-            CommandError::local_failure(format!(
-                "This device could not read or write its channel messages: {error}"
-            ))
-        };
+        let data = self
+            .data()
+            .ok_or_else(|| CommandError::unsupported(LEDGER_STORE))?;
+        let unavailable =
+            |error: std::io::Error| CommandError::local_failure(format!("{LEDGER_STORE} {error}"));
         let gate = LEDGER_GATE.lock().unwrap_or_else(PoisonError::into_inner);
         std::fs::create_dir_all(&data).map_err(unavailable)?;
         // The lock is on a file of its own, held until the guard is dropped: a lock on the ledger
@@ -508,7 +512,7 @@ impl DraftDesk {
                 return Err(RemovalFault {
                     renamed: false,
                     error: CommandError::local_failure(format!(
-                        "This device could not read its list of removals: {error}"
+                        "This device could not read its list of removals. {error}"
                     )),
                 });
             }
@@ -516,7 +520,7 @@ impl DraftDesk {
                 return Err(RemovalFault {
                     renamed: false,
                     error: CommandError::local_failure(
-                        "This device could not read its list of removals",
+                        "This device could not read its list of removals.",
                     ),
                 });
             }
@@ -524,18 +528,13 @@ impl DraftDesk {
         if !change(&mut removals) {
             flush_directory(&locked.data, NameKind::File).map_err(|error| RemovalFault {
                 renamed: true,
-                error: CommandError::local_failure(format!(
-                    "This device could not read or write its channel messages: {error}"
-                )),
+                error: CommandError::local_failure(format!("{LEDGER_STORE} {error}")),
             })?;
             return Ok(Change::Unchanged);
         }
         locked.publish(&removals).map_err(|fault| RemovalFault {
             renamed: fault.renamed,
-            error: CommandError::local_failure(format!(
-                "This device could not read or write its channel messages: {}",
-                fault.error
-            )),
+            error: CommandError::local_failure(format!("{LEDGER_STORE} {}", fault.error)),
         })?;
         Ok(Change::Published)
     }
