@@ -1716,9 +1716,18 @@ export interface OpenUpload {
   /**
    * `sending` while chunks go out or the host is asked, `paused` when the connection ended,
    * `waiting` for one kept from before that the host has not been asked about, `published` for one
-   * sent in full and not yet bound to a draft, and the last two for one that cannot go on.
+   * sent in full and not yet bound to a draft, `cancelAsked` for one the person cancelled and the host
+   * has not yet been told, and the last three for one that cannot go on.
    */
-  readonly state: 'sending' | 'paused' | 'waiting' | 'published' | 'cannotResume' | 'unrecoverable' | 'failed'
+  readonly state:
+    | 'sending'
+    | 'paused'
+    | 'waiting'
+    | 'published'
+    | 'cannotResume'
+    | 'unrecoverable'
+    | 'failed'
+    | 'cancelAsked'
   /** The session the file is for, when it is for one. */
   readonly sessionId: string | null
   readonly fileName: string
@@ -1738,11 +1747,17 @@ export interface OpenUpload {
 /** What a cancel did, from the host's own answer. */
 export interface UploadCancelled {
   readonly key: string
-  /** `published` when the upload was already sent in full and the host keeps it. */
-  readonly state: 'cancelled' | 'published' | 'forgotten'
+  /**
+   * `published` when the upload was already sent in full and the host keeps it, and `asked` when the
+   * cancel is kept and not yet finished: nothing more of the file is sent, and the next contact with
+   * the host finishes it.
+   */
+  readonly state: 'cancelled' | 'published' | 'forgotten' | 'asked'
   /** The bytes the host released, a decimal string, from its answer and nothing else. */
   readonly releasedByteLen: string | null
   readonly handle: AttachmentHandle | null
+  /** For `asked`, the words that say why the cancel is not finished, when something went wrong. */
+  readonly said: string | null
 }
 
 /** What binding a file to the draft a paired device keeps for a session answers. */

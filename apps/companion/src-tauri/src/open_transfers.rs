@@ -87,6 +87,9 @@ pub const UNRECOVERABLE: &str = "this device asked the host to take this file an
 /// What the command that waited for an upload is told when the person cancelled it.
 pub const CANCELLED: &str = "this file was cancelled before it was sent in full";
 
+/// A cancel names no upload this device holds, or one that is another account's.
+pub const NO_OPEN_UPLOAD: &str = "no open upload has that key";
+
 /// The directory the entries are kept in, under an application data directory.
 #[must_use]
 pub fn kept_in(data: &Path) -> PathBuf {
@@ -633,6 +636,9 @@ pub enum OpenState {
     Unrecoverable,
     /// The host refused it for good and still holds the reservation until it is cancelled.
     Failed,
+    /// The person cancelled it and the cancel is not finished: no more of it is sent, and the next
+    /// reach of the host finishes the cancel.
+    CancelAsked,
 }
 
 /// One open upload, as `transfers_open` answers.
@@ -668,12 +674,15 @@ pub struct Cancelled {
     /// What was asked to be cancelled.
     pub key: String,
     /// `cancelled` when the host released the reservation, `published` when the upload was already
-    /// finished and is kept, `forgotten` when the host holds nothing this device can name.
+    /// finished and is kept, `forgotten` when the host holds nothing this device can name, `asked`
+    /// when the cancel is kept to be finished at the next reach of the host.
     pub state: &'static str,
     /// The bytes the host released, from its answer.
     pub released_byte_len: Option<String>,
     /// The handle, for a `published` upload.
     pub handle: Option<AttachmentHandle>,
+    /// For `asked`, the words that say why the cancel is not finished, when something went wrong.
+    pub said: Option<String>,
 }
 
 /// The tasks the desk starts for itself, counted so that a suite can wait until none is left.
@@ -1516,9 +1525,15 @@ impl Desk {
                 continue;
             }
             let progress = *held.progress.borrow();
-            let state = match *locked(&held.phase) {
-                Phase::Admitted | Phase::Sending | Phase::Stopping => OpenState::Sending,
-                Phase::Paused => OpenState::Paused,
+            // A cancel is read before anything else of the upload: its key is recorded first, and a
+            // paused or sending upload that is cancelled goes on no more.
+            let state = if file.cancel_asked || self.is_cancelled(*key) {
+                OpenState::CancelAsked
+            } else {
+                match *locked(&held.phase) {
+                    Phase::Admitted | Phase::Sending | Phase::Stopping => OpenState::Sending,
+                    Phase::Paused => OpenState::Paused,
+                }
             };
             views.push(view_of(
                 *key,
@@ -1536,6 +1551,11 @@ impl Desk {
             let verdict = locked(&self.verdicts).get(&file.key).cloned();
             let (state, said) = match (file.reached, verdict) {
                 (Reached::Published, _) => (OpenState::Published, None),
+                // A key the person cancelled counts as asked whether or not the record of it could
+                // be written.
+                _ if file.cancel_asked || self.is_cancelled(file.key) => {
+                    (OpenState::CancelAsked, None)
+                }
                 (Reached::Beginning, _) => {
                     (OpenState::Unrecoverable, Some(UNRECOVERABLE.to_owned()))
                 }
@@ -1567,14 +1587,23 @@ impl Desk {
     /// finished is recorded in the entry and finished at the next reach, and the upload is never sent
     /// on.
     ///
+    /// `paired` is the connection to the host when one is held. With none the cancel is kept, and the
+    /// upload is read as cancelled until the next reach finishes it.
+    ///
     /// # Errors
     ///
-    /// Returns the host's refusal, and the failure when the connection ended before the answer, which
-    /// leaves the cancel to be finished: the host's record says what became of it.
-    pub async fn cancel(self: &Arc<Self>, paired: Paired, key: Uuid) -> Result<Cancelled> {
+    /// Returns a refusal when `key` is no upload of `who`'s, in which case nothing is recorded, and
+    /// when the desk has no place to keep entries. Every other failure answers `asked`: the key is
+    /// cancelled, nothing more is sent, and the cancel is finished at the next reach, or at once by
+    /// [`Self::finish_asked`].
+    pub async fn cancel(
+        self: &Arc<Self>,
+        who: Who,
+        paired: Option<Paired>,
+        key: Uuid,
+    ) -> Result<Cancelled> {
         let store = self.store()?;
-        let who = paired.who();
-        let none = || CommandError::invalid("no open upload has that key");
+        let none = || CommandError::invalid(NO_OPEN_UPLOAD);
         #[cfg(feature = "testing")]
         testing::note(key, testing::Point::CancelBegun);
         // Step 0. A stored entry of another account or principal is never marked.
@@ -1618,10 +1647,11 @@ impl Desk {
                 }),
             };
             if let Err(error) = asked {
+                // Nothing runs for this key: it is cancelled, whatever could be written.
                 if let Some(live) = &held {
                     *locked(&live.phase) = Phase::Paused;
                 }
-                return Err(record_not_kept(&error));
+                return Ok(Self::asked(key, Some(record_not_kept(&error).message)));
             }
         }
         let file = match &held {
@@ -1631,7 +1661,29 @@ impl Desk {
                 ..file
             },
         };
-        self.finish_cancel(&turn, &store, &paired, held, file).await
+        let Some(paired) = paired else {
+            // No connection: a reservation the host never answered is forgotten here, and any other
+            // is kept as cancelled until the host is reached.
+            if Self::transfer_of(&held, &file).is_none() {
+                self.forget(&store, &held, key);
+                return Ok(Self::said(key, "forgotten", None, None));
+            }
+            if let Some(live) = &held {
+                *locked(&live.phase) = Phase::Paused;
+            }
+            return Ok(Self::asked(key, None));
+        };
+        match self.finish_cancel(&turn, &store, &paired, held, file).await {
+            Ok(answer) => Ok(answer),
+            Err(error) => Ok(Self::asked(key, Some(error.message))),
+        }
+    }
+
+    /// The transfer the host gave for an upload, whether or not the entry could keep it.
+    fn transfer_of(held: &Option<Arc<Live>>, file: &UploadFile) -> Option<TransferId> {
+        held.as_ref()
+            .and_then(|live| live.transfer())
+            .or(file.transfer_id)
     }
 
     fn said(
@@ -1645,6 +1697,16 @@ impl Desk {
             state,
             released_byte_len: released,
             handle,
+            said: None,
+        }
+    }
+
+    /// A cancel kept to be finished: nothing more of the upload is sent, and `said` tells what went
+    /// wrong when something did.
+    fn asked(key: Uuid, said: Option<String>) -> Cancelled {
+        Cancelled {
+            said,
+            ..Self::said(key, "asked", None, None)
         }
     }
 
@@ -1652,7 +1714,7 @@ impl Desk {
     /// stopped and waited for, the upload or the entry is read again, and the cancel is finished
     /// only when the key is still held or kept and was cancelled. A key already gone answers
     /// `forgotten`, so a second finisher never cancels again.
-    async fn finish_asked(self: &Arc<Self>, paired: &Paired, key: Uuid) -> Result<Cancelled> {
+    pub async fn finish_asked(self: &Arc<Self>, paired: &Paired, key: Uuid) -> Result<Cancelled> {
         let store = self.store()?;
         let turn = self.turn(key).await;
         self.stopped(&turn).await;
@@ -1665,19 +1727,23 @@ impl Desk {
             },
         };
         if !file.is_of(paired) {
-            return Err(CommandError::invalid("no open upload has that key"));
+            return Err(CommandError::invalid(NO_OPEN_UPLOAD));
         }
         if file.reached == Reached::Published {
             return Ok(Self::said(key, "published", None, file.handle));
         }
         if !file.cancel_asked && !self.is_cancelled(key) {
-            return Err(CommandError::invalid("no open upload has that key"));
+            return Err(CommandError::invalid(NO_OPEN_UPLOAD));
         }
         let file = UploadFile {
             cancel_asked: true,
             ..file
         };
-        self.finish_cancel(&turn, &store, paired, held, file).await
+        // A host that cannot be asked leaves the cancel kept: the next reach finishes it.
+        match self.finish_cancel(&turn, &store, paired, held, file).await {
+            Ok(answer) => Ok(answer),
+            Err(error) => Ok(Self::asked(key, Some(error.message))),
+        }
     }
 
     /// The host's record is read, and then the upload is cancelled unless it is published. The
@@ -1696,11 +1762,7 @@ impl Desk {
                 *locked(&live.phase) = Phase::Paused;
             }
         };
-        let transfer = held
-            .as_ref()
-            .and_then(|live| live.transfer())
-            .or(file.transfer_id);
-        let Some(transfer_id) = transfer else {
+        let Some(transfer_id) = Self::transfer_of(&held, &file) else {
             // A reservation whose answer never came: nothing this device can name is held.
             self.forget(store, &held, key);
             return Ok(Self::said(key, "forgotten", None, None));
@@ -2222,6 +2284,111 @@ mod tests {
             .admit(&store, &mine(kr_ipc::new_uuid()), &who)
             .expect_err("a third open upload is refused");
         assert_eq!(refused.message, TOO_MANY_OPEN);
+    }
+
+    /// A folder of its own with one entry kept in it for `account`, and a desk over it.
+    fn kept_for(
+        account: Option<String>,
+        reached: Reached,
+    ) -> (tempfile::TempDir, Arc<Desk>, Store, UploadFile) {
+        let dir = tempfile::tempdir().expect("a directory");
+        let store = Store {
+            root: dir.path().join("open-transfers"),
+        };
+        let desk = Arc::new(Desk::default());
+        desk.keep_at(store.root.clone());
+        let entry = UploadFile {
+            account,
+            ..file(
+                kr_ipc::new_uuid(),
+                Some(TransferId::new(kr_ipc::new_uuid())),
+                reached,
+            )
+        };
+        store.write(&entry).expect("the entry");
+        (dir, desk, store, entry)
+    }
+
+    fn who_of(entry: &UploadFile, account: Option<AccountMark>) -> Who {
+        Who {
+            device_id: entry.device_id,
+            environment_id: Some(entry.environment_id),
+            account,
+        }
+    }
+
+    /// KR-REQ-13.12: a cancel from a sign-in with no account finds no upload of an account: nothing is
+    /// recorded, and the entry stays.
+    #[tokio::test]
+    async fn a_cancel_with_no_account_finds_no_upload_of_an_account() {
+        let (_dir, desk, store, entry) = kept_for(Some("ab".repeat(32)), Reached::Begun);
+        let refused = desk
+            .cancel(who_of(&entry, None), None, entry.key)
+            .await
+            .expect_err("another account's upload is not found");
+        assert_eq!(refused.message, NO_OPEN_UPLOAD);
+        assert!(!desk.is_cancelled(entry.key), "no key is recorded");
+        assert!(
+            store
+                .entry(entry.key)
+                .is_some_and(|kept| !kept.cancel_asked)
+        );
+    }
+
+    /// KR-REQ-13.12: a cancel whose record cannot be written still cancels the key: it answers asked
+    /// with the words, and the upload is read as cancelled, not as waiting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancel_whose_record_cannot_be_written_is_read_as_asked() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, desk, store, entry) = kept_for(None, Reached::Begun);
+        let who = who_of(&entry, None);
+        std::fs::set_permissions(&store.root, std::fs::Permissions::from_mode(0o555))
+            .expect("the folder is read only");
+        let answer = desk.cancel(who.clone(), None, entry.key).await;
+        std::fs::set_permissions(&store.root, std::fs::Permissions::from_mode(0o755))
+            .expect("the folder is writable again");
+        let answer = answer.expect("the cancel is answered");
+        assert_eq!(answer.state, "asked");
+        assert!(answer.said.is_some(), "the failure is said");
+        assert!(desk.is_cancelled(entry.key));
+        let views = desk.open(&who);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].state, OpenState::CancelAsked);
+        assert!(
+            store
+                .entry(entry.key)
+                .is_some_and(|kept| !kept.cancel_asked)
+        );
+    }
+
+    /// KR-REQ-13.12: with no connection a cancel of an upload whose reservation was never answered is
+    /// forgotten at once, and one the host holds is kept, read as asked, with nothing asked of the host.
+    #[tokio::test]
+    async fn a_cancel_with_no_connection_keeps_what_the_host_holds_and_forgets_the_rest() {
+        let (_dir, desk, store, entry) = kept_for(None, Reached::Begun);
+        let who = who_of(&entry, None);
+        let answer = desk
+            .cancel(who.clone(), None, entry.key)
+            .await
+            .expect("answered");
+        assert_eq!(answer.state, "asked");
+        assert!(store.entry(entry.key).is_some_and(|kept| kept.cancel_asked));
+        assert_eq!(desk.open(&who)[0].state, OpenState::CancelAsked);
+
+        let (_dir, desk, store, entry) = kept_for(None, Reached::Beginning);
+        let entry = UploadFile {
+            transfer_id: None,
+            ..entry
+        };
+        store.write(&entry).expect("an entry with no identifier");
+        let answer = desk
+            .cancel(who_of(&entry, None), None, entry.key)
+            .await
+            .expect("answered");
+        assert_eq!(answer.state, "forgotten");
+        assert!(store.entry(entry.key).is_none());
     }
 
     /// KR-REQ-13.12: only the host's own words for an unknown transfer say it knows nothing of the

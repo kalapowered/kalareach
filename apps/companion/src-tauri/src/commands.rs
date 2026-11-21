@@ -2943,9 +2943,24 @@ pub async fn uploads_open(state: State<'_, AppState>) -> Result<Value> {
 /// host's own answer: the bytes it released, or that the upload was already published and is kept.
 #[tauri::command]
 pub async fn upload_cancel(state: State<'_, AppState>, transfer_key: String) -> Result<Value> {
-    let paired = state.paired().await?;
     let key = transfer_key_of(Some(transfer_key))?;
-    encode(&state.transfers().cancel(paired, key).await?)
+    // The cancel needs no connection: with none it is kept and finished at the next reach, and the
+    // application says whose uploads it reads from the host it is paired with.
+    let paired = state.paired().await.ok();
+    let who = match &paired {
+        Some(paired) => paired.who(),
+        None => state.paired_who().await?,
+    };
+    let answer = state.transfers().cancel(who, paired, key).await?;
+    if answer.state != "asked" {
+        return encode(&answer);
+    }
+    // A reach that came while the cancel was under way found the upload mid-cancel and left it: the
+    // connection is looked for again, and the cancel is finished now if one is held.
+    if let Ok(paired) = state.paired().await {
+        return encode(&state.transfers().finish_asked(&paired, key).await?);
+    }
+    encode(&answer)
 }
 
 /// The header a handed file's name comes in, percent-encoded, because a header carries no other

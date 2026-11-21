@@ -2344,14 +2344,9 @@ export function fakeHost(
       hostDrafts.published(handle)
       return Promise.resolve(handle)
     },
-    uploadsOpen: () => {
-      requireConnection()
-      return Promise.resolve(pairedUploads.open())
-    },
-    uploadCancel: (transferKey) => {
-      requireConnection()
-      return pairedUploads.cancel(transferKey)
-    },
+    // The application answers both from what it holds, with no connection to the host.
+    uploadsOpen: () => Promise.resolve(pairedUploads.open()),
+    uploadCancel: (transferKey) => pairedUploads.cancel(transferKey),
     draftEnd: (subject, sessionId) => {
       requireConnection()
       requireWholeSubject(subject)

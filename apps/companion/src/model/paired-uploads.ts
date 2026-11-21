@@ -19,6 +19,7 @@ import { describeBytes } from '../mobile/model/media'
 import {
   CANCELLED_BEFORE_SENT,
   PUBLISHED_AND_KEPT,
+  isNoOpenUpload,
   refusalOf,
   sentence,
   type Refusal
@@ -39,6 +40,8 @@ export type Phase =
   | { readonly kind: 'finishing' }
   /** The person cancelled; the host has not answered. */
   | { readonly kind: 'cancelling' }
+  /** The person cancelled and the application kept the cancel: it is finished when the host can be reached. */
+  | { readonly kind: 'cancelAsked'; readonly said: string | null }
   /** The host released the reservation, with the bytes it says. */
   | { readonly kind: 'cancelled'; readonly released: string | null }
   /** Sent in full and being added to the draft. */
@@ -76,11 +79,14 @@ const DRIVEN: ReadonlySet<PhaseKind> = new Set([
   'resuming',
   'paused',
   'waiting',
-  'finishing'
+  'finishing',
+  'cancelAsked'
 ])
 
-/** The phases in which the person may cancel. */
-const CANCELLABLE: ReadonlySet<PhaseKind> = new Set([...DRIVEN, 'stuck'])
+/** The phases in which the person may cancel: a cancel asked is cancelled already. */
+const CANCELLABLE: ReadonlySet<PhaseKind> = new Set<PhaseKind>(
+  [...DRIVEN, 'stuck' as const].filter((kind) => kind !== 'cancelAsked')
+)
 
 /** Whether a person may cancel a file in `phase`. */
 export function canCancel(phase: Phase): boolean {
@@ -128,6 +134,12 @@ export function lineOf(phase: Phase): Line {
       return { text: 'Finishing with the host', progress: 1, tone: 'plain' }
     case 'cancelling':
       return { text: 'Cancelling', progress: null, tone: 'plain' }
+    case 'cancelAsked':
+      return {
+        text: 'Cancel asked: no more of this file is sent, and the cancel is finished when the host can be reached.',
+        progress: null,
+        tone: 'warning'
+      }
     case 'cancelled':
       return {
         text:
@@ -178,6 +190,8 @@ function phaseOf(view: OpenUpload): Phase {
       return { kind: 'paused', done, of }
     case 'waiting':
       return { kind: 'waiting' }
+    case 'cancelAsked':
+      return { kind: 'cancelAsked', said: null }
     case 'published':
       return { kind: 'kept', words: null }
     case 'cannotResume':
@@ -252,15 +266,23 @@ export class PairedUploads {
     this.#poll()
     return this.#port.attachmentUploadBytes(file, subject, key).then(
       async (handle) => {
-        this.#patch(key, { handle, phase: { kind: 'adding' }, awaited: false })
+        // A cancel that was asked and found the file published: the file was sent, and the row says so.
+        const asked = this.#rows.get(key)?.phase.kind === 'cancelAsked'
+        this.#patch(key, {
+          handle,
+          phase: { kind: 'adding' },
+          awaited: false,
+          ...(asked ? { note: sentence(PUBLISHED_AND_KEPT) } : {})
+        })
         await this.#binding(key, handle, bind)
         return handle
       },
       async (failure: unknown) => {
         const refusal = refusalOf(failure)
         const phase = this.#rows.get(key)?.phase.kind
-        // The person's own cancel has said what became of it.
-        if (phase !== 'cancelling' && phase !== 'cancelled') {
+        // The person's own cancel has said what became of it; a cancel asked is ended only by the
+        // application saying it was cancelled.
+        if (phase !== 'cancelling' && phase !== 'cancelled' && !(phase === 'cancelAsked' && refusal.kind !== 'cancelled')) {
           if (refusal.kind === 'cancelled') {
             this.#patch(key, { phase: { kind: 'cancelled', released: null }, awaited: false })
           } else {
@@ -332,6 +354,10 @@ export class PairedUploads {
         })
         return
       }
+      if (answer.state === 'asked') {
+        this.#asked(key, answer.said)
+        return
+      }
       this.#patch(key, {
         phase: {
           kind: 'cancelled',
@@ -340,9 +366,21 @@ export class PairedUploads {
         awaited: false
       })
     } catch (failure) {
-      // The upload goes on: the host was not asked, or did not answer.
-      this.#patch(key, { phase: before, note: refusalOf(failure).words })
+      if (isNoOpenUpload(failure)) {
+        // The application holds no such upload: nothing was cancelled, and the file is as it was.
+        this.#patch(key, { phase: before, note: refusalOf(failure).words })
+      } else {
+        // The application records a cancel before it does anything else, so a call that failed after
+        // that has cancelled the file: it is never shown as going on.
+        this.#asked(key, refusalOf(failure).words)
+      }
     }
+  }
+
+  /** A cancel the application keeps and has not finished: nothing more is sent, and it is read again. */
+  #asked(key: string, said: string | null): void {
+    this.#patch(key, { phase: { kind: 'cancelAsked', said }, note: said })
+    this.#poll()
   }
 
   /** Drops the row of a file that has left the composer. */
@@ -456,17 +494,30 @@ export class PairedUploads {
           (!row.awaited && row.phase.kind === 'kept')
         ) {
           const next = phaseOf(view)
+          // A cancel asked ends as listed published (the file was kept, and the row says so) or as
+          // no longer listed; a read that was made before the cancel was recorded changes nothing.
+          if (row.phase.kind === 'cancelAsked' && next.kind !== 'cancelAsked' && next.kind !== 'kept') continue
           // A file kept after the draft refused it keeps the reason it was refused for: the
           // application lists it as published and says nothing of why it was not added.
-          const phase = row.phase.kind === 'kept' && next.kind === 'kept' ? row.phase : next
-          set({ ...row, phase, handle: view.handle ?? row.handle })
+          const phase =
+            (row.phase.kind === 'kept' && next.kind === 'kept') ||
+            (row.phase.kind === 'cancelAsked' && next.kind === 'cancelAsked')
+              ? row.phase
+              : next
+          const note = row.phase.kind === 'cancelAsked' && next.kind === 'kept' ? sentence(PUBLISHED_AND_KEPT) : row.note
+          set({ ...row, phase, handle: view.handle ?? row.handle, note })
         }
       }
       // A file the application no longer lists, which no call of this window waits for, has ended.
       for (const [key, row] of this.#rows) {
         const going = DRIVEN.has(row.phase.kind) || row.phase.kind === 'stuck'
         if (!seen.has(key) && !row.awaited && going) {
-          this.#rows.delete(key)
+          // The cancel was finished: the row says it was cancelled, with nothing released to report.
+          if (row.phase.kind === 'cancelAsked') {
+            this.#rows.set(key, { ...row, phase: { kind: 'cancelled', released: null }, note: null })
+          } else {
+            this.#rows.delete(key)
+          }
           changed = true
         }
       }
