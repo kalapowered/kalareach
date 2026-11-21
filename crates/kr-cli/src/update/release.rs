@@ -87,8 +87,8 @@ impl ChannelRoot {
     ///
     /// Returns a refusal when the root cannot be read, is not root metadata, gives one key to two
     /// roles, names one key under two identifiers in a role or a key that is not an Ed25519 key of
-    /// 32 bytes, has no root role, lists the signature of one key twice, holds a number with a
-    /// fraction or an exponent, or is not signed by its own root keys.
+    /// 32 bytes, has no root role, lists the signature of one key twice, holds a number that a
+    /// signed document cannot hold, or is not signed by its own root keys.
     pub fn read(release: &Path) -> Result<Option<Self>> {
         let path = release.join(CHANNEL_ROOT);
         let bytes = match read_bounded(&path, MAX_ROOT_LEN) {
@@ -138,14 +138,17 @@ impl ChannelRoot {
                     Shown::root(&path)
                 ),
                 kr_release::VerifyError::NoCanonicalForm(_) => shown!(
-                    "the update channel's root at {} holds a number written with a fraction or an \
-                     exponent, which a signed document cannot hold",
+                    "the update channel's root at {} holds a number that a signed document cannot \
+                     hold: one written with a fraction or an exponent, a negative zero, or a whole \
+                     number outside the 64-bit range",
                     Shown::root(&path)
                 ),
-                _ => shown!(
-                    "the update channel's root at {} is not signed by the root keys it names",
-                    Shown::root(&path)
-                ),
+                kr_release::VerifyError::Threshold | kr_release::VerifyError::Document(_) => {
+                    shown!(
+                        "the update channel's root at {} is not signed by the root keys it names",
+                        Shown::root(&path)
+                    )
+                }
             })
         })?;
         Ok(Some(Self { signed }))
@@ -157,8 +160,8 @@ impl ChannelRoot {
     ///
     /// Returns a refusal when it gives one key to two roles, names one key under two identifiers in
     /// a role or a key that is not an Ed25519 key of 32 bytes, has no root role, lists the
-    /// signature of one key twice, holds a number with a fraction or an exponent, or is not signed
-    /// by its own root keys.
+    /// signature of one key twice, holds a number that a signed document cannot hold, or is not
+    /// signed by its own root keys.
     pub fn kept(signed: tough::schema::Signed<tough::schema::Root>) -> Result<Self> {
         kr_release::verify_root_itself(&signed).map_err(|error| {
             CliError::Other(Shown::said(match error {
@@ -183,10 +186,11 @@ impl ChannelRoot {
                      keys that sign it"
                 }
                 kr_release::VerifyError::NoCanonicalForm(_) => {
-                    "the update channel's root this host kept holds a number written with a \
-                     fraction or an exponent, which a signed document cannot hold"
+                    "the update channel's root this host kept holds a number that a signed \
+                     document cannot hold: one written with a fraction or an exponent, a negative \
+                     zero, or a whole number outside the 64-bit range"
                 }
-                _ => {
+                kr_release::VerifyError::Threshold | kr_release::VerifyError::Document(_) => {
                     "the update channel's root this host kept is not signed by the root keys it \
                      names"
                 }
@@ -254,8 +258,8 @@ impl ChannelRoot {
     /// # Errors
     ///
     /// Returns a refusal when the document is not a signed manifest, lists the signature of one key
-    /// twice or holds a number with a fraction or an exponent, the root has no targets role, or the
-    /// signatures do not reach the threshold.
+    /// twice or holds a number that a signed document cannot hold, the root has no targets role, or
+    /// the signatures do not reach the threshold.
     pub fn verify(&self, document: &[u8]) -> Result<ReleaseManifest> {
         let members = kr_release::verify_manifest(&self.signed.signed, document).map_err(
             |error| match error {
@@ -278,8 +282,9 @@ impl ChannelRoot {
                      a release's manifest",
                 )),
                 kr_release::VerifyError::NoCanonicalForm(_) => CliError::Other(Shown::said(
-                    "the release's manifest holds a number written with a fraction or an \
-                     exponent, which a signed document cannot hold",
+                    "the release's manifest holds a number that a signed document cannot hold: one \
+                     written with a fraction or an exponent, a negative zero, or a whole number \
+                     outside the 64-bit range",
                 )),
             },
         )?;

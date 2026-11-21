@@ -3716,7 +3716,7 @@ fn trusted_from(text: &str) -> kr_cli::update::release::ChannelRoot {
         .expect("the root is there")
 }
 
-/// KR-REQ-26.40: a root that lists the signature of its one key twice is refused as that, and is
+/// KR-REQ-26.37: a root that lists the signature of its one key twice is refused as that, and is
 /// not said to be unsigned.
 #[cfg(unix)]
 #[test]
@@ -3743,7 +3743,7 @@ fn a_host_refuses_a_channel_root_that_lists_a_signature_twice_as_that() {
     );
 }
 
-/// KR-REQ-26.40: a root with no root role is refused as that, and is not said to be unsigned.
+/// KR-REQ-26.37: a root with no root role is refused as that, and is not said to be unsigned.
 #[cfg(unix)]
 #[test]
 fn a_host_refuses_a_channel_root_with_no_root_role_as_that() {
@@ -3769,7 +3769,7 @@ fn a_host_refuses_a_channel_root_with_no_root_role_as_that() {
     );
 }
 
-/// KR-REQ-26.40: a root with a member that has no canonical form, here a number with a fraction,
+/// KR-REQ-26.37: a root with a member that has no canonical form, here a number with a fraction,
 /// which no signature can be made over, is refused as that and is not said to be unsigned.
 #[cfg(unix)]
 #[test]
@@ -3783,8 +3783,8 @@ fn a_host_refuses_a_channel_root_with_a_member_that_has_no_canonical_form_as_tha
     let mut document: serde_json::Value = serde_json::from_str(&sound).expect("a root");
     document["signed"]["ratio"] = serde_json::json!(1.5);
     let text = document.to_string();
-    let words = "holds a number written with a fraction or an exponent, which a signed document \
-                 cannot hold";
+    let words = "holds a number that a signed document cannot hold: one written with a fraction or \
+                 an exponent, a negative zero, or a whole number outside the 64-bit range";
     let carried = said_of_a_carried_root(&text);
     assert!(carried.contains(words), "{carried}");
     let kept = said_of_a_kept_root(&text);
@@ -3802,8 +3802,8 @@ fn a_host_refuses_a_channel_root_with_a_member_that_has_no_canonical_form_as_tha
 fn a_host_refuses_a_manifest_that_lists_a_signature_twice_or_has_no_canonical_form_as_that() {
     let root = trusted();
     let (_, _, document) = small_release(&keys().targets);
-    let said = |document: &Value| {
-        root.verify(document.to_string().as_bytes())
+    let said = |document: &str| {
+        root.verify(document.as_bytes())
             .expect_err("a host refuses the manifest")
             .to_string()
     };
@@ -3815,26 +3815,37 @@ fn a_host_refuses_a_manifest_that_lists_a_signature_twice_or_has_no_canonical_fo
         .as_array_mut()
         .expect("signatures")
         .push(listed);
-    let said_twice = said(&twice);
+    let said_twice = said(&twice.to_string());
     assert!(
         said_twice.contains("the release's manifest lists the signature of one key twice"),
         "{said_twice}"
     );
+    assert!(!said_twice.contains("is not signed by"), "{said_twice}");
 
+    // A number a signed document cannot hold: one with a fraction, and three written as whole
+    // numbers that the JSON reader keeps as floating-point values all the same, a negative zero
+    // and a whole number past each end of the 64-bit range, in the document's own text.
+    let words = "the release's manifest holds a number that a signed document cannot hold: one \
+                 written with a fraction or an exponent, a negative zero, or a whole number \
+                 outside the 64-bit range";
     let mut fractional = signed;
     fractional["signed"]["ratio"] = serde_json::json!(1.5);
-    let said_fractional = said(&fractional);
-    assert!(
-        said_fractional.contains(
-            "the release's manifest holds a number written with a fraction or an exponent, which \
-             a signed document cannot hold"
-        ),
-        "{said_fractional}"
-    );
-    assert!(
-        !said_twice.contains("is not signed by") && !said_fractional.contains("is not signed by"),
-        "{said_twice} {said_fractional}"
-    );
+    let mut numbers = vec![("1.5", fractional.to_string())];
+    let signed_at = document.find("\"signed\":").expect("the signed members");
+    let open = signed_at + document[signed_at..].find('{').expect("an object") + 1;
+    for number in ["-0", "18446744073709551616", "-9223372036854775809"] {
+        let mut raw = document.clone();
+        raw.insert_str(open, &format!("\"ratio\":{number},"));
+        numbers.push((number, raw));
+    }
+    for (number, text) in &numbers {
+        let said_number = said(text);
+        assert!(said_number.contains(words), "{number}: {said_number}");
+        assert!(
+            !said_number.contains("is not signed by"),
+            "{number}: {said_number}"
+        );
+    }
 }
 
 /// KR-REQ-26.09: a manifest checked against a root with no targets role is refused as that, since

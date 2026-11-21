@@ -70,7 +70,9 @@ pub enum VerifyError {
         role: &'static str,
     },
     /// The document holds a member that has no canonical form, so no signature over it can be
-    /// checked: a number written with a fraction or an exponent.
+    /// checked. It is a number that the JSON reader keeps as a floating-point value: one written
+    /// with a fraction or an exponent, a negative zero, or a whole number outside the 64-bit
+    /// range.
     #[error("it has no canonical form: {0}")]
     NoCanonicalForm(String),
     /// Fewer distinct keys than the role's threshold signed.
@@ -191,6 +193,7 @@ fn refused(error: &tough::schema::Error) -> VerifyError {
         tough::schema::Error::JsonSerialization { source, .. } => {
             VerifyError::NoCanonicalForm(source.to_string())
         }
+        tough::schema::Error::SignatureThreshold { .. } => VerifyError::Threshold,
         // An error the library adds later keeps the threshold's refusal until it is named here.
         _ => VerifyError::Threshold,
     }
