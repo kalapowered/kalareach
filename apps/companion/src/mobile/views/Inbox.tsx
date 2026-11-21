@@ -237,13 +237,10 @@ export function Inbox({
     }
   }, [port, load])
 
-  // The host in use's rows are those read under the host and epoch the connection holds now, and a
-  // host that refused shows none.
+  // The host in use's rows are those read under the host and epoch the connection holds now. A
+  // refusal moves the epoch, so a host that refused shows none.
   const latest = others.latest
-  const here =
-    inbox !== null && latest !== null && holdsFor(inbox.key, latest) && latest.contact.state !== 'refused'
-      ? inbox
-      : null
+  const here = inbox !== null && latest !== null && holdsFor(inbox.key, latest) ? inbox : null
   const numbered: ReadonlyMap<string, string> =
     numbers !== null && latest !== null && holdsFor(numbers.key, latest) ? numbers.named : NO_NUMBERS
   // Only a paired host in use has a name and a row of contact: the host on this computer has none.

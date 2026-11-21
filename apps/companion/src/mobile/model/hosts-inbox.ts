@@ -129,7 +129,6 @@ export function useOtherHosts(): OtherHosts {
     if (!answered || latest === null) return null
     const shown: HostInbox[] = []
     for (const other of latest.others) {
-      if (other.contact.state === 'refused') continue
       if (latest.host?.kind === 'paired' && latest.host.reference === other.reference) continue
       const held = caches.get(other.reference)
       if (held !== undefined && held.epoch === other.inbox_epoch) shown.push(held.read)
