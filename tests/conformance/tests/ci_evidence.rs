@@ -292,13 +292,19 @@ fn steps_named(condition: &str) -> Vec<String> {
         .collect()
 }
 
-/// The matrix leg a condition names (`matrix.part == 'second'`), if it names one.
-fn leg_named(condition: &str) -> Option<String> {
-    let after = compact(condition)
-        .split_once("matrix.part=='")?
-        .1
-        .to_owned();
-    Some(after.split('\'').next()?.to_owned())
+/// The matrix leg a condition names, if it names one: `matrix.part == 'second'` names that leg, and
+/// `startsWith(matrix.part, 'tests')` every leg whose part begins so. The flag is true for the
+/// second form.
+fn leg_named(condition: &str) -> Option<(String, bool)> {
+    let compacted = compact(condition);
+    let (after, prefix) = match compacted.split_once("matrix.part=='") {
+        Some((_, after)) => (after.to_owned(), false),
+        None => (
+            compacted.split_once("startsWith(matrix.part,'")?.1.to_owned(),
+            true,
+        ),
+    };
+    Some((after.split('\'').next()?.to_owned(), prefix))
 }
 
 /// The `part` of each leg that the job's matrix includes: the line after a `- name:` entry.
@@ -459,10 +465,12 @@ const CLASSES: [ClassOfTest; 10] = [
         runner: &["runs-on: macos-15"],
         runs_on: "macos-15",
         job_when: Some("github.event_name != 'workflow_dispatch' || inputs.macos"),
-        // The whole text of the step's command line, to its end, so that the whole-workspace step
-        // holds the class and not a step that starts with the same words.
-        tool: "cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --",
-        when: Some("${{ !cancelled() && matrix.part == 'tests' }}"),
+        // The step's command line to the `--` that ends the cargo flags, so that the step that runs
+        // each leg's packages holds the class and not a step that starts with the same words. The
+        // packages are the matrix entry's, and `scripts/check-macos-test-division.py` holds the two
+        // legs' lists to the workspace's members less one.
+        tool: "cargo test --locked ${{ matrix.packages }} --no-fail-fast --",
+        when: Some("${{ !cancelled() && startsWith(matrix.part, 'tests') }}"),
     },
 ];
 
@@ -473,8 +481,8 @@ const CLASSES: [ClassOfTest; 10] = [
 /// system's own tooling for native controls and for the iOS Simulator on macOS, an Android
 /// emulator for the Android phone, the Tauri desktop application's native backend on Linux and
 /// macOS, its release build and its window on Windows, the real-worker host suite on a native
-/// Windows machine, and the workspace's tests on a hosted Linux and macOS machine (the macOS step
-/// leaves out one package and skips named cases). A step whose condition is never true, or true on
+/// Windows machine, and the workspace's tests on a hosted Linux and macOS machine (the macOS job
+/// divides the workspace's packages between two legs, leaving out one, and skips named cases). A step whose condition is never true, or true on
 /// one kind of runner when its class names both, or whose leg is gone from the matrix, runs on no
 /// runner and fails the case. The Windows job runs many more test steps than the two this case
 /// holds. The conformance document's table names the same jobs. Physical devices are the person's
@@ -536,9 +544,11 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                 when.map(compact),
                 "{class}: a step that runs {tool} runs under a condition other than {when:?}"
             );
-            if let Some(leg) = when.and_then(leg_named) {
+            if let Some((leg, prefix)) = when.and_then(leg_named) {
                 assert!(
-                    legs(&text).contains(&leg),
+                    legs(&text)
+                        .iter()
+                        .any(|part| if prefix { part.starts_with(&leg) } else { *part == leg }),
                     "{class}: the {name} job's matrix has no {leg} leg, so a step that runs {tool} \
                      never runs"
                 );
