@@ -10,22 +10,37 @@
  * decision.
  */
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import type { AttentionReadResult } from '@kalareach/protocol'
 
 import { Badge, Banner, Button, Card } from '../components/ui'
 import { readOnCadence } from '../app/cadence'
 import { useApp } from '../app/state'
-import { failureMessage, watch, type Watch } from '../host/port'
+import {
+  failureCode,
+  failureMessage,
+  holdsFor,
+  keyOfState,
+  READ_SUPERSEDED,
+  sameKey,
+  watch,
+  type ConnectionState,
+  type ReadKey,
+  type Watch
+} from '../host/port'
 import { ask } from '../mobile/model/call'
 import {
   ATTENTION_READ_CADENCE_MS,
+  contactWords,
+  describeElapsed,
   emptyMessage,
   filter as filtered,
   inboxNotes,
+  KIND_LABEL,
   order,
   readWholeInbox,
+  THIS_COMPUTER,
   type AttentionFilter,
   type AttentionRow
 } from '../model/attention'
@@ -62,57 +77,104 @@ function asksAQuestion(row: AttentionRow): boolean {
 /** The largest page of the inbox one read asks for. */
 const PAGE_ITEMS = '200'
 
-/** The inbox. */
-export function Attention(): ReactNode {
+const NO_NUMBERS: ReadonlyMap<string, string> = new Map()
+
+/**
+ * The inbox. `latest` is the connection's latest state, which the row of contact is drawn from and
+ * which decides what of a cache is shown: null until the connection has said anything.
+ */
+export function Attention({ latest }: { readonly latest: ConnectionState | null }): ReactNode {
   const { port, go, say } = useApp()
-  const [inbox, setInbox] = useState<AttentionReadResult | null>(null)
-  const [readAtMs, setReadAtMs] = useState(0)
+  // What the host in use said, under the key the owner said it holds under: a read is stored only
+  // while that is the key of the connection's latest state, and shown while the host and its epoch
+  // still hold. A read that fails leaves it as it is, and a host that refused moved its epoch.
+  const [inbox, setInbox] = useState<{
+    readonly key: ReadKey
+    readonly result: AttentionReadResult
+    readonly atMs: number
+  } | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
   const [chosen, setChosen] = useState<AttentionFilter>('all')
-  // Each session's display number, by its identifier, as the host listed them.
-  const [numbers, setNumbers] = useState<ReadonlyMap<string, string>>(new Map())
+  // Each session's display number, by its identifier, as the host in use listed them, under a key of
+  // their own: a failed or differently keyed read of them leaves the inbox as it is.
+  const [numbers, setNumbers] = useState<{
+    readonly key: ReadKey
+    readonly named: ReadonlyMap<string, string>
+  } | null>(null)
+  const [nowMs, setNowMs] = useState(() => Date.now())
   // Every read of the inbox, on opening, on the cadence, after an answer and on a retry, goes
   // through one cadence under one watch with no listeners: one read at a time, only the newest
   // read's answer shown, and none once the screen closes.
   const reads = useRef<Watch | null>(null)
   const again = useRef<() => void>(() => undefined)
 
-  const load = useCallback((): Promise<void> => {
-    const current = reads.current?.read() ?? null
-    if (current === null) return Promise.resolve()
-    const inboxRead = ask(() =>
-      readWholeInbox((after) =>
-        port.attentionRead({
-          session_id: null,
-          include_acknowledged: false,
-          max_items: PAGE_ITEMS,
-          after
-        })
+  // One read of the inbox and of the numbers. What it read is kept only under the key of the
+  // connection's latest state at the moment it completes: the answer's own key is the owner's, and the
+  // page gives no read an authority of its own. A dropped read (superseded, or under another key) says
+  // so, and the next read waits for the cadence, a connection change or one more attempt.
+  const readOnce = useCallback(
+    (current: () => boolean): Promise<boolean> => {
+      const inboxRead = ask(() =>
+        readWholeInbox((after) =>
+          port.attentionRead({
+            session_id: null,
+            include_acknowledged: false,
+            max_items: PAGE_ITEMS,
+            after
+          })
+        )
+      ).then(
+        (answer) => {
+          if (!current()) return false
+          const now = port.connectionLatest()
+          if (now === null || !sameKey(answer.key, keyOfState(now))) return true
+          setInbox({ key: answer.key, result: answer.value, atMs: Date.now() })
+          setFailure(null)
+          return false
+        },
+        (error: unknown) => {
+          if (!current()) return false
+          if (failureCode(error) === READ_SUPERSEDED) return true
+          setFailure(failureMessage(error))
+          return false
+        }
       )
-    )
-      .then((answer) => {
-        if (!current()) return
-        setInbox(answer.value)
-        setReadAtMs(Date.now())
-        setFailure(null)
-      })
-      .catch((error: unknown) => {
-        if (!current()) return
-        setFailure(failureMessage(error))
-      })
-    // Only for the words: an inbox read without them names a session by nothing but the item.
-    const numbersRead = ask(() => port.sessionNumbers())
-      .then((answer) => {
-        if (!current()) return
-        setNumbers(new Map(answer.value.sessions.map((session) => [session.session_id, session.display_number])))
-      })
-      .catch(() => undefined)
-    return Promise.all([inboxRead, numbersRead]).then(() => undefined)
-  }, [port])
+      // Only for the words: an inbox read without them names a session by nothing but the item.
+      const numbersRead = ask(() => port.sessionNumbers()).then(
+        (answer) => {
+          if (!current()) return
+          const now = port.connectionLatest()
+          if (now === null || !sameKey(answer.key, keyOfState(now))) return
+          setNumbers({
+            key: answer.key,
+            named: new Map(
+              answer.value.sessions.map((session) => [session.session_id, session.display_number])
+            )
+          })
+        },
+        () => undefined
+      )
+      return Promise.all([inboxRead, numbersRead]).then(([dropped]) => dropped)
+    },
+    [port]
+  )
 
+  const load = useCallback(async (): Promise<void> => {
+    const current = reads.current?.read() ?? null
+    if (current === null) return
+    // A read that is dropped makes one new read from the connection's state as it stands then; a
+    // second one that is dropped waits for the cadence.
+    if (await readOnce(current)) await readOnce(current)
+    if (current()) setNowMs(Date.now())
+  }, [readOnce])
+
+  // The inbox is read once the connection listener is registered, so no change of connection falls
+  // between the read and it, and read again on the cadence and on each change of connection.
   useEffect(() => {
     const cadence = readOnCadence(load, ATTENTION_READ_CADENCE_MS)
-    const reading = watch([], cadence.now)
+    const reading = watch([port.onConnection(cadence.now)], cadence.now, (error) => {
+      setFailure(failureMessage(error))
+    })
     reads.current = reading
     again.current = cadence.now
     return () => {
@@ -121,7 +183,7 @@ export function Attention(): ReactNode {
       if (reads.current === reading) reads.current = null
       again.current = () => undefined
     }
-  }, [load])
+  }, [port, load])
 
   const readAgain = useCallback(() => {
     again.current()
@@ -146,8 +208,42 @@ export function Attention(): ReactNode {
       })
   }
 
-  const rows = inbox ? filtered(order(inbox, readAtMs), chosen) : []
-  const notes = inbox ? inboxNotes(inbox) : []
+  // The host in use's rows are those read under the host and epoch the connection holds now. A
+  // refusal moves the epoch, so a host that refused shows none.
+  const here = inbox !== null && latest !== null && holdsFor(inbox.key, latest) ? inbox : null
+  const numbered: ReadonlyMap<string, string> =
+    numbers !== null && latest !== null && holdsFor(numbers.key, latest) ? numbers.named : NO_NUMBERS
+  const rows = here ? filtered(order(here.result, here.atMs), chosen) : []
+  const notes = here ? inboxNotes(here.result) : []
+
+  // A host in use that does not answer has a row of contact, from the connection's state: the host
+  // on this computer is named by the shared title. A host never reached, and one that answered and
+  // refused, are not out of contact.
+  const lost = useMemo(() => {
+    if (latest === null || latest.host === null || latest.contact.state !== 'out_of_contact') return null
+    return {
+      name: latest.host.kind === 'local' ? THIS_COMPUTER : latest.host.name,
+      sinceMs: latest.contact.since_ms,
+      escalatesAtMs: latest.contact.escalates_at_ms
+    }
+  }, [latest])
+  const escalatesAtMs = lost?.escalatesAtMs ?? null
+  const urgent = escalatesAtMs !== null && nowMs >= escalatesAtMs
+
+  // The level a loss has reached moves at the instant its state says, whatever the reads do.
+  useEffect(() => {
+    if (escalatesAtMs === null) return undefined
+    const wait = escalatesAtMs - Date.now()
+    if (wait <= 0) return undefined
+    const timer = setTimeout(() => {
+      setNowMs(Date.now())
+    }, wait)
+    return () => {
+      clearTimeout(timer)
+    }
+  }, [escalatesAtMs])
+
+  const showContact = lost !== null && (chosen === 'all' || chosen === 'disconnected')
   // A session's approvals are listed once, under its first approval item, whatever number of items
   // the host raised for them.
   const approvalsShown = new Set<string>()
@@ -167,7 +263,7 @@ export function Attention(): ReactNode {
 
       <KeptAnswers />
 
-      {failure ? (
+      {failure && lost === null ? (
         <Banner
           tone="warning"
           title="This list could not be read"
@@ -204,16 +300,46 @@ export function Attention(): ReactNode {
         </div>
       </div>
 
-      {rows.length === 0 ? (
+      {rows.length === 0 && !showContact ? (
         <div className="empty-state">
-          <h2>{inbox ? emptyMessage(chosen) : 'Reading the inbox…'}</h2>
+          <h2>{here ? emptyMessage(chosen) : 'Reading the inbox…'}</h2>
           <p>Work that needs a decision or a review will appear here.</p>
         </div>
       ) : (
         <ul className="attention-list" data-testid="attention-list">
+          {showContact ? (
+            <li key="contact">
+              <Card
+                data-kind="disconnected"
+                data-testid="attention-contact"
+                data-level={urgent ? 'urgent' : 'notable'}
+                data-host={lost.name}
+              >
+                <div className="attention-top">
+                  <span className="row">
+                    <Badge tone={BADGE_TONE.muted}>{KIND_LABEL.disconnected}</Badge>
+                    <span className="small faint">{lost.name}</span>
+                  </span>
+                  {urgent ? <Badge tone="danger">Urgent</Badge> : null}
+                </div>
+                <div className="attention-body">
+                  <h2>{lost.name} is out of contact</h2>
+                  <p>
+                    {contactWords(lost.sinceMs, nowMs)}
+                    {here === null
+                      ? ''
+                      : ` What is listed here from it was read ${describeElapsed(nowMs - here.atMs)} ago.`}
+                  </p>
+                </div>
+                <div className="card-footer">
+                  <span className="small faint">Nothing here is a failure.</span>
+                </div>
+              </Card>
+            </li>
+          ) : null}
           {rows.map((row) => {
             const sessionId = row.item.session_id
-            const number = sessionId === null ? undefined : numbers.get(sessionId)
+            const number = sessionId === null ? undefined : numbered.get(sessionId)
             // A session's approvals, and its questions, are listed once however many rows the host
             // raised for them: each row is for one request, and a panel lists the session's all.
             const approvals =

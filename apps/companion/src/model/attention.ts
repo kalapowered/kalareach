@@ -75,6 +75,9 @@ async function followPages(
   return { key: first.key, value: { ...page, items } }
 }
 
+/** What the desktop calls the host on this computer, in a row's title. */
+export const THIS_COMPUTER = 'This computer'
+
 /** What an item is asking for, as the inbox tells them apart. */
 export type AttentionKind =
   | 'pending_decision'

@@ -24,7 +24,7 @@ import { Session } from './views/Session'
 import { Setup } from './setup/Setup'
 import { KeptDrafts } from './views/KeptDrafts'
 import { useRebind } from './app/drafts'
-import { failureMessage } from './host/port'
+import { failureMessage, type ConnectionState } from './host/port'
 import { useConfirmations } from './pairing/Confirmations'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
@@ -58,6 +58,8 @@ export function App(): ReactNode {
     readonly rights: readonly ActionRight[] | null
     readonly paired: boolean
   } | null>(null)
+  // The connection's latest state whole, which the inbox draws its row of contact from.
+  const [latest, setLatest] = useState<ConnectionState | null>(null)
   const account = useAccount(port)
   const [accountOpen, setAccountOpen] = useState(false)
   // Drafts the application was started or disconnected with are bound to their conversations again
@@ -88,6 +90,7 @@ export function App(): ReactNode {
             say(CONNECTION_REPLACED, 'pending')
           }
           replacements.current = Math.max(replacements.current ?? 0, state.replaced)
+          setLatest(state)
           if (state.connected && state.rights !== null) rememberRights(state.rights)
           setConnection({
             connected: state.connected,
@@ -215,7 +218,7 @@ export function App(): ReactNode {
         </header>
 
         <main id="main" tabIndex={-1}>
-          {place.view === 'attention' ? <Attention /> : null}
+          {place.view === 'attention' ? <Attention latest={latest} /> : null}
           {place.view === 'sessions' ? <Sessions /> : null}
           {place.view === 'hosts' ? <Hosts /> : null}
           {place.view === 'devices' ? <Devices /> : null}
