@@ -214,9 +214,13 @@ fn provided(name: &str, provider: &str) -> bool {
 pub enum Rules {
     /// Every refusal: the crate is one the scan reads for sightings.
     All,
-    /// Only the renames of a name the scan reads and the aliases of the two types (R1 and R2): a crate
-    /// that the scan does not read for sightings is still one that a crate it reads may reach a type
-    /// through, by a `pub use` or a `pub type`.
+    /// The renames of a name the scan reads and the aliases of the two types (R1 and R2), in its files
+    /// and in the tokens of its macros: a crate that the scan does not read for sightings is still one
+    /// that a crate it reads may reach a type through, by a `pub use` or a `pub type`. The module
+    /// walk's own refusals (a link, `..` or a root in a `#[path]`, a module at no file or at two, a
+    /// `#[path]` that is no string, a module declared in a block, a condition the rule cannot read,
+    /// a `cfg_attr` that sets a path, a file that does not parse) hold for it too: the walk cannot
+    /// read what it cannot reach.
     Renames,
 }
 

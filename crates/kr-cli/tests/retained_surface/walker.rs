@@ -1585,6 +1585,9 @@ impl Tree {
             match self.followed_set(krate, &[*name], Depth::Alone) {
                 Ok(_) => {}
                 Err(WalkError::Undefined(_)) => undefined.push(name),
+                // Not reached with a file that fails to parse or to read: `refusals` above scans
+                // every file of the crate's inventory first and stops on it. A lookup in a second
+                // crate is not made at `Depth::Alone`. The arm stays for a fault that scan lacks.
                 Err(WalkError::Other(error)) => return Lookup::Failed(error),
             }
         }
