@@ -430,6 +430,28 @@ describe('the page’s keeping of the room', () => {
     stop()
   })
 
+  it('measures a message again when an attribute moves its words with no change of size or text, and not for its own padding', async () => {
+    const { pane: root, messages } = pane(1, (message) => {
+      link(message, 100, 110)
+      link(message, 130, 140)
+    })
+    const stop = startLinkFit(root)
+    frame()
+    await mutations()
+    expect(frames.length, 'frames asked for by the hook’s own writes to the links’ style').toBe(0)
+    const [first, second] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    if (!first || !second) throw new Error('the made page has no links')
+    expect(given(first).right, 'the first link shares the gap with the second').toBe(10)
+    // A cell's alignment moves the second link's words away with the message's size and text as they were.
+    words.set(second, { left: 300, top: 20, right: 310, bottom: 64 })
+    messages[0]?.setAttribute('style', 'text-align: right')
+    await mutations()
+    expect(frames.length, 'one frame asked for by the attribute').toBe(1)
+    frame()
+    expect(given(first).right, 'the first link now has the room, the second being far').toBeGreaterThan(10)
+    stop()
+  })
+
   it('stops: a change after it is made is not measured', async () => {
     const { pane: root } = pane(1, (message) => {
       link(message, 100, 110)
