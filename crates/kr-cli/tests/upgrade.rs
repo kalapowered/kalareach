@@ -2698,8 +2698,7 @@ async fn inside_the_level_a_rollback_goes_on_beside_a_worker_of_this_build_and_s
 async fn inside_the_level_a_rollback_leaves_the_launch_commands_store_and_an_update_again_shows_them()
  {
     use kr_protocol::launch_commands::{
-        NamedLaunch, ShellLaunchCommandsListParams, ShellLaunchCommandsListResult,
-        ShellLaunchCommandsSaveParams, ShellLaunchCommandsSaveResult,
+        NamedLaunch, ShellLaunchCommandsSaveParams, ShellLaunchCommandsSaveResult,
     };
     use kr_protocol::scalars::U64;
 
@@ -2802,18 +2801,24 @@ async fn inside_the_level_a_rollback_leaves_the_launch_commands_store_and_an_upd
         "the daemon is this build's again"
     );
     assert_eq!(std::fs::read(&file).expect("the store"), kept);
-    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-        .await
-        .expect("reaches the daemon");
-    let listed: ShellLaunchCommandsListResult = pairing::read(
-        &mut client,
-        Method::ShellLaunchCommandsList,
-        &ShellLaunchCommandsListParams {},
-    )
-    .await
-    .expect("the owner reads the list");
-    assert_eq!(listed.revision, revision, "the same revision");
-    assert_eq!(listed.commands, commands, "the same commands, in order");
+    // The person's own `kr`, the one this update installed, reads the list the way they would.
+    let (output, listed) = host.kr_json(&["--json", "launch", "list"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "kr launch list reads the list after the update: {listed} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        listed["revision"],
+        revision.to_string(),
+        "the same revision, as the protocol's decimal string"
+    );
+    assert_eq!(
+        listed["commands"],
+        serde_json::to_value(&commands).expect("the commands as JSON"),
+        "the same commands, in order"
+    );
 
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_now(), &updated.display);
