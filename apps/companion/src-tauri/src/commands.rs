@@ -103,9 +103,15 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
         "draft_add_attachment",
         Some(Method::AgentDraftAddAttachment),
     ),
+    // The draft this device keeps for a session on a paired host ends when the composer drops it.
+    ("draft_end", None),
     ("attachment_upload", Some(Method::UploadBegin)),
     ("attachment_upload_bytes", Some(Method::UploadBegin)),
     ("attachment_upload_status", Some(Method::UploadStatus)),
+    // The uploads this device holds open on a paired host: read from native state, and cancelled by
+    // native code, which reads the host's record first.
+    ("uploads_open", None),
+    ("upload_cancel", None),
     // History and receipts. A live session's are read from its own worker, and a closed one's from
     // the host's archive.
     ("history_page", Some(Method::HistoryPage)),
@@ -615,6 +621,14 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     // was shown is only compared with the newest uncertain send recorded on this device, and the
     // actions asked about are the ones recorded there.
     ("question_answer", &[Method::ActionRead]),
+    // An upload is cancelled after the host's record of it is read, and one that the host has
+    // published is not cancelled: the page names the upload by the key it chose.
+    (
+        "upload_cancel",
+        &[Method::UploadStatus, Method::UploadCancel],
+    ),
+    // A draft kept on a paired host is ended by the host's own method.
+    ("draft_end", &[Method::DraftDiscard]),
 ];
 
 /// The command handlers, in the form Tauri registers.
@@ -660,9 +674,12 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         device_drafts_ledger_set_aside,
         draft_create,
         draft_add_attachment,
+        draft_end,
         attachment_upload,
         attachment_upload_bytes,
         attachment_upload_status,
+        uploads_open,
+        upload_cancel,
         history_page,
         action_read,
         action_cancel,
@@ -1212,8 +1229,22 @@ async fn send_prompt(
     let target = typed.target;
     let expected = PromptPreconditions(supersedes);
     if typed.draft_id.is_present() {
-        not_on_a_paired_host(state, "a prompt that names a draft")?;
-        return send_draft_prompt(state, method, &typed, &expected).await;
+        let settled = send_draft_prompt(state, method, &typed, &expected).await?;
+        // A prompt that names the draft records the send on the host, which frees the draft's place:
+        // the draft is the session's now, and what this device kept of it ends.
+        if !settled.answer_lost {
+            if let Ok((device_id, environment_id, session)) = state.paired_snapshot() {
+                state.paired_drafts().sent(
+                    &crate::open_transfers::Paired {
+                        device_id,
+                        environment_id,
+                        session,
+                    },
+                    typed.target.subject.session_id,
+                );
+            }
+        }
+        return Ok(settled);
     }
     submitted(
         links
@@ -1266,9 +1297,8 @@ pub async fn agent_prompt_queue(
     .await
 }
 
-/// Refuses what a device paired with a host cannot do: the host serves no file to it, so it keeps
-/// no draft with an attachment there, and a command that reaches the host's desktop or its files
-/// is not made from here.
+/// Refuses what a device paired with a host cannot do: a command that reaches the host's desktop or
+/// its files is not made from here.
 fn not_on_a_paired_host(state: &AppState, what: &str) -> Result<()> {
     if state.paired_context().is_some() {
         return Err(CommandError::unsupported(format!(
@@ -1795,16 +1825,40 @@ pub async fn terminal_view_launch(
 
 /// Creates a draft on the host, which a file is then bound to.
 ///
-/// Not offered over a host this device is paired with: that host serves no file to a device, so a
-/// draft there carries no attachment and a prompt sends its text inline.
+/// On a host this device is paired with the draft is made at the first bind, never before: this
+/// answers the draft the device keeps for the session, with the files it bound, or that none is
+/// made yet.
 #[tauri::command]
 pub async fn draft_create(
     state: State<'_, AppState>,
     subject: Subject,
     params: Value,
 ) -> Result<Settled> {
-    not_on_a_paired_host(&state, "a draft")?;
     let typed: kr_protocol::transfer::DraftCreateParams = decode(params)?;
+    if state.paired_context().is_some() {
+        // A device makes its draft at the first bind and never before: this answers the draft it
+        // keeps for the session, or that none is made yet.
+        let (device_id, environment_id, session) = state.paired_snapshot()?;
+        let Some(session_id) = typed.session_id.as_ref().copied() else {
+            return Err(CommandError::invalid(
+                "a draft on a paired host needs a session: open one first",
+            ));
+        };
+        let kept = state.paired_drafts().kept(
+            &crate::open_transfers::Paired {
+                device_id,
+                environment_id,
+                session,
+            },
+            session_id,
+        );
+        return Ok(Settled {
+            receipt: None,
+            action_id: None,
+            value: Some(encode(&kept)?),
+            answer_lost: false,
+        });
+    }
     let target = subject.target(state.environment_id()?)?;
     let session = state.session()?;
     submitted_as::<kr_protocol::transfer::DraftCreateResult>(
@@ -1824,14 +1878,41 @@ pub async fn draft_create(
 /// Binds a completed attachment handle to a draft, and answers with the draft after it and the
 /// binding, whose read grant names the path the file can be read at.
 ///
-/// Not offered over a host this device is paired with, for the reason a draft is not.
+/// On a host this device is paired with the draft is the device's own: one for each session, made
+/// at the first bind and used again by every later one.
 #[tauri::command]
 pub async fn draft_add_attachment(
     state: State<'_, AppState>,
     subject: Subject,
     params: Value,
 ) -> Result<Settled> {
-    not_on_a_paired_host(&state, "an attachment")?;
+    if state.paired_context().is_some() {
+        // The draft is this device's to keep: it is made at the first bind and used again after.
+        let bind: crate::paired_drafts::Bind = decode(params)?;
+        let transfer_id = bind.transfer_id;
+        let (device_id, environment_id, session) = state.paired_snapshot()?;
+        let target = subject.target(environment_id)?;
+        let bound = state
+            .paired_drafts()
+            .bind(
+                crate::open_transfers::Paired {
+                    device_id,
+                    environment_id,
+                    session,
+                },
+                target,
+                bind,
+            )
+            .await?;
+        // The upload's entry ends with its binding.
+        state.transfers().bound(transfer_id);
+        return Ok(Settled {
+            receipt: None,
+            action_id: None,
+            value: Some(encode(&bound)?),
+            answer_lost: false,
+        });
+    }
     let typed: kr_protocol::transfer::AgentDraftAddAttachmentParams = decode(params)?;
     let target = subject.target(state.environment_id()?)?;
     let session = state.session()?;
@@ -1847,6 +1928,33 @@ pub async fn draft_add_attachment(
             )
             .await,
     )
+}
+
+/// Ends the draft this device keeps for a session on the host it is paired with, because the
+/// composer dropped its files unsent.
+#[tauri::command]
+pub async fn draft_end(
+    state: State<'_, AppState>,
+    subject: Subject,
+    session_id: String,
+) -> Result<()> {
+    let session_id = session_id
+        .parse()
+        .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
+    let (device_id, environment_id, session) = state.paired_snapshot()?;
+    let target = subject.target(environment_id)?;
+    state
+        .paired_drafts()
+        .end(
+            crate::open_transfers::Paired {
+                device_id,
+                environment_id,
+                session,
+            },
+            target,
+            session_id,
+        )
+        .await
 }
 
 session_mutate_command!(
@@ -2734,22 +2842,22 @@ read_command!(
 /// The page never sees the file. The platform gives this process a path when the person drops
 /// something on the window, the page passes that path back, and the shared client's upload
 /// sequence does the rest: declare the size and digest, send the chunks, publish the handle.
+///
+/// To a host this device is paired with the upload is the application's, not this call's: it goes
+/// on when the page stops waiting, resumes on a new connection, and is named by `transfer_key` (a
+/// UUID the page chooses, or one made here) to the commands that read or cancel it.
 #[tauri::command]
 pub async fn attachment_upload(
     state: State<'_, AppState>,
     subject: Subject,
     path: String,
     session_id: Option<String>,
+    transfer_key: Option<String>,
 ) -> Result<Value> {
-    // A host this device is paired with takes no file from it.
-    not_on_a_paired_host(&state, "a file")?;
     // Only a file this window was actually given. The platform hands the backend a path when a
     // person drops something on the window, and that path is spent by one upload. A path the page
     // names is refused, so this command is not a general file read.
     let path = state.take_dropped_file(std::path::Path::new(&path))?;
-    let environment_id = state.environment_id()?;
-    let target = subject.target(environment_id)?;
-    let session = state.session()?;
     let session_id = match session_id {
         None => None,
         Some(value) => Some(
@@ -2758,14 +2866,82 @@ pub async fn attachment_upload(
                 .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
         ),
     };
+    if state.paired_context().is_some() {
+        let (device_id, environment_id, session) = state.paired_snapshot()?;
+        let target = subject.target(environment_id)?;
+        let handle = crate::transfers::upload_paired(
+            &state.transfers(),
+            crate::open_transfers::Paired {
+                device_id,
+                environment_id,
+                session,
+            },
+            transfer_key_of(transfer_key)?,
+            target,
+            session_id,
+            path,
+        )
+        .await?;
+        return encode(&handle);
+    }
+    let environment_id = state.environment_id()?;
+    let target = subject.target(environment_id)?;
+    let session = state.session()?;
     let handle =
         crate::transfers::upload(&session, target, environment_id, session_id, path).await?;
     encode(&handle)
 }
 
+/// The key a page names an upload by, or a new one when it names none.
+fn transfer_key_of(key: Option<String>) -> Result<kr_protocol::scalars::Uuid> {
+    match key {
+        None => Ok(kr_ipc::new_uuid()),
+        Some(text) => text
+            .parse()
+            .map_err(|_| CommandError::invalid("that is not a transfer key")),
+    }
+}
+
+/// Reads the uploads this device holds open on the host it is paired with: the ones sending, the
+/// ones waiting for a connection, the published ones not yet bound to a draft, and the ones a
+/// restart found and could not resume.
+#[tauri::command]
+pub async fn uploads_open(state: State<'_, AppState>) -> Result<Value> {
+    let (device_id, environment_id, session) = state.paired_snapshot()?;
+    encode(&state.transfers().open(&crate::open_transfers::Paired {
+        device_id,
+        environment_id,
+        session,
+    }))
+}
+
+/// Cancels one upload this device holds open on the host it is paired with, and answers from the
+/// host's own answer: the bytes it released, or that the upload was already published and is kept.
+#[tauri::command]
+pub async fn upload_cancel(state: State<'_, AppState>, transfer_key: String) -> Result<Value> {
+    let (device_id, environment_id, session) = state.paired_snapshot()?;
+    let key = transfer_key_of(Some(transfer_key))?;
+    encode(
+        &state
+            .transfers()
+            .cancel(
+                crate::open_transfers::Paired {
+                    device_id,
+                    environment_id,
+                    session,
+                },
+                key,
+            )
+            .await?,
+    )
+}
+
 /// The header a handed file's name comes in, percent-encoded, because a header carries no other
 /// text.
 pub const HANDED_NAME_HEADER: &str = "kr-file-name";
+
+/// The header the key a handed file's upload is named by comes in: a UUID the page chooses.
+pub const HANDED_KEY_HEADER: &str = "kr-transfer-key";
 
 /// The header the subject of a handed file's upload comes in, as the JSON a subject takes.
 pub const HANDED_SUBJECT_HEADER: &str = "kr-subject";
@@ -2782,8 +2958,6 @@ pub async fn attachment_upload_bytes(
     state: State<'_, AppState>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<Value> {
-    // A host this device is paired with takes no file from it.
-    not_on_a_paired_host(&state, "a file")?;
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err(CommandError::invalid(
             "a pasted or picked file is handed over as raw bytes",
@@ -2807,8 +2981,6 @@ pub async fn attachment_upload_bytes(
         .map_err(|error| CommandError::invalid(format!("that is not a subject: {error}")))?,
     };
     let file = crate::transfers::HandedFile::new(bytes.clone(), &name)?;
-    let environment_id = state.environment_id()?;
-    let target = subject.target(environment_id)?;
     let session_id = match subject.session_id.as_deref() {
         None => None,
         Some(value) => Some(
@@ -2817,6 +2989,39 @@ pub async fn attachment_upload_bytes(
                 .map_err(|_| CommandError::invalid("that is not a session identifier"))?,
         ),
     };
+    if state.paired_context().is_some() {
+        let key = transfer_key_of(
+            request
+                .headers()
+                .get(HANDED_KEY_HEADER)
+                .map(|value| {
+                    value
+                        .to_str()
+                        .map(str::to_owned)
+                        .map_err(|_| CommandError::invalid("the transfer key is not header text"))
+                })
+                .transpose()?,
+        )?;
+        let (device_id, environment_id, session) = state.paired_snapshot()?;
+        let target = subject.target(environment_id)?;
+        let handle = crate::transfers::upload_handed_paired(
+            &state.transfers(),
+            crate::open_transfers::Paired {
+                device_id,
+                environment_id,
+                session,
+            },
+            key,
+            target,
+            session_id,
+            file,
+            bytes.clone(),
+        )
+        .await?;
+        return encode(&handle);
+    }
+    let environment_id = state.environment_id()?;
+    let target = subject.target(environment_id)?;
     let session = state.session()?;
     let handle =
         crate::transfers::upload_handed(&session, target, environment_id, session_id, file).await?;
@@ -4105,6 +4310,9 @@ mod tests {
         "device_channel_hold_clear",
         "device_drafts_ledger_set_aside",
         "attachment_upload_status",
+        "uploads_open",
+        "upload_cancel",
+        "draft_end",
         "question_kept",
         "question_dismiss_kept",
         "attention_read",
@@ -4444,6 +4652,11 @@ mod tests {
                 "question_settle",
                 "question_send_kept",
                 "question_dismiss_kept",
+                // The uploads to a paired host that this device holds open: read, and cancelled
+                // after the host's record of each is read.
+                "uploads_open",
+                "upload_cancel",
+                "draft_end",
                 // The drafts this device keeps, in a store of its own.
                 "device_drafts",
                 "device_draft_save",

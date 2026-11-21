@@ -2364,7 +2364,8 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
         .expect("the launch surface is read on the link of the share's opening");
     assert_eq!(surface["state"], "served", "{surface}");
 
-    // What a paired host does not serve a device is refused in words, before anything is sent.
+    // The draft and upload commands are served to a device over a paired host: each is reached
+    // here with a body that is refused for its own reason, and none is refused as not offered.
     for (command, body) in [
         ("draft_create", json!({ "params": {}, "subject": {} })),
         (
@@ -2377,10 +2378,12 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
         ),
         ("attachment_upload_bytes", json!({})),
     ] {
-        let refused = call(command, body).expect_err("not offered over a paired host");
-        assert_eq!(
-            code(&refused),
-            "RESOURCE_UNAVAILABLE",
+        let refused = call(command, body).expect_err("refused for its own reason");
+        assert!(
+            !refused["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("is not offered over a host this device is paired with"),
             "{command}: {refused}"
         );
     }
@@ -4578,10 +4581,10 @@ async fn kr_req_19_08_an_upload_goes_out_on_a_data_stream_of_the_connection_that
             &mut upload,
             DurationMs::new(60_000),
             &progress,
+            &kr_client::uploads::NoJournal,
         ),
     )
     .await
-            &kr_client::uploads::NoJournal,
     .expect("the upload ends")
     .expect("the upload is published");
 
@@ -4792,10 +4795,10 @@ async fn an_upload_that_the_close_of_its_connection_interrupts_ends_and_leaves_n
                 &mut upload,
                 DurationMs::new(60_000),
                 &progress,
+                &kr_client::uploads::NoJournal,
             )
             .await;
             (sent, route)
-                &kr_client::uploads::NoJournal,
         }
     });
 
