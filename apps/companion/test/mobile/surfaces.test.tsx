@@ -293,8 +293,8 @@ describe('the camera of the attachment picker, when the system refuses it (KR-RE
     const person = userEvent.setup()
     const { controls } = start('android')
     controls.setCameraAccess('denied')
-    // A host this phone is paired with takes no file from it: the picker is drawn and offers nothing.
-    controls.reachAsPairedDevice()
+    // A phone that may not send files to its host: the picker is drawn and offers nothing.
+    controls.reachAsPhone({ rights: ['session.view'] })
     await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
     await person.click(await screen.findByRole('button', { name: /Session 1/ }))
     const group = await screen.findByRole('group', { name: 'Add an attachment' })

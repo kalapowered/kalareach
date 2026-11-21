@@ -253,16 +253,16 @@ describe('a file picked on a phone (KR-REQ-13.14, 13.17)', () => {
     ])
   })
 
-  it('is not taken over a host the phone is paired with, and says why beside the pickers', async () => {
+  it('offers nothing over a host the phone is paired with while it may not send files, and says whom to ask', async () => {
     const person = userEvent.setup({ applyAccept: false })
     const { controls } = await onTheSession(person)
     await act(async () => {
-      controls.reachAsPairedDevice()
+      controls.reachAsPhone({ rights: ['session.view', 'agent.prompt'] })
       await Promise.resolve()
     })
 
     const reason = await screen.findByTestId('attach-reason')
-    expect(reason).toHaveTextContent(/takes no file/)
+    expect(reason).toHaveTextContent("This device may not send files to this host: ask the host's owner to allow it.")
     for (const button of within(screen.getByRole('group', { name: 'Add an attachment' })).getAllByRole(
       'button'
     )) {
