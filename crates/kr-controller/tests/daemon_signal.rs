@@ -468,10 +468,10 @@ fn ended_gracefully(status: ExitStatus) -> bool {
     status.code() == Some(0) && status.signal().is_none()
 }
 
-/// SIGTERM, which launchd and systemd send at a stop, ends a daemon that serves the way an
-/// interrupt does: it exits with status zero rather than dying by the signal, and what it owned is
-/// let go of. Its two endpoints and its attachment-chunk endpoint are gone, no client reaches it,
-/// and its environment's lock can be taken by the next daemon.
+/// KR-REQ-07.91: SIGTERM, which launchd and systemd send at a stop, ends a daemon that serves the
+/// way an interrupt does: it exits with status zero rather than dying by the signal, and what it
+/// owned is let go of. Its two endpoints and its attachment-chunk endpoint are gone, no client
+/// reaches it, and its environment's lock can be taken by the next daemon.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sigterm_ends_a_serving_daemon_with_exit_status_zero_and_lets_go_of_what_it_owned() {
     let mut host = Host::create();
@@ -578,10 +578,10 @@ async fn sigterm_during_the_start_ends_the_daemon_by_the_signal_as_it_always_has
         .expect("the environment's lock can be taken once the daemon has ended");
 }
 
-/// KR-REQ-02.03, KR-REQ-05.01: a session goes on through a daemon's graceful end. A terminal
-/// attached to it keeps reading and typing while no daemon exists, a terminal that attaches then is
-/// drawn the screen, and a daemon started again lists the session live, with both terminals still
-/// attached.
+/// KR-REQ-02.03, KR-REQ-05.01, KR-REQ-07.91: a session goes on through a daemon's graceful end. A
+/// terminal attached to it keeps reading and typing while no daemon exists, a terminal that
+/// attaches then is drawn the screen, and a daemon started again lists the session live, with both
+/// terminals still attached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_goes_on_through_the_stop_sigterm_asks_for_and_the_next_daemon_lists_it() {
     let mut host = Host::create();
