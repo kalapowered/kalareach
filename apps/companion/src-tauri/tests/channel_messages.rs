@@ -431,6 +431,37 @@ fn a_file_of_another_layout_is_counted_and_left_and_never_replaced() {
     assert_eq!(std::fs::read(&misnamed).ok(), Some(misnamed_bytes));
 }
 
+/// KR-REQ-12.26: the file of a message holds these members in this order, and the bound on bytes
+/// counts its length. The scripted store of the page's tests counts the length of this same text
+/// for the same message (`fake-channel-contract.test.ts`).
+#[test]
+fn a_message_file_holds_the_members_the_scripted_store_counts_and_takes_its_length() {
+    let data = data();
+    let window = Window::over(data.path());
+    let refs = [(
+        "00000000-0000-4000-8000-000000000001".to_owned(),
+        "3".to_owned(),
+    )];
+    window.keep(message(1, "é text", &refs)).expect("kept");
+    let expected = concat!(
+        r#"{"version":1,"action_id":"6a7b6c50-22bb-4c3d-8e4f-000000000401","hold_id":null,"#,
+        r#""local_id":"s-1","session_id":"8a7b6c50-22bb-4c3d-8e4f-000000000101","#,
+        r#""application_instance_id":"9a7b6c50-22bb-4c3d-8e4f-000000000201","#,
+        r#""agent_binding_revision":"1","environment_id":null,"host_name":"studio","#,
+        r#""text":"é text","sent_at_ms":1001,"#,
+        r#""drafts":[{"id":"00000000-0000-4000-8000-000000000001","expectedRevision":"3"}]}"#
+    );
+    let path = dir(data.path()).join(format!("{}.message", action(1)));
+    assert_eq!(
+        std::fs::read_to_string(&path).ok().as_deref(),
+        Some(expected),
+        "the file's text"
+    );
+    let list = window.list();
+    assert_eq!(list["used"]["bytes"], expected.len(), "{list}");
+    assert_eq!(list["used"]["entries"], 1, "{list}");
+}
+
 /// KR-REQ-12.26: a keep under an identity that holds a different message is refused, and a repeat
 /// of the same one is a resume.
 #[test]
