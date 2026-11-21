@@ -1481,7 +1481,7 @@ pub async fn device_channel_message_keep(
     encode(&blocking(move || channels.keep(&drafts, typed)).await?)
 }
 
-/// Removes a message the person chose, or every message of a session they chose.
+/// Removes the messages the person chose, named by their identities, and no others.
 #[tauri::command]
 pub async fn device_channel_message_remove(
     state: State<'_, AppState>,
