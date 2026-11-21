@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use kr_client::services::AccountMark;
 use kr_client::session::ComposedMutation;
 use kr_client::transport::Reach;
 use kr_client::{ClientError, Settled as Answered};
@@ -294,6 +295,9 @@ pub struct Drafts {
     turns: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
     /// When this process first sent or repeated each kept request.
     armed: Mutex<HashMap<String, Instant>>,
+    /// How many times a freeing of other accounts' drafts freed something, so that a creation that
+    /// was refused while another creation's freeing ran knows a place may be free.
+    places_freed: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Drafts {
@@ -337,6 +341,14 @@ fn discard_outcome(error: &ClientError) -> Ended {
     } else {
         Ended::Failed
     }
+}
+
+/// Whether the host refused a draft creation for the device's count of open drafts. The host gives
+/// that refusal the code of a quota and words that name the bound; a draft that is too large has
+/// the same code and other words, and no discard of another account's draft could help it.
+fn is_the_count_refusal(error: &ClientError) -> bool {
+    error.code() == ErrorCode::QuotaExceeded
+        && host_words(error).is_some_and(|words| words.contains("drafts it may keep open"))
 }
 
 /// What a refused create is told as: when the host's own bound on drafts is reached and its build
@@ -408,6 +420,19 @@ impl Drafts {
             Arc::clone(turns.entry(key_of(paired, session_id)).or_default())
         };
         lock.lock_owned().await
+    }
+
+    /// The turn of the draft when no operation holds it, and none otherwise.
+    fn try_turn(
+        &self,
+        paired: &Paired,
+        session_id: SessionId,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(turns.entry(key_of(paired, session_id)).or_default())
+        };
+        lock.try_lock_owned().ok()
     }
 
     fn read(&self, paired: &Paired, session_id: SessionId) -> Result<Read> {
@@ -714,54 +739,150 @@ impl Drafts {
         bind: &Bind,
         file: &mut DraftFile,
     ) -> Result<()> {
-        let composed = paired
-            .session
-            .compose(
-                Method::DraftCreate,
-                ActionId::new(kr_ipc::new_uuid()),
-                target.clone(),
-                None,
-                &NoPreconditions {},
-                &DraftCreateParams {
-                    environment_id: paired.environment_id,
-                    device_id: Nullable::null(),
-                    session_id: Nullable::some(bind.session_id),
-                    application_instance_id: bind
-                        .application_instance_id
-                        .map_or_else(Nullable::null, Nullable::some),
-                    text: bind.text.clone(),
-                },
-                MUTATION_TTL,
-            )
-            .await?;
-        file.target = target.clone();
-        file.create = Some(KeptRequest::of(&composed)?);
-        self.write(paired, file)?;
-        let action = composed.action_id();
-        self.arm(action);
-        match sent_as(paired.session.send(&composed).await, false) {
-            Sent::Done(settled) => self.made(paired, file, action, &settled).await,
-            Sent::Refused(error) => {
-                // The host decided, so nothing was made.
-                file.create = None;
-                paired.session.settle(action).await;
-                if gone(&error) {
-                    self.remove(paired, bind.session_id);
-                    return Err(CommandError::refused(GONE));
+        let freed_before = self.places_freed.load(std::sync::atomic::Ordering::Acquire);
+        let mut asked_for_places = false;
+        loop {
+            let composed = paired
+                .session
+                .compose(
+                    Method::DraftCreate,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target.clone(),
+                    None,
+                    &NoPreconditions {},
+                    &DraftCreateParams {
+                        environment_id: paired.environment_id,
+                        device_id: Nullable::null(),
+                        session_id: Nullable::some(bind.session_id),
+                        application_instance_id: bind
+                            .application_instance_id
+                            .map_or_else(Nullable::null, Nullable::some),
+                        text: bind.text.clone(),
+                    },
+                    MUTATION_TTL,
+                )
+                .await?;
+            file.target = target.clone();
+            file.create = Some(KeptRequest::of(&composed)?);
+            self.write(paired, file)?;
+            let action = composed.action_id();
+            self.arm(action);
+            return match sent_as(paired.session.send(&composed).await, false) {
+                Sent::Done(settled) => self.made(paired, file, action, &settled).await,
+                Sent::Refused(error) => {
+                    // The host decided, so nothing was made.
+                    file.create = None;
+                    paired.session.settle(action).await;
+                    if gone(&error) {
+                        self.remove(paired, bind.session_id);
+                        return Err(CommandError::refused(GONE));
+                    }
+                    // The host counts open drafts for every account of this device, and an account
+                    // cannot see the drafts another left. A refusal for the count frees those, once,
+                    // and the creation is tried once more. A freeing that another creation made
+                    // meanwhile counts: the place it freed may be this one's.
+                    if is_the_count_refusal(&error)
+                        && !asked_for_places
+                        && (self.free_places(paired).await
+                            || self.places_freed.load(std::sync::atomic::Ordering::Acquire)
+                                != freed_before)
+                    {
+                        asked_for_places = true;
+                        continue;
+                    }
+                    self.write(paired, file)?;
+                    let flag = self.refused_discard(paired);
+                    Err(at_the_bound(flag, &error).unwrap_or_else(|| error.into()))
                 }
-                self.write(paired, file)?;
-                let flag = self.refused_discard(paired);
-                Err(at_the_bound(flag, &error).unwrap_or_else(|| error.into()))
-            }
-            Sent::NeverLeft(error) => {
-                file.create = None;
-                paired.session.settle(action).await;
-                self.write(paired, file)?;
-                Err(error.into())
-            }
-            Sent::Uncertain(error) => Err(error.into()),
-            Sent::Unresolved => Err(CommandError::unavailable(CREATE_PENDING)),
+                Sent::NeverLeft(error) => {
+                    file.create = None;
+                    paired.session.settle(action).await;
+                    self.write(paired, file)?;
+                    Err(error.into())
+                }
+                Sent::Uncertain(error) => Err(error.into()),
+                Sent::Unresolved => Err(CommandError::unavailable(CREATE_PENDING)),
+            };
         }
+    }
+
+    /// Discards the drafts that other accounts of this device keep for this host, one at a time, for
+    /// a creation the host refused for the device's count of open drafts, and says whether a place
+    /// was freed. Each draft is taken by its own account's key, in its turn, and read again there: a
+    /// draft that is gone, or whose creation was not answered, is left, and so is one whose turn
+    /// another operation holds. The discard goes on the connection in force, whose principal is the
+    /// device's, and the file goes with the host's answer. A host of an earlier build, which cannot
+    /// discard a draft, frees nothing.
+    async fn free_places(&self, paired: &Paired) -> bool {
+        if self.refused_discard(paired) {
+            return false;
+        }
+        let Ok(root) = self.root() else {
+            return false;
+        };
+        let Ok(listing) = std::fs::read_dir(&root) else {
+            return false;
+        };
+        let mut others: Vec<(Paired, SessionId)> = Vec::new();
+        for item in listing.flatten() {
+            let path = item.path();
+            if path.extension().is_none_or(|ext| ext != EXTENSION) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(file) = serde_json::from_slice::<DraftFile>(&bytes) else {
+                continue;
+            };
+            if file.version != DRAFT_VERSION
+                || file.environment_id != paired.environment_id
+                || file.device_id != paired.device_id
+                || file.account == paired.account_id()
+                || file.draft_id.is_none()
+                || file.create.is_some()
+            {
+                continue;
+            }
+            let account = match &file.account {
+                Some(text) => match AccountMark::from_hex(text) {
+                    Some(mark) => Some(mark),
+                    None => continue,
+                },
+                None => None,
+            };
+            others.push((
+                Paired {
+                    account,
+                    ..paired.clone()
+                },
+                file.session_id,
+            ));
+        }
+        let mut freed = false;
+        for (theirs, session_id) in others {
+            let Some(_turn) = self.try_turn(&theirs, session_id) else {
+                continue;
+            };
+            let Ok(Some(mut file)) = self.entry(&theirs, session_id) else {
+                continue;
+            };
+            if file.draft_id.is_none() || file.create.is_some() {
+                continue;
+            }
+            // The storage is the draft's own account's: `theirs` names it, and carries the
+            // connection in force.
+            match self.discard_once(&theirs, &mut file).await {
+                Ok(Step::Ended) if !self.refused_discard(paired) => freed = true,
+                Ok(Step::Ended) => break,
+                _ => {}
+            }
+        }
+        if freed {
+            self.places_freed
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        freed
     }
 
     /// The host's answer to the creation is kept, and the action leaves the client's book.
@@ -1120,6 +1241,24 @@ mod tests {
 
     fn refused(code: ErrorCode, message: &str) -> ClientError {
         ClientError::Host(ProtocolError::new(code, message))
+    }
+
+    /// KR-REQ-23.41: only the host's refusal of a creation for the device's count of open drafts
+    /// frees another account's drafts: a draft that is too large has the same code and other words.
+    #[test]
+    fn only_the_count_refusal_of_a_creation_frees_other_accounts_drafts() {
+        assert!(is_the_count_refusal(&refused(
+            ErrorCode::QuotaExceeded,
+            "this device holds 64 of the 64 drafts it may keep open: end a draft it no longer uses"
+        )));
+        assert!(!is_the_count_refusal(&refused(
+            ErrorCode::QuotaExceeded,
+            "this draft is larger than a result may be"
+        )));
+        assert!(!is_the_count_refusal(&refused(
+            ErrorCode::ResourceUnavailable,
+            "this device holds 64 of the 64 drafts it may keep open"
+        )));
     }
 
     /// KR-REQ-23.41: a host that refuses `draft.discard` by name is read as of an earlier build; a
