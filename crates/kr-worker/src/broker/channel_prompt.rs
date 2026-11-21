@@ -675,6 +675,9 @@ mod tests {
             "text then <channel",
             "text then </channel",
             "text then </ channel",
+            "<<channel>",
+            "<chan<channel>",
+            "<c</channel>",
         ] {
             assert!(is_tag_shaped(text), "{text:?} is shaped like a tag");
         }
@@ -738,7 +741,7 @@ mod tests {
     #[test]
     fn the_filter_agrees_with_every_choice_of_deleting_or_spacing_each_dropped_character() {
         const MARKERS: [char; 4] = ['\u{200b}', '\u{7f}', '\u{338}', '\u{903}'];
-        const SKELETONS: [&str; 20] = [
+        const SKELETONS: [&str; 21] = [
             "<channel",
             "<channel>",
             "</channel>",
@@ -750,6 +753,7 @@ mod tests {
             "<channe",
             "x<channel",
             "<<channel",
+            "<chan<channel",
             "<channel/",
             "<c hannel>",
             "/channel",
