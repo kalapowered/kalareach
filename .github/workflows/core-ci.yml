@@ -3183,27 +3183,40 @@ jobs:
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the documentation"
 
-      # The programs a leg's suites start that the leg's own packages do not build. Suites find them
-      # beside their test programs and fail where one is missing ("is not built", "there is none
-      # at"), and `cargo test -p <package>` builds the programs of that package alone: the one step
-      # that ran the whole workspace built every package's, with the `testing` features that
-      # development dependencies asked for. `tests-1` builds the worker and the plugin host the
-      # controller's suites start, and the Codex stand-in its gateway suites and the forwarder's
-      # start. `tests-2` builds the control daemon, with the held build `kr-cli`'s startup and update
-      # suites start, and the forwarder the end-to-end suites start. The limit is a bound that no run
-      # has measured yet.
+      # The programs a leg's suites start and its own packages do not build. A suite finds a program
+      # beside its test program and fails where it is not there ("is not built", "there is none at")
+      # or where it will not start with it ("would not take", "are not built beside this test"),
+      # and `cargo test -p <package>` builds the programs of those packages alone, so each leg
+      # builds the others here. The one step that ran the whole workspace's tests built every
+      # package's programs with the features that all the members' development dependencies asked
+      # for, among them `testing` for the worker, the plugin host and the control daemon, each of
+      # which names itself as a development dependency with it. `--workspace --exclude
+      # kr-sync-integration --examples` asks for that same resolution: Cargo takes the development
+      # dependencies of every member into the features when it builds examples, and the workspace
+      # has none, so nothing is built for them. `--features <package>/testing` does not: it reaches
+      # the dependency and not the package, and `--bins` then leaves out a program that needs a
+      # feature that nothing turned on, with no message. Each program is named with `--bin`, so one
+      # that is gone, or that a missing feature leaves out, fails this step. `tests-1` builds the
+      # worker and the plugin host that the controller's suites start, and the Codex stand-ins that
+      # its gateway suites start. `tests-2` builds the control daemon, its held build and its
+      # stub inference process, which `kr-cli`'s suites start, and the forwarder that the
+      # end-to-end suites start. The limit of 45 minutes is a guess: no run has measured the step,
+      # and the first run on a hosted runner without a cache sets it.
       - name: Build the programs the suites of this leg start
         if: ${{ !cancelled() && matrix.part == 'tests-1' }}
         timeout-minutes: 45
         run: >-
-          cargo build --locked -p kr-codex-stand-in -p kr-plugin-host -p kr-worker
-          --features kr-plugin-host/testing,kr-worker/testing --bins
+          cargo build --locked --workspace --exclude kr-sync-integration --examples
+          --bin kr-worker --bin kr-plugin-host
+          --bin codex-stand-in --bin codex-stand-in-newer
 
       - name: Build the programs the suites of this leg start
         if: ${{ !cancelled() && matrix.part == 'tests-2' }}
         timeout-minutes: 45
         run: >-
-          cargo build --locked -p kr-controller -p kr-hook --features kr-controller/testing --bins
+          cargo build --locked --workspace --exclude kr-sync-integration --examples
+          --bin kr-controller --bin kr-controller-held
+          --bin kr-stub-inference --bin kr-hook
 
       # The workspace's tests, less what this runner cannot run, each left out by name here:
       #
@@ -3220,11 +3233,12 @@ jobs:
       # build, with the cache restored, and 157 to run 668 test programs and 45 sets of
       # documentation tests, from the times of that run's log), and on 21 November it ran into its
       # limit of 197 minutes. A leg's figure is its share of those 157 minutes (85 for `tests-1`, 72
-      # for `tests-2`) and the 32 minutes of the whole build, which a leg's own build does not
-      # exceed with the cache restored: 117 minutes for `tests-1` and 104 for `tests-2`, estimates
-      # that no run has measured, and a cold build is not among them. The limits are 174 and 158
-      # minutes, about half as much again, and each leg's limits, with the 45 minutes of its program
-      # build, add up to 335 and 345 of the job's 355 minutes.
+      # for `tests-2`) and the 32 minutes that the whole workspace took to build with the cache
+      # restored: 117 minutes for `tests-1` and 104 for `tests-2`. They are estimates, not bounds: a
+      # leg builds with other features than the whole workspace did, its programs are built in a
+      # step of their own, and no run has measured a leg or a build with no cache. The limits are
+      # 174 and 158 minutes, about half as much again, and each leg's limits, with the 45 minutes
+      # of its program build, add up to 335 and 345 of the job's 355 minutes.
       - name: Test
         if: ${{ !cancelled() && startsWith(matrix.part, 'tests') }}
         timeout-minutes: ${{ matrix.minutes }}

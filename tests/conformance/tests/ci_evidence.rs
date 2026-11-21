@@ -619,6 +619,69 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
         );
     }
 
+    // Each leg builds the programs its suites start, before its Test step, by the form that gives
+    // them the features of the whole workspace's one step: every member's development
+    // dependencies (`--workspace --examples`), and each program named, so that one a missing
+    // feature leaves out fails the step.
+    for (leg, programs) in [
+        (
+            "tests-1",
+            [
+                "--bin kr-worker ",
+                "--bin kr-plugin-host ",
+                "--bin codex-stand-in ",
+                "--bin codex-stand-in-newer ",
+            ],
+        ),
+        (
+            "tests-2",
+            [
+                "--bin kr-controller ",
+                "--bin kr-controller-held ",
+                "--bin kr-stub-inference ",
+                "--bin kr-hook ",
+            ],
+        ),
+    ] {
+        let build = "cargo build --locked --workspace --exclude kr-sync-integration --examples";
+        let held: Vec<String> = steps_running(&macos, build)
+            .into_iter()
+            .filter(|step| {
+                step_condition(step)
+                    == Some(compact(&format!(
+                        "${{{{ !cancelled() && matrix.part == '{leg}' }}}}"
+                    )))
+            })
+            .collect();
+        assert_eq!(held.len(), 1, "one step of the {leg} leg runs {build}");
+        assert!(
+            !is_disabled(&held[0]),
+            "the {leg} leg's program build is disabled"
+        );
+        // Each flag ends in a space, so that a name that begins another is not taken for it.
+        let words = format!(
+            "{} ",
+            held[0].split_whitespace().collect::<Vec<_>>().join(" ")
+        );
+        for program in programs {
+            assert!(
+                words.contains(program),
+                "the {leg} leg's program build does not have {}",
+                program.trim_end()
+            );
+        }
+        assert!(
+            !words.contains(" --features ") && !words.contains(" -p "),
+            "the {leg} leg's program build narrows the features or the packages the form gives"
+        );
+        assert!(
+            position_of_tool(&macos, build)
+                .zip(position_of_tool(&macos, test_tool))
+                .is_some_and(|(built, test)| built < test),
+            "the {leg} leg's program build comes after the Test step"
+        );
+    }
+
     // The landing workflow runs on every push to main and on every pull request, with no filter
     // that leaves a change out, and by hand: the first four lines of its `on:` block are these
     // exactly, and what follows them is the manual run's inputs.
