@@ -20,7 +20,7 @@ import {
 
 import type { ActionRight } from '@kalareach/protocol'
 
-import type { HostPort, TerminalPlace } from '../host/port'
+import type { HostPort, StoredHold, TerminalPlace } from '../host/port'
 import { AnnouncementScope } from '../components/announcements'
 import { closeSheets, type ToastAction, type ToastMessage } from '../components/ui'
 import { ChannelShelf } from '../model/channel-messages'
@@ -29,7 +29,7 @@ import { ManualPaths } from '../model/manual-paths'
 import { QuestionForms } from '../model/question-forms'
 import { Openings } from '../model/openings'
 import { ReceiptReads } from '../model/receipt-reads'
-import type { Submission } from '../model/receipts'
+import { holdRemovable, type Submission } from '../model/receipts'
 import { SessionStates, type SessionState } from '../model/sessions'
 import { ConfirmationStore } from '../pairing/confirmationStore'
 import { applyMode, modeApplications } from '../theme-init'
@@ -403,6 +403,18 @@ export function useSubmissions(sessionId: string): readonly Submission[] {
   return useSyncExternalStore(
     useCallback((listener) => sessions.subscribe(listener), [sessions]),
     () => sessions.submissionsOf(sessionId)
+  )
+}
+
+/**
+ * How many of these records of sends this window gives no Remove: the row it holds for the record
+ * waits for the host's answer (see `holdRemovable`).
+ */
+export function useWaitingHolds(holds: readonly StoredHold[]): number {
+  const { sessions } = useApp()
+  return useSyncExternalStore(
+    useCallback((listener) => sessions.subscribe(listener), [sessions]),
+    () => holds.filter((hold) => !holdRemovable(sessions.submissionsOf(hold.sessionId), hold.holdId)).length
   )
 }
 

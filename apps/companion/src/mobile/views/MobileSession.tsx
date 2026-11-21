@@ -27,7 +27,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { flushSync } from 'react-dom'
 
-import { useApp, useKeptPlace, useSession } from '../../app/state'
+import { useApp, useKeptPlace, useSession, useWaitingHolds } from '../../app/state'
 import { useSessionAgent } from '../../app/agent'
 import { useSessionOpening } from '../../app/opening'
 import { useHeldConnection } from '../../app/rights'
@@ -203,7 +203,8 @@ export function MobileSession({
   const camera = useCameraControl(port, say)
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
-  const keptEntryLine = keptEntry(shown, useChannelMessages())
+  const channelShelf = useChannelMessages()
+  const keptEntryLine = keptEntry(shown, channelShelf, useWaitingHolds(channelShelf.holds))
   const [pane, setPane] = useState<Pane>('semantic')
   // The session's agent, read from its own worker while this screen is open, into the session's
   // own store: nothing of another session is ever shown under this one.

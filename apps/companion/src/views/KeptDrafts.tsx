@@ -107,6 +107,8 @@ export function KeptDrafts({
   const shelf = useChannelMessages()
   const channels = useChannelShelf()
   const [sessions, setSessions] = useState<readonly Session[] | null>(null)
+  // Until the host answers, the list is being read; a failed read is a different state from it.
+  const [sessionsFailed, setSessionsFailed] = useState(false)
   const [busy, setBusy] = useState<string | null>(null)
 
   // Where a draft can be moved is read once on opening. A host out of reach leaves the list empty,
@@ -119,10 +121,12 @@ export function KeptDrafts({
         .then((result) => {
           if (!current()) return
           setSessions(result.sessions)
+          setSessionsFailed(false)
         })
         .catch(() => {
           if (!current()) return
           setSessions(null)
+          setSessionsFailed(true)
         })
     })
     return reading.stop
@@ -302,6 +306,7 @@ export function KeptDrafts({
       <ChannelGroup
         shelf={shelf}
         sessions={sessions}
+        sessionsFailed={sessionsFailed}
         busy={busy}
         onRemove={(id, removal, all) => {
           run(
@@ -541,10 +546,13 @@ function whenWords(ms: string): string {
 }
 
 /** What a record of a send says it was: to a session by its name, or to one that cannot be named. */
-function holdWords(sessions: readonly Session[] | null, hold: StoredHold): string {
+function holdWords(sessions: readonly Session[] | null, sessionsFailed: boolean, hold: StoredHold): string {
   const at = whenWords(hold.sentAtMs)
   if (sessions === null) {
-    return `A message to a session on ${hold.hostName}, which this device cannot reach now, pressed at ${at}.`
+    // A read that has not answered yet says nothing about the host: only a failed one says it cannot be reached.
+    return sessionsFailed
+      ? `A message to a session on ${hold.hostName}, which this device cannot reach now, pressed at ${at}.`
+      : `A message to a session on ${hold.hostName}, pressed at ${at}.`
   }
   const home = sessions.find((session) => session.session_id === hold.sessionId)
   return home === undefined
@@ -556,12 +564,15 @@ function holdWords(sessions: readonly Session[] | null, hold: StoredHold): strin
 function ChannelGroup({
   shelf,
   sessions,
+  sessionsFailed,
   busy,
   onRemove,
   onClearHold
 }: {
   readonly shelf: ShelfSnapshot
   readonly sessions: readonly Session[] | null
+  /** True when the newest read of the session list failed; false while it has not answered. */
+  readonly sessionsFailed: boolean
   readonly busy: string | null
   /** `all` is true for "Remove all" of a session: the removal names the identities the group shows. */
   readonly onRemove: (id: string, removal: ChannelMessageRemoval, all: boolean) => void
@@ -645,6 +656,7 @@ function ChannelGroup({
                 key={hold.holdId}
                 hold={hold}
                 sessions={sessions}
+                sessionsFailed={sessionsFailed}
                 busy={busy === `hold-${hold.holdId}`}
                 onClear={() => {
                   onClearHold(hold.holdId, hold.sessionId)
@@ -734,11 +746,13 @@ function ChannelMessageRow({
 function ChannelHoldRow({
   hold,
   sessions,
+  sessionsFailed,
   busy,
   onClear
 }: {
   readonly hold: StoredHold
   readonly sessions: readonly Session[] | null
+  readonly sessionsFailed: boolean
   readonly busy: boolean
   readonly onClear: () => void
 }): ReactNode {
@@ -748,7 +762,7 @@ function ChannelHoldRow({
   return (
     <li className="kept-draft" data-testid="channel-hold">
       <p className="small muted">
-        {holdWords(sessions, hold)} This device has not settled what became of it. Removing this record
+        {holdWords(sessions, sessionsFailed, hold)} This device has not settled what became of it. Removing this record
         sends nothing.
       </p>
       {removable ? (
