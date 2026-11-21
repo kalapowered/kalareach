@@ -609,6 +609,9 @@ async function pointOnWords(page: Page, href: string): Promise<{ x: number; y: n
 
 const SURFACES = ['ios', 'android'] as const
 
+/** A short link above the control of an image that has not been loaded, and one below it: both are narrower than the least size. */
+const SHORT_BESIDE_CONTROL = '[i](https://example.org/short-above)\n\n![a picture](https://example.org/picture.png)\n\n[i](https://example.org/short-below)'
+
 // KR-REQ-13.19: the layout of the pane's links and controls is the page's own. A link has no enlarged
 // box, so the browser's hit test decides every click that lands on a link's words or on another
 // control, and a press near one of them is that one's click. Each case counts the clicks the browser
@@ -673,6 +676,58 @@ test.describe('the links and the controls of a message in the pane', () => {
       })
     }
 
+    // At the largest text size the control is wider than the message's column and lies past its end: no link lies under it.
+    for (const [size, ratio] of [SIZES[0]]) {
+      test(`a press 1 to 3 px inside the edge of "Load this image", with a short link above and one below that take room beside their words, is one click of the control on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio, only: [SHORT_BESIDE_CONTROL] })
+        const control = page.getByRole('button', { name: 'Load this image' })
+        await control.scrollIntoViewIfNeeded()
+        const first = await control.boundingBox()
+        const pane = await paneBox(page)
+        if (!first) throw new Error('the control has no box')
+        // The short links lie over and under the control's own width, with no gap between the paragraphs: their boxes reach the control's.
+        await page.addStyleTag({
+          content: `.m-node p { margin-block: 0; } .m-node p:has(.md-link[title*='short-']) { padding-inline-start: ${String(Math.round(first.x - pane.left + 6))}px; }`
+        })
+        const short = ['https://example.org/short-above', 'https://example.org/short-below']
+        await expect
+          .poll(
+            () =>
+              page.evaluate(
+                ({ hrefs, label }) => {
+                  const box = Array.from(document.querySelectorAll<HTMLElement>('button')).find((each) => each.textContent?.trim() === label)?.getBoundingClientRect()
+                  return hrefs.map((href) => {
+                    const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${href}"]`)
+                    const rect = link?.getBoundingClientRect()
+                    const style = link?.style
+                    const room = (parseFloat(style?.getPropertyValue('--md-link-left') ?? '') || 0) + (parseFloat(style?.getPropertyValue('--md-link-right') ?? '') || 0)
+                    // The link takes room, and its box reaches the control's both across and down.
+                    return room > 0 && rect !== undefined && box !== undefined && rect.left < box.right && rect.right > box.left && rect.top < box.bottom && rect.bottom > box.top
+                  })
+                },
+                { hrefs: short, label: 'Load this image' }
+              ),
+            'the short links take room beside their words and their boxes reach the control: the case is vacuous where they do not'
+          )
+          .toEqual([true, true])
+        for (const side of ['top', 'bottom'] as const) {
+          for (const inside of [1, 2, 3]) {
+            const box = await control.boundingBox()
+            if (!box) throw new Error('the control has no box')
+            const before = (await clicksSeen(page)).length
+            await tap(page, box.x + box.width / 2, side === 'top' ? box.y + inside : box.y + box.height - inside)
+            await expect.poll(async () => (await clicksSeen(page)).length, `clicks of a press ${String(inside)} px inside the ${side}`).toBeGreaterThan(before)
+            const made = (await clicksSeen(page)).slice(before)
+            expect(browsers(made).map((click) => click.named), `what the click named ${String(inside)} px inside the ${side} edge`).toEqual(['control Load this image'])
+            expect(handlers(made), `clicks that the page added ${String(inside)} px inside the ${side} edge`).toEqual([])
+          }
+        }
+        expect(await openedLinks(page), 'links opened by presses on the control').toEqual([])
+      })
+    }
+
     test(`"Attach again", pressed 2 px inside a side and held 200 ms, attaches on ${surface}`, async ({ page }) => {
       await endedTerminal(page, surface)
       const again = page.getByRole('button', { name: 'Attach again' })
@@ -716,6 +771,46 @@ test.describe('the links and the controls of a message in the pane', () => {
   }
 })
 
+/** A box on the page: a link's or a control's, as it lies now, with a link's words and its message's column. */
+interface Spot {
+  readonly href: string
+  readonly left: number
+  readonly top: number
+  readonly right: number
+  readonly bottom: number
+  readonly wordsLeft: number
+  readonly wordsRight: number
+  readonly column: { readonly left: number; readonly right: number }
+}
+
+/** The box of every link and every other control of the messages, in the page's coordinates. */
+const boxesNow = (page: Page): Promise<{ links: Spot[]; controls: Spot[] }> =>
+  page.evaluate(() => {
+    const spot = (element: HTMLElement, href: string): Spot => {
+      const box = element.getBoundingClientRect()
+      const label = element.querySelector('.md-link-label')
+      const range = document.createRange()
+      range.selectNodeContents(label ?? element)
+      const lines = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)
+      const message = element.closest('.m-node')?.getBoundingClientRect() ?? box
+      return {
+        href,
+        left: box.left,
+        top: box.top,
+        right: box.right,
+        bottom: box.bottom,
+        wordsLeft: lines.length > 0 ? Math.min(...lines.map((rect) => rect.left)) : box.left,
+        wordsRight: lines.length > 0 ? Math.max(...lines.map((rect) => rect.right)) : box.right,
+        column: { left: message.left, right: message.right }
+      }
+    }
+    const links = Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link')).map((link) => spot(link, link.title))
+    const controls = Array.from(document.querySelectorAll<HTMLElement>('.m-node button:not(.md-link), .m-node a[href]')).map((control) =>
+      spot(control, `control ${control.textContent?.trim() ?? ''}`)
+    )
+    return { links, controls }
+  })
+
 /** Where every line and word of a conversation lies, in the pane's own coordinates, and how far the pane scrolls sideways. */
 interface Placed {
   readonly messages: number[][]
@@ -751,6 +846,10 @@ function firstDifference(what: string, before: readonly number[][], after: reado
 
 const AT_END = 'https://example.org/at-end'
 
+/** Three short links with no word between them: the one in the middle has a box beside it on each side, so its box has no room to grow into. */
+const HEMMED = 'Hemmed in: [m](https://example.org/hem-1)[n](https://example.org/hem-2)[o](https://example.org/hem-3) end of the line.'
+const HEMMED_IN = ['https://example.org/hem-2']
+
 // KR-REQ-13.19: the box that a screen reader reads for a link of a message is the least size high, and the
 // message lies where it would with no box: the room around the words takes no tap, so a link beside or
 // above another keeps its own taps, and the pane the words end at has no scroll bar over them.
@@ -758,24 +857,72 @@ test.describe('the box of a link in a message', () => {
   test.use({ hasTouch: true })
   for (const surface of SURFACES) {
     for (const [size, ratio] of SIZES) {
-      test(`is at least the least size high for every link, and no more than the page gives it, on ${surface} at ${size} text size`, async ({
-        page
-      }) => {
-        await pressPage(page, surface, { scale: ratio })
-        const boxes = await page.evaluate(() =>
-          Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link')).map((link) => {
-            const box = link.getBoundingClientRect()
-            return { href: link.title, width: box.width, height: box.height }
-          })
-        )
-        expect(boxes.length, 'links on the page').toBeGreaterThan(20)
+      test(`is at least the least size high for every link on ${surface} at ${size} text size`, async ({ page }) => {
+        await pressPage(page, surface, { scale: ratio, extra: [HEMMED] })
+        const boxes = await boxesNow(page)
+        expect(boxes.links.length, 'links on the page').toBeGreaterThan(20)
         const least = FINGER[surface]
         expect(
-          boxes.filter((box) => box.height < least - 0.01),
+          boxes.links.filter((link) => link.bottom - link.top < least - 0.01).map((link) => link.href),
           `links whose box is under ${String(least)} px high`
         ).toEqual([])
-        // The width of a link narrower than the least size is its words': room beside them would scroll the pane sideways.
-        test.info().annotations.push({ type: 'narrow', description: boxes.filter((box) => box.width < least).map((box) => `${box.href} ${String(Math.round(box.width))}`).join(', ') })
+      })
+
+      test(`is at least the least size wide for every link, or is as wide as the boxes beside it allow, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        await pressPage(page, surface, { scale: ratio, extra: [HEMMED] })
+        const { links, controls } = await boxesNow(page)
+        const least = FINGER[surface]
+        const limited: string[] = []
+        for (const link of links) {
+          const width = link.right - link.left
+          // Nothing else of the line lies over the box: what lies beside the words keeps the room that the box has not taken.
+          const others = [...links.filter((other) => other !== link), ...controls].filter(
+            (other) => other.top < link.bottom && other.bottom > link.top && (other.right <= link.wordsLeft || other.left >= link.wordsRight)
+          )
+          const left = Math.max(link.column.left, ...others.filter((other) => other.right <= link.wordsLeft).map((other) => other.right))
+          const right = Math.min(link.column.right, ...others.filter((other) => other.left >= link.wordsRight).map((other) => other.left))
+          expect(link.left - left, `the room that the box of ${link.href} has gone past on its left: ${String(link.left)} to ${String(left)}`).toBeGreaterThanOrEqual(-0.02)
+          expect(right - link.right, `the room that the box of ${link.href} has gone past on its right: ${String(link.right)} to ${String(right)}`).toBeGreaterThanOrEqual(-0.02)
+          if (width >= least - 0.01) continue
+          // Narrower than the least size: the box was held on each side by what lies there (a box or the column's edge), and no
+          // more of the gap to it is left than the box itself took of it (a gap between two short links is shared in halves).
+          limited.push(`${link.href} ${width.toFixed(2)} px wide of ${String(least)}`)
+          expect(link.left - left, `the gap left of ${link.href} after its box, which may be no more than its own padding there`).toBeLessThanOrEqual(link.wordsLeft - link.left + 0.1)
+          expect(right - link.right, `the gap right of ${link.href} after its box, which may be no more than its own padding there`).toBeLessThanOrEqual(link.right - link.wordsRight + 0.1)
+        }
+        expect(limited.filter((each) => HEMMED_IN.some((href) => each.startsWith(href))), 'the link that a box on each side hems in: the case is vacuous where it is as wide as the least size').not.toEqual([])
+        // The stated limit: the width of every link whose line has no room for the least size.
+        test.info().annotations.push({ type: 'limit', description: limited.join(', ') })
+        console.log(`narrow links ${surface} ${size}: ${limited.join(', ')}`)
+      })
+
+      test(`puts no box over the box of a link or control that lies beside it, on ${surface} at ${size} text size`, async ({ page }) => {
+        await pressPage(page, surface, { scale: ratio, extra: [HEMMED] })
+        const boxed = await boxesNow(page)
+        await page.addStyleTag({ content: '.m-node .md-link { padding: 0 !important; margin: 0 !important; }' })
+        const bare = await boxesNow(page)
+        const alike = (list: typeof boxed): Spot[] => [...list.links, ...list.controls]
+        const now = alike(boxed)
+        const without = alike(bare)
+        expect(now.length, 'boxes on the page').toBe(without.length)
+        const across = (a: Spot, b: Spot): number => Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left))
+        const over: string[] = []
+        for (let first = 0; first < now.length; first += 1) {
+          for (let second = first + 1; second < now.length; second += 1) {
+            const a = now[first]
+            const b = now[second]
+            const x = without[first]
+            const y = without[second]
+            if (!a || !b || !x || !y) continue
+            // Two boxes that reach each other's height lie beside each other where their words do not lie one over the other
+            // (a link on the line above, with the words of the other under them, is above it, not beside it).
+            if (a.top >= b.bottom || b.top >= a.bottom || across(x, y) > 0.02) continue
+            if (across(a, b) > 0.02) over.push(`${a.href} and ${b.href}: ${across(a, b).toFixed(2)} px across, ${across(x, y).toFixed(2)} with no box`)
+          }
+        }
+        expect(over, 'boxes that overlap though their words do not lie one over the other').toEqual([])
       })
 
       test(`leaves every message, line and word, and the pane’s sideways scroll, where a button with no box has them, on ${surface} at ${size} text size`, async ({

@@ -32,9 +32,19 @@ describe('the box of a link in a message', () => {
     expect(link.get('--md-link-pad'), 'the room above and below: half of what the line lacks of the least size').toBe(
       'max(0px, calc((var(--target) - 1lh) / 2 + 0.05px))'
     )
-    expect(link.get('padding-block'), 'the padding of the button').toBe('var(--md-link-pad)')
-    expect(link.get('margin-block'), 'the margin of the button').toBe('calc(-1 * var(--md-link-pad))')
-    expect(link.has('padding') || link.has('padding-inline') || link.has('margin') || link.has('margin-inline'), 'room beside the words').toBe(false)
+    expect(link.get('padding-block'), 'the padding of the button above and below').toBe('var(--md-link-pad)')
+    expect(link.get('margin-block'), 'the margin of the button above and below').toBe('calc(-1 * var(--md-link-pad))')
+  })
+
+  it('is padded beside its words by what the page measures for it, and the margin takes the same room back', () => {
+    expect(link.get('padding-left'), 'the padding on the left').toBe('var(--md-link-left, 0px)')
+    expect(link.get('padding-right'), 'the padding on the right').toBe('var(--md-link-right, 0px)')
+    expect(link.get('margin-left'), 'the margin on the left').toBe('calc(-1 * var(--md-link-left, 0px))')
+    expect(link.get('margin-right'), 'the margin on the right').toBe('calc(-1 * var(--md-link-right, 0px))')
+    // A shorthand or a logical property beside these would give a second room that nothing measures.
+    for (const name of ['padding', 'margin', 'padding-inline', 'margin-inline', 'padding-inline-start', 'padding-inline-end', 'margin-inline-start', 'margin-inline-end']) {
+      expect(link.has(name), `a ${name} of the button`).toBe(false)
+    }
   })
 
   it('takes no tap in its padded room: the button has no hit of its own and the words keep theirs', () => {
