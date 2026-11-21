@@ -1101,13 +1101,13 @@ fn kr_req_12_07_a_gateway_that_cannot_bind_tells_the_launcher_why() {
         said.contains("serves `app-server"),
         "it ran with the arguments it was typed with: {said}"
     );
-    let recorded = shell
-        .last_launch_failure()
-        .expect("the backend's record says why");
+    let recorded = shell.last_launch_failure();
     assert!(
-        recorded.starts_with("the gateway could not listen on /")
-            && recorded.contains("gw.sock: it holds a file"),
-        "{recorded}"
+        recorded.as_deref().is_some_and(|text| {
+            text.starts_with("the gateway could not listen on /")
+                && text.contains("gw.sock: it holds a file")
+        }),
+        "the backend's record says why: {recorded:?}"
     );
     eventually("no server is left running", || {
         shell.servers().iter().all(|server| {
