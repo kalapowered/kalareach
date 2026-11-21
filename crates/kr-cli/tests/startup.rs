@@ -610,6 +610,7 @@ impl Standalone {
     /// This tree's commands get a `PATH` that names a folder of its own with nothing in it, so a
     /// real daemon here finds no program of the system by name: it runs only what is named by its
     /// whole path.
+    #[cfg(target_os = "linux")]
     fn with_an_empty_path(mut self) -> Self {
         let folder = self.tree.root().join("no-tools");
         std::fs::create_dir_all(&folder).expect("an empty folder for the path");
@@ -824,6 +825,7 @@ impl Standalone {
 
     /// A shell that ends by itself two minutes after it starts, named `sh` in a folder of its own,
     /// for a case whose session is closed by the case and must not outlive it if the case fails.
+    #[cfg(target_os = "linux")]
     fn a_short_lived_shell(&self) -> String {
         let folder = self.tree.root().join("short-lived");
         std::fs::create_dir_all(&folder).expect("a folder for the shell");
