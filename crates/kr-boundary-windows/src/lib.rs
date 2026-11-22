@@ -20,6 +20,7 @@
 //! | [`channel`] | The names of an invocation's data pipes, and how long the broker waits for the client to connect to them |
 //! | [`mod@env`] | The environment of every child, built from a fixed table and nothing of the caller's |
 //! | [`quote`] | A child's command line, quoted so that the platform's own splitting gives back its parts |
+//! | [`lifecycle`] | What the end of an invocation proves, from the processes, the scan and the logon session, and the rows that close the journal in the one order |
 //! | [`journal`] | The journal's records: their framing (a length, the bytes and a checksum, with a torn tail dropped), their rows and the order the rows may come in |
 //! | [`repository`] | What the broker reads of a repository before it starts Git, from bytes alone: its `HEAD`, its attributes, its configuration listing and the output of the five readers it runs |
 //! | [`refusal`] | The refusal those readers give: a kind, the rule's name and a short text |
@@ -63,6 +64,7 @@ pub mod events;
 pub mod filekey;
 pub mod frame;
 pub mod journal;
+pub mod lifecycle;
 pub mod limits;
 pub mod manifest;
 pub mod messages;
