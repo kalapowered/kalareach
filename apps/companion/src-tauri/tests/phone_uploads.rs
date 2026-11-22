@@ -3728,6 +3728,15 @@ async fn kr_req_13_12_a_late_reach_between_a_newer_pairings_admission_and_its_st
     adopted.stop().await;
 }
 
+/// What the queue cases read once the second cleanup has had its turn: how many stops began, the
+/// upload's generation before and after, its phase, and the send's answer. The cases assert it.
+struct QueueEnd {
+    stops: usize,
+    generation: (Option<u64>, Option<u64>),
+    phase: Option<&'static str>,
+    published: companion_tauri::Result<kr_protocol::transfer::AttachmentHandle>,
+}
+
 /// The state of the queue cases R3e and R3e2: an entry of the old pairing under `key` with no upload
 /// held, and the turn of the key held by the case.
 struct Queue {
@@ -3776,7 +3785,7 @@ impl Queue {
     /// The newer pairing admits an upload under the key, held in its content, once the first of the
     /// two cleanups has removed the entry and stopped before its decision; then the second cleanup
     /// takes the turn and must leave the upload alone.
-    async fn finish(self, first_removed: Arc<testing::Gate>, tail: Arc<testing::Gate>) {
+    async fn finish(self, first_removed: Arc<testing::Gate>, tail: Arc<testing::Gate>) -> QueueEnd {
         use testing::Point;
 
         let Self {
@@ -3802,20 +3811,21 @@ impl Queue {
             () = desk.idle() => {}
             () = waiting.until_passed(1) => {}
         }
-        assert_eq!(
-            waiting.passed(),
-            0,
-            "a stop began: a cleanup queued for the entry stopped the upload the newer pairing admitted"
-        );
-        assert_eq!(desk.generation_for_test(key), generation);
-        assert_eq!(desk.phase_for_test(key), Some("sending"));
+        let stops = waiting.passed();
+        let generation_after = desk.generation_for_test(key);
+        let phase = desk.phase_for_test(key);
         gate.release();
-        tokio::time::timeout(WATCHDOG, sending)
+        let published = tokio::time::timeout(WATCHDOG, sending)
             .await
             .expect("the send answers")
-            .expect("the task ran")
-            .expect("the upload the cleanup left alone publishes");
+            .expect("the task ran");
         adopted.stop().await;
+        QueueEnd {
+            stops,
+            generation: (generation, generation_after),
+            phase,
+            published,
+        }
     }
 }
 
@@ -3841,7 +3851,15 @@ async fn kr_req_13_12_a_cleanup_queued_for_a_foreign_key_leaves_the_upload_the_c
     // The forgetting removes the entry and stops before its decision.
     arrived(&tail, 1).await;
     let reached = Arc::clone(&tail);
-    queue.finish(reached.clone(), tail).await;
+    let end = queue.finish(reached.clone(), tail).await;
+    assert_eq!(
+        end.stops, 0,
+        "a stop began: a cleanup queued for the entry stopped the upload the newer pairing admitted"
+    );
+    assert_eq!(end.generation.1, end.generation.0);
+    assert_eq!(end.phase, Some("sending"));
+    end.published
+        .expect("the upload the cleanup left alone publishes");
 }
 
 /// KR-REQ-13.12 (R3e2): as R3e with the requests the other way round: the newer pairing's cleanup
@@ -3865,7 +3883,15 @@ async fn kr_req_13_12_a_forgotten_devices_cleanup_queued_behind_the_restarts_lea
     // The newer pairing's cleanup removes the entry and stops before its decision.
     arrived(&tail, 1).await;
     let reached = Arc::clone(&tail);
-    queue.finish(reached.clone(), tail).await;
+    let end = queue.finish(reached.clone(), tail).await;
+    assert_eq!(
+        end.stops, 0,
+        "a stop began: a cleanup queued for the entry stopped the upload the newer pairing admitted"
+    );
+    assert_eq!(end.generation.1, end.generation.0);
+    assert_eq!(end.phase, Some("sending"));
+    end.published
+        .expect("the upload the cleanup left alone publishes");
 }
 
 /// The host refuses the next begin for the size of the file, and `limit` says what it allows.
