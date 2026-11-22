@@ -1410,21 +1410,22 @@ fn a_child_that_hides_from_the_scan_changes_nothing_because_the_end_rests_on_the
 }
 
 /// Runs an invocation in which the service is told to stop at `point`, with a copy of the token
-/// held so that the end cannot be proved, and returns the replies.
+/// held so that the end cannot be proved, and returns the replies. The tree has a reader that runs
+/// the stand-in with `reader`, or none.
 fn stopped_at(
     setting: &Setting,
     point: &'static str,
-    reading: bool,
+    reader: Option<&[&str]>,
     how: How,
 ) -> Vec<InvocationReply> {
     let edit = |env: &mut Environment| {
         env.bounds.session = Duration::from_secs(2);
     };
-    let life = if reading {
+    let life = if let Some(reader) = reader {
         Life::open_reading(
             &setting.scratch.dir,
             &setting.account,
-            &["sleep", "120000"],
+            reader,
             &["exit", "0"],
             1,
             edit,
@@ -1468,7 +1469,12 @@ fn a_stop_of_the_service_during_the_reader_or_the_wait_for_the_pipes_ends_by_the
     }
     let setting = Setting::new();
     // The reader is running when the service is told to stop, and the end cannot be proved.
-    let replies = stopped_at(&setting, "reader resumed", true, How::Reads);
+    let replies = stopped_at(
+        &setting,
+        "reader resumed",
+        Some(&["sleep", "120000"]),
+        How::Reads,
+    );
     assert!(
         matches!(
             replies.last(),
@@ -1483,7 +1489,32 @@ fn a_stop_of_the_service_during_the_reader_or_the_wait_for_the_pipes_ends_by_the
     );
     // The service is told to stop while the client is to connect the data pipes.
     forget_journals(&setting);
-    let replies = stopped_at(&setting, "accepted", false, How::NeverConnects);
+    let replies = stopped_at(&setting, "accepted", None, How::NeverConnects);
+    assert!(
+        matches!(
+            replies.last(),
+            Some(InvocationReply::Finished {
+                ended_by: EndedBy::Stop,
+                exit: None,
+                cleanup: Cleanup::Uncertain,
+                ..
+            })
+        ),
+        "{replies:?}"
+    );
+}
+
+/// The service is told to stop after the reader ended and left a live process: the wait for the
+/// job's processes to end gives way to the stop, and the invocation ends by the stop.
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_stop_of_the_service_while_a_process_of_the_reader_lives_ends_by_the_stop() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    let replies = stopped_at(&setting, "reader ended", Some(&["leave"]), How::Reads);
     assert!(
         matches!(
             replies.last(),
