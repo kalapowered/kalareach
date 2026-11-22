@@ -2,8 +2,9 @@
 //!
 //! `scripts/real-proxy.sh` runs a squid on the loopback and writes the three names the cases read:
 //! `KR_REAL_PROXY` (its origin), `KR_REAL_PROXY_CREDENTIAL_FILE` (one `user:password` line made for
-//! the run) and `KR_REAL_PROXY_ACCESS_LOG` (the proxy's access log). A proxy that offers Digest
-//! only also sets `KR_REAL_PROXY_DIGEST`, so a case written for the other kind refuses it.
+//! the run) and `KR_REAL_PROXY_ACCESS_LOG` (the proxy's access log). A second proxy that offers
+//! Digest only is named the same way by `KR_REAL_PROXY_DIGEST`, `KR_REAL_PROXY_DIGEST_CREDENTIAL_FILE`
+//! and `KR_REAL_PROXY_DIGEST_ACCESS_LOG`.
 //!
 //! The log is the proxy's record of what reached it. A line is
 //! `<time> <client> <method> <target> <status> <result> <user>`, written when the request ends: a
@@ -48,45 +49,42 @@ pub struct RealProxy {
     log: PathBuf,
 }
 
-fn named(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| {
-        panic!("KR_REAL_PROXY, KR_REAL_PROXY_CREDENTIAL_FILE and KR_REAL_PROXY_ACCESS_LOG name the proxy to run against, and {name} is not set")
+fn named(origin: &str, suffix: &str) -> String {
+    let name = format!("{origin}{suffix}");
+    std::env::var(&name).unwrap_or_else(|_| {
+        panic!("{origin}, {origin}_CREDENTIAL_FILE and {origin}_ACCESS_LOG name the proxy to run against, and {name} is not set")
     })
 }
 
 impl RealProxy {
     /// The proxy that asks for a login by HTTP Basic.
     pub fn basic() -> Self {
-        assert!(
-            std::env::var_os("KR_REAL_PROXY_DIGEST").is_none(),
-            "KR_REAL_PROXY_DIGEST is set: the proxy named offers Digest only, and this case needs one that asks for Basic"
-        );
-        Self::read()
+        Self::read("KR_REAL_PROXY")
     }
 
     /// The proxy that offers Digest only.
     pub fn digest() -> Self {
-        assert!(
-            std::env::var_os("KR_REAL_PROXY_DIGEST").is_some(),
-            "KR_REAL_PROXY_DIGEST is not set: this case needs the proxy that offers Digest only"
-        );
-        Self::read()
+        Self::read("KR_REAL_PROXY_DIGEST")
     }
 
-    fn read() -> Self {
-        let origin = named("KR_REAL_PROXY");
-        let credential = std::fs::read_to_string(named("KR_REAL_PROXY_CREDENTIAL_FILE"))
+    fn read(origin: &str) -> Self {
+        let credential = std::fs::read_to_string(named(origin, "_CREDENTIAL_FILE"))
             .expect("the credential file is readable");
         let (user, password) = credential
             .trim_end_matches(['\r', '\n'])
             .split_once(':')
             .expect("the credential file holds one user:password line");
         Self {
-            origin,
+            origin: named(origin, ""),
             user: user.to_owned(),
             password: password.to_owned(),
-            log: PathBuf::from(named("KR_REAL_PROXY_ACCESS_LOG")),
+            log: PathBuf::from(named(origin, "_ACCESS_LOG")),
         }
+    }
+
+    /// The login line, `user:password`, as the owner stores it.
+    pub fn login_line(&self) -> String {
+        format!("{}:{}", self.user, self.password)
     }
 
     /// The name the proxy was started with, and what its log says for that user.
@@ -136,15 +134,28 @@ impl RealProxy {
 
     /// Waits until the lines that name `target` number `count`, and returns them.
     pub async fn wait_for(&self, target: &str, count: usize) -> Vec<Logged> {
+        self.wait_until(target, &format!("{count} line(s)"), |lines| {
+            lines.len() >= count
+        })
+        .await
+    }
+
+    /// Waits until the lines that name `target` satisfy `enough`, and returns them.
+    pub async fn wait_until(
+        &self,
+        target: &str,
+        wanted: &str,
+        enough: impl Fn(&[Logged]) -> bool,
+    ) -> Vec<Logged> {
         let deadline = Instant::now() + LOG_PATIENCE;
         loop {
             let lines = self.lines_to(target);
-            if lines.len() >= count {
+            if enough(&lines) {
                 return lines;
             }
             assert!(
                 Instant::now() < deadline,
-                "the proxy's log never held {count} line(s) for {target}: {lines:?}"
+                "the proxy's log never held {wanted} for {target}: {lines:?}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

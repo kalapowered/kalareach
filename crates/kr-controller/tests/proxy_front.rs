@@ -13,6 +13,11 @@ mod local_relay;
 #[path = "../../kr-client/src/services/http/connect_proxy.rs"]
 mod connect_proxy;
 
+// A real proxy a case names. Only the cases that run against one use it.
+#[path = "../../kr-transport/tests/support/real_proxy.rs"]
+#[allow(dead_code)]
+mod real_proxy;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +35,7 @@ use kr_transport::endpoint::{bind_network, guard_proxy};
 use kr_transport::front::FrontOpener;
 use kr_transport::proxy::{ProxyCredential, StopKind};
 use local_relay::LocalRelay;
+use real_proxy::{Login as Held, RealProxy};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -571,4 +577,40 @@ async fn an_endpoint_the_proxy_has_refused_takes_no_leased_relay_while_its_close
     gate.notify_one();
     until("the end of the endpoint", || guard.proxy_closed()).await;
     assert!(closer.closed() && endpoint.is_closed());
+}
+
+/// KR-REQ-10.02: a relay-only endpoint whose proxy is a real one that asks for a login reaches its
+/// relay through the front: it goes online, and the proxy's log shows tunnels opened to the
+/// relay's own address for the user, every one of them let through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs only against a proxy this machine runs, named by KR_REAL_PROXY, KR_REAL_PROXY_CREDENTIAL_FILE and KR_REAL_PROXY_ACCESS_LOG"]
+async fn an_endpoint_reaches_its_relay_through_a_real_proxy_by_its_front() {
+    let relay = LocalRelay::spawn().await;
+    let proxy = RealProxy::basic();
+    let proxy_url = proxy.url(Held::Right);
+    let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+    let (endpoint, closer) =
+        bind_network(&config(&relay, proxy_url.clone(), trusting(&[])), &identity)
+            .await
+            .expect("a network endpoint");
+    tokio::time::timeout(WATCHDOG, endpoint.online())
+        .await
+        .expect("the endpoint reached its relay through the front and the real proxy");
+    assert_eq!(
+        proxy_url.login().expect("a login").stopped(),
+        None,
+        "the real proxy took the login"
+    );
+
+    // The proxy writes a tunnel's line when the tunnel closes, which is when the endpoint ends.
+    closer.close().await;
+    assert!(closer.closed() && endpoint.is_closed());
+    let target = authority(&relay);
+    let lines = proxy.wait_for(&target, 1).await;
+    assert!(
+        lines.iter().all(|line| line.method == "CONNECT"
+            && line.status == 200
+            && line.user == proxy.user()),
+        "every request the proxy took for the relay was a tunnel for the user: {lines:?}"
+    );
 }

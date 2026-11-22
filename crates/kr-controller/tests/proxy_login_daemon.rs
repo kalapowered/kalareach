@@ -5,6 +5,10 @@
 //!
 //! The proxy is a stand-in on the loopback. The password is planted: it is in no answer, no
 //! diagnostic and no line of the daemon's log.
+//!
+//! The cases that end the file run the same daemon against a real proxy, the squid that
+//! `scripts/real-proxy.sh` runs, and read what the proxy's own access log says it was asked. They
+//! run only when the environment names the proxy.
 
 #![cfg(unix)]
 
@@ -12,6 +16,10 @@ mod net_support;
 
 #[path = "../../kr-client/src/services/http/connect_proxy.rs"]
 mod connect_proxy;
+
+#[path = "../../kr-transport/tests/support/real_proxy.rs"]
+#[allow(dead_code)]
+mod real_proxy;
 
 use std::time::Duration;
 
@@ -27,6 +35,7 @@ use kr_protocol::ids::ActionId;
 use kr_protocol::method::Method;
 use kr_protocol::network_proxy::NetworkProxyLoginSetParams;
 use kr_protocol::scalars::Nullable;
+use real_proxy::RealProxy;
 use tokio::net::TcpListener;
 
 /// A password that must be found in no answer and no log line.
@@ -166,6 +175,18 @@ async fn host_behind_with(
     tokio::task::JoinHandle<()>,
     String,
 ) {
+    host_behind_at(&proxy.url, change).await
+}
+
+/// [`host_behind_with`] for the proxy at the origin `proxy`.
+async fn host_behind_at(
+    proxy: &str,
+    change: impl FnOnce(&mut ConfigurationDocument),
+) -> (
+    kr_ipc::testing::TempHost,
+    tokio::task::JoinHandle<()>,
+    String,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
     let port = listener.local_addr().expect("an address").port();
     let held = tokio::spawn(async move {
@@ -179,7 +200,7 @@ async fn host_behind_with(
     document.revision = 1;
     document.network.enabled = Nullable::some(true);
     document.network.relay_urls = Nullable::some(vec![format!("https://127.0.0.1:{port}")]);
-    document.network.proxy_url = Nullable::some(proxy.url.clone());
+    document.network.proxy_url = Nullable::some(proxy.to_owned());
     change(&mut document);
     net_support::write_document(&host, &document);
     (host, held, format!("127.0.0.1:{port}"))
@@ -200,6 +221,11 @@ async fn unused_origin() -> (String, String) {
 /// Keeps `user:PASSWORD` as the login this host holds for `proxy`, in the file store the daemon
 /// reads.
 fn store_login(host: &kr_ipc::testing::TempHost, proxy: &ConnectProxy, user: &str, password: &str) {
+    store_login_at(host, &proxy.url, user, password);
+}
+
+/// [`store_login`] for the proxy at the origin `proxy`.
+fn store_login_at(host: &kr_ipc::testing::TempHost, proxy: &str, user: &str, password: &str) {
     let store = open_store_in(&host.environment().secrets_dir())
         .expect("the store the daemon keeps its secrets in")
         .store;
@@ -207,7 +233,7 @@ fn store_login(host: &kr_ipc::testing::TempHost, proxy: &ConnectProxy, user: &st
     store
         .set(
             &name,
-            item_bytes(&proxy.url, format!("{user}:{password}").as_bytes()).expose(),
+            item_bytes(proxy, format!("{user}:{password}").as_bytes()).expose(),
         )
         .expect("the item is kept");
 }
@@ -768,4 +794,177 @@ async fn a_section_that_does_not_join_reads_no_trust_anchor_and_the_daemon_start
         proxy.calls()
     );
     daemon.stop();
+}
+
+/// A real proxy's `CONNECT` log lines for `target`, as `(status, user)` pairs.
+fn answers(lines: &[real_proxy::Logged]) -> Vec<(u16, &str)> {
+    lines
+        .iter()
+        .map(|line| (line.status, line.user.as_str()))
+        .collect()
+}
+
+/// KR-REQ-10.02: a daemon behind a real proxy that asks for a login, with none stored, starts, says
+/// so in the diagnostics, and is not on the network, and the proxy's log shows the start check's one
+/// request with no login; a login the owner stores is not in force until the next start; at the
+/// next start the daemon is on the network and the proxy's log shows a tunnel opened for the user
+/// and no login it refused. The login is in no line of the daemon's log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs only against a proxy this machine runs, named by KR_REAL_PROXY, KR_REAL_PROXY_CREDENTIAL_FILE and KR_REAL_PROXY_ACCESS_LOG"]
+async fn a_daemon_behind_a_real_proxy_starts_says_so_and_takes_the_login_at_its_next_start() {
+    let proxy = RealProxy::basic();
+    let (host, _relay, relay_address) = host_behind_at(&proxy.origin, |_| {}).await;
+
+    let mut daemon = Daemon::start(&host);
+    let said = network_detail(&host).await;
+    assert!(
+        said.contains("the proxy requires a sign-in, and this host holds no login for it"),
+        "{said}"
+    );
+    assert!(
+        said.contains("this host is not on the network"),
+        "no endpoint is registered: {said}"
+    );
+    let lines = proxy.wait_for(&relay_address, 1).await;
+    assert_eq!(
+        answers(&lines),
+        vec![(407, "-")],
+        "the start check, once, with no login: {lines:?}"
+    );
+    assert_eq!(lines[0].method, "CONNECT");
+
+    let mut control = local_client(&host).await;
+    control
+        .mutate(
+            Method::NetworkProxyLoginSet,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id()),
+            &NetworkProxyLoginSetParams {
+                proxy: proxy.origin.clone(),
+                login: SecretText::new(proxy.login_line()).expect("a credential text"),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the owner stores the login");
+    let said = network_detail(&host).await;
+    assert!(
+        said.contains(
+            "changed since this host started, and the change applies when the host restarts"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("this host is not on the network"),
+        "the login is not in force yet: {said}"
+    );
+
+    daemon.stop();
+    let mut daemon = Daemon::start(&host);
+    let said = network_detail(&host).await;
+    assert!(said.contains("this host is on the network"), "{said}");
+    assert!(
+        !said.contains("requires a sign-in") && !said.contains("refused the login"),
+        "{said}"
+    );
+    // The proxy writes a tunnel's line when the tunnel closes, which is when the daemon ends.
+    daemon.stop();
+    let lines = proxy
+        .wait_until(&relay_address, "a tunnel opened for the user", |lines| {
+            lines
+                .iter()
+                .any(|line| line.status == 200 && line.user == proxy.user())
+        })
+        .await;
+    assert!(
+        lines
+            .iter()
+            .all(|line| !(line.status == 407 && line.user == proxy.user())),
+        "the proxy refused no login the daemon sent: {lines:?}"
+    );
+    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    let (_, password) = proxy
+        .login_line()
+        .split_once(':')
+        .map(|(u, p)| (u.to_owned(), p.to_owned()))
+        .expect("a pair");
+    assert!(!log.contains(&password), "the daemon's log holds the login");
+    let basic = base64::engine::general_purpose::STANDARD.encode(proxy.login_line());
+    assert!(!log.contains(&basic), "the daemon's log holds the login");
+}
+
+/// KR-REQ-10.02: a daemon whose stored login a real proxy refuses is written no login after the
+/// check that found the refusal: the proxy's log shows one refused request for the user and no
+/// later one, the diagnostics say that the proxy refused the login and that this host starts no new
+/// request through it, and the local socket serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs only against a proxy this machine runs, named by KR_REAL_PROXY, KR_REAL_PROXY_CREDENTIAL_FILE and KR_REAL_PROXY_ACCESS_LOG"]
+async fn a_wrong_login_is_written_to_a_real_proxy_once_and_the_daemon_stops_every_request_through_it()
+ {
+    let proxy = RealProxy::basic();
+    let (host, _relay, relay_address) = host_behind_at(&proxy.origin, |_| {}).await;
+    store_login_at(&host, &proxy.origin, proxy.user(), "not-the-password");
+
+    let mut daemon = Daemon::start(&host);
+    let said = network_detail(&host).await;
+    assert!(
+        said.contains("the proxy refused the login this host holds, so this host starts no new request through the proxy"),
+        "{said}"
+    );
+    assert!(
+        said.contains("this host is not on the network"),
+        "no endpoint is registered: {said}"
+    );
+    let lines = proxy.wait_for(&relay_address, 1).await;
+    assert_eq!(
+        answers(&lines),
+        vec![(407, proxy.user())],
+        "the check's own request, and no other: {lines:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        proxy.lines_to(&relay_address).len(),
+        1,
+        "the proxy was asked for nothing after the refusal"
+    );
+    daemon.stop();
+    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    assert!(!log.contains("not-the-password"), "the log holds the login");
+}
+
+/// KR-REQ-10.02: a real proxy that offers Digest only is "unsupported" to the daemon whether or not
+/// it holds a login, never "refused", and the proxy's log shows the check's one request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs only against a proxy this machine runs that offers Digest only, named by KR_REAL_PROXY_DIGEST, KR_REAL_PROXY_DIGEST_CREDENTIAL_FILE and KR_REAL_PROXY_DIGEST_ACCESS_LOG"]
+async fn a_real_proxy_that_offers_digest_only_is_unsupported_whether_or_not_a_login_is_held() {
+    let proxy = RealProxy::digest();
+    for (label, stored) in [("no login", None), ("a login held", Some("another"))] {
+        let (host, _relay, relay_address) = host_behind_at(&proxy.origin, |_| {}).await;
+        if let Some(password) = stored {
+            store_login_at(&host, &proxy.origin, proxy.user(), password);
+        }
+        let mut daemon = Daemon::start(&host);
+        let said = network_detail(&host).await;
+        assert!(
+            said.contains("the proxy asks for a sign-in method this host does not support; this host can send only a user name and password (Basic)"),
+            "{label}: {said}"
+        );
+        assert!(
+            !said.contains("refused the login") && !said.contains("requires a sign-in"),
+            "{label}: {said}"
+        );
+        assert!(
+            said.contains("this host is not on the network"),
+            "{label}: no endpoint is registered: {said}"
+        );
+        let lines = proxy.wait_for(&relay_address, 1).await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "{label}: the check's own request: {lines:?}"
+        );
+        assert_eq!(lines[0].method, "CONNECT");
+        assert_eq!(lines[0].status, 407, "{label}: {lines:?}");
+        daemon.stop();
+    }
 }

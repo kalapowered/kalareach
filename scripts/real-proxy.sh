@@ -11,7 +11,9 @@
 #   KR_REAL_PROXY                    the proxy's origin, for example http://127.0.0.1:41230
 #   KR_REAL_PROXY_CREDENTIAL_FILE    the credential file
 #   KR_REAL_PROXY_ACCESS_LOG         the proxy's own access log
-#   KR_REAL_PROXY_DIGEST             set to 1 by `digest` only: the proxy offers Digest only
+#
+# `digest` writes the same three names with DIGEST after the first two words: KR_REAL_PROXY_DIGEST,
+# KR_REAL_PROXY_DIGEST_CREDENTIAL_FILE and KR_REAL_PROXY_DIGEST_ACCESS_LOG, so one run can name both.
 #
 # `basic` asks every CONNECT for a user name and password by HTTP Basic. `digest` offers Digest only,
 # so it stands for a proxy that asks for a sign-in method this host does not send. Each log line is
@@ -95,13 +97,14 @@ start() {
     cat "$SQUID_EXTRA_CONF" >>"$run/squid.conf"
   fi
   : >"$run/access.log"
+  local name=KR_REAL_PROXY
+  if [ "$mode" = digest ]; then
+    name=KR_REAL_PROXY_DIGEST
+  fi
   {
-    echo "export KR_REAL_PROXY=http://127.0.0.1:$port"
-    echo "export KR_REAL_PROXY_CREDENTIAL_FILE=$run/credential"
-    echo "export KR_REAL_PROXY_ACCESS_LOG=$run/access.log"
-    if [ "$mode" = digest ]; then
-      echo "export KR_REAL_PROXY_DIGEST=1"
-    fi
+    echo "export $name=http://127.0.0.1:$port"
+    echo "export ${name}_CREDENTIAL_FILE=$run/credential"
+    echo "export ${name}_ACCESS_LOG=$run/access.log"
   } >"$run/env.sh"
 
   "$program" -k parse -f "$run/squid.conf" >"$run/parse.log" 2>&1 \
