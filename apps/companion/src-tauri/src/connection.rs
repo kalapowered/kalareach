@@ -1066,7 +1066,19 @@ async fn supervise<R: Runtime>(
             state.transfers().host_reached(paired.clone());
             // The drafts kept for sessions the host no longer lists are ended.
             let drafts = state.paired_drafts();
-            tauri::async_runtime::spawn(async move { drafts.sweep_after_reach(paired).await });
+            // A draft of another device goes only while this is still the pairing the device holds
+            // with the host; a read that fails is no authority to remove.
+            let held = state.device().ok();
+            tauri::async_runtime::spawn(async move {
+                let in_force = move || {
+                    paired_host
+                        .zip(held.as_ref())
+                        .is_some_and(|(host, device)| {
+                            device.paired_as(host).ok().flatten() == Some(device_id)
+                        })
+                };
+                drafts.sweep_after_reach(paired, &in_force).await;
+            });
         }
     }
     if let Some(first) = first.take() {
