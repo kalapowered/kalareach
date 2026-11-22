@@ -2682,9 +2682,14 @@ async fn kr_req_13_12_a_cancel_whose_caller_was_dropped_is_finished_by_the_attem
 }
 
 /// KR-REQ-13.12 (C1): a finish for a connection that is not the upload's owner's changes nothing: the
-/// sender of the upload is not stopped and the upload still ends as published.
+/// sender of the upload is not stopped and the upload still ends as published. A finish that was
+/// not refused first stops the sender and waits for it, and the sender is held in its content read:
+/// the case selects the finish's answer against the stop's own note, so that a missing refusal is
+/// seen at the note and not at a time limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_13_12_finish_asked_for_another_owner_changes_nothing() {
+    use testing::Point;
+
     let adopted = Adopted::start(1).await;
     let (phone, _control) = phone_for(&adopted).await;
     let companion = &phone.companion;
@@ -2692,6 +2697,7 @@ async fn kr_req_13_12_finish_asked_for_another_owner_changes_nothing() {
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
     let key = kr_ipc::new_uuid();
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
     let paired = paired_of(companion).await;
     let sending = {
         let sent = request(&adopted, &bytes, content, key);
@@ -2704,8 +2710,23 @@ async fn kr_req_13_12_finish_asked_for_another_owner_changes_nothing() {
         device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
         ..paired
     };
+    let mut finishing = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.finish_asked(&other, key).await })
+    };
+    let answered = tokio::select! {
+        answer = &mut finishing => Some(answer),
+        () = waiting.until_passed(1) => None,
+    };
     assert!(
-        desk.finish_asked(&other, key).await.is_err(),
+        answered.is_some(),
+        "a stop began: the finish was not refused before the barrier"
+    );
+    assert!(
+        answered
+            .expect("the finish answered")
+            .expect("the task ran")
+            .is_err(),
         "another owner's connection is refused"
     );
     assert_eq!(
