@@ -4,7 +4,8 @@
 #   scripts/check-retained-release.sh
 #
 # Run it in a clean checkout of the commit a release is cut from, on macOS or Linux, with the
-# release tags fetched (`git fetch --tags`): the tags are what say which release came before. It
+# release tags fetched (`git fetch --tags`) and the `x86_64-pc-windows-gnu` target installed
+# (`rustup target add x86_64-pc-windows-gnu`): the tags are what say which release came before. It
 #
 #   1. takes the release before this one, the newest tag `packages/v<version>+<commit>` in the
 #      commit's history at the highest compatibility level below its own, and fails unless that
@@ -35,6 +36,12 @@ case "$(uname -s)" in
     exit 1
     ;;
 esac
+
+installed_targets=$(rustup target list --installed 2>/dev/null || true)
+if ! grep -qx 'x86_64-pc-windows-gnu' <<<"$installed_targets"; then
+  echo "REFUSED: the x86_64-pc-windows-gnu target is not installed, and the retained_surface test builds its fixtures for it too. Run: rustup target add x86_64-pc-windows-gnu" >&2
+  exit 1
+fi
 
 if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   echo "REFUSED: the checkout has changes; run this in a clean checkout of the commit to be released" >&2
