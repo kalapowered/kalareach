@@ -58,6 +58,9 @@ const ADMINISTRATOR_IDLE: std::time::Duration = std::time::Duration::from_secs(9
 /// How long the write of an answer may take. An answer is a small frame that the pipe's buffer
 /// takes whole, so a write that waits this long has a client that reads nothing.
 const ANSWER_WRITE: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the broker waits, after its last answer on a connection and before it closes it, for
+/// the client to read that answer: bytes that are still unread when a connection closes are lost.
+const CLIENT_READ: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long a cycle of proofs lasts, all the proofs of it together: the log names the rule about
 /// 170 s after the start of Windows. A cycle has one absolute deadline, and every wait, every query
 /// of the log and every program of a proof stays within it. The first cycle begins with the
@@ -439,6 +442,19 @@ fn send(connection: &mut Connection, response: &Response) -> Result<(), FrameErr
 
 /// Serves one connection until it ends. Every read and every write has a deadline, so a client
 /// that sends nothing or reads nothing gives its slot back.
+/// Sends the answer that ends a connection and lets the client read it before the connection closes.
+fn send_last(connection: &mut Connection, response: &Response) {
+    match send(connection, response) {
+        // Whether the client read the answer in time changes nothing that is left to do: the
+        // connection closes next either way.
+        Ok(()) => {
+            connection.let_the_client_read(CLIENT_READ);
+        }
+        // An answer that could not be sent leaves nothing for the client to read.
+        Err(unsent) => drop(unsent),
+    }
+}
+
 fn answer(mut connection: Connection, state: &State, kind: Kind) {
     // The platform lets a server take on a client's identity only after it has read from the pipe,
     // so the first message is read before the caller is identified. Nothing is done with it until
@@ -452,7 +468,7 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
     let identity = match connection.identity() {
         Ok(identity) => identity,
         Err(error) => {
-            let _ = send(
+            send_last(
                 &mut connection,
                 &refuse(Refusal::Failed, &error.to_string()),
             );
@@ -477,7 +493,7 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
             }
         }
         Ok(Request::Hello { .. }) => {
-            let _ = send(
+            send_last(
                 &mut connection,
                 &refuse(
                     Refusal::Version,
@@ -487,7 +503,7 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
             return;
         }
         _ => {
-            let _ = send(
+            send_last(
                 &mut connection,
                 &refuse(Refusal::Malformed, "the first message must be hello"),
             );
@@ -508,7 +524,7 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
         let request = match frame::read::<_, Request>(&mut connection) {
             Ok(request) => request,
             Err(FrameError::Malformed(reason)) => {
-                let _ = send(&mut connection, &refuse(Refusal::Malformed, &reason));
+                send_last(&mut connection, &refuse(Refusal::Malformed, &reason));
                 return;
             }
             Err(_) => return,
