@@ -23,6 +23,7 @@
 //! | `rights` | What a token may do to an object, computed from the object's descriptor: the person's, the broker's own and a sibling's |
 //! | `session` | The system's logon sessions: the session of a token, the list, and the wait until one is gone |
 //! | `scan` | The detector scan of an invocation's end: every process, looked at once |
+//! | `lifecycle` | One invocation's life: the phases, the one ending function, and recovery's process half |
 //! | `walk` | The anchored walk: objects reached by identifier from a held directory |
 //! | `pipe` | The broker's local pipe |
 //! | `proof` | The proof that the boundary is in force, and that it was released |
@@ -44,6 +45,7 @@ pub mod install;
 pub mod job;
 pub mod journal;
 pub mod launch;
+pub mod lifecycle;
 pub mod pipe;
 pub mod privilege;
 pub mod proof;

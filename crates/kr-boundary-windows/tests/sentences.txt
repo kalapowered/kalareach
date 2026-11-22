@@ -792,7 +792,6 @@ UNCERTAIN_END_WORDS | the project stays closed until the broker has proof | the 
 MAINTENANCE_WORDS | the broker is in maintenance and starts no operation | the broker is in maintenance and starts no operation | flow: the administrator turned maintenance on, and the request came during it
 TRANSPORT_WORDS | the client did not connect to the output pipes within ten seconds | the client did not connect to the output pipes within ten seconds | rule: DataPipes::wait_connected answered that the bound ran out before both pipes had the retained client connected
 NOT_STARTED_WORDS | the broker could not start the operation | the broker could not start the operation: {reason} | rule: a phase between the account's choice and the primary child's resume failed; the reason is the platform's or the check's own words
-listed | pub const | lifecycle.rs | 6 | names of rules, for cases and documents; no sentence for a person
 scan_list-1 | listing the processes of the machine | listing the processes of the machine: Windows error N | read: NtQuerySystemInformation answered the status that the number gives
 scan_created_of-1 | reading a process's creation time | reading a process's creation time: Windows error N | read: GetProcessTimes on a process that was opened for a limited query returned an error
 scan_look-1 | looking at a process | looking at a process: Windows error N | read: OpenProcess with the limited query right on the number that the list gave returned an error
@@ -807,3 +806,5 @@ token_information-1 | last(what) | the words that the caller gave: Windows error
 token_read_back-1 | the token's owner is not the invocation's group | the token's owner is not the invocation's group | read: the owner that GetTokenInformation gave back is not the group that the token was made with
 token_read_back-2 | the token's account is not deny-only | the token's account is not deny-only | read: the token's user entry has no deny-only attribute or is enabled
 token_read_back-3 | the invocation's group is not among the token's groups | the invocation's group is not among the token's groups | read: no entry of the token's groups is the group
+listed | pub const | lifecycle.rs | 6 | names of rules, for cases and documents; no sentence for a person
+listed | pub fn | win/lifecycle/recovery.rs | 1 | the reason that the journals cannot be read, in the words of the journal's own error
