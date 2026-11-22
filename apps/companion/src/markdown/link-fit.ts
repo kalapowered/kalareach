@@ -319,12 +319,12 @@ let reader: HTMLElement | null = null
 const withoutRoom = (style: string | null): string => {
   reader ??= document.createElement('span')
   reader.setAttribute('style', style ?? '')
-  const kept: string[] = []
+  const kept: [string, string, string][] = []
   for (const name of Array.from(reader.style)) {
     if (name === LEFT || name === RIGHT) continue
-    kept.push(`${name}:${reader.style.getPropertyValue(name)}${reader.style.getPropertyPriority(name)}`)
+    kept.push([name, reader.style.getPropertyValue(name), reader.style.getPropertyPriority(name)])
   }
-  return kept.join(';')
+  return JSON.stringify(kept)
 }
 
 /** What the page has given a link, read from its element. */

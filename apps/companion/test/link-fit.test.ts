@@ -791,6 +791,31 @@ describe('the page’s keeping of the room', () => {
     stop()
   })
 
+  it('measures a message again when a link’s style loses a priority, though what is left of the declaration reads as the same text', async () => {
+    const { pane: root } = pane(1, (message) => {
+      link(message, 0, 10)
+      link(message, 30, 40)
+      link(message, 40, 380)
+    })
+    const stop = startLinkFit(root)
+    frame()
+    await mutations()
+    const first = root.querySelector<HTMLElement>('.md-link')
+    if (!first) throw new Error('the made page has no links')
+    first.style.setProperty('font-family', 'monospace', 'important')
+    await mutations()
+    frame()
+    await mutations()
+    expect(frames.length, 'frames asked for after the font was measured').toBe(0)
+    const written = first.getAttribute('style') ?? ''
+    expect(written, 'the style holds the font with its priority').toContain('font-family: monospace !important')
+    first.setAttribute('style', written.replace('monospace !important', 'monospaceimportant'))
+    expect(first.style.getPropertyPriority('font-family'), 'the font has no priority now').toBe('')
+    await mutations()
+    expect(frames.length, 'one frame asked for by a font whose priority went').toBe(1)
+    stop()
+  })
+
   it('stops: a change after it is made is not measured', async () => {
     const { pane: root } = pane(1, (message) => {
       link(message, 100, 110)
