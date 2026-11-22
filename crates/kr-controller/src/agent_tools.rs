@@ -3326,9 +3326,9 @@ fn entry_command_of(running: Option<&kr_ipc::install::Running>) -> String {
         .map_or_else(|| "kr".to_owned(), |path| display(&path))
 }
 
-/// What the unit tests run when a removal asks which records hold an entry, after it has read the
-/// document and before it goes on from that read, to make the change another process could make in
-/// between. `once(skip, then)` runs `then` at the call after `skip` calls have passed.
+/// What the unit tests run just after a removal has read the document of an entry, before it goes
+/// on from that read, to make the change another process could make in between. `once(skip, then)`
+/// runs `then` at the call after `skip` calls have passed.
 #[cfg(test)]
 mod holders_pause {
     use std::cell::RefCell;
@@ -7919,8 +7919,8 @@ mod tests {
     }
 
     /// KR-REQ-11.01: the entry a removal checks and the document it edits are one read: an entry that
-    /// another process changes after the check, while the removal asks which records hold it, is not
-    /// removed by the edit, whatever it has become.
+    /// another process changes after the removal read the document is not removed by the edit,
+    /// whatever it has become. The removal says the entry has changed, and its record goes.
     #[cfg(unix)]
     #[test]
     fn an_entry_changed_after_it_was_checked_is_not_removed_by_the_edit_made_from_the_same_read() {
@@ -7939,7 +7939,27 @@ mod tests {
         holders_pause::once(1, move |_| {
             std::fs::write(&at, changed).expect("another process changes the entry");
         });
-        let _ = installer.remove(&params(amp(), InstallScope::User));
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "an entry that another process changed is told, not refused: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        let changed = format!(
+            "{}: it has changed since it was installed",
+            document.display()
+        );
+        assert!(
+            removed.retained.iter().any(|note| note.ends_with(&changed)),
+            "the removal says that the entry has changed: {:?}",
+            removed.retained
+        );
+        assert!(
+            !installer
+                .record_path(&params(amp(), InstallScope::User))
+                .exists(),
+            "the record of an entry that has changed goes"
+        );
         let text = std::fs::read_to_string(&document).expect("the document stays");
         assert!(
             text.contains("/usr/local/bin/kr"),
