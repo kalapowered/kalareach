@@ -194,6 +194,16 @@ if [ -f '{tools}/stalls' ]; then
   done
   exit 255
 fi
+# A test that wants a helper that is ended by a signal says so with a file.
+if [ -f '{tools}/signalled' ]; then
+  kill -9 $$
+fi
+# A test that wants an environment that refuses the bridge says so with a file holding the frame
+# it writes. It then reads what it is sent, as a destination that answered does.
+if [ -f '{tools}/refusal' ]; then
+  cat '{tools}/refusal'
+  exec cat >/dev/null
+fi
 # A test that wants the destination unreachable says so with a file, and the connection is refused
 # the way `ssh` refuses one.
 if [ -f '{tools}/unreachable' ]; then
@@ -268,6 +278,26 @@ case "$1" in
   exec)
     # exec --interactive --user <user> -- <container> <helper> bridge --stdio
     printf '%s\n' "$$" >'{tools}/last-bridge.pid'
+    # A test that wants a helper that is ended by a signal says so with a file.
+    if [ -f '{tools}/signalled' ]; then
+      kill -9 $$
+    fi
+    # A test that wants an environment that refuses the bridge says so with a file holding the frame
+    # it writes. It then reads what it is sent, as a destination that answered does.
+    if [ -f '{tools}/refusal' ]; then
+      cat '{tools}/refusal'
+      exec cat >/dev/null
+    fi
+    # A test that wants a helper that never answers says so with a file. It goes when the program
+    # that asked for the connection does, or at the end of the stall in any case.
+    if [ -f '{tools}/stalls' ]; then
+      waited=0
+      while kill -0 "$PPID" 2>/dev/null && [ "$waited" -lt 40 ]; do
+        sleep 1
+        waited=$((waited + 1))
+      done
+      exit 255
+    fi
     # A test that wants the helper unreachable says so with a file: the container runs, and the
     # runtime cannot start the program in it.
     if [ -f '{tools}/unreachable' ]; then
@@ -1723,15 +1753,6 @@ fn own_account() -> String {
     .to_owned()
 }
 
-/// The length a person is told of a sentence the host said: "[message withheld, 52 bytes]".
-fn withheld_bytes(shown: &str) -> Option<u64> {
-    shown
-        .strip_prefix("[message withheld, ")?
-        .strip_suffix(" bytes]")?
-        .parse()
-        .ok()
-}
-
 /// How many times the stand-in for `podman` was run, and the lines of how.
 fn podman_invocations(world: &World) -> Vec<String> {
     std::fs::read_to_string(world.tools.join("podman-invocations"))
@@ -1940,27 +1961,275 @@ async fn a_connection_that_fails_claims_nothing_for_an_ssh_host_or_a_container()
             failed["row"]["readiness"]["channel_scoped"], false,
             "{label}: what an earlier answer established is taken back: {failed}"
         );
+        let connection = failed["connection"].as_str().unwrap_or_default();
         assert!(
-            failed["connection"]
-                .as_str()
-                .and_then(withheld_bytes)
-                .is_some_and(|bytes| bytes > 0),
+            !connection.is_empty() && !connection.starts_with('['),
             "{label}: the result says what opening the connection did: {failed}"
         );
-        // What the person reads: the record's label and where it stands, then the host's sentence
-        // about the connection as its class and length, as every sentence of the host's is shown,
-        // and no line that claims a protocol nothing spoke.
+        // What the person reads: the record's label and where it stands, then what the connection
+        // did in the same words as the result, and no line that claims a protocol nothing spoke.
+        // The cases that follow read the sentence for each way a connection fails.
         let said = world.run(&["bridge", "refresh", label]);
         let said = String::from_utf8_lossy(&said.stdout);
         let lines: Vec<&str> = said.lines().collect();
         assert_eq!(lines.len(), 2, "{label}: {said}");
         assert!(lines[0].starts_with(&format!("{label} is ")), "{said}");
-        assert!(
-            withheld_bytes(lines[1].trim_start()).is_some_and(|bytes| bytes > 0),
-            "{label}: the connection's sentence is shown as its class and length: {said}"
-        );
+        assert_eq!(lines[1].trim_start(), connection, "{label}: {said}");
         std::fs::remove_file(&switch).expect("the switch is taken away");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a refresh tells a person about the connection it opened.
+
+/// The sentence a destination says in its own words when it refuses a bridge. The refresh shows
+/// it as its class and length, so the text itself is in no output of `kr`.
+const DESTINATION_SENTENCE: &str = "kr-test-destination-refused-in-its-own-words";
+
+/// The destinations the diagnostic cases try, each as its label, access class, target and the
+/// program the host runs for it.
+const DESTINATIONS: [(&str, &str, &str, &str); 2] = [
+    ("sshdest", "ssh", "build.example", "ssh"),
+    ("box", "container", STAND_IN_CONTAINER_NAME, "podman"),
+];
+
+/// What `kr bridge refresh` told a person of one environment, in both forms.
+struct Told {
+    /// The document `--json` prints.
+    document: Value,
+    /// The lines a person reads.
+    lines: Vec<String>,
+    /// Everything either run printed, standard error included.
+    everything: String,
+}
+
+/// A source host with a destination whose helper answers, a stand-in for the container runtime, and
+/// the stand-in for `ssh`.
+async fn world_whose_destination_answers() -> World {
+    let world = World::start().await;
+    world.stand_in_for_the_container_runtime();
+    world.enrol_destination();
+    let _ = world.create_in_destination();
+    world
+}
+
+/// Enrols `target` under `label` and refreshes it while the destination answers, so what a later
+/// failure says is what changed. Both enrolments name the destination's own identity, so each is
+/// tried to its end before the other is enrolled.
+fn enrolled_and_answering(world: &World, label: &str, access: &str, target: &str) {
+    let helper = support::kr().display().to_string();
+    let account = own_account();
+    let enrolled = world.run(&[
+        "bridge", "enrol", "--access", access, "--label", label, "--target", target, "--user",
+        &account, "--helper", &helper, "--probe",
+    ]);
+    assert!(
+        enrolled.status.success(),
+        "{label}: {}",
+        String::from_utf8_lossy(&enrolled.stderr)
+    );
+    let answered = world.refreshed(label);
+    assert_eq!(
+        answered["row"]["readiness"]["channel_scoped"], true,
+        "{label}: the channel is scoped while the destination answers: {answered}"
+    );
+}
+
+/// Refreshes `label` as `--json` and as lines of text.
+fn refreshed_both_ways(world: &World, label: &str) -> Told {
+    let document = world.refreshed(label);
+    let said = world.run(&["bridge", "refresh", label]);
+    assert!(
+        said.status.success(),
+        "{label}: {}",
+        String::from_utf8_lossy(&said.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&said.stdout).into_owned();
+    Told {
+        lines: stdout.lines().map(str::to_owned).collect(),
+        everything: format!(
+            "{document}{stdout}{}",
+            String::from_utf8_lossy(&said.stderr)
+        ),
+        document,
+    }
+}
+
+/// Checks that a refresh that could not reach its destination says `expected`, the same words in
+/// `--json` and in the lines a person reads, with no verification and no scoped channel, and that
+/// none of `withheld` is in anything printed.
+fn assert_refresh_says(world: &World, label: &str, expected: &str, withheld: &[&str]) {
+    let told = refreshed_both_ways(world, label);
+    assert!(told.document["verification"].is_null(), "{label}: {told:?}");
+    assert_eq!(
+        told.document["row"]["readiness"]["channel_scoped"], false,
+        "{label}: {:?}",
+        told.document
+    );
+    assert_eq!(
+        told.document["connection"], expected,
+        "{label}: the JSON says what failed"
+    );
+    assert_eq!(told.lines.len(), 2, "{label}: {:?}", told.lines);
+    assert!(
+        told.lines[0].starts_with(&format!("{label} is ")),
+        "{label}: {:?}",
+        told.lines
+    );
+    assert_eq!(
+        told.lines[1].trim_start(),
+        expected,
+        "{label}: the line a person reads says what failed"
+    );
+    for text in withheld {
+        assert!(
+            !told.everything.contains(text),
+            "{label}: the host's sentence {text:?} is in what was printed: {}",
+            told.everything
+        );
+    }
+}
+
+impl std::fmt::Debug for Told {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} / {:?}", self.document, self.lines)
+    }
+}
+
+/// Runs `each` with a switch file `switch` in the tools directory for as long as it runs.
+fn with_the_switch_on(world: &World, switch: &str, label: &str, each: impl FnOnce()) {
+    let path = world.tools.join(switch);
+    std::fs::write(&path, "").expect("the switch");
+    each();
+    std::fs::remove_file(&path).unwrap_or_else(|error| panic!("{label}: the switch: {error}"));
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a helper that ends with an exit code
+/// before the environment answers: a named SSH host and a named container each say the program the
+/// host ran and the code, in `--json` and in the lines a person reads, and the host's own sentence
+/// stays withheld: what the program said on its standard error is in neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_helper_that_exits_before_the_environment_answers_is_told_with_its_program_and_its_code()
+{
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    for (label, access, target, program) in DESTINATIONS {
+        enrolled_and_answering(&world, label, access, target);
+        // The stand-ins end with the codes `ssh` and the runtime end with, and say why on their
+        // standard error.
+        let (code, said) = if program == "ssh" {
+            (255, "Connection refused")
+        } else {
+            (127, "executable file not found")
+        };
+        with_the_switch_on(&world, "unreachable", label, || {
+            assert_refresh_says(
+                &world,
+                label,
+                &format!("{program} ended with exit code {code} before the environment answered"),
+                &[said],
+            );
+        });
+    }
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a helper that a signal ends before the
+/// environment answers: the sentence names the program and the signal, and not the code a shell
+/// would report for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_helper_that_a_signal_ends_is_told_with_its_program_and_the_signal() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    for (label, access, target, program) in DESTINATIONS {
+        enrolled_and_answering(&world, label, access, target);
+        with_the_switch_on(&world, "signalled", label, || {
+            assert_refresh_says(
+                &world,
+                label,
+                &format!("{program} was ended by signal 9 before the environment answered"),
+                &[],
+            );
+        });
+    }
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a helper that says nothing: past the
+/// bound the host puts on a destination's silence, the sentence names the program and the bound,
+/// and says the helper was ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_helper_that_says_nothing_is_told_with_its_program_and_its_bound() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    for (label, access, target, program) in DESTINATIONS {
+        enrolled_and_answering(&world, label, access, target);
+        with_the_switch_on(&world, "stalls", label, || {
+            assert_refresh_says(
+                &world,
+                label,
+                &format!("{program} said nothing for 20 seconds, so it was ended"),
+                &[],
+            );
+        });
+    }
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for an environment that refuses the
+/// bridge: the sentence names the program, the refusal's code and the length of what the
+/// destination said, and the destination's own sentence is in neither output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_environment_that_refuses_the_bridge_is_told_with_its_program_and_the_code() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    let frame = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control)
+        .encode_message(&kr_protocol::identity::BridgeFrame::Refused(
+            kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                DESTINATION_SENTENCE,
+            ),
+        ))
+        .expect("the destination's refusal as a frame");
+    for (label, access, target, program) in DESTINATIONS {
+        enrolled_and_answering(&world, label, access, target);
+        std::fs::write(world.tools.join("refusal"), &frame).expect("the frame the stand-in writes");
+        let length = DESTINATION_SENTENCE.len();
+        assert_refresh_says(
+            &world,
+            label,
+            &format!(
+                "{program} ran, and the environment refused the bridge: PERMISSION_DENIED \
+                 ([message withheld, {length} bytes])"
+            ),
+            &[DESTINATION_SENTENCE],
+        );
+        std::fs::remove_file(world.tools.join("refusal")).expect("the frame is taken away");
+    }
+}
+
+/// KR-REQ-18.11, the part about connection diagnostics, for a refresh that finds nothing wrong:
+/// the sentence for an environment that answers and for one that is stopped is readable too, with
+/// each value that arrived at the host, the name of the user the helper ran as, given as its class
+/// and length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_that_answers_or_finds_the_environment_stopped_says_so_in_words() {
+    let _turn = CONTAINER_RUNTIME_TURN.lock().await;
+    let world = world_whose_destination_answers().await;
+    let environment = world.destination.environment_id().to_string();
+    let account = own_account();
+    enrolled_and_answering(&world, "box", "container", STAND_IN_CONTAINER_NAME);
+    let answered = refreshed_both_ways(&world, "box");
+    let expected = format!(
+        "environment {environment} answered as [name withheld, {} bytes] over its own local channel",
+        account.len()
+    );
+    assert_eq!(answered.document["connection"], expected, "{answered:?}");
+    assert_eq!(answered.lines[1].trim_start(), expected, "{answered:?}");
+
+    std::fs::write(world.tools.join("container-running"), "false").expect("the container stops");
+    let stopped = refreshed_both_ways(&world, "box");
+    let expected = "no bridge was opened, because this environment is not running; refresh with \
+                    --start to start it";
+    assert_eq!(stopped.document["connection"], expected, "{stopped:?}");
+    assert_eq!(stopped.lines[1].trim_start(), expected, "{stopped:?}");
 }
 
 // ---------------------------------------------------------------------------------------------

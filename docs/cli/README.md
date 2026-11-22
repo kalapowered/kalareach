@@ -1859,9 +1859,13 @@ selected only with `--start`.
 
 A refresh of a running environment also opens a bridge to it and reports what answered: the
 environment identity, the user the helper runs as inside it, the protocol version and the frame
-bound. That line is the connection diagnostic, and it says what stopped the bridge when one could
-not be opened: the program that would not start, the environment that answered with another
-identity, or the destination's own refusal.
+bound. That line is the connection diagnostic. When no bridge answers it names the program the host
+ran for the environment (`podman` for a container, `ssh` for an SSH host, `wsl.exe` for a WSL
+distribution) and what happened to it: it could not be started, it ended with an exit code, a signal
+ended it, it said nothing for 20 seconds and was ended, or the environment refused the bridge, in
+which case the line gives the refusal's code. What the operating system or the destination wrote in
+its own words shows only as its class and length, as every message from the host does. `--json`
+carries the same sentence in `connection`.
 
 An SSH host is enrolled with `--access ssh`, and `--probe` asks its helper over ssh which
 environment it is. The same refresh registers it: the helper answers once, over ssh, and the answer
