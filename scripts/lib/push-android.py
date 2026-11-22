@@ -175,15 +175,19 @@ def send(phone: Phone, blind: bool) -> None:
         "the page to say what became of the answer",
         45,
     )
-    # The page says what became of the answer in the words it keeps for the person's own: the
-    # screen is read once they are drawn.
-    seen_within(
-        phone,
-        lambda each: each.startswith("Your answer was recorded") or each.lower() == "no longer waiting",
-        8,
-    )
     phone.shot("sent")
-    print(f"PUSH-SENT {texts(phone)}", flush=True)
+    # The page tells the person what became of the answer in a notice that stays a few seconds: the
+    # screen is read until it holds those words, and the first read that does is what is printed.
+    end = time.monotonic() + 8
+    while True:
+        labels = [each["label"] for each in phone.screen() if each["label"]]
+        if (
+            any(label.startswith("Your answer was recorded") or label.lower() == "no longer waiting" for label in labels)
+            or time.monotonic() >= end
+        ):
+            break
+        time.sleep(0.2)
+    print(f"PUSH-SENT {' | '.join(labels)[:3000]}", flush=True)
 
 
 def observe(phone: Phone) -> None:
