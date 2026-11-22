@@ -8375,6 +8375,12 @@ mod tests {
             "and that the entry and its record stay: {:?}",
             removed.retained
         );
+        assert!(
+            installer
+                .record_path(&params(amp(), InstallScope::User))
+                .exists(),
+            "the record of the entry that stays is kept"
+        );
         assert_held_and_finished(
             &installer,
             &params(amp(), InstallScope::User),
