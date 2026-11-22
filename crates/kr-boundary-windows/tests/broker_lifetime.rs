@@ -1125,7 +1125,11 @@ fn a_program_that_cannot_start_is_a_refusal_when_nothing_is_left_and_not_started
         "{:?}",
         kinds(&life.rows())
     );
-    // With something left on the tree, the reply says the operation did not start.
+    // With something left on the tree, the reply says the operation did not start. The first
+    // invocation's journal is taken away, so that the rows read are this one's.
+    for entry in std::fs::read_dir(setting.scratch.path("journal")).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
     let life = setting.life(&["exit", "0"], 1);
     std::fs::remove_file(setting.scratch.path("kr-launch-stand-in.exe")).unwrap();
     life.trees.leave(vec![Left {
@@ -1638,8 +1642,14 @@ fn a_journal_with_a_damaged_middle_record_keeps_its_tree_blocked() {
             Row::GrantComplete { count: 0 },
         ],
     );
+    // The damage is in the second record, which a valid record follows: the first row is whole, so
+    // the tree's chain is known and the slot can be kept.
     let mut bytes = std::fs::read(&path).unwrap();
-    let middle = bytes.len() / 2;
+    let last =
+        kr_boundary_windows::journal::framing::encode(&Row::GrantComplete { count: 0 }.to_bytes())
+            .unwrap()
+            .len();
+    let middle = bytes.len() - last - 2;
     bytes[middle] ^= 0xff;
     std::fs::write(&path, &bytes).unwrap();
     let broker = Life::open(
