@@ -506,9 +506,12 @@ mod tests {
     #[test]
     fn the_macos_plan_states_every_steps_seconds_and_its_three_parts_take_two_hours_at_most() {
         let steps = steps(Platform::MacOs, &every_group(), "/tmp/evidence", None);
+        // A set-up step that another step names is not cut and states no weight.
+        let is_set_up =
+            |step: &Step| step.setup && steps.iter().any(|s| s.after.contains(&step.id));
         let unweighed: Vec<&str> = steps
             .iter()
-            .filter(|step| step.weight.is_none())
+            .filter(|step| step.weight.is_none() && !is_set_up(step))
             .map(|step| step.id.as_str())
             .collect();
         assert!(unweighed.is_empty(), "no weight: {unweighed:?}");
@@ -520,10 +523,20 @@ mod tests {
                 seconds <= 2 * 3600,
                 "macOS part {number} of 3 is estimated at {seconds} seconds"
             );
-            every.extend(part.into_iter().skip(1).map(|step| step.id));
+            every.extend(
+                part.into_iter()
+                    .skip(1)
+                    .filter(|step| !is_set_up(step))
+                    .map(|step| step.id),
+            );
         }
         // The first step is the build that opens each part, and the others are in one part each.
-        let others: Vec<String> = steps.iter().skip(1).map(|step| step.id.clone()).collect();
+        let others: Vec<String> = steps
+            .iter()
+            .skip(1)
+            .filter(|step| !is_set_up(step))
+            .map(|step| step.id.clone())
+            .collect();
         assert_eq!(every, others);
     }
 
@@ -861,13 +874,16 @@ mod tests {
     }
 
     /// Cuts `plan` into `parts` parts and holds that every part opens with the plan's opening
-    /// builds and that the other steps of the parts are the plan's, each once.
+    /// builds and that the other steps of the parts are the plan's, each once, apart from the
+    /// set-up steps that other steps name: each of those is in a part that holds a step naming it,
+    /// before that step, and in no other part.
     fn holds_every_step_once(plan: &[Step], parts: usize) {
         let opening = plan
             .iter()
             .take_while(|step| step.reading == Reading::Build)
             .count();
         let named = |step: &Step| format!("{} :: {}", step.what, step.line());
+        let is_set_up = |step: &Step| step.setup && plan.iter().any(|s| s.after.contains(&step.id));
         let mut seen = Vec::new();
         for number in 1..=parts {
             let part = part_of(plan.to_vec(), (number, parts));
@@ -878,9 +894,29 @@ mod tests {
                 &plan[..opening],
                 "builds lead part {number}/{parts}"
             );
-            seen.extend(others.iter().map(named));
+            for (at, step) in others.iter().enumerate() {
+                for name in &step.after {
+                    assert!(
+                        others[..at].iter().any(|before| before.id == *name),
+                        "part {number}/{parts} holds `{}` and not `{name}` before it",
+                        step.id
+                    );
+                }
+                if is_set_up(step) {
+                    assert!(
+                        others.iter().any(|later| later.after.contains(&step.id)),
+                        "part {number}/{parts} holds the set-up step `{}` and no step that names it",
+                        step.id
+                    );
+                }
+            }
+            seen.extend(others.iter().filter(|step| !is_set_up(step)).map(named));
         }
-        let mut expected: Vec<String> = plan[opening..].iter().map(named).collect();
+        let mut expected: Vec<String> = plan[opening..]
+            .iter()
+            .filter(|step| !is_set_up(step))
+            .map(named)
+            .collect();
         seen.sort();
         expected.sort();
         assert_eq!(seen, expected, "{parts} parts");
@@ -926,10 +962,16 @@ mod tests {
         );
         assert_eq!(plan[0].reading, Reading::Build);
         assert!(plan[0].command.iter().any(|word| word == "kr-worker"));
-        // The workspace's tests: kr-controller, companion-tauri with kr-worker, and the rest.
-        assert!(plan[1].command.iter().any(|word| word == "kr-controller"));
-        assert!(plan[2].command.iter().any(|word| word == "companion-tauri"));
-        assert!(runs_the_workspace(&plan[3]), "{}", plan[3].line());
+        // The programs that the suites of the three steps start come next, as a set-up step.
+        assert!(plan[1].setup, "{}", plan[1].line());
+        // The workspace's tests: kr-controller, companion-tauri with kr-worker, and the rest, each
+        // naming that set-up step.
+        assert!(plan[2].command.iter().any(|word| word == "kr-controller"));
+        assert!(plan[3].command.iter().any(|word| word == "companion-tauri"));
+        assert!(runs_the_workspace(&plan[4]), "{}", plan[4].line());
+        for step in &plan[2..=4] {
+            assert_eq!(step.after, [plan[1].id.clone()], "{}", step.line());
+        }
         assert_eq!(
             plan.iter().filter(|step| runs_the_workspace(step)).count(),
             1
@@ -1036,7 +1078,10 @@ mod tests {
     #[test]
     fn a_skipped_case_is_left_out_by_the_command_and_recorded_with_its_reason() {
         let steps = steps(Platform::MacOs, &["rust"], "/tmp/e", None);
-        let first = &steps[0];
+        let first = steps
+            .iter()
+            .find(|step| !step.setup)
+            .expect("a step that runs tests");
         assert!(!first.skips.is_empty());
         assert_eq!(
             first

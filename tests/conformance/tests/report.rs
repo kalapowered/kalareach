@@ -4396,6 +4396,114 @@ fn the_platform_plans_run_what_the_landing_workflow_runs_there() {
     assert_eq!(platform_drift(&core_plan()), Ok(()));
 }
 
+/// The macOS package steps stand in for the one step that ran the workspace's tests, which built
+/// every program of every package, and a package's suites start programs of other packages. Each
+/// part that holds a package step holds, before it, a set-up step that builds those programs by the
+/// form the landing workflow's macOS legs use (the whole workspace's features, each program named),
+/// and a part that holds none holds no such build.
+#[test]
+fn each_macos_package_step_has_the_programs_its_suites_start_built_before_it_in_its_part() {
+    let plan = core_plan();
+    let steps = plan.steps(
+        Platform::MacOs,
+        &plan.all_groups(),
+        &Values::evidence("/tmp/e"),
+        None,
+    );
+    let packages: Vec<&Step> = steps
+        .iter()
+        .filter(|step| step.command.iter().any(|word| word == "--no-fail-fast"))
+        .collect();
+    assert_eq!(
+        packages.len(),
+        3,
+        "the macOS plan has three package steps: {:?}",
+        packages.iter().map(|step| &step.id).collect::<Vec<_>>()
+    );
+    let form = "cargo build --locked --workspace --exclude kr-sync-integration --examples";
+    let mut built: BTreeSet<String> = BTreeSet::new();
+    for package in &packages {
+        assert!(
+            !package.after.is_empty(),
+            "the package step `{}` names no set-up step that builds the programs its suites start",
+            package.id
+        );
+        for name in &package.after {
+            let setup = steps
+                .iter()
+                .find(|step| step.id == *name)
+                .expect("a set-up step of the plan");
+            assert!(setup.setup, "`{name}` is a set-up step");
+            assert!(
+                setup.weight.is_none(),
+                "the set-up step `{name}` states no weight"
+            );
+            let line = setup.command.join(" ");
+            assert!(
+                line.starts_with(form),
+                "the set-up step `{name}` builds by `{line}`, not by `{form}`"
+            );
+            assert!(
+                !setup
+                    .command
+                    .iter()
+                    .any(|word| word == "-p" || word == "--features"),
+                "the set-up step `{name}` narrows the packages or the features: {line}"
+            );
+            built.extend(
+                setup
+                    .command
+                    .windows(2)
+                    .filter(|pair| pair[0] == "--bin")
+                    .map(|pair| pair[1].clone()),
+            );
+        }
+    }
+    // Every program the landing workflow's macOS legs build for their suites is built here.
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+    for command in workflow_commands("macos", "cargo build") {
+        let words: Vec<&str> = command.split_whitespace().collect();
+        wanted.extend(
+            words
+                .windows(2)
+                .filter(|pair| pair[0] == "--bin")
+                .map(|pair| pair[1].to_owned()),
+        );
+    }
+    assert!(!wanted.is_empty(), "the macOS legs build programs");
+    assert_eq!(
+        built.difference(&wanted).count() + wanted.difference(&built).count(),
+        0,
+        "the programs the macOS legs build, {wanted:?}, against the set-up steps', {built:?}"
+    );
+    let named: BTreeSet<&str> = packages
+        .iter()
+        .flat_map(|step| step.after.iter().map(String::as_str))
+        .collect();
+    for number in 1..=3 {
+        let part = plan::part_of(steps.clone(), (number, 3));
+        for (at, step) in part.iter().enumerate() {
+            if packages.iter().any(|package| package.id == step.id) {
+                for name in &step.after {
+                    let before = part.iter().position(|other| other.id == *name);
+                    assert!(
+                        before.is_some_and(|place| place < at),
+                        "part {number}/3 holds `{}` and not `{name}` before it",
+                        step.id
+                    );
+                }
+            }
+            if named.contains(step.id.as_str()) {
+                assert!(
+                    part.iter().any(|other| other.after.contains(&step.id)),
+                    "part {number}/3 holds the set-up step `{}` and no step that names it",
+                    step.id
+                );
+            }
+        }
+    }
+}
+
 /// What `scripts/performance.sh` measures, against the plan's performance steps.
 fn performance_drift(plan: &Plan) -> Result<(), String> {
     let script = std::fs::read_to_string(repository().join("scripts").join("performance.sh"))

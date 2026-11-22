@@ -289,7 +289,10 @@ jobs:
     # seconds from that night as its `weight`, so that the report cuts the steps into parts of
     # nearly equal time and not by count. The weights of the three are estimates, because that night
     # ran them as one step; from them the parts take about 106, 116 and 79 minutes (each holds the
-    # worker's build, 239 seconds). The first run of the three parts measures them, and the weights
+    # worker's build, 239 seconds). A part that holds a package step also builds, before it, the
+    # programs its suites start from other packages: a set-up step of the plan, which states no
+    # weight, because the 3,809 seconds of compiling that the weights share out held the same build
+    # in that night's one step. The first run of the three parts measures them, and the weights
     # are refreshed from it. A part that fails does not stop the others.
     strategy:
       fail-fast: false

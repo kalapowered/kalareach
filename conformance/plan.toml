@@ -138,6 +138,39 @@ reading = 'build'
 command = ['cargo', 'build', '--locked', '-p', 'kr-worker', '--bin', 'kr-worker']
 
 [[step]]
+id = 'rust-the-programs-the-macos-package-steps-start'
+group = 'rust'
+what = '''the programs that the suites of the macOS package steps start, built with the workspace's features'''
+platforms = ['macos']
+reading = 'exit'
+setup = true
+command = [
+    'cargo',
+    'build',
+    '--locked',
+    '--workspace',
+    '--exclude',
+    'kr-sync-integration',
+    '--examples',
+    '--bin',
+    'kr-worker',
+    '--bin',
+    'kr-plugin-host',
+    '--bin',
+    'codex-stand-in',
+    '--bin',
+    'codex-stand-in-newer',
+    '--bin',
+    'kr-controller',
+    '--bin',
+    'kr-controller-held',
+    '--bin',
+    'kr-stub-inference',
+    '--bin',
+    'kr-hook',
+]
+
+[[step]]
 id = 'rust-the-workspace-s-tests-kr-controller-on-macos'
 group = 'rust'
 what = '''the workspace's tests of kr-controller, less what the macOS runner cannot host'''
@@ -145,6 +178,7 @@ platforms = ['macos']
 weight = { macos = 6170 }
 weighed = '''an estimate: the libtest times of kr-controller's programs in the scheduled conformance run 44892776113 of 2026-11-21, macOS part 1 of 2, are 4,349 of the 9,097 seconds that its one workspace step's programs took, and the 3,809 seconds of that step that were compiling and doc-tests are shared by those times; refresh it from the first run of the three parts'''
 reading = 'cargo'
+after = ['rust-the-programs-the-macos-package-steps-start']
 command = [
     'cargo',
     'test',
@@ -231,6 +265,7 @@ platforms = ['macos']
 weight = { macos = 3337 }
 weighed = '''an estimate: the libtest times of the programs of companion-tauri and kr-worker in the scheduled conformance run 44892776113 of 2026-11-21, macOS part 1 of 2, are 2,352 of the 9,097 seconds that its one workspace step's programs took, and the 3,809 seconds of that step that were compiling and doc-tests are shared by those times; refresh it from the first run of the three parts'''
 reading = 'cargo'
+after = ['rust-the-programs-the-macos-package-steps-start']
 command = [
     'cargo',
     'test',
@@ -319,6 +354,7 @@ platforms = ['macos']
 weight = { macos = 3399 }
 weighed = '''an estimate: the libtest times of the other programs and the doc-tests in the scheduled conformance run 44892776113 of 2026-11-21, macOS part 1 of 2, are 2,396 of the 9,097 seconds that its one workspace step's programs took, and the 3,809 seconds of that step that were compiling and doc-tests are shared by those times; refresh it from the first run of the three parts'''
 reading = 'cargo'
+after = ['rust-the-programs-the-macos-package-steps-start']
 command = [
     'cargo',
     'test',

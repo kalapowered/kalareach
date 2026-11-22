@@ -118,8 +118,8 @@ its output, and the run exits 1. `--all-terminals` takes no `--group`.
 ### A plan run in parts
 
 `--part <number>/<parts>` runs one part of the platform's plan, for a plan that one job cannot hold.
-Every part runs the build steps that open the plan, which the suites that start a program need, and
-then its share of the other steps, cut in order into parts of nearly equal time when every step that
+Every part runs the build steps that open the plan, and then its share of the other steps, cut in
+order into parts of nearly equal time when every step that
 is cut states its seconds, and into parts of nearly equal count when one does not. A step states
 its seconds in the plan file as `weight`, for each platform it runs on, with `weighed`, the run and
 the date it was measured at, which a later reader refreshes it from; the cut puts the steps in
@@ -133,7 +133,13 @@ that part with nothing to run. The Windows and Linux jobs run their plans as two
 with the workspace's tests alone in part 1 on Linux, and the macOS job runs its plan as three parts,
 cut by time: the workspace's tests are three steps there (kr-controller; companion-tauri with
 kr-worker; the rest), and the weights of those three are estimates until a run of the three parts
-measures them. Each part is one job of its platform's matrix, and a part that fails does not stop
+measures them. A suite starts programs that its own package does not build, and a `cargo test -p`
+builds only the programs of the packages it names, so each of the three steps names a set-up step
+in `after` that builds the programs the suites start, by the form of the landing workflow's macOS
+legs: `cargo build --workspace --examples` with each program named, which gives them the features
+of the whole workspace. A set-up step has no weight and is not cut: it runs, in its own place, in
+each part that holds a step naming it, and a part that holds none does not build the programs.
+Each part is one job of its platform's matrix, and a part that fails does not stop
 the others.
 
 ### The report's own program
