@@ -644,9 +644,12 @@ async fn kr_req_12_07_the_owner_confirms_an_integration_with_its_servers_argumen
         .0
         .as_deref()
         .expect("the owner is shown what the integration does");
+    let own_words =
+        "Starts the Codex app server as the session's backend and points the terminal at it.";
     assert!(
-        statement.starts_with(INTEGRATION_STATEMENT_LABEL),
-        "the host's reading is labelled as the host's: {statement}"
+        statement.starts_with(&format!("{own_words} {INTEGRATION_STATEMENT_LABEL}")),
+        "the integration's own words are the publisher's, and the host's reading follows its \
+         label: {statement}"
     );
     for shown in [
         "\"codex\"",

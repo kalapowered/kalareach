@@ -1278,9 +1278,10 @@ fn check_placement(
 /// Refuses a package whose whole installation statement is longer than an owner is shown whole.
 ///
 /// The statement is composed as the host composes it for a grant that holds every capability it
-/// has a part for: the publisher's words of the bridge, the host's reading of the placement the
-/// table declares and the host's reading of the command integration, or its words that the
-/// package declares none. Each part may meet its own limit and the three together may not.
+/// has a part for: the publisher's words of the bridge and of the command integration, the host's
+/// reading of the placement the table declares and the host's reading of the command integration,
+/// or its words that the package declares none. Each part may meet its own limit and the parts
+/// together may not.
 fn check_statement(
     manifest: &PluginManifest,
     connector: Option<&ConnectorManifest>,
@@ -1296,8 +1297,15 @@ fn check_statement(
         || crate::integration::NO_INTEGRATION_STATEMENT.to_owned(),
         crate::integration::CommandIntegration::statement,
     );
-    let whole = kr_protocol::confirmation::install_statement(
+    let publisher = kr_protocol::confirmation::publisher_words(
         Some(bridge.grant_statement.as_str()),
+        manifest
+            .command_integration
+            .as_ref()
+            .map(|declared| declared.grant_statement.as_str()),
+    );
+    let whole = kr_protocol::confirmation::install_statement(
+        publisher.as_deref(),
         placement.as_deref(),
         Some(integration.as_str()),
     );
@@ -1524,6 +1532,7 @@ fn check_manifest(
                  command_integration.launch",
             ));
         }
+        check_integration_words(integration, report);
         let permits = LaunchPermits::for_package(&manifest.sdk_range, connector);
         for problem in integration.problems(&manifest.match_rules, &permits) {
             report.push(Finding::at(
@@ -1860,6 +1869,37 @@ fn check_answer(
                     ));
                 }
             }
+        }
+    }
+}
+
+/// Checks that a command integration's own words hold neither label the host writes. An owner reads
+/// them as the publisher's, ahead of the host's reading of the integration and of the placement,
+/// and tells the two apart by those labels, so the publisher cannot write them.
+fn check_integration_words(
+    integration: &crate::integration::CommandIntegration,
+    report: &mut Report,
+) {
+    let words = integration.grant_statement.as_str();
+    for (label, reading_of) in [
+        (
+            kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL,
+            "a command integration",
+        ),
+        (
+            kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL,
+            "a placement",
+        ),
+    ] {
+        if words.contains(label) {
+            report.push(Finding::at(
+                FindingCode::IntegrationInvalid,
+                MANIFEST_FILE,
+                format!(
+                    "the command integration's statement holds the words the host writes before \
+                     its own reading of {reading_of}"
+                ),
+            ));
         }
     }
 }

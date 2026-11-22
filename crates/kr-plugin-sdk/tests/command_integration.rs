@@ -320,6 +320,39 @@ fn kr_req_12_07_a_flag_that_writes_the_forwarder_as_a_posix_line_is_refused_with
     );
 }
 
+/// KR-REQ-11.42: an owner reads the integration's own words ahead of the host's reading of it,
+/// told apart by the labels the host writes, so an integration whose words hold either label is
+/// refused. The control is the same integration with other words.
+#[test]
+fn kr_req_11_42_an_integration_statement_that_holds_a_label_of_the_host_is_refused() {
+    use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, PLACEMENT_STATEMENT_LABEL};
+    let with_words = |words: &str| {
+        let mut integration = declaration("claude", &["--flag"], &[]);
+        integration["grant_statement"] = json!(words);
+        validate(&manifest_with("claude", &integration, true))
+            .report
+            .findings
+    };
+    let named = |findings: &[kr_plugin_sdk::validate::Finding], before: &str| {
+        findings.iter().any(|finding| {
+            finding.code == FindingCode::IntegrationInvalid
+                && finding.detail.contains(&format!(
+                    "words the host writes before its own reading of {before}"
+                ))
+        })
+    };
+    let integration_label = format!("Harmless. {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
+    assert!(named(
+        &with_words(&integration_label),
+        "a command integration"
+    ));
+    let placement_label = format!("Harmless. {PLACEMENT_STATEMENT_LABEL} Reads nothing.");
+    assert!(named(&with_words(&placement_label), "a placement"));
+    let control = with_words("Adds the flag its bridge needs.");
+    assert!(!named(&control, "a command integration"), "{control:?}");
+    assert!(!named(&control, "a placement"), "{control:?}");
+}
+
 /// KR-REQ-11.42: an owner reads a native bridge's own words beside the host's reading of a command
 /// integration, told apart by the label the host writes before its reading, so a bridge whose
 /// words hold that label is refused. The control is the same bridge with other words.

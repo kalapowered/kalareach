@@ -399,10 +399,12 @@ pub const NATIVE_BRIDGE_NOTICE: &str = "This package installs a native bridge: c
 
 /// What the host says, in its own words, of a command integration an installation would grant: the
 /// command a person runs in a KalaReach session starts with arguments and environment variables
-/// the package declares. The host's own exact reading of the declaration is in the statement.
+/// the package declares. The publisher's own statement of what the integration does and the host's
+/// own exact reading of the declaration are in the statement, the publisher's first.
 pub const COMMAND_INTEGRATION_NOTICE: &str = "This package changes how a command you run in a \
      KalaReach session starts, with the arguments and environment variables it declares. The \
-     host's own exact reading of what it declares follows in the statement.";
+     publisher's own statement of what the integration does is in the statement before the \
+     host's reading, which follows it.";
 
 /// What the host writes before its own exact reading of a command integration in an installation's
 /// statement. A bridge's own words never hold it (the package check refuses them, and the host
@@ -425,10 +427,14 @@ pub const PLACEMENT_STATEMENT_LABEL: &str = "The host's exact reading of the pla
 pub const PLACEMENT_READING_CAPABILITY: &str = "statement.placement_reading/1";
 
 /// The longest statement an installation's confirmation carries, and so the longest shown whole:
-/// the publisher's statement of a native bridge, the host's label, and the host's reading of a
-/// command integration, each at the longest the package contract allows. The host's reading of a
-/// placement shares the room: a release whose whole statement is longer is refused by the host.
-pub const STATEMENT_CHARS: usize = 5054;
+/// the publisher's statement of a native bridge, the publisher's statement of a command
+/// integration, the host's label, and the host's reading of a command integration, each at the
+/// longest the package contract allows. The host's reading of a placement shares the room: a
+/// release whose whole statement is longer is refused by the host.
+///
+/// A device that holds a smaller figure refuses a longer statement: nothing is confirmed and
+/// nothing is shown wrongly.
+pub const STATEMENT_CHARS: usize = 6055;
 
 /// Whether a link's hello states that its host writes the placement reading.
 #[must_use]
@@ -457,22 +463,35 @@ pub fn install_notices(grant: &[String]) -> Vec<&'static str> {
     notices
 }
 
-/// The statement an installation's confirmation carries, from the words the release's manifest
-/// gives for a native bridge it installs, the host's reading of the placement the package
-/// declares and the host's reading of a command integration it declares, each present only where
-/// the grant holds the capability that applies it.
+/// The publisher's words of an installation's statement: what the release's manifest says of the
+/// native bridge it installs and then what it says of the command integration it declares, each
+/// present only where the grant holds the capability that applies it. Both are the publisher's,
+/// so a device captions them together, ahead of the host's labels.
+#[must_use]
+pub fn publisher_words(bridge: Option<&str>, integration: Option<&str>) -> Option<String> {
+    match (bridge, integration) {
+        (Some(bridge), Some(integration)) => Some(format!("{bridge} {integration}")),
+        (Some(words), None) | (None, Some(words)) => Some(words.to_owned()),
+        (None, None) => None,
+    }
+}
+
+/// The statement an installation's confirmation carries, from the publisher's words (see
+/// [`publisher_words`]), the host's reading of the placement the package declares and the host's
+/// reading of a command integration it declares, each present only where the grant holds the
+/// capability that applies it.
 ///
-/// A bridge's words are the publisher's and come first; the placement reading follows after
+/// The publisher's words come first; the placement reading follows after
 /// [`PLACEMENT_STATEMENT_LABEL`] and the integration's after [`INTEGRATION_STATEMENT_LABEL`], both
 /// the host's, so a reader can tell where the publisher's words end.
 #[must_use]
 pub fn install_statement(
-    bridge: Option<&str>,
+    publisher: Option<&str>,
     placement: Option<&str>,
     integration: Option<&str>,
 ) -> Option<String> {
     let parts: Vec<String> = [
-        bridge.map(str::to_owned),
+        publisher.map(str::to_owned),
         placement.map(|text| format!("{PLACEMENT_STATEMENT_LABEL} {text}")),
         integration.map(|text| format!("{INTEGRATION_STATEMENT_LABEL} {text}")),
     ]
@@ -482,8 +501,9 @@ pub fn install_statement(
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// The parts of an installation's statement: the publisher's words about a native bridge, and the
-/// host's readings of a placement and of a command integration, each where the statement has it.
+/// The parts of an installation's statement: the publisher's words about a native bridge and a
+/// command integration, and the host's readings of a placement and of a command integration, each
+/// where the statement has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatementParts<'a> {
     /// The publisher's own words, before the host's labels.
@@ -1174,6 +1194,32 @@ mod tests {
         assert!(
             NATIVE_BRIDGE_NOTICE.contains("outside"),
             "the host's own sentence says the bridge runs outside the plugin sandbox"
+        );
+    }
+
+    /// The publisher's words are the bridge's and then the integration's own, joined by one space,
+    /// and a device captions them together: both stand before the host's first label.
+    #[test]
+    fn the_publishers_words_are_the_bridges_and_then_the_integrations() {
+        assert_eq!(publisher_words(None, None), None);
+        assert_eq!(
+            publisher_words(Some("Places files."), None).as_deref(),
+            Some("Places files.")
+        );
+        assert_eq!(
+            publisher_words(None, Some("Adds a flag.")).as_deref(),
+            Some("Adds a flag.")
+        );
+        let both = publisher_words(Some("Places files."), Some("Adds a flag.")).expect("words");
+        assert_eq!(both, "Places files. Adds a flag.");
+        let grant = ["native_bridge.install", "command_integration.launch"].map(str::to_owned);
+        let composed = install_statement(Some(&both), None, Some("Runs x.")).expect("a statement");
+        let parts = split_install_statement(&grant, &composed, false);
+        assert_eq!(parts.publisher, Some("Places files. Adds a flag."));
+        assert_eq!(parts.reading, Some("Runs x."));
+        assert!(
+            composed.chars().count() <= STATEMENT_CHARS,
+            "the bound holds a bridge's words and an integration's own words"
         );
     }
 

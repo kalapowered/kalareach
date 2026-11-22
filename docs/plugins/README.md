@@ -337,8 +337,9 @@ declaration, which describes the command and flags as JSON strings in order, var
 `NAME="value"`, arguments to pass to the application server if any, and when the integration
 applies. The host generates this reading from the signed manifest, and it is never shortened. A
 bridge's statement cannot hold the label the reading follows, and the package check refuses one that
-does. Packages whose reading is longer than 4,000 characters will not be accepted. Any
-`grant_statement` included in the command integration itself will not be shown. `plugin.grant` does
+does. Packages whose reading is longer than 4,000 characters will not be accepted. The command
+integration's own `grant_statement` is shown with the bridge's words, as the publisher's, before the
+host's reading; the package check refuses one that holds a label the host writes. `plugin.grant` does
 not add `command_integration.launch` to an installed release: it names `plugin.install`, where the
 owner is shown the reading.
 

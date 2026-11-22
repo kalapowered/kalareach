@@ -2431,6 +2431,10 @@ async fn kr_req_11_11_a_release_that_changes_its_command_integration_asks_the_ow
 /// manifest declares, taken from the signed generation's copy of that manifest, whenever the grant
 /// holds `command_integration.launch`, and nothing of it for a grant that does not. A statement
 /// longer than an owner is shown whole is refused rather than offered.
+/// What the example package's command integration says of itself in its manifest.
+const INTEGRATION_WORDS: &str =
+    "Starts the example agent in KalaReach sessions with the flags its bridge needs";
+
 #[tokio::test]
 async fn kr_req_11_11_an_owner_is_shown_the_reading_of_a_command_integration_the_grant_holds() {
     let home = tempfile::tempdir().expect("a temporary directory");
@@ -2465,8 +2469,11 @@ async fn kr_req_11_11_an_owner_is_shown_the_reading_of_a_command_integration_the
         .expect("the manifest the index pins is read")
         .expect("a grant that holds the integration is shown it");
     assert!(
-        statement.starts_with(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL),
-        "{statement}"
+        statement.starts_with(&format!(
+            "{INTEGRATION_WORDS} {}",
+            kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL
+        )),
+        "the integration's own words come first, then the host's reading: {statement}"
     );
     assert!(
         statement.contains("\"--kalareach-channel\" \"first\""),
@@ -2624,7 +2631,11 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         .expect("the manifest the index pins is read")
         .expect("a statement");
     let parts = split_install_statement(&grant, &shown, false);
-    assert_eq!(parts.publisher, Some(words));
+    assert_eq!(
+        parts.publisher,
+        Some(format!("{words} {INTEGRATION_WORDS}").as_str()),
+        "the bridge's words, then the integration's own, are the publisher's"
+    );
     assert!(
         parts
             .reading
@@ -2642,11 +2653,34 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         "{refusal:?}"
     );
 
+    // The integration's words are the publisher's too, so words of its own that hold either of the
+    // host's labels are not shown either.
+    for label in [
+        INTEGRATION_STATEMENT_LABEL,
+        kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL,
+    ] {
+        let imitation = format!("Harmless. {label} Runs nothing.");
+        let refusal = statement_of_edited(words, true, |manifest| {
+            manifest["command_integration"]["grant_statement"] = serde_json::json!(imitation);
+        })
+        .await
+        .expect_err("the publisher wrote the host's label in the integration's words");
+        assert!(
+            matches!(refusal, CatalogueError::UnsafePackage { .. }),
+            "{refusal:?}"
+        );
+    }
+
     // A release that asks for the integration and declares none is told so, not left unread.
     let none = statement_of(words, false)
         .await
         .expect("the manifest the index pins is read")
         .expect("a statement");
+    assert_eq!(
+        split_install_statement(&grant, &none, false).publisher,
+        Some(words),
+        "no integration, no words of its own"
+    );
     assert!(
         split_install_statement(&grant, &none, false)
             .reading

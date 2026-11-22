@@ -920,14 +920,16 @@ fn the_statement_bound_is_the_sum_of_the_contract_limits() {
     use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, STATEMENT_CHARS};
     assert_eq!(
         STATEMENT_CHARS,
-        kr_plugin_sdk::text::Summary::LIMIT
+        // The bridge's words, the integration's own words, the host's label and the host's reading.
+        2 * kr_plugin_sdk::text::Summary::LIMIT
+            + 1
             + 1
             + INTEGRATION_STATEMENT_LABEL.len()
             + 1
             + kr_plugin_sdk::integration::MAX_STATEMENT_CHARS,
         "today's sum"
     );
-    assert_eq!(STATEMENT_CHARS, 5054);
+    assert_eq!(STATEMENT_CHARS, 6055);
 }
 
 /// The longest reading `statement` can return is the bound: the one label whose reading holds a
@@ -1448,7 +1450,13 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
         let reading = Placement::claude_code()
             .statement(&bridge)
             .expect("a reading");
-        let words = bridge.grant_statement.as_str().to_owned();
+        // The publisher's words are the bridge's and then the integration's own, in the one
+        // statement.
+        let words = format!(
+            "{} {}",
+            bridge.grant_statement.as_str(),
+            integration.grant_statement.as_str()
+        );
         (words, reading, integration.statement())
     };
     let composed = |manifest: &Value| {
@@ -1465,7 +1473,7 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
         "the longest that fits"
     );
     let (words, reading, integration) = parts(&with_filler(exact + 1));
-    assert!(words.chars().count() <= kr_plugin_sdk::text::Summary::LIMIT);
+    assert!(words.chars().count() <= 2 * kr_plugin_sdk::text::Summary::LIMIT + 1);
     assert!(reading.chars().count() <= kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS);
     assert!(integration.chars().count() <= kr_plugin_sdk::integration::MAX_STATEMENT_CHARS);
 
@@ -1501,7 +1509,7 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
         over.report.findings
     );
     assert!(
-        over.report.findings[0].detail.contains("5055 characters"),
+        over.report.findings[0].detail.contains("6056 characters"),
         "{:?}",
         over.report.findings
     );

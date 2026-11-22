@@ -2290,10 +2290,10 @@ impl Catalogue {
     }
 
     /// Returns what an owner is shown of what `grant` would let this release do: the publisher's
-    /// statement of a native bridge it installs, where the grant holds `native_bridge.install`, and
-    /// the host's exact reading of a command integration it declares, where the grant holds
-    /// `command_integration.launch`. Both are taken from the manifest the signed index pins by hash
-    /// for this exact release.
+    /// statement of a native bridge it installs, where the grant holds `native_bridge.install`, the
+    /// publisher's own statement of a command integration it declares and the host's exact reading
+    /// of it, where the grant holds `command_integration.launch`. All are taken from the manifest
+    /// the signed index pins by hash for this exact release.
     ///
     /// The manifest is read from the cache when it is there and fetched by its hash, like the
     /// first thing an installation downloads, when it is not; either way it is held to the length
@@ -2306,9 +2306,9 @@ impl Catalogue {
     /// Returns [`CatalogueError::NotFound`] when the repository has no activated generation or its
     /// index does not carry the release, [`CatalogueError::Integrity`] when the hash is not the
     /// one the index declares or the manifest is not the document it names,
-    /// [`CatalogueError::UnsafePackage`] when the bridge's words hold the label the host writes
-    /// before its reading of an integration or that reading is longer than an owner is shown
-    /// whole, and the refusal a fetch decided when the manifest has to be fetched and cannot be.
+    /// [`CatalogueError::UnsafePackage`] when the bridge's or the integration's words hold a label
+    /// the host writes before its readings or that reading is longer than an owner is shown whole,
+    /// and the refusal a fetch decided when the manifest has to be fetched and cannot be.
     pub async fn grant_statement(
         &mut self,
         id: &RepositoryId,
@@ -2384,29 +2384,41 @@ impl Catalogue {
             .as_ref()
             .filter(|_| grant.holds(PluginCapability::NativeBridgeInstall))
             .map(|bridge| bridge.grant_statement.as_str());
+        // The integration's own words are the publisher's too, and are shown only where the grant
+        // holds the capability that applies the integration.
+        let integration_words = manifest
+            .command_integration
+            .as_ref()
+            .filter(|_| grant.holds(PluginCapability::CommandIntegrationLaunch))
+            .map(|declared| declared.grant_statement.as_str());
         // The host's label tells its reading from the publisher's words, so words that hold it are
         // not shown: the package check refuses them, and a manifest kept from before does too.
-        if bridge.is_some_and(|words| {
-            words.contains(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL)
-        }) {
-            return Err(CatalogueError::UnsafePackage {
-                detail: format!(
-                    "{subject} is not a package this host will install: the bridge's statement \
-                     holds the words the host writes before its own reading of a command \
-                     integration"
-                ),
-            });
-        }
-        // The words the host writes before its reading of a placement are the host's too.
-        if bridge.is_some_and(|words| {
-            words.contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL)
-        }) {
-            return Err(CatalogueError::UnsafePackage {
-                detail: format!(
-                    "{subject} is not a package this host will install: the bridge's statement \
-                     holds the words the host writes before its own reading of a placement"
-                ),
-            });
+        for (words, whose) in [
+            (bridge, "the bridge's"),
+            (integration_words, "the command integration's"),
+        ] {
+            if words.is_some_and(|words| {
+                words.contains(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL)
+            }) {
+                return Err(CatalogueError::UnsafePackage {
+                    detail: format!(
+                        "{subject} is not a package this host will install: {whose} statement \
+                         holds the words the host writes before its own reading of a command \
+                         integration"
+                    ),
+                });
+            }
+            // The words the host writes before its reading of a placement are the host's too.
+            if words.is_some_and(|words| {
+                words.contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL)
+            }) {
+                return Err(CatalogueError::UnsafePackage {
+                    detail: format!(
+                        "{subject} is not a package this host will install: {whose} statement \
+                         holds the words the host writes before its own reading of a placement"
+                    ),
+                });
+            }
         }
         // A package that declares where its bridge is placed gets the host's reading of it, written
         // from the table the verified manifest pins, which is read only after the range test and
@@ -2443,8 +2455,9 @@ impl Catalogue {
                 ),
             });
         }
+        let publisher = kr_protocol::confirmation::publisher_words(bridge, integration_words);
         let statement = kr_protocol::confirmation::install_statement(
-            bridge,
+            publisher.as_deref(),
             placement.as_deref(),
             integration.as_deref(),
         );
