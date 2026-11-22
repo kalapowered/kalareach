@@ -1509,7 +1509,7 @@ export function MobileSession({
           {draft.attachments.length > 0 || pairedFiles.found.length > 0 ? (
             <div className="m-attachments" data-testid="draft-attachments">
               {draft.attachments.map((attachment) => {
-                const row = paired ? (pairedFiles.rows.get(attachment.localId) ?? waitingRow(attachment)) : null
+                const row = paired ? (pairedFiles.rows.get(attachment.localId) ?? waitingRow(attachment, filesShown)) : null
                 if (row !== null) {
                   return (
                     <UploadRowView
@@ -1670,8 +1670,12 @@ function nearestZoom(scale: number): number {
   return nearest
 }
 
-/** What a file shows before this window has asked the application about it: it is being checked. */
-function waitingRow(attachment: DraftAttachment): UploadRow {
+/**
+ * What a file shows before this window has a row for it: it is being checked. A card that is
+ * already sent and has no row is checked until what the device keeps for the session has been read
+ * and shown, and is said to be on the draft only after that.
+ */
+function waitingRow(attachment: DraftAttachment, filesShown: boolean): UploadRow {
   return {
     key: attachment.localId,
     sessionId: null,
@@ -1680,7 +1684,7 @@ function waitingRow(attachment: DraftAttachment): UploadRow {
     phase:
       attachment.upload === 'failed'
         ? { kind: 'cancelled', released: null }
-        : attachment.upload === 'uploaded'
+        : attachment.upload === 'uploaded' && (filesShown || attachment.handle === null)
           ? { kind: 'bound' }
           : { kind: 'checking' },
     handle: attachment.handle,

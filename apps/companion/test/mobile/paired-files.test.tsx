@@ -347,6 +347,60 @@ describe('the draft the application keeps across a restart', () => {
   })
 })
 
+describe('a card the device stored, before the application has said what it holds', () => {
+  it('J3: is checked, with no Cancel and a Remove that only takes it off the composer, while the files cannot be shown', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS })
+    await port.deviceDraftSave({
+      id: null,
+      expectedRevision: null,
+      sessionId: SESSION,
+      applicationInstanceId: null,
+      agentBindingRevision: null,
+      state: 'open',
+      text: '',
+      attachments: [
+        {
+          transfer_id: 't-stored',
+          environment_id: 'e',
+          byte_len: '9',
+          content_digest: 'c'.repeat(64),
+          declared_media_type: 'application/pdf',
+          original_file_name: 'stored.pdf',
+          presented_as_image: false,
+          session_id: null,
+          preview: null,
+          published_at_ms: '1',
+          expires_at_ms: '2',
+          submitted: false
+        }
+      ]
+    })
+    // The application's list cannot be read, so the files of the session are not shown.
+    const listing = vi.spyOn(port, 'uploadsOpen').mockRejectedValue(new Error('not in contact'))
+    const cancel = vi.spyOn(port, 'uploadCancel')
+    const end = vi.spyOn(port, 'draftEnd')
+    render(
+      <AppProvider port={port} uploadPollMs={10}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    const person = userEvent.setup({ applyAccept: false })
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    const row = await screen.findByTestId('m-upload')
+    await waitFor(() => {
+      expect(listing).toHaveBeenCalled()
+    })
+    expect(within(row).getByTestId('upload-line')).toHaveTextContent('Checking with the host')
+    expect(within(row).queryByRole('button', { name: /^Cancel/ })).toBeNull()
+    await person.click(within(row).getByRole('button', { name: 'Remove stored.pdf' }))
+    expect(screen.queryByTestId('m-upload')).toBeNull()
+    expect(cancel).not.toHaveBeenCalled()
+    expect(end).not.toHaveBeenCalled()
+  })
+})
+
 describe('what the picker offers on a paired host', () => {
   it('names whom to ask when the device may not send files, and offers none', async () => {
     const { port, controls } = fakeHost()

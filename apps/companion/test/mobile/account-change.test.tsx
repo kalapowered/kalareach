@@ -5,13 +5,13 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, renderHook, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, renderHook, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ReactNode } from 'react'
 
-import { AppProvider } from '../../src/app/state'
+import { AppProvider, useApp } from '../../src/app/state'
 import { fakeHost } from '../../src/host/fake'
-import type { AttachmentHandle } from '../../src/host/port'
+import type { AttachmentHandle, OpenUpload } from '../../src/host/port'
 import { MobileApp } from '../../src/mobile/MobileApp'
 import { usePairedFiles } from '../../src/mobile/usePairedFiles'
 import type { AccountView } from '../../src/model/account'
@@ -382,5 +382,103 @@ describe('a submission whose commands wait while the account changes', () => {
     expect(controls.promptParams).toHaveLength(0)
     expect(await screen.findByText(SIGN_IN_AGAIN)).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Message this session' })).toHaveValue('read the file')
+  })
+})
+
+describe('a stored card, when the list of uploads cannot be read', () => {
+  const stored = (id: string): DraftAttachment => ({
+    localId: `file-${id}`,
+    transferId: id,
+    name: `${id}.pdf`,
+    byteLen: 10,
+    mediaType: 'application/pdf',
+    presentedAsImage: false,
+    upload: 'uploaded',
+    acceptedUpstream: false,
+    handle: handleOf(id)
+  })
+
+  /** The listed upload of `id`, published. */
+  const listed = (id: string): OpenUpload => ({
+    key: `listed-${id}`,
+    state: 'published',
+    sessionId: SESSION,
+    fileName: `${id}.pdf`,
+    byteLen: 10,
+    acknowledgedChunks: 0,
+    chunks: 0,
+    stage: null,
+    handle: handleOf(id),
+    said: null
+  })
+
+  /** The hook on a composer that holds a stored card of the transfer `id`, whose list cannot be read at first. */
+  function composerWith(id: string) {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS, organisation: true })
+    const listing = vi.spyOn(port, 'uploadsOpen').mockRejectedValue(new Error('not in contact'))
+    const add = vi.spyOn(port, 'draftAddAttachment')
+    const attachments = [stored(id)]
+    const draft = {
+      ...startDraft('composer', { sessionId: SESSION, applicationInstanceId: null, agentBindingRevision: null }, 1),
+      attachments
+    }
+    const changes: ((files: readonly DraftAttachment[]) => readonly DraftAttachment[])[] = []
+    const wrapper = ({ children }: { children: ReactNode }) => <AppProvider port={port}>{children}</AppProvider>
+    const app: { uploads: ReturnType<typeof useApp>['uploads'] | null } = { uploads: null }
+    const { result } = renderHook(
+      () => {
+        app.uploads = useApp().uploads
+        return usePairedFiles({
+          active: true,
+          sessionId: SESSION,
+          draft,
+          nameSession: () => Promise.resolve({ sessionId: SESSION, sessionEpoch: '1' }),
+          changeFiles: (change) => changes.push(change),
+          removed: { current: new Set<string>() }
+        })
+      },
+      { wrapper }
+    )
+    const uploads = app.uploads
+    if (uploads === null) throw new Error('the store was not read')
+    /**
+     * Asks for one more reconciliation and waits for it: the one the hook asked for is in the same
+     * turn order, so when this has settled, that one has too.
+     */
+    const reconcile = () =>
+      act(async () => {
+        await uploads.reconcile(SESSION)
+      })
+    return { listing, add, attachments, changes, uploads, result, reconcile }
+  }
+
+  it('J1: is neither offered nor dropped while the list cannot be read, and is settled by the next list that can be', async () => {
+    const { listing, add, attachments, changes, uploads, reconcile } = composerWith('t-stored')
+    await reconcile()
+    expect(listing).toHaveBeenCalled()
+    expect(uploads.snapshot().has('file-t-stored')).toBe(false)
+    expect(uploads.ready(SESSION)).toBe(false)
+    expect(changes).toHaveLength(0)
+    expect(add).not.toHaveBeenCalled()
+    // A list that can be read and does not hold the card drops it.
+    listing.mockResolvedValue([])
+    await reconcile()
+    expect(uploads.ready(SESSION)).toBe(true)
+    expect(changes).toHaveLength(1)
+    expect(changes[0]?.(attachments)).toEqual([])
+  })
+
+  it('J1: is kept, to be added, by a list that holds it', async () => {
+    const { listing, add, changes, uploads, reconcile } = composerWith('t-stored')
+    await reconcile()
+    expect(uploads.ready(SESSION)).toBe(false)
+    listing.mockResolvedValue([listed('t-stored')])
+    await reconcile()
+    expect(uploads.ready(SESSION)).toBe(true)
+    expect(changes).toHaveLength(0)
+    const row = [...uploads.snapshot().values()].find((each) => each.handle?.transfer_id === 't-stored')
+    expect(row?.phase.kind).toBe('kept')
+    expect(add).not.toHaveBeenCalled()
   })
 })

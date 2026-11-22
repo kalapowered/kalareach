@@ -262,8 +262,8 @@ export class PairedUploads {
   readonly #listeners = new Set<() => void>()
   #cached: ReadonlyMap<string, UploadRow> | null = null
   #timer: ReturnType<typeof setInterval> | null = null
-  /** The cycle of the read that is under way, none when no read is. */
-  #reading: number | null = null
+  /** The read of the application's list that is under way and the cycle it was made in, none when no read is. */
+  #reading: { readonly cycle: number; readonly list: Promise<readonly OpenUpload[] | null> } | null = null
   /** How many times the store was reset: a call that began in an earlier cycle changes nothing. */
   #cycle = 0
   /** The end of the last turn of each session: a turn starts when the one before it has settled. */
@@ -637,7 +637,8 @@ export class PairedUploads {
 
   /**
    * Reads the application's account once, adding the uploads this window did not start. Answers what
-   * the application listed, or null when it could not be read or another read of this cycle is under way.
+   * the application listed, or null when it could not be read: a call that finds a read of this cycle
+   * under way waits for it and answers its list.
    */
   async restore(): Promise<readonly OpenUpload[] | null> {
     const listed = await this.#read()
@@ -702,10 +703,22 @@ export class PairedUploads {
     }, this.#pollMs)
   }
 
-  async #read(): Promise<readonly OpenUpload[] | null> {
+  /**
+   * The one read of the application's list that a cycle makes at a time. A reset starts a new read,
+   * and the reply of the old one changes nothing: it neither makes rows nor ends the new read.
+   */
+  #read(): Promise<readonly OpenUpload[] | null> {
     const cycle = this.#cycle
-    if (this.#reading === cycle) return null
-    this.#reading = cycle
+    if (this.#reading?.cycle === cycle) return this.#reading.list
+    const reading = { cycle, list: this.#readList(cycle) }
+    this.#reading = reading
+    void reading.list.then(() => {
+      if (this.#reading === reading) this.#reading = null
+    })
+    return reading.list
+  }
+
+  async #readList(cycle: number): Promise<readonly OpenUpload[] | null> {
     try {
       const views = await this.#port.uploadsOpen()
       // A read that was asked for before a reset describes rows that are gone: it makes none.
@@ -778,8 +791,6 @@ export class PairedUploads {
     } catch {
       // Not in contact: the rows stay as they were, and the next interval asks again.
       return null
-    } finally {
-      if (this.#reading === cycle) this.#reading = null
     }
   }
 }
