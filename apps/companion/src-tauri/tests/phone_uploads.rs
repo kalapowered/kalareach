@@ -3713,7 +3713,12 @@ async fn kr_req_13_12_a_paused_upload_is_read_while_the_host_is_out_of_reach() {
     .await
     .expect("the upload is paused");
 
-    let read = try_open(companion).expect("the application answers while the host is out of reach");
+    let read = try_open(companion);
+    assert!(
+        read.is_ok(),
+        "the application answers while the host is out of reach: {read:?}"
+    );
+    let read = read.unwrap_or_default();
     assert_eq!(read.len(), 1);
     assert_eq!(read[0]["state"], "paused");
 
