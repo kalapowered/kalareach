@@ -716,11 +716,8 @@ final class LinkTapTests: HarnessTestCase {
                 // A step outside a side that is the pane's own edge lies outside the pane: no tap there.
                 if !room.contains(outside) { continue }
                 let beyond = tap("\(label), one step outside", at: outside, shift: edgeShift, within: Self.pointerTolerance)
-                if edge.box.intersection(edge.view).contains(outside) {
-                    expectOnTheLinksButton(beyond, edge.name)
-                } else {
-                    expectNotOpenedByThePage(beyond, edge.name)
-                }
+                // A tap just outside the area is the page's to refuse, whether or not it lies in the button's padded box.
+                expectNotOpenedByThePage(beyond, edge.name)
             }
         }
         if edge.name == "at-end" {
@@ -752,16 +749,8 @@ final class LinkTapTests: HarnessTestCase {
         return CGRect(x: across.0, y: down.0, width: across.1 - across.0, height: down.1 - down.0)
     }
 
-    /// A tap outside the area that lands on the link's own button: the system's click names the button, the page adds no
-    /// click, and the link opens once and has the look at the click (the tap's own check holds the look and the opening).
-    private func expectOnTheLinksButton(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
-        XCTAssertFalse(result.events.contains { $0.type == "click" && !$0.trusted }, "\(result.label): the page added a click on the link's own button", file: file, line: line)
-        XCTAssertEqual(result.opened.count, 1, "\(result.label): the links that opened: \(result.opened), expected \(name) once", file: file, line: line)
-        XCTAssertTrue(result.opened.allSatisfy { $0.hasSuffix(name) }, "\(result.label): opened \(result.opened), expected only \(name)", file: file, line: line)
-    }
-
     /// A tap outside the area: the page adds no click and lights nothing at the press, and nothing opens unless the platform's own
-    /// adjustment moves the click onto the link's button: then the system's click names that link, which opens once and has the
+    /// adjustment moves the click onto the link's words: then the system's click names that link, which opens once and has the
     /// look at the click. A click on plain text opens nothing here.
     private func expectNotOpenedByThePage(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertFalse(result.events.contains { $0.type == "click" && !$0.trusted }, "\(result.label): the page added a click outside the area", file: file, line: line)
