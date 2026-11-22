@@ -1876,11 +1876,11 @@ mod projection_tests {
     #[test]
     fn a_geometry_that_does_not_fit_the_session_budget_is_refused_before_it_is_allocated() {
         let mut engine = engine();
-        // Inside every one of section 8's three independent limits — 61 columns, 1,002 rows and
-        // 61,122 cells — and outside what both screen buffers and their scrollback may hold. The
+        // Inside every one of section 8's three independent limits — 61 columns, 1,009 rows and
+        // 61,549 cells — and outside what both screen buffers and their scrollback may hold. The
         // two are different refusals and this is the second one.
         let refused = engine
-            .resize(dimensions(61, 1_002))
+            .resize(dimensions(61, 1_009))
             .expect_err("a grid whose state does not fit the session budget");
         assert!(
             matches!(refused, WorkerError::ResourceUnavailable { .. }),
