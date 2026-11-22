@@ -781,8 +781,10 @@ fn documentation_is_no_candidate_as_an_attribute_but_a_literal_in_the_tokens_of_
     // The text of a `doc` attribute, `///` and `//!` among them, is documentation: no candidate. The same
     // tokens in the arguments or the rules of a macro are what the macro makes of them (a runtime string,
     // here), and so are a literal. Nothing else that a `cfg_attr` holds is documentation. A `!` that
-    // follows a keyword (`return !{..}`, `if !{..}`, `while !(..)`) is the operator, and no macro call; a
-    // raw `r#macro_rules` still defines one, and a raw `r#return!` is a call of a macro of that name.
+    // follows a keyword (`return !{..}`, `if !{..}`, `while !(..)`) is the operator, and no macro call.
+    // rustc refuses a raw `r#macro_rules! name {..}`, but the closed check reads its tokens as a
+    // definition's, so no syntax rule applies inside them (line 28 is a candidate); a raw `r#return!(..)`
+    // is a call of a macro of that name.
     assert_eq!(
         found,
         [
