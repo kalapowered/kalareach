@@ -658,6 +658,8 @@ print_confirm-1 | Type yes to {action}:  | Type yes to the action:  | read: the 
 # ---- public words outside remedy.rs and records.rs
 APPLICATION_CONTROL_STARTING | Windows starts application control after the service starts | Windows starts application control after the service starts, and the installation waits for it | rule: said after the Application Identity service starts; the wait's own bound is 300 seconds and no time of the platform is said
 STILL_STARTING | Windows is still starting application control after the restart | Windows is still starting application control after the restart; try again in a few minutes | flow: the broker's answer to every request while its proof of the boundary has not passed
+PER_CLIENT_WORDS | this account already has the most repository operations | this account already has the most repository operations the broker runs at once; wait for one to finish | rule: InvocationCounts::admit found the account's count at the per-account limit
+PER_MACHINE_WORDS | the broker already runs the most repository operations | the broker already runs the most repository operations it allows on this computer; try again when one has finished | rule: InvocationCounts::admit found the computer's total at the per-computer limit
 ADMINISTRATORS_ONLY | this pipe answers hello and status only | this pipe answers hello and status only; ask for a state change or a proof on the administrators' pipe | rule: the persons' pipe serves hello and status only
 USAGE | usage: kr-boundary-setup install|repair --payload DIRECTORY | usage: kr-boundary-setup install|repair --payload DIRECTORY [--person SID]; remove; status | rule: what the setup program prints for a command line that is not one; no machine fact
 system_form | FormatMessageW( | the code in hexadecimal and the system's message for it | read: FormatMessageW's text for the code (an HRESULT that wraps a Windows error is looked up by that error)
@@ -715,6 +717,7 @@ listed | pub const | operation/tables.rs | 3 | names, keys, limits, encodings an
 listed | pub const | policy.rs | 8 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | repository/attributes.rs | 7 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | repository/config.rs | 17 | names, keys, limits, encodings and paths; no sentence for a person
+listed | pub const | limits.rs | 2 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | repository/readers.rs | 8 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/install.rs | 3 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
