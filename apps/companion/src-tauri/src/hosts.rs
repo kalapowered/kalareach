@@ -38,6 +38,36 @@ const FIRST_ATTEMPT_WITHIN: Duration = Duration::from_secs(60);
 /// panic, which is logged: the failure then says so and sends the person to the connection's state,
 /// because the choice may or may not have been made.
 pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Result<Publication> {
+    choose(app, host, false).await
+}
+
+/// Makes `host` the one this application's commands go to when none is in use and none is reached,
+/// and says where that stands once the first attempt to reach it has ended. It is what a computer
+/// does with the first host it pairs with.
+///
+/// Whether a host is in use or reached is read inside the step that makes the choice, under the
+/// choice gate, so two changes of the pairing that ask for the first choice together make one:
+/// the second finds the host in use and does nothing, instead of choosing again and replacing the
+/// connection the first one made.
+///
+/// # Errors
+///
+/// Returns a refusal when a host is in use or reached, and then nothing has changed; otherwise
+/// what [`use_host`] returns.
+pub async fn use_first_host<R: Runtime>(
+    app: &AppHandle<R>,
+    host: PairedHost,
+) -> Result<Publication> {
+    choose(app, host, true).await
+}
+
+/// The choice [`use_host`] and [`use_first_host`] make; `first_only` is whether it is made only
+/// while no host is in use and none is reached.
+async fn choose<R: Runtime>(
+    app: &AppHandle<R>,
+    host: PairedHost,
+    first_only: bool,
+) -> Result<Publication> {
     let state = app.state::<AppState>();
     let device = state.device()?;
     let (first, reached) = tokio::sync::oneshot::channel();
@@ -58,6 +88,12 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
                     // connect to.
                     if device.paired_as(host.host_device_id)? != Some(host.device_id) {
                         return Err(unknown_host());
+                    }
+                    if first_only
+                        && (device.host_in_use().is_some()
+                            || handle.state::<AppState>().connection_state().connected)
+                    {
+                        return Err(CommandError::refused("a host is already in use"));
                     }
                     device.use_host(host.host_device_id)?;
                     Ok(Started {

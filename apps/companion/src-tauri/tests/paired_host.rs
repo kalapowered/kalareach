@@ -72,6 +72,60 @@ async fn connection(companion: &Companion, connected: bool) -> serde_json::Value
     .expect("the connection gets there")
 }
 
+/// KR-REQ-13.12: the first host a computer pairs with is chosen once, however many changes of the
+/// pairing ask for it. The choice the pairing makes of its own accord waits before the gate while a
+/// second change asks for the same choice and makes it; when the first goes on it finds the host in
+/// use and chooses nothing, so the connection the second one made is not replaced by a third.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_changes_of_a_new_pairing_that_ask_for_the_first_choice_make_one_choice() {
+    use companion_tauri::state::testing::ChoicePoint;
+
+    let owner = DeviceKeys::generate().expect("keys");
+    let host = Host::start(&owner).await;
+    let phone = unpaired_phone_controlled(&host, &LinkControl::new());
+    let companion = &phone.companion;
+    let state = companion.app.state::<companion_tauri::AppState>();
+
+    // The choice the pairing makes of its own accord waits before it takes the gate.
+    let mut waiting = state.hold_the_choice_at(ChoicePoint::BeforeGate);
+    pair(&phone, &host, &owner, &[ActionRight::SessionView]).await;
+    waiting.reached().await;
+    let paired = companion
+        .device()
+        .newest_host()
+        .expect("the pairing is listed");
+
+    // Another change of the pairing asks for the same choice. The pairing may have asked for it
+    // again of its own accord, and then this one is refused: either way a host is in use.
+    let _ = companion_tauri::hosts::use_first_host(companion.app.handle(), paired).await;
+    assert!(
+        companion.device().host_in_use().is_some(),
+        "the choice that did not wait was made"
+    );
+    connection(companion, true).await;
+    let chosen = state.contact_owner().stand().choice;
+
+    // The first one goes on, inside the gate, and finds the host in use.
+    let mut inside = state.hold_the_choice_at(ChoicePoint::BeforeStart);
+    waiting.release();
+    inside.reached().await;
+    inside.release();
+    let handle = companion.app.handle().clone();
+    tokio::task::spawn_blocking(move || {
+        handle
+            .state::<companion_tauri::AppState>()
+            .under_the_choice_gate(|| ());
+    })
+    .await
+    .expect("the gate is taken once the first choice is over");
+    assert_eq!(
+        state.contact_owner().stand().choice,
+        chosen,
+        "the choice that went on later made no choice of its own"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-13.08: before this computer has paired with anything every command says there is no
 /// connection; the host it pairs with first becomes the one its commands go to, with the rights its
 /// grant carries and no others; the page's reads are answered by that host; a command the grant
