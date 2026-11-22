@@ -301,10 +301,16 @@ pub fn closing_rows(closing: &Closing) -> Vec<Row> {
     rows
 }
 
-/// The name of an object of the private root as the journal and the reply give it.
+/// The name of an object of the private root as the journal and the reply give it: the root's
+/// path, then the object's name below the root with a backslash between. The root itself has no
+/// name below it, and its own path is the name.
 #[must_use]
-pub fn root_object(_root: &str, below: &str) -> String {
-    below.to_owned()
+pub fn root_object(root: &str, below: &str) -> String {
+    if below.is_empty() {
+        root.to_owned()
+    } else {
+        format!("{root}\\{below}")
+    }
 }
 
 /// What the reply says about the cleanup after the closing rows: the first object that holds the
