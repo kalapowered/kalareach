@@ -3925,18 +3925,20 @@ jobs:
   # more than 8 GiB, the operating system and architecture recorded beside the figure. The
   # macos-demonstrations job's runner is short of that host, so it records the idle processor
   # figure and does not assert it; this job asserts it, with the memory bound, where nothing read
-  # falls short. Only the measurements run here: the tests are the macos job's.
+  # falls short. Only the measurements and the whole-reconnect case run here: the tests are the
+  # macos job's.
   macos-reference:
     name: macos-reference
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15-intel
     # The build alone is about an hour on this runner when its cache is warm. With no cache the
-    # first of its two commands took from 47 to 120 minutes, the longest on two runners of one run,
-    # and the second had run 40 more without ending. Every step has a limit of its own, and the
-    # limits add up to less than this one: the build's 240 minutes, twice the 120, and the other
-    # steps' 114 make 354, and this limit of 355 is under the 360 at which GitHub ends a hosted job.
-    timeout-minutes: 355
+    # first of its first two commands took from 47 to 120 minutes, the longest on two runners of one
+    # run, and the second had run 40 more without ending; the third builds one test program and adds
+    # little. Every step has a limit of its own, and the limits add up to less than this one: the
+    # build's 240 minutes, twice the 120, and the other steps' 118 make 358, and this limit of 359 is
+    # under the 360 at which GitHub ends a hosted job.
+    timeout-minutes: 359
     # The launchd checks and the daemons the workspace's tests, the demonstrations and the
     # measurements start load jobs into the account's own launchd, and stand down with a printed
     # reason, or run detached, in a run that does not ask for it, as a person's own Mac does. This
@@ -3985,13 +3987,15 @@ jobs:
       # Everything the script below builds before it measures, so that the script has as little
       # left to build as it can. Its limit is twice the 120 minutes the first command took with no
       # cache on a slow runner, so that a build with no cache still ends here and is saved below,
-      # where one that is cut leaves the next run as cold as this one.
+      # where one that is cut leaves the next run as cold as this one. The last command builds the
+      # whole-reconnect case, so that its step below has only to run it.
       - name: Build what the measurements run
         id: build
         timeout-minutes: 240
         run: |
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
+          cargo test --locked --release -p kr-controller --test network_reconnect_time --no-run
 
       # The measurements assert on an idle host, so the sampling of the free space ends here and
       # the report after them reads the disk once.
@@ -4012,6 +4016,26 @@ jobs:
         env:
           KR_PERF_SETTLE_LOAD: "2.0"
         run: bash scripts/performance.sh
+
+      # KR-PERF-006's two seconds, asserted: a paired device that comes back to a real daemon has a
+      # painted 120x40 screen within two seconds of dialling. The case asserts them only where
+      # nothing it reads falls short of the reference host, and a debug build always falls short,
+      # so it runs here in the release build made above, on this four-processor host. Where a
+      # shortfall shows, the case records its figure and passes, so the step fails when its output
+      # does not say that the target was asserted: a run that asserted nothing is no pass. The
+      # program is built above and the case takes seconds, so the limit is short.
+      - name: The whole reconnect in a release build
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/reconnect-case.log"
+          cargo test --locked --release -p kr-controller --test network_reconnect_time \
+            -- --nocapture 2>&1 | tee "$log"
+          if ! grep -q -F 'no measured shortfall, so the target is asserted here' "$log"; then
+            echo "::error::the whole-reconnect case named a condition it lacked, so it recorded its figure and asserted nothing"
+            exit 1
+          fi
 
       - name: What the disk has left
         if: ${{ !cancelled() }}
