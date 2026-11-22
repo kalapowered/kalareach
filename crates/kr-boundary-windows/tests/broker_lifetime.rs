@@ -2145,7 +2145,8 @@ fn a_reader_that_ends_and_leaves_a_live_descendant_refuses_the_operation_before_
     };
     let refused = matches!(replies.last(), Some(InvocationReply::Refused { .. }));
     eprintln!(
-        "diagnostic: refused {refused}; {at_the_end}; grew (pid, before, now): {grown:?} {named}"
+        "diagnostic: refused {refused}; replies {replies:?}; rows {:?}; {at_the_end}; grew (pid, before, now): {grown:?} {named}",
+        life.rows()
     );
     if !refused {
         let rows = life.rows();
