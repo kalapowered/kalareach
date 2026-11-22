@@ -345,6 +345,6 @@ impl Run<'_> {
             || facts::not_started("the invocation had nothing to end"),
             |failure| failure.refusal,
         );
-        self.first_cleanup(Failure { refusal })
+        self.first_cleanup(Failure::from(refusal))
     }
 }

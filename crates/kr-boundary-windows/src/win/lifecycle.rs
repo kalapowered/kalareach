@@ -432,17 +432,28 @@ pub(super) struct Run<'a> {
 /// written, which decides between the first cleanup and the ending function.
 pub(super) struct Failure {
     pub(super) refusal: Refusal,
+    /// Whether the service's stop is what ended the phase: the ending then keeps it as its reason.
+    pub(super) stopped: bool,
 }
 
 impl From<Refusal> for Failure {
     fn from(refusal: Refusal) -> Self {
-        Failure { refusal }
+        Failure {
+            refusal,
+            stopped: false,
+        }
     }
 }
 
 fn not_started(failure: impl std::fmt::Display) -> Failure {
+    Failure::from(facts::not_started(&failure.to_string()))
+}
+
+/// A phase that the service's stop ended.
+fn stopping() -> Failure {
     Failure {
-        refusal: facts::not_started(&failure.to_string()),
+        stopped: true,
+        ..not_started("the broker is stopping")
     }
 }
 
@@ -586,7 +597,7 @@ impl Run<'_> {
             Ok(Some(code)) => Err(not_started(format!(
                 "the reader of the project ended with the code {code}"
             ))),
-            Ok(None) if self.env.stop.is_set() => Err(not_started("the broker is stopping")),
+            Ok(None) if self.env.stop.is_set() => Err(stopping()),
             Ok(None) => Err(not_started("the reader of the project did not end in time")),
             Err(unread) => Err(not_started(unread)),
         }
@@ -624,10 +635,8 @@ impl Run<'_> {
                 at("connected");
                 Ok(())
             }
-            Outcome::TimedOut => Err(Failure {
-                refusal: facts::not_connected(),
-            }),
-            Outcome::Stopped => Err(not_started("the broker is stopping")),
+            Outcome::TimedOut => Err(Failure::from(facts::not_connected())),
+            Outcome::Stopped => Err(stopping()),
         }
     }
 
@@ -910,7 +919,14 @@ pub fn run_invocation(
     };
     let finished = match run.phases(connection, request) {
         Ok(ended_by) => run.end(ended_by, None),
-        Err(failure) if run.began => run.end(EndedBy::NotStarted, Some(failure)),
+        Err(failure) if run.began => {
+            let ended_by = if failure.stopped {
+                EndedBy::Stop
+            } else {
+                EndedBy::NotStarted
+            };
+            run.end(ended_by, Some(failure))
+        }
         Err(failure) => run.first_cleanup(failure),
     };
     match finished {

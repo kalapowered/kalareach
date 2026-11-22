@@ -352,7 +352,8 @@ pub fn configuration_of(closing: &Closing) -> ConfigurationState {
 
 /// The reply of an ending. A failure that began it is the refusal when nothing is left; where the
 /// cleanup is unclean or uncertain the client is told `finished`, and an operation that did not
-/// start says so, with no exit code.
+/// start says so, with no exit code. A stop of the service that began the ending is kept as the
+/// reason, whatever phase it came in.
 #[must_use]
 pub fn ending_reply(
     failure: Option<Refusal>,
@@ -366,7 +367,7 @@ pub fn ending_reply(
         Some(refusal) if cleanup == Cleanup::Clean => Ending::Refused(refusal),
         _ => Ending::Finished(InvocationReply::Finished {
             exit: if failed { None } else { exit },
-            ended_by: if failed {
+            ended_by: if failed && ended_by != EndedBy::Stop {
                 EndedBy::NotStarted
             } else {
                 ended_by
