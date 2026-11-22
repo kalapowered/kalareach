@@ -29,6 +29,14 @@ pub const RULE_LOW: &str = "client-low-integrity";
 /// The rule that refuses a connection below identification level.
 pub const RULE_LEVEL: &str = "client-identification-level";
 
+/// The rule that refuses a connection whose caller cannot be identified.
+pub const RULE_IDENTIFY: &str = "client-identify";
+/// The rule that refuses a caller whose process cannot be held, or runs as another account than
+/// the connection's.
+pub const RULE_PROCESS: &str = "client-process";
+/// The rule that refuses an account that is not enrolled.
+pub const RULE_NOT_ENROLLED: &str = "client-not-enrolled";
+
 /// What a person reads when the client runs with administrator rights.
 // text: ELEVATED_WORDS
 pub const ELEVATED_WORDS: &str = "this program runs with administrator rights; run it from an ordinary session, not an elevated one";
@@ -48,6 +56,15 @@ pub const LOW_WORDS: &str =
 // text: LEVEL_WORDS
 pub const LEVEL_WORDS: &str =
     "the broker cannot identify the caller at the level its connection allows";
+
+/// What a person reads when the caller's process does not run as the account that opened the
+/// connection.
+// text: PROCESS_WORDS
+pub const PROCESS_WORDS: &str =
+    "the caller's process does not run as the account that opened the connection";
+/// What a person reads when the account is not enrolled.
+// text: NOT_ENROLLED_WORDS
+pub const NOT_ENROLLED_WORDS: &str = "this account is not enrolled for the repository boundary";
 
 /// What the platform says of a client's token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,4 +111,44 @@ pub fn refuse(facts: &TokenFacts) -> Result<(), Refusal> {
         return refused(RULE_LEVEL, LEVEL_WORDS);
     }
     Ok(())
+}
+
+/// Decides that the process the pipe names runs as the account whose token opened the connection.
+///
+/// # Errors
+///
+/// Refuses with the kind `authentication` when the two accounts differ.
+pub fn same_user(caller: &str, process: &str) -> Result<(), Refusal> {
+    if caller == process {
+        Ok(())
+    } else {
+        Err(Refusal::new(
+            RefusedKind::Authentication,
+            RULE_PROCESS,
+            PROCESS_WORDS,
+        ))
+    }
+}
+
+/// Decides that the account is one of the enrolled persons.
+///
+/// # Errors
+///
+/// Refuses with the kind `authentication` when the account is not in the list.
+pub fn enrolled(user: &str, persons: &[String]) -> Result<(), Refusal> {
+    if persons.iter().any(|person| person == user) {
+        Ok(())
+    } else {
+        Err(Refusal::new(
+            RefusedKind::Authentication,
+            RULE_NOT_ENROLLED,
+            NOT_ENROLLED_WORDS,
+        ))
+    }
+}
+
+/// The refusal for a connection whose caller the broker could not identify, by any step.
+#[must_use]
+pub fn unidentified(rule: &'static str) -> Refusal {
+    Refusal::new(RefusedKind::Authentication, rule, LEVEL_WORDS)
 }

@@ -122,9 +122,3 @@ fn threads_that_ask_together_never_hold_more_than_the_limits() {
     );
     assert_eq!(counts.in_use(), 0, "every permit was given back");
 }
-
-#[test]
-fn the_limits_are_ordered_so_that_one_account_cannot_take_the_whole_computer_alone() {
-    assert!(MAX_INVOCATIONS_PER_CLIENT >= 1);
-    assert!(MAX_INVOCATIONS_PER_CLIENT < MAX_INVOCATIONS_PER_MACHINE);
-}

@@ -18,6 +18,9 @@
 //! | `privilege` | The backup and restore privileges, held by one thread for one privileged action |
 //! | `root` | An invocation's private root: its creation and its removal |
 //! | `journal` | The journal's file: each row written through before the step it protects, and read back after a crash |
+//! | `channel` | An invocation's data pipes: the two named pipes that carry Git's output to the client |
+//! | `client` | The client of an invocation: its process and token, known from the pipe and never from a message |
+//! | `rights` | What a token may do to an object, computed from the object's descriptor: the person's, the broker's own and a sibling's |
 //! | `walk` | The anchored walk: objects reached by identifier from a held directory |
 //! | `pipe` | The broker's local pipe |
 //! | `proof` | The proof that the boundary is in force, and that it was released |
@@ -31,6 +34,8 @@ pub mod acl;
 pub mod applocker;
 pub mod boot;
 pub mod broker;
+pub mod channel;
+pub mod client;
 pub mod ffi;
 pub mod fresh;
 pub mod install;
@@ -41,6 +46,7 @@ pub mod pipe;
 pub mod privilege;
 pub mod proof;
 pub mod registry;
+pub mod rights;
 pub mod root;
 pub mod sd;
 pub mod service;

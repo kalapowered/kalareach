@@ -29,7 +29,7 @@ use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptor
 use windows_sys::Win32::Security::{
     CheckTokenMembership, DACL_SECURITY_INFORMATION, GetTokenInformation,
     PROTECTED_DACL_SECURITY_INFORMATION, RevertToSelf, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES,
-    SetKernelObjectSecurity, TOKEN_QUERY, TokenUser,
+    SetKernelObjectSecurity, TOKEN_DUPLICATE, TOKEN_QUERY, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
@@ -504,13 +504,16 @@ impl Connection {
         self.deadline = deadline;
     }
 
-    /// The process on the other end of a connection a client made to this server, and the account
-    /// and standing of its token.
+    /// The process on the other end of a connection a client made to this server, and a copy of the
+    /// token that the caller's side of the connection carries, read while the caller is impersonated
+    /// and reverted at once. The copy is an impersonation token at the level the caller's open
+    /// allowed; it is the caller's own effective token, and the process's token is another thing.
     ///
     /// # Errors
     ///
-    /// Returns the platform's error when the caller cannot be identified.
-    pub fn identity(&self) -> Result<Identity> {
+    /// Returns the platform's error when the caller cannot be identified: a caller that opened the
+    /// pipe anonymously gives `ERROR_CANT_OPEN_ANONYMOUS`.
+    pub fn caller(&self) -> Result<(u32, Handle)> {
         let mut pid = 0_u32;
         // SAFETY: the pipe is a connected server end.
         if unsafe { GetNamedPipeClientProcessId(self.pipe.raw(), &raw mut pid) } == 0 {
@@ -526,7 +529,14 @@ impl Connection {
         }
         let mut token: HANDLE = null_mut();
         // SAFETY: the thread's own impersonation token is opened as the service itself.
-        let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &raw mut token) };
+        let opened = unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                1,
+                &raw mut token,
+            )
+        };
         let failure = if opened == 0 {
             // text: pipe_identity-3
             Some(last("reading the caller's token"))
@@ -541,7 +551,17 @@ impl Connection {
             return Err(failure);
         }
         // text: pipe_identity-4
-        let token = Handle::new(token, "the caller's token")?;
+        Ok((pid, Handle::new(token, "the caller's token")?))
+    }
+
+    /// The process on the other end of a connection a client made to this server, and the account
+    /// and standing of its token.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the caller cannot be identified.
+    pub fn identity(&self) -> Result<Identity> {
+        let (pid, token) = self.caller()?;
         let administrators = Sid::parse("S-1-5-32-544")?;
         let mut member = 0;
         // SAFETY: the token is an impersonation token and the identifier is valid.
