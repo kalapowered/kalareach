@@ -294,9 +294,10 @@ jobs:
     # ran them as one step; from them the parts take about 106, 116 and 79 minutes (each holds the
     # worker's build, 239 seconds). A part that holds a package step also builds, before it, the
     # programs its suites start from other packages: a set-up step of the plan, which states no
-    # weight, because the 3,809 seconds of compiling that the weights share out held the same build
-    # in that night's one step. The first run of the three parts measures them, and the weights
-    # are refreshed from it. A part that fails does not stop the others.
+    # weight of its own. Its build is not shared with the package steps, which build with their own
+    # feature sets, so each part's estimate counts the shared crates once and its real time runs
+    # above the estimate. The first run of the three parts measures them, and the weights are
+    # refreshed from it. A part that fails does not stop the others.
     strategy:
       fail-fast: false
       matrix:
@@ -465,10 +466,10 @@ jobs:
       # also reads the kernel's log for failed writes to the volume, has 4), so the limits of the
       # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The step's 287
       # minutes and the job's 355 are unchanged by the three parts: the longest part is estimated at
-      # 116 minutes (see the job's note above), which leaves 171 minutes, 2.5 times the estimate, for
-      # a slower runner or an estimate that is short; they are lowered from the first run's measured
-      # times. Part 1 of the two parts took 215 minutes of the step on 21 November, which is what the
-      # three parts replace.
+      # 116 minutes (see the job's note above), which leaves 171 minutes, 1.5 times the estimate (the
+      # whole 287 is 2.5 times it), for a slower runner or an estimate that is short; they are
+      # lowered from the first run's measured times. Part 1 of the two parts took 215 minutes of the
+      # step on 21 November, which is what the three parts replace.
       - name: The conformance report
         timeout-minutes: 287
         env:
