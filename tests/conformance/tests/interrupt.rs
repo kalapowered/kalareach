@@ -33,9 +33,9 @@ typescript = 't'
 const BOUND: Duration = Duration::from_secs(60);
 
 /// Records its pid, then its child's, and waits for the child: the group of a step has two
-/// processes, and the child ignores `INT` because a shell without job control starts it so.
-const GROUP: &str =
-    "printf '%s\\n' \"$$\" >> \"$1\"\nsleep 61 &\nprintf '%s\\n' \"$!\" >> \"$1\"\nwait\n";
+/// processes, and the child ignores `INT` because a shell without job control starts it so. The
+/// leader traps `INT` and `TERM` and writes the name of the one it is sent to `<file>.signals`.
+const GROUP: &str = "trap 'printf \"%s\\n\" INT >> \"$1.signals\"' INT\ntrap 'printf \"%s\\n\" TERM >> \"$1.signals\"' TERM\nprintf '%s\\n' \"$$\" >> \"$1\"\nsleep 61 &\nprintf '%s\\n' \"$!\" >> \"$1\"\nwait\n";
 
 /// [`GROUP`] with both signals ignored by the whole group, so that only the force ends it.
 const IGNORES: &str = "trap '' INT TERM\nprintf '%s\\n' \"$$\" >> \"$1\"\nsleep 61 &\nprintf '%s\\n' \"$!\" >> \"$1\"\nwait\n";
@@ -254,6 +254,9 @@ fn assert_stopped_by(signal: Signal, words: &str, script: (&str, &str)) {
     );
     let left = left_after(&started, Duration::from_secs(10));
     assert!(left.is_empty(), "processes of the step were left: {left:?}");
+    // The group was sent the signal, before the force: its leader wrote the signal's name.
+    let sent = std::fs::read_to_string(place.path().join("pids.txt.signals")).unwrap_or_default();
+    assert_eq!(sent, format!("{words}\n"), "the group was not sent {words}");
     let result = run.result();
     let held = &result["steps"][0];
     let said = format!("stopped by signal {words}");

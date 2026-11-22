@@ -183,7 +183,17 @@ fn supervised(
     deadline: Deadline,
     capture: bool,
 ) -> io::Result<Waited<Output>> {
-    let interrupts = Group::arm()?;
+    supervise(command, deadline, capture, Group::arm()?)
+}
+
+/// [`supervised`] with the `interrupts` it reads and holds, which a unit can give.
+#[cfg(unix)]
+fn supervise(
+    command: &mut Command,
+    deadline: Deadline,
+    capture: bool,
+    interrupts: &Interrupts,
+) -> io::Result<Waited<Output>> {
     // While this guard is held a signal is recorded and sent on to the command's group, and no
     // longer has its default action.
     let _running = Running::begin(interrupts);
@@ -825,27 +835,26 @@ mod tests {
         assert_eq!(asked, "", "a signal was sent to the group");
     }
 
-    /// KR-REQ-29.01, the part about reproducible commands: a signal that reached the report while a
-    /// command ran is sent on to the command's group, and the group is ended: the call says which
-    /// signal it was, and the command's leader is reaped when it returns. Its child waits with
-    /// `sleep` and, as a background command of a shell without job control, ignores `INT`, so it ends
-    /// at the end of the grace, by the force; it is not the leader's to reap, so the case looks for it
-    /// for up to 10 s after the call, as the cases of `tests/execution.rs` do: on Linux a process that
-    /// has ended answers a look until its parent reaps it. The signal is recorded by a thread of the
-    /// case once the processes have started, which stands for the handler that sets it. The case
-    /// allows 30 s for the processes to start, and 30 s from the signal for the call to return.
-    #[test]
-    fn a_signal_that_reached_the_report_is_sent_on_and_the_group_is_ended() {
+    /// Runs a group whose processes record the signal they are sent, with the signal that the flag
+    /// `flag` of the interrupts holds recorded once the group has started, and gives what the
+    /// group recorded. The group's leader traps `INT` and `TERM`; its child waits with `sleep` and,
+    /// as a background command of a shell without job control, ignores `INT`, so it ends at the end
+    /// of the grace, by the force. It is not the leader's to reap, so the case looks for it for up
+    /// to 10 s after the call, as the cases of `tests/execution.rs` do: on Linux a process that has
+    /// ended answers a look until its parent reaps it. The flag is stored by a thread of the case
+    /// once the processes have started, which stands for the handler that sets it. The case allows
+    /// 30 s for the processes to start, and 30 s from the signal for the call to return.
+    fn group_signalled(flag: usize, number: i32) -> String {
         let place = tempfile::tempdir().expect("a directory");
         let pids = place.path().join("pids.txt");
-        let script =
-            "printf '%s\\n' \"$$\" >> \"$1\"; sleep 61 & printf '%s\\n' \"$!\" >> \"$1\"; wait";
+        let signals = place.path().join("signals.txt");
+        let script = "trap 'printf \"%s\\n\" INT >> \"$1\"' INT; trap 'printf \"%s\\n\" TERM >> \"$1\"' TERM; printf '%s\\n' \"$$\" >> \"$2\"; sleep 61 & printf '%s\\n' \"$!\" >> \"$2\"; wait";
         let mut command = Command::new("bash");
         command
             .arg("-c")
             .arg(script)
             .arg("bash")
-            .arg(&pids)
+            .args([&signals, &pids])
             .stdin(Stdio::null());
         Group::prepare(&mut command);
         command.stdout(Stdio::piped());
@@ -856,7 +865,7 @@ mod tests {
             seconds: 600,
             budget: false,
         };
-        let int = usize::try_from(signal_hook::consts::SIGINT).expect("a number");
+        let stored = usize::try_from(number).expect("a number");
         let signalled = std::sync::OnceLock::new();
         let waited = std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -870,7 +879,7 @@ mod tests {
                 {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                interrupts.received[0].store(int, Ordering::SeqCst);
+                interrupts.received[flag].store(stored, Ordering::SeqCst);
                 let _ = signalled.set(Instant::now());
             });
             watch(&mut child, deadline, Child::try_wait, || {
@@ -885,7 +894,7 @@ mod tests {
             "the processes did not start: {recorded:?}"
         );
         match waited.expect("a watched command") {
-            Waited::Interrupted(_, signal) => assert_eq!(usize::try_from(signal), Ok(int)),
+            Waited::Interrupted(_, signal) => assert_eq!(signal, number),
             other => panic!("the command was not interrupted: {other:?}"),
         }
         assert!(
@@ -911,6 +920,56 @@ mod tests {
             left.is_empty(),
             "processes of the group were left: {left:?}"
         );
+        std::fs::read_to_string(&signals).unwrap_or_default()
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: an interrupt that reached the report while
+    /// a command ran is sent on to the command's group, before the force: a process of the group
+    /// writes the name of the signal it was sent, and the file holds `INT` and nothing else.
+    #[test]
+    fn an_interrupt_that_reached_the_report_is_sent_on_to_the_group() {
+        assert_eq!(
+            group_signalled(0, signal_hook::consts::SIGINT),
+            "INT\n",
+            "the group was not sent INT"
+        );
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: the same for the termination request.
+    #[test]
+    fn a_termination_request_that_reached_the_report_is_sent_on_to_the_group() {
+        assert_eq!(
+            group_signalled(1, 15),
+            "TERM\n",
+            "the group was not sent TERM"
+        );
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a signal that reached the report before a
+    /// command is due starts nothing: the call says which signal it was, and the command's script,
+    /// which writes a file, did not run.
+    #[test]
+    fn a_signal_received_before_a_command_is_due_starts_nothing() {
+        let place = tempfile::tempdir().expect("a directory");
+        let started = place.path().join("started.txt");
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg("printf started >> \"$1\"")
+            .arg("bash")
+            .arg(&started)
+            .stdin(Stdio::null());
+        let interrupts = Interrupts::new();
+        interrupts.received[0].store(2, Ordering::SeqCst);
+        let deadline = Deadline {
+            at: Instant::now() + Duration::from_secs(600),
+            seconds: 600,
+            budget: false,
+        };
+        let waited = supervise(&mut command, deadline, false, &interrupts).expect("a call");
+        assert!(matches!(waited, Waited::Interrupted(_, 2)), "{waited:?}");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!started.exists(), "the command was started");
     }
 
     /// KR-REQ-29.01, the part about reproducible commands: the report finds a host that cannot wait
