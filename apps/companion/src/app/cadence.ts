@@ -77,6 +77,7 @@ export function readOnCadence(
     lastStart = Date.now()
     void read(() => {
       owed = false
+      owedSoon = false
     })
       .catch(() => undefined)
       .finally(() => {
