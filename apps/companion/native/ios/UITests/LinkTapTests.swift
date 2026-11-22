@@ -264,12 +264,13 @@ enum LinkTapRules {
         return nil
     }
 
-    /// Whether a walk away from the border has gone past the band: its last two steps lie on two touch rows and have the pointer-down
-    /// and the click both on `far`, the link at that end of the walk.
+    /// Whether a walk away from the border has gone past the band: its last two steps lie on two touch rows and have the click on `far`,
+    /// the link at that end of the walk, and no pointer-down on the other link. A pointer-down on the padded room of a button names no
+    /// link (the room takes no tap, so only a link's words are named), so it does not hold a step back.
     static func pastTheBand(_ steps: [BandStep], far: String) -> Bool {
         let tail = steps.suffix(2)
         guard tail.count == 2, Set(tail.map(\.row)).count == 2 else { return false }
-        return tail.allSatisfy { $0.down == far && $0.click == far }
+        return tail.allSatisfy { ($0.down == nil || $0.down == far) && $0.click == far }
     }
 
     /// The touch rows at which the pointer-down and the click named different links, in the steps of both walks.
@@ -1191,9 +1192,9 @@ final class LinkTapTests: HarnessTestCase {
 
     /// Two links on lines one above the other: a sweep of points between their lines, a halving search of the place where the click's
     /// link changes, then a walk in quarter points away from it on both sides. At every tap the light and the opening are the same
-    /// link (`tap` holds it). The walk goes on until two steps past the band agree, and the band is measured in the simulator's touch
-    /// rows (a third of a point), the grid that every touch lands on: a width counted from requested steps would claim more than the
-    /// rows show.
+    /// link (`tap` holds it). The walk goes on until two steps on two touch rows past the band have the click on the link at that end and
+    /// no pointer-down on the other, and the band is measured in the simulator's touch rows (a third of a point), the grid that every
+    /// touch lands on: a width counted from requested steps would claim more than the rows show.
     private func walkBetweenStackedLinks(named: String) {
         var upper = scroll(to: "upper", attempts: 40)
         var shift = offset(of: upper)
@@ -1249,7 +1250,7 @@ final class LinkTapTests: HarnessTestCase {
         }
         let border = (low + high) / 2
         // The walk: quarter points away from the border, down toward the lower link and then up toward the upper link, each side until two
-        // steps on two touch rows past the band have the pointer-down and the click on the link at that end. A side that does not get there
+        // steps on two touch rows past the band have the click on the link at that end and no pointer-down on the other link. A side that does not get there
         // in the most steps fails; so does a band that is not narrower than two touch rows.
         var walk: [String] = []
         var walkOther = 0
