@@ -352,9 +352,9 @@ async fn query_helper_identity(
 }
 
 /// What a helper that did not give its environment is told as. A helper that could not be
-/// started, whose stream failed, that said nothing for long enough or that could not be ended
-/// after it answered is a program outside `kr` that failed; one that answered wrongly is the
-/// person's to correct. Nothing the launch or the destination said is repeated.
+/// started, whose stream failed, that said nothing for long enough or that could not be ended,
+/// whether before it answered or after, is a program outside `kr` that failed; one that answered
+/// wrongly is the person's to correct. Nothing the launch or the destination said is repeated.
 fn helper_failure(refusal: &Refusal) -> CliError {
     match refusal {
         Refusal::NotStarted { .. } => CliError::Other(Shown::said(
@@ -369,7 +369,13 @@ fn helper_failure(refusal: &Refusal) -> CliError {
             "the destination did not say which environment it is (the helper said nothing for \
              long enough that it was given up on); pass --environment-id <uuid> instead",
         )),
-        Refusal::Unkillable { .. } => CliError::Other(Shown::said(
+        Refusal::Unkillable {
+            answered: false, ..
+        } => CliError::Other(Shown::said(
+            "the destination did not say which environment it is (the helper did not answer and \
+             could not be ended); pass --environment-id <uuid> instead",
+        )),
+        Refusal::Unkillable { answered: true, .. } => CliError::Other(Shown::said(
             "the destination did not say which environment it is (the helper answered and could \
              not be ended); pass --environment-id <uuid> instead",
         )),
@@ -675,6 +681,7 @@ mod tests {
                 program: "podman".to_owned(),
                 pid: None,
                 detail: "a-value".to_owned(),
+                answered: false,
             },
         ] {
             let told = helper_failure(&outside);
@@ -703,6 +710,33 @@ mod tests {
             ControllerError::InvalidArgument("a target".to_owned()),
         );
         assert_eq!(asked.exit_code(), 2, "{asked}");
+    }
+
+    /// KR-REQ-18.11: a helper that could not be ended is told as one that answered or as one that
+    /// did not, so a person learns from the sentence whether the destination spoke at all.
+    #[test]
+    fn a_helper_that_could_not_be_ended_is_told_as_one_that_answered_or_one_that_did_not() {
+        for (answered, said) in [
+            (
+                false,
+                "the destination did not say which environment it is (the helper did not answer \
+                 and could not be ended); pass --environment-id <uuid> instead",
+            ),
+            (
+                true,
+                "the destination did not say which environment it is (the helper answered and \
+                 could not be ended); pass --environment-id <uuid> instead",
+            ),
+        ] {
+            let told = helper_failure(&Refusal::Unkillable {
+                program: "podman".to_owned(),
+                pid: Some(4242),
+                detail: "a-value".to_owned(),
+                answered,
+            });
+            assert_eq!(told.exit_code(), 1, "{told}");
+            assert_eq!(told.to_string(), said, "answered: {answered}");
+        }
     }
 
     /// A runtime that answers with success and something that is not an identifier has failed, and

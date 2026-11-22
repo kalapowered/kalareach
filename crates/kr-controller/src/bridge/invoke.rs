@@ -209,6 +209,10 @@ pub enum Refusal {
         pid: Option<u32>,
         /// What happened when it was killed.
         detail: String,
+        /// Whether the destination had acknowledged the opening when this host tried to end the
+        /// helper. A helper that never answered and one that did are told apart by it, and it is
+        /// not part of the sentence this refusal displays.
+        answered: bool,
     },
 }
 
@@ -303,6 +307,7 @@ impl core::fmt::Display for Refusal {
                 program,
                 pid,
                 detail,
+                answered: _,
             } => match pid {
                 Some(pid) => write!(
                     formatter,
@@ -592,11 +597,12 @@ pub async fn discover(
     drop(stdout);
     // Discovery carries no request, so the helper is ended as soon as it has answered, and waited
     // for here so the runtime is not left to collect it after this function has returned.
-    end(child, &command.program, KILL_LIMIT).await?;
+    end(child, &command.program, KILL_LIMIT, true).await?;
     Ok(acknowledgement)
 }
 
-/// Kills a helper this host started, and waits no longer than `limit` for it to go.
+/// Kills a helper this host started, and waits no longer than `limit` for it to go. `answered` is
+/// whether the destination had acknowledged the opening, which an [`Refusal::Unkillable`] says.
 ///
 /// Section 7's supervision is the rule: what this host ended it may report as ended, and what it
 /// could not end it names rather than claims. Past the bound the helper's handle is dropped, and
@@ -608,6 +614,7 @@ async fn end(
     mut child: tokio::process::Child,
     program: &str,
     limit: std::time::Duration,
+    answered: bool,
 ) -> Result<(), Refusal> {
     let pid = child.id();
     ended_within(child.kill(), limit)
@@ -616,6 +623,7 @@ async fn end(
             program: program.to_owned(),
             pid,
             detail,
+            answered,
         })
 }
 
@@ -663,10 +671,15 @@ impl HelperEnd {
 /// # Errors
 ///
 /// Returns [`Refusal::Unkillable`] when a helper that outlived the bound could not be ended.
-async fn settle(mut child: tokio::process::Child, program: &str) -> Result<HelperEnd, Refusal> {
+/// `answered` is as for [`end`].
+async fn settle(
+    mut child: tokio::process::Child,
+    program: &str,
+    answered: bool,
+) -> Result<HelperEnd, Refusal> {
     match tokio::time::timeout(END_STATUS_LIMIT, child.wait()).await {
         Ok(Ok(status)) => Ok(HelperEnd::of(status)),
-        Ok(Err(_)) | Err(_) => end(child, program, KILL_LIMIT)
+        Ok(Err(_)) | Err(_) => end(child, program, KILL_LIMIT, answered)
             .await
             .map(|()| HelperEnd::Unaccounted),
     }
@@ -806,7 +819,7 @@ async fn acknowledge_within(
         // before it has said anything. How it ended is read, so that the diagnostic can say.
         Err(Refusal::Stream { detail, .. }) => {
             drop(stdin);
-            let helper = settle(child, program).await?;
+            let helper = settle(child, program, false).await?;
             return Err(Refusal::Stream {
                 detail,
                 helper: Some(helper),
@@ -816,7 +829,7 @@ async fn acknowledge_within(
         // that says it was ended is one of a helper that is gone, or one that could not be ended.
         Err(Refusal::Silent { waited }) => {
             drop(stdin);
-            end(child, program, KILL_LIMIT).await?;
+            end(child, program, KILL_LIMIT, false).await?;
             return Err(Refusal::Silent { waited });
         }
         Err(other) => return Err(other),
@@ -930,7 +943,7 @@ impl Invocation {
         match refusal {
             Refusal::Silent { waited } => {
                 drop(self.stdin);
-                match end(self.child, &self.program, KILL_LIMIT).await {
+                match end(self.child, &self.program, KILL_LIMIT, true).await {
                     Ok(()) => Refusal::Silent { waited },
                     Err(unended) => unended,
                 }
@@ -940,7 +953,7 @@ impl Invocation {
                 helper: None,
             } => {
                 drop(self.stdin);
-                match settle(self.child, &self.program).await {
+                match settle(self.child, &self.program, true).await {
                     Ok(helper) => Refusal::Stream {
                         detail,
                         helper: Some(helper),
@@ -1018,7 +1031,7 @@ impl Invocation {
             // caller asked for one exchange, and it is over. One that will not end at the kill
             // either is named and let go rather than waited for.
             Err(_elapsed) => {
-                end(self.child, &self.program, kill_limit).await?;
+                end(self.child, &self.program, kill_limit, true).await?;
                 Err(Refusal::Silent { waited: silence })
             }
         }
@@ -1536,7 +1549,7 @@ impl BridgeStream {
                 helper: None,
             }),
             Err(_elapsed) => {
-                end(self.child, &self.program, kill_limit).await?;
+                end(self.child, &self.program, kill_limit, true).await?;
                 Err(Refusal::Silent { waited: silence })
             }
         }
@@ -2257,7 +2270,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .expect("sleep starts");
-        end(child, "/bin/sleep", KILL_LIMIT)
+        end(child, "/bin/sleep", KILL_LIMIT, false)
             .await
             .expect("a helper that goes at the kill is ended, and nothing is reported");
     }
@@ -2363,6 +2376,7 @@ mod tests {
                 program: "wsl.exe".to_owned(),
                 pid: Some(4242),
                 detail: "it had not gone 5 seconds after it was killed".to_owned(),
+                answered: true,
             },
         ];
         let mut messages: Vec<String> = refusals.iter().map(ToString::to_string).collect();
@@ -2415,6 +2429,7 @@ mod tests {
             program: "wsl.exe".to_owned(),
             pid: Some(4242),
             detail: "it had not gone 5 seconds after it was killed".to_owned(),
+            answered: true,
         }
         .into();
         assert!(

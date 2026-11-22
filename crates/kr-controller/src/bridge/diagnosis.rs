@@ -477,6 +477,7 @@ mod tests {
                     program: "podman".to_owned(),
                     pid: Some(4242),
                     detail: ARRIVED.to_owned(),
+                    answered: false,
                 },
                 format!(
                     "podman (process 4242) could not be ended: [message withheld, {} bytes]; it \
@@ -489,6 +490,7 @@ mod tests {
                     program: "podman".to_owned(),
                     pid: None,
                     detail: ARRIVED.to_owned(),
+                    answered: true,
                 },
                 format!(
                     "podman could not be ended: [message withheld, {} bytes]; it may still be \
