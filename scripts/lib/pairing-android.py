@@ -1232,6 +1232,24 @@ def host_in_use(phone: Phone) -> str | None:
     return nearest["label"].split()[1]
 
 
+def press_clear_of_the_bar(phone: Phone, label: str, timeout: float = 60) -> None:
+    """Presses the button named `label` once the page shows all of it above the tab bar. A row the
+    page has scrolled under the bar is still reported, with a box the bar covers, and a tap at the
+    centre of that box lands on one of the bar's tabs: the page is scrolled until the button is clear."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        nodes = phone.screen()
+        bar = next((each for each in nodes if each["class"].endswith("NavigationView")), None)
+        button = next((each for each in nodes if each["label"].lower() == label.lower()), None)
+        if button is not None and (bar is None or button["box"][3] <= bar["box"][1]):
+            phone.tap(button)
+            return
+        if button is not None:
+            phone.run("shell", "input", "swipe", "540", "1600", "540", "1000", "300")
+        time.sleep(0.4)
+    phone.give_up(f"timed out waiting for the {label} button to show clear of the tab bar")
+
+
 def leave_session(phone: Phone) -> None:
     """Leaves the open session by the system's back, which leaves it as the bar's control does."""
     hide_keyboard(phone)
@@ -1381,7 +1399,7 @@ def sessions(adb: str, serial: str, directory: Path, shots: Path, port: str) -> 
     # The second host is chosen, and its session is listed in place of the first host's.
     open_tab(phone, "Hosts")
     phone.wait(lambda each: each == "Use this host", "the second host listed to be used", 60)
-    phone.press("Use this host")
+    press_clear_of_the_bar(phone, "Use this host")
     phone.wait_screen(lambda nodes: host_in_use(phone) == second, "the second host to be in use", 60)
     phone.shot("hosts-second-in-use")
     ask_about(directory, "chosen", "2")
@@ -1410,8 +1428,9 @@ def sessions(adb: str, serial: str, directory: Path, shots: Path, port: str) -> 
     # The first host is chosen again: its two sessions return, and choosing sent nothing.
     open_tab(phone, "Hosts")
     phone.wait(lambda each: each == "Use this host", "the first host listed to be used", 60)
-    phone.press("Use this host")
+    press_clear_of_the_bar(phone, "Use this host")
     phone.wait_screen(lambda nodes: host_in_use(phone) == first, "the first host to be in use", 60)
+    phone.shot("hosts-first-in-use-again")
     ask_about(directory, "chosen", "1")
     chosen = read(directory, "chosen-1.txt")
     if re.fullmatch(r"host=1 h1=[1-9][0-9]* h2=[0-9]+", chosen) is None:
