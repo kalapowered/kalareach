@@ -4211,6 +4211,57 @@ async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU3): an upload belongs to the desk from its admission. A send whose caller is
+/// dropped while the copy of the content is kept still has its upload started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_dropped_send_still_starts_the_upload_it_admitted() {
+    use companion_tauri::open_transfers::OpenState;
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let who = paired.who();
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let after_copy = desk.hold_after_copy_for_test();
+    let after = testing::hold_at(key, Point::AfterCopy);
+    // The start is counted and never held.
+    let started = testing::hold_at(key, Point::Started);
+    started.release();
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    after.until_passed(1).await;
+    sending.abort();
+    assert!(
+        sending
+            .await
+            .expect_err("the call was dropped")
+            .is_cancelled(),
+        "the caller is gone"
+    );
+    after_copy.add_permits(1);
+    tokio::time::timeout(WATCHDOG, desk.sends_idle())
+        .await
+        .expect("the desk's task of the send ends");
+    assert_eq!(
+        started.passed(),
+        1,
+        "the desk started the upload of the dropped send"
+    );
+    until("the upload is published", || {
+        desk.open(&who)
+            .iter()
+            .any(|view| view.key == key.to_string() && view.state == OpenState::Published)
+    })
+    .await;
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (R3k): a send on a connection that a newer pairing has passed is refused, and the
 /// upload it admitted ends in the section that refused it: no upload is held and no copy is left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -745,6 +745,21 @@ impl Drop for Counted {
     }
 }
 
+#[cfg(feature = "testing")]
+impl Work {
+    async fn idle(&self) {
+        loop {
+            let over = self.over.notified();
+            tokio::pin!(over);
+            over.as_mut().enable();
+            if self.running.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            over.await;
+        }
+    }
+}
+
 impl Work {
     fn spawn(self: &Arc<Self>, task: impl std::future::Future<Output = ()> + Send + 'static) {
         self.running.fetch_add(1, Ordering::AcqRel);
@@ -1079,6 +1094,9 @@ pub struct Desk {
     root: Mutex<Option<PathBuf>>,
     /// The tasks the desk started for itself and has not seen end.
     work: Arc<Work>,
+    /// The tasks that keep the copy of an admitted upload and start it, counted apart from `work`:
+    /// a send that a suite holds before its start is not a task that the other cases wait for.
+    sends: Arc<Work>,
     registry: Mutex<Registry>,
     /// What a restart or a failure found of entries it could not resume.
     verdicts: Mutex<HashMap<Uuid, Verdict>>,
@@ -1247,8 +1265,8 @@ impl Desk {
 
     /// Sends one file to the paired host and answers with the verified handle.
     ///
-    /// The upload belongs to the desk, not to this call: dropping the call leaves it running, and a
-    /// connection that ends pauses it until the host is reached again.
+    /// The upload belongs to the desk, not to this call: dropping the call leaves it running, from
+    /// its admission on, and a connection that ends pauses it until the host is reached again.
     ///
     /// # Errors
     ///
@@ -1302,7 +1320,37 @@ impl Desk {
             .or_default()
             .observe(Connection::of(&paired));
         locked(&self.registry).admit(&store, &live, &paired.who())?;
-        if let Keeping::Copy(bytes) = request.keeping {
+        // From its admission the upload is the desk's: its copy and its start are a task of the
+        // desk's own, so that a caller that is dropped meanwhile leaves the upload started and not
+        // admitted with no sender. The caller waits for the task's answer.
+        let (told, answer) = tokio::sync::oneshot::channel();
+        {
+            let (desk, live) = (Arc::clone(self), Arc::clone(&live));
+            self.sends.spawn(async move {
+                let answered = desk
+                    .keep_and_start(&store, &live, request.keeping, &paired)
+                    .await;
+                let _ = told.send(answered);
+            });
+        }
+        answer
+            .await
+            .map_err(|_| CommandError::local_failure("the upload ended without an outcome"))??;
+        Self::outcome_of(&live).await
+    }
+
+    /// Keeps the copy of an admitted upload's content when the request asks for one, and starts the
+    /// upload. It runs as a task of the desk's, so that dropping the call of [`Desk::send`] leaves
+    /// the upload to the desk.
+    async fn keep_and_start(
+        self: &Arc<Self>,
+        store: &Store,
+        live: &Arc<Live>,
+        keeping: Keeping,
+        paired: &Paired,
+    ) -> Result<()> {
+        let key = live.key;
+        if let Keeping::Copy(bytes) = keeping {
             let copied = store.clone();
             let written =
                 tauri::async_runtime::spawn_blocking(move || copied.write_copy(key, &bytes))
@@ -1321,11 +1369,11 @@ impl Desk {
                 // again, and then neither the upload nor the copy is this send's to remove.
                 {
                     let mut registry = locked(&self.registry);
-                    registry.remove_copy_of(&store, &live);
+                    registry.remove_copy_of(store, live);
                     if registry
                         .held
                         .get(&key)
-                        .is_some_and(|held| Arc::ptr_eq(held, &live))
+                        .is_some_and(|held| Arc::ptr_eq(held, live))
                         && *locked(&live.phase) == Phase::Admitted
                     {
                         registry.held.remove(&key);
@@ -1352,19 +1400,20 @@ impl Desk {
             let _ = locked(&self.sessions)
                 .entry((paired.environment_id, paired.device_id))
                 .or_default()
-                .observe(Connection::of(&paired));
-            let started = self.start_under(&mut registry, &live, Connection::of(&paired), false);
+                .observe(Connection::of(paired));
+            let started = self.start_under(&mut registry, live, Connection::of(paired), false);
             // A refused send leaves the copy that is another upload's: a cleanup may have ended
             // this upload and let the key be used again.
             if !started {
-                registry.remove_copy_of(&store, &live);
+                registry.remove_copy_of(store, live);
             }
             started
         };
-        if !started {
-            return Err(CommandError::refused(CANCELLED));
+        if started {
+            Ok(())
+        } else {
+            Err(CommandError::refused(CANCELLED))
         }
-        Self::outcome_of(&live).await
     }
 
     /// Waits for the upload's outcome.
@@ -2801,15 +2850,12 @@ impl Desk {
     /// Resolves once none of the tasks the desk started for itself is running, so that a suite reads
     /// what they left only when they are over.
     pub async fn idle(&self) {
-        loop {
-            let over = self.work.over.notified();
-            tokio::pin!(over);
-            over.as_mut().enable();
-            if self.work.running.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            over.await;
-        }
+        self.work.idle().await;
+    }
+
+    /// Resolves once no send is between its admission and its start or its refusal.
+    pub async fn sends_idle(&self) {
+        self.sends.idle().await;
     }
 
     /// Holds every send at the top of `send`, before it is admitted, until the returned gate is
