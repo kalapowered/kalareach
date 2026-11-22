@@ -6,7 +6,7 @@
 
 use kr_boundary_windows::filekey::FileKey;
 use kr_boundary_windows::frame::invocation::{
-    Cleanup, EndedBy, InvocationReply, LeftoverClass as ReplyClass, RefusedKind,
+    Cleanup, ConfigurationState, EndedBy, InvocationReply, LeftoverClass as ReplyClass, RefusedKind,
 };
 use kr_boundary_windows::journal::replay::{Standing, Tracker};
 use kr_boundary_windows::journal::rows::{
@@ -14,7 +14,7 @@ use kr_boundary_windows::journal::rows::{
 };
 use kr_boundary_windows::lifecycle::{
     self, Closing, Ending, Evidence, Left, Session, Uncertainty, cleanup_of, closing_rows,
-    ending_reply,
+    configuration_of, ending_reply,
 };
 
 const BOOT: &str = "11111111-1111-1111-1111-111111111111";
@@ -244,7 +244,14 @@ fn a_leftover_of_the_private_root_comes_before_the_end_and_frees_the_slot() {
     assert_eq!(tracker.standing(), Standing::Finished);
     assert!(!tracker.holds_the_slot());
     assert_eq!(tracker.leftovers().len(), 1);
-    assert_eq!(cleanup_of(&closing), Cleanup::Clean);
+    // The slot is free, and the reply still says what is left and where.
+    assert_eq!(
+        cleanup_of(&closing),
+        Cleanup::Failed {
+            object: r"run\x\file.lock".to_owned(),
+            class: ReplyClass::Root,
+        }
+    );
 }
 
 #[test]
@@ -364,6 +371,49 @@ fn a_changed_repository_is_journalled_as_a_snapshot_before_the_leftover_that_nam
 }
 
 #[test]
+fn a_changed_repository_reaches_the_final_reply_as_a_changed_configuration() {
+    let changed = Closing {
+        repository: Some((
+            snapshot(1, SnapshotKind::Changed),
+            left(r"C:\work\tree\.git\hooks\pre-commit"),
+        )),
+        ..closing()
+    };
+    let configuration = configuration_of(&changed);
+    assert_eq!(
+        configuration,
+        ConfigurationState::Changed {
+            name: r"C:\work\tree\.git\hooks\pre-commit".to_owned()
+        }
+    );
+    match ending_reply(
+        None,
+        EndedBy::Exit,
+        Some(0),
+        cleanup_of(&changed),
+        configuration.clone(),
+    ) {
+        Ending::Finished(InvocationReply::Finished {
+            configuration: said,
+            cleanup,
+            ..
+        }) => {
+            assert_eq!(said, configuration);
+            assert!(matches!(
+                cleanup,
+                Cleanup::Failed {
+                    class: ReplyClass::Repository,
+                    ..
+                }
+            ));
+        }
+        other => panic!("{other:?}"),
+    }
+    // A configuration that is the same stays the same.
+    assert_eq!(configuration_of(&closing()), ConfigurationState::Same);
+}
+
+#[test]
 fn every_refusal_of_the_lifecycle_has_its_kind_and_a_printable_text_within_the_frame() {
     let refusals = [
         (lifecycle::busy(), RefusedKind::Busy),
@@ -403,7 +453,13 @@ fn an_operation_that_did_not_start_is_a_refusal_when_nothing_is_left_and_says_so
 {
     let refusal = lifecycle::not_started("the logon was refused");
     assert_eq!(
-        ending_reply(Some(refusal.clone()), EndedBy::Exit, None, Cleanup::Clean),
+        ending_reply(
+            Some(refusal.clone()),
+            EndedBy::Exit,
+            None,
+            Cleanup::Clean,
+            ConfigurationState::Same,
+        ),
         Ending::Refused(refusal.clone())
     );
     for cleanup in [
@@ -420,6 +476,7 @@ fn an_operation_that_did_not_start_is_a_refusal_when_nothing_is_left_and_says_so
             EndedBy::Exit,
             Some(0),
             cleanup.clone(),
+            ConfigurationState::Same,
         );
         match reply {
             Ending::Finished(InvocationReply::Finished {
@@ -436,7 +493,13 @@ fn an_operation_that_did_not_start_is_a_refusal_when_nothing_is_left_and_says_so
         }
     }
     // An ending that no failure began keeps the ending the caller names and its exit code.
-    match ending_reply(None, EndedBy::Cancel, Some(3), Cleanup::Uncertain) {
+    match ending_reply(
+        None,
+        EndedBy::Cancel,
+        Some(3),
+        Cleanup::Uncertain,
+        ConfigurationState::Same,
+    ) {
         Ending::Finished(InvocationReply::Finished { ended_by, exit, .. }) => {
             assert_eq!(ended_by, EndedBy::Cancel);
             assert_eq!(exit, Some(3));

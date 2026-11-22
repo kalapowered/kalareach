@@ -225,7 +225,8 @@ impl Run<'_> {
                 slot.keep(Blocked::Leftover(object), self.tree.take());
             }
         }
-        self.reply(failure, ended_by, exit, cleanup)
+        let configuration = facts::configuration_of(&closed.closing);
+        self.reply(failure, ended_by, exit, cleanup, configuration)
     }
 
     /// The reply of an end.
@@ -235,12 +236,14 @@ impl Run<'_> {
         ended_by: EndedBy,
         exit: Option<u32>,
         cleanup: Cleanup,
+        configuration: ConfigurationState,
     ) -> Final {
         match facts::ending_reply(
             failure.map(|failure| failure.refusal),
             ended_by,
             exit,
             cleanup,
+            configuration,
         ) {
             facts::Ending::Refused(refusal) => Final::Refused(refusal),
             facts::Ending::Finished(reply) => Final::Finished(reply),

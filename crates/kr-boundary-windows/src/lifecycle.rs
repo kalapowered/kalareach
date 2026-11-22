@@ -298,6 +298,12 @@ pub enum Ending {
     Finished(InvocationReply),
 }
 
+/// What the reply says about the repository's configuration after the end check.
+#[must_use]
+pub fn configuration_of(_closing: &Closing) -> ConfigurationState {
+    ConfigurationState::Same
+}
+
 /// The reply of an ending. A failure that began it is the refusal when nothing is left; where the
 /// cleanup is unclean or uncertain the client is told `finished`, and an operation that did not
 /// start says so, with no exit code.
@@ -307,6 +313,7 @@ pub fn ending_reply(
     ended_by: EndedBy,
     exit: Option<u32>,
     cleanup: Cleanup,
+    _configuration: ConfigurationState,
 ) -> Ending {
     let failed = failure.is_some();
     match failure {
