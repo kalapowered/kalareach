@@ -2935,7 +2935,7 @@ mod guest {
             .is_ok_and(|user| user.to_text().unwrap() == "S-1-5-18")
         {
             eprintln!(
-                "SKIPPED: not run under this token: the case makes objects owned by another account, which only the system's token may set"
+                "skipped: not run under this token: the case makes objects owned by another account, which only the system's token may set"
             );
             return;
         }

@@ -568,7 +568,7 @@ fn open_thread_as(token: &Handle, thread_id: u32, access: u32) -> Result<(), u32
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_is_in_its_job_and_has_run_nothing_until_it_is_resumed() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -614,7 +614,7 @@ fn a_child_is_in_its_job_and_has_run_nothing_until_it_is_resumed() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn exactly_the_three_standard_handles_reach_a_child_whatever_else_is_open_or_launching() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -697,7 +697,7 @@ fn exactly_the_three_standard_handles_reach_a_child_whatever_else_is_open_or_lau
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_process_and_thread_name_the_group_and_the_system_and_the_group_cannot_change_them() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -777,7 +777,7 @@ fn the_process_and_thread_name_the_group_and_the_system_and_the_group_cannot_cha
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_job_holds_the_whole_tree_with_the_limits_asked_for_and_ends_every_process() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -831,7 +831,7 @@ fn the_job_holds_the_whole_tree_with_the_limits_asked_for_and_ends_every_process
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_that_asks_to_break_away_from_the_job_is_refused_or_stays_in() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -875,7 +875,7 @@ fn a_child_that_asks_to_break_away_from_the_job_is_refused_or_stays_in() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_suspended_child_that_is_dropped_is_ended_and_leaves_no_process() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -915,7 +915,7 @@ fn a_suspended_child_that_is_dropped_is_ended_and_leaves_no_process() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_runs_only_with_the_permit_made_for_it() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -979,7 +979,7 @@ fn copy_of(process: &Handle) -> Handle {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_permit_is_compared_on_the_invocation_the_process_number_and_the_creation_time_each_alone() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1033,7 +1033,7 @@ fn a_permit_is_compared_on_the_invocation_the_process_number_and_the_creation_ti
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocation() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1082,7 +1082,7 @@ fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocat
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1119,7 +1119,7 @@ fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_uncertain_end() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     use kr_boundary_windows::win::proof::run_captured;
@@ -1232,7 +1232,7 @@ fn a_pipe_that_a_writer_outside_the_job_holds_open_after_a_proved_end_is_an_unce
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_suspended_child_that_is_dropped_is_waited_for_only_to_the_callers_deadline() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1397,7 +1397,7 @@ fn proof_run_with<'a>(
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_launch_that_fails_after_the_process_was_made_is_an_uncertain_end_for_the_proofs_runner() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1450,7 +1450,7 @@ fn a_launch_that_fails_after_the_process_was_made_is_an_uncertain_end_for_the_pr
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_program_that_outlasts_the_deadline_is_ended_and_the_call_returns_within_it() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1479,7 +1479,7 @@ fn a_program_that_outlasts_the_deadline_is_ended_and_the_call_returns_within_it(
 fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
     use kr_boundary_windows::win::pipe::Stop;
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1530,7 +1530,7 @@ fn a_program_that_is_running_when_the_stop_comes_is_ended_at_the_stop() {
 fn a_stop_that_is_already_set_starts_no_program() {
     use kr_boundary_windows::win::pipe::Stop;
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1575,7 +1575,7 @@ fn a_stop_that_comes_after_the_process_is_made_resumes_nothing() {
         }
     }
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1629,7 +1629,7 @@ fn a_stop_that_comes_after_a_failed_launch_ends_the_run_with_the_launchs_own_err
         }
     }
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1686,7 +1686,7 @@ fn a_stop_ends_the_readers_and_the_jobs_end_within_a_short_bound_though_a_writer
  {
     use kr_boundary_windows::win::pipe::Stop;
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1750,7 +1750,7 @@ fn pipe_name_length(pipe: &Handle) -> usize {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_capture_pipe_has_a_descriptor_for_the_system_and_the_administrators_alone() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -1973,7 +1973,7 @@ fn open_the_brokers_pipe() -> Result<(), u32> {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_boundary_account_cannot_open_the_brokers_pipe_that_the_system_opens() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     use kr_boundary_windows::win::pipe::{Kind, Listener, Stop};
@@ -2118,7 +2118,7 @@ fn the_logs_last_words_are_read_well_inside_their_reserve_for_the_system_and_for
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_launch_that_cannot_use_the_job_attribute_starts_nothing() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -2155,7 +2155,7 @@ fn a_launch_that_cannot_use_the_job_attribute_starts_nothing() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_job_that_has_ended_takes_no_new_child() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -2185,7 +2185,7 @@ fn a_job_that_has_ended_takes_no_new_child() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_sees_exactly_the_environment_it_was_given() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -2259,7 +2259,7 @@ const AWKWARD: &[&str] = &[
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_quoted_command_line_is_split_back_by_the_system_and_by_a_real_child() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -2534,7 +2534,7 @@ fn git_with_helper(fixture: &Fixture, job: &Job) -> (String, String, Option<u32>
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_child_a_grandchild_and_a_child_of_git_inherit_the_brokers_error_mode() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -2588,7 +2588,7 @@ fn dump_within(dumps: &Dumps, pid: u32, bound: Duration) -> Option<Duration> {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_crash_of_a_child_a_grandchild_or_git_s_child_leaves_no_dump_where_the_default_mode_does() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -2771,7 +2771,7 @@ fn the_brokers_own_crash_leaves_no_dump_where_the_default_mode_does() {
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_four_ways_to_start_a_program_outside_the_job_start_nothing_from_a_launched_child() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();
@@ -2876,7 +2876,7 @@ Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn the_bits_cmdlets_start_nothing_outside_the_job_from_a_launched_child() {
     if !runs_as_the_system() {
-        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        eprintln!("skipped: the fixture of this case needs the system's token");
         return;
     }
     let fixture = Fixture::new();

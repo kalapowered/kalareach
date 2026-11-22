@@ -353,7 +353,7 @@ fn needs_the_system() -> bool {
         return false;
     }
     eprintln!(
-        "SKIPPED: not run under this token: the case makes its folders in the system's temporary folder"
+        "skipped: not run under this token: the case makes its folders in the system's temporary folder"
     );
     true
 }

@@ -450,7 +450,7 @@ fn status(connection: &mut Connection) -> Option<Response> {
 fn nothing_is_served_after(failure: fn()) {
     if !runs_as_the_system() {
         eprintln!(
-            "SKIPPED: not run under this token: the service's pipe is made and served by the system"
+            "skipped: not run under this token: the service's pipe is made and served by the system"
         );
         return;
     }
@@ -613,7 +613,7 @@ fn root_with_hostile_objects(
 fn the_least_set_of_privileges_that_removes_a_root_of_hostile_objects_is_backup_and_restore() {
     if !runs_as_the_system() {
         eprintln!(
-            "SKIPPED: not run under this token: the case makes objects owned by another account, which only the system's token may set"
+            "skipped: not run under this token: the case makes objects owned by another account, which only the system's token may set"
         );
         return;
     }

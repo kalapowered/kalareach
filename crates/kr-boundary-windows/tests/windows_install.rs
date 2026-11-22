@@ -529,7 +529,7 @@ fn installation_lays_down_and_removal_restores() {
         );
     } else {
         eprintln!(
-            "SKIPPED the boot marker: not run under this token: only the system may set the owner of its key"
+            "skipped: the boot marker, not run under this token: only the system may set the owner of its key"
         );
     }
     // No hive of an account's is loaded, no profile folder is made, and neither a window station nor
@@ -639,7 +639,7 @@ fn installation_lays_down_and_removal_restores() {
         );
     } else {
         eprintln!(
-            "SKIPPED the in-process proofs: not run under this token: only the system may register with the logon service"
+            "skipped: the in-process proofs, not run under this token: only the system may register with the logon service"
         );
     }
 
@@ -722,7 +722,7 @@ fn removal_keeps_an_administrators_later_rule_and_the_rule_that_lets_others_run(
     // which only the system may register with.
     if !runs_as_the_system() {
         eprintln!(
-            "SKIPPED the rest: not run under this token: only the system may register with the logon service"
+            "skipped: the rest, not run under this token: only the system may register with the logon service"
         );
         return;
     }
@@ -5343,7 +5343,7 @@ fn needs_the_system() -> bool {
     if runs_as_the_system() {
         return false;
     }
-    eprintln!("SKIPPED: not run under this token: only the system may make the broker's pipe");
+    eprintln!("skipped: not run under this token: only the system may make the broker's pipe");
     true
 }
 
@@ -6578,7 +6578,7 @@ fn the_administrators_pipe_refuses_a_person_and_an_administrator_who_is_not_elev
             "an administrator that is not elevated"
         );
     } else {
-        eprintln!("SKIPPED: the not-elevated administrator needs the administrator's own token");
+        eprintln!("skipped: the not-elevated administrator needs the administrator's own token");
     }
     drop(case);
 }
