@@ -76,6 +76,9 @@ pub const READER_BOUND: Duration = Duration::from_secs(30);
 /// How long the wait for the logon session to leave the system's list may take.
 pub const SESSION_BOUND: Duration = Duration::from_secs(30);
 
+/// How long the job's count of live processes is given to fall to nothing after a reader ended.
+const DESCENDANTS_BOUND: Duration = Duration::from_secs(2);
+
 /// How often the wait of step 10 looks at the control pipe, which has no handle to wait on.
 const CONTROL_SLICE: Duration = Duration::from_millis(50);
 
@@ -592,7 +595,7 @@ impl Run<'_> {
         match reader.wait_or_stop(self.env.bounds.reader, &self.env.stop) {
             Ok(Some(0)) => {
                 at("reader ended");
-                Ok(())
+                self.no_process_is_left()
             }
             Ok(Some(code)) => Err(not_started(format!(
                 "the reader of the project ended with the code {code}"
@@ -600,6 +603,25 @@ impl Run<'_> {
             Ok(None) if self.env.stop.is_set() => Err(stopping()),
             Ok(None) => Err(not_started("the reader of the project did not end in time")),
             Err(unread) => Err(not_started(unread)),
+        }
+    }
+
+    /// Every process of the reader has ended, not only the reader: the job counts none alive. A
+    /// process that a reader left would hold the group's token through the grant.
+    fn no_process_is_left(&self) -> Result<(), Failure> {
+        let job = self.job.as_ref().ok_or_else(|| not_started("no job"))?;
+        let until = Instant::now() + DESCENDANTS_BOUND;
+        loop {
+            let live = job.active_processes().map_err(not_started)?;
+            if live == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= until {
+                return Err(not_started(format!(
+                    "the reader of the project ended and left {live} live processes"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
