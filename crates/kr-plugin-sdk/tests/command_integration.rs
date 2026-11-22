@@ -353,6 +353,78 @@ fn kr_req_11_42_an_integration_statement_that_holds_a_label_of_the_host_is_refus
     assert!(!named(&control, "a placement"), "{control:?}");
 }
 
+/// KR-REQ-11.42: an owner reads the bridge's words and then the integration's own as one run of
+/// the publisher's words, so a label of the host that the two form only where they join is refused
+/// as well, though neither holds it. The control is the same pair with other words.
+#[test]
+fn kr_req_11_42_two_statements_that_form_a_label_of_the_host_where_they_join_are_refused() {
+    use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, PLACEMENT_STATEMENT_LABEL};
+    let findings_of = |bridge: &str, integration: &str| {
+        let mut declared = declaration("claude", &["--flag"], &[]);
+        declared["grant_statement"] = json!(integration);
+        let mut manifest = manifest_with("claude", &declared, true);
+        manifest["capabilities"]
+            .as_array_mut()
+            .expect("the manifest requests capabilities")
+            .push(json!({
+                "capability": "native_bridge.install",
+                "reason": "Register the forwarder the example agent starts"
+            }));
+        manifest["native_bridge"] = json!({
+            "application": "Example Agent",
+            "application_range": ">=1.0.0, <2.0.0",
+            "install": [{
+                "type": "add_configuration_key",
+                "file": "settings.json",
+                "key": "enabled.example",
+                "value": "true"
+            }],
+            "remove": [{
+                "type": "remove_configuration_key",
+                "file": "settings.json",
+                "key": "enabled.example"
+            }],
+            "grant_statement": bridge
+        });
+        validate(&manifest).report.findings
+    };
+    let named = |findings: &[kr_plugin_sdk::validate::Finding], before: &str| {
+        findings.iter().any(|finding| {
+            finding.code == FindingCode::IntegrationInvalid
+                && finding.detail.contains(&format!(
+                    "read together, hold the words the host writes before its own reading of \
+                     {before}"
+                ))
+        })
+    };
+    let bridge = "Changes one setting. The host's exact reading of";
+    for (label, rest, before) in [
+        (
+            INTEGRATION_STATEMENT_LABEL,
+            "the command integration: Runs nothing.",
+            "a command integration",
+        ),
+        (
+            PLACEMENT_STATEMENT_LABEL,
+            "the placement: Reads nothing.",
+            "a placement",
+        ),
+    ] {
+        assert!(
+            format!("{bridge} {rest}").contains(label),
+            "the two form the label where they join"
+        );
+        assert!(
+            !bridge.contains(label) && !rest.contains(label),
+            "and neither holds it"
+        );
+        assert!(named(&findings_of(bridge, rest), before), "{before}");
+    }
+    let control = findings_of(bridge, "Adds the flag its bridge needs.");
+    assert!(!named(&control, "a command integration"), "{control:?}");
+    assert!(!named(&control, "a placement"), "{control:?}");
+}
+
 /// KR-REQ-11.42: an owner reads a native bridge's own words beside the host's reading of a command
 /// integration, told apart by the label the host writes before its reading, so a bridge whose
 /// words hold that label is refused. The control is the same bridge with other words.

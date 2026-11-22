@@ -2420,6 +2420,32 @@ impl Catalogue {
                 });
             }
         }
+        // Neither holds a label by itself. The two are shown as one run of the publisher's words,
+        // and a label can still be formed where they join, which the owner would read as the host's.
+        let publisher = kr_protocol::confirmation::publisher_words(bridge, integration_words);
+        for (label, reading_of) in [
+            (
+                kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL,
+                "a command integration",
+            ),
+            (
+                kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL,
+                "a placement",
+            ),
+        ] {
+            if publisher
+                .as_deref()
+                .is_some_and(|words| words.contains(label))
+            {
+                return Err(CatalogueError::UnsafePackage {
+                    detail: format!(
+                        "{subject} is not a package this host will install: the bridge's \
+                         statement and the command integration's statement, read together, hold \
+                         the words the host writes before its own reading of {reading_of}"
+                    ),
+                });
+            }
+        }
         // A package that declares where its bridge is placed gets the host's reading of it, written
         // from the table the verified manifest pins, which is read only after the range test and
         // by the one function the controller reads it with. A table that cannot be fetched, read
@@ -2455,7 +2481,6 @@ impl Catalogue {
                 ),
             });
         }
-        let publisher = kr_protocol::confirmation::publisher_words(bridge, integration_words);
         let statement = kr_protocol::confirmation::install_statement(
             publisher.as_deref(),
             placement.as_deref(),

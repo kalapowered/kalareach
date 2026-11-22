@@ -1532,7 +1532,7 @@ fn check_manifest(
                  command_integration.launch",
             ));
         }
-        check_integration_words(integration, report);
+        check_integration_words(manifest, integration, report);
         let permits = LaunchPermits::for_package(&manifest.sdk_range, connector);
         for problem in integration.problems(&manifest.match_rules, &permits) {
             report.push(Finding::at(
@@ -1873,14 +1873,24 @@ fn check_answer(
     }
 }
 
-/// Checks that a command integration's own words hold neither label the host writes. An owner reads
-/// them as the publisher's, ahead of the host's reading of the integration and of the placement,
-/// and tells the two apart by those labels, so the publisher cannot write them.
+/// Checks that a command integration's own words hold neither label the host writes, by
+/// themselves or read together with a bridge's words. An owner reads the bridge's words and then
+/// the integration's own as one run of the publisher's words, ahead of the host's reading of the
+/// integration and of the placement, and tells them apart from it by those labels, so the
+/// publisher cannot write them: not in one statement, and not by ending the bridge's with the start
+/// of a label and beginning the integration's with the rest of it.
 fn check_integration_words(
+    manifest: &PluginManifest,
     integration: &crate::integration::CommandIntegration,
     report: &mut Report,
 ) {
     let words = integration.grant_statement.as_str();
+    let bridge = manifest
+        .native_bridge
+        .0
+        .as_ref()
+        .map(|bridge| bridge.grant_statement.as_str());
+    let together = kr_protocol::confirmation::publisher_words(bridge, Some(words));
     for (label, reading_of) in [
         (
             kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL,
@@ -1898,6 +1908,20 @@ fn check_integration_words(
                 format!(
                     "the command integration's statement holds the words the host writes before \
                      its own reading of {reading_of}"
+                ),
+            ));
+        } else if !bridge.is_some_and(|bridge| bridge.contains(label))
+            && together.as_deref().is_some_and(|text| text.contains(label))
+        {
+            // The bridge's own refusal names a label it holds by itself; this one is the label the
+            // two form only where they join.
+            report.push(Finding::at(
+                FindingCode::IntegrationInvalid,
+                MANIFEST_FILE,
+                format!(
+                    "the bridge's statement and the command integration's statement, read \
+                     together, hold the words the host writes before its own reading of \
+                     {reading_of}"
                 ),
             ));
         }

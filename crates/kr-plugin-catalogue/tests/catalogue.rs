@@ -2689,6 +2689,54 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
     );
 }
 
+/// The bridge's words and then the integration's own are one run of the publisher's words, so a
+/// label of the host that the two form only where they join is not shown either, though neither
+/// holds it, and a manifest kept from before is refused the same way: the host reads what the
+/// index pins and writes the statement from it.
+#[tokio::test]
+async fn kr_req_11_42_two_statements_that_form_a_label_where_they_join_are_not_shown() {
+    use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, PLACEMENT_STATEMENT_LABEL};
+    let bridge = "Changes one setting. The host's exact reading of";
+    for (label, rest) in [
+        (
+            INTEGRATION_STATEMENT_LABEL,
+            "the command integration: Runs nothing.",
+        ),
+        (PLACEMENT_STATEMENT_LABEL, "the placement: Reads nothing."),
+    ] {
+        assert!(
+            format!("{bridge} {rest}").contains(label),
+            "the two form the label where they join"
+        );
+        assert!(
+            !bridge.contains(label) && !rest.contains(label),
+            "and neither holds it"
+        );
+        let refusal = statement_of_edited(bridge, true, |manifest| {
+            manifest["command_integration"]["grant_statement"] = serde_json::json!(rest);
+        })
+        .await
+        .expect_err("the publisher's two statements wrote the host's label together");
+        assert!(
+            matches!(&refusal, CatalogueError::UnsafePackage { detail }
+                if detail.contains("read together, hold the words the host writes before")),
+            "{refusal:?}"
+        );
+    }
+    // The control: the same bridge's words with the integration's other words are shown.
+    let shown = statement_of_edited(bridge, true, |manifest| {
+        manifest["command_integration"]["grant_statement"] =
+            serde_json::json!("Adds the flag its bridge needs.");
+    })
+    .await
+    .expect("the manifest the index pins is read")
+    .expect("a statement");
+    assert!(
+        shown.starts_with(&format!("{bridge} Adds the flag its bridge needs.")),
+        "{shown}"
+    );
+}
+
 /// One bundled bridge package (`name` is its folder under the bundled targets) copied under
 /// `into`, with an SDK range that holds the arrival of a placement, `edit` applied to its
 /// connector table and `edit_manifest` to its manifest, and the table's payload record brought up
