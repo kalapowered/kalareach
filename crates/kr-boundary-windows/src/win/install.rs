@@ -7548,10 +7548,9 @@ mod tests {
         }
         // A read of the manifest's name takes the published replacement as the run's own record.
         let on_disk = run.manifest_on_disk();
-        assert!(
-            on_disk.is_ok(),
-            "the manifest on disk is not the record that the run holds: {on_disk:?}"
-        );
+        if let Err(failure) = &on_disk {
+            panic!("the manifest on disk is not the record that the run holds: {failure:?}");
+        }
         let rolled = run.take_away();
         assert!(rolled.stayed.is_empty(), "{rolled:?}");
         let prior = rolled
