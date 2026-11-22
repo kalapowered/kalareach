@@ -6,8 +6,9 @@
 # `scripts/e2e-pairing-device.sh` pairs the phone with a host that its test harness drives through
 # library calls, so no leg of it shows what the person at the host sees. This one starts the real
 # `kr-controller` daemon (the shipped daemon's own source, built with the `testing` feature that starts no
-# launchd job; it has no owner and joins the network on the loopback interface alone) and runs the real `kr`
-# below a pseudo-terminal, as a person at the host runs it:
+# launchd job; it has no owner and joins the network at the address KR_ISSUER_BIND names: the loopback
+# interface for an iOS run, every interface for an Android run, see below) and runs the real `kr` below a
+# pseudo-terminal, as a person at the host runs it:
 #
 #   kr pair invite --direct --owner   the host has no owner, so the command asks for the word `pair`, issues
 #                                     the invitation and draws its QR code; the drawing is put where the
@@ -37,17 +38,24 @@
 #
 # Usage:
 #   KR_ISSUER_IOS_APP=<KalaReach.app> scripts/e2e-pairing-issuer-device.sh ios
-#   KR_ISSUER_ANDROID_APK=<package> scripts/e2e-pairing-issuer-device.sh android
+#   KR_ISSUER_BIND=0.0.0.0:<port> KR_ISSUER_ANDROID_APK=<package> scripts/e2e-pairing-issuer-device.sh android
 #
+# KR_ISSUER_BIND is the address the host's endpoint binds to; the default, 127.0.0.1:0, is what an iOS run
+# uses (the simulator shares this machine's network). The invitation names the addresses the endpoint is
+# bound to, and the emulator cannot reach this machine's loopback interface at the address an invitation
+# names there, so an Android run is refused unless KR_ISSUER_BIND starts with 0.0.0.0: or [::]:. That opens
+# the host's endpoint on every network interface of this machine, the local network too, while the
+# first-owner invitation is open (until it is approved or expires, at most five minutes), and the invitation then names this machine's own
+# addresses: use it only on a network you trust.
 # KR_PAIRING_SHOTS is where the phone's screenshots go (default /tmp/kr-pair-issuer); KR_PAIRING_GRPC_PORT is
 # the port of the Android emulator's controller (default 8754), which must be free: the camera is moved
-# through it, so a port that already answers would move another emulator's. KR_ISSUER_BIND is the address the
-# host's endpoint binds to (default 127.0.0.1:0); an Android run names a fixed port, so that the address the
-# invitation carries can be reached from the emulator. KR_IOS_PACKAGES names an absolute folder that the iOS
-# test build keeps the Swift packages in (see scripts/lib/xcode.sh).
+# through it, so a port that already answers would move another emulator's. KR_IOS_PACKAGES names an
+# absolute folder that the iOS test build keeps the Swift packages in (see scripts/lib/xcode.sh).
 #
-# The host's tree (keys of a test host, for this account alone) is left under /private/tmp/kr-dl5-host.* when
-# the run ends, and its path is printed: it is for the person who ran this to remove.
+# Every run writes into an output folder of its own, made under the artifacts folder and named at its start
+# and its end, so that no file of an earlier run is read as this run's. The host's tree (keys of a test host,
+# for this account alone) is left under the temporary folder as kr-issuer.* when the run ends, and its path
+# is printed: it is for the person who ran this to remove.
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail
@@ -71,7 +79,7 @@ esac
 # shellcheck source=scripts/lib/host-program.sh
 . "$here/scripts/lib/host-program.sh"
 kr_artifacts_dir
-artefacts="$kr_artifacts/pairing-issuer-device-$platform"
+artefacts="$kr_artifacts/pairing-issuer-device-$platform-$(date +%Y%m%d%H%M%S)-$$"
 transcripts="$artefacts/transcripts"
 shots="${KR_PAIRING_SHOTS:-/tmp/kr-pair-issuer}"
 mkdir -p "${artefacts:?}" "${transcripts:?}" "${shots:?}"
@@ -94,8 +102,8 @@ log="$artefacts/run.log"
 # it holds stays with the run.
 harness="$artefacts/phone-$(date +%s)-$$"
 mkdir -p "${harness:?}"
-# The host: its runtime and state folders and the home folder `kr` runs with, made when the host starts,
-# at a short path for the daemon's sockets.
+# The host: its runtime and state folders and the home folder `kr` runs with, made when the host starts, under
+# the temporary folder (a short path, for the daemon's sockets).
 hostroot=""
 daemon_pid=""
 driver_pid=""
@@ -112,6 +120,7 @@ invitation=""
 moments=""
 
 say() { printf '== [pairing-issuer-device] %s\n' "$*" | tee -a "$log"; }
+say "the output folder of this run is $artefacts"
 
 # Ends what this script started: the phone's driver, the feeder and the daemon by the pids this script
 # recorded (the daemon is asked to stop first), and the emulator or simulator it started.
@@ -137,7 +146,6 @@ finish() {
     fi
     if [ -n "$emulator_pid" ] && kill -0 "$emulator_pid" 2>/dev/null; then
         if [ "$emulator_checked" = 1 ]; then
-            "$emulator_adb" -s "$emulator_serial" reverse --remove-all >/dev/null 2>&1
             "$emulator_adb" -s "$emulator_serial" uninstall "$app_id" >/dev/null 2>&1
             "$emulator_adb" -s "$emulator_serial" emu kill >/dev/null 2>&1
         else
@@ -203,7 +211,7 @@ build_host() {
 # Its environment's identity and configuration document are written before it starts, so that it reads them.
 start_host() {
     local bind="${KR_ISSUER_BIND:-127.0.0.1:0}"
-    hostroot="$(mktemp -d /private/tmp/kr-dl5-host.XXXXXX)" || return 2
+    hostroot="$(mktemp -d "${TMPDIR:-/tmp}/kr-issuer.XXXXXX")" || return 2
     local environment_id state
     environment_id="$(uuidgen | tr 'A-F' 'a-f')"
     state="$hostroot/s/environments/${environment_id%%-*}"
@@ -246,7 +254,9 @@ issuer() {
         | tee -a "$log"
 }
 
-moment() { moments="$moments $1=$(date +%s)"; }
+# A moment of this script's own clock, taken as a step returns, in milliseconds. It orders the steps as the script runs them;
+# the transcripts' own times (UTC, to the millisecond, one clock for every command) show when each command printed what.
+moment() { moments="$moments $1=$(python3 -c 'import time; print(int(time.time() * 1000))')"; }
 moment_of() { printf '%s' "$moments" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 
 # ---- What the run must have shown ------------------------------------------------------------
@@ -263,8 +273,46 @@ screen_has() { # <name> <phrase>...
 # The value a status or a phone shows, with its grouping taken away.
 plain_value() { tr -d ' -' | tr 'A-F' 'a-f'; }
 
+# The JSON form of the status, read for its values: the candidate's value is the phone's, the host awaits approval of it,
+# and the grant proposed is an owner's. Prints what it read.
+json_check() { # <status file> <the phone's value>
+    python3 - "$1" "$2" <<'PY'
+import json
+import re
+import sys
+
+try:
+    document = json.load(open(sys.argv[1], encoding="utf-8"))
+    owner = document["owner"]
+    candidate = owner["candidate"]
+    plain = lambda text: re.sub(r"[^0-9a-f]", "", str(text).lower())
+    value = plain(candidate["verification_value"])
+    waiting = plain(document["status"]["awaiting_approval"]["verification_value"])
+    actions = owner["proposed_grant"]["actions"]
+    ok = (
+        bool(sys.argv[2])
+        and value == plain(sys.argv[2])
+        and waiting == value
+        and owner["grant_kind"] == "personal_owner"
+        and isinstance(actions, list)
+        and "host.manage" in actions
+        and "session.view" in actions
+    )
+    print(f"value {value}, awaiting approval of {waiting}, grant {owner['grant_kind']} with {len(actions)} actions")
+except (OSError, ValueError, KeyError, TypeError) as error:
+    print(f"unreadable: {error!r}")
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+}
+
+# The moment, in milliseconds since the epoch, that the first line of a command's timed transcript holding a phrase was printed.
+printed_at() { # <transcript name> <phrase>
+    python3 "$here/scripts/lib/pairing-issuer.py" when --file "$transcripts/$1.timed.txt" --phrase "$2"
+}
+
 judge() { # <driver output>
-    local bad=0 phone_value="" shown=""
+    local bad=0 phone_value="" shown="" json_detail json_ok
     [ -s "$harness/phone-value.txt" ] && phone_value="$(plain_value <"$harness/phone-value.txt" | tr -d '\n')"
 
     if screen_has invite "This host has no owner yet" "Type pair to issue the invitation:" \
@@ -294,10 +342,11 @@ judge() { # <driver output>
         bad=1
     fi
 
-    if screen_has status-after-json '"proposed_grant"' '"candidate"' '"verification_value"'; then
-        say "check=the status in JSON names the candidate and the permissions proposed ok=1"
+    json_detail="$(json_check "$transcripts/status-after-json.txt" "$phone_value")" && json_ok=1 || json_ok=0
+    if [ "$json_ok" = 1 ]; then
+        say "check=the status in JSON names the candidate with the value the phone shows, and the permissions proposed for approval ok=1 detail=$json_detail"
     else
-        say "check=the status in JSON names the candidate and the permissions proposed ok=0 detail=see $transcripts/status-after-json.txt"
+        say "check=the status in JSON names the candidate with the value the phone shows, and the permissions proposed for approval ok=0 detail=$json_detail"
         bad=1
     fi
 
@@ -333,23 +382,25 @@ judge() { # <driver output>
         bad=1
     fi
 
-    # The order: the invitation was drawn, then read before any scan, then scanned; the phone showed its value
-    # before the status that names it and the question that asks for it.
-    local invite_done status_before_done picture_given value_seen status_after_done confirm_done
+    # The order: the invitation was drawn, then read before any scan, then scanned; the phone showed its value before the status
+    # that names it, and the status that names the device was printed before the question that asks for its value.
+    local invite_done status_before_done picture_given value_seen status_after_done confirm_done named_at asked_at
     invite_done="$(moment_of invite_done)"
     status_before_done="$(moment_of status_before_done)"
     picture_given="$(moment_of picture_given)"
     value_seen="$(moment_of value_seen)"
     status_after_done="$(moment_of status_after_done)"
     confirm_done="$(moment_of confirm_done)"
+    named_at="$(printed_at status-after "a device is waiting for approval")"
+    asked_at="$(printed_at confirm "the new device shows:")"
     if [ -n "$invite_done" ] && [ -n "$status_before_done" ] && [ -n "$picture_given" ] && [ -n "$value_seen" ] \
-        && [ -n "$status_after_done" ] && [ -n "$confirm_done" ] \
+        && [ -n "$status_after_done" ] && [ -n "$confirm_done" ] && [ -n "$named_at" ] && [ -n "$asked_at" ] \
         && [ "$invite_done" -le "$status_before_done" ] && [ "$status_before_done" -le "$picture_given" ] \
         && [ "$picture_given" -le "$value_seen" ] && [ "$value_seen" -le "$status_after_done" ] \
-        && [ "$status_after_done" -le "$confirm_done" ]; then
-        say "check=the order was the invitation drawn, the status before any scan, the phone's scan, the phone's value, the status naming the device, the approval ok=1 detail=$moments"
+        && [ "$named_at" -le "$asked_at" ] && [ "$asked_at" -le "$confirm_done" ]; then
+        say "check=the order was the invitation drawn, the status before any scan, the phone's scan, the phone's value, the status naming the device, the question asking for its value, the approval ok=1 detail=$moments, status printed at $named_at, question printed at $asked_at"
     else
-        say "check=the order was the invitation drawn, the status before any scan, the phone's scan, the phone's value, the status naming the device, the approval ok=0 detail=$moments"
+        say "check=the order was the invitation drawn, the status before any scan, the phone's scan, the phone's value, the status naming the device, the question asking for its value, the approval ok=0 detail=$moments, status printed at ${named_at:-never}, question printed at ${asked_at:-never}"
         bad=1
     fi
     return "$bad"
@@ -487,6 +538,15 @@ start_driver_android() { # <driver output>
     driver_pid=$!
 }
 
+# An Android run needs a wildcard bind: see the header for why, and for what it opens.
+require_wildcard_bind() {
+    case "${KR_ISSUER_BIND:-}" in
+        0.0.0.0:* | '[::]':*) return 0 ;;
+    esac
+    say "an Android run needs KR_ISSUER_BIND=0.0.0.0:<port>: the invitation names the addresses the host's endpoint is bound to, and an invitation that names a loopback address cannot be reached from the emulator. Binding 0.0.0.0 opens the host's endpoint on every network of this machine, the local network too, while its first-owner invitation is open (until it is approved or expires, at most five minutes): use it only on a network you trust."
+    return 2
+}
+
 run_android() {
     local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}" avd apk="${KR_ISSUER_ANDROID_APK:-}"
     local adb="${KR_ADB:-$sdk/platform-tools/adb}" serial_port=5594 grpc_port="${KR_PAIRING_GRPC_PORT:-8754}"
@@ -497,6 +557,7 @@ run_android() {
         return 3
     fi
     [ -f "$apk" ] || { say "KR_ISSUER_ANDROID_APK names no package ($apk)"; return 2; }
+    require_wildcard_bind || return 2
     python3 "$here/scripts/lib/android-network-config.py" debug "$apk" | tee -a "$log" \
         || { say "the package's network security configuration is not the development build's"; return 2; }
     build_host || return 2
@@ -537,13 +598,6 @@ run_android() {
     "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the package did not install"; return 2; }
     "$adb" -s "$serial" shell pm grant "$app_id" android.permission.POST_NOTIFICATIONS 2>/dev/null
     start_host || return 2
-    # The host's endpoint is on the loopback interface of this machine; the emulator's own loopback
-    # interface is tied to it for the port the endpoint binds to, when KR_ISSUER_BIND names one.
-    local bound="${KR_ISSUER_BIND:-}"
-    if [ -n "$bound" ] && [ "${bound##*:}" != 0 ]; then
-        "$adb" -s "$serial" reverse "tcp:${bound##*:}" "tcp:${bound##*:}" >/dev/null \
-            || { say "the emulator's loopback interface could not be tied to the host's port"; return 2; }
-    fi
     feed_android "$adb" "$serial" &
     feeder_pid=$!
 

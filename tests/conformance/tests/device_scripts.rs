@@ -89,7 +89,10 @@ const SCRIPTS: [Script; 13] = [
         path: "scripts/e2e-pairing-issuer-device.sh",
         args: &["android"],
         waits_for_boot: false,
-        env: &[("KR_ISSUER_ANDROID_APK", "application.apk")],
+        env: &[
+            ("KR_ISSUER_ANDROID_APK", "application.apk"),
+            ("KR_ISSUER_BIND", "0.0.0.0:47311"),
+        ],
     },
     Script {
         // The package it installs is named, so the script goes no further than the device for it.
@@ -1171,6 +1174,48 @@ fn the_pairing_script_starts_no_emulator_while_its_controllers_port_is_taken() {
     assert_eq!(run.status, Some(3), "{}", run.output);
     assert!(run.output.contains(&port), "{}", run.output);
     assert!(run.started().is_empty(), "{:?}", run.started());
+    drop(taken);
+}
+
+/// An Android run of the issuing-side leg binds the host's endpoint to a wildcard address, since an
+/// invitation that names a loopback address cannot be reached from the emulator. A loopback bind, or
+/// none, is refused before anything is built or started, in words that name the variable and say what
+/// a wildcard bind opens; both wildcard forms go on.
+#[test]
+fn the_issuer_script_refuses_a_loopback_bind_for_android_before_it_builds_or_starts_anything() {
+    let script = SCRIPTS
+        .iter()
+        .find(|script| script.path == "scripts/e2e-pairing-issuer-device.sh")
+        .expect("a script of the cases");
+    for bind in ["127.0.0.1:47311", "127.0.0.1:0", "localhost:47311", ""] {
+        let run = run(script, &[KALAREACH], None, &[("KR_ISSUER_BIND", bind)]);
+        assert_eq!(run.status, Some(2), "{bind:?}: {}", run.output);
+        for words in ["KR_ISSUER_BIND=0.0.0.0:<port>", "local network"] {
+            assert!(run.output.contains(words), "{bind:?}: {}", run.output);
+        }
+        assert!(
+            !run.called("cargo") && !run.called("pnpm android") && !run.called("gradlew"),
+            "{bind:?}: it built before it refused"
+        );
+        assert!(run.started().is_empty(), "{bind:?}: {:?}", run.started());
+    }
+    // A wildcard bind is not refused: with the controller's port taken, the run ends at that check.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = taken.local_addr().expect("its address").port().to_string();
+    for bind in ["0.0.0.0:47311", "[::]:47311"] {
+        let run = run(
+            script,
+            &[KALAREACH],
+            None,
+            &[("KR_ISSUER_BIND", bind), ("KR_PAIRING_GRPC_PORT", &port)],
+        );
+        assert_eq!(run.status, Some(3), "{bind:?}: {}", run.output);
+        assert!(
+            !run.output.contains("KR_ISSUER_BIND"),
+            "{bind:?}: {}",
+            run.output
+        );
+    }
     drop(taken);
 }
 
