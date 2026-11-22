@@ -612,16 +612,28 @@ fn two_releases_read_through_git_have_each_the_crate_they_had() {
     )
     .expect("a manifest");
     std::fs::write(other.join("src/lib.rs"), "pub fn elsewhere() {}\n").expect("a source");
+    // A crate under `tests/` that the worker depends on for its tests: the same.
+    let support = repository.join("tests/kr-support");
+    std::fs::create_dir_all(support.join("src")).expect("a folder");
     std::fs::write(
-        crate_at.join("Cargo.toml"),
-        "[package]\nname = \"kr-worker\"\n\n[dependencies]\nkr-protocol = { path = \"../kr-protocol\" }\n",
+        support.join("Cargo.toml"),
+        "[package]\nname = \"kr-support\"\n",
     )
     .expect("a manifest");
+    std::fs::write(support.join("src/lib.rs"), "pub fn support() {}\n").expect("a source");
+    std::fs::write(
+        crate_at.join("Cargo.toml"),
+        "[package]\nname = \"kr-worker\"\n\n[dependencies]\nkr-protocol = { path = \"../kr-protocol\" }\n\n[dev-dependencies]\nkr-support = { path = \"../../tests/kr-support\" }\n",
+    )
+    .expect("a manifest");
+    // The root declares a module whose file is in a folder: the copy has to reach it.
+    std::fs::create_dir_all(crate_at.join("src/inner")).expect("a folder");
+    std::fs::write(crate_at.join("src/inner/mod.rs"), "pub fn nested() {}\n").expect("a source");
     let mut commits = Vec::new();
     for body in ["let _ = 1;", "let _ = 2;"] {
         std::fs::write(
             crate_at.join("src/lib.rs"),
-            format!("pub fn check_envelope() {{}}\npub fn helper_fn() {{ {body} }}\n"),
+            format!("mod inner;\npub fn check_envelope() {{}}\npub fn helper_fn() {{ {body} }}\n"),
         )
         .expect("a source");
         git(&repository, &["add", "-A"]);
@@ -639,7 +651,7 @@ fn two_releases_read_through_git_have_each_the_crate_they_had() {
 
     let root = the_root(ROOT, "kr_worker", Depth::Alone);
     let work = folder.path().join("work");
-    let trees = read_releases(
+    let read = read_releases(
         &[control().entry],
         std::slice::from_ref(&root),
         &commits
@@ -651,8 +663,9 @@ fn two_releases_read_through_git_have_each_the_crate_they_had() {
             .collect::<Vec<_>>(),
         &reader,
         &work,
-    )
-    .expect("the releases are read");
+    );
+    assert!(read.is_ok(), "{:?}", read.as_ref().err());
+    let trees = read.unwrap_or_default();
     let helper = |at: usize| trees[at].1.item("kr_worker", "helper_fn");
     assert!(matches!(helper(0), Lookup::Found(_)), "{:?}", helper(0));
     assert!(matches!(helper(1), Lookup::Found(_)), "{:?}", helper(1));
