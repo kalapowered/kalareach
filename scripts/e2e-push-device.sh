@@ -546,10 +546,12 @@ if platform == "android":
               + ("on the screen" if "so this attempt changed nothing" in ended else "not on the screen") + " in that read")
         late = report.get("expire_tap_step") or ""
         shown_ms = report.get("untouched_shown_with_ms_left")
-        say("a notification the person left alone until its question had run out of time opened the Attention screen with nothing to send, and the host holds the question as expired with no answer",
+        say("a notification the person left alone until its question had run out of time opened the Attention screen, which says that nothing needs the person and offers nothing to send, and the host holds the question as expired with no answer",
             report.get("untouched_shown") is True and isinstance(shown_ms, int) and shown_ms > 0
             and report.get("untouched_expired_without_an_answer") is True and "PUSH-TAPPED" in late and "Attention" in late
-            and "Send answer" not in late and report.get("untouched_still_expired_without_an_answer") is True,
+            and "PUSH-EMPTY" in late and "Nothing needs you right now." in late.split("PUSH-EMPTY", 1)[1]
+            and "Send answer" not in late.split("PUSH-EMPTY", 1)[1] and "A question is waiting" not in late.split("PUSH-EMPTY", 1)[1]
+            and report.get("untouched_still_expired_without_an_answer") is True,
             late[:300].replace("\n", " "))
 
 if report.get("later_phases_ran") is not True:
@@ -816,7 +818,7 @@ steps_android() { # <adb> <serial>
             : >"$harness/started-expire-tap"
             local alert_late
             alert_late="$(python3 "$here/scripts/lib/push-inject.py" alert "$(ls -t "$harness"/inject-*.json | head -1)")"
-            KR_PUSH_SHOT_PREFIX=expire-late python3 "$here/scripts/lib/push-android.py" tap "$adb" "$serial" "$shots" "$alert_late" >"$harness/done-expire-tap.tmp" 2>&1
+            KR_PUSH_SHOT_PREFIX=expire-late python3 "$here/scripts/lib/push-android.py" tap-empty "$adb" "$serial" "$shots" "$alert_late" >"$harness/done-expire-tap.tmp" 2>&1
             mv "$harness/done-expire-tap.tmp" "$harness/done-expire-tap"
         fi
         if [ -e "$harness/step-newtoken.json" ] && [ ! -e "$harness/started-newtoken" ]; then

@@ -23,6 +23,11 @@ Commands, each given the adb program, the emulator's serial and a screenshot dir
       Waits until the page says that the question was answered by someone else, with what the person
       had chosen, and offers nothing to send. Prints `PUSH-ENDED <what the screen shows>`.
 
+  tap-empty <words>
+      As `tap`, and then waits until the Attention screen says that nothing needs the person, with no
+      waiting question and nothing to send. Prints `PUSH-TAPPED ...` and then `PUSH-EMPTY <what the
+      screen shows>`.
+
   expired
       Waits until the page says that the question expired, with what the person had chosen, and
       offers nothing to send. Prints `PUSH-EXPIRED <what the screen shows>`.
@@ -198,6 +203,22 @@ def observe(phone: Phone) -> None:
     print(f"PUSH-ENDED {texts(phone)}", flush=True)
 
 
+def empty(phone: Phone) -> None:
+    """Waits for the Attention screen to say that nothing needs the person: no waiting question and
+    nothing to send. The words are the page's own for an empty list."""
+    def said(nodes: list[dict]) -> bool:
+        labels = [each["label"] for each in nodes]
+        return (
+            any(label == "Nothing needs you right now." for label in labels)
+            and not any(label.startswith("A question is waiting") for label in labels)
+            and not any(label == "Send answer" for label in labels)
+        )
+
+    phone.wait_screen(said, "the Attention screen to say that nothing needs you", 60, nudging=True)
+    phone.shot("empty")
+    print(f"PUSH-EMPTY {texts(phone)}", flush=True)
+
+
 def expired(phone: Phone) -> None:
     """Waits for the page to say that a question the person had chosen Yes to, and had not sent,
     expired, and to offer nothing to send."""
@@ -225,7 +246,7 @@ def shade(phone: Phone, words: str) -> None:
 
 def main() -> None:
     arguments = sys.argv[1:]
-    if len(arguments) >= 4 and arguments[0] in {"tap", "choose", "send", "observe", "expired", "shade"}:
+    if len(arguments) >= 4 and arguments[0] in {"tap", "tap-empty", "choose", "send", "observe", "expired", "shade"}:
         phone = Phone(arguments[1], arguments[2], Path(arguments[3]))
         prefix = os.environ.get("KR_PUSH_SHOT_PREFIX", "")
         if prefix:
@@ -239,6 +260,10 @@ def main() -> None:
             return
         if arguments[0] == "tap" and len(arguments) == 5:
             tap_notification(phone, arguments[4])
+            return
+        if arguments[0] == "tap-empty" and len(arguments) == 5:
+            tap_notification(phone, arguments[4])
+            empty(phone)
             return
         if arguments[0] == "observe" and len(arguments) == 4:
             observe(phone)
