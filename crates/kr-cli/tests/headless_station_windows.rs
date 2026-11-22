@@ -11,9 +11,11 @@
 //! as one entry with another mask, is refused too, and the refusal does not say that it admits more.
 //!
 //! The desktop is checked the same way. A desktop that exists already on the station keeps the
-//! access list it was made with, so a desktop that admits more than the starter's own is refused. A
-//! worker's desktop is named for its reservation, so the case takes a launch of a reservation of
-//! its own, holds a desktop of that name, and hands the launch to the task's starter.
+//! access list it was made with, so a desktop that admits more than the starter's own is refused,
+//! and one whose integrity label is lower and which the starter may change is used once the starter
+//! has put its own label on it. A worker's desktop is named for its reservation, so the cases take a
+//! launch of a reservation of their own, hold a desktop of that name, and hand the launch to the
+//! task's starter.
 //!
 //! These cases change the security of objects that every headless start of this logon meets, so
 //! they run one at a time, and each puts back what it changed. They need a signed-in interactive
@@ -273,6 +275,71 @@ async fn a_desktop_that_exists_already_and_admits_more_than_the_starters_own_ref
             && detail.contains("access list")
             && detail.contains("admits more"),
         "the refusal does not say that the desktop's access list admits more: {detail}"
+    );
+}
+
+/// KR-REQ-03.24: a desktop that exists already on the logon's window station with a lower integrity
+/// label than the interactive desktop's, and whose list leaves the starter the right to change it,
+/// is used once the starter has put the interactive desktop's label on it, and the label it reads
+/// back is the interactive desktop's. Where the interactive desktop has no label there is none to
+/// put on it, and the case fails rather than passing without having shown anything.
+///
+/// The desktop of a headless worker is named for its reservation, so the case takes a launch of a
+/// reservation of its own, holds a desktop of that name with the lowest label, and hands the launch
+/// to the task's starter. The launch's program is not there, so the start ends at the program once
+/// the starter has used the desktop, and nothing is left running. A starter that did not put its
+/// label on the desktop would read the lowest one back and refuse the start for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_logon_desktop_with_a_lower_label_that_the_starter_may_change_is_used() {
+    const MISSING_PROGRAM: &str = "kr-worker-that-is-not-there.exe";
+    let _alone = ONE_AT_A_TIME.lock().await;
+    let host = WorkerHost::start().await;
+    the_starter_meets_the_stations_this_test_makes(&host).await;
+
+    let interactive = windows_station::interactive_desktop_label()
+        .unwrap_or_else(|error| panic!("the interactive desktop's label: {error}"));
+    let entry = label_entry(&interactive).unwrap_or_else(|| {
+        panic!(
+            "the interactive desktop has no integrity label, so the starter has none to put on a \
+             desktop and this case would show nothing: {interactive:?}"
+        )
+    });
+    let station = HeldStation::make(|own| own.to_owned()).unwrap_or_else(|error| {
+        panic!("the logon's station as the starter would make it: {error}")
+    });
+    let mut launch = host.headless_launch();
+    launch.program = host.tree.root().join(MISSING_PROGRAM);
+    let lowered = HeldDesktop::make_labelled(
+        &station,
+        &launch.label(),
+        |own| own.to_owned(),
+        UNTRUSTED_LABEL,
+    )
+    .unwrap_or_else(|error| panic!("a desktop with the lowest integrity label: {error}"));
+    assert!(
+        lowered.label.contains("S-1-16-0"),
+        "the desktop was made with another label than the lowest one: {:?}",
+        lowered.label
+    );
+
+    let supervisor = host.task_supervisor();
+    let outcome = tokio::task::spawn_blocking(move || supervisor.start(&launch))
+        .await
+        .expect("the start returns");
+    let LaunchOutcome::NotStarted { detail } = outcome else {
+        panic!("the start of a program that is not there did not end at the program: {outcome:?}");
+    };
+    assert!(
+        !detail.contains("check the desktop's security") && detail.contains(MISSING_PROGRAM),
+        "the start was refused for the desktop, or did not end at the program: {detail}"
+    );
+    let now = lowered
+        .label_now()
+        .unwrap_or_else(|error| panic!("the desktop's label now: {error}"));
+    assert_eq!(
+        label_entry(&now),
+        Some(entry),
+        "the starter did not put the interactive desktop's label on the desktop: {now:?}"
     );
 }
 

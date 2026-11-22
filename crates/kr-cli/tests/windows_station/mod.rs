@@ -154,6 +154,9 @@ pub struct HeldDesktop {
     handle: HDESK,
     /// The desktop's access list as the system writes it, as it was read back after it was made.
     pub access_list: String,
+    /// The desktop's integrity label as the system writes it, as it was read back after it was
+    /// made, or the text the system writes for none (empty, or a null list).
+    pub label: String,
 }
 
 impl HeldDesktop {
@@ -171,10 +174,27 @@ impl HeldDesktop {
         name: &str,
         change: impl FnOnce(&str) -> String,
     ) -> Result<Self, String> {
+        Self::make_labelled(station, name, change, "")
+    }
+
+    /// Makes the desktop as [`Self::make`] does, with the integrity label `label` as the system
+    /// writes one (`S:(ML;;NW;;;LW)`), or none when it is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong, including that the station already had a desktop of this name,
+    /// whose access list is then not the one asked for. The label is read back for the case to
+    /// check, and is not compared here.
+    pub fn make_labelled(
+        station: &HeldStation,
+        name: &str,
+        change: impl FnOnce(&str) -> String,
+        label: &str,
+    ) -> Result<Self, String> {
         let interactive = Interactive::open(READ_CONTROL)?;
         let own = access_list_text(interactive.desktop)?;
         let wanted = change(&own);
-        let descriptor = DescriptorFromText::of(&wanted)?;
+        let descriptor = DescriptorFromText::of(&format!("{wanted}{label}"))?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
             lpSecurityDescriptor: descriptor.descriptor,
@@ -210,6 +230,7 @@ impl HeldDesktop {
         let mut held = Self {
             handle,
             access_list: String::new(),
+            label: String::new(),
         };
         let read_back = access_list_text(held.handle)?;
         if read_back != normalised(&wanted)? {
@@ -219,8 +240,31 @@ impl HeldDesktop {
             ));
         }
         held.access_list = read_back;
+        held.label = label_text(held.handle)?;
         Ok(held)
     }
+
+    /// The desktop's integrity label as the system writes it now, or the text the system writes
+    /// for none (empty, or a null list): the starter may have changed it since the desktop was
+    /// made.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong reading it.
+    pub fn label_now(&self) -> Result<String, String> {
+        label_text(self.handle)
+    }
+}
+
+/// The interactive desktop's integrity label as the system writes it, or the text the system
+/// writes for none (empty, or a null list).
+///
+/// # Errors
+///
+/// Returns what went wrong reading it.
+pub fn interactive_desktop_label() -> Result<String, String> {
+    let interactive = Interactive::open(READ_CONTROL)?;
+    label_text(interactive.desktop)
 }
 
 impl Drop for HeldDesktop {
