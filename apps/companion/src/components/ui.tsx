@@ -112,6 +112,9 @@ export function IconButton({
  * counts no press comes without one, as WebKit's accessibility activation and a script's `click()`
  * do: a deliberate action, so it commits, once. Nothing is remembered from one event for another,
  * so no decision waits on a click that never comes, as after a key or a touch that slid away.
+ *
+ * The commit is given the time its press began, on a clock that never steps back; a click that counts no
+ * press begins when it comes.
  */
 export function CommitButton({
   onCommit,
@@ -120,13 +123,15 @@ export function CommitButton({
   disabled,
   ...rest
 }: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'className' | 'onClick'> & {
-  readonly onCommit: () => void
+  readonly onCommit: (began: number) => void
   readonly tone?: ButtonTone
   readonly children: ReactNode
 }): ReactNode {
   const [pressed, setPressed] = useState(false)
   const pointer = useRef<number | null>(null)
   const key = useRef<string | null>(null)
+  const pointerBegan = useRef(0)
+  const keyBegan = useRef(0)
 
   const cancel = useCallback(() => {
     pointer.current = null
@@ -155,6 +160,7 @@ export function CommitButton({
         if (disabled || event.button !== 0 || pointer.current !== null) return
         event.currentTarget.setPointerCapture(event.pointerId)
         pointer.current = event.pointerId
+        pointerBegan.current = performance.now()
         setPressed(true)
       }}
       onPointerMove={(event) => {
@@ -165,7 +171,7 @@ export function CommitButton({
         if (pointer.current !== event.pointerId) return
         const within = inside(event, event.currentTarget)
         cancel()
-        if (within && !disabled) onCommit()
+        if (within && !disabled) onCommit(pointerBegan.current)
       }}
       onPointerCancel={cancel}
       onLostPointerCapture={cancel}
@@ -180,6 +186,7 @@ export function CommitButton({
           event.preventDefault()
           if (event.repeat) return
           key.current = event.key
+          keyBegan.current = performance.now()
           setPressed(true)
         }
       }}
@@ -188,13 +195,13 @@ export function CommitButton({
         event.preventDefault()
         const armed = key.current === event.key
         cancel()
-        if (armed && !disabled) onCommit()
+        if (armed && !disabled) onCommit(keyBegan.current)
       }}
       onClick={(event) => {
         // This control holds a pointer's capture, so the browser sends it the click after the
         // release wherever the release happened. That click counts the press, which has decided.
         if (event.detail > 0 || disabled) return
-        onCommit()
+        onCommit(performance.now())
       }}
       {...rest}
     >
@@ -251,23 +258,20 @@ export function TwoPressButton({
   const [armedOn, setArmedOn] = useState<string | null>(null)
   const armed = armedOn === armKey
   if (armedOn !== null && armedOn !== armKey) setArmedOn(null)
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const armedAt = useRef(0)
-  const pressedAt = useRef<number | null>(null)
   const wrapper = useRef<HTMLSpanElement>(null)
 
   const disarm = useCallback(() => {
-    if (timer.current !== null) clearTimeout(timer.current)
-    timer.current = null
     setArmedOn(null)
   }, [])
 
-  useEffect(
-    () => () => {
-      if (timer.current !== null) clearTimeout(timer.current)
-    },
-    []
-  )
+  useEffect(() => {
+    if (!armed) return undefined
+    const ends = setTimeout(disarm, ARMED_FOR_MS)
+    return () => {
+      clearTimeout(ends)
+    }
+  }, [armed, disarm])
 
   // While armed, a press anywhere else and Escape end it. Focus alone cannot say so: Safari gives a
   // button no focus when a pointer presses it, so a press elsewhere moves nothing out of focus.
@@ -293,7 +297,6 @@ export function TwoPressButton({
   const [wasDisabled, setWasDisabled] = useState(disabled === true)
   if ((disabled === true) !== wasDisabled) {
     setWasDisabled(disabled === true)
-    // The timer that is left ends in a disarm of a control that is not armed.
     if (disabled === true) setArmedOn(null)
   }
 
@@ -301,12 +304,6 @@ export function TwoPressButton({
     <span
       ref={wrapper}
       className="two-press"
-      onPointerDownCapture={(event) => {
-        if (event.button === 0) pressedAt.current = performance.now()
-      }}
-      onKeyDownCapture={(event) => {
-        if ((event.key === ' ' || event.key === 'Enter') && !event.repeat) pressedAt.current = performance.now()
-      }}
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) disarm()
       }}
@@ -316,14 +313,10 @@ export function TwoPressButton({
         disabled={disabled}
         data-armed={armed ? 'true' : undefined}
         data-wraps=""
-        onCommit={() => {
-          // When this press began; a click that counts no press begins when it comes.
-          const began = pressedAt.current ?? performance.now()
-          pressedAt.current = null
+        onCommit={(began) => {
           if (!armed) {
             setArmedOn(armKey)
             armedAt.current = performance.now()
-            timer.current = setTimeout(disarm, ARMED_FOR_MS)
             return
           }
           if (began - armedAt.current < SECOND_PRESS_AFTER_MS) return

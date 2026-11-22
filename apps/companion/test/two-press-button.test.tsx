@@ -5,7 +5,7 @@
 
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 
 import { ARMED_FOR_MS, SECOND_PRESS_AFTER_MS, TwoPressButton } from '../src/components/ui'
 import { afterTheGuard, holdTheClock } from './two-press'
@@ -193,6 +193,113 @@ describe('a control that commits on its second press', () => {
     await person.click(button)
     expect(commits).not.toHaveBeenCalled()
     expect(button).toHaveAttribute('data-armed', 'true')
+  })
+
+  it('keeps a second arming for its whole time when the arm key changed between', () => {
+    vi.useFakeTimers()
+    const commits = vi.fn()
+    const control = (key: string) => (
+      <TwoPressButton data-testid="control" armedLabel="Press again to remove" armKey={key} onCommit={commits}>
+        Remove
+      </TwoPressButton>
+    )
+    const view = render(control('a'))
+    const button = screen.getByTestId('control')
+    const press = () => {
+      fireEvent.keyDown(button, { key: 'Enter' })
+      fireEvent.keyUp(button, { key: 'Enter' })
+    }
+    const wait = (ms: number) => {
+      act(() => {
+        vi.advanceTimersByTime(ms)
+      })
+    }
+    press()
+    expect(button).toHaveAttribute('data-armed', 'true')
+    wait(1_000)
+    view.rerender(control('b'))
+    expect(button).not.toHaveAttribute('data-armed')
+    wait(1_000)
+    press()
+    expect(button).toHaveAttribute('data-armed', 'true')
+    // The first arming's time is over at 6 s; the second arming has until 8 s.
+    wait(ARMED_FOR_MS - 1)
+    expect(button, 'armed until its own time is over').toHaveAttribute('data-armed', 'true')
+    press()
+    expect(commits).toHaveBeenCalledTimes(1)
+  })
+
+  it('judges a press by its own start after a cancelled press, a second touch and a click that counts no press', () => {
+    const scenario = (): { control: HTMLElement; commits: Mock<() => void> } => {
+      cleanup()
+      const commits = vi.fn<() => void>()
+      shown(commits)
+      const control = screen.getByTestId('control')
+      // A click that counts no press arms it, at the time it comes.
+      fireEvent.click(control)
+      expect(control).toHaveAttribute('data-armed', 'true')
+      return { control, commits }
+    }
+
+    // A press that was cancelled leaves nothing for a click that counts no press, which begins when it comes.
+    let { control, commits } = scenario()
+    vi.advanceTimersByTime(100)
+    fireEvent.pointerDown(control, { button: 0, pointerId: 11 })
+    fireEvent.pointerCancel(control, { pointerId: 11 })
+    vi.advanceTimersByTime(1_000)
+    fireEvent.click(control)
+    expect.soft(commits, 'a click that counts no press, after a cancelled press').toHaveBeenCalledTimes(1)
+
+    // A second touch that begins while the first is down does not give the first its start.
+    ;({ control, commits } = scenario())
+    vi.advanceTimersByTime(100)
+    fireEvent.pointerDown(control, { button: 0, pointerId: 21 })
+    vi.advanceTimersByTime(500)
+    fireEvent.pointerDown(control, { button: 0, pointerId: 22 })
+    vi.advanceTimersByTime(50)
+    fireEvent.pointerUp(control, { pointerId: 21 })
+    expect.soft(commits, 'the first touch began inside the guard').not.toHaveBeenCalled()
+    expect.soft(control).toHaveAttribute('data-armed', 'true')
+
+    // A click that counts no press, in the middle of a key that is down, does not empty the key's start.
+    cleanup()
+    commits = vi.fn<() => void>()
+    shown(commits)
+    control = screen.getByTestId('control')
+    fireEvent.keyDown(control, { key: 'Enter' })
+    vi.advanceTimersByTime(300)
+    fireEvent.click(control)
+    expect(control).toHaveAttribute('data-armed', 'true')
+    vi.advanceTimersByTime(700)
+    fireEvent.keyUp(control, { key: 'Enter' })
+    expect.soft(commits, 'the key began before the arming').not.toHaveBeenCalled()
+    expect.soft(control).toHaveAttribute('data-armed', 'true')
+  })
+
+  it('commits nothing at a key that repeats and once at its release', () => {
+    const commits = vi.fn()
+    shown(commits)
+    const control = screen.getByTestId('control')
+    fireEvent.click(control)
+    expect(control).toHaveAttribute('data-armed', 'true')
+    // A key that goes down inside the guard and repeats past it began inside the guard.
+    vi.advanceTimersByTime(100)
+    fireEvent.keyDown(control, { key: 'Enter' })
+    vi.advanceTimersByTime(200)
+    fireEvent.keyDown(control, { key: 'Enter', repeat: true })
+    vi.advanceTimersByTime(300)
+    fireEvent.keyDown(control, { key: 'Enter', repeat: true })
+    fireEvent.keyUp(control, { key: 'Enter' })
+    expect(commits).not.toHaveBeenCalled()
+    expect(control).toHaveAttribute('data-armed', 'true')
+    // A key that goes down after the guard repeats and commits once, at its release.
+    afterTheGuard()
+    fireEvent.keyDown(control, { key: 'Enter' })
+    fireEvent.keyDown(control, { key: 'Enter', repeat: true })
+    fireEvent.keyDown(control, { key: 'Enter', repeat: true })
+    expect(commits).not.toHaveBeenCalled()
+    fireEvent.keyUp(control, { key: 'Enter' })
+    expect(commits).toHaveBeenCalledTimes(1)
   })
 
   it('keeps the room of its longer label in both states: the sizing copy is the armed label whichever label shows', async () => {
