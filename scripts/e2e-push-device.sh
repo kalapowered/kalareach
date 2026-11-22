@@ -495,6 +495,16 @@ if platform == "android":
             report.get("doze_delivered") is True and request.get("priority") == "high" and request.get("data_only") is True
             and request.get("collapse_key") is True and ttl is not None and 0 < int(ttl.group(1)) <= 4 * 60 * 60, f"{request}")
         number = report.get("doze_message_number")
+        alert_text = ""
+        if isinstance(number, int):
+            try:
+                alert_text = json.load(open(os.path.join(harness, f"inject-{number}.json"), encoding="utf-8"))["message"]["message"]["data"]["alert"]
+            except (OSError, ValueError, KeyError):
+                alert_text = ""
+        posted_dump = read(f"notifications-{number}.txt").split("Enqueued Notification List", 1)[0] if isinstance(number, int) else ""
+        say("the Doze question carried a marker, and neither the provider's message nor the notification the phone listed for it holds the marker or the question's words, only the generic alert",
+            request.get("carries_the_marker") is False and alert_text != "" and alert_text in posted_dump
+            and "kr-marker-4f1c9a" not in posted_dump and "Publish the release" not in posted_dump, f"alert {alert_text!r}")
         state = delivery_state(number) if isinstance(number, int) else {}
         before, after = state.get("before", {}), state.get("after", {})
         say("the delivery was put on the phone while it was in deep Doze, with the screen off, and the application's receiver showed the generic alert with none of the question's text",

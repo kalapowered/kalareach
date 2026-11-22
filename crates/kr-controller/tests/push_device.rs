@@ -850,7 +850,10 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         let entered = run.step_done("doze-on", SCREEN_STEP_WAIT).await;
         report.insert("doze_on_step".to_owned(), json!(entered));
         let before = fcm.sent().len();
-        let dozing = worker.ask_with_context("doze-1", "asked while the phone is in deep Doze");
+        let dozing = worker.ask_with_context(
+            &format!("doze-{MARKER}"),
+            &format!("asked while the phone is in deep Doze {MARKER}"),
+        );
         asked_questions.push(dozing.clone());
         let body = delivery_after(&fcm, &token, before, DELIVERY_WAIT.min(run.left())).await;
         report.insert("doze_delivered".to_owned(), json!(body.is_some()));
@@ -862,6 +865,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
                     "priority": android["priority"],
                     "ttl": android["ttl"],
                     "collapse_key": android["collapse_key"].is_string(),
+                    "carries_the_marker": body.to_string().contains(MARKER),
                     "data_only": body["message"]["notification"].is_null()
                         && android["notification"].is_null()
                         && body["message"]["data"]["alert"].is_string(),
