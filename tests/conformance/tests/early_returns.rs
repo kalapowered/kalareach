@@ -77,6 +77,11 @@ const ALLOWED: &[Allowed] = &[
         reason: "the child half of the case, a program the case starts: it prints the marker the case reads and ends, and the case fails for the marker",
     },
     Allowed {
+        path: "crates/kr-cli/tests/retained_surface/history.rs",
+        said: "snapshot {}: the tree cannot be read",
+        reason: "the helper that reads a tag's tree says which tag Cargo cannot read and returns it as a failed snapshot; the audit that reads the snapshot fails and names the tag, so no case passes on it",
+    },
+    Allowed {
         path: "crates/kr-cli/tests/upgrade.rs",
         said: "inside the level: no kept release",
         reason: "the helper that finds the release runs once for the program; each case that needs it says on its own line that it did not run",
