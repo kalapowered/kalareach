@@ -2920,6 +2920,7 @@ fn a_loading_in_a_path_a_status_line_or_the_history_is_not_the_start_draft() {
         "› the loading screen shows a spinner",
         "  Codex is loading it",
         "  │ echo loading data",
+        "  the loading │",
         "› Ask Codex to do anything",
         "  gpt-5.5 loading · ~/work",
         "  loading",
@@ -2927,7 +2928,7 @@ fn a_loading_in_a_path_a_status_line_or_the_history_is_not_the_start_draft() {
     assert_eq!(
         draft_showing(&elsewhere, composer, &draft),
         None,
-        "a path, the history, a command's continuation row and the status line under the composer are no draft"
+        "a path, the history, a command's continuation row, a row that only closes with the frame and the status line under the composer are no draft"
     );
     assert!(
         start_is_over(&elsewhere, composer, &draft),
