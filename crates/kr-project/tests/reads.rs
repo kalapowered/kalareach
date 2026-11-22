@@ -959,11 +959,28 @@ mod confined {
             /// Attaches it at `spelled`, which is another name for `directory`, and detaches it
             /// by `directory`.
             fn spelled(directory: &Path, spelled: &Path, scratch: &Path) -> Option<Self> {
-                let image = scratch.join(format!("{}.dmg", uuid::Uuid::new_v4().simple()));
+                let name = uuid::Uuid::new_v4().simple().to_string();
+                let image = scratch.join(format!("{name}.dmg"));
+                // The image is made from a directory that holds the file the indexer looks for as
+                // the volume is attached, in the read and write format a source directory needs.
+                let contents = kr_ipc::testing::volumes::never_indexed_contents(
+                    scratch,
+                    &format!("{name}-contents"),
+                );
                 let made = Command::new("/usr/bin/hdiutil")
                     .args([
-                        "create", "-size", "2m", "-fs", "APFS", "-volname", "krreads",
+                        "create",
+                        "-size",
+                        "2m",
+                        "-fs",
+                        "APFS",
+                        "-volname",
+                        "krreads",
+                        "-format",
+                        "UDRW",
+                        "-srcfolder",
                     ])
+                    .arg(&contents)
                     .arg(&image)
                     .output();
                 let Ok(made) = made else {
@@ -978,7 +995,13 @@ mod confined {
                     return None;
                 }
                 let attached = Command::new("/usr/bin/hdiutil")
-                    .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
+                    .args([
+                        "attach",
+                        "-nobrowse",
+                        "-noverify",
+                        "-noautoopen",
+                        "-mountpoint",
+                    ])
                     .arg(spelled)
                     .arg(&image)
                     .output();
@@ -1065,6 +1088,25 @@ mod confined {
                 said(&*failing.expect_err("the case fails")),
                 "the case's own failure"
             );
+        }
+
+        /// A disk image this file attaches is one the system's indexer is told to leave alone: the
+        /// file that says so is at the root of the volume as it is attached, because the indexer
+        /// looks for it then, and a volume that something indexes is one that is held when the case
+        /// detaches it.
+        #[test]
+        fn a_disk_image_a_case_attaches_is_one_the_indexer_leaves_alone() {
+            let scratch = tempfile::TempDir::new().expect("a directory for the image");
+            let mounted = scratch.path().join("mounted");
+            std::fs::create_dir(&mounted).expect("a directory to attach at");
+            let Some(attached) = Attached::at(&mounted, scratch.path()) else {
+                return;
+            };
+            assert!(
+                mounted.join(".metadata_never_index").is_file(),
+                "the volume holds the file that keeps it from being indexed"
+            );
+            drop(attached);
         }
 
         /// A secret in the machine's shared temporary directory, and the system's own hosts file,
