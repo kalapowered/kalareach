@@ -418,6 +418,76 @@ pub fn boundary_token(account: &str, group: &Sid) -> Result<Handle> {
     Ok(token)
 }
 
+/// The token's information of one class, in a buffer that is aligned for the records it holds.
+fn information(token: &Handle, class: i32, what: &'static str) -> Result<Vec<u64>> {
+    let mut needed = 0_u32;
+    // SAFETY: the first call only asks for the size.
+    unsafe {
+        GetTokenInformation(token.raw(), class, null_mut(), 0, &raw mut needed);
+    }
+    let mut buffer = vec![0_u64; (needed as usize).div_ceil(8).max(1)];
+    // SAFETY: the buffer is the size the first call asked for and is aligned.
+    if unsafe {
+        GetTokenInformation(
+            token.raw(),
+            class,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &raw mut needed,
+        )
+    } == 0
+    {
+        // text: token_information-1
+        return Err(last(what));
+    }
+    Ok(buffer)
+}
+
+/// Reads the token back and refuses one that differs from what the broker made: its owner is the
+/// invocation's group, its account's own identifier is deny-only, and the group is among its
+/// groups.
+///
+/// # Errors
+///
+/// Returns the platform's error when the token cannot be read, or an error that names what differs.
+pub fn read_back(token: &Handle, group: &Sid) -> Result<()> {
+    use windows_sys::Win32::Security::{TOKEN_GROUPS, TokenGroups};
+    let owner = information(token, TokenOwner, "reading the token's owner")?;
+    // SAFETY: the buffer holds a TOKEN_OWNER whose identifier points inside it.
+    let owner = unsafe { Sid::from_ptr((*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner) };
+    if owner != *group {
+        // text: token_read_back-1
+        return Err(error(0, "the token's owner is not the invocation's group"));
+    }
+    let user = information(token, TokenUser, "reading the token's account")?;
+    // SAFETY: the buffer holds a TOKEN_USER, which is a SID_AND_ATTRIBUTES.
+    let attributes = unsafe { (*user.as_ptr().cast::<SID_AND_ATTRIBUTES>()).Attributes };
+    // The attribute that makes an identifier match a deny entry and nothing else.
+    const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+    if attributes & SE_GROUP_USE_FOR_DENY_ONLY == 0 || attributes & (SE_GROUP_ENABLED as u32) != 0 {
+        // text: token_read_back-2
+        return Err(error(0, "the token's account is not deny-only"));
+    }
+    let groups = information(token, TokenGroups, "reading the token's groups")?;
+    // SAFETY: the buffer holds a TOKEN_GROUPS record and its entries.
+    let record = unsafe { &*groups.as_ptr().cast::<TOKEN_GROUPS>() };
+    // SAFETY: the record holds `GroupCount` entries from its first.
+    let entries =
+        unsafe { std::slice::from_raw_parts(record.Groups.as_ptr(), record.GroupCount as usize) };
+    // SAFETY: each entry's identifier points inside the buffer.
+    if !entries
+        .iter()
+        .any(|entry| unsafe { Sid::from_ptr(entry.Sid) } == *group)
+    {
+        // text: token_read_back-3
+        return Err(error(
+            0,
+            "the invocation's group is not among the token's groups",
+        ));
+    }
+    Ok(())
+}
+
 /// A token for an account with no invocation group and the account's identifier enabled. Nothing
 /// runs under it: it stands for what the account holds on its own, which is what a check of the
 /// account's reach is made against.

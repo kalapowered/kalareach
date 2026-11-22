@@ -793,3 +793,17 @@ MAINTENANCE_WORDS | the broker is in maintenance and starts no operation | the b
 TRANSPORT_WORDS | the client did not connect to the output pipes within ten seconds | the client did not connect to the output pipes within ten seconds | rule: DataPipes::wait_connected answered that the bound ran out before both pipes had the retained client connected
 NOT_STARTED_WORDS | the broker could not start the operation | the broker could not start the operation: {reason} | rule: a phase between the account's choice and the primary child's resume failed; the reason is the platform's or the check's own words
 listed | pub const | lifecycle.rs | 6 | names of rules, for cases and documents; no sentence for a person
+scan_list-1 | listing the processes of the machine | listing the processes of the machine: Windows error N | read: NtQuerySystemInformation answered the status that the number gives
+scan_created_of-1 | reading a process's creation time | reading a process's creation time: Windows error N | read: GetProcessTimes on a process that was opened for a limited query returned an error
+scan_look-1 | looking at a process | looking at a process: Windows error N | read: OpenProcess with the limited query right on the number that the list gave returned an error
+scan_carries-1 | opening a process's token | opening a process's token: Windows error N | read: OpenProcessToken on a process opened for a limited query returned an error
+scan_carries-2 | opening a process's token | opening a process's token: Windows error N | read: the token handle that OpenProcessToken made was not valid
+scan_carries-3 | reading a process's groups | reading a process's groups: Windows error N | read: GetTokenInformation for the token's groups returned an error
+session_of-1 | reading the logon session of a token | reading the logon session of a token: Windows error N | read: GetTokenInformation for the token's statistics returned an error
+sessions-1 | listing the logon sessions | listing the logon sessions: Windows error N | read: LsaEnumerateLogonSessions answered a status that LsaNtStatusToWinError turned into the number
+sessions_of-1 | reading the data of a logon session | reading the data of a logon session: Windows error N | read: LsaGetLogonSessionData for a session of the list answered a status other than success and than that the session is gone
+launch_handle_values-1 | listing the handles of a suspended child | listing the handles of a suspended child: Windows error N | read: NtQueryInformationProcess for the handles of the suspended child answered the status that the number gives
+token_information-1 | last(what) | the words that the caller gave: Windows error N | read: GetTokenInformation for the class that the caller names returned an error; the caller's words say which
+token_read_back-1 | the token's owner is not the invocation's group | the token's owner is not the invocation's group | read: the owner that GetTokenInformation gave back is not the group that the token was made with
+token_read_back-2 | the token's account is not deny-only | the token's account is not deny-only | read: the token's user entry has no deny-only attribute or is enabled
+token_read_back-3 | the invocation's group is not among the token's groups | the invocation's group is not among the token's groups | read: no entry of the token's groups is the group
