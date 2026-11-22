@@ -868,7 +868,7 @@ impl Invocation {
     /// that failed.
     ///
     /// The helper is waited for [`END_STATUS_LIMIT`] and ended and collected past it, as
-    /// [`start_and_acknowledge`] does for a stream that fails before the acknowledgement. Any
+    /// `start_and_acknowledge` does for a stream that fails before the acknowledgement. Any
     /// other refusal is returned as it is, and the helper goes with the invocation.
     pub async fn settled(self, refusal: Refusal) -> Refusal {
         match refusal {
