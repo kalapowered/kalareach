@@ -660,6 +660,11 @@ APPLICATION_CONTROL_STARTING | Windows starts application control after the serv
 STILL_STARTING | Windows is still starting application control after the restart | Windows is still starting application control after the restart; try again in a few minutes | flow: the broker's answer to every request while its proof of the boundary has not passed
 PER_CLIENT_WORDS | this account already has the most repository operations | this account already has the most repository operations the broker runs at once; wait for one to finish | rule: InvocationCounts::admit found the account's count at the per-account limit
 PER_MACHINE_WORDS | the broker already runs the most repository operations | the broker already runs the most repository operations it allows on this computer; try again when one has finished | rule: InvocationCounts::admit found the computer's total at the per-computer limit
+ELEVATED_WORDS | this program runs with administrator rights | this program runs with administrator rights; run it from an ordinary session, not an elevated one | read: standing::refuse over the facts of the caller's token (the elevation flag, the Administrators group enabled, or an integrity level of high or above)
+RESTRICTED_WORDS | this program runs with a restricted token | this program runs with a restricted token; run it from an ordinary session | read: standing::refuse over the token's restricted flag (IsTokenRestricted)
+APP_CONTAINER_WORDS | this program runs inside an app container | this program runs inside an app container; run it from an ordinary session | read: standing::refuse over the token's app container flag (TokenIsAppContainer)
+LOW_WORDS | this program runs at a low integrity level | this program runs at a low integrity level; run it from an ordinary session | read: standing::refuse over the token's integrity level below medium (TokenIntegrityLevel)
+LEVEL_WORDS | the broker cannot identify the caller at the level | the broker cannot identify the caller at the level its connection allows | read: standing::refuse over the connection's impersonation level below identification (the caller opened the pipe anonymously)
 ADMINISTRATORS_ONLY | this pipe answers hello and status only | this pipe answers hello and status only; ask for a state change or a proof on the administrators' pipe | rule: the persons' pipe serves hello and status only
 USAGE | usage: kr-boundary-setup install|repair --payload DIRECTORY | usage: kr-boundary-setup install|repair --payload DIRECTORY [--person SID]; remove; status | rule: what the setup program prints for a command line that is not one; no machine fact
 system_form | FormatMessageW( | the code in hexadecimal and the system's message for it | read: FormatMessageW's text for the code (an HRESULT that wraps a Windows error is looked up by that error)
@@ -718,6 +723,7 @@ listed | pub const | policy.rs | 8 | names, keys, limits, encodings and paths; n
 listed | pub const | repository/attributes.rs | 7 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | repository/config.rs | 17 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | limits.rs | 2 | names of rules, for cases and documents; no sentence for a person
+listed | pub const | standing.rs | 5 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | repository/readers.rs | 8 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/install.rs | 3 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person

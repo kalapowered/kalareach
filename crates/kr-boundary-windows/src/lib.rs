@@ -28,6 +28,7 @@
 //! | [`messages`] | The product's own messages whose exact words are fixed: the installer's wait for application control, and the broker's answer while its proof has not passed |
 //! | [`operation`] | The eight commands a request may name: their argument tables, the settings every command runs with, the one rule for line endings, and the checks of the repository's state |
 //! | [`pipe_access`] | The rights of a client of the broker's pipe, one value for the entry the broker grants and the request the installer makes |
+//! | [`standing`] | Which clients of the broker are refused for what their token is: an elevated token, a restricted one, an app container, a low integrity level, a connection that cannot be identified |
 //! | [`state`] | What the doctor says in each state of the installation |
 //! | [`window`] | When the proof's search for a refusal is over: a run cut by the window's own end ends it, a run that failed does not |
 //!
@@ -74,6 +75,7 @@ pub mod refusal;
 pub mod remedy;
 pub mod repository;
 pub mod setup_args;
+pub mod standing;
 pub mod state;
 pub mod window;
 
