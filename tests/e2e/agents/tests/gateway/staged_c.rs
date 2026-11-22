@@ -1578,12 +1578,27 @@ fn a_start_whose_process_ended_is_an_end_whatever_the_screen_shows_of_the_typed_
     );
 }
 
-/// The agent's process below the worker of `session_id` now: one read of the process table.
-fn agent_now(ctx: &Context, session_id: SessionId) -> Option<ProcessStartIdentity> {
+/// The agent's process below the worker of `session_id` now: one read of the process table, or why
+/// the table could not be read.
+fn agent_now(ctx: &Context, session_id: SessionId) -> Result<Option<ProcessStartIdentity>, String> {
     let worker =
         u32::try_from(ctx.run.worker_of(&session_id.to_string()).pid.get()).expect("a pid");
-    process_mapping_once(worker, inode_of(&ctx.executable), None)
-        .unwrap_or_else(|why| panic!("the agent's process was not looked for: {why}"))
+    process_mapping_once(worker, inode_of(&ctx.executable), None).map_err(|why| why.to_string())
+}
+
+/// What a part says when the process table could not be read for the agent's process: a read that
+/// failed, which is not a read that found nothing.
+fn process_not_looked_for(why: &str) -> String {
+    format!("the agent's process could not be looked for: {why}")
+}
+
+/// A failed read of the process table is said to be one that could not look, not one that did not.
+#[test]
+fn a_failed_read_of_the_process_table_says_the_agents_process_could_not_be_looked_for() {
+    assert_eq!(
+        process_not_looked_for("ps did not end"),
+        "the agent's process could not be looked for: ps did not end"
+    );
 }
 
 /// How long the window must have taken no byte, after the agent's process is seen to end, before the
@@ -1670,7 +1685,8 @@ fn second_start(
     let started = Instant::now();
     loop {
         if agent.is_none() {
-            agent = agent_now(ctx, at.session_id);
+            agent = agent_now(ctx, at.session_id)
+                .unwrap_or_else(|why| panic!("{}", process_not_looked_for(&why)));
         }
         let ended = agent.as_ref().is_some_and(|identity| !running(identity));
         let window = &at.person.window;
@@ -1705,22 +1721,44 @@ fn second_start(
 }
 
 /// What became of the agent's process after it refused the second start.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Standing {
     /// It went on running with the conversation open read-only and a notice in place of the
     /// composer, as Codex does.
     ReadOnly,
     /// It ended after the refusal, or was not found once the refusal showed.
     Ended,
+    /// The process table could not be read, so the standing is not known; the refusal is as it was.
+    Unknown(String),
 }
 
 /// How a refused start stands, from whether the agent's process runs now (`None` where none was
-/// found below the session's worker).
-fn refusal_standing(runs: Option<bool>) -> Standing {
-    if runs.unwrap_or(false) {
-        Standing::ReadOnly
-    } else {
-        Standing::Ended
+/// found below the session's worker), or why the process table could not be read.
+fn refusal_standing(runs: Result<Option<bool>, String>) -> Standing {
+    match runs {
+        Ok(runs) if runs.unwrap_or(false) => Standing::ReadOnly,
+        Ok(_) => Standing::Ended,
+        Err(why) => Standing::Unknown(why),
+    }
+}
+
+/// What part 7's evidence records of a refusal's standing, by key: where the standing is not known
+/// both answers are null, and the reason stands beside them.
+fn standing_evidence(standing: &Standing) -> Vec<(&'static str, serde_json::Value)> {
+    match standing {
+        Standing::ReadOnly => vec![
+            ("still_running_read_only", serde_json::json!(true)),
+            ("ended_after_the_refusal", serde_json::json!(false)),
+        ],
+        Standing::Ended => vec![
+            ("still_running_read_only", serde_json::json!(false)),
+            ("ended_after_the_refusal", serde_json::json!(true)),
+        ],
+        Standing::Unknown(why) => vec![
+            ("still_running_read_only", serde_json::Value::Null),
+            ("ended_after_the_refusal", serde_json::Value::Null),
+            ("process_read_failed", serde_json::json!(why)),
+        ],
     }
 }
 
@@ -1729,12 +1767,43 @@ fn refusal_standing(runs: Option<bool>) -> Standing {
 /// refusal either way.
 #[test]
 fn a_refusal_that_ended_the_agent_is_an_ended_refusal_and_a_card_that_runs_is_read_only() {
-    assert_eq!(refusal_standing(Some(true)), Standing::ReadOnly);
-    assert_eq!(refusal_standing(Some(false)), Standing::Ended);
-    assert_eq!(refusal_standing(None), Standing::Ended);
+    assert_eq!(refusal_standing(Ok(Some(true))), Standing::ReadOnly);
+    assert_eq!(refusal_standing(Ok(Some(false))), Standing::Ended);
+    assert_eq!(refusal_standing(Ok(None)), Standing::Ended);
     let refused = taken(Started::Refused, None, None).expect("a refusal is an outcome");
     assert_eq!(refused, Taken::Refused);
     assert!(check_taken(false, refused).is_ok());
+}
+
+/// A refusal whose process table could not be read afterwards is still a refusal: the evidence
+/// records an unknown standing, with the reason, in place of failing a part that passed.
+#[test]
+fn a_refusal_whose_process_table_could_not_be_read_records_an_unknown_standing() {
+    let unknown = refusal_standing(Err("ps did not end".to_owned()));
+    assert_eq!(unknown, Standing::Unknown("ps did not end".to_owned()));
+    assert_eq!(
+        standing_evidence(&unknown),
+        vec![
+            ("still_running_read_only", serde_json::Value::Null),
+            ("ended_after_the_refusal", serde_json::Value::Null),
+            ("process_read_failed", serde_json::json!("ps did not end")),
+        ],
+        "neither answer is claimed, and the reason is kept"
+    );
+    assert_eq!(
+        standing_evidence(&Standing::Ended),
+        vec![
+            ("still_running_read_only", serde_json::json!(false)),
+            ("ended_after_the_refusal", serde_json::json!(true)),
+        ]
+    );
+    assert_eq!(
+        standing_evidence(&Standing::ReadOnly),
+        vec![
+            ("still_running_read_only", serde_json::json!(true)),
+            ("ended_after_the_refusal", serde_json::json!(false)),
+        ]
+    );
 }
 
 /// Every file of the agent's record with its content, in the order of their places.
@@ -2002,18 +2071,15 @@ fn second_process(
             // and a notice in place of the composer: a refusal is an outcome either way, and the
             // process is recorded as it stands. Session A's conversation is as it was, since a
             // read-only view writes nothing.
-            let standing = refusal_standing(
-                agent_seen
-                    .or_else(|| agent_now(ctx, b.session_id))
-                    .as_ref()
-                    .map(running),
-            );
+            let standing = refusal_standing(match agent_seen {
+                Some(identity) => Ok(Some(running(&identity))),
+                None => agent_now(ctx, b.session_id).map(|found| found.as_ref().map(running)),
+            });
             record_unchanged(&record_before, &record_files(ctx, real))
                 .unwrap_or_else(|why| panic!("session A's conversation is as it was: {why}"));
-            evidence["session_b"]["still_running_read_only"] =
-                serde_json::json!(standing == Standing::ReadOnly);
-            evidence["session_b"]["ended_after_the_refusal"] =
-                serde_json::json!(standing == Standing::Ended);
+            for (key, value) in standing_evidence(&standing) {
+                evidence["session_b"][key] = value;
+            }
         } else {
             // The agent's start ended: the host shows no instance for it.
             check_unchanged(None, &shown_now(ctx, &b)).unwrap_or_else(|why| {
