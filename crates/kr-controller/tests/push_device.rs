@@ -667,6 +667,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
             "provider_message_shape".to_owned(),
             json!({
                 "android_data_only": message["android"].is_object()
+                    && message["notification"].is_null()
                     && message["android"]["notification"].is_null()
                     && message["data"]["alert"].is_string(),
                 "android_priority": message["android"]["priority"],
@@ -861,7 +862,8 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
                     "priority": android["priority"],
                     "ttl": android["ttl"],
                     "collapse_key": android["collapse_key"].is_string(),
-                    "data_only": android["notification"].is_null()
+                    "data_only": body["message"]["notification"].is_null()
+                        && android["notification"].is_null()
                         && body["message"]["data"]["alert"].is_string(),
                 }),
             );
