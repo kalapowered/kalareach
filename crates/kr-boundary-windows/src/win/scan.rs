@@ -228,8 +228,32 @@ pub fn is_alive(pid: u32, created: u64) -> Result<bool> {
 /// looked at is not an error of the scan: it is a line of the report where it appeared after the
 /// invocation began.
 pub fn scan(facts: &Facts<'_>) -> Result<Report> {
+    Ok(scan_entries(facts, &list()?))
+}
+
+/// Seams for the test build.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use super::{Entry, Facts, Report, scan_entries};
+
+    /// The scan over the processes a case names, by number and creation time, as if the system's
+    /// list held them.
+    #[must_use]
+    pub fn scan_listed(facts: &Facts<'_>, listed: &[(u32, u64)]) -> Report {
+        let entries: Vec<Entry> = listed
+            .iter()
+            .map(|(pid, created)| Entry {
+                pid: *pid,
+                created: *created,
+            })
+            .collect();
+        scan_entries(facts, &entries)
+    }
+}
+
+fn scan_entries(facts: &Facts<'_>, entries: &[Entry]) -> Report {
     let mut report = Report::default();
-    for entry in list()? {
+    for entry in entries {
         report.listed += 1;
         if entry.pid == 0 || entry.pid == 4 {
             continue;
@@ -290,5 +314,5 @@ pub fn scan(facts: &Facts<'_>) -> Result<Report> {
             }
         }
     }
-    Ok(report)
+    report
 }

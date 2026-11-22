@@ -21,13 +21,16 @@ use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, GENERIC_READ, GetLastError, HANDLE,
     INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+use windows_sys::Win32::Security::{
+    CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx, SecurityImpersonation,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, TokenImpersonation,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, OPEN_EXISTING, ReadFile, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
-    PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess,
+    PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, SetThreadToken, TerminateProcess,
 };
 
 use kr_boundary_windows::env::{Kind as EnvKind, QualifiedGit, RootPaths, build_env};
@@ -57,7 +60,7 @@ use kr_boundary_windows::win::pipe::{
 };
 use kr_boundary_windows::win::rights::ImpersonationToken;
 use kr_boundary_windows::win::sd::descriptor_from_text;
-use kr_boundary_windows::win::{account, acl, boot, broker, session, token};
+use kr_boundary_windows::win::{account, acl, boot, broker, scan, session, token};
 
 mod common;
 use common::Scratch;
@@ -1358,6 +1361,123 @@ fn a_stop_of_the_service_during_the_reader_or_the_wait_for_the_pipes_ends_by_the
             })
         ),
         "{replies:?}"
+    );
+}
+
+/// Runs `body` on this thread under a copy of this process's token that holds no privilege, which is
+/// the service's condition: its token holds no debug privilege and gets none.
+fn without_privileges<T>(body: impl FnOnce() -> T) -> T {
+    let mut process_token: HANDLE = null_mut();
+    // SAFETY: opens this process's token for copying; the result is checked and owned below.
+    unsafe {
+        assert_ne!(
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+                &raw mut process_token
+            ),
+            0,
+            "this process's token opens"
+        );
+    }
+    let process_token = Handle::new(process_token, "this process's token").unwrap();
+    let mut restricted: HANDLE = null_mut();
+    // SAFETY: makes a copy that holds no privilege; the result is checked and owned below.
+    unsafe {
+        assert_ne!(
+            CreateRestrictedToken(
+                process_token.raw(),
+                DISABLE_MAX_PRIVILEGE,
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                &raw mut restricted
+            ),
+            0,
+            "the token loses its privileges"
+        );
+    }
+    let restricted = Handle::new(restricted, "the token without privileges").unwrap();
+    let mut impersonation: HANDLE = null_mut();
+    // SAFETY: makes an impersonation copy; the result is checked and owned below.
+    unsafe {
+        assert_ne!(
+            DuplicateTokenEx(
+                restricted.raw(),
+                TOKEN_IMPERSONATE | TOKEN_QUERY,
+                null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &raw mut impersonation
+            ),
+            0,
+            "the token is copied for impersonation"
+        );
+    }
+    let impersonation = Handle::new(impersonation, "the impersonation token").unwrap();
+    // SAFETY: sets this thread's token for the body and takes it away after.
+    unsafe {
+        assert_ne!(SetThreadToken(null(), impersonation.raw()), 0);
+    }
+    let result = body();
+    // SAFETY: takes the token from this thread.
+    unsafe {
+        SetThreadToken(null(), null_mut());
+    }
+    result
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn the_scan_reports_a_process_that_refuses_a_limited_look_and_not_one_that_is_gone() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    prepare();
+    let scratch = Scratch::new();
+    let marker = scratch.path("hidden.txt");
+    // A process that took every entry out of its own permission list: a limited look is refused.
+    let mut child = std::process::Command::new(bin().join("kr-launch-stand-in.exe"))
+        .args(["hide", "120000", &marker.display().to_string()])
+        .spawn()
+        .unwrap();
+    let said = wait_for_file(&marker);
+    let pid = child.id();
+    let created = creation_of(&process_handle(pid));
+    // A number that no process has.
+    let gone = u32::MAX - 3;
+    let group = Sid::parse("S-1-9-1-2-3-4").unwrap();
+    let facts = scan::Facts {
+        group: &group,
+        job: None,
+        since: 0,
+    };
+    let report = without_privileges(|| {
+        scan::testing::scan_listed(&facts, &[(pid, created), (gone, u64::MAX)])
+    });
+    child.kill().unwrap();
+    let _ = child.wait();
+    assert!(
+        said.trim() == format!("{pid} hidden"),
+        "the child did not hide: {said:?}"
+    );
+    assert!(
+        report
+            .reports
+            .iter()
+            .any(|line| line.starts_with(&format!("process {pid} "))),
+        "a process that refuses a limited look is reported: {report:?}"
+    );
+    assert!(
+        !report
+            .reports
+            .iter()
+            .any(|line| line.starts_with(&format!("process {gone} "))),
+        "a process that is gone is not reported: {report:?}"
     );
 }
 
