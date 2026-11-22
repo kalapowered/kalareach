@@ -22,9 +22,6 @@ use super::{Blocked, ChildPlan, EndCheck, Release, Slot, TreeHold, Trees};
 /// Builds what the primary child runs, from the private root.
 pub type Plan = Box<dyn Fn(&PrivateRoot) -> Result<ChildPlan, String> + Send + Sync>;
 
-/// Builds the readers that run before the grant.
-pub type Readers = Box<dyn Fn(&PrivateRoot) -> Vec<ChildPlan> + Send + Sync>;
-
 #[derive(Debug)]
 enum Lock {
     Free,
@@ -48,7 +45,6 @@ pub struct FixtureTrees {
     dir: PathBuf,
     lock: Arc<Mutex<Lock>>,
     primary: Arc<Plan>,
-    readers: Arc<Readers>,
     grants: u64,
     /// What a case reads.
     pub counts: Arc<Counts>,
@@ -63,18 +59,10 @@ impl FixtureTrees {
             dir,
             lock: Arc::new(Mutex::new(Lock::Free)),
             primary: Arc::new(primary),
-            readers: Arc::new(Box::new(|_| Vec::new())),
             grants: 0,
             counts: Arc::new(Counts::default()),
             left: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    /// Readers that run before the grant.
-    #[must_use]
-    pub fn with_readers(mut self, readers: Readers) -> FixtureTrees {
-        self.readers = Arc::new(readers);
-        self
     }
 
     /// How many objects the grant records.
@@ -119,7 +107,6 @@ impl FixtureTrees {
             granted: to_release,
             intents,
             primary: Arc::clone(&self.primary),
-            readers: Arc::clone(&self.readers),
         }
     }
 }
@@ -141,7 +128,6 @@ impl Slot for FixtureSlot {
 struct FixtureTree {
     path: String,
     primary: Arc<Plan>,
-    readers: Arc<Readers>,
     counts: Arc<Counts>,
     left: Arc<Mutex<Vec<Left>>>,
     grants: u64,
@@ -164,10 +150,6 @@ impl TreeHold for FixtureTree {
 
     fn initial_snapshot(&self) -> Option<Row> {
         None
-    }
-
-    fn readers(&mut self, root: &PrivateRoot) -> Result<Vec<ChildPlan>, Refusal> {
-        Ok((self.readers)(root))
     }
 
     fn grant(

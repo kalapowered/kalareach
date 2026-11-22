@@ -127,7 +127,7 @@ impl Run<'_> {
             _ => None,
         };
         // Terminate and wait.
-        let retained: Vec<&Child> = self.readers.iter().chain(self.primary.iter()).collect();
+        let retained: Vec<&Child> = self.primary.iter().collect();
         let ended = match self.job.as_mut() {
             Some(job) => job.end(&retained, Instant::now() + bounds.end),
             None => Ended {
@@ -164,7 +164,6 @@ impl Run<'_> {
         // Every handle the broker holds that keeps the invocation's token alive is closed before the
         // wait for the session: the token, and the process objects of the children, which refer to
         // their token for as long as they exist.
-        self.readers.clear();
         self.primary = None;
         self.token = None;
         #[cfg(feature = "testing")]
