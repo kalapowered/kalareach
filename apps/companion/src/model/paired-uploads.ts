@@ -18,6 +18,7 @@ import type { AttachmentHandle, HandedFile, HostPort, OpenUpload, SessionSubject
 import { describeBytes } from '../mobile/model/media'
 import {
   CANCELLED_BEFORE_SENT,
+  NO_LONGER_HELD,
   PUBLISHED_AND_KEPT,
   isNoOpenUpload,
   refusalOf,
@@ -351,8 +352,10 @@ export class PairedUploads {
     this.#poll()
     return this.#port.attachmentUploadBytes(file, subject, key).then(
       async (handle) => {
-        // A cancel that was asked and found the file published: the file was sent, and the row says so.
-        const asked = this.#rows.get(key)?.phase.kind === 'cancelAsked'
+        // A cancel that was asked, or whose answer is still to come, and found the file published:
+        // the file was sent, and the row says so.
+        const phase = this.#rows.get(key)?.phase.kind
+        const asked = phase === 'cancelAsked' || phase === 'cancelling'
         this.#patch(key, {
           handle,
           phase: { kind: 'adding' },
@@ -364,13 +367,15 @@ export class PairedUploads {
       },
       async (failure: unknown) => {
         still()
+        // No call of this window waits for the upload any more, whatever the row says.
+        this.#patch(key, { awaited: false })
         const refusal = refusalOf(failure)
         const phase = this.#rows.get(key)?.phase.kind
         // The person's own cancel has said what became of it; a cancel asked is ended only by the
         // application saying it was cancelled.
         if (phase !== 'cancelling' && phase !== 'cancelled' && !(phase === 'cancelAsked' && refusal.kind !== 'cancelled')) {
           if (refusal.kind === 'cancelled') {
-            this.#patch(key, { phase: { kind: 'cancelled', released: null }, awaited: false })
+            this.#patch(key, { phase: { kind: 'cancelled', released: null } })
           } else {
             // A reservation the application still keeps stays on the screen with what the application
             // says of it, so that it can be cancelled; only an upload it keeps nothing of is refused.
@@ -379,14 +384,14 @@ export class PairedUploads {
             if (kept === UNREAD) {
               // Not knowing is not the same as nothing kept: the row says what was refused, and the
               // next read of the list decides whether the application holds the upload.
-              this.#patch(key, { phase: { kind: 'refused', refusal }, awaited: false, unread: true })
+              this.#patch(key, { phase: { kind: 'refused', refusal }, unread: true })
               this.#poll()
             } else {
               this.#patch(
                 key,
                 kept === null
-                  ? { phase: { kind: 'refused', refusal }, awaited: false }
-                  : { phase: phaseOf(kept), handle: kept.handle ?? undefined, awaited: false }
+                  ? { phase: { kind: 'refused', refusal } }
+                  : { phase: phaseOf(kept), handle: kept.handle ?? undefined }
               )
             }
           }
@@ -435,7 +440,14 @@ export class PairedUploads {
         this.#patch(key, { phase: { kind: 'bound' } })
       } catch (failure) {
         if (isReset(failure)) throw failure
-        this.#patch(key, { phase: { kind: 'kept', words: wordsOf(failure) || null } })
+        // The application holds no record of the file any more: it cannot be added from here, and no
+        // read of its list moves this row. The person removes it and attaches the file again.
+        this.#patch(
+          key,
+          isNoOpenUpload(failure)
+            ? { phase: { kind: 'refused', refusal: { kind: 'other', words: NO_LONGER_HELD } } }
+            : { phase: { kind: 'kept', words: wordsOf(failure) || null } }
+        )
       }
     })
   }
@@ -586,10 +598,14 @@ export class PairedUploads {
     if (!canCancel(row.phase)) return
     const before = row.phase
     const cycle = this.#cycle
-    this.#patch(key, { phase: { kind: 'cancelling' }, note: null })
+    const cancelling: Phase = { kind: 'cancelling' }
+    this.#patch(key, { phase: cancelling, note: null })
+    // The answer applies only while the row is still in the state this call put it in: a result of
+    // the upload, a bind or a read that moved the row on has said what became of the file already.
+    const applies = (): boolean => cycle === this.#cycle && this.#rows.get(key)?.phase === cancelling
     try {
       const answer = await this.#port.uploadCancel(key)
-      if (cycle !== this.#cycle) return
+      if (!applies()) return
       if (answer.state === 'published') {
         const handle = answer.handle ?? this.#rows.get(key)?.handle ?? null
         const waiting = this.#rows.get(key)?.awaited === true
@@ -612,7 +628,7 @@ export class PairedUploads {
         awaited: false
       })
     } catch (failure) {
-      if (cycle !== this.#cycle) return
+      if (!applies()) return
       if (isNoOpenUpload(failure)) {
         // The application holds no such upload: nothing was cancelled, and the file is as it was.
         this.#patch(key, { phase: before, note: refusalOf(failure).words })

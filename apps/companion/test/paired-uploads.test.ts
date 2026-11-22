@@ -7,7 +7,7 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { fakeHost } from '../src/host/fake'
-import type { OpenUpload } from '../src/host/port'
+import type { OpenUpload, UploadCancelled } from '../src/host/port'
 import { PairedUploads, boundIdsOf, canCancel, lineOf, type Phase } from '../src/model/paired-uploads'
 import * as words from '../src/model/transfer-words'
 import openTransfers from '../src-tauri/src/open_transfers.rs?raw'
@@ -519,6 +519,173 @@ describe('the list of the application is read once at a time', () => {
     replies[1]?.()
     expect(await current).toEqual([view])
     expect(await joined).toEqual([view])
+  })
+})
+
+describe('the answer to a cancel applies only to the row that asked it', () => {
+  const file = { name: 'a.pdf', bytes: new Uint8Array(10) }
+  const subject = { sessionId: 's-1', sessionEpoch: '1' }
+  const wait = async (check: () => boolean) => {
+    for (let spent = 0; spent < 1500 && !check(); spent += 5) await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(check()).toBe(true)
+  }
+  const answer = (state: UploadCancelled['state'], key: string): UploadCancelled => ({
+    key,
+    state,
+    releasedByteLen: state === 'cancelled' ? '10' : null,
+    handle: null,
+    said: null
+  })
+
+  /** A store whose cancels wait for the test, and answer as it says. */
+  function pending() {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: ['files.upload', 'agent.prompt'] })
+    const uploads = new PairedUploads(port, 5)
+    const replies: { resolve: (answer: UploadCancelled) => void; reject: (failure: unknown) => void }[] = []
+    vi.spyOn(port, 'uploadCancel').mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          replies.push({ resolve, reject })
+        })
+    )
+    return { uploads, scripted: controls.pairedUploads, replies }
+  }
+
+  it('K1: leaves a bound row bound when a cancel answers published after the file was added', async () => {
+    const { uploads, scripted, replies } = pending()
+    const sent = uploads.send({ key: 'k-1', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    await wait(() => scripted.started.length === 1)
+    const cancelling = uploads.cancel('k-1')
+    expect(uploads.snapshot().get('k-1')?.phase).toEqual({ kind: 'cancelling' })
+    // The upload's result and its bind come first.
+    scripted.finish('k-1')
+    await sent
+    expect(uploads.snapshot().get('k-1')?.phase).toEqual({ kind: 'bound' })
+    replies[0]?.resolve(answer('published', 'k-1'))
+    await cancelling
+    expect(uploads.snapshot().get('k-1')?.phase).toEqual({ kind: 'bound' })
+    const end = vi.fn(() => Promise.resolve())
+    expect(await uploads.end('s-1', 'k-1', end)).toEqual(['k-1'])
+    expect(end).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['cancelled', 'adding'],
+    ['asked', 'adding'],
+    ['cancelled', 'bound'],
+    ['asked', 'bound']
+  ] as const)('K2: drops a late %s answer over a row that is %s', async (state, over) => {
+    const { uploads, scripted, replies } = pending()
+    let added: () => void = () => undefined
+    const adding = new Promise<void>((resolve) => {
+      added = resolve
+    })
+    const sent = uploads.send({ key: 'k-2', sessionId: 's-1', subject, file }, () => (over === 'adding' ? adding : Promise.resolve()))
+    sent.catch(() => undefined)
+    await wait(() => scripted.started.length === 1)
+    const cancelling = uploads.cancel('k-2')
+    scripted.finish('k-2')
+    if (over === 'bound') await sent
+    else await wait(() => uploads.snapshot().get('k-2')?.phase.kind === 'adding')
+    replies[0]?.resolve(answer(state, 'k-2'))
+    await cancelling
+    expect(uploads.snapshot().get('k-2')?.phase.kind).toBe(over)
+    added()
+    await sent
+    expect(uploads.snapshot().get('k-2')?.phase.kind).toBe('bound')
+  })
+
+  it('K3: an upload failure during cancelling lets the poll end the row', async () => {
+    const { uploads, scripted, replies } = pending()
+    const sent = uploads.send({ key: 'k-3', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    const failed = sent.catch(() => undefined)
+    await wait(() => scripted.started.length === 1)
+    const cancelling = uploads.cancel('k-3')
+    // The upload fails for a reason of its own while the cancel waits for the host.
+    scripted.refuse('k-3', { code: 'UNAVAILABLE', message: 'the host went away' })
+    await failed
+    replies[0]?.resolve(answer('asked', 'k-3'))
+    await cancelling
+    expect(uploads.snapshot().get('k-3')?.phase).toEqual({ kind: 'cancelAsked', said: null })
+    // The application no longer lists the upload: a read of its list ends the row.
+    await uploads.restore()
+    expect(uploads.snapshot().get('k-3')?.phase).toEqual({ kind: 'cancelled', released: null })
+  })
+
+  it('K4: says the file was kept when its result comes while a cancel waits for its answer', async () => {
+    const { uploads, scripted, replies } = pending()
+    const sent = uploads.send({ key: 'k-4', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    await wait(() => scripted.started.length === 1)
+    const cancelling = uploads.cancel('k-4')
+    scripted.finish('k-4')
+    await sent
+    expect(uploads.snapshot().get('k-4')?.note).toBe(words.sentence(words.PUBLISHED_AND_KEPT))
+    replies[0]?.resolve(answer('published', 'k-4'))
+    await cancelling
+  })
+})
+
+describe('a bind the application refuses for want of a record of the file', () => {
+  const handle = {
+    transfer_id: 't-1',
+    environment_id: 'e-1',
+    byte_len: '9',
+    content_digest: 'b'.repeat(64),
+    declared_media_type: 'application/octet-stream',
+    original_file_name: 'left.bin',
+    presented_as_image: false,
+    session_id: null,
+    preview: null,
+    published_at_ms: '1',
+    expires_at_ms: '2',
+    submitted: false
+  }
+  const left: OpenUpload = {
+    key: 'found-1',
+    state: 'published',
+    sessionId: 's-1',
+    fileName: 'left.bin',
+    byteLen: 9,
+    acknowledgedChunks: 0,
+    chunks: 0,
+    stage: null,
+    handle,
+    said: null
+  }
+
+  it('Q1d: ends the row as refused, with the words, and no later list moves it', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: ['files.upload', 'agent.prompt'] })
+    const uploads = new PairedUploads(port, 60_000)
+    controls.pairedUploads.leave([left])
+    await uploads.restore()
+    expect(uploads.snapshot().get('found-1')?.phase).toEqual({ kind: 'kept', words: null })
+    // A read of the list is made before the refusal, and its answer, the published upload, comes after it.
+    const real = port.uploadsOpen.bind(port)
+    const answers: (() => void)[] = []
+    vi.spyOn(port, 'uploadsOpen').mockImplementationOnce(
+      () =>
+        new Promise((resolve, reject) => {
+          answers.push(() => {
+            real().then(resolve, reject)
+          })
+        })
+    )
+    const delayed = uploads.restore()
+    await uploads.bind('found-1', handle, () => Promise.reject({ code: 'INVALID_ARGUMENT', message: words.NO_OPEN_UPLOAD }))
+    const refused = { kind: 'refused', refusal: { kind: 'other', words: words.NO_LONGER_HELD } }
+    expect(uploads.snapshot().get('found-1')?.phase).toEqual(refused)
+    expect(canCancel(uploads.snapshot().get('found-1')?.phase ?? { kind: 'bound' })).toBe(false)
+    answers[0]?.()
+    expect(await delayed).toHaveLength(1)
+    expect(uploads.snapshot().get('found-1')?.phase).toEqual(refused)
+    // The application then lists nothing: the row stays, with its words, until the person removes it.
+    controls.pairedUploads.leave([])
+    await uploads.restore()
+    expect(uploads.snapshot().get('found-1')?.phase).toEqual(refused)
+    uploads.forget('found-1')
+    expect(uploads.snapshot().has('found-1')).toBe(false)
   })
 })
 

@@ -141,6 +141,9 @@ const APPLICATION_WORDS: readonly (readonly [string, RefusalKind])[] = [
  * full staging area says its quota, a changed file says its source changed, and a right the device
  * lacks is a permission refusal. Anything else is shown in the host's own words.
  */
+/** A file whose bind the application refused because it holds no record of the file: the row ends here until the person removes it. */
+export const NO_LONGER_HELD = 'The application no longer holds this file. Remove it and attach the file again.'
+
 /** Whether `failure` says the application holds no upload under the key: nothing was cancelled. */
 export function isNoOpenUpload(failure: unknown): boolean {
   return failureWords(failure) === NO_OPEN_UPLOAD
