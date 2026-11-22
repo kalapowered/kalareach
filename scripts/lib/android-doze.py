@@ -21,6 +21,9 @@ The readback is one line of `key=value` pairs: `deep` and `light` (`dumpsys devi
 it), `wakefulness`, `forced`, `powered` (any power source on), `allowlisted` (the application is on
 the device-idle allowlist) and `clock_ms` (the emulator's own clock, in milliseconds).
 
+A command that fails, or output that does not hold what a field needs, ends the command with
+`DOZE-FAILED unreadable=...` and status 1: a field that could not be read is never read as false.
+
 It uses the Python standard library alone and nothing but the emulator it is given.
 """
 
@@ -30,6 +33,10 @@ import sys
 import time
 
 APPLICATION = "to.kala.reach"
+
+
+class Unreadable(Exception):
+    """A command of the phone failed, or its output is not what a field needs."""
 
 
 class Phone:
@@ -45,6 +52,8 @@ class Phone:
             timeout=60,
             check=False,
         )
+        if done.returncode != 0:
+            raise Unreadable(f"`{' '.join(command)}` exited {done.returncode}")
         return (done.stdout + done.stderr).replace("\r", "")
 
     def readback(self) -> dict[str, str]:
@@ -53,23 +62,38 @@ class Phone:
         battery = self.shell("dumpsys", "battery")
         allowlist = self.shell("dumpsys", "deviceidle", "whitelist")
 
-        def field(text: str, name: str) -> str:
+        def field(text: str, name: str, allowed: set[str]) -> str:
             found = re.search(rf"^\s*{re.escape(name)}=(\S+)", text, re.MULTILINE)
-            return found.group(1) if found else "unknown"
+            if found is None or found.group(1) not in allowed:
+                raise Unreadable(f"no valid `{name}` in the phone's report")
+            return found.group(1)
 
-        powered = any(
-            re.search(rf"^\s*{source} powered: true", battery, re.MULTILINE)
+        sources = [
+            re.search(rf"^\s*{source} powered: (true|false)", battery, re.MULTILINE)
             for source in ("AC", "USB", "Wireless", "Dock")
-        )
+        ]
+        if any(each is None for each in sources):
+            raise Unreadable("the battery's report names no power source")
+        listed = re.findall(r"^(?:system|system-excidle|user),[^,\s]+,\d+$", allowlist, re.MULTILINE)
+        if not listed:
+            raise Unreadable("the allowlist's report lists no application")
         clock = self.shell("date", "+%s%3N").strip()
+        if not clock.isdigit():
+            raise Unreadable("the phone's clock is not a number")
+        states = {}
+        for which in ("deep", "light"):
+            states[which] = self.shell("dumpsys", "deviceidle", "get", which).strip()
+            if not re.fullmatch(r"[A-Z_]+", states[which]):
+                raise Unreadable(f"no valid `get {which}` state")
+        flag = {"true", "false"}
         return {
-            "deep": self.shell("dumpsys", "deviceidle", "get", "deep").strip(),
-            "light": self.shell("dumpsys", "deviceidle", "get", "light").strip(),
-            "idle_mode": field(power, "mDeviceIdleMode"),
-            "wakefulness": field(power, "mWakefulness"),
-            "forced": field(idle, "mForceIdle"),
-            "powered": "true" if powered else "false",
-            "allowlisted": "true" if f",{APPLICATION}," in allowlist else "false",
+            "deep": states["deep"],
+            "light": states["light"],
+            "idle_mode": field(power, "mDeviceIdleMode", flag),
+            "wakefulness": field(power, "mWakefulness", {"Awake", "Asleep", "Dreaming", "Dozing"}),
+            "forced": field(idle, "mForceIdle", flag),
+            "powered": "true" if any(each.group(1) == "true" for each in sources if each) else "false",
+            "allowlisted": "true" if any(f",{APPLICATION}," in each for each in listed) else "false",
             "clock_ms": clock,
         }
 
@@ -130,10 +154,14 @@ def main() -> int:
     arguments = sys.argv[1:]
     if len(arguments) == 3 and arguments[0] in {"enter", "read", "wake", "leave"}:
         phone = Phone(arguments[1], arguments[2])
-        if arguments[0] == "read":
-            print("DOZE-READ " + line(phone.readback()), flush=True)
-            return 0
-        return {"enter": enter, "wake": wake, "leave": leave}[arguments[0]](phone)
+        try:
+            if arguments[0] == "read":
+                print("DOZE-READ " + line(phone.readback()), flush=True)
+                return 0
+            return {"enter": enter, "wake": wake, "leave": leave}[arguments[0]](phone)
+        except (Unreadable, subprocess.SubprocessError, OSError) as failure:
+            print(f"DOZE-FAILED unreadable={failure}", flush=True)
+            return 1
     sys.stderr.write(__doc__)
     return 2
 
