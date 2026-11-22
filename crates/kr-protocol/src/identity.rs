@@ -296,6 +296,19 @@ pub enum EnrolmentError {
 }
 
 impl EnrolmentError {
+    /// Every reason, in the order they are declared.
+    pub const ALL: [Self; 9] = [
+        Self::ClipboardDestinationUnknown,
+        Self::EmptyLabel,
+        Self::EmptyTarget,
+        Self::EmptyUser,
+        Self::HelperPathNotAbsolute,
+        Self::ContainerTargetNotIdentifier,
+        Self::SshTargetNotPlain,
+        Self::SshUserNotPlain,
+        Self::SshHelperPathNotPlain,
+    ];
+
     /// Returns the sentence that says why, which is the same words for the same cause.
     #[must_use]
     pub const fn describe(self) -> &'static str {
@@ -868,9 +881,223 @@ pub struct EnvironmentRefreshResult {
     pub connection: Sentence,
 }
 
+impl EnvironmentRefreshResult {
+    /// Returns whether [`Self::connection`] is one of the sentences a host of this release
+    /// composes. A host of an earlier release wrote the refusal's own words there, and the user's
+    /// name, which this release's does not: its text is not one of them.
+    #[must_use]
+    pub fn connection_is_composed(&self) -> bool {
+        is_composed_connection(self.connection.as_str())
+    }
+}
+
+/// The programs a connection sentence names: the ones the host runs for an environment, and the
+/// words it says when it knows of none.
+const CONNECTION_PROGRAMS: [&str; 4] = ["podman", "ssh", "wsl.exe", "the helper program"];
+
+/// What the host says when opening a bridge was refused, each as the words it is composed of and
+/// its placeholders: `{program}`, `{n}` for a number, `{id}` for an environment identifier,
+/// `{word}` for a closed word (an error code, a role, an access class or an ingress), and
+/// `{message}` and `{name}` for a value that arrived, as its class and length.
+const REFUSAL_FORMS: &[&str] = &[
+    "a process bridge carries locally authenticated invocations only, and this request arrived as \
+     {word}; reach that environment through its own paired endpoint",
+    "a request crosses at most one process bridge",
+    "{word} is not reached by a process bridge; an SSH user runs the command line on the \
+     destination host and a paired host is reached through its own endpoint",
+    "{program} could not be started: {message}",
+    "{program} ended with exit code {n} before the environment answered",
+    "{program} was ended by signal {n} before the environment answered",
+    "{program} ended the connection before the environment answered",
+    "{program} ended with exit code {n} after the environment acknowledged the bridge, before it \
+     answered the read",
+    "{program} was ended by signal {n} after the environment acknowledged the bridge, before it \
+     answered the read",
+    "{program} ended the connection after the environment acknowledged the bridge, before it \
+     answered the read",
+    "{program} ran, and the environment that answered wrote a frame this host cannot read \
+     ({message})",
+    "{program} ran, and the environment's first frame was not an acknowledgement of the opening",
+    "{program} ran, and the environment answered the read with something that is not an answer",
+    "{program} ran, and the environment that answered speaks protocol major {n}, and this host \
+     speaks {n}",
+    "{program} ran, and the environment that answered is the {word}, where the opening asked for \
+     the {word}",
+    "{program} ran, and the environment that answered is environment {id}, and the enrolment names \
+     environment {id}; enrol the environment that is installed there rather than reusing this \
+     record",
+    "{program} ran, and the environment refused the bridge: {word} ({message})",
+    "{program} ran, and the environment answered the read with an error: {word} ({message})",
+    "that session is closed",
+    "{program} said nothing for {n} seconds, so it was ended",
+    "{program} ran, and the helper that answered ran as {name}, not as the user {name} the \
+     enrolment names",
+    "{program} ran, and the environment that answered is this host's own environment, so it is \
+     not another one: a socket forwarded from here does not register an environment",
+    "{program} ran, and the environment that answered runs {name} with protocol {n}.{n}.{n}, and \
+     this host speaks protocol {n}.{n}.{n}: update kr in the destination or here so both are of \
+     one release",
+    "{program} ran, and the environment that answered is of a build that states no protocol \
+     version, and this host speaks protocol {n}.{n}.{n}: update kr in the destination",
+    "{program} ran, and the environment that answered sent more than {n} bytes this host had not \
+     yet been asked for, so the bridge was ended",
+    "{program} (process {n}) could not be ended: {message}; it may still be running, and this host \
+     no longer waits for it",
+    "{program} could not be ended: {message}; it may still be running, and this host no longer \
+     waits for it",
+];
+
+/// What else the host says about opening a bridge, in the same notation as [`REFUSAL_FORMS`].
+const OTHER_FORMS: &[&str] = &[
+    "{word} is not reached by a process bridge, so none was opened",
+    "no bridge was opened, because this environment is not running; refresh with --start to start \
+     it",
+    "no bridge was opened, because {message}",
+    "environment {id} answered as {name} over its own local channel",
+    "environment {id} answered as {name} on the helper installed there, over ssh; no request \
+     crosses ssh",
+    "this environment's record changed while the bridge was open, so what answered says nothing \
+     about what is recorded now",
+    "this environment's record changed while its helper was asked, so what answered says nothing \
+     about what is recorded now",
+    "the bridge answered, and this host did not record that, because {message}",
+];
+
+/// What the host appends to a refusal when it could not record it either.
+const NOT_RECORDED: &str = "; and this host did not record that, because ";
+
+/// Returns whether `text` is one of the sentences a host composes for what opening a bridge did:
+/// fixed words, a program by name, numbers, closed words, an environment identifier, and any
+/// value that arrived only as its class and length. Any other text, such as the refusal's own
+/// words that a host of an earlier release wrote, is not.
+#[must_use]
+pub fn is_composed_connection(text: &str) -> bool {
+    if OTHER_FORMS.iter().any(|form| matches_form(form, text)) {
+        return true;
+    }
+    if is_refusal(text) {
+        return true;
+    }
+    text.rfind(NOT_RECORDED).is_some_and(|at| {
+        is_refusal(&text[..at]) && matches_form("{message}", &text[at + NOT_RECORDED.len()..])
+    })
+}
+
+/// Returns whether `text` is one of the sentences for a refusal of the bridge.
+fn is_refusal(text: &str) -> bool {
+    if REFUSAL_FORMS.iter().any(|form| matches_form(form, text)) {
+        return true;
+    }
+    text.strip_prefix("no helper was started, because ")
+        .is_some_and(|reason| {
+            EnrolmentError::ALL
+                .iter()
+                .any(|error| error.describe() == reason)
+        })
+}
+
+/// Returns whether `text` is exactly `form`, with each placeholder taken by the shape it names.
+fn matches_form(form: &str, text: &str) -> bool {
+    let (mut form, mut text) = (form, text);
+    while let Some(open) = form.find('{') {
+        let Some(after_words) = text.strip_prefix(&form[..open]) else {
+            return false;
+        };
+        let Some(length) = form[open..].find('}') else {
+            return false;
+        };
+        let Some(rest) = take_placeholder(&form[open + 1..open + length], after_words) else {
+            return false;
+        };
+        form = &form[open + length + 1..];
+        text = rest;
+    }
+    form == text
+}
+
+/// Takes the shape a placeholder names off the front of `text`.
+fn take_placeholder<'a>(placeholder: &str, text: &'a str) -> Option<&'a str> {
+    let run = |keep: fn(char) -> bool| {
+        let end = text.find(|c: char| !keep(c)).unwrap_or(text.len());
+        (end > 0).then(|| &text[end..])
+    };
+    match placeholder {
+        "program" => CONNECTION_PROGRAMS
+            .iter()
+            .find_map(|program| text.strip_prefix(program)),
+        "n" => run(|c| c.is_ascii_digit()),
+        "word" => run(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "id" => take_identifier(text),
+        "message" => take_withheld("message", text),
+        "name" => take_withheld("name", text),
+        _ => None,
+    }
+}
+
+/// Takes an environment identifier, thirty-six characters in groups of 8, 4, 4, 4 and 12
+/// hexadecimal digits.
+fn take_identifier(text: &str) -> Option<&str> {
+    let head = text.get(..36)?;
+    head.bytes()
+        .enumerate()
+        .all(|(at, byte)| match at {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
+        .then(|| &text[36..])
+}
+
+/// Takes a value that arrived at the host, as the host says it: its class and its length.
+fn take_withheld<'a>(class: &str, text: &'a str) -> Option<&'a str> {
+    let after_class = text
+        .strip_prefix('[')?
+        .strip_prefix(class)?
+        .strip_prefix(" withheld, ")?;
+    let digits = after_class
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after_class.len());
+    if digits == 0 {
+        return None;
+    }
+    after_class[digits..].strip_prefix(" bytes]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// KR-REQ-18.11: the sentences the host composes are told from the text a host of an earlier
+    /// release wrote into the same field, which carried the refusal's own words and the user's
+    /// name.
+    #[test]
+    fn a_connection_is_composed_only_when_it_is_one_of_the_hosts_sentences() {
+        let id = "18d3ba9f-df2d-43ec-84a3-83475d614273";
+        for composed in [
+            "podman could not be started: [message withheld, 38 bytes]".to_owned(),
+            "podman ended with exit code 125 before the environment answered".to_owned(),
+            "ssh ended the connection before the environment answered".to_owned(),
+            "wsl.exe ran, and the environment refused the bridge: PERMISSION_DENIED ([message withheld, 41 bytes])".to_owned(),
+            format!("environment {id} answered as [name withheld, 1 bytes] over its own local channel"),
+            "no bridge was opened, because [message withheld, 12 bytes]".to_owned(),
+            "podman said nothing for 20 seconds, so it was ended; and this host did not record that, because [message withheld, 9 bytes]".to_owned(),
+            "no helper was started, because an enrolment carries the label people use".to_owned(),
+        ] {
+            assert!(is_composed_connection(&composed), "{composed}");
+        }
+        for raw in [
+            "the destination refused the bridge: kr-test-destination-words",
+            "podman could not be started: No such file or directory (os error 2)",
+            "the bridge stream failed: unexpected end of file",
+            "environment 18d3ba9f-df2d-43ec-84a3-83475d614273 answered as kala over its own local channel",
+            "the enrolment names user kala and the helper ran as root",
+            "podman ran, and the environment refused the bridge: PERMISSION_DENIED (kr-test-words)",
+            "podman ended with exit code 125 before the environment answered. kr-test-words",
+            "no bridge was opened, because the fence says so",
+            "",
+        ] {
+            assert!(!is_composed_connection(raw), "{raw}");
+        }
+    }
 
     #[test]
     fn a_reused_process_identifier_does_not_match_the_original() {

@@ -265,6 +265,7 @@ mod tests {
     use kr_protocol::actor::ActorIngress;
     use kr_protocol::error::{ErrorCode, ProtocolError};
     use kr_protocol::hello::PackageVersion;
+    use kr_protocol::identity::is_composed_connection;
     use kr_protocol::ids::{BuildId, EnvironmentId};
     use kr_protocol::local::{LocalBuild, LocalRole};
     use kr_protocol::scalars::Uuid;
@@ -499,6 +500,7 @@ mod tests {
         for (refusal, expected) in table {
             let said = of(&refusal, EnvironmentAccess::Container, Stage::Opening);
             assert_eq!(said.as_str(), expected, "{refusal:?}");
+            assert!(is_composed_connection(said.as_str()), "{refusal:?}: {said}");
             assert!(!said.as_str().contains(ARRIVED), "{refusal:?}: {said}");
         }
     }
@@ -568,7 +570,52 @@ mod tests {
         ] {
             let said = of(&refusal, EnvironmentAccess::Container, Stage::Read);
             assert_eq!(said.as_str(), expected, "{refusal:?}");
+            assert!(is_composed_connection(said.as_str()), "{refusal:?}: {said}");
             assert!(!said.as_str().contains(ARRIVED), "{refusal:?}: {said}");
+        }
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: every sentence the host composes for
+    /// what opening a bridge did, the ones that are not a refusal of it included, is one the
+    /// command line recognises, with each program the host names.
+    #[test]
+    fn every_sentence_the_host_composes_is_one_the_command_line_recognises() {
+        let ended = Refusal::Stream {
+            detail: ARRIVED.to_owned(),
+            helper: Some(HelperEnd::Exited(1)),
+        };
+        let mut sentences = vec![
+            not_a_process_bridge(EnvironmentAccess::PairedHost),
+            not_running(),
+            not_opened(ARRIVED),
+            answered(&environment(3), ARRIVED, false),
+            answered(&environment(3), ARRIVED, true),
+            record_changed(false),
+            record_changed(true),
+            answered_not_recorded(ARRIVED),
+            and_not_recorded(
+                of(&ended, EnvironmentAccess::Container, Stage::Read),
+                ARRIVED,
+            ),
+        ];
+        for access in [
+            EnvironmentAccess::SshHost,
+            EnvironmentAccess::Container,
+            EnvironmentAccess::WslDistribution,
+            EnvironmentAccess::PairedHost,
+        ] {
+            sentences.push(of(&ended, access, Stage::Opening));
+        }
+        for error in kr_protocol::identity::EnrolmentError::ALL {
+            sentences.push(of(
+                &Refusal::Launch(LaunchError::Incomplete(error)),
+                EnvironmentAccess::Container,
+                Stage::Opening,
+            ));
+        }
+        for sentence in sentences {
+            assert!(is_composed_connection(sentence.as_str()), "{sentence}");
+            assert!(!sentence.as_str().contains(ARRIVED), "{sentence}");
         }
     }
 }

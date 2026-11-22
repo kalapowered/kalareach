@@ -175,8 +175,20 @@ fn readiness_detail(row: &EnvironmentInventoryRow) -> Shown {
 
 /// What the host says opening a bridge did, as the host composed it: the program it ran and how
 /// that went, with anything that arrived at the host given as its class and its length.
+///
+/// A daemon of an earlier release writes the refusal's own words and the user's name into the same
+/// field, and states the same package version as this one. Text that is not one of the sentences
+/// the host composes is therefore shown as its class and its length, as every host sentence was.
 fn connection(refreshed: &EnvironmentRefreshResult) -> Shown {
-    crate::shown::host_text(&refreshed.connection)
+    if refreshed.connection_is_composed() {
+        crate::shown::host_text(&refreshed.connection)
+    } else {
+        crate::shown::exported(
+            "EnvironmentRefreshResult",
+            "connection",
+            refreshed.connection.as_str(),
+        )
+    }
 }
 
 /// An enrolment, in the shape the protocol answers it.
@@ -278,6 +290,34 @@ mod tests {
             kr_protocol::identity::CLIPBOARD_DESTINATION_TERMINAL.to_owned(),
         );
         assert_eq!(enrolment(&record).json()["takes_clipboard_writes"], true);
+    }
+
+    /// KR-REQ-18.11: a daemon of an earlier release writes the refusal's own text into
+    /// `connection`: the destination's words, the operating system's message, the name of the
+    /// user. Its package version is the same as this one's, so nothing tells the two apart, and
+    /// the command line shows any text that is not one of the sentences the host now composes as
+    /// its class and length, in the lines and in the document.
+    #[test]
+    fn an_earlier_daemons_raw_text_is_shown_as_its_class_and_length() {
+        const RAW: [&str; 3] = [
+            "the destination refused the bridge: kr-test-destination-words",
+            "podman could not be started: kr-test-os-message (os error 2)",
+            "environment 18d3ba9f-df2d-43ec-84a3-83475d614273 answered as kr-test-user over its \
+             own local channel",
+        ];
+        for mut refreshed in planted::<EnvironmentRefreshResult>() {
+            for raw in RAW {
+                refreshed.connection =
+                    serde_json::from_value(serde_json::json!(raw)).expect("a sentence");
+                let withheld = format!("[message withheld, {} bytes]", raw.len());
+                assert_eq!(connection(&refreshed).as_str(), withheld, "{raw}");
+                assert_eq!(
+                    refresh(&refreshed).json()["connection"],
+                    serde_json::json!(withheld),
+                    "{raw}"
+                );
+            }
+        }
     }
 
     /// KR-REQ-23.25: planted text in the bridge's answers shows only where the person asked for it
