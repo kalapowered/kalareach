@@ -45,6 +45,7 @@ pub struct FixtureTrees {
     dir: PathBuf,
     lock: Arc<Mutex<Lock>>,
     primary: Arc<Plan>,
+    reader: Option<Arc<Plan>>,
     grants: u64,
     /// What a case reads.
     pub counts: Arc<Counts>,
@@ -59,10 +60,18 @@ impl FixtureTrees {
             dir,
             lock: Arc::new(Mutex::new(Lock::Free)),
             primary: Arc::new(primary),
+            reader: None,
             grants: 0,
             counts: Arc::new(Counts::default()),
             left: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The tree has a reader child, the program `reader` plans.
+    #[must_use]
+    pub fn with_reader(mut self, reader: Plan) -> FixtureTrees {
+        self.reader = Some(Arc::new(reader));
+        self
     }
 
     /// How many objects the grant records.
@@ -107,6 +116,7 @@ impl FixtureTrees {
             granted: to_release,
             intents,
             primary: Arc::clone(&self.primary),
+            reader: self.reader.clone(),
         }
     }
 }
@@ -128,6 +138,7 @@ impl Slot for FixtureSlot {
 struct FixtureTree {
     path: String,
     primary: Arc<Plan>,
+    reader: Option<Arc<Plan>>,
     counts: Arc<Counts>,
     left: Arc<Mutex<Vec<Left>>>,
     grants: u64,
@@ -177,6 +188,10 @@ impl TreeHold for FixtureTree {
             self.granted.push(key);
         }
         rows(Row::GrantComplete { count: self.grants }).map_err(|why| facts::not_started(&why))
+    }
+
+    fn reader(&self, root: &PrivateRoot) -> Result<Option<ChildPlan>, String> {
+        self.reader.as_ref().map(|plan| plan(root)).transpose()
     }
 
     fn child(&self, root: &PrivateRoot) -> Result<ChildPlan, String> {

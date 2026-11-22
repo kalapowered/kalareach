@@ -25,8 +25,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, OPEN_EXISTING, ReadFile, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE,
-    PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+    PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, TerminateProcess,
 };
 
 use kr_boundary_windows::env::{Kind as EnvKind, QualifiedGit, RootPaths, build_env};
@@ -46,7 +46,7 @@ use kr_boundary_windows::win::client::ClientIdentity;
 use kr_boundary_windows::win::ffi::{Handle, Sid, system_windows_directory, wide};
 use kr_boundary_windows::win::install::Paths;
 use kr_boundary_windows::win::launch::VerifiedPath;
-use kr_boundary_windows::win::lifecycle::fixture::FixtureTrees;
+use kr_boundary_windows::win::lifecycle::fixture::{FixtureTrees, Plan};
 use kr_boundary_windows::win::lifecycle::testing as hooks;
 use kr_boundary_windows::win::lifecycle::{
     Blocked, ChildPlan, Environment, Recovered, recover, run_invocation,
@@ -346,6 +346,41 @@ struct Life {
     env: Arc<Environment>,
 }
 
+/// What a stand-in child runs: the program copied into the folder, with these arguments.
+fn stand_in_plan(dir: &Path, arguments: &[&str]) -> Plan {
+    let stand_in = dir.join("kr-launch-stand-in.exe");
+    if std::fs::metadata(&stand_in).is_err() {
+        std::fs::copy(bin().join("kr-launch-stand-in.exe"), &stand_in).unwrap();
+    }
+    let arguments: Vec<String> = arguments.iter().map(|text| (*text).to_owned()).collect();
+    let scratch = dir.to_path_buf();
+    let program = stand_in;
+    Box::new(move |root: &kr_boundary_windows::win::root::PrivateRoot| {
+        let name = program.display().to_string();
+        let mut parts = vec![name.as_str()];
+        parts.extend(arguments.iter().map(String::as_str));
+        let env = build_env(
+            EnvKind::Proof,
+            &RootPaths {
+                system: system_windows_directory().map_err(|failure| failure.to_string())?,
+                boundary: r"C:\Program Files\KalaReach\Boundary".to_owned(),
+                private_root: root.path().display().to_string(),
+            },
+            None,
+            &QualifiedGit {
+                dir: GUEST_GIT.to_owned(),
+            },
+        )
+        .map_err(|failure| failure.to_string())?;
+        Ok(ChildPlan {
+            program: VerifiedPath::new(&program).map_err(|failure| failure.to_string())?,
+            command_line: kr_boundary_windows::quote::quote_command_line(&parts),
+            cwd: scratch.clone(),
+            env,
+        })
+    })
+}
+
 impl Life {
     /// The primary child runs the stand-in with these arguments. `edit` changes the waits.
     fn open(
@@ -355,38 +390,33 @@ impl Life {
         grants: u64,
         edit: impl FnOnce(&mut Environment),
     ) -> Life {
-        let stand_in = dir.join("kr-launch-stand-in.exe");
-        if std::fs::metadata(&stand_in).is_err() {
-            std::fs::copy(bin().join("kr-launch-stand-in.exe"), &stand_in).unwrap();
-        }
-        let arguments: Vec<String> = arguments.iter().map(|text| (*text).to_owned()).collect();
-        let scratch = dir.to_path_buf();
-        let program = stand_in.clone();
-        let plan = Box::new(move |root: &kr_boundary_windows::win::root::PrivateRoot| {
-            let name = program.display().to_string();
-            let mut parts = vec![name.as_str()];
-            parts.extend(arguments.iter().map(String::as_str));
-            let env = build_env(
-                EnvKind::Proof,
-                &RootPaths {
-                    system: system_windows_directory().map_err(|failure| failure.to_string())?,
-                    boundary: r"C:\Program Files\KalaReach\Boundary".to_owned(),
-                    private_root: root.path().display().to_string(),
-                },
-                None,
-                &QualifiedGit {
-                    dir: GUEST_GIT.to_owned(),
-                },
-            )
-            .map_err(|failure| failure.to_string())?;
-            Ok(ChildPlan {
-                program: VerifiedPath::new(&program).map_err(|failure| failure.to_string())?,
-                command_line: kr_boundary_windows::quote::quote_command_line(&parts),
-                cwd: scratch.clone(),
-                env,
-            })
-        });
-        let trees = Arc::new(FixtureTrees::new(dir.to_path_buf(), plan).with_grants(grants));
+        let trees =
+            FixtureTrees::new(dir.to_path_buf(), stand_in_plan(dir, arguments)).with_grants(grants);
+        Life::around(dir, account, trees, edit)
+    }
+
+    /// The tree has a reader child, which runs the stand-in with `reader`, before the grant.
+    fn open_reading(
+        dir: &Path,
+        account: &str,
+        reader: &[&str],
+        arguments: &[&str],
+        grants: u64,
+        edit: impl FnOnce(&mut Environment),
+    ) -> Life {
+        let trees = FixtureTrees::new(dir.to_path_buf(), stand_in_plan(dir, arguments))
+            .with_reader(stand_in_plan(dir, reader))
+            .with_grants(grants);
+        Life::around(dir, account, trees, edit)
+    }
+
+    fn around(
+        dir: &Path,
+        account: &str,
+        trees: FixtureTrees,
+        edit: impl FnOnce(&mut Environment),
+    ) -> Life {
+        let trees = Arc::new(trees);
         let stop = Stop::new().unwrap();
         let name = account.to_owned();
         let mut env = Environment::new(
@@ -1065,12 +1095,26 @@ fn the_broker_that_the_crash_cases_crash() {
     let account = std::env::var("KR_LIFE_ACCOUNT").unwrap();
     let parent: u32 = std::env::var("KR_LIFE_PARENT").unwrap().parse().unwrap();
     let hold = std::env::var("KR_LIFE_HOLD").is_ok();
+    let reading = std::env::var("KR_LIFE_READER").is_ok();
     prepare();
     let marker = dir.join("marks").join("child-running.txt");
     let running = marker.display().to_string();
-    let life = Life::open(&dir, &account, &["sleep", "120000", &running], 1, |_| {});
+    // With a reader, the reader is the child that runs: it sleeps, and the primary is never reached.
+    let life = if reading {
+        Life::open_reading(
+            &dir,
+            &account,
+            &["sleep", "120000", &running],
+            &["exit", "0"],
+            1,
+            |_| {},
+        )
+    } else {
+        Life::open(&dir, &account, &["sleep", "120000", &running], 1, |_| {})
+    };
     let reached = Arc::new(AtomicU32::new(0));
     let hook_dir = dir.clone();
+    let hook_marker = marker.clone();
     hooks::set_hook(Some(Arc::new(move |name| {
         if hooks::session() != 0 {
             note(&hook_dir, "session.txt", &hooks::session().to_string());
@@ -1096,6 +1140,10 @@ fn the_broker_that_the_crash_cases_crash() {
                 note(&hook_dir, "held.txt", &(copy as usize).to_string());
             }
         }
+        if reading {
+            // The reader is at its work before the broker is cut off.
+            wait_for_file(&hook_marker);
+        }
         note(&hook_dir, "crashed-at.txt", name);
         reached.store(1, Ordering::SeqCst);
         // SAFETY: ends this process at once, as a crash does.
@@ -1112,7 +1160,7 @@ fn the_broker_that_the_crash_cases_crash() {
 }
 
 /// Starts the broker child that crashes at `point` and returns its exit code.
-fn crash_child(setting: &Setting, point: &str, hold: bool) -> i32 {
+fn crash_child(setting: &Setting, point: &str, hold: bool, reading: bool) -> i32 {
     let me = std::env::current_exe().unwrap();
     let mut command = std::process::Command::new(me);
     command
@@ -1130,6 +1178,9 @@ fn crash_child(setting: &Setting, point: &str, hold: bool) -> i32 {
         .stderr(std::process::Stdio::null());
     if hold {
         command.env("KR_LIFE_HOLD", "1");
+    }
+    if reading {
+        command.env("KR_LIFE_READER", "1");
     }
     let mut child = command.spawn().unwrap();
     let until = Instant::now() + Duration::from_secs(180);
@@ -1203,7 +1254,7 @@ fn a_broker_that_crashes_at_each_point_is_finished_by_the_restart_with_its_sessi
     let mut failures = Vec::new();
     for point in POINTS {
         clear_run(&setting);
-        let code = crash_child(&setting, point, false);
+        let code = crash_child(&setting, point, false, false);
         if code != 99 {
             failures.push(format!(
                 "{point}: the broker ended with {code}, not by the crash"
@@ -1256,7 +1307,7 @@ fn a_crash_with_a_handle_held_on_purpose_keeps_the_grants_and_the_slot_until_the
     }
     let setting = Setting::new();
     clear_run(&setting);
-    assert_eq!(crash_child(&setting, "waiting", true), 99);
+    assert_eq!(crash_child(&setting, "waiting", true, false), 99);
     let luid: u64 = std::fs::read_to_string(setting.scratch.path("session.txt"))
         .unwrap()
         .trim()
@@ -1443,4 +1494,164 @@ fn a_journal_with_a_damaged_middle_record_keeps_its_tree_blocked() {
         "an unreadable journal keeps its tree blocked"
     );
     assert!(matches!(broker.trees.blocked(), Some(Blocked::Leftover(_))));
+}
+
+/// Whether the process with this number is still running.
+fn still_running(pid: u32) -> bool {
+    // SAFETY: opens a process by number for a limited query; a process that cannot be opened is
+    // gone; the exit code is read into a local.
+    unsafe {
+        let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if raw.is_null() {
+            return false;
+        }
+        let process = Handle::new(raw, "a process").unwrap();
+        let mut code = 0_u32;
+        GetExitCodeProcess(process.raw(), &raw mut code) != 0 && code == 259
+    }
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_reader_child_ends_before_the_grant_and_one_that_refuses_or_overruns_ends_the_invocation() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    // A reader that accepts runs and ends, and the journal has no row for it: the primary child's
+    // is the only row of a process.
+    let marker = setting.mark("reader.txt");
+    let said = marker.display().to_string();
+    let life = Life::open_reading(
+        &setting.scratch.dir,
+        &setting.account,
+        &["sleep", "1", &said],
+        &["exit", "0"],
+        1,
+        |_| {},
+    );
+    let replies = run_one(&life, How::Reads, client_of(None), None);
+    expect_clean_end(&replies, EndedBy::Exit);
+    let pid: u32 = wait_for_file(&marker).trim().parse().unwrap();
+    assert!(!still_running(pid), "the reader ended");
+    let names = kinds(&life.rows());
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| *name == "ProcessStarted")
+            .count(),
+        1,
+        "{names:?}"
+    );
+    assert!(life.ended() && life.releases() == 1 && !life.trees.locked());
+    // A reader that ends with another code refuses the operation, before the grant and before the
+    // primary child: the invocation ends clean and the project is free.
+    let life = Life::open_reading(
+        &setting.scratch.dir,
+        &setting.account,
+        &["exit", "3"],
+        &["exit", "0"],
+        1,
+        |_| {},
+    );
+    let replies = run_one(&life, How::Reads, client_of(None), None);
+    assert!(
+        matches!(
+            replies.last(),
+            Some(InvocationReply::Refused { kind: RefusedKind::Operation, detail }) if detail.contains("code 3")
+        ),
+        "{replies:?}"
+    );
+    let names = kinds(&life.rows());
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "ProcessStarted" || name == "GrantComplete"),
+        "{names:?}"
+    );
+    assert!(
+        life.ended() && life.releases() == 1 && !life.trees.locked(),
+        "{names:?}"
+    );
+    absent_session(hooks::session());
+    // A reader that does not end within its bound is ended with the job, and the end is proved.
+    let life = Life::open_reading(
+        &setting.scratch.dir,
+        &setting.account,
+        &["sleep", "120000"],
+        &["exit", "0"],
+        1,
+        |env| {
+            env.bounds.reader = Duration::from_secs(2);
+        },
+    );
+    let replies = run_one(&life, How::Reads, client_of(None), None);
+    assert!(
+        matches!(
+            replies.last(),
+            Some(InvocationReply::Refused { kind: RefusedKind::Operation, detail }) if detail.contains("did not end in time")
+        ),
+        "{replies:?}"
+    );
+    absent_session(hooks::session());
+    assert!(
+        life.ended() && life.releases() == 1 && !life.trees.locked(),
+        "{:?}",
+        kinds(&life.rows())
+    );
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_crash_while_a_reader_child_runs_is_finished_by_the_restart_with_its_session_gone() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    clear_run(&setting);
+    assert_eq!(crash_child(&setting, "reader resumed", false, true), 99);
+    let luid: u64 = std::fs::read_to_string(setting.scratch.path("session.txt"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let pid: u32 = wait_for_file(&setting.mark("child-running.txt"))
+        .trim()
+        .parse()
+        .unwrap();
+    // The journal says nothing of the reader: no process row.
+    let broker = Life::open(
+        &setting.scratch.dir,
+        &setting.account,
+        &["sleep", "60000"],
+        1,
+        |_| {},
+    );
+    let names = kinds(&broker.rows());
+    assert!(
+        names.iter().any(|name| name == "RootMade")
+            && !names.iter().any(|name| name == "ProcessStarted"),
+        "{names:?}"
+    );
+    // The job's last handle closed with the broker, so the reader ended with it.
+    let until = Instant::now() + Duration::from_secs(30);
+    while still_running(pid) {
+        assert!(Instant::now() < until, "the reader {pid} still runs");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let recovery = recover(&broker.env).unwrap();
+    assert!(
+        matches!(recovery.invocations.as_slice(), [Recovered::Ended(_)]),
+        "{:?}",
+        recovery.invocations
+    );
+    absent_session(luid);
+    let names = kinds(&broker.rows());
+    assert!(
+        broker.ended() && names.iter().any(|name| name == "RootRemoved"),
+        "{names:?}"
+    );
+    assert!(broker.releases() == 1 && !broker.trees.locked());
 }
