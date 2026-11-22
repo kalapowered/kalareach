@@ -942,26 +942,30 @@ struct TimeServices {
     hyper_v_sync_ran: bool,
 }
 
-/// Moves the system's clock and puts it back when it is dropped: to the time it began at plus the
-/// time that has passed since.
+/// Moves the system's clock and puts it back: to the time it began at plus the time that has passed
+/// since. The case calls [`Clock::restore`] and reads the result; the drop does the same on a way
+/// out that the case did not take, such as a failed assertion.
 ///
 /// Two services set a moved clock back to the host's time within seconds, so both are held off
 /// for as long as the clock is held. The Windows Time service takes the host's time through its
 /// Hyper-V time provider: the guest's maintenance task that starts it ran at the first move, so
 /// its start type is set to disabled, which makes that start fail, and it is stopped when it
 /// runs. The Hyper-V time synchronisation service set the clock forward again after a move back,
-/// so it is stopped when it runs. The drop puts the start type and the states back as they were
+/// so it is stopped when it runs. The clock goes back while both are still held, so that no
+/// service sets it right a second time, and then the start type and the states go back as they were
 /// found.
 ///
 /// A killed process cannot run the drop, so the clock and the services change only behind the
 /// gate of the case that uses this value: the case is ignored unless a run asks for the ignored
 /// cases, it returns at once unless the process is the system's (checked again here), and it
 /// runs in a disposable guest that a restore resets. No other run changes the clock or either
-/// service.
+/// service. The case moves the clock of the whole guest, so it runs alone (the guest's runner gives
+/// `--test-threads=1`).
 struct Clock {
     began: std::time::SystemTime,
     at: Instant,
     services: TimeServices,
+    restored: bool,
 }
 impl Clock {
     fn new() -> Clock {
@@ -993,6 +997,7 @@ impl Clock {
                 windows_time_ran: windows_time == "Running",
                 hyper_v_sync_ran: hyper_v_sync == "Running",
             },
+            restored: false,
         };
         // From here the drop puts the services back, whether or not this call finishes.
         let held = powershell(
@@ -1011,7 +1016,7 @@ impl Clock {
         clock
     }
 
-    fn adjust(seconds: i64) {
+    fn adjust(seconds: i64) -> Result<(), String> {
         let status = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
@@ -1019,33 +1024,47 @@ impl Clock {
                 &format!("Set-Date -Adjust ([TimeSpan]::FromSeconds({seconds})) | Out-Null"),
             ])
             .status()
-            .unwrap();
-        assert!(status.success(), "the clock was not moved: {status}");
+            .map_err(|failure| format!("the clock was not moved: {failure}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("the clock was not moved: {status}"))
+        }
     }
 
     /// Moves the clock by `seconds` and says how far it moved.
     fn move_by(&self, seconds: i64) -> i64 {
         let was = std::time::SystemTime::now();
-        Clock::adjust(seconds);
+        Clock::adjust(seconds).unwrap();
         seconds_between(was, std::time::SystemTime::now())
     }
 
     /// Reads the clock back: it must stand `offset` seconds from the true time, which is the time
-    /// the case began at plus the time that has passed since. Whatever set the clock back after
-    /// the move of `last` seconds fails the case here, with the offset it left.
-    fn expect_offset(&self, offset: i64, last: i64, when: &str) {
+    /// the case began at plus the time that has passed since. Whatever set the clock after the
+    /// last move fails the case here, with the offset it left.
+    fn expect_offset(&self, offset: i64, when: &str) {
         let right = self.began + self.at.elapsed();
         let stands = seconds_between(right, std::time::SystemTime::now());
         assert!(
             (stands - offset).abs() < 600,
-            "the clock was set back after the move of {last} s: it stood {stands} s from the true time {when}, not {offset} s"
+            "the clock stood {stands} s from the true time {when}, not {offset} s"
         );
     }
-}
 
-impl Drop for Clock {
-    fn drop(&mut self) {
-        // The services go back first: a clock that cannot be put back still leaves them as found.
+    /// Puts the clock back, then the services; each step runs whatever the one before it did, and
+    /// the failures of all of them are the result. The clock goes first, while both services are
+    /// held off: a service that is running sets the clock to the host's time within seconds, and
+    /// a correction made after that would come on top of it.
+    fn restore(&mut self) -> Result<(), String> {
+        self.restored = true;
+        let mut failures = Vec::new();
+        let right = self.began + self.at.elapsed();
+        let off = seconds_between(std::time::SystemTime::now(), right);
+        if off.abs() > 2
+            && let Err(failure) = Clock::adjust(off)
+        {
+            failures.push(failure);
+        }
         let TimeServices {
             start,
             windows_time_ran,
@@ -1062,10 +1081,20 @@ impl Drop for Clock {
                 ),
             ])
             .status();
-        let right = self.began + self.at.elapsed();
-        let off = seconds_between(std::time::SystemTime::now(), right);
-        if off.abs() > 2 {
-            Clock::adjust(off);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+}
+
+impl Drop for Clock {
+    fn drop(&mut self) {
+        if !self.restored
+            && let Err(failure) = self.restore()
+        {
+            eprintln!("the clock case could not put everything back: {failure}");
         }
     }
 }
@@ -1126,7 +1155,7 @@ fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_
     };
     assert!(same_boot(&first.id));
     // The clock goes a day forward, and then two days back, past the time of the first row.
-    let clock = Clock::new();
+    let mut clock = Clock::new();
     let mut offset = 0;
     for seconds in [86_400, -172_800] {
         let moved = clock.move_by(seconds);
@@ -1137,7 +1166,10 @@ fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_
         offset += seconds;
         // The marker is read while the moved clock is in force: the clock is read back on both
         // sides of the read.
-        clock.expect_offset(offset, seconds, "before the marker was read");
+        clock.expect_offset(
+            offset,
+            &format!("after the move of {seconds} s, before the marker was read"),
+        );
         let again = boot::marker().unwrap();
         assert_eq!(
             (again.id.as_str(), again.made, again.trusted),
@@ -1145,9 +1177,15 @@ fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_
             "the marker changed with the clock"
         );
         assert!(same_boot(&again.id), "the journal reads another boot");
-        clock.expect_offset(offset, seconds, "after the marker was read");
+        clock.expect_offset(
+            offset,
+            &format!("after the move of {seconds} s, after the marker was read"),
+        );
     }
-    drop(clock);
+    // The clock goes back while both services are held, then the services come back, and the clock
+    // is read once more.
+    clock.restore().unwrap();
+    clock.expect_offset(0, "after the clock and the services were put back");
     assert_eq!(boot::marker().unwrap().id, first.id);
 }
 
