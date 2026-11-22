@@ -667,6 +667,23 @@ fn kinds(rows: &[Row]) -> Vec<String> {
 }
 
 /// Waits until the session is not in the system's list: an observed state, not a time.
+fn diagnostic_listing(luid: u64) -> String {
+    let script = format!(
+        "Get-CimInstance -Query \"ASSOCIATORS OF {{Win32_LogonSession.LogonId='{luid}'}} WHERE AssocClass=Win32_SessionProcess\" | ForEach-Object {{ 'session process ' + $_.ProcessId + ' ' + $_.Name }}; Get-Process -Name 'kr-launch-stand-in*' -ErrorAction SilentlyContinue | ForEach-Object {{ 'stand-in ' + $_.Id + ' exited=' + $_.HasExited + ' threads=' + $_.Threads.Count + ' handles=' + $_.HandleCount }}"
+    );
+    match std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        Ok(out) => format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(error) => format!("no listing: {error}"),
+    }
+}
+
 fn absent_session(luid: u64) {
     assert_eq!(
         session::wait_absent(luid, Duration::from_secs(60)),
@@ -1969,6 +1986,14 @@ fn a_reader_that_ends_and_leaves_a_live_descendant_refuses_the_operation_before_
         |_| {},
     );
     let replies = run_one(&life, How::Reads, client_of(None), None);
+    if !matches!(replies.last(), Some(InvocationReply::Refused { .. })) {
+        let luid = hooks::session();
+        let rows = life.rows();
+        let listing = diagnostic_listing(luid);
+        drop(life);
+        let after = session::wait_absent(luid, Duration::from_secs(40));
+        panic!("{replies:?} {rows:?}\n{listing}\nafter the broker's side was dropped: {after:?}");
+    }
     assert!(
         matches!(
             replies.last(),
