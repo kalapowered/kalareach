@@ -332,7 +332,8 @@ deadline, the step runs out of time and the report closes the pipe. The kill doe
   example), and a process that a service starts for the step (launchd, systemd, a simulator, the
   adb server);
 - a process in uninterruptible sleep: it outlives the kill until its I/O ends, and when it is the
-  step's own process, the report waits for it.
+  step's own process, the report waits for it, and a further `INT` or `TERM` does not end the report
+  while it waits (`QUIT`, `HUP` and `KILL` still do).
 
 On macOS and Linux, Ctrl-C (INT) and a termination request (TERM) that reach the report while a step
 with a limit runs are sent on to the step's group; the report waits two seconds, kills what is left of
