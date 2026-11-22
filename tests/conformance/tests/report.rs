@@ -4304,8 +4304,9 @@ fn without_display(command: &str) -> String {
 }
 
 /// The test steps the plan holds for Windows are the tests the landing workflow's Windows job runs,
-/// its build steps are builds that job also runs, and the workspace step it holds for macOS leaves
-/// out, by name, the cases the macOS job's workspace run leaves out.
+/// its build steps are builds that job also runs, and each of the three package steps it holds for
+/// macOS in place of the workspace's one step leaves out, by name, the cases the macOS job's
+/// workspace run leaves out.
 fn platform_drift(plan: &Plan) -> Result<(), String> {
     // Windows: every `cargo test` of the workflow's Windows job is a step, and every test step is
     // one; what the plan builds first, the Windows job builds too.
@@ -4357,22 +4358,33 @@ fn platform_drift(plan: &Plan) -> Result<(), String> {
         .filter(|pair| pair[0] == "--skip")
         .map(|pair| pair[1].to_owned())
         .collect();
-    let mut skipped: Vec<String> = plan.steps(
-        Platform::MacOs,
-        &rust_group(),
-        &Values::evidence("/tmp/e"),
-        None,
-    )[0]
-    .skips
-    .iter()
-    .map(|(name, _)| name.clone())
-    .collect();
     left_out.sort();
-    skipped.sort();
-    if skipped != left_out {
+    // The workspace's tests are three package steps on macOS, and each leaves out the same cases.
+    let packages: Vec<Step> = plan
+        .steps(
+            Platform::MacOs,
+            &rust_group(),
+            &Values::evidence("/tmp/e"),
+            None,
+        )
+        .into_iter()
+        .filter(|step| step.command.iter().any(|word| word == "--no-fail-fast"))
+        .collect();
+    if packages.len() != 3 {
         return Err(format!(
-            "the macOS job's workspace run: {skipped:?} against {left_out:?}"
+            "the plan has {} macOS package steps, not three",
+            packages.len()
         ));
+    }
+    for step in &packages {
+        let mut skipped: Vec<String> = step.skips.iter().map(|(name, _)| name.clone()).collect();
+        skipped.sort();
+        if skipped != left_out {
+            return Err(format!(
+                "the macOS job's workspace run, against the step `{}`: {left_out:?} against {skipped:?}",
+                step.id
+            ));
+        }
     }
     Ok(())
 }
