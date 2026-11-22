@@ -399,12 +399,13 @@ pub const NATIVE_BRIDGE_NOTICE: &str = "This package installs a native bridge: c
 
 /// What the host says, in its own words, of a command integration an installation would grant: the
 /// command a person runs in a KalaReach session starts with arguments and environment variables
-/// the package declares. The publisher's own statement of what the integration does and the host's
-/// own exact reading of the declaration are in the statement, the publisher's first.
+/// the package declares. The publisher's own words, if it gives any, and the host's own exact
+/// reading of the declaration are in the statement, the publisher's first. The second sentence
+/// holds in every shape: a release that declares no integration, or a host that writes no words of
+/// the integration's own, sends the reading with no publisher's words before it.
 pub const COMMAND_INTEGRATION_NOTICE: &str = "This package changes how a command you run in a \
      KalaReach session starts, with the arguments and environment variables it declares. The \
-     publisher's own statement of what the integration does is in the statement before the \
-     host's reading, which follows it.";
+     publisher's own words, if it gives any, come before the host's exact reading.";
 
 /// What the host writes before its own exact reading of a command integration in an installation's
 /// statement. The publisher's own words, a bridge's and an integration's, never hold it, alone or

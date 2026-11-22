@@ -661,6 +661,13 @@ async fn kr_req_12_07_the_owner_confirms_an_integration_with_its_servers_argumen
         assert!(statement.contains(shown), "{shown}: {statement}");
     }
     assert_eq!(install_notices(grant), [COMMAND_INTEGRATION_NOTICE]);
+    assert_eq!(
+        COMMAND_INTEGRATION_NOTICE,
+        "This package changes how a command you run in a KalaReach session starts, with the \
+         arguments and environment variables it declares. The publisher's own words, if it \
+         gives any, come before the host's exact reading.",
+        "the notice of a release that declares an integration"
+    );
     // The device builds the digest from what it is shown, and it is the one the host asks to be
     // confirmed.
     let shown = PluginInstallPlan::of_display(&launch.display).expect("a display of a plan");

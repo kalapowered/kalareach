@@ -1422,6 +1422,15 @@ mod tests {
             install_statement(None, None, Some(reading)),
         );
         assert!(only.checkable);
+        assert_eq!(
+            only.notice.as_deref(),
+            Some(
+                "This package changes how a command you run in a KalaReach session starts, with \
+                 the arguments and environment variables it declares. The publisher's own words, \
+                 if it gives any, come before the host's exact reading."
+            ),
+            "an older host's statement, which carries no integration words"
+        );
         assert_eq!(only.notice.as_deref(), Some(COMMAND_INTEGRATION_NOTICE));
         assert_eq!(
             only.statement, None,

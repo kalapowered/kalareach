@@ -2664,6 +2664,17 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         Some(words),
         "no integration, no words of its own"
     );
+    // The notice says the same of every release: the publisher's words come first, if it gives any.
+    assert_eq!(
+        kr_protocol::confirmation::install_notices(&grant),
+        [
+            kr_protocol::confirmation::NATIVE_BRIDGE_NOTICE,
+            "This package changes how a command you run in a KalaReach session starts, with the \
+             arguments and environment variables it declares. The publisher's own words, if it \
+             gives any, come before the host's exact reading."
+        ],
+        "the notice of a release that declares no integration"
+    );
     assert!(
         split_install_statement(&grant, &none, false)
             .reading
