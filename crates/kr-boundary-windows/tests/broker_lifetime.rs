@@ -691,6 +691,14 @@ fn token_handles_of(luid: u64) -> String {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
     const EXTENDED_HANDLES: i32 = 64;
+    // The type number of a token handle is the one of a token this process opens before the list
+    // is read.
+    let mut own = null_mut();
+    // SAFETY: the pseudo handle is valid and the result is checked.
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut own) };
+    if opened == 0 {
+        return "the process's own token cannot be opened".to_owned();
+    }
     let mut buffer = vec![0_u64; 1 << 20];
     loop {
         let mut needed = 0_u32;
@@ -719,17 +727,10 @@ fn token_handles_of(luid: u64) -> String {
     let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
     let count = word(0) as usize;
     let me = u64::from(std::process::id());
-    // The type number of a token handle is the one of a token this process opens.
-    let mut own = null_mut();
-    // SAFETY: the pseudo handle is valid and the result is checked.
-    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut own) };
-    if opened == 0 {
-        return "the process's own token cannot be opened".to_owned();
-    }
     let entry = |index: usize| 16 + index * 40;
     let type_of = |index: usize| {
         u16::from_le_bytes(
-            bytes[entry(index) + 34..entry(index) + 36]
+            bytes[entry(index) + 30..entry(index) + 32]
                 .try_into()
                 .unwrap(),
         )
