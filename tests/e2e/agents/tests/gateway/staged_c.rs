@@ -1623,10 +1623,18 @@ struct Look {
     output_ended: bool,
 }
 
+/// What the polls of a second start have seen since the first of them saw the agent's process end:
+/// the window's quiet count, and how many bytes the window had taken when that count began.
+struct EndSeen {
+    quiet: Quiet,
+    mark: usize,
+}
+
 /// One poll of a second start: the screen is read only once it can be read as the last the agent
-/// drew ([`last_drawn`]), and judged by [`second_screen`]. `screen` reads it.
+/// drew ([`last_drawn`]), and judged by [`second_screen`]. `screen` reads it. `end` is where the
+/// poll that first sees the agent's process end starts the window's quiet count.
 fn second_poll(
-    quiet: &mut Option<Quiet>,
+    end: &mut Option<EndSeen>,
     look: Look,
     screen: impl FnOnce() -> Vec<String>,
     typed: &str,
@@ -1635,9 +1643,12 @@ fn second_poll(
     draft: &[String],
 ) -> Option<(Started, Option<String>)> {
     let window_quiet = look.agent_ended && {
-        quiet
-            .get_or_insert_with(|| Quiet::new(look.mark, look.now))
-            .is_quiet(look.mark, look.now, QUIET)
+        end.get_or_insert_with(|| EndSeen {
+            quiet: Quiet::new(look.mark, look.now),
+            mark: look.mark,
+        })
+        .quiet
+        .is_quiet(look.mark, look.now, QUIET)
             || look.output_ended
     };
     if !last_drawn(look.agent_ended, window_quiet) {
@@ -1669,7 +1680,7 @@ fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet
     ]);
     // The end is seen at 0 ms; the card's bytes reach the window at 300 ms, behind the end.
     let start = Instant::now();
-    let mut quiet: Option<Quiet> = None;
+    let mut end: Option<EndSeen> = None;
     let reads = std::cell::Cell::new(0_u32);
     let mut read = None;
     for at in (0..=2000_u64).step_by(50) {
@@ -1681,7 +1692,7 @@ fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet
         };
         let rows = if at < 300 { &before } else { &after };
         let polled = second_poll(
-            &mut quiet,
+            &mut end,
             look,
             || {
                 reads.set(reads.get() + 1);
@@ -1716,6 +1727,12 @@ fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet
         "{at} ms: the read waits for {QUIET:?} of no byte"
     );
     assert_eq!(reads.get(), 1, "the screen is read once");
+    assert_eq!(
+        end.map(|end| end.mark),
+        Some(100),
+        "the count's mark is the window's as of the poll that first saw the end, not as of the \
+         bytes that came after"
+    );
     assert!(
         last_drawn(false, false),
         "a screen read while the agent runs is as far as the window has taken it"
@@ -1743,8 +1760,9 @@ fn a_running_agents_screen_and_an_ended_windows_output_are_read_at_once() {
             now: Instant::now(),
             output_ended,
         };
+        let mut end = None;
         let how = second_poll(
-            &mut None,
+            &mut end,
             look,
             || {
                 reads.set(reads.get() + 1);
@@ -1755,21 +1773,22 @@ fn a_running_agents_screen_and_an_ended_windows_output_are_read_at_once() {
             &refusals,
             &[],
         );
-        (how, reads.get())
+        (how, reads.get(), end.map(|end: EndSeen| end.mark))
     };
     assert_eq!(
         poll(false, false),
-        (Some((Started::Running, None)), 1),
-        "the screen of an agent that runs is read at once"
+        (Some((Started::Running, None)), 1, None),
+        "the screen of an agent that runs is read at once, and no end is counted from"
     );
     assert_eq!(
         poll(true, false),
-        (None, 0),
-        "the screen of an agent that has ended waits for the window to be quiet"
+        (None, 0, Some(100)),
+        "the screen of an agent that has ended waits for the window to be quiet, counted from the \
+         mark of the poll that saw the end"
     );
     assert_eq!(
         poll(true, true),
-        (Some((Started::Ended, None)), 1),
+        (Some((Started::Ended, None)), 1, Some(100)),
         "a window whose output has ended is read at once, and an ended agent's composer is no running agent"
     );
 }
@@ -1789,7 +1808,7 @@ fn second_start(
     draft: &[String],
 ) -> (Started, Option<String>, Option<ProcessStartIdentity>) {
     let mut agent: Option<ProcessStartIdentity> = None;
-    let mut quiet: Option<Quiet> = None;
+    let mut end: Option<EndSeen> = None;
     let started = Instant::now();
     loop {
         if agent.is_none() {
@@ -1804,7 +1823,7 @@ fn second_start(
             output_ended: window.output_ended(),
         };
         if let Some((how, shown)) = second_poll(
-            &mut quiet,
+            &mut end,
             look,
             || window.screen(),
             typed,
@@ -1817,33 +1836,56 @@ fn second_start(
         assert!(
             started.elapsed() < LIVENESS,
             "{}",
-            second_start_timeout(agent.as_ref().map(running), &window.screen())
+            second_start_timeout(
+                agent.as_ref().map(running),
+                end.as_ref().map(|end| end.mark),
+                window.mark(),
+                &window.screen()
+            )
         );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
 /// The text of the second start's failure at its time bound, from how the agent's process stands as
-/// the text is made (`None` where it was never seen, then whether it runs) and the screen.
-fn second_start_timeout(agent_runs: Option<bool>, screen: &[String]) -> String {
+/// the text is made (`None` where it was never seen, then whether it runs), the window's mark when a
+/// poll first saw the process end (`None` where none did), the window's mark as the text is made,
+/// and the screen.
+fn second_start_timeout(
+    agent_runs: Option<bool>,
+    end_mark: Option<usize>,
+    mark: usize,
+    screen: &[String],
+) -> String {
     let screen = screen.join("\n");
-    match agent_runs {
-        None => format!(
+    match (agent_runs, end_mark) {
+        (None, _) => format!(
             "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
              agent's process was not seen; the screen is:\n{screen}"
         ),
-        Some(true) => format!(
+        (Some(true), _) => format!(
             "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
              agent's process was seen and still running; the screen is:\n{screen}"
         ),
-        Some(false) => format!(
+        (Some(false), None) => format!(
+            "the second start was not read within {LIVENESS:?}: the agent's process ended after \
+             the last poll of it, so the window was not seen to take output after the end; the \
+             screen is:\n{screen}"
+        ),
+        (Some(false), Some(seen)) if mark != seen => format!(
             "the second start was not read within {LIVENESS:?}: the agent's process ended, and \
              the window kept taking output; the screen is:\n{screen}"
+        ),
+        (Some(false), Some(_)) => format!(
+            "the second start was not read within {LIVENESS:?}: the agent's process ended, the \
+             end was first seen less than {QUIET:?} before the bound, and the window has taken \
+             no byte since; the screen is:\n{screen}"
         ),
     }
 }
 
-/// The time-out text of a second start says how the agent's process stands as it is made.
+/// The time-out text of a second start says how the agent's process stands as it is made, and says
+/// of the window's output only what the polls saw: that it moved after the end, or that it did not.
 #[test]
 fn the_time_out_of_a_second_start_says_how_the_agents_process_stands_as_it_is_made() {
     let screen = [
@@ -1852,7 +1894,7 @@ fn the_time_out_of_a_second_start_says_how_the_agents_process_stands_as_it_is_ma
     ];
     let shown = "kr-session$ codex resume 0123-4567\n  loading";
     assert_eq!(
-        second_start_timeout(None, &screen),
+        second_start_timeout(None, None, 100, &screen),
         format!(
             "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
              agent's process was not seen; the screen is:\n{shown}"
@@ -1860,7 +1902,7 @@ fn the_time_out_of_a_second_start_says_how_the_agents_process_stands_as_it_is_ma
         "a process that was never seen is said not to be seen"
     );
     assert_eq!(
-        second_start_timeout(Some(true), &screen),
+        second_start_timeout(Some(true), None, 100, &screen),
         format!(
             "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
              agent's process was seen and still running; the screen is:\n{shown}"
@@ -1868,12 +1910,31 @@ fn the_time_out_of_a_second_start_says_how_the_agents_process_stands_as_it_is_ma
         "a process that runs is said to run"
     );
     assert_eq!(
-        second_start_timeout(Some(false), &screen),
+        second_start_timeout(Some(false), Some(100), 160, &screen),
         format!(
             "the second start was not read within {LIVENESS:?}: the agent's process ended, and \
              the window kept taking output; the screen is:\n{shown}"
         ),
-        "a process that has ended is said to have ended, not to run"
+        "output seen to move after the end is said to have kept coming"
+    );
+    assert_eq!(
+        second_start_timeout(Some(false), Some(100), 100, &screen),
+        format!(
+            "the second start was not read within {LIVENESS:?}: the agent's process ended, the \
+             end was first seen less than {QUIET:?} before the bound, and the window has taken \
+             no byte since; the screen is:\n{shown}"
+        ),
+        "an end first seen just before the bound, with no byte since, is not said to have kept \
+         taking output"
+    );
+    assert_eq!(
+        second_start_timeout(Some(false), None, 100, &screen),
+        format!(
+            "the second start was not read within {LIVENESS:?}: the agent's process ended after \
+             the last poll of it, so the window was not seen to take output after the end; the \
+             screen is:\n{shown}"
+        ),
+        "an end that no poll saw is said so, and nothing is said of the output"
     );
 }
 
