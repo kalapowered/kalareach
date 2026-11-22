@@ -738,7 +738,7 @@ listed | last( | win/root.rs | 1 | reaches no person (a function with no product
 listed | last( | win/token.rs | 3 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
 listed | last( | win/walk.rs | 1 | reaches no person (a function with no production caller, a test seam, or an error that ends in the broker's service, which has no console) or passes on a context that has its own row
 listed | print!( | bin/kr-launch-stand-in.rs | 4 | the stand-in program of the tests, which a test runs and no person does
-listed | println!( | bin/kr-launch-stand-in.rs | 12 | the stand-in program of the tests, which a test runs and no person does
+listed | println!( | bin/kr-launch-stand-in.rs | 14 | the stand-in program of the tests, which a test runs and no person does
 listed | pub const | names.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | notice.rs | 1 | the notice: its words are fixed and do not change
 listed | pub const | operation.rs | 23 | names, keys, limits, encodings and paths; no sentence for a person

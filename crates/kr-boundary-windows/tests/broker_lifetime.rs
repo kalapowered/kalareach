@@ -1810,6 +1810,45 @@ fn a_journal_with_a_damaged_middle_record_keeps_its_tree_blocked() {
     assert!(matches!(broker.trees.blocked(), Some(Blocked::Leftover(_))));
 }
 
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_reader_that_ends_and_leaves_a_live_descendant_refuses_the_operation_before_the_grant() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    // The reader ends with the code 0 and a process it started is still alive in the job.
+    let life = Life::open_reading(
+        &setting.scratch.dir,
+        &setting.account,
+        &["leave"],
+        &["exit", "0"],
+        1,
+        |_| {},
+    );
+    let replies = run_one(&life, How::Reads, client_of(None), None);
+    assert!(
+        matches!(
+            replies.last(),
+            Some(InvocationReply::Refused { kind: RefusedKind::Operation, detail }) if detail.contains("live process")
+        ),
+        "{replies:?}"
+    );
+    let names = kinds(&life.rows());
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "Grant" || name == "GrantComplete" || name == "ProcessStarted"),
+        "no grant is made while a process of the reader lives: {names:?}"
+    );
+    assert!(
+        life.ended() && life.releases() == 1 && !life.trees.locked(),
+        "{names:?}"
+    );
+    absent_session(hooks::session());
+}
+
 /// Whether the process with this number is still running.
 fn still_running(pid: u32) -> bool {
     // SAFETY: opens a process by number for a limited query; a process that cannot be opened is
