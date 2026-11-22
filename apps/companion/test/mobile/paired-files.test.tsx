@@ -308,6 +308,45 @@ describe('a file picked on a phone paired with a host', () => {
   })
 })
 
+describe('the draft the application keeps across a restart', () => {
+  const handleOf = (id: string) => ({
+    transfer_id: id,
+    environment_id: 'e',
+    byte_len: '9',
+    content_digest: 'c'.repeat(64),
+    declared_media_type: 'application/pdf',
+    original_file_name: `${id}.pdf`,
+    presented_as_image: false,
+    session_id: null,
+    preview: null,
+    published_at_ms: '1',
+    expires_at_ms: '2',
+    submitted: false
+  })
+
+  it('has its files shown on the composer as added to it, once each', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS })
+    // The application answers a draft with each attachment carrying the handle it was bound with.
+    controls.pairedUploads.keep(SESSION, handleOf('kept-1'))
+    controls.pairedUploads.keep(SESSION, handleOf('kept-2'))
+    render(
+      <AppProvider port={port} uploadPollMs={10}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    const person = userEvent.setup({ applyAccept: false })
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('m-upload')).toHaveLength(2)
+    })
+    for (const name of ['kept-1.pdf', 'kept-2.pdf']) {
+      expect(lineOfFile(name).getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+    }
+  })
+})
+
 describe('what the picker offers on a paired host', () => {
   it('names whom to ask when the device may not send files, and offers none', async () => {
     const { port, controls } = fakeHost()
