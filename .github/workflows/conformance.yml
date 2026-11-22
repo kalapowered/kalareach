@@ -44,16 +44,19 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.linux
     runs-on: ubuntu-24.04
     # The platform's plan is run in two parts, one in each job of the matrix, as the macOS and Windows
-    # jobs run theirs: on 21 November the report's 240 minutes ended before its step 32, which had
-    # not started 239.9 minutes in, and the workspace's tests alone took 10,627 seconds (177
-    # minutes) of them. The plan's rule puts that step by itself in part 1, with the report's own
-    # build and fetch before it (about 4 minutes) and the build of the worker that follows it (127
-    # seconds), which is 183 minutes of the step's 240: 57 minutes, 31 percent, of room. Part 2 is
-    # every other step: steps 3 to 31 took 3,386 seconds (56 minutes) on that night, and steps 32
-    # to 34 did not run, so part 2's time is not measured; it also compiles what part 1's workspace
-    # run compiled for it before, which no step of that night shows, and the first run of the two
-    # parts says it. The report's 240 minutes and the job's 340 are the limits of the single job
-    # that they were, and the steps' limits still add up to 326 of the 340.
+    # jobs run theirs: on 21 November the report's 240 minutes ended in its step 32, which had run
+    # for 2 minutes (it started 238.1 minutes in), and the workspace's tests alone took 10,630
+    # seconds (177 minutes) of them. The plan has no build that opens it on Linux, and its rule puts
+    # the workspace's tests by themselves in part 1, after the report's own build and fetch (2.2
+    # minutes): 179 minutes of the step's 240, which leaves 61 minutes, 34 percent, of room. Part 2
+    # is every other step, the worker's build (127 seconds) first: that build and steps 3 to 31
+    # took 3,526 seconds (59 minutes) on that night, step 32 had run for 125 seconds when the limit
+    # ended it, and steps 33 and 34 did not run, so part 2's time is not fully measured; it also
+    # compiles what part 1's workspace run compiled for it before, which no step of that night
+    # shows, and the first run of the two parts says it. The report's 240 minutes and the job's 340
+    # are the limits of the single job that they were, and the steps' limits still add up to 326 of
+    # the 340.
+    timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
@@ -183,12 +186,12 @@ jobs:
       # The groups of this platform's part of the plan, the applications fetched and built from the
       # pins in tests/conformance/applications.lock. The step fails when the run did. The whole plan
       # in one step took 152 to 207 minutes on the eleven nights of 30 October to 9 November (207 on
-      # 8 November), and over 240 on 21 November; part 1 of the two now takes about 183 (see the
+      # 8 November), and over 240 on 21 November; part 1 of the two now takes about 179 (see the
       # job's note above), and the job's whole run 155 to 210 on those nights. The limits of the job's
       # steps add up to 326 of its 340 minutes, the other steps' each at least twice the longest its
       # step took in those nights (the disk step, at 2.7 minutes, has 6), the package install's 35
       # minutes the retries of its script, and the two cache steps around it 2 minutes each. The
-      # report's 240 minutes are 57 over part 1 as measured, and the fetch's worst case (22 and a
+      # report's 240 minutes are 61 over part 1 as measured, and the fetch's worst case (22 and a
       # half minutes, in scripts/run-conformance.sh) is inside that.
       - name: The conformance report
         timeout-minutes: 240

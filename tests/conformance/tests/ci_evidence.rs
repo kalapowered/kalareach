@@ -1701,6 +1701,51 @@ fn the_linux_job_of_the_conformance_workflow_runs_its_plan_in_two_parts_and_the_
     }
 }
 
+/// Every job of the conformance workflow has a limit of its own, under the 360 minutes at which
+/// GitHub ends a hosted job, and the Linux job's steps have limits that add up to less than its 340
+/// minutes, so that a step that hangs is ended by its own limit and the steps after it still
+/// report.
+#[test]
+fn every_job_of_the_conformance_workflow_has_a_limit_under_githubs_and_the_linux_steps_fit_in_it() {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
+        .expect("the conformance workflow");
+    let jobs = jobs_of(&workflow);
+    assert!(
+        ["linux", "macos", "windows"]
+            .iter()
+            .all(|name| jobs.iter().any(|job| job == name)),
+        "the workflow's jobs: {jobs:?}"
+    );
+    let minutes = |text: &str, indent: usize| {
+        value_at(text, indent, "timeout-minutes").and_then(|value| value.parse::<u32>().ok())
+    };
+    for name in jobs.iter().filter(|name| name.as_str() != "linux") {
+        let limit = minutes(&header(&job(&workflow, name)), 4)
+            .unwrap_or_else(|| panic!("the {name} job has no limit of its own"));
+        assert!(
+            limit < 360,
+            "the {name} job's limit of {limit} minutes is not under the 360 GitHub ends a hosted job at"
+        );
+    }
+    let linux = job(&workflow, "linux");
+    assert_eq!(
+        minutes(&header(&linux), 4),
+        Some(340),
+        "the linux job's limit of its own is not its 340 minutes"
+    );
+    let total: u32 = steps_of(&linux)
+        .iter()
+        .map(|step| {
+            minutes(step, 8)
+                .unwrap_or_else(|| panic!("a step of the linux job has no limit:\n{step}"))
+        })
+        .sum();
+    assert!(
+        total < 340,
+        "the linux job's steps' limits add up to {total} minutes, which its 340 does not exceed"
+    );
+}
+
 /// A person on Windows is shown the PowerShell commands that start the report twice: in the guide,
 /// and in what the script prints where it refuses to run there. They are the same lines.
 #[test]
