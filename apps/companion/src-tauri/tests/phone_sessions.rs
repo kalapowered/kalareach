@@ -3925,6 +3925,24 @@ async fn places_held(host: kr_protocol::ids::DeviceId, count: usize) {
     });
 }
 
+/// Waits until at least `count` places are held on `host`: the connections the control counts
+/// include the keeper's dials, so a wait on them can end before each opening holds its place.
+async fn places_held_at_least(host: kr_protocol::ids::DeviceId, count: usize) {
+    let places = companion_tauri::places::budget();
+    tokio::time::timeout(WATCHDOG, async {
+        while places.held_on(host) < count {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "at least {count} places are held, not {}",
+            companion_tauri::places::budget().held_on(host)
+        )
+    });
+}
+
 /// KR-REQ-19.08: an opening whose link is lost, while every place of this computer's budget on the
 /// host is held by others, tells the page the budget's own cause while its watch waits for a place,
 /// and not that contact was lost for as long as the wait lasts; it reaches the host when a place is
@@ -4518,6 +4536,7 @@ async fn kr_req_19_08_a_reload_or_a_change_of_host_stops_the_dials_under_way() {
         opening_call(companion, second, None, "before-2"),
     ];
     held_at_least(&control, 2).await;
+    places_held_at_least(host, main_only + 2).await;
     assert_eq!(places.held_on(host), main_only + 2);
 
     // The page loads again: its openings are left, and the dials they were making stop where they
@@ -4539,6 +4558,7 @@ async fn kr_req_19_08_a_reload_or_a_change_of_host_stops_the_dials_under_way() {
         opening_call(companion, second, None, "after-2"),
     ];
     held_at_least(&control, 4).await;
+    places_held_at_least(host, main_only + 2).await;
     assert_eq!(places.held_on(host), main_only + 2);
     links.close_all();
     for call in after {
