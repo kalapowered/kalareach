@@ -4,7 +4,9 @@
  *
  * The scripted host stands in for native code. A case holds the reads it needs to order and answers
  * them by index, or holds the connection's publications, so what decides each outcome is the order
- * of the calls and never the time a call takes. The one case that depends on a clock sets it.
+ * of the calls and never the time a call takes. The cases of a loss's escalation, and the three that
+ * count the reads of a retry (after a numbers-only drop, and with a change of host during a dropped
+ * read or during its retry), run on a clock that only the test moves; the others run on the real one.
  */
 
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
@@ -131,6 +133,21 @@ function start(
     </AppProvider>
   )
   return { controls, port }
+}
+
+/**
+ * The same, on a clock that only the test moves: no cadence timer fires and no time passes until the
+ * test advances it, so the reads a case counts are the ones its own calls make. The first read has
+ * answered when it returns.
+ */
+async function startOnFakeClock(...args: Parameters<typeof start>): Promise<Started> {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
+  const started = start(...args)
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0)
+  })
+  expect(rowsOf('studio').length).toBeGreaterThan(0)
+  return started
 }
 
 function rowsOf(host: string): HTMLElement[] {
@@ -418,8 +435,7 @@ describe('what the host in use shows is stored and shown under the owner’s key
   // A numbers read that is dropped, under another key than the connection's, is a drop like the
   // inbox's: one new read follows and a second drop waits for the cadence.
   it('a_numbers_only_drop_makes_one_new_read_and_then_waits_for_the_cadence', async () => {
-    const { controls } = start(null)
-    await shown('studio')
+    const { controls } = await startOnFakeClock(null)
     const numbers = controls.hold('sessionNumbers')
     const first = numbers.count
     readNow()
@@ -477,8 +493,7 @@ describe('what the host in use shows is stored and shown under the owner’s key
   // A change of host that comes while a read is on its way asks for a read of its own. The one new
   // read that follows a dropped answer is that read, so two drops across the change make two reads.
   it('a_change_of_host_during_a_dropped_read_is_read_by_the_retry_and_not_again', async () => {
-    const { controls } = start(null)
-    await shown('studio')
+    const { controls } = await startOnFakeClock(null)
     controls.supersedeNextInboxReads(2)
     const held = controls.hold('attentionRead')
     const first = held.count
@@ -505,8 +520,7 @@ describe('what the host in use shows is stored and shown under the owner’s key
 
   // The retry covers the change that came before it began and no later one.
   it('a_change_of_host_during_the_retry_still_makes_a_read_of_its_own', async () => {
-    const { controls } = start(null)
-    await shown('studio')
+    const { controls } = await startOnFakeClock(null)
     controls.supersedeNextInboxReads(1)
     const held = controls.hold('attentionRead')
     const first = held.count
