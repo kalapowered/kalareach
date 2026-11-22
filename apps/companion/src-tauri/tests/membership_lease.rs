@@ -3874,8 +3874,11 @@ async fn each_draft_command_and_a_draft_prompt_is_refused_at_its_entry_for_an_ea
         );
     }
 
-    // Under the account now in force a command is not refused as a sign-out.
-    for (command, arguments) in &commands[..4] {
+    // Under the account now in force a command is not refused as a sign-out, and nor is the prompt
+    // that names a draft. The prompt is not applied here: the draft it names is not one this host
+    // knows, so what the case reads is the entry's stamp check, and the host's own record of an
+    // applied prompt is read by the cases of the paired companion (`phone_uploads`, E1).
+    for (command, arguments) in &commands {
         let answer = companion.call(command, with_mark(arguments, Some(grace.as_str())));
         assert!(
             !answer.as_ref().err().is_some_and(asks_to_sign_in),

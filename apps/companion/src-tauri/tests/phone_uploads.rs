@@ -3086,6 +3086,7 @@ async fn kr_req_13_12_a_connection_of_another_owner_reaching_during_the_cancel_i
     let key = kr_ipc::new_uuid();
     let held = testing::hold_at(key, Point::Writing(Step::Begun));
     let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let decided = testing::hold_at(key, Point::DecisionDone);
     let paired = paired_of(companion).await;
     let who = paired.who();
     let sending = {
@@ -3115,9 +3116,17 @@ async fn kr_req_13_12_a_connection_of_another_owner_reaching_during_the_cancel_i
         answer.state, "asked",
         "no connection of the upload's account"
     );
-    tokio::time::timeout(WATCHDOG, desk.idle())
-        .await
-        .expect("the desk's own tasks end");
+    // A decision that handed the key over again would give a chain of them: the case waits for the
+    // desk to be idle or for a third decision, and counts.
+    tokio::select! {
+        () = desk.idle() => {}
+        () = decided.until_passed(3) => {}
+    }
+    assert_eq!(
+        decided.passed(),
+        1,
+        "one decision: nothing of the other account's connection is a news or usable"
+    );
     assert_eq!(desk.phase_for_test(key), Some("paused"));
     assert!(
         desk.open(&who)
@@ -6282,7 +6291,9 @@ async fn kr_req_13_12_a_start_candidate_read_before_the_mark_is_refused_after_it
     let places = Places::start(1, true).await;
     let a_key = places.keys[0];
     // Account 1's reach reads the paused upload as a candidate and is held at the claim. Its
-    // connection has the number of the one in force, so it does not become the newest.
+    // connection has the number of the one in force, so it does not become the newest. The equal
+    // number is a device of the rig: the owner gives each installation its own number, and the case
+    // checks that the atomic mark, not the order of the connections, refuses the start.
     let claiming = testing::hold_at(a_key, Point::Claiming);
     let reached = Paired {
         account: places.earlier.account,
