@@ -581,6 +581,18 @@ impl Facilities for Platform {
 /// Reading the whole of a file the check knows nothing about would be a diagnostic that copies a
 /// document into memory, so it reads enough to establish that the bytes come out and stops.
 fn read_authorised_file(plan: &Plan) -> Ran {
+    read_authorised_file_by(plan, bounded_read)
+}
+
+/// The authorised-file read, with the bounded read of the file given rather than chosen.
+///
+/// The product gives [`bounded_read`]. A case can give a read that does not return, to see the
+/// check stop waiting for it at its declared bound; everything else the check does is this
+/// function's own.
+fn read_authorised_file_by(
+    plan: &Plan,
+    read: impl FnOnce(&Path, Duration) -> Option<std::io::Result<FirstBlock>>,
+) -> Ran {
     let check = Check::AuthorisedFileRead;
     let Some(path) = plan.authorised_file.as_deref() else {
         return Ran {
@@ -599,7 +611,7 @@ fn read_authorised_file(plan: &Plan) -> Ran {
     // a pipe or a device between a look and a read is not read at all. The open itself does not
     // wait for the other end of a pipe, and the whole check answers inside its own bound whatever
     // the filesystem does.
-    let outcome = match bounded_read(path, check.effects().bound) {
+    let outcome = match read(path, check.effects().bound) {
         None => Outcome::NotAttempted {
             detail: Sentence::new()
                 .path(path)
