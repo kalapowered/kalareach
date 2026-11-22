@@ -1606,10 +1606,51 @@ fn a_failed_read_of_the_process_table_says_the_agents_process_could_not_be_looke
 const QUIET: Duration = Duration::from_millis(500);
 
 /// Whether the screen can be read as the last the agent drew: while the agent's process runs, the
-/// screen is as far as it has drawn; once it has ended, only when the window has taken no byte for
-/// [`QUIET`] since the end was seen, or its output has ended (nothing more can come).
+/// screen is as far as the window has taken what it drew; once it has ended, only when the window
+/// has taken no byte for [`QUIET`] since the end was seen, or its output has ended (nothing more
+/// can come).
 const fn last_drawn(agent_ended: bool, window_quiet: bool) -> bool {
     !agent_ended || window_quiet
+}
+
+/// What one poll of a second start has seen: whether the agent's process has ended, how many bytes
+/// the window has taken as of `now`, and whether its output has ended.
+#[derive(Clone, Copy)]
+struct Look {
+    agent_ended: bool,
+    mark: usize,
+    now: Instant,
+    output_ended: bool,
+}
+
+/// One poll of a second start: the screen is read only once it can be read as the last the agent
+/// drew ([`last_drawn`]), and judged by [`second_screen`]. `screen` reads it.
+fn second_poll(
+    quiet: &mut Option<Quiet>,
+    look: Look,
+    screen: impl FnOnce() -> Vec<String>,
+    typed: &str,
+    composer: &str,
+    refusals: &[String],
+    draft: &[String],
+) -> Option<(Started, Option<String>)> {
+    let window_quiet = look.agent_ended && {
+        quiet
+            .get_or_insert_with(|| Quiet::new(look.mark, look.now))
+            .is_quiet(look.mark, look.now, QUIET)
+            || look.output_ended
+    };
+    if !last_drawn(look.agent_ended, window_quiet) {
+        return None;
+    }
+    second_screen(
+        &screen(),
+        typed,
+        composer,
+        refusals,
+        draft,
+        look.agent_ended,
+    )
 }
 
 /// A refusal printed just before the agent's process ends reaches the window after the end is
@@ -1628,20 +1669,38 @@ fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet
     ]);
     // The end is seen at 0 ms; the card's bytes reach the window at 300 ms, behind the end.
     let start = Instant::now();
-    let mut quiet = Quiet::new(100, start);
+    let mut quiet: Option<Quiet> = None;
+    let reads = std::cell::Cell::new(0_u32);
     let mut read = None;
     for at in (0..=2000_u64).step_by(50) {
-        let now = start + Duration::from_millis(at);
-        let mark = if at < 300 { 100 } else { 160 };
-        let window_quiet = quiet.is_quiet(mark, now, QUIET);
-        if last_drawn(true, window_quiet) {
-            let rows = if at < 300 { &before } else { &after };
-            read = Some((
-                at,
-                second_screen(rows, typed, composer, &refusals, &[], true),
-            ));
+        let look = Look {
+            agent_ended: true,
+            mark: if at < 300 { 100 } else { 160 },
+            now: start + Duration::from_millis(at),
+            output_ended: false,
+        };
+        let rows = if at < 300 { &before } else { &after };
+        let polled = second_poll(
+            &mut quiet,
+            look,
+            || {
+                reads.set(reads.get() + 1);
+                rows.clone()
+            },
+            typed,
+            composer,
+            &refusals,
+            &[],
+        );
+        if polled.is_some() {
+            read = Some((at, polled));
             break;
         }
+        assert_eq!(
+            reads.get(),
+            0,
+            "no screen is read at {at} ms, before the window is quiet"
+        );
     }
     let (at, how) = read.expect("the window goes quiet");
     assert_eq!(
@@ -1656,13 +1715,62 @@ fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet
         at >= 300 + 500,
         "{at} ms: the read waits for {QUIET:?} of no byte"
     );
+    assert_eq!(reads.get(), 1, "the screen is read once");
     assert!(
         last_drawn(false, false),
-        "a screen read while the agent runs is as far as it has drawn"
+        "a screen read while the agent runs is as far as the window has taken it"
     );
     assert!(
         !last_drawn(true, false),
         "a screen read after the end, with bytes still arriving, is not the last"
+    );
+}
+
+/// The screen of an agent whose process runs is read at once, and so is the screen of one that has
+/// ended once the window's output has ended; the composer of an ended agent is no running agent.
+#[test]
+fn a_running_agents_screen_and_an_ended_windows_output_are_read_at_once() {
+    let rows = vec![
+        "kr-session$ codex resume 0123-4567".to_owned(),
+        "> Ask Codex to do anything".to_owned(),
+    ];
+    let refusals = ["This conversation is open in another app".to_owned()];
+    let poll = |agent_ended: bool, output_ended: bool| {
+        let reads = std::cell::Cell::new(0_u32);
+        let look = Look {
+            agent_ended,
+            mark: 100,
+            now: Instant::now(),
+            output_ended,
+        };
+        let how = second_poll(
+            &mut None,
+            look,
+            || {
+                reads.set(reads.get() + 1);
+                rows.clone()
+            },
+            "codex resume 0123-4567",
+            "Ask Codex to do anything",
+            &refusals,
+            &[],
+        );
+        (how, reads.get())
+    };
+    assert_eq!(
+        poll(false, false),
+        (Some((Started::Running, None)), 1),
+        "the screen of an agent that runs is read at once"
+    );
+    assert_eq!(
+        poll(true, false),
+        (None, 0),
+        "the screen of an agent that has ended waits for the window to be quiet"
+    );
+    assert_eq!(
+        poll(true, true),
+        (Some((Started::Ended, None)), 1),
+        "a window whose output has ended is read at once, and an ended agent's composer is no running agent"
     );
 }
 
@@ -1688,21 +1796,22 @@ fn second_start(
             agent = agent_now(ctx, at.session_id)
                 .unwrap_or_else(|why| panic!("{}", process_not_looked_for(&why)));
         }
-        let ended = agent.as_ref().is_some_and(|identity| !running(identity));
         let window = &at.person.window;
-        let window_quiet = ended && {
-            let now = Instant::now();
-            let mark = window.mark();
-            quiet
-                .get_or_insert_with(|| Quiet::new(mark, now))
-                .is_quiet(mark, now, QUIET)
-                || window.output_ended()
+        let look = Look {
+            agent_ended: agent.as_ref().is_some_and(|identity| !running(identity)),
+            mark: window.mark(),
+            now: Instant::now(),
+            output_ended: window.output_ended(),
         };
-        let rows = window.screen();
-        if last_drawn(ended, window_quiet)
-            && let Some((how, shown)) =
-                second_screen(&rows, typed, composer, refusals, draft, ended)
-        {
+        if let Some((how, shown)) = second_poll(
+            &mut quiet,
+            look,
+            || window.screen(),
+            typed,
+            composer,
+            refusals,
+            draft,
+        ) {
             return (how, shown, agent);
         }
         assert!(
@@ -1714,7 +1823,7 @@ fn second_start(
             } else {
                 "not seen"
             },
-            rows.join("\n")
+            window.screen().join("\n")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
