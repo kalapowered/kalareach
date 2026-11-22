@@ -933,69 +933,80 @@ fn powershell(script: &str) -> std::process::Output {
         .unwrap()
 }
 
-/// The Windows Time service as the case found it: its start type in the words of `sc config`,
-/// and whether it was running.
-struct TimeService {
+/// The services that can set the clock, as the case found them: the Windows Time service's start
+/// type in the words of `sc config`, and whether it and the Hyper-V time synchronisation service
+/// were running.
+struct TimeServices {
     start: String,
-    ran: bool,
+    windows_time_ran: bool,
+    hyper_v_sync_ran: bool,
 }
 
 /// Moves the system's clock and puts it back when it is dropped: to the time it began at plus the
 /// time that has passed since.
 ///
-/// The Windows Time service takes the host's time through its Hyper-V time provider and sets a
-/// moved clock back within seconds: the guest's maintenance task that starts it ran at the first
-/// move. So the service is held off for as long as the clock is held: its start type is set to
-/// disabled, which makes that task's start fail, and it is stopped when it runs. The drop puts
-/// the start type and the state back as they were found.
+/// Two services set a moved clock back to the host's time within seconds, so both are held off
+/// for as long as the clock is held. The Windows Time service takes the host's time through its
+/// Hyper-V time provider: the guest's maintenance task that starts it ran at the first move, so
+/// its start type is set to disabled, which makes that start fail, and it is stopped when it
+/// runs. The Hyper-V time synchronisation service set the clock forward again after a move back,
+/// so it is stopped when it runs. The drop puts the start type and the states back as they were
+/// found.
 ///
-/// A killed process cannot run the drop, so the clock and the service change only behind the gate
-/// of the case that uses this value: the case is ignored unless a run asks for the ignored cases,
-/// it returns at once unless the process is the system's (checked again here), and it runs in a
-/// disposable guest that a restore resets. No other run changes the clock or the service.
+/// A killed process cannot run the drop, so the clock and the services change only behind the
+/// gate of the case that uses this value: the case is ignored unless a run asks for the ignored
+/// cases, it returns at once unless the process is the system's (checked again here), and it
+/// runs in a disposable guest that a restore resets. No other run changes the clock or either
+/// service.
 struct Clock {
     began: std::time::SystemTime,
     at: Instant,
-    time_service: TimeService,
+    services: TimeServices,
 }
 impl Clock {
     fn new() -> Clock {
         assert!(
             runs_as_the_system(),
-            "the clock and the time service change only in a run as the system"
+            "the clock and the time services change only in a run as the system"
         );
         let found = powershell(
             "$s = Get-Service -Name W32Time; \
              $d = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\W32Time').DelayedAutostart; \
              $m = switch ([string]$s.StartType) { 'Automatic' { if ($d -eq 1) { 'delayed-auto' } else { 'auto' } } 'Manual' { 'demand' } 'Disabled' { 'disabled' } default { throw ('start type ' + $s.StartType) } }; \
-             $m + ' ' + $s.Status",
+             $v = Get-Service -Name vmictimesync -ErrorAction SilentlyContinue; \
+             $m + ' ' + $s.Status + ' ' + $(if ($v) { $v.Status } else { 'absent' })",
         );
         assert!(
             found.status.success(),
-            "the time service was not read: {found:?}"
+            "the time services were not read: {found:?}"
         );
         let text = String::from_utf8_lossy(&found.stdout).trim().to_owned();
-        let (start, state) = text
-            .split_once(' ')
-            .unwrap_or_else(|| panic!("the time service's state is unreadable: {text}"));
+        let words: Vec<&str> = text.split(' ').collect();
+        let [start, windows_time, hyper_v_sync] = words[..] else {
+            panic!("the time services' state is unreadable: {text}");
+        };
         let clock = Clock {
             began: std::time::SystemTime::now(),
             at: Instant::now(),
-            time_service: TimeService {
+            services: TimeServices {
                 start: start.to_owned(),
-                ran: state == "Running",
+                windows_time_ran: windows_time == "Running",
+                hyper_v_sync_ran: hyper_v_sync == "Running",
             },
         };
-        // From here the drop puts the service back, whether or not this call finishes.
+        // From here the drop puts the services back, whether or not this call finishes.
         let held = powershell(
             "& sc.exe config W32Time start= disabled | Out-Null; \
              if ($LASTEXITCODE -ne 0) { throw 'the start type was not set' }; \
              Stop-Service -Name W32Time -Force -ErrorAction Stop; \
-             [string](Get-Service -Name W32Time).Status",
+             $v = Get-Service -Name vmictimesync -ErrorAction SilentlyContinue; \
+             if ($v -and $v.Status -eq 'Running') { Stop-Service -Name vmictimesync -Force -ErrorAction Stop }; \
+             [string](Get-Service -Name W32Time).Status + ' ' + $(if ($v) { [string](Get-Service -Name vmictimesync).Status } else { 'absent' })",
         );
+        let state = String::from_utf8_lossy(&held.stdout).trim().to_owned();
         assert!(
-            held.status.success() && String::from_utf8_lossy(&held.stdout).trim() == "Stopped",
-            "the time service was not held off: {held:?}"
+            held.status.success() && (state == "Stopped Stopped" || state == "Stopped absent"),
+            "the time services were not held off: {held:?}"
         );
         clock
     }
@@ -1034,15 +1045,20 @@ impl Clock {
 
 impl Drop for Clock {
     fn drop(&mut self) {
-        // The service goes back first: a clock that cannot be put back still leaves it as found.
-        let TimeService { start, ran } = &self.time_service;
+        // The services go back first: a clock that cannot be put back still leaves them as found.
+        let TimeServices {
+            start,
+            windows_time_ran,
+            hyper_v_sync_ran,
+        } = &self.services;
         let _ = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
                 "-Command",
                 &format!(
                     "& sc.exe config W32Time start= {start}; \
-                     if ('{ran}' -eq 'true') {{ Start-Service -Name W32Time -ErrorAction SilentlyContinue }}"
+                     if ('{windows_time_ran}' -eq 'true') {{ Start-Service -Name W32Time -ErrorAction SilentlyContinue }}; \
+                     if ('{hyper_v_sync_ran}' -eq 'true') {{ Start-Service -Name vmictimesync -ErrorAction SilentlyContinue }}"
                 ),
             ])
             .status();
