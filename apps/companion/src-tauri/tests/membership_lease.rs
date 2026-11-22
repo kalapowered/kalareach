@@ -3748,3 +3748,138 @@ async fn a_bind_of_a_transfer_no_record_of_the_account_holds_is_refused_and_the_
         "the host saw no bind"
     );
 }
+
+/// KR-REQ-23.41: on a member host each command of a draft, and the prompt that names a draft, is
+/// refused at its entry in the sign-in words when the mark it carries is an earlier account's or is
+/// none, before the draft is read or ended and before the host is asked; a command made under the
+/// account now signed in is not refused as a sign-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_draft_command_and_a_draft_prompt_is_refused_at_its_entry_for_an_earlier_mark_or_none()
+{
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    let companion = rig.companion();
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let ada = state
+        .account_of(true)
+        .await
+        .expect("an account is signed in")
+        .expect("a mark")
+        .to_hex();
+    // The person signs in as another member; the page has not been told, so its commands still
+    // carry the earlier account's mark.
+    rig.signs_in_as("grace").await;
+    let grace = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            if let Ok(Some(mark)) = state.account_of(true).await
+                && mark.to_hex() != ada
+            {
+                return mark.to_hex();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the account in force is the new one");
+
+    let session = rig.session();
+    let subject = json!({ "sessionId": session.to_string(), "sessionEpoch": "1" });
+    let create = json!({
+        "environment_id": kr_ipc::new_uuid().to_string(),
+        "device_id": null,
+        "session_id": session.to_string(),
+        "application_instance_id": null,
+        "text": "",
+    });
+    let bind = json!({
+        "session_id": session.to_string(),
+        "text": "see the file",
+        "transfer_id": kr_ipc::new_uuid().to_string(),
+        "contribution": serde_json::to_value(kr_protocol::transfer::AttachmentContribution {
+            operation_id: "attach".to_owned(),
+            accepted_media_types: vec!["application/octet-stream".to_owned()],
+            max_byte_len: kr_protocol::scalars::U64::new(1 << 20),
+            max_count: kr_protocol::scalars::U64::new(4),
+            insertion_method: kr_protocol::transfer::InsertionMethod::ManualTerminalWorkflow,
+            external_destination: Nullable::null(),
+            model_media_capability: false,
+        })
+        .expect("encodes"),
+    });
+    let prompt = serde_json::to_value(kr_protocol::agent::AgentPromptParams {
+        target: kr_protocol::agent::AgentMutationTarget {
+            subject: kr_worker::broker::subject(
+                session,
+                kr_protocol::ids::ApplicationInstanceId::new(kr_ipc::new_uuid()),
+            ),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+        },
+        draft_id: Nullable::some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid())),
+        text: Nullable::null(),
+    })
+    .expect("encodes");
+    // The command's name and the arguments it takes, without a mark.
+    let commands = [
+        (
+            "draft_set_text",
+            json!({ "subject": subject, "sessionId": session.to_string(), "text": "typed" }),
+        ),
+        (
+            "draft_create",
+            json!({ "subject": subject, "params": create }),
+        ),
+        (
+            "draft_add_attachment",
+            json!({ "subject": subject, "params": bind }),
+        ),
+        (
+            "draft_end",
+            json!({ "subject": subject, "sessionId": session.to_string() }),
+        ),
+        (
+            "agent_prompt_submit",
+            json!({ "params": prompt, "opening": "screen" }),
+        ),
+    ];
+    let with_mark = |arguments: &serde_json::Value, mark: Option<&str>| {
+        let mut made = arguments.clone();
+        if let (Some(mark), Some(object)) = (mark, made.as_object_mut()) {
+            object.insert("mark".to_owned(), json!(mark));
+        }
+        made
+    };
+    for (command, arguments) in &commands {
+        for (what, mark) in [
+            ("the earlier account's mark", Some(ada.as_str())),
+            ("no mark", None),
+        ] {
+            let said = companion.call(command, with_mark(arguments, mark)).err();
+            assert!(
+                said.as_ref().is_some_and(asks_to_sign_in),
+                "{command} under {what} is refused in the sign-in words: {said:?}"
+            );
+        }
+    }
+    for method in [
+        Method::DraftCreate,
+        Method::DraftUpdate,
+        Method::DraftDiscard,
+        Method::AgentDraftAddAttachment,
+        Method::AgentPromptSubmit,
+    ] {
+        assert_eq!(
+            rig.control.sent(method),
+            0,
+            "the host was asked nothing: {method:?}"
+        );
+    }
+
+    // Under the account now in force a command is not refused as a sign-out.
+    for (command, arguments) in &commands[..4] {
+        let answer = companion.call(command, with_mark(arguments, Some(grace.as_str())));
+        assert!(
+            !answer.as_ref().err().is_some_and(asks_to_sign_in),
+            "{command} under the account in force is not refused as a sign-out: {answer:?}"
+        );
+    }
+}
