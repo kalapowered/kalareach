@@ -540,7 +540,7 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 19] = [
                 "the held daemon, or the script that hands over to it, placed under the installed name; nothing starts the plain build",
             ),
             (
-                "stub_installation",
+                "stub_installation_in",
                 1,
                 "a stub daemon written under a name nothing runs and placed under the installed name; nothing starts the plain build",
             ),

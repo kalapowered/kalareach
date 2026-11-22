@@ -1675,7 +1675,12 @@ fn prints_the_listen_line(
 /// An installation of its own for a case whose daemon is a stub: the real `kr` and its guard, and
 /// the stub as the `kr-controller` `kr` finds beside itself.
 fn stub_installation(host: &Standalone, daemon: &str) -> PathBuf {
-    let directory = host.tree.root().join("stub-installation");
+    stub_installation_in(host.tree.root(), daemon)
+}
+
+/// [`stub_installation`] in the tree at `root`: for a host that is not a standalone one.
+fn stub_installation_in(root: &Path, daemon: &str) -> PathBuf {
+    let directory = root.join("stub-installation");
     std::fs::create_dir(&directory).expect("a folder for the installation");
     for name in ["kr", "kr-attach-guard"] {
         kr_ipc::testing::place_program(
@@ -1684,7 +1689,7 @@ fn stub_installation(host: &Standalone, daemon: &str) -> PathBuf {
         );
     }
     // Written under a name nothing runs, and placed under the one `kr` runs by a copy.
-    let script = host.tree.root().join("stub-daemon.sh");
+    let script = root.join("stub-daemon.sh");
     std::fs::write(&script, daemon).expect("writes the stub daemon");
     kr_ipc::testing::place_program(&script, &directory.join("kr-controller"));
     directory
@@ -4056,13 +4061,16 @@ impl ServiceHost {
 
     /// `kr` from the service installation, against this tree, this home and this host's manager.
     fn kr(&self, arguments: &[&str]) -> Command {
+        self.kr_from(service_installation(), arguments)
+    }
+
+    /// [`Self::kr`] from another installation: the one a case with a stub daemon lays out. It runs
+    /// in the working directory of the service installation, so the held daemon and the worker are
+    /// built first, as for every case of this host.
+    fn kr_from(&self, installation: &Path, arguments: &[&str]) -> Command {
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-        let mut command = service_command(
-            &service_installation().join("kr"),
-            arguments,
-            &self.home,
-            &self.tree,
-        );
+        let mut command =
+            service_command(&installation.join("kr"), arguments, &self.home, &self.tree);
         #[cfg(target_os = "linux")]
         command.env("XDG_RUNTIME_DIR", &self.manager.runtime);
         command
@@ -4814,6 +4822,102 @@ fn the_service_start_is_chosen_and_used_where_no_daemon_has_ever_run() {
             .expect("the service manager reports the daemon it started"),
     );
     host.close(&created);
+}
+
+/// KR-REQ-07.12: a restart whose service start's daemon ended after writing why it could not
+/// listen says why, in this command's words, and does not say that the requested daemon may still
+/// start: the manager named the process that wrote the line, the process ended with it, and the
+/// definition kr wrote does not start it again.
+///
+/// No daemon runs, so the restart starts one through the user manager, from a definition that
+/// names a stub daemon: a script that records that it started, waits for the case to let it go,
+/// prints, as itself, the line a daemon prints for a file where its rendezvous endpoint belongs,
+/// and ends. The manager gives the process of a daemon that is running when it is asked, so the
+/// case lets the stub go only after the manager reports the stub's process, and the failure has to
+/// name that process.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_service_start_whose_daemon_ended_with_a_listen_line_says_why_and_no_requested_daemon_may_still_start()
+ {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    let started = host.tree.root().join("stub-started");
+    let go = host.tree.root().join("stub-go");
+    let tail = "a tail only the daemon's own log holds";
+    let daemon = stub_daemon(
+        &started,
+        Some(&go),
+        host.tree.root(),
+        &prints_the_listen_line(
+            &host.tree.environment(),
+            ListenRole::Rendezvous,
+            ListenRefusal::NotASocket {
+                object: ObjectKind::File,
+            },
+            tail,
+        ),
+    );
+    let installation = stub_installation_in(host.tree.root(), &daemon);
+    let chosen = start(host.kr_from(
+        &installation,
+        &["--json", "host", "startup", "--set", "service"],
+    ))
+    .finish("kr host startup");
+    let chosen = document(&chosen, "kr host startup");
+    assert_eq!(chosen["startup"]["controller"], "service", "{chosen}");
+    assert_eq!(
+        chosen["startup"]["definition"]["state"], "matches",
+        "{chosen}"
+    );
+
+    let running = start(host.kr_from(&installation, &["--json", "host", "restart"]));
+    wait_for_mark(&started, "the stub daemon's start");
+    let process = host
+        .daemon()
+        .expect("the user manager reports the stub it started");
+    // The restart asks the manager for the process as soon as the manager has started the stub;
+    // this is the margin for that.
+    std::thread::sleep(Duration::from_millis(2000));
+    std::fs::write(&go, "").expect("lets the stub go");
+
+    let output = running.finish("kr host restart");
+    let failed = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(1), "{failed}");
+    assert_eq!(failed["code"], "ENVIRONMENT_UNAVAILABLE", "{failed}");
+    let message = failed["message"].as_str().unwrap_or_default();
+    let rendezvous = host
+        .tree
+        .environment()
+        .rendezvous_endpoint()
+        .expect("an endpoint")
+        .as_text();
+    let said = format!(
+        "This command's start failed: the control daemon systemd started for environment {} \
+         (process {process}) did not answer; its log reports that it could not listen on its \
+         rendezvous endpoint {rendezvous}: it holds a file; kr does not remove what it did not \
+         make; if you do not need it, move it away, then run the command again; what it writes \
+         is in ",
+        host.tree.environment_id()
+    );
+    assert!(
+        message.contains(&said),
+        "the failure names the stub's process and says why it ended, in this command's words: \
+         {message}"
+    );
+    assert!(
+        !message.contains("seconds"),
+        "and says no bound was waited out: {message}"
+    );
+    assert!(
+        !message.contains(tail),
+        "and repeats nothing of the daemon's own text: {message}"
+    );
+    assert!(
+        !message.contains("The requested daemon may still start."),
+        "a daemon that wrote its last line and ended is not a daemon that may still start: \
+         {message}"
+    );
 }
 
 /// KR-REQ-07.12: a service manager holding anything but the definition kr wrote is not asked to
