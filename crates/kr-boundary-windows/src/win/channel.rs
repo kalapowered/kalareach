@@ -34,14 +34,14 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_OUTBOUND,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_GENERIC_WRITE, PIPE_ACCESS_OUTBOUND, SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+use windows_sys::Win32::System::Threading::{CreateEventW, EVENT_MODIFY_STATE, SetEvent};
 
 use crate::channel::{PipeNames, pipe_names};
 
@@ -225,8 +225,8 @@ fn connect_blocking(pipe: HANDLE) -> Result<()> {
 
 /// The body of the thread that waits on one pipe: it takes connections until one comes from the
 /// retained client, and disconnects every other, leaving the instance.
-fn connect_the_client(pipe: usize, expected: u32, cancelled: &AtomicBool) -> Result<()> {
-    let pipe = pipe as HANDLE;
+fn connect_the_client(pipe: &Handle, expected: u32, cancelled: &AtomicBool) -> Result<()> {
+    let pipe = pipe.raw();
     loop {
         if cancelled.load(Ordering::SeqCst) {
             // text: channel_connect-2
@@ -247,7 +247,10 @@ fn connect_the_client(pipe: usize, expected: u32, cancelled: &AtomicBool) -> Res
     }
 }
 
-/// One waiting thread, with the event it sets when it ends.
+/// One waiting thread, with the event it sets when it ends. The thread owns its own copies of the
+/// pipe's server end and of the event, so that nothing that closes the broker's handles, a wait that
+/// gave the thread up included, leaves the thread with a closed handle or with one that another
+/// object now has. A waiter that is dropped cancels its thread.
 struct Waiter {
     thread: Option<JoinHandle<Result<()>>>,
     done: Handle,
@@ -280,17 +283,19 @@ impl Waiter {
         // text: channel_waiter-1
         let done = Handle::new(event, "making an event for a data pipe's wait")?;
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (pipe, event, flag) = (pipe.raw() as usize, done.raw() as usize, cancelled.clone());
+        let pipe = pipe.duplicate(FILE_GENERIC_WRITE)?;
+        let event = done.duplicate(EVENT_MODIFY_STATE | SYNCHRONIZE)?;
+        let flag = cancelled.clone();
         #[cfg(feature = "testing")]
         let counted = {
             live.fetch_add(1, Ordering::SeqCst);
             Counted(live.clone())
         };
         let thread = std::thread::spawn(move || {
-            let result = connect_the_client(pipe, expected, &flag);
-            // SAFETY: the event is open until the waiter has joined this thread.
+            let result = connect_the_client(&pipe, expected, &flag);
+            // SAFETY: the thread's own copy of the event is open for the call.
             unsafe {
-                SetEvent(event as HANDLE);
+                SetEvent(event.raw());
             }
             #[cfg(feature = "testing")]
             drop(counted);
@@ -346,6 +351,12 @@ impl Waiter {
             // text: channel_waiter-2
             Err(_) => Err(error(0, "waiting for a client to connect to a data pipe")),
         }
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
