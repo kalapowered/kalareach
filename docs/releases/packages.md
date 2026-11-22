@@ -163,6 +163,10 @@ Every landing on main is tagged and published, so the branches that change the s
 level land in one train. Three branches that land in three trains make three releases, and the
 first of them is the level.
 
+The first tag of a level freezes its surface. A release from that tag cannot be replaced. After
+that tag, each landing on the level is compared to the newest release of the level, and any
+difference in surface is deferred until the next level is cut.
+
 The surface is these four things:
 
 - the types of the retained surface, `SURFACE_ROOTS` in `crates/kr-protocol/src/retained.rs`;
@@ -178,6 +182,10 @@ The shell bridge's `root.*` methods are not in it, and neither are the hook's re
 `kr_hello` line and its private exchange: their peers are the shell package and the forwarder that
 a session launched, which have releases of their own. Nothing checks that a hook of one release
 works with a worker of another at the same level; the upgrade suite does not drive one yet.
+
+A worker's input rule that refuses more than the retained release's rule did is recorded in the
+narrower table, and [Retaining a level](support-window.md#retaining-a-level) says what a cut does
+with it.
 
 A level is also the public contract of the protocol package: a client built from the package meets
 a host of its own level, and the Rust types refuse a member or a value they do not know. Three

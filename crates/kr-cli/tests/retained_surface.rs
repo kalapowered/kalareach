@@ -17,8 +17,11 @@
 //! * **Probes.** [`probes::probes`] gives inputs and whether this build accepts each; a level
 //!   records what its release did (`retained/<level>/vectors.json`).
 //!
-//! A difference from a level's record needs a reviewed [`SAME`] entry, which says the change leaves
-//! what the level accepts as it was and carries the new digest.
+//! A difference from a level's record needs a reviewed entry. A [`SAME`] entry says the change
+//! leaves what the level accepts as it was and carries the new digest. A `NARROWER` entry
+//! (`retained_surface/narrower_table.rs`) is the one kind for a worker input rule that refuses more
+//! than the retained release's rule did: it names the rule's root, the helpers the root does not
+//! follow, and what reaches the rule from every peer that can send to a worker of this level.
 //!
 //! The limits of this, which the document on the support window states: a rule in a dependency
 //! (serde, uuid, base64), a rule reached through trait dispatch that no path names, a rule applied
