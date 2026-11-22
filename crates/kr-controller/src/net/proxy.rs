@@ -376,6 +376,9 @@ impl WorkerProxy {
         }
         // The kind of grant travels only with an attach: under a share it is drawn the screen the
         // share's issuer was shown, and under a pairing grant the live one.
+        if mutation.method.method() == Some(Method::SessionAttach) {
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        }
         let screen_basis = vouched
             .screen_basis
             .filter(|_| mutation.method.method() == Some(Method::SessionAttach));
