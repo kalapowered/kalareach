@@ -1957,6 +1957,48 @@ mod tests {
         );
     }
 
+    /// Whether a process of this identifier is still there. A process that was ended and not
+    /// collected is: it answers signal zero until its parent has waited for it.
+    #[cfg(unix)]
+    fn still_there(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .expect("kill runs")
+            .status
+            .success()
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: a helper that acknowledged the opening
+    /// and then says nothing is ended and collected before the refusal that says it was ended
+    /// returns, as one that said nothing before it is. The helper is a stand-in that writes the
+    /// acknowledgement and then stalls, so the identifier comes from the handle and nothing waits
+    /// on a bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_says_nothing_after_it_acknowledged_is_ended_and_collected_before_the_refusal_returns()
+     {
+        let (_directory, opening) = writing(
+            &[BridgeFrame::HelloAck(Box::new(acknowledgement()))],
+            "exec sleep 60",
+        );
+        let invocation = opening
+            .launch()
+            .await
+            .expect("the helper answered as the enrolled environment");
+        let pid = invocation
+            .child
+            .id()
+            .expect("a running helper has an identifier");
+        let waited = SILENCE_LIMIT;
+        let refusal = invocation.settled(Refusal::Silent { waited }).await;
+        assert_eq!(refusal, Refusal::Silent { waited });
+        assert!(
+            !still_there(pid),
+            "process {pid} was left running or uncollected"
+        );
+    }
+
     #[test]
     fn an_ssh_environment_is_refused_as_a_bridge_rather_than_started() {
         let mut ssh = enrolment();
