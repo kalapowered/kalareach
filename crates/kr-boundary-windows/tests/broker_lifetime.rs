@@ -2117,37 +2117,44 @@ fn a_reader_that_ends_and_leaves_a_live_descendant_refuses_the_operation_before_
     let mut baseline = std::collections::HashMap::new();
     let _ = token_handles_of(0, &mut baseline);
     let replies = run_one(&life, How::Reads, client_of(None), None);
-    if !matches!(replies.last(), Some(InvocationReply::Refused { .. })) {
-        let luid = hooks::session();
+    let luid = hooks::session();
+    let mut now = std::collections::HashMap::new();
+    let at_the_end = token_handles_of(luid, &mut now);
+    let grown: Vec<(u64, u32, u32)> = now
+        .iter()
+        .filter(|(pid, count)| **count > baseline.get(*pid).copied().unwrap_or(0))
+        .map(|(pid, count)| (*pid, baseline.get(pid).copied().unwrap_or(0), *count))
+        .collect();
+    let numbers: Vec<String> = grown.iter().map(|(pid, _, _)| pid.to_string()).collect();
+    let named = if numbers.is_empty() {
+        String::new()
+    } else {
+        std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "Get-Process -Id {} -ErrorAction SilentlyContinue | ForEach-Object {{ '' + $_.Id + ' ' + $_.ProcessName }}",
+                    numbers.join(",")
+                ),
+            ])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let refused = matches!(replies.last(), Some(InvocationReply::Refused { .. }));
+    eprintln!(
+        "diagnostic: refused {refused}; {at_the_end}; grew (pid, before, now): {grown:?} {named}"
+    );
+    if !refused {
         let rows = life.rows();
         let listing = diagnostic_listing(luid);
-        let mut now = std::collections::HashMap::new();
-        let before = token_handles_of(luid, &mut now);
-        let grown: Vec<(u64, u32, u32)> = now
-            .iter()
-            .filter(|(pid, count)| **count > baseline.get(*pid).copied().unwrap_or(0))
-            .map(|(pid, count)| (*pid, baseline.get(pid).copied().unwrap_or(0), *count))
-            .collect();
-        let numbers: Vec<String> = grown.iter().map(|(pid, _, _)| pid.to_string()).collect();
-        let named = if numbers.is_empty() {
-            String::new()
-        } else {
-            std::process::Command::new("powershell.exe")
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &format!(
-                        "Get-Process -Id {} -ErrorAction SilentlyContinue | ForEach-Object {{ '' + $_.Id + ' ' + $_.ProcessName }}",
-                        numbers.join(",")
-                    ),
-                ])
-                .output()
-                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-                .unwrap_or_default()
-        };
+        let started = Instant::now();
+        let later = session::wait_absent(luid, Duration::from_secs(150));
         panic!(
-            "{replies:?} {rows:?}\n{listing}\nat the end: {before}\ntoken handles per process that grew (pid, before, now): {grown:?}\n{named}"
+            "{replies:?} {rows:?}\n{listing}\nthe session: {later:?} after {} s more",
+            started.elapsed().as_secs()
         );
     }
     assert!(
