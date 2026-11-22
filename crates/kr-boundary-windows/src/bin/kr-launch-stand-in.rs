@@ -187,6 +187,49 @@ fn main() -> std::process::ExitCode {
             }
             std::thread::sleep(std::time::Duration::from_millis(milliseconds));
         }
+        // Ends at once with the code it is given.
+        "exit" => {
+            let code = arguments
+                .get(1)
+                .and_then(|text| text.parse::<u8>().ok())
+                .unwrap_or(0);
+            return ExitCode::from(code);
+        }
+        // Takes every entry out of its own process's permission list, the system's included, so that
+        // no other process can open it, says that it did, and then sleeps.
+        "hide" => {
+            use windows_sys::Win32::Security::Authorization::{SE_KERNEL_OBJECT, SetSecurityInfo};
+            use windows_sys::Win32::Security::{
+                ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, InitializeAcl,
+                PROTECTED_DACL_SECURITY_INFORMATION,
+            };
+            let mut empty = [0_u64; 2];
+            // SAFETY: the buffer is eight-byte aligned and sixteen bytes long, which an empty list
+            // fits in; the list is applied to this process's own handle.
+            let hidden = unsafe {
+                InitializeAcl(empty.as_mut_ptr().cast::<ACL>(), 16, ACL_REVISION) != 0
+                    && SetSecurityInfo(
+                        GetCurrentProcess(),
+                        SE_KERNEL_OBJECT,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        null_mut(),
+                        null_mut(),
+                        empty.as_ptr().cast::<ACL>(),
+                        null(),
+                    ) == 0
+            };
+            if let Some(path) = arguments.get(2) {
+                let text = if hidden { "hidden" } else { "not hidden" };
+                if std::fs::write(path, format!("{} {text}", std::process::id())).is_err() {
+                    return ExitCode::from(3);
+                }
+            }
+            let milliseconds = arguments
+                .get(1)
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(60_000);
+            std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+        }
         "write-stderr" => eprintln!("on the error stream"),
         // Starts PowerShell with a hidden console of its own, which a detached program has to ask
         // for because PowerShell needs one, and passes on what it wrote.
