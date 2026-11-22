@@ -607,7 +607,8 @@ impl Run<'_> {
     }
 
     /// Every process of the reader has ended, not only the reader: the job counts none alive. A
-    /// process that a reader left would hold the group's token through the grant.
+    /// process that a reader left would hold the group's token through the grant. The service's
+    /// stop ends the wait, as it ends the wait for the reader.
     fn no_process_is_left(&self) -> Result<(), Failure> {
         let job = self.job.as_ref().ok_or_else(|| not_started("no job"))?;
         let until = Instant::now() + DESCENDANTS_BOUND;
@@ -615,6 +616,9 @@ impl Run<'_> {
             let live = job.active_processes().map_err(not_started)?;
             if live == 0 {
                 return Ok(());
+            }
+            if self.env.stop.is_set() {
+                return Err(stopping());
             }
             if Instant::now() >= until {
                 return Err(not_started(format!(
