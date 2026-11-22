@@ -282,18 +282,7 @@ pub fn install_package(
         .collect();
     grant.sort();
     grant.dedup();
-    let holds = |name: &str| grant.iter().any(|capability| capability == name);
-    let grant_statement = kr_protocol::confirmation::install_statement(
-        holds("native_bridge.install")
-            .then(|| native_bridge_statement(copy, entry))
-            .as_deref(),
-        // The packages this stage installs declare no placement, so the host writes no reading
-        // of one.
-        None,
-        holds("command_integration.launch")
-            .then(|| integration_statement(copy, entry))
-            .as_deref(),
-    );
+    let grant_statement = grant_statement_of(&release_manifest(copy, entry), &grant);
 
     let environment_id = owner.remote.environment_id();
     let listed: CatalogueListResult = runtime
@@ -353,32 +342,41 @@ pub fn install_package(
     }
 }
 
-/// What the release's manifest says its native bridge does, which the owner is shown and the
-/// installation's digest covers.
+/// What an owner device is shown of what `grant` would let the release `manifest` describes do,
+/// as the host composes it: the publisher's words of the native bridge and then of the command
+/// integration, each where the grant holds the capability that applies it, and the host's reading
+/// of the integration after them. The installation's digest covers it.
 ///
 /// # Panics
 ///
-/// Panics when the generation's copy holds no manifest for the entry or the manifest names no
-/// native bridge statement.
-fn native_bridge_statement(copy: &Path, entry: &serde_json::Value) -> String {
-    release_manifest(copy, entry)["native_bridge"]["grant_statement"]
-        .as_str()
-        .expect("a native bridge release's manifest carries its grant statement")
-        .to_owned()
-}
-
-/// The host's reading of the command integration the generation's manifest for `entry` declares,
-/// which is what an owner device is shown for it.
-///
-/// # Panics
-///
-/// Panics when the generation's copy holds no manifest for the entry or the manifest declares no
-/// command integration.
-fn integration_statement(copy: &Path, entry: &serde_json::Value) -> String {
-    let declared = release_manifest(copy, entry)["command_integration"].clone();
-    serde_json::from_value::<kr_plugin_sdk::integration::CommandIntegration>(declared)
+/// Panics when the grant holds a capability whose declaration the manifest does not carry.
+fn grant_statement_of(manifest: &serde_json::Value, grant: &[String]) -> Option<String> {
+    let holds = |name: &str| grant.iter().any(|capability| capability == name);
+    let bridge = holds("native_bridge.install").then(|| {
+        manifest["native_bridge"]["grant_statement"]
+            .as_str()
+            .expect("a native bridge release's manifest carries its grant statement")
+            .to_owned()
+    });
+    let integration = holds("command_integration.launch").then(|| {
+        serde_json::from_value::<kr_plugin_sdk::integration::CommandIntegration>(
+            manifest["command_integration"].clone(),
+        )
         .expect("a command integration release's manifest declares one")
-        .statement()
+    });
+    let publisher = kr_protocol::confirmation::publisher_words(
+        bridge.as_deref(),
+        integration
+            .as_ref()
+            .map(|declared| declared.grant_statement.as_str()),
+    );
+    kr_protocol::confirmation::install_statement(
+        publisher.as_deref(),
+        // The packages this stage installs declare no placement, so the host writes no reading
+        // of one.
+        None,
+        integration.map(|declared| declared.statement()).as_deref(),
+    )
 }
 
 /// The manifest the generation's copy holds for the release `entry` names.
@@ -2545,5 +2543,51 @@ mod tests {
                 crate::provenance::ENVIRONMENT_NOT_CLEAR
             ))
         );
+    }
+
+    /// The statement the harness's owner device confirms is the one the host composes: the
+    /// bridge's words, then the integration's own, then the host's reading of the integration,
+    /// each only where the grant holds the capability that applies it. The host refuses a
+    /// confirmation whose digest covers any other statement.
+    #[test]
+    fn the_statement_the_owner_device_confirms_is_the_one_the_host_composes() {
+        use kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL;
+        let manifest = serde_json::json!({
+            "native_bridge": { "grant_statement": "Installs three registration files." },
+            "command_integration": {
+                "command": "claude",
+                "flags": ["--flag"],
+                "variables": [],
+                "grant_statement": "Starts the agent with the flag its bridge needs."
+            }
+        });
+        let grant = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let both = grant_statement_of(
+            &manifest,
+            &grant(&["command_integration.launch", "native_bridge.install"]),
+        )
+        .expect("a statement");
+        assert!(
+            both.starts_with(&format!(
+                "Installs three registration files. Starts the agent with the flag its bridge \
+                 needs. {INTEGRATION_STATEMENT_LABEL} "
+            )),
+            "{both}"
+        );
+        let only = grant_statement_of(&manifest, &grant(&["command_integration.launch"]))
+            .expect("a statement");
+        assert!(
+            only.starts_with(&format!(
+                "Starts the agent with the flag its bridge needs. {INTEGRATION_STATEMENT_LABEL} "
+            )),
+            "{only}"
+        );
+        assert_eq!(
+            grant_statement_of(&manifest, &grant(&["native_bridge.install"])).as_deref(),
+            Some("Installs three registration files.")
+        );
+        assert_eq!(grant_statement_of(&manifest, &grant(&[])), None);
     }
 }
