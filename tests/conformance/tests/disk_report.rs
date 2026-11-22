@@ -159,6 +159,12 @@ fn write_program(path: &Path, text: &str) {
 /// command, which holds the whole predicate: it returns what the report printed and the text of the
 /// `disk-faults.txt` it kept.
 fn kernel_read_with(reader: &str) -> (String, String) {
+    kernel_read_after(reader, "")
+}
+
+/// [`kernel_read_with`] after `prepare`, shell text that runs once the evidence directory exists
+/// and may use `$evidence`.
+fn kernel_read_after(reader: &str, prepare: &str) -> (String, String) {
     let state = tempfile::tempdir().expect("a state directory");
     let program = state.path().join("log");
     write_program(&program, reader);
@@ -167,14 +173,16 @@ fn kernel_read_with(reader: &str) -> (String, String) {
     let evidence = state.path().join("evidence");
     let body = format!(
         "mkdir -p \"$state\" '{evidence}'\n\
+         evidence='{evidence}'\n{prepare}\n\
          echo \"S $(( $(date +%s) - 600 ))\" > \"$samples\"\n\
          export RUNNER_ENVIRONMENT=github-hosted KR_TEST_ARTIFACTS_DIR='{evidence}' \
          KR_DISK_REPORT_LOG='{program}' KR_DISK_REPORT_PRIVILEGE='{privilege}'\n\
          kernel_storage_errors\n\
-         echo \"== file\"\ncat '{evidence}/disk-faults.txt'\n",
+         echo \"== file\"\ncat '{evidence}/disk-faults.txt' 2>&1\ntrue\n",
         evidence = evidence.display(),
         program = program.display(),
-        privilege = privilege.display()
+        privilege = privilege.display(),
+        prepare = prepare
     );
     let (text, ok) = in_shell(state.path(), &body);
     assert!(ok, "{text}");
@@ -324,4 +332,45 @@ fn the_line_sudo_logs_for_the_read_holds_the_predicate_and_is_not_counted_as_a_f
         "kernel",
         "a line about nothing"
     ));
+}
+
+#[test]
+fn a_read_that_fails_after_it_gave_lines_keeps_them_and_says_how_many() {
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
+    let (printed, kept) = kernel_read_with(
+        "#!/bin/sh\n\
+         echo '2026-11-21 13:01:52.100 Df kernel[0:1a] (apfs) apfs_vnop_pagein: error 5'\n\
+         echo 'log: the store went away' >&2\nexit 3\n",
+    );
+    assert!(
+        printed.contains("was not read at all (status 3)")
+            && printed.contains("matching lines read before it ended: 1"),
+        "{printed}"
+    );
+    assert!(
+        kept.contains("apfs_vnop_pagein: error 5")
+            && kept.contains("was not read at all (status 3)")
+            && kept.contains("the reader said: log: the store went away"),
+        "{kept}"
+    );
+}
+
+#[test]
+fn a_file_the_report_cannot_write_is_not_named_as_the_place_of_the_reason() {
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
+    // A directory stands where the file belongs, so nothing can be written to it.
+    let (printed, _) =
+        kernel_read_after("#!/bin/sh\nexit 3\n", "mkdir \"$evidence/disk-faults.txt\"");
+    assert!(
+        printed.contains("was not read at all") && printed.contains("could not be written"),
+        "{printed}"
+    );
+    assert!(
+        !printed.contains("the reason is in disk-faults.txt"),
+        "{printed}"
+    );
 }

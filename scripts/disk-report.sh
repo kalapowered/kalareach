@@ -318,20 +318,28 @@ kernel_storage_errors() {
         fi
     done
     alarm_stderr=/dev/null
+    stamped='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '
     if [ "$read_ok" -ne 1 ]; then
         if [ "$status" -eq 142 ]; then
             reason="in 90 seconds"
         else
             reason="at all (status $status)"
         fi
-        {
-            echo "# the kernel's log was not read $reason, so this file says nothing about storage faults"
-            head -c 2000 "$said" 2> /dev/null | sed 's/^/# the reader said: /'
-        } > "$out" 2> /dev/null
-        echo "  the kernel's log was not read $reason: a storage fault is not ruled out (the reason is in disk-faults.txt)"
+        # What the read gave before it ended stays in the file, above the note.
+        partial="$(grep -c "$stamped" "$out" 2> /dev/null || true)"
+        if {
+            {
+                echo "# the kernel's log was not read $reason, so this file says nothing about storage faults beyond the ${partial:-0} matching lines above it"
+                head -c 2000 "$said" 2> /dev/null | sed 's/^/# the reader said: /'
+            } >> "$out"
+        } 2> /dev/null; then
+            where="the reason is in disk-faults.txt"
+        else
+            where="disk-faults.txt could not be written"
+        fi
+        echo "  the kernel's log was not read $reason: a storage fault is not ruled out ($where; matching lines read before it ended: ${partial:-0})"
         return 0
     fi
-    stamped='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '
     count="$(grep -c "$stamped" "$out" || true)"
     echo "# the kernel's log was read: ${count:-0} matching lines" >> "$out"
     if [ "${count:-0}" -eq 0 ]; then
