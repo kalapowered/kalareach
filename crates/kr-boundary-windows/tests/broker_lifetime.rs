@@ -56,7 +56,7 @@ use kr_boundary_windows::win::pipe::{
 };
 use kr_boundary_windows::win::rights::ImpersonationToken;
 use kr_boundary_windows::win::sd::descriptor_from_text;
-use kr_boundary_windows::win::{account, acl, broker, session, token};
+use kr_boundary_windows::win::{account, acl, boot, broker, session, token};
 
 mod common;
 use common::Scratch;
@@ -751,26 +751,15 @@ fn hold_the_token(held: &Arc<Mutex<Option<Handle>>>) {
     })));
 }
 
-#[test]
-#[ignore = "runs as the system in a disposable guest"]
-fn a_held_token_handle_makes_the_end_uncertain_and_closing_it_clears_it_at_the_next_try() {
-    if !runs_as_the_system() {
-        eprintln!("SKIPPED: needs the system's token");
-        return;
-    }
-    let setting = Setting::new();
-    let life = Life::open(
-        &setting.scratch.dir,
-        &setting.account,
-        &["exit", "0"],
-        1,
-        |env| {
-            env.bounds.session = Duration::from_secs(2);
-        },
-    );
-    let held = Arc::new(Mutex::new(None));
-    hold_the_token(&held);
-    let replies = run_one(&life, How::Reads, client_of(None), None);
+/// What an end that a held handle keeps from being proved leaves: the reply says uncertain, the
+/// rows say so, nothing is released, the slot is blocked and the tree held, a request is refused
+/// with the words of the uncertain end, and a restart finds the session still there. `release`
+/// lets the held handle go, and the next try proves the end and finishes it.
+fn expect_uncertain_until_released(
+    life: &Life,
+    replies: &[InvocationReply],
+    release: impl FnOnce(),
+) {
     assert!(
         matches!(
             replies.last(),
@@ -802,7 +791,7 @@ fn a_held_token_handle_makes_the_end_uncertain_and_closing_it_clears_it_at_the_n
         "the tree stays held"
     );
     // A request on the blocked project is refused with the words of the uncertain end.
-    let again = run_one(&life, How::Reads, client_of(None), None);
+    let again = run_one(life, How::Reads, client_of(None), None);
     assert!(
         matches!(
             again.last(),
@@ -820,9 +809,8 @@ fn a_held_token_handle_makes_the_end_uncertain_and_closing_it_clears_it_at_the_n
     );
     assert_eq!(broker.releases(), 0);
     // Closing the handle clears it at the next try.
-    let copy = held.lock().unwrap().take().expect("a handle was held");
     let luid = hooks::session();
-    drop(copy);
+    release();
     absent_session(luid);
     let next_try = recover(&broker.env).unwrap();
     assert!(
@@ -837,6 +825,184 @@ fn a_held_token_handle_makes_the_end_uncertain_and_closing_it_clears_it_at_the_n
     );
     assert!(broker.ended());
     assert!(!broker.trees.locked(), "the slot is free");
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_held_token_handle_makes_the_end_uncertain_and_closing_it_clears_it_at_the_next_try() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    let life = Life::open(
+        &setting.scratch.dir,
+        &setting.account,
+        &["exit", "0"],
+        1,
+        |env| {
+            env.bounds.session = Duration::from_secs(2);
+        },
+    );
+    let held = Arc::new(Mutex::new(None));
+    hold_the_token(&held);
+    let replies = run_one(&life, How::Reads, client_of(None), None);
+    expect_uncertain_until_released(&life, &replies, || {
+        drop(held.lock().unwrap().take().expect("a handle was held"));
+    });
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_held_process_object_makes_the_end_uncertain_and_closing_it_clears_it_at_the_next_try() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    let marker = setting.mark("holding.txt");
+    let said = marker.display().to_string();
+    // The child runs long enough for a handle to its process to be taken, and then ends by itself:
+    // the process is gone and its object stays, because this handle keeps it.
+    let life = Life::open(
+        &setting.scratch.dir,
+        &setting.account,
+        &["sleep", "1500", &said],
+        1,
+        |env| {
+            env.bounds.session = Duration::from_secs(2);
+        },
+    );
+    let held: Arc<Mutex<Option<Handle>>> = Arc::new(Mutex::new(None));
+    let taker = std::thread::spawn({
+        let held = Arc::clone(&held);
+        move || {
+            let pid: u32 = wait_for_file(&marker).trim().parse().unwrap();
+            *held.lock().unwrap() = Some(process_handle(pid));
+        }
+    });
+    let replies = run_one(&life, How::Reads, client_of(None), None);
+    taker.join().unwrap();
+    expect_uncertain_until_released(&life, &replies, || {
+        drop(
+            held.lock()
+                .unwrap()
+                .take()
+                .expect("a process object was held"),
+        );
+    });
+}
+
+/// Moves the system's clock and puts it back when it is dropped.
+struct Clock {
+    moved: i64,
+}
+
+impl Clock {
+    fn adjust(&mut self, seconds: i64) {
+        let status = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Set-Date -Adjust ([TimeSpan]::FromSeconds({seconds})) | Out-Null"),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "the clock was not moved: {status}");
+        self.moved += seconds;
+    }
+}
+
+impl Drop for Clock {
+    fn drop(&mut self) {
+        if self.moved != 0 {
+            let back = -self.moved;
+            self.moved = 0;
+            self.adjust(back);
+        }
+    }
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_the_same_boot() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    // The service's key is the installation's; the marker is made under it.
+    let key = std::process::Command::new("reg")
+        .args([
+            "add",
+            r"HKLM\SYSTEM\CurrentControlSet\Services\KalaReachBoundary",
+            "/f",
+        ])
+        .output()
+        .unwrap();
+    assert!(key.status.success(), "the service's key was not made");
+    let first = boot::marker().unwrap();
+    assert!(first.trusted && first.made, "{first:?}");
+    let life = Life::open(
+        &setting.scratch.dir,
+        &setting.account,
+        &["exit", "0"],
+        1,
+        |env| env.boot.clone_from(&first.id),
+    );
+    let replies = run_one(&life, How::Reads, client_of(None), None);
+    expect_clean_end(&replies, EndedBy::Exit);
+    let begin = life
+        .rows()
+        .into_iter()
+        .find_map(|row| match row {
+            Row::Begin { boot_marker, .. } => Some(boot_marker),
+            _ => None,
+        })
+        .expect("the journal has its first row");
+    assert_eq!(begin, first.id, "the first row records the marker");
+    // Whether a journal reads the boot it began in as the current one.
+    let same_boot = |current: &str| {
+        let path = std::fs::read_dir(setting.scratch.path("journal"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let id = path.file_stem().unwrap().to_string_lossy().into_owned();
+        match read_file(&id, &std::fs::read(&path).unwrap(), current) {
+            kr_boundary_windows::journal::replay::Reading::Invocation(found) => found.same_boot,
+            kr_boundary_windows::journal::replay::Reading::MadeNothing => {
+                panic!("the file holds an invocation")
+            }
+        }
+    };
+    assert!(same_boot(&first.id));
+    // The clock goes a day forward, and then two days back, past the time of the first row.
+    let before = std::time::SystemTime::now();
+    let mut clock = Clock { moved: 0 };
+    for seconds in [86_400, -172_800] {
+        clock.adjust(seconds);
+        let now = std::time::SystemTime::now();
+        let shown = match now.duration_since(before) {
+            Ok(forward) => forward.as_secs() as i64,
+            Err(back) => -(back.duration().as_secs() as i64),
+        };
+        assert!(
+            (shown - clock.moved).abs() < 600,
+            "the clock moved {shown} s, not {} s",
+            clock.moved
+        );
+        let again = boot::marker().unwrap();
+        assert_eq!(
+            (again.id.as_str(), again.made, again.trusted),
+            (first.id.as_str(), false, true),
+            "the marker changed with the clock"
+        );
+        assert!(same_boot(&again.id), "the journal reads another boot");
+    }
+    drop(clock);
+    assert_eq!(boot::marker().unwrap().id, first.id);
 }
 
 fn expect_clean_end(replies: &[InvocationReply], by: EndedBy) {
