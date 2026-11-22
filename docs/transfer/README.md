@@ -744,19 +744,29 @@ and an upload never resumes on a connection of another account. Another account'
 the device, hidden, and come back when that account signs in again. The host counts a device's open
 uploads and drafts across all of the device's accounts, so another account's paused upload can hold
 one of the device's two places. When the host refuses a begin for that count
-(`RESOURCE_UNAVAILABLE`), the desk cancels the places other accounts hold, once, and tries the begin
-once more; a refusal for the file's size or the staged bytes (`QUOTA_EXCEEDED`) frees nothing. A
-draft the host refuses for its count of drafts is handled the same way, with other accounts' drafts
-discarded instead of cancelled.
+(`RESOURCE_UNAVAILABLE`), the desk cancels the places that the paused or kept uploads of other
+accounts hold, once, and tries the begin once more; a refusal for the file's size or the staged bytes
+(`QUOTA_EXCEEDED`) frees nothing. A draft the host refuses for its count of drafts is handled the
+same way, with other accounts' drafts discarded instead of cancelled. If the desk cannot learn
+whether the host cancelled an upload of another account that it stopped to free a place, that upload
+is shown as cancel asked until the host can be reached.
 
 Every command of the page that reads or changes an upload or a draft carries the mark of the account
 the page made it under. On a host that answers to an organisation, a command whose mark is missing
 or is not the signed-in account's is refused at its entry with the sign-in sentence, even when no
 connection is held.
 
+On such a host, the status of an upload is read only for a transfer that a record of the signed-in
+account still holds. On such a host, a file is added to a draft only from a transfer that a record of
+the signed-in account still holds.
+
 A cancel asked while no connection to the host is open is kept in the entry and finished once the
 host can be reached, unless the host already has the whole file, which the row then says; until then
-the row says that the cancel was asked.
+the row says that the cancel was asked. An upload that has no transfer id, because the host did not
+answer its begin or the begin was not yet sent, is forgotten as soon as its cancel is recorded. If
+the application cannot write that record, the row says what went wrong and the cancel is kept in
+memory only; a restart before the host is reached loses it, and the upload then follows the usual
+rules of a restart.
 
 **The store of open transfers, version 1.** `open-transfers/<key>.upload` is one JSON entry for each
 upload, with exactly the members it names; `<key>.bytes` is the copy of a file the page handed over.
@@ -786,7 +796,9 @@ cannot take one file off a draft.
 
 A draft entry this device cannot read, because another release wrote it or because it is damaged, is
 a failed read and not an absent draft: `draft_create` refuses it, and the page keeps that session's
-files hidden and holds a prompt that names the draft until the draft can be read.
+files hidden and holds a prompt that names the draft until the draft can be read. The same holds
+when the application's list of uploads cannot be read: the page offers no restored file until a later
+read succeeds.
 
 When the signed-in account changes, a sign-out included, a window whose last connection was to a
 host that answers to an organisation takes that host's files off its composers, keeps the text of
