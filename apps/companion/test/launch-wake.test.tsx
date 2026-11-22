@@ -40,7 +40,13 @@ function replaceable(): { readonly port: HostPort; readonly publish: () => void 
     reason: null,
     rights: ['host.manage'],
     paired: false,
-    replaced: 0
+    replaced: 0,
+    revision: 1,
+    link: 1,
+    host: { kind: 'local' },
+    contact: { state: 'in_contact' },
+    inbox_epoch: 1,
+    others: []
   }
   let replaced = 0
   return {
