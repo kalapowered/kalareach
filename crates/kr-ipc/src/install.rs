@@ -3816,6 +3816,29 @@ mod tests {
         );
     }
 
+    /// A hold attempt that finds its release gone from its path after it took the shared lock
+    /// leaves no lock on the manifest, though a program keeps a copy of its file.
+    #[test]
+    fn a_hold_attempt_that_finds_its_release_gone_leaves_no_lock_though_a_program_keeps_a_copy() {
+        let test = test_store();
+        let one = release("0.1.0+aaaaaaaaaaaa");
+        install(&test.store, &one);
+        let path = test.store.manifest(&one);
+        let opened = File::open(&path).expect("a program opens its manifest");
+        let _program = program_with_a_copy_of(&opened);
+        let aside = test.store.trash().join("moved");
+        std::fs::rename(test.store.release_directory(&one), &aside).expect("moved aside");
+        assert!(matches!(
+            hold_opened_within(opened, path, &one, Duration::ZERO),
+            Err(InstallError::Replaced { .. })
+        ));
+        let moved = File::open(aside.join(MANIFEST_FILE)).expect("the moved manifest");
+        assert!(
+            probe_is_free(&moved).expect("asks"),
+            "the failed attempt left no lock"
+        );
+    }
+
     /// The roots a daemon records are read back whole, a path of any bytes included.
     #[test]
     fn the_roots_a_daemon_served_are_read_back() {
