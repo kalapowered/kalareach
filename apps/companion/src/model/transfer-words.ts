@@ -133,14 +133,6 @@ const APPLICATION_WORDS: readonly (readonly [string, RefusalKind])[] = [
   [UPDATE_THE_HOST_TO_END_A_DRAFT, 'other']
 ]
 
-/**
- * What a refusal of an upload, a bind or a text means to the person, and the words to show.
- *
- * The application's own sentences are recognised by their words and shown as written. A host's
- * refusal is recognised by its protocol code: an earlier build says it does not know the method, a
- * full staging area says its quota, a changed file says its source changed, and a right the device
- * lacks is a permission refusal. Anything else is shown in the host's own words.
- */
 /** A file whose bind the application refused because it holds no record of the file: the row ends here until the person removes it. */
 export const NO_LONGER_HELD = 'The application no longer holds this file. Remove it and attach the file again.'
 
@@ -149,6 +141,14 @@ export function isNoOpenUpload(failure: unknown): boolean {
   return failureWords(failure) === NO_OPEN_UPLOAD
 }
 
+/**
+ * What a refusal of an upload, a bind or a text means to the person, and the words to show.
+ *
+ * The application's own sentences are recognised by their words and shown as written. A host's
+ * refusal is recognised by its protocol code: an earlier build says it does not know the method, a
+ * full staging area says its quota, a changed file says its source changed, and a right the device
+ * lacks is a permission refusal. Anything else is shown in the host's own words.
+ */
 export function refusalOf(failure: unknown): Refusal {
   const words = failureWords(failure)
   for (const [known, kind] of APPLICATION_WORDS) {

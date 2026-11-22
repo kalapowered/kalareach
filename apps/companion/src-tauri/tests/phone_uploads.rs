@@ -396,13 +396,14 @@ async fn kr_req_13_12_a_cancel_shows_the_released_bytes_from_the_answer() {
     };
     gate.reached().await;
 
-    // The cancel stops the sender first: the content is let go only once the cancel is under way, so
-    // that the upload cannot publish before it.
+    // The cancel stops the sender first: the content is let go only once the cancel is under way
+    // (it has stopped the sender and is waiting for it), so that the upload cannot publish before it.
+    let waiting = testing::hold_at(key, testing::Point::CancelWaiting);
     let cancelling = {
         let (desk, paired) = (Arc::clone(&desk), paired_of(companion).await);
         tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    waiting.until_passed(1).await;
     gate.release();
     let answer = cancelling
         .await
@@ -1550,12 +1551,14 @@ async fn kr_req_13_12_an_entry_of_another_version_is_left_with_its_copy() {
     let desk = desk_of(&phone.companion);
     desk.restart(paired_of(&phone.companion).await).await;
     assert_eq!(
-        std::fs::read(&entry).expect("the entry stands"),
-        br#"{"version":2,"kept":"by a later release"}"#
+        std::fs::read(&entry).ok().as_deref(),
+        Some(&br#"{"version":2,"kept":"by a later release"}"#[..]),
+        "the entry stands"
     );
     assert_eq!(
-        std::fs::read(&copy).expect("the copy stands"),
-        b"the person's file"
+        std::fs::read(&copy).ok().as_deref(),
+        Some(&b"the person's file"[..]),
+        "the copy stands"
     );
 
     let bytes = pattern(5);
@@ -1568,8 +1571,9 @@ async fn kr_req_13_12_an_entry_of_another_version_is_left_with_its_copy() {
         .expect_err("the key is held by the later entry");
     assert_eq!(refused.message, companion_tauri::open_transfers::KEY_IN_USE);
     assert_eq!(
-        std::fs::read(&copy).expect("the copy stands"),
-        b"the person's file"
+        std::fs::read(&copy).ok().as_deref(),
+        Some(&b"the person's file"[..]),
+        "the copy stands"
     );
     adopted.stop().await;
 }
@@ -2073,12 +2077,11 @@ async fn kr_req_23_41_a_lost_discard_is_answered_by_the_hosts_record() {
     old.transport().close();
     on_another_connection(companion, &old).await;
 
-    companion
-        .call(
-            "draft_end",
-            json!({ "subject": on_session(session), "sessionId": session.to_string() }),
-        )
-        .expect("the host's record ends it");
+    let ended = companion.call(
+        "draft_end",
+        json!({ "subject": on_session(session), "sessionId": session.to_string() }),
+    );
+    assert!(ended.is_ok(), "the host's record ends it: {ended:?}");
     assert_eq!(kept(companion, session).await["made"], false);
     let next = bind(companion, session, &handed(companion)).expect("a new draft is made");
     assert_ne!(
@@ -2222,7 +2225,9 @@ async fn kr_req_23_41_the_wait_for_a_lost_create_runs_out_and_the_draft_is_made_
 
     // Past the wait: nothing was made, and the bind goes on to make the draft.
     drafts.armed_ago_for_test(composed.action_id(), window + Duration::from_secs(31));
-    let made = bind(companion, session, &handed(companion)).expect("the wait ran out");
+    let made = bind(companion, session, &handed(companion));
+    assert!(made.is_ok(), "the wait ran out: {made:?}");
+    let made = made.unwrap_or_default();
     assert!(made["value"]["draftId"].is_string(), "{made}");
     let shown = kept(companion, session).await;
     assert_eq!(shown["made"], true, "{shown}");
@@ -2301,7 +2306,12 @@ async fn kr_req_23_41_a_draft_prompt_to_a_live_agent_ends_the_kept_draft_only_wh
 
     // An outcome nobody can establish: the agent has the prompt and nothing says it was applied.
     let unknown = made_draft(&bind(companion, sessions[0], &handed(companion)).expect("a bind"));
-    let answer = prompt_for(0, unknown).expect("an outcome nobody can establish is an answer");
+    let answer = prompt_for(0, unknown);
+    assert!(
+        answer.is_ok(),
+        "an outcome nobody can establish is an answer: {answer:?}"
+    );
+    let answer = answer.unwrap_or_default();
     assert!(answer["value"].is_null(), "{answer}");
     let stays = kept(companion, sessions[0]).await;
     assert_eq!(stays["made"], true, "the draft stays: {stays}");
@@ -3694,6 +3704,7 @@ async fn left_by(adopted: &Adopted, phone: &Phone, desk: &Arc<Desk>, earlier: &P
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
     let live_key = kr_ipc::new_uuid();
+    let exit = testing::hold_at(live_key, testing::Point::SenderExit);
     let sending = {
         let sent = request(adopted, &bytes, content, live_key);
         let (desk, earlier) = (Arc::clone(desk), earlier.clone());
@@ -3707,12 +3718,13 @@ async fn left_by(adopted: &Adopted, phone: &Phone, desk: &Arc<Desk>, earlier: &P
     })
     .await;
     gate.release();
-    until("the upload is paused", || {
-        desk.open(&earlier.who())
-            .iter()
-            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
-    })
-    .await;
+    // The sender ends however the reach treated it: it settles the upload as paused, or a reach
+    // that stopped it drops the upload. What became of the upload is the case's to assert, once what
+    // the desk started for itself is over.
+    tokio::time::timeout(WATCHDOG, exit.until_passed(1))
+        .await
+        .expect("the sender of the upload ends");
+    desk.idle().await;
     Left {
         handle,
         sending,
@@ -3763,6 +3775,12 @@ async fn kr_req_13_12_another_accounts_entries_are_neither_shown_nor_acted_on() 
             "{when}: the published entry, the hidden entry and the paused upload's entry, their two copies and the draft are all kept"
         );
     };
+    assert!(
+        desk.open(&earlier.who())
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused),
+        "the earlier account's upload is paused: a reach of another account does not stop it"
+    );
     held("before");
     let reads = control.sent(Method::UploadStatus);
     let begins = control.sent(Method::UploadBegin);
@@ -3842,6 +3860,12 @@ async fn kr_req_13_12_an_account_sees_its_own_entries_and_drafts_again_when_it_s
         .app
         .state::<companion_tauri::AppState>()
         .paired_drafts();
+    assert!(
+        desk.open(&earlier.who())
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused),
+        "the earlier account's upload is paused: a reach of another account does not stop it"
+    );
     // The other account reaches the host: nothing of the earlier account moves.
     desk.host_reached(now.clone());
     drafts.sweep_after_reach(now.clone()).await;
@@ -3895,8 +3919,10 @@ async fn kr_req_13_12_a_send_is_not_resumed_on_a_connection_of_another_account()
     };
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let settled = testing::hold_at(key, testing::Point::SenderSettled);
     let sending = {
-        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let sent = request(&adopted, &bytes, content, key);
         let (desk, earlier) = (Arc::clone(&desk), earlier.clone());
         tokio::spawn(async move { desk.send(earlier, sent).await })
     };
@@ -3911,14 +3937,22 @@ async fn kr_req_13_12_a_send_is_not_resumed_on_a_connection_of_another_account()
     .await;
     let chunks = control.sent(kr_protocol::method::Method::UploadChunk);
     gate.release();
-    until("the upload is paused", || {
-        desk.open(&earlier.who())
-            .iter()
-            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
-    })
-    .await;
+    // The sender that sees the end settles, and what it handed on is decided; only then is the
+    // desk's record read.
+    tokio::time::timeout(WATCHDOG, settled.until_passed(1))
+        .await
+        .expect("the sender on the ended connection settles");
     desk.idle().await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        desk.resumed_on_for_test(key),
+        None,
+        "no resume used the connection of another account"
+    );
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("paused"),
+        "the upload waits for a connection of its own account"
+    );
     assert!(
         !sending.is_finished(),
         "the upload was not sent on the other account's connection"
@@ -4109,8 +4143,10 @@ async fn kr_req_13_12_a_begin_refused_for_the_devices_count_frees_the_other_acco
             vec![send(&desk).await]
         };
         for outcome in sent {
-            outcome.expect(
-                "the begin is tried again once the places are freed, and the upload is published",
+            assert!(
+                outcome.is_ok(),
+                "the begin is tried again once the places are freed, and the upload is published: {:?}",
+                outcome.err()
             );
         }
         assert_eq!(
@@ -4422,14 +4458,18 @@ async fn kr_req_23_41_a_draft_creation_refused_for_the_devices_count_discards_th
         "contribution": contribution(),
     }))
     .expect("a bind");
-    drafts
+    let bound = drafts
         .bind(
             now.clone(),
             net_support::on_the_session(&adopted.host, sessions[0]),
             bind,
         )
-        .await
-        .expect("the creation is tried again once the places are freed, and the file is bound");
+        .await;
+    assert!(
+        bound.is_ok(),
+        "the creation is tried again once the places are freed, and the file is bound: {:?}",
+        bound.err()
+    );
     assert_eq!(
         control.sent(Method::DraftCreate) - creates,
         2,
@@ -5462,9 +5502,12 @@ async fn kr_req_13_12_a_cancel_with_the_host_out_of_reach_is_kept_and_finished_a
     })
     .await;
 
-    let answered = companion
-        .call("upload_cancel", json!({ "transferKey": key.to_string() }))
-        .expect("the cancel is answered with no connection");
+    let answered = companion.call("upload_cancel", json!({ "transferKey": key.to_string() }));
+    assert!(
+        answered.is_ok(),
+        "the cancel is answered with no connection: {answered:?}"
+    );
+    let answered = answered.unwrap_or_default();
     assert_eq!(answered["state"], "asked");
     let listed = open(companion);
     assert_eq!(listed.len(), 1);
