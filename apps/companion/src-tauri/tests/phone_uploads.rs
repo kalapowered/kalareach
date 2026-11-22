@@ -5702,6 +5702,22 @@ async fn kr_req_13_12_a_restored_upload_whose_cancel_record_failed_is_finished_a
 
 // ---- the freeing as work of the desk --------------------------------------------------------------
 
+/// Account 2 has an upload sending on `desk`, held at its content, so that the host counts a place
+/// for it.
+async fn account_2_sending(
+    adopted: &Adopted,
+    desk: &Arc<Desk>,
+    now: &Paired,
+) -> (Arc<ChunkGate>, Releasing) {
+    let bytes = pattern(5);
+    let (content, gate, release) = gated(&bytes);
+    let sent = request(adopted, &bytes, content, kr_ipc::new_uuid());
+    let (desk, now) = (Arc::clone(desk), now.clone());
+    tokio::spawn(async move { desk.send(now, sent).await });
+    gate.reached().await;
+    (gate, release)
+}
+
 /// What the freeing's cases stand on: a device with two accounts, and the places the host counts.
 struct Places {
     adopted: Adopted,
@@ -5716,6 +5732,9 @@ struct Places {
     keys: Vec<Uuid>,
     x_gate: Option<Arc<ChunkGate>>,
     _x_release: Option<Releasing>,
+    /// The earlier process of the application that began account 1's kept upload, when the case
+    /// stands on an entry that this desk holds no upload for.
+    _first: Option<Arc<Desk>>,
 }
 
 impl Places {
@@ -5745,12 +5764,7 @@ impl Places {
         assert_eq!(keys.len(), count, "account 1 left its uploads paused");
         let (mut x_gate, mut x_release) = (None, None);
         if sending {
-            let bytes = pattern(5);
-            let (content, gate, release) = gated(&bytes);
-            let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
-            let (desk, now) = (Arc::clone(&desk), now.clone());
-            tokio::spawn(async move { desk.send(now, sent).await });
-            gate.reached().await;
+            let (gate, release) = account_2_sending(&adopted, &desk, &now).await;
             (x_gate, x_release) = (Some(gate), Some(release));
         }
         Self {
@@ -5763,6 +5777,72 @@ impl Places {
             keys,
             x_gate,
             _x_release: x_release,
+            _first: None,
+        }
+    }
+
+    /// As `start(1, true)`, with account 1's upload kept in the folder by an earlier process: this
+    /// desk holds no upload for it, as after a restart, and the host still counts its place.
+    async fn start_kept() -> Self {
+        use kr_client::services::AccountMark;
+
+        let adopted = Adopted::start(1).await;
+        let (phone, control) = phone_for(&adopted).await;
+        let desk = desk_of(&phone.companion);
+        let paired = paired_of(&phone.companion).await;
+        let earlier = Paired {
+            account: Some(AccountMark::from_bytes([1; 32])),
+            ..paired.clone()
+        };
+        let first = Arc::new(Desk::default());
+        first.keep_at(folder(&phone));
+        let bytes = pattern(5);
+        let (content, gate, release) = gated(&bytes);
+        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let first_process = {
+            let (first, earlier) = (Arc::clone(&first), earlier.clone());
+            tokio::spawn(async move { first.send(earlier, sent).await })
+        };
+        gate.reached().await;
+        earlier.session.transport().close();
+        let newer = on_another_connection(&phone.companion, &earlier.session).await;
+        until("the desk is told of the new connection", || {
+            desk.holds_newest_for_test(&newer)
+        })
+        .await;
+        gate.release();
+        drop(release);
+        until("the earlier process pauses the upload", || {
+            first
+                .open(&earlier.who())
+                .iter()
+                .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
+        })
+        .await;
+        first_process.abort();
+        let now = Paired {
+            account: Some(AccountMark::from_bytes([2; 32])),
+            ..newer
+        };
+        let keys: Vec<Uuid> = desk
+            .open(&earlier.who())
+            .iter()
+            .map(|view| view.key.parse().expect("a key"))
+            .collect();
+        assert_eq!(keys.len(), 1, "account 1's upload is kept in the folder");
+        assert_eq!(desk.held_count_for_test(), 0, "this desk holds no upload");
+        let (x_gate, x_release) = account_2_sending(&adopted, &desk, &now).await;
+        Self {
+            adopted,
+            _phone: phone,
+            control,
+            desk,
+            earlier,
+            now,
+            keys,
+            x_gate: Some(x_gate),
+            _x_release: Some(x_release),
+            _first: Some(first),
         }
     }
 
@@ -6134,6 +6214,75 @@ async fn kr_req_13_12_a_start_candidate_read_before_the_mark_is_refused_after_it
     assert_eq!(
         places.desk.open(&places.earlier.who())[0].state,
         OpenState::CancelAsked
+    );
+    places.end().await;
+}
+
+/// KR-REQ-13.12 (M2): a reach reads the host's record of an upload that the freeing then marks as
+/// cancelled, and does not start it. The restart reads the record (the host holds the upload, so it
+/// is still receiving) and waits for the key's turn, which the freeing holds. The freeing records the
+/// cancel and the host does not answer it; the barrier's attempt on the reach's connection is not
+/// answered either, so the marked entry is still there when the restart has the turn. It finds the
+/// mark, and finishes the cancel on its own connection: the entry is gone and the host was asked a
+/// third time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_act_on_does_not_start_an_entry_the_freeing_marked_after_its_status_read() {
+    use companion_tauri::open_transfers::OpenState;
+    use kr_protocol::method::Method;
+    use testing::{Awaited, Point};
+
+    let places = Places::start_kept().await;
+    let a_key = places.keys[0];
+    let cancels = places.control.sent(Method::UploadCancel);
+    let key = kr_ipc::new_uuid();
+    let freeing = testing::hold_awaited(key, Awaited::Freeing);
+    let before_tail = testing::hold_awaited(a_key, Awaited::BeforeTail);
+    let sending = places.wanting(key);
+    arrived(&freeing, 1).await;
+    // The freeing holds the kept entry's turn. Account 1 reaches the host: the restart reads the
+    // host's record of the upload, then asks for the turn.
+    let wanted = testing::hold_at(a_key, Point::TurnWanted);
+    places.reach_of_account_1(1_000);
+    tokio::time::timeout(WATCHDOG, wanted.until_passed(1))
+        .await
+        .expect("the restart waits for the entry's turn");
+    // The host does not answer a cancel: the freeing's, nor the attempt that follows it.
+    places
+        .control
+        .lose_the_answer_to(Some(Method::UploadCancel));
+    freeing.release();
+    arrived(&before_tail, 1).await;
+    assert_eq!(
+        places.control.sent(Method::UploadCancel) - cancels,
+        2,
+        "the freeing and the attempt on the reach's connection both asked the host"
+    );
+    assert_eq!(
+        places.desk.open(&places.earlier.who())[0].state,
+        OpenState::CancelAsked,
+        "the entry is marked and stays"
+    );
+    places.control.lose_the_answer_to(None);
+    before_tail.release();
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the wanting send ends")
+        .expect("the task ran")
+        .expect_err("nothing was freed");
+    settled(&places.desk).await;
+    assert!(
+        places.desk.open(&places.earlier.who()).is_empty(),
+        "the restart finished the cancel the freeing recorded: the entry is gone"
+    );
+    assert_eq!(
+        places.control.sent(Method::UploadCancel) - cancels,
+        3,
+        "the host was asked a third time, by the restart"
+    );
+    assert_eq!(
+        places.desk.phase_for_test(a_key),
+        None,
+        "nothing was started"
     );
     places.end().await;
 }
