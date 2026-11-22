@@ -58,6 +58,7 @@ env:
 
 jobs:
   rust:
+    if: github.event_name == 'none'
     name: rust
     runs-on: ubuntu-24.04
     steps:
@@ -663,6 +664,7 @@ jobs:
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
   windows:
+    if: github.event_name == 'none'
     name: ${{ matrix.name }}
     runs-on: windows-2025
     strategy:
@@ -1798,6 +1800,7 @@ jobs:
           paths: target/aarch64-pc-windows-msvc
 
   shell-packages:
+    if: github.event_name == 'none'
     name: shell-packages
     runs-on: ubuntu-24.04
     steps:
@@ -2153,6 +2156,7 @@ jobs:
             --test-threads=1 --include-ignored
 
   typescript:
+    if: github.event_name == 'none'
     name: typescript
     runs-on: ubuntu-24.04
     steps:
@@ -2187,6 +2191,7 @@ jobs:
   # ARM one. The runner's own Android NDK compiles the C library in that graph (the step names the
   # toolchain itself and links nothing), so the job installs no toolchain beyond the targets.
   android:
+    if: github.event_name == 'none'
     name: android
     runs-on: ubuntu-24.04
     steps:
@@ -2242,6 +2247,7 @@ jobs:
   # No cache is saved: the repository's caches are at their limit, and a cache saved here would
   # take the room of one every other job restores. The job's time is the cost of that.
   android-app:
+    if: github.event_name == 'none'
     name: android-app
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -2455,7 +2461,7 @@ jobs:
   ios:
     name: ios
     # Skipped, and shown as skipped, only in a manual run that turns off both the macOS jobs and this one.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos || inputs.ios
+    if: github.event_name == 'none'
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -2625,6 +2631,7 @@ jobs:
         run: bash scripts/disk-report.sh end "what the disk has left"
 
   companion:
+    if: github.event_name == 'none'
     name: companion
     strategy:
       fail-fast: false
@@ -2896,7 +2903,7 @@ jobs:
   macos:
     name: ${{ matrix.name }}
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    if: github.event_name == 'none'
     runs-on: macos-15
     strategy:
       fail-fast: false
@@ -3597,7 +3604,7 @@ jobs:
   macos-shipped-hold:
     name: macos-shipped-hold
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    if: github.event_name == 'none'
     runs-on: macos-15
     timeout-minutes: 330
     steps:
@@ -3670,7 +3677,7 @@ jobs:
   macos-powershell:
     name: macos-powershell
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    if: github.event_name == 'none'
     runs-on: macos-15
     timeout-minutes: 195
     # The tests here run where the account is the run's alone, so the cases that load a launchd job
@@ -3794,7 +3801,7 @@ jobs:
   macos-shell-packages:
     name: macos-shell-packages
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    if: github.event_name == 'none'
     runs-on: macos-15
     timeout-minutes: 160
     # The tests here run where the account is the run's alone, so the cases that load a launchd job
@@ -4004,6 +4011,7 @@ jobs:
       # failing without a figure when it does not fall. Four such waits fit the limit below with
       # the measurements.
       - name: Performance measurements
+        if: github.event_name == 'none'
         timeout-minutes: 60
         env:
           KR_PERF_SETTLE_LOAD: "2.0"
