@@ -665,6 +665,33 @@ RESTRICTED_WORDS | this program runs with a restricted token | this program runs
 APP_CONTAINER_WORDS | this program runs inside an app container | this program runs inside an app container; run it from an ordinary session | read: standing::refuse over the token's app container flag (TokenIsAppContainer)
 LOW_WORDS | this program runs at a low integrity level | this program runs at a low integrity level; run it from an ordinary session | read: standing::refuse over the token's integrity level below medium (TokenIntegrityLevel)
 LEVEL_WORDS | the broker cannot identify the caller at the level | the broker cannot identify the caller at the level its connection allows | read: standing::refuse over the connection's impersonation level below identification (the caller opened the pipe anonymously)
+PROCESS_WORDS | the caller's process does not run as the account | the caller's process does not run as the account that opened the connection | read: win::client compared the user of the process's own token with the user of the caller's token (standing::same_user), or the process could not be held
+NOT_ENROLLED_WORDS | this account is not enrolled | this account is not enrolled for the repository boundary | read: standing::enrolled over the account's identifier and the broker's list of enrolled persons
+client_hold_process-1 | opening the caller's process | opening the caller's process: Windows error N | read: OpenProcess on the number the pipe gave returned no handle
+client_created-1 | reading when the caller's process was created | reading when the caller's process was created: Windows error N | read: GetProcessTimes on the held process returned 0
+client_user_of_process-1 | opening the caller's own token | opening the caller's own token: Windows error N | read: OpenProcessToken on the held process returned 0
+client_user_of_process-2 | opening the caller's own token | opening the caller's own token: Windows error N | read: OpenProcessToken on the held process returned no usable handle
+client_information-1 | reading a client's token | reading a client's token: Windows error N | read: GetTokenInformation of a class of the caller's token returned 0
+client_facts-1 | checking a client's standing | checking a client's standing: Windows error N | read: CheckTokenMembership of the caller's token against the Administrators group returned 0
+client_facts-2 | reading a client's impersonation level | reading a client's impersonation level | read: the impersonation level that GetTokenInformation gave is not a non-negative number
+client_wait-1 | checking the caller's process | checking the caller's process: Windows error N | read: a wait of no length on the held process failed
+client_wait-2 | checking the client's process | checking the client's process: Windows error N | read: a wait of no length on the held process failed
+rights_duplicate-1 | copying a token for an access check | copying a token for an access check: Windows error N | read: DuplicateTokenEx returned 0
+rights_duplicate-2 | copying a token for an access check | copying a token for an access check: Windows error N | read: DuplicateTokenEx returned no usable handle
+rights_without_privileges-1 | turning a token's privileges off | turning a token's privileges off: Windows error N | read: AdjustTokenPrivileges on the copy returned 0
+rights_sd-1 | reading an object's descriptor for an access check | reading an object's descriptor for an access check: Windows error N | read: GetSecurityInfo on the open object returned a nonzero code
+rights_granted-1 | checking a token's access to an object | checking a token's access to an object: Windows error N | read: AccessCheck returned 0
+rights_system_token-1 | the broker's own token | the broker's own token: Windows error N | read: the handle OpenProcessToken gave for the broker's own process was not usable
+rights_probe_token-1 | proof::account_of | the reason that the manifest or the account lookup gave, passed on | read: proof::account_of found no account for the class (no record, no account with the recorded identifier, or a failed lookup)
+channel_random_bits-1 | making a data pipe's name | making a data pipe's name: Windows error N | read: BCryptGenRandom returned a status other than success
+channel_make_server-1 | making a data pipe | making a data pipe: Windows error N | read: CreateNamedPipeW returned no usable handle (the name was taken, or the descriptor was refused)
+channel_client_pid-1 | identifying the process that connected to a data pipe | identifying the process that connected to a data pipe: Windows error N | read: GetNamedPipeClientProcessId on the connected server end returned 0
+channel_connect-1 | waiting for a client to connect to a data pipe | waiting for a client to connect to a data pipe: Windows error N | read: ConnectNamedPipe returned 0 with an error other than a client already connected
+channel_connect-2 | waiting for a client to connect to a data pipe | waiting for a client to connect to a data pipe: Windows error 995 | read: the wait was cancelled by the broker's own end of the invocation
+channel_disconnect-1 | disconnecting a wrong client of a data pipe | disconnecting a wrong client of a data pipe: Windows error N | read: DisconnectNamedPipe on a connected server end returned 0
+channel_waiter-1 | making an event for a data pipe's wait | making an event for a data pipe's wait: Windows error N | read: CreateEventW returned no usable handle
+channel_waiter-2 | waiting for a client to connect to a data pipe | waiting for a client to connect to a data pipe | read: the thread that waits for the client ended by a panic
+channel_cancel-1 | waiting for a cancelled connect to end | waiting for a cancelled connect to end: Windows error N | read: the wait on the thread's end event failed; the result is not used
 ADMINISTRATORS_ONLY | this pipe answers hello and status only | this pipe answers hello and status only; ask for a state change or a proof on the administrators' pipe | rule: the persons' pipe serves hello and status only
 USAGE | usage: kr-boundary-setup install|repair --payload DIRECTORY | usage: kr-boundary-setup install|repair --payload DIRECTORY [--person SID]; remove; status | rule: what the setup program prints for a command line that is not one; no machine fact
 system_form | FormatMessageW( | the code in hexadecimal and the system's message for it | read: FormatMessageW's text for the code (an HRESULT that wraps a Windows error is looked up by that error)
@@ -723,7 +750,7 @@ listed | pub const | policy.rs | 8 | names, keys, limits, encodings and paths; n
 listed | pub const | repository/attributes.rs | 7 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | repository/config.rs | 17 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | limits.rs | 2 | names of rules, for cases and documents; no sentence for a person
-listed | pub const | standing.rs | 5 | names of rules, for cases and documents; no sentence for a person
+listed | pub const | standing.rs | 8 | names of rules, for cases and documents; no sentence for a person
 listed | pub const | repository/readers.rs | 8 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/install.rs | 3 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub const | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person

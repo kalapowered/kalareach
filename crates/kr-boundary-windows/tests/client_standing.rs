@@ -156,3 +156,29 @@ fn a_token_in_several_of_these_states_is_refused_by_the_first_in_the_order_of_th
     };
     assert_eq!(refused_by(&facts), RULE_LEVEL);
 }
+
+#[test]
+fn the_process_must_run_as_the_account_that_opened_the_connection() {
+    use kr_boundary_windows::standing::{RULE_PROCESS, same_user};
+    assert_eq!(
+        same_user("S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1001"),
+        Ok(())
+    );
+    let refusal = same_user("S-1-5-21-1-2-3-1001", "S-1-5-18").unwrap_err();
+    assert_eq!(refusal.kind, RefusedKind::Authentication);
+    assert_eq!(refusal.rule, RULE_PROCESS);
+}
+
+#[test]
+fn only_an_enrolled_account_is_served() {
+    use kr_boundary_windows::standing::{RULE_NOT_ENROLLED, enrolled};
+    let persons = vec![
+        "S-1-5-21-1-2-3-1001".to_owned(),
+        "S-1-5-21-1-2-3-1002".to_owned(),
+    ];
+    assert_eq!(enrolled("S-1-5-21-1-2-3-1002", &persons), Ok(()));
+    let refusal = enrolled("S-1-5-21-1-2-3-1003", &persons).unwrap_err();
+    assert_eq!(refusal.kind, RefusedKind::Authentication);
+    assert_eq!(refusal.rule, RULE_NOT_ENROLLED);
+    assert!(enrolled("S-1-5-21-1-2-3-1001", &[]).is_err());
+}

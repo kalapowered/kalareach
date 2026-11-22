@@ -99,7 +99,7 @@ fn fail(detail: impl Into<String>) -> Proof {
 /// the recorded identifier now (an account that was renamed is found by its identifier, not by the
 /// name that the installation gave it), and the identifier's text. The reason where the manifest
 /// records no identifier for it, no account has the identifier, or the lookup failed.
-fn account_of(manifest: &Manifest, class: Class) -> Result<(String, String), String> {
+pub(super) fn account_of(manifest: &Manifest, class: Class) -> Result<(String, String), String> {
     let name = match class {
         Class::Checkout => super::install::CHECKOUT,
         Class::Connect => super::install::CONNECT,
