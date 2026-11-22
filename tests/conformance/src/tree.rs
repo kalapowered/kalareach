@@ -765,11 +765,13 @@ mod tests {
 
     /// KR-REQ-29.01, the part about reproducible commands: a signal that reached the report while a
     /// command ran is sent on to the command's group, and the group is ended: the call says which
-    /// signal it was, and the command's leader and its child are gone when it returns. The child
-    /// waits with `sleep` and, as a background command of a shell without job control, ignores `INT`,
-    /// so it ends at the end of the grace; the case does not depend on which of the two ends the
-    /// child. The signal is recorded by a thread of the case once the processes have started, which
-    /// stands for the handler that sets it.
+    /// signal it was, and the command's leader is reaped when it returns. Its child waits with
+    /// `sleep` and, as a background command of a shell without job control, ignores `INT`, so it ends
+    /// at the end of the grace, by the force; it is not the leader's to reap, so the case looks for it
+    /// for up to 10 s after the call, as the cases of `tests/execution.rs` do: on Linux a process that
+    /// has ended answers a look until its parent reaps it. The signal is recorded by a thread of the
+    /// case once the processes have started, which stands for the handler that sets it. The case
+    /// allows 30 s for the processes to start, and 30 s from the signal for the call to return.
     #[test]
     fn a_signal_that_reached_the_report_is_sent_on_and_the_group_is_ended() {
         let place = tempfile::tempdir().expect("a directory");
@@ -793,7 +795,7 @@ mod tests {
             budget: false,
         };
         let int = usize::try_from(signal_hook::consts::SIGINT).expect("a number");
-        let began = Instant::now();
+        let signalled = std::sync::OnceLock::new();
         let waited = std::thread::scope(|scope| {
             scope.spawn(|| {
                 let until = Instant::now() + Duration::from_secs(30);
@@ -807,10 +809,11 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 received.store(int, Ordering::SeqCst);
+                let _ = signalled.set(Instant::now());
             });
             watch(&mut child, deadline, Child::try_wait, || raised(&received))
         });
-        let took = began.elapsed();
+        let took = signalled.get().map(Instant::elapsed);
         let recorded = std::fs::read_to_string(&pids).unwrap_or_default();
         assert_eq!(
             recorded.lines().count(),
@@ -821,15 +824,25 @@ mod tests {
             Waited::Interrupted(_, signal) => assert_eq!(usize::try_from(signal), Ok(int)),
             other => panic!("the command was not interrupted: {other:?}"),
         }
-        assert!(took < Duration::from_secs(30), "the call took {took:?}");
-        let left: Vec<&str> = recorded
-            .lines()
-            .filter(|pid| {
-                let number = pid.parse::<i32>().expect("a pid");
-                rustix::process::Pid::from_raw(number)
-                    .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
-            })
-            .collect();
+        assert!(
+            took.is_some_and(|took| took < Duration::from_secs(30)),
+            "the call took {took:?} from the signal"
+        );
+        let until = Instant::now() + Duration::from_secs(10);
+        let left = loop {
+            let left: Vec<&str> = recorded
+                .lines()
+                .filter(|pid| {
+                    let number = pid.parse::<i32>().expect("a pid");
+                    rustix::process::Pid::from_raw(number)
+                        .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+                })
+                .collect();
+            if left.is_empty() || Instant::now() >= until {
+                break left;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
         assert!(
             left.is_empty(),
             "processes of the group were left: {left:?}"
