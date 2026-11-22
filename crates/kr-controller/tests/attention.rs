@@ -5143,8 +5143,9 @@ mod session_work {
     /// no review is outstanding, and the one item is as it was. Two guards each hold alone: the
     /// engine stops any record at or below the cursor it has consumed, whatever version it names,
     /// and the host stops the end of a turn at a version it already holds, whatever its sequence;
-    /// the steps below leave each one to decide. A record that passes both and names a later
-    /// version is a later end, so the delivery does reach the review.
+    /// the steps below leave each one to decide for the item; the review keeps its version by the
+    /// host's own cursor test and by its version, which only goes forward. A record that passes
+    /// both and names a later version is a later end, so the delivery does reach the review.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_page_of_a_turn_a_hook_reported_delivered_again_changes_nothing() {
         let first = lasting_worker().await;
