@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs a squid on the loopback for the cases that name a real proxy, and stops it.
 #
-#   scripts/real-proxy.sh start <run folder> basic|digest
+#   scripts/real-proxy.sh start <run folder> basic|digest|bump
 #   scripts/real-proxy.sh stop <run folder>
 #
 # The run folder is made for the run and holds everything the proxy needs: its configuration, its
@@ -14,6 +14,11 @@
 #
 # `digest` writes the same three names with DIGEST after the first two words: KR_REAL_PROXY_DIGEST,
 # KR_REAL_PROXY_DIGEST_CREDENTIAL_FILE and KR_REAL_PROXY_DIGEST_ACCESS_LOG, so one run can name both.
+#
+# `bump` intercepts TLS with a certificate authority made for the run (`ca.pem`, its key `ca.key`
+# and the authority's DER form `ca.der`, all in the run folder) and asks for no login. It listens on
+# two ports: the origin KR_REAL_PROXY_BUMP passes a WebSocket upgrade and KR_REAL_PROXY_BUMP_BLOCKING
+# answers it with 403. KR_REAL_PROXY_BUMP_CA_FILE and KR_REAL_PROXY_BUMP_ACCESS_LOG complete the names.
 #
 # `basic` asks every CONNECT for a user name and password by HTTP Basic. `digest` offers Digest only,
 # so it stands for a proxy that asks for a sign-in method this host does not send. Each log line is
@@ -70,7 +75,7 @@ s.close()'
 
 start() {
   local run="$1" mode="$2"
-  case "$mode" in basic | digest) ;; *) die "the mode is basic or digest" ;; esac
+  case "$mode" in basic | digest | bump) ;; *) die "the mode is basic, digest or bump" ;; esac
   case "$run" in /*) ;; *) die "the run folder is an absolute path" ;; esac
   [ ! -e "$run/proxy.pid" ] || die "a proxy was started in $run: stop it first"
   mkdir -p "$run"
@@ -85,27 +90,47 @@ start() {
   password="$(openssl rand -hex 16)"
 
   umask 077
-  if [ "$mode" = basic ]; then
-    printf '%s' "$password" | openssl passwd -apr1 -stdin | sed "s/^/$user:/" >"$run/passwd"
+  local blockport=""
+  if [ "$mode" = bump ]; then
+    blockport="$(free_port)"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=a real proxy case authority" \
+      -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+      -keyout "$run/ca.key" -out "$run/ca.pem" >"$run/ca.log" 2>&1 || die "no authority: see $run/ca.log"
+    openssl x509 -in "$run/ca.pem" -outform der -out "$run/ca.der"
+    "$libexec/security_file_certgen" -c -s "$run/ssl_db" -M 4MB >"$run/certgen.log" 2>&1 \
+      || die "no certificate database: see $run/certgen.log"
   else
-    printf '%s:%s\n' "$user" "$password" >"$run/passwd"
+    if [ "$mode" = basic ]; then
+      printf '%s' "$password" | openssl passwd -apr1 -stdin | sed "s/^/$user:/" >"$run/passwd"
+    else
+      printf '%s:%s\n' "$user" "$password" >"$run/passwd"
+    fi
+    printf '%s:%s\n' "$user" "$password" >"$run/credential"
   fi
-  printf '%s:%s\n' "$user" "$password" >"$run/credential"
-  sed -e "s|@RUN@|$run|g" -e "s|@PORT@|$port|g" -e "s|@LIBEXEC@|$libexec|g" \
+  sed -e "s|@RUN@|$run|g" -e "s|@PORT@|$port|g" -e "s|@BLOCKPORT@|$blockport|g" -e "s|@LIBEXEC@|$libexec|g" \
     "$here/real-proxy/$mode.conf" >"$run/squid.conf"
   if [ -n "${SQUID_EXTRA_CONF:-}" ]; then
     cat "$SQUID_EXTRA_CONF" >>"$run/squid.conf"
   fi
   : >"$run/access.log"
-  local name=KR_REAL_PROXY
-  if [ "$mode" = digest ]; then
-    name=KR_REAL_PROXY_DIGEST
+  if [ "$mode" = bump ]; then
+    {
+      echo "export KR_REAL_PROXY_BUMP=http://127.0.0.1:$port"
+      echo "export KR_REAL_PROXY_BUMP_BLOCKING=http://127.0.0.1:$blockport"
+      echo "export KR_REAL_PROXY_BUMP_CA_FILE=$run/ca.der"
+      echo "export KR_REAL_PROXY_BUMP_ACCESS_LOG=$run/access.log"
+    } >"$run/env.sh"
+  else
+    local name=KR_REAL_PROXY
+    if [ "$mode" = digest ]; then
+      name=KR_REAL_PROXY_DIGEST
+    fi
+    {
+      echo "export $name=http://127.0.0.1:$port"
+      echo "export ${name}_CREDENTIAL_FILE=$run/credential"
+      echo "export ${name}_ACCESS_LOG=$run/access.log"
+    } >"$run/env.sh"
   fi
-  {
-    echo "export $name=http://127.0.0.1:$port"
-    echo "export ${name}_CREDENTIAL_FILE=$run/credential"
-    echo "export ${name}_ACCESS_LOG=$run/access.log"
-  } >"$run/env.sh"
 
   "$program" -k parse -f "$run/squid.conf" >"$run/parse.log" 2>&1 \
     || die "squid refuses the configuration: see $run/parse.log"
@@ -152,7 +177,7 @@ stop() {
 }
 
 case "${1:-}" in
-  start) [ $# -eq 3 ] || die "usage: real-proxy.sh start <run folder> basic|digest"; start "$2" "$3" ;;
+  start) [ $# -eq 3 ] || die "usage: real-proxy.sh start <run folder> basic|digest|bump"; start "$2" "$3" ;;
   stop) [ $# -eq 2 ] || die "usage: real-proxy.sh stop <run folder>"; stop "$2" ;;
-  *) die "usage: real-proxy.sh start <run folder> basic|digest | stop <run folder>" ;;
+  *) die "usage: real-proxy.sh start <run folder> basic|digest|bump | stop <run folder>" ;;
 esac

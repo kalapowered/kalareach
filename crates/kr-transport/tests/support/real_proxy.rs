@@ -52,7 +52,7 @@ pub struct RealProxy {
 fn named(origin: &str, suffix: &str) -> String {
     let name = format!("{origin}{suffix}");
     std::env::var(&name).unwrap_or_else(|_| {
-        panic!("{origin}, {origin}_CREDENTIAL_FILE and {origin}_ACCESS_LOG name the proxy to run against, and {name} is not set")
+        panic!("{name} is not set: the environment names the proxy this case runs against, as scripts/real-proxy.sh writes the names")
     })
 }
 
@@ -65,6 +65,22 @@ impl RealProxy {
     /// The proxy that offers Digest only.
     pub fn digest() -> Self {
         Self::read("KR_REAL_PROXY_DIGEST")
+    }
+
+    /// The proxy that intercepts TLS and asks for no login: the proxy at the port that passes a
+    /// WebSocket upgrade, the origin of the port that refuses it, and the DER form of the
+    /// authority whose certificates it presents.
+    pub fn bump() -> (Self, String, Vec<u8>) {
+        let name = "KR_REAL_PROXY_BUMP";
+        let authority =
+            std::fs::read(named(name, "_CA_FILE")).expect("the authority file is readable");
+        let proxy = Self {
+            origin: named(name, ""),
+            user: String::new(),
+            password: String::new(),
+            log: PathBuf::from(named(name, "_ACCESS_LOG")),
+        };
+        (proxy, named(name, "_BLOCKING"), authority)
     }
 
     fn read(origin: &str) -> Self {
@@ -111,6 +127,16 @@ impl RealProxy {
 
     /// Every line of the log that names `target`, in the order they were written.
     pub fn lines_to(&self, target: &str) -> Vec<Logged> {
+        self.lines_matching(|line_target| line_target == target)
+    }
+
+    /// Every line of the log whose target holds `text`, in the order they were written. A request
+    /// the proxy read inside a tunnel it intercepted is named by its whole address.
+    pub fn lines_naming(&self, text: &str) -> Vec<Logged> {
+        self.lines_matching(|line_target| line_target.contains(text))
+    }
+
+    fn lines_matching(&self, keep: impl Fn(&str) -> bool) -> Vec<Logged> {
         let log = std::fs::read_to_string(&self.log).unwrap_or_default();
         log.lines()
             .filter_map(|line| {
@@ -118,7 +144,7 @@ impl RealProxy {
                 let [_, _, method, line_target, status, result, user] = fields[..] else {
                     return None;
                 };
-                if line_target != target {
+                if !keep(line_target) {
                     return None;
                 }
                 Some(Logged {
@@ -156,6 +182,27 @@ impl RealProxy {
             assert!(
                 Instant::now() < deadline,
                 "the proxy's log never held {wanted} for {target}: {lines:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits until the lines whose target holds `text` satisfy `enough`, and returns them.
+    pub async fn wait_until_naming(
+        &self,
+        text: &str,
+        wanted: &str,
+        enough: impl Fn(&[Logged]) -> bool,
+    ) -> Vec<Logged> {
+        let deadline = Instant::now() + LOG_PATIENCE;
+        loop {
+            let lines = self.lines_naming(text);
+            if enough(&lines) {
+                return lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the proxy's log never held {wanted} for {text}: {lines:?}"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
