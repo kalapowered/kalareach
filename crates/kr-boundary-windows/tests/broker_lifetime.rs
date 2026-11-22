@@ -2225,3 +2225,52 @@ fn a_crash_after_a_root_leftover_is_finished_by_the_restart_when_the_root_can_no
         "the private root is gone"
     );
 }
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn a_restart_in_another_boot_proves_an_end_only_when_no_session_of_a_boundary_account_stands() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: needs the system's token");
+        return;
+    }
+    let setting = Setting::new();
+    // An invocation that began under the boot marker the cases use and did not end. Its recorded
+    // session number is one that no session has, so the rule of the same boot would find it gone.
+    write_journal(&setting, &[]);
+    // A session of the boundary account stands.
+    let made = token::boundary_token(&setting.account, &token::new_invocation_group())
+        .expect("a logon of the boundary account");
+    let luid = session::session_of(&made).unwrap();
+    // The broker now runs in another boot: the recorded number means nothing, and the end is proved
+    // only when no session of either boundary account exists.
+    let broker = Life::open(
+        &setting.scratch.dir,
+        &setting.account,
+        &["sleep", "60000"],
+        1,
+        |env| env.boot = "another-boot-marker".to_owned(),
+    );
+    let first = recover(&broker.env).unwrap();
+    assert!(
+        matches!(first.invocations.as_slice(), [Recovered::Uncertain(..)]),
+        "{:?}",
+        first.invocations
+    );
+    assert_eq!(
+        broker.releases(),
+        0,
+        "nothing is released on an end that is not proved"
+    );
+    assert_eq!(broker.trees.blocked(), Some(Blocked::Uncertain));
+    // The session leaves: the next try proves the end and finishes the invocation.
+    drop(made);
+    absent_session(luid);
+    let second = recover(&broker.env).unwrap();
+    assert!(
+        matches!(second.invocations.as_slice(), [Recovered::Ended(..)]),
+        "{:?}",
+        second.invocations
+    );
+    assert_eq!(broker.releases(), 1);
+    assert!(broker.ended() && !broker.trees.locked());
+}
