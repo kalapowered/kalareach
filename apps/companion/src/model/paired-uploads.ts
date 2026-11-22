@@ -71,7 +71,15 @@ export interface UploadRow {
   readonly note: string | null
   /** Whether a call of this window waits for the upload's outcome. */
   readonly awaited: boolean
+  /**
+   * The upload was refused and the application's list could not be read afterwards, so whether it
+   * still holds the upload is not known: the next read of the list settles it.
+   */
+  readonly unread?: boolean
 }
+
+/** What the read of one upload's account answers when the application's list could not be read. */
+const UNREAD = Symbol('unread')
 
 /** The phases the application's account decides. */
 const DRIVEN: ReadonlySet<PhaseKind> = new Set([
@@ -368,12 +376,19 @@ export class PairedUploads {
             // says of it, so that it can be cancelled; only an upload it keeps nothing of is refused.
             const kept = await this.#kept(key)
             still()
-            this.#patch(
-              key,
-              kept === null
-                ? { phase: { kind: 'refused', refusal }, awaited: false }
-                : { phase: phaseOf(kept), handle: kept.handle ?? undefined, awaited: false }
-            )
+            if (kept === UNREAD) {
+              // Not knowing is not the same as nothing kept: the row says what was refused, and the
+              // next read of the list decides whether the application holds the upload.
+              this.#patch(key, { phase: { kind: 'refused', refusal }, awaited: false, unread: true })
+              this.#poll()
+            } else {
+              this.#patch(
+                key,
+                kept === null
+                  ? { phase: { kind: 'refused', refusal }, awaited: false }
+                  : { phase: phaseOf(kept), handle: kept.handle ?? undefined, awaited: false }
+              )
+            }
           }
         }
         throw failure
@@ -381,12 +396,12 @@ export class PairedUploads {
     )
   }
 
-  /** What the application keeps of the upload `key`, none when it keeps nothing. */
-  async #kept(key: string): Promise<OpenUpload | null> {
+  /** What the application keeps of the upload `key`, none when it keeps nothing, and `UNREAD` when its list cannot be read. */
+  async #kept(key: string): Promise<OpenUpload | null | typeof UNREAD> {
     try {
       return (await this.#port.uploadsOpen()).find((view) => view.key === key) ?? null
     } catch {
-      return null
+      return UNREAD
     }
   }
 
@@ -674,7 +689,7 @@ export class PairedUploads {
   }
 
   #anyDriven(): boolean {
-    for (const row of this.#rows.values()) if (DRIVEN.has(row.phase.kind)) return true
+    for (const row of this.#rows.values()) if (DRIVEN.has(row.phase.kind) || row.unread === true) return true
     return false
   }
 
@@ -721,6 +736,7 @@ export class PairedUploads {
         } else if (
           DRIVEN.has(row.phase.kind) ||
           row.phase.kind === 'stuck' ||
+          row.unread === true ||
           (!row.awaited && row.phase.kind === 'kept')
         ) {
           const next = phaseOf(view)
@@ -735,11 +751,17 @@ export class PairedUploads {
               ? row.phase
               : next
           const note = row.phase.kind === 'cancelAsked' && next.kind === 'kept' ? sentence(PUBLISHED_AND_KEPT) : row.note
-          set({ ...row, phase, handle: view.handle ?? row.handle, note })
+          set({ ...row, phase, handle: view.handle ?? row.handle, note, ...(row.unread === true ? { unread: false } : {}) })
         }
       }
       // A file the application no longer lists, which no call of this window waits for, has ended.
       for (const [key, row] of this.#rows) {
+        // A refused file whose list could not be read is now known to be one the application keeps nothing of.
+        if (!seen.has(key) && row.unread === true) {
+          this.#rows.set(key, { ...row, unread: false })
+          changed = true
+          continue
+        }
         const going = DRIVEN.has(row.phase.kind) || row.phase.kind === 'stuck'
         if (!seen.has(key) && !row.awaited && going) {
           // The cancel was finished: the row says it was cancelled, with nothing released to report.

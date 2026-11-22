@@ -1,9 +1,10 @@
 /**
  * What a person is told about a file sent to a host this device is paired with.
  *
- * The first group is the application's own words, written in `open_transfers.rs` and
- * `paired_drafts.rs`: the page shows them as written and recognises a refusal by them, so a case
- * reads those two files and holds the constants here to them. The second group is the page's own
+ * The first group is the application's own words, written in `open_transfers.rs`,
+ * `paired_drafts.rs` and, for the sign-in refusal, `kr-client`'s `organisation.rs`: the page shows
+ * them as written and recognises a refusal by them, so a case reads those files and holds the
+ * constants here to them. The second group is the page's own
  * words for what the host refused and for each state of an upload.
  */
 
@@ -59,6 +60,14 @@ export const CHANGED_AGAIN = 'the draft changed again while the file was being a
 /** The host was asked to make the draft and its answer has not been received. */
 export const CREATE_PENDING =
   'the host was asked to make a draft for this session and its answer has not been received: try again later'
+
+/**
+ * No account is signed in on this device that can ask the organisation for the lease the host needs,
+ * or the command was made under another account than the one signed in. The application refuses with
+ * the code of a missing right, written in `kr-client`'s `LeaseStop::SignIn`.
+ */
+export const SIGN_IN_AGAIN =
+  'sign in to your account again: this device cannot ask your organisation for the lease that lets it use this host'
 
 /** The host was asked to end the draft and its answer has not been received. */
 export const DISCARD_PENDING =
@@ -117,6 +126,7 @@ const APPLICATION_WORDS: readonly (readonly [string, RefusalKind])[] = [
   [CANNOT_RESUME, 'other'],
   [KEY_IN_USE, 'other'],
   [NEWER_DRAFT, 'other'],
+  [SIGN_IN_AGAIN, 'other'],
   [CHANGED_AGAIN, 'other'],
   [CREATE_PENDING, 'other'],
   [DISCARD_PENDING, 'other'],

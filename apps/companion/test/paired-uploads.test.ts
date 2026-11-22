@@ -12,6 +12,7 @@ import { PairedUploads, boundIdsOf, canCancel, lineOf, type Phase } from '../src
 import * as words from '../src/model/transfer-words'
 import openTransfers from '../src-tauri/src/open_transfers.rs?raw'
 import pairedDrafts from '../src-tauri/src/paired_drafts.rs?raw'
+import organisation from '../../../crates/kr-client/src/organisation.rs?raw'
 
 const RUST: Readonly<Record<string, string>> = {
   'open_transfers.rs': openTransfers,
@@ -25,6 +26,14 @@ function rustConstant(file: string, name: string): string {
   const match = new RegExp(`pub const ${name}: &str\\s*=\\s*((?:"(?:[^"\\\\]|\\\\.)*"\\s*)+);`).exec(text)
   if (match?.[1] === undefined) throw new Error(`${name} is not in ${file}`)
   return [...match[1].matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((part) => part[1] ?? '').join('')
+}
+
+/** The sentence `kr-client` says for one `LeaseStop`, joined across the lines it is written on. */
+function leaseStopSentence(variant: string): string {
+  const match = new RegExp(`Self::${variant} => Shown::said\\(\\s*"((?:[^"\\\\]|\\\\[\\s\\S])*)"\\s*,?\\s*\\)`).exec(organisation)
+  if (match?.[1] === undefined) throw new Error(`${variant} is not in organisation.rs`)
+  // A backslash at the end of a line in a Rust string takes the line break and the next line's indent with it.
+  return match[1].replace(/\\\r?\n\s*/g, '')
 }
 
 describe("the application's sentences are the ones the page recognises and shows", () => {
@@ -45,6 +54,10 @@ describe("the application's sentences are the ones the page recognises and shows
     ['paired_drafts.rs', 'UPDATE_THE_HOST', words.UPDATE_THE_HOST_TO_END_A_DRAFT]
   ])('%s %s', (file, name, constant) => {
     expect(constant).toBe(rustConstant(file, name))
+  })
+
+  it('holds the sign-in sentence to the words kr-client says for a stopped lease', () => {
+    expect(words.SIGN_IN_AGAIN).toBe(leaseStopSentence('SignIn'))
   })
 
   it('states the sentence of a cancel that found the file published as the approved words', () => {
@@ -71,6 +84,8 @@ describe('what each refusal means to the person, and the words it is shown in', 
     [host('PERMISSION_DENIED', words.CANNOT_RESUME), 'other', words.sentence(words.CANNOT_RESUME)],
     [host('PERMISSION_DENIED', words.KEY_IN_USE), 'other', words.sentence(words.KEY_IN_USE)],
     [host('PERMISSION_DENIED', words.NEWER_DRAFT), 'other', words.sentence(words.NEWER_DRAFT)],
+    // The refusal of a command made under another sign-in, or with none, is not a right the device lacks.
+    [host('PERMISSION_DENIED', words.SIGN_IN_AGAIN), 'other', words.sentence(words.SIGN_IN_AGAIN)],
     [host('UNSUPPORTED_CAPABILITY', 'unknown method upload.begin'), 'earlier-host', words.EARLIER_HOST],
     [host('UNSUPPORTED_SCHEMA', 'schema'), 'earlier-host', words.EARLIER_HOST],
     [host('PERMISSION_DENIED', 'the device holds no right for files.upload'), 'no-right', words.NO_RIGHT_TO_SEND],
@@ -169,6 +184,60 @@ describe('the store reads the application, and the application is the one that s
     const phase = uploads.snapshot().get('k-9')?.phase
     expect(phase?.kind).not.toBe('refused')
     expect(phase !== undefined && canCancel(phase)).toBe(true)
+  })
+
+  /** The store with its list of the application's uploads unreadable until `mend()` is called. */
+  const unreadable = () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: ['files.upload', 'agent.prompt'] })
+    const real = port.uploadsOpen.bind(port)
+    let readable = false
+    const asked = vi
+      .spyOn(port, 'uploadsOpen')
+      .mockImplementation(() => (readable ? real() : Promise.reject(new Error('the application cannot be reached'))))
+    const uploads = new PairedUploads(port, 5)
+    return {
+      uploads,
+      scripted: controls.pairedUploads,
+      asked,
+      mend: () => {
+        readable = true
+      }
+    }
+  }
+  const refusal = {
+    code: 'RESOURCE_UNAVAILABLE',
+    message: 'this device could not keep a record of the upload: disk full'
+  }
+
+  it('does not take a refused file for one the application keeps nothing of when its list cannot be read', async () => {
+    const { uploads, scripted, mend } = unreadable()
+    const sent = uploads.send({ key: 'k-7', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    const failed = sent.catch(() => undefined)
+    await wait(() => scripted.started.length === 1)
+    scripted.refuseRetaining('k-7', refusal)
+    await failed
+    // Nothing is known of what the application keeps: the row says what was refused, and asks again.
+    expect(uploads.snapshot().get('k-7')?.phase.kind).toBe('refused')
+    mend()
+    await wait(() => uploads.snapshot().get('k-7')?.phase.kind !== 'refused')
+    const phase = uploads.snapshot().get('k-7')?.phase
+    expect(phase !== undefined && canCancel(phase)).toBe(true)
+  })
+
+  it('stops asking once the list is read and the application keeps nothing of the refused file', async () => {
+    const { uploads, scripted, asked, mend } = unreadable()
+    const sent = uploads.send({ key: 'k-6', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    const failed = sent.catch(() => undefined)
+    await wait(() => scripted.started.length === 1)
+    scripted.refuse('k-6', refusal)
+    await failed
+    mend()
+    await wait(() => uploads.snapshot().get('k-6')?.unread !== true)
+    expect(uploads.snapshot().get('k-6')?.phase.kind).toBe('refused')
+    const reads = asked.mock.calls.length
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(asked.mock.calls.length).toBe(reads)
   })
 
   it('keeps the reason a finished file was not added when the application is read again', async () => {
