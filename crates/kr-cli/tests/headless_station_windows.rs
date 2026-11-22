@@ -44,6 +44,9 @@ const NATIVE: &[&str] = &["--shell-mode", "native_compat"];
 /// The integrity label no object can have a lower one than: untrusted, with no writing from below.
 const UNTRUSTED_LABEL: &str = "S:(ML;;NW;;;S-1-16-0)";
 
+/// The trustee of the untrusted label's entry, as a label the system wrote names it.
+const UNTRUSTED_SID: &str = "S-1-16-0";
+
 /// Held by each case for as long as it changes the security of anything.
 static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -282,7 +285,8 @@ async fn a_desktop_that_exists_already_and_admits_more_than_the_starters_own_ref
 /// label than the interactive desktop's, and whose list leaves the starter the right to change it,
 /// is used once the starter has put the interactive desktop's label on it, and the label it reads
 /// back is the interactive desktop's. Where the interactive desktop has no label there is none to
-/// put on it, and the case fails rather than passing without having shown anything.
+/// put on it, and one at the lowest level has nothing to raise the desktop to; the case fails in
+/// both rather than passing without having shown anything.
 ///
 /// The desktop of a headless worker is named for its reservation, so the case takes a launch of a
 /// reservation of its own, holds a desktop of that name with the lowest label, and hands the launch
@@ -304,6 +308,12 @@ async fn a_logon_desktop_with_a_lower_label_that_the_starter_may_change_is_used(
              desktop and this case would show nothing: {interactive:?}"
         )
     });
+    assert!(
+        !entry.contains(&format!(";;;{UNTRUSTED_SID})")),
+        "the interactive desktop is at the lowest integrity level, which is the level the desktop \
+         below is made with, so the starter's label would change nothing and this case would pass \
+         without it: {interactive:?}"
+    );
     let station = HeldStation::make(|own| own.to_owned()).unwrap_or_else(|error| {
         panic!("the logon's station as the starter would make it: {error}")
     });
