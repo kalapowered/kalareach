@@ -71,6 +71,7 @@ HOST_ONLY = {
     "kr-transfer": "docs/transfer/README.md: filesystem authority and previews on the host",
     "kr-project": "docs/project/README.md: repositories, workspaces and the restricted Git profile",
     "kr-changeset": "docs/project/README.md: change sets captured and applied on the host",
+    "kr-boundary-windows": "docs/project/README.md: the Windows execution boundary and its broker on the host",
     "kr-automation": "docs/automation/README.md: the workflow engine a host runs",
     "kr-attention": "docs/host/README.md: the attention engine a host runs",
     "kr-delivery": "docs/delivery/README.md: the delivery journal and push outbox a host keeps",
