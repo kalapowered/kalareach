@@ -20,6 +20,17 @@ use kr_transport::proxy::ProxyCredential;
 /// How long a case waits for the proxy to write a line.
 const LOG_PATIENCE: Duration = Duration::from_secs(20);
 
+/// The password of the login a case presents as the wrong one.
+pub const WRONG_PASSWORD: &str = "not-this-password";
+
+/// Whether `text` holds the password, or the form `user:password` takes in a `Basic`
+/// `Proxy-Authorization` value: the two forms a login can leave in a log.
+pub fn holds_login(text: &str, user: &str, password: &str) -> bool {
+    use base64::Engine as _;
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+    text.contains(password) || text.contains(&basic)
+}
+
 /// The login a case presents.
 #[derive(Clone, Copy, Debug)]
 pub enum Login {
@@ -113,7 +124,7 @@ impl RealProxy {
         let proxy: ProxyUrl = self.origin.parse().expect("the proxy's origin");
         let password = match login {
             Login::Right => self.password.clone(),
-            Login::Wrong => "not-this-password".to_owned(),
+            Login::Wrong => WRONG_PASSWORD.to_owned(),
             Login::None => return proxy,
         };
         proxy.with_login(
@@ -156,6 +167,32 @@ impl RealProxy {
                 })
             })
             .collect()
+    }
+
+    /// Whether the proxy's access log holds the login `user:password` in either form.
+    pub fn log_holds_login(&self, user: &str, password: &str) -> bool {
+        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+        holds_login(&log, user, password)
+    }
+
+    /// Whether the proxy's access log holds the login the proxy was started with, in either form.
+    pub fn log_holds_own_login(&self) -> bool {
+        self.log_holds_login(&self.user, &self.password)
+    }
+
+    /// Whether `text` holds the login the proxy was started with, in either form.
+    pub fn holds_own_login(&self, text: &str) -> bool {
+        holds_login(text, &self.user, &self.password)
+    }
+
+    /// Waits until the lines that name `target` number `count`, waits a moment more, and returns
+    /// them if they number `count` still: a request that came late is a failure.
+    pub async fn exactly(&self, target: &str, count: usize) -> Vec<Logged> {
+        self.wait_for(target, count).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let lines = self.lines_to(target);
+        assert_eq!(lines.len(), count, "{target}: {lines:?}");
+        lines
     }
 
     /// Waits until the lines that name `target` number `count`, and returns them.

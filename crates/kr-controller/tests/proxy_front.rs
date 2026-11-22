@@ -613,4 +613,8 @@ async fn an_endpoint_reaches_its_relay_through_a_real_proxy_by_its_front() {
             && line.user == proxy.user()),
         "every request the proxy took for the relay was a tunnel for the user: {lines:?}"
     );
+    assert!(
+        !proxy.log_holds_own_login(),
+        "the proxy's log holds the login"
+    );
 }

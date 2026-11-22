@@ -35,7 +35,7 @@ use kr_protocol::ids::ActionId;
 use kr_protocol::method::Method;
 use kr_protocol::network_proxy::NetworkProxyLoginSetParams;
 use kr_protocol::scalars::Nullable;
-use real_proxy::RealProxy;
+use real_proxy::{RealProxy, holds_login};
 use tokio::net::TcpListener;
 
 /// A password that must be found in no answer and no log line.
@@ -825,7 +825,7 @@ async fn a_daemon_behind_a_real_proxy_starts_says_so_and_takes_the_login_at_its_
         said.contains("this host is not on the network"),
         "no endpoint is registered: {said}"
     );
-    let lines = proxy.wait_for(&relay_address, 1).await;
+    let lines = proxy.exactly(&relay_address, 1).await;
     assert_eq!(
         answers(&lines),
         vec![(407, "-")],
@@ -883,14 +883,14 @@ async fn a_daemon_behind_a_real_proxy_starts_says_so_and_takes_the_login_at_its_
         "the proxy refused no login the daemon sent: {lines:?}"
     );
     let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
-    let (_, password) = proxy
-        .login_line()
-        .split_once(':')
-        .map(|(u, p)| (u.to_owned(), p.to_owned()))
-        .expect("a pair");
-    assert!(!log.contains(&password), "the daemon's log holds the login");
-    let basic = base64::engine::general_purpose::STANDARD.encode(proxy.login_line());
-    assert!(!log.contains(&basic), "the daemon's log holds the login");
+    assert!(
+        !proxy.holds_own_login(&log),
+        "the daemon's log holds the login"
+    );
+    assert!(
+        !proxy.log_holds_own_login(),
+        "the proxy's log holds the login"
+    );
 }
 
 /// KR-REQ-10.02: a daemon whose stored login a real proxy refuses is written no login after the
@@ -929,7 +929,14 @@ async fn a_wrong_login_is_written_to_a_real_proxy_once_and_the_daemon_stops_ever
     );
     daemon.stop();
     let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
-    assert!(!log.contains("not-the-password"), "the log holds the login");
+    assert!(
+        !holds_login(&log, proxy.user(), "not-the-password"),
+        "the daemon's log holds the login"
+    );
+    assert!(
+        !proxy.log_holds_login(proxy.user(), "not-the-password"),
+        "the proxy's log holds the login"
+    );
 }
 
 /// KR-REQ-10.02: a real proxy that offers Digest only is "unsupported" to the daemon whether or not
@@ -937,8 +944,9 @@ async fn a_wrong_login_is_written_to_a_real_proxy_once_and_the_daemon_stops_ever
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "runs only against a proxy this machine runs that offers Digest only, named by KR_REAL_PROXY_DIGEST, KR_REAL_PROXY_DIGEST_CREDENTIAL_FILE and KR_REAL_PROXY_DIGEST_ACCESS_LOG"]
 async fn a_real_proxy_that_offers_digest_only_is_unsupported_whether_or_not_a_login_is_held() {
+    const STORED: &str = "not-the-digest-password";
     let proxy = RealProxy::digest();
-    for (label, stored) in [("no login", None), ("a login held", Some("another"))] {
+    for (label, stored) in [("no login", None), ("a login held", Some(STORED))] {
         let (host, _relay, relay_address) = host_behind_at(&proxy.origin, |_| {}).await;
         if let Some(password) = stored {
             store_login_at(&host, &proxy.origin, proxy.user(), password);
@@ -957,14 +965,18 @@ async fn a_real_proxy_that_offers_digest_only_is_unsupported_whether_or_not_a_lo
             said.contains("this host is not on the network"),
             "{label}: no endpoint is registered: {said}"
         );
-        let lines = proxy.wait_for(&relay_address, 1).await;
-        assert_eq!(
-            lines.len(),
-            1,
-            "{label}: the check's own request: {lines:?}"
-        );
+        let lines = proxy.exactly(&relay_address, 1).await;
         assert_eq!(lines[0].method, "CONNECT");
         assert_eq!(lines[0].status, 407, "{label}: {lines:?}");
         daemon.stop();
+        let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+        assert!(
+            !holds_login(&log, proxy.user(), STORED),
+            "{label}: the daemon's log holds the login"
+        );
+        assert!(
+            !proxy.log_holds_login(proxy.user(), STORED),
+            "{label}: the proxy's log holds the login"
+        );
     }
 }

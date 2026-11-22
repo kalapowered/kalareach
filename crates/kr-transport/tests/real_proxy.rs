@@ -24,7 +24,7 @@ use kr_transport::config::ProxyUrl;
 use kr_transport::proxy::{
     Following, ProxyLoginKind, StopKind, admit, follow, proxied, proxy_login_kind,
 };
-use real_proxy::{Login, RealProxy};
+use real_proxy::{Login, RealProxy, WRONG_PASSWORD, holds_login};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -116,7 +116,7 @@ async fn a_client_with_the_right_login_reaches_an_origin_through_a_real_proxy() 
 
     // The proxy writes a tunnel's line when the tunnel closes.
     drop(client);
-    let lines = proxy.wait_for(&origin.address, 1).await;
+    let lines = proxy.exactly(&origin.address, 1).await;
     assert_eq!(
         lines.len(),
         1,
@@ -125,6 +125,10 @@ async fn a_client_with_the_right_login_reaches_an_origin_through_a_real_proxy() 
     assert_eq!(lines[0].method, "CONNECT");
     assert_eq!(lines[0].status, 200, "{lines:?}");
     assert_eq!(lines[0].user, proxy.user(), "{lines:?}");
+    assert!(
+        !proxy.log_holds_own_login(),
+        "the proxy's log holds the login"
+    );
 }
 
 /// KR-REQ-10.02: a real proxy turns a wrong login away with its own `407`, and the client reads it:
@@ -167,6 +171,14 @@ async fn a_wrong_login_is_refused_by_a_real_proxy_once_and_stops_every_request()
         1,
         "a second request sent nothing to the proxy"
     );
+    assert!(
+        !proxy.log_holds_login(proxy.user(), WRONG_PASSWORD),
+        "the proxy's log holds the wrong login"
+    );
+    assert!(
+        !proxy.log_holds_own_login(),
+        "the proxy's log holds the login"
+    );
 }
 
 /// KR-REQ-10.02: a client that holds no login is told by a real proxy that one is needed: the
@@ -186,11 +198,15 @@ async fn a_client_with_no_login_is_told_by_a_real_proxy_that_one_is_needed() {
         .await
         .expect_err("the proxy asks for a login");
     assert_eq!(proxy_login_kind(&needed), Some(ProxyLoginKind::Needed));
-    let lines = proxy.wait_for(&origin.address, 1).await;
+    let lines = proxy.exactly(&origin.address, 1).await;
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].method, "CONNECT");
     assert_eq!(lines[0].status, 407, "{lines:?}");
     assert_eq!(lines[0].user, "-", "no login was sent: {lines:?}");
+    assert!(
+        !proxy.log_holds_own_login(),
+        "the proxy's log holds the login"
+    );
 }
 
 /// KR-REQ-10.02: the login travels only in a `CONNECT`. A request to a plain `http` address, sent
@@ -258,4 +274,32 @@ async fn a_plain_http_target_is_refused_before_a_real_proxy_is_asked() {
     let lines = proxy.wait_for(&tls_origin.address, 1).await;
     assert_eq!(lines[0].status, 200, "{lines:?}");
     assert_eq!(lines[0].user, proxy.user(), "{lines:?}");
+    assert!(
+        !proxy.log_holds_own_login(),
+        "the proxy's log holds the login"
+    );
+}
+
+/// The check the cases make of every log finds a login in each form it can take there, and finds
+/// nothing in a log that holds neither.
+#[test]
+fn the_login_check_finds_the_password_and_its_basic_form() {
+    use base64::Engine as _;
+    let basic = base64::engine::general_purpose::STANDARD.encode("user:secret-text");
+    assert!(holds_login(
+        "a line with secret-text in it",
+        "user",
+        "secret-text"
+    ));
+    assert!(holds_login(
+        &format!("Proxy-Authorization: Basic {basic}"),
+        "user",
+        "secret-text"
+    ));
+    assert!(!holds_login("a line with neither", "user", "secret-text"));
+    assert!(!holds_login(
+        &format!("Proxy-Authorization: Basic {basic}"),
+        "user",
+        "another-text"
+    ));
 }
