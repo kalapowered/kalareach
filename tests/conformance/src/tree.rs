@@ -835,10 +835,29 @@ mod tests {
         assert_eq!(asked, "", "a signal was sent to the group");
     }
 
+    /// The leader of the group of `group_signalled`: it writes the name of each signal it is sent to
+    /// the file of its first argument, records its pid and its child's in the file of its second,
+    /// and goes on for 30 s at most, so that it ends by itself when nothing ends it.
+    const GROUP_LEADER: &str = "import os, signal, subprocess, sys, time
+names = {signal.SIGINT: 'INT', signal.SIGTERM: 'TERM'}
+def note(number, frame):
+    with open(sys.argv[1], 'a') as out:
+        out.write(names[number] + '\\n')
+signal.signal(signal.SIGINT, note)
+signal.signal(signal.SIGTERM, note)
+child = subprocess.Popen(['sleep', '61'])
+with open(sys.argv[2], 'a') as out:
+    out.write(str(os.getpid()) + '\\n' + str(child.pid) + '\\n')
+end = time.monotonic() + 30
+while time.monotonic() < end:
+    time.sleep(0.05)
+";
+
     /// Runs a group whose processes record the signal they are sent, with the signal that the flag
     /// `flag` of the interrupts holds recorded once the group has started, and gives what the
-    /// group recorded. The group's leader traps `INT` and `TERM`; its child waits with `sleep` and,
-    /// as a background command of a shell without job control, ignores `INT`, so it ends at the end
+    /// group recorded. The group's leader is a Python program that handles `INT` and `TERM`, and not a shell: a
+    /// shell that is started with `INT` ignored, as it is under a parent that runs in the background
+    /// of a non-interactive shell, cannot trap it. Its child waits with `sleep`, and ends at the end
     /// of the grace, by the force. It is not the leader's to reap, so the case looks for it for up
     /// to 10 s after the call, as the cases of `tests/execution.rs` do: on Linux a process that has
     /// ended answers a look until its parent reaps it. The flag is stored by a thread of the case
@@ -848,12 +867,11 @@ mod tests {
         let place = tempfile::tempdir().expect("a directory");
         let pids = place.path().join("pids.txt");
         let signals = place.path().join("signals.txt");
-        let script = "trap 'printf \"%s\\n\" INT >> \"$1\"' INT; trap 'printf \"%s\\n\" TERM >> \"$1\"' TERM; printf '%s\\n' \"$$\" >> \"$2\"; sleep 61 & printf '%s\\n' \"$!\" >> \"$2\"; wait";
-        let mut command = Command::new("bash");
+        let script = GROUP_LEADER;
+        let mut command = Command::new("python3");
         command
             .arg("-c")
             .arg(script)
-            .arg("bash")
             .args([&signals, &pids])
             .stdin(Stdio::null());
         Group::prepare(&mut command);
