@@ -872,7 +872,7 @@ fn broker_auth_the_rights_come_from_the_descriptor_and_agree_with_a_real_open() 
     let (_, system_reads_the_list_only) = folder(
         &scratch,
         "system_reads_the_list_only",
-        &format!("O:BAD:P(A;OICI;0x20000;;;SY)(A;OICI;FA;;;{who})"),
+        &format!("O:BAD:P(A;OICI;0x120000;;;SY)(A;OICI;FA;;;{who})"),
     );
     let (_, system_full) = folder(&scratch, "system_full", "O:SYD:P(A;OICI;FA;;;SY)");
     assert!(system_may(&system_reads_the_list_only, Right::ReadControl));
@@ -1246,26 +1246,51 @@ fn broker_auth_a_handle_value_in_an_operate_frame_is_an_unknown_field_and_nothin
 // The pipe's server and its protocol
 // ---------------------------------------------------------------------------------------------
 
-/// The broker's own loop in this process for everyone, ended by the stop.
-fn serve_the_brokers_loop() -> (Arc<Stop>, JoinHandle<Result<(), String>>) {
-    assert!(
-        std::fs::metadata(Kind::Persons.name()).is_err(),
-        "the machine is not clean: the broker's pipe is in use"
-    );
-    let stop = Stop::new().unwrap();
-    let thread = std::thread::spawn({
-        let stop = Arc::clone(&stop);
-        move || {
-            let everyone = Sid::parse("S-1-1-0").unwrap();
-            broker::testing::serve(
-                Manifest::begin(),
-                Paths::system().expect("the system's folders are read"),
-                &[everyone],
-                stop,
-            )
+/// The broker's own loop in this process for everyone. It is ended by the stop, which is set when
+/// the value is dropped, so that a case that fails does not leave its pipe to the next one.
+struct BrokerLoop {
+    stop: Arc<Stop>,
+    thread: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl BrokerLoop {
+    fn start() -> BrokerLoop {
+        assert!(
+            std::fs::metadata(Kind::Persons.name()).is_err(),
+            "the machine is not clean: the broker's pipe is in use"
+        );
+        let stop = Stop::new().unwrap();
+        let thread = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                let everyone = Sid::parse("S-1-1-0").unwrap();
+                broker::testing::serve(
+                    Manifest::begin(),
+                    Paths::system().expect("the system's folders are read"),
+                    &[everyone],
+                    stop,
+                )
+            }
+        });
+        BrokerLoop {
+            stop,
+            thread: Some(thread),
         }
-    });
-    (stop, thread)
+    }
+
+    fn end(mut self) -> Result<(), String> {
+        self.stop.set();
+        self.thread.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for BrokerLoop {
+    fn drop(&mut self) {
+        self.stop.set();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[test]
@@ -1275,7 +1300,7 @@ fn broker_auth_a_wrong_protocol_version_is_refused_by_the_running_broker() {
         eprintln!("SKIPPED: needs the system's token");
         return;
     }
-    let (stop, thread) = serve_the_brokers_loop();
+    let broker_loop = BrokerLoop::start();
     let until = std::time::Instant::now() + Duration::from_secs(30);
     let pipe = loop {
         match open_pipe(Kind::Persons.name(), pipe_access::CLIENT, 0x0001_0000) {
@@ -1290,10 +1315,9 @@ fn broker_auth_a_wrong_protocol_version_is_refused_by_the_running_broker() {
         }
     };
     write_all(&pipe, &framed(r#"{"request":"hello","version":99}"#));
-    let size = read_some(&pipe, 4).expect("the answer's length");
-    let length = u32::from_le_bytes(size.try_into().unwrap()) as usize;
-    let body = read_some(&pipe, length).expect("the answer");
-    let answer: Response = serde_json::from_slice(&body).unwrap();
+    // The refusal is one frame, read whole: the broker closes the connection after it.
+    let frame_bytes = read_some(&pipe, 4096).expect("the answer");
+    let answer: Response = serde_json::from_slice(&frame_bytes[4..]).unwrap();
     assert!(
         matches!(
             answer,
@@ -1305,8 +1329,7 @@ fn broker_auth_a_wrong_protocol_version_is_refused_by_the_running_broker() {
         "{answer:?}"
     );
     drop(pipe);
-    stop.set();
-    assert_eq!(thread.join().unwrap(), Ok(()));
+    assert_eq!(broker_loop.end(), Ok(()));
 }
 
 #[test]
