@@ -367,15 +367,15 @@ export class PairedUploads {
       },
       async (failure: unknown) => {
         still()
-        // No call of this window waits for the upload any more, whatever the row says.
-        this.#patch(key, { awaited: false })
         const refusal = refusalOf(failure)
         const phase = this.#rows.get(key)?.phase.kind
         // The person's own cancel has said what became of it; a cancel asked is ended only by the
         // application saying it was cancelled.
         if (phase !== 'cancelling' && phase !== 'cancelled' && !(phase === 'cancelAsked' && refusal.kind !== 'cancelled')) {
+          // The row stays guarded against a list that was asked for before this failure until the
+          // patch that gives it its settled state, and that patch ends the guard.
           if (refusal.kind === 'cancelled') {
-            this.#patch(key, { phase: { kind: 'cancelled', released: null } })
+            this.#patch(key, { phase: { kind: 'cancelled', released: null }, awaited: false })
           } else {
             // A reservation the application still keeps stays on the screen with what the application
             // says of it, so that it can be cancelled; only an upload it keeps nothing of is refused.
@@ -384,30 +384,36 @@ export class PairedUploads {
             if (kept === UNREAD) {
               // Not knowing is not the same as nothing kept: the row says what was refused, and the
               // next read of the list decides whether the application holds the upload.
-              this.#patch(key, { phase: { kind: 'refused', refusal }, unread: true })
+              this.#patch(key, { phase: { kind: 'refused', refusal }, unread: true, awaited: false })
               this.#poll()
             } else {
               this.#patch(
                 key,
                 kept === null
-                  ? { phase: { kind: 'refused', refusal } }
-                  : { phase: phaseOf(kept), handle: kept.handle ?? undefined }
+                  ? { phase: { kind: 'refused', refusal }, awaited: false }
+                  : { phase: phaseOf(kept), handle: kept.handle ?? undefined, awaited: false }
               )
             }
           }
+        } else {
+          // No call of this window waits for the upload any more, whatever the row says; no read
+          // follows, and a cancelling row is not one that a list moves.
+          this.#patch(key, { awaited: false })
         }
         throw failure
       }
     )
   }
 
-  /** What the application keeps of the upload `key`, none when it keeps nothing, and `UNREAD` when its list cannot be read. */
+  /**
+   * What the application keeps of the upload `key`, none when it keeps nothing, and `UNREAD` when its
+   * list cannot be read. The list is the cycle's one read at a time: a read under way is waited for,
+   * so that its reply is never applied after the answer to this one.
+   */
   async #kept(key: string): Promise<OpenUpload | null | typeof UNREAD> {
-    try {
-      return (await this.#port.uploadsOpen()).find((view) => view.key === key) ?? null
-    } catch {
-      return UNREAD
-    }
+    if (this.#reading?.cycle === this.#cycle) await this.#reading.list
+    const list = await this.#read()
+    return list === null ? UNREAD : (list.find((view) => view.key === key) ?? null)
   }
 
   /** Adds a published file to the draft again, or for the first time after a restart. */

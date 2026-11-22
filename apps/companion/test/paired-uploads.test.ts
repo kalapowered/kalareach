@@ -223,6 +223,59 @@ describe('the store reads the application, and the application is the one that s
     await wait(() => uploads.snapshot().get('k-7')?.phase.kind !== 'refused')
     const phase = uploads.snapshot().get('k-7')?.phase
     expect(phase !== undefined && canCancel(phase)).toBe(true)
+    // The row waits for no call: when the application stops holding the upload, the next read ends it.
+    scripted.refuse('k-7', refusal)
+    await uploads.restore()
+    expect(uploads.snapshot().get('k-7')).toBeUndefined()
+  })
+
+  /** The store with every read of the application's list held until the test lets its reply go. */
+  const held = () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: ['files.upload', 'agent.prompt'] })
+    const real = port.uploadsOpen.bind(port)
+    const replies: { resolve: (views: readonly OpenUpload[]) => void }[] = []
+    const open = vi.spyOn(port, 'uploadsOpen').mockImplementation(
+      () =>
+        new Promise<readonly OpenUpload[]>((resolve) => {
+          replies.push({ resolve })
+        })
+    )
+    return { uploads: new PairedUploads(port, 60_000), scripted: controls.pairedUploads, open, replies, real }
+  }
+
+  it('Z2: an older empty list does not delete the row of an upload the application still holds', async () => {
+    const { uploads, scripted, open, replies, real } = held()
+    const sent = uploads.send({ key: 'k-9', sessionId: 's-1', subject, file }, () => Promise.resolve())
+    const failed = sent.catch(() => undefined)
+    await wait(() => scripted.started.length === 1)
+    // An older read of the list is under way, and the application has not heard of the upload yet.
+    const older = uploads.restore()
+    expect(replies).toHaveLength(1)
+    scripted.refuseRetaining('k-9', refusal)
+    // Every task has run: the failure has reached its read of what the application keeps.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    // The status read waits for the read under way, so no second list is asked for yet.
+    expect(open).toHaveBeenCalledTimes(1)
+    replies[0]?.resolve([])
+    await older
+    // The older list does not hold the upload, and it does not end the row the failure still guards.
+    expect(uploads.snapshot().get('k-9')).toBeDefined()
+    const early = uploads.snapshot().get('k-9')?.phase
+    expect(early !== undefined && canCancel(early)).toBe(true)
+    // The status read asks for a list of its own now, and its answer settles the row.
+    await wait(() => replies.length === 2)
+    replies[1]?.resolve(await real())
+    await failed
+    const row = uploads.snapshot().get('k-9')
+    expect(row?.phase.kind).not.toBe('refused')
+    expect(row !== undefined && canCancel(row.phase)).toBe(true)
+    expect(row?.awaited).toBe(false)
+    // The application stops holding the upload: a driven row that no call waits for is ended by the list.
+    open.mockRestore()
+    scripted.refuse('k-9', refusal)
+    await uploads.restore()
+    expect(uploads.snapshot().get('k-9')).toBeUndefined()
   })
 
   it('stops asking once the list is read and the application keeps nothing of the refused file', async () => {
