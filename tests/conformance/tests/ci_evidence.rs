@@ -1515,8 +1515,8 @@ fn the_macos_selection_finds_every_form_of_a_test_run_and_the_job_that_does_not_
 /// run that ends without saving the cache starts cold again. So the save runs after a good build
 /// whatever a later step does (a failure, a limit, a cancelled run) and after no build that did not
 /// end well: it is the job's one save, its condition reads the outcome of the step that builds and
-/// of no other, and it comes after the measurements, because the save takes the workspace's own
-/// output out of the build directory and the measurements run that output.
+/// of no other, and it comes after the measurements and the whole-reconnect case, because the save
+/// takes the workspace's own output out of the build directory and they run that output.
 #[test]
 fn the_reference_host_job_saves_its_cargo_cache_after_a_good_build_whatever_follows() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
@@ -1575,10 +1575,38 @@ fn the_reference_host_job_saves_its_cargo_cache_after_a_good_build_whatever_foll
         "the save does not come after the build and the measurements: it would take out the \
          output the measurements run"
     );
+    // The whole-reconnect case runs the release build the job made, so it runs before the save,
+    // and it fails the step when its output does not say that the target was asserted.
+    let reconnect: Vec<String> = steps_holding(&text, "--test network_reconnect_time")
+        .into_iter()
+        .filter(|step| !step.contains("--no-run"))
+        .collect();
+    assert_eq!(
+        reconnect.len(),
+        1,
+        "the job does not run the whole-reconnect case in one step"
+    );
+    assert!(
+        reconnect[0].contains("cargo test --locked --release -p kr-controller"),
+        "the whole-reconnect case does not run in the release build"
+    );
+    assert!(
+        reconnect[0].contains("grep -q -F 'no measured shortfall, so the target is asserted here'")
+            && reconnect[0].contains("exit 1"),
+        "the whole-reconnect step does not fail when the case asserted nothing"
+    );
+    let reconnect_at = steps_of(&text)
+        .iter()
+        .position(|step| step == &reconnect[0])
+        .expect("the whole-reconnect step is a step of the job");
+    assert!(
+        build_at < reconnect_at && reconnect_at < save_at,
+        "the whole-reconnect step does not run after the build and before the save"
+    );
 }
 
 /// What a cold build of the reference host's job needs: its runner took 120 minutes for the first
-/// of the build step's two commands, so the step has at least twice that. Every step has a limit of
+/// of the build step's three commands, so the step has at least twice that. Every step has a limit of
 /// its own, the limits add up to less than the job's, and the job's is under the 360 minutes at which
 /// GitHub ends a hosted job, so that a step is ended by its own limit and the steps after it still
 /// report.

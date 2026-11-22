@@ -3939,10 +3939,11 @@ jobs:
     runs-on: macos-15-intel
     # The build alone is about an hour on this runner when its cache is warm. With no cache the
     # first of its first two commands took from 47 to 120 minutes, the longest on two runners of one
-    # run, and the second had run 40 more without ending; the third builds one test program and adds
-    # little. Every step has a limit of its own, and the limits add up to less than this one: the
-    # build's 240 minutes, twice the 120, and the other steps' 118 make 358, and this limit of 359 is
-    # under the 360 at which GitHub ends a hosted job.
+    # run, and the second had run 40 more without ending; the third builds one test program and
+    # compiles again the crates whose features its dev-dependencies change. Every step has a limit
+    # of its own, and the limits add up to less than this one: the build's 240 minutes, twice the
+    # 120, and the other steps' 118 make 358, and this limit of 359 is under the 360 at which
+    # GitHub ends a hosted job.
     timeout-minutes: 359
     # The launchd checks and the daemons the workspace's tests, the demonstrations and the
     # measurements start load jobs into the account's own launchd, and stand down with a printed
@@ -4038,7 +4039,7 @@ jobs:
           cargo test --locked --release -p kr-controller --test network_reconnect_time \
             -- --nocapture 2>&1 | tee "$log"
           if ! grep -q -F 'no measured shortfall, so the target is asserted here' "$log"; then
-            echo "::error::the whole-reconnect case named a condition it lacked, so it recorded its figure and asserted nothing"
+            echo "::error::the whole-reconnect case did not print that its target was asserted, so its figure may not have been checked against the target"
             exit 1
           fi
 
