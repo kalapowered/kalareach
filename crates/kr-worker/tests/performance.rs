@@ -92,16 +92,23 @@ const WORKERS_HELD_ALARM_STEP_KIB: u64 = 4 * 1024;
 
 /// The size on disk of the worker program, in kibibytes: the length of the file the daemon starts
 /// each worker from, divided by 1,024 and rounded down, as `scripts/worker-size.sh` prints a size.
-/// Read on the build box on 2026-11-16: 35,328 KiB (36,176,328 bytes, one file) in the 8 of the 13
-/// valid readings of commit 3ace455c69 whose runs recorded the file's hash, and in 4 runs of commit
-/// 2bc513d435, which differs from it in this test file, the guide and a comment of
-/// `scripts/performance.sh`: a spread of 0 KiB and a mean of 35,328 KiB. A size has no low reading, because no reclaim of mapped pages moves it. The `worker
-/// size` line that `scripts/performance.sh` prints before the case is read from the program that
+/// Read on the build box on 2026-11-22 at commit ec97fa24b3: the program that the idle test's
+/// build leaves is 37,682,992 bytes, one file, which is 36,799 KiB rounded down; the level is set
+/// at 36,800 KiB. The build log is `logs/f131-worker-size-ec97fa24.log`, the line `ROW test file
+/// bytes`. The program is 1,174,072 bytes larger than the one the same build left at commit
+/// 85164cab77, 36,508,920 bytes.
+///
+/// The level before was 35,328 KiB (36,176,328 bytes, one file), read on the build box on
+/// 2026-11-16: in the 8 of the 13 valid readings of commit 3ace455c69 whose runs recorded the
+/// file's hash, and in 4 runs of commit 2bc513d435, which differs from it in this test file, the
+/// guide and a comment of `scripts/performance.sh`: a spread of 0 KiB and a mean of 35,328 KiB. A
+/// size has no low reading, because no reclaim of mapped pages moves it. The `worker size` line
+/// that `scripts/performance.sh` prints before the case is read from the program that
 /// `cargo build --workspace` leaves, which is another build of the same sources: 35,101 KiB at
-/// commit 3ace455c69, 227 KiB less than this file. Its sections show where the workspace build
-/// grew, and not this file's; the `worker file` line prints the figure the alarm reads. See
+/// commit 3ace455c69, 227 KiB less than this file then. Its sections show where the workspace
+/// build grew, and not this file's; the `worker file` line prints the figure the alarm reads. See
 /// [`WORKER_SIZE_ALARM_STEP_KIB`].
-const WORKER_SIZE_RECORDED_KIB: u64 = 35_328;
+const WORKER_SIZE_RECORDED_KIB: u64 = 36_800;
 
 /// How far the worker program's size may rise above [`WORKER_SIZE_RECORDED_KIB`] before the idle
 /// measurement fails, so that a ruling is asked for. The step is 512 KiB, more than twice the 236
