@@ -297,7 +297,7 @@ unicode-normalization = "=0.1.25"
 # Where a text can be cut without cutting a character a person sees: the end of a generated
 # activity line that ran out of room.
 unicode-segmentation = "=1.13.3"
-url = "=2.5.8"
+url = "=2.5.9"
 # The one outbound HTTP request this product makes from a client: an image a person explicitly
 # imported. Blocking, rustls-backed and used with an explicit response-size limit.
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "_ring"] }
