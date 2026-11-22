@@ -36,6 +36,9 @@ pub enum LocalRole {
 }
 
 impl LocalRole {
+    /// Every role, in declaration order.
+    pub const ALL: &'static [Self] = &[Self::Controller, Self::Worker, Self::Rendezvous];
+
     /// Returns the stable wire string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

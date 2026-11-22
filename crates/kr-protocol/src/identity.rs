@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actor::ActorIngress;
 use crate::envelope::ControlFrame;
-use crate::error::ProtocolError;
+use crate::error::{ErrorCode, ProtocolError};
 use crate::hello::{ActionWindow, ProtocolVersion};
 use crate::hostinfo::export::Sentence;
 use crate::ids::{BuildId, ConnectionId, DesktopSessionId, EnvironmentId, SessionId};
@@ -896,14 +896,14 @@ impl EnvironmentRefreshResult {
 const CONNECTION_PROGRAMS: [&str; 4] = ["podman", "ssh", "wsl.exe", "the helper program"];
 
 /// What the host says when opening a bridge was refused, each as the words it is composed of and
-/// its placeholders: `{program}`, `{n}` for a number, `{id}` for an environment identifier,
-/// `{word}` for a closed word (an error code, a role, an access class or an ingress), and
-/// `{message}` and `{name}` for a value that arrived, as its class and length.
+/// its placeholders: `{program}`, `{n}` for a number, `{id}` for an environment identifier, a
+/// closed word of its own set (`{code}` for an error code, `{role}`, `{access}` and `{ingress}`),
+/// and `{message}` and `{name}` for a value that arrived, as its class and length.
 const REFUSAL_FORMS: &[&str] = &[
     "a process bridge carries locally authenticated invocations only, and this request arrived as \
-     {word}; reach that environment through its own paired endpoint",
+     {ingress}; reach that environment through its own paired endpoint",
     "a request crosses at most one process bridge",
-    "{word} is not reached by a process bridge; an SSH user runs the command line on the \
+    "{access} is not reached by a process bridge; an SSH user runs the command line on the \
      destination host and a paired host is reached through its own endpoint",
     "{program} could not be started: {message}",
     "{program} ended with exit code {n} before the environment answered",
@@ -921,13 +921,13 @@ const REFUSAL_FORMS: &[&str] = &[
     "{program} ran, and the environment answered the read with something that is not an answer",
     "{program} ran, and the environment that answered speaks protocol major {n}, and this host \
      speaks {n}",
-    "{program} ran, and the environment that answered is the {word}, where the opening asked for \
-     the {word}",
+    "{program} ran, and the environment that answered is the {role}, where the opening asked for \
+     the {role}",
     "{program} ran, and the environment that answered is environment {id}, and the enrolment names \
      environment {id}; enrol the environment that is installed there rather than reusing this \
      record",
-    "{program} ran, and the environment refused the bridge: {word} ({message})",
-    "{program} ran, and the environment answered the read with an error: {word} ({message})",
+    "{program} ran, and the environment refused the bridge: {code} ({message})",
+    "{program} ran, and the environment answered the read with an error: {code} ({message})",
     "that session is closed",
     "{program} said nothing for {n} seconds, so it was ended",
     "{program} ran, and the helper that answered ran as {name}, not as the user {name} the \
@@ -949,7 +949,7 @@ const REFUSAL_FORMS: &[&str] = &[
 
 /// What else the host says about opening a bridge, in the same notation as [`REFUSAL_FORMS`].
 const OTHER_FORMS: &[&str] = &[
-    "{word} is not reached by a process bridge, so none was opened",
+    "{access} is not reached by a process bridge, so none was opened",
     "no bridge was opened, because this environment is not running; refresh with --start to start \
      it",
     "no bridge was opened, because {message}",
@@ -1026,12 +1026,34 @@ fn take_placeholder<'a>(placeholder: &str, text: &'a str) -> Option<&'a str> {
             .iter()
             .find_map(|program| text.strip_prefix(program)),
         "n" => run(|c| c.is_ascii_digit()),
-        "word" => run(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "code" => take_word(text, |word| ErrorCode::from_wire(word).is_some()),
+        "role" => take_word(text, |word| {
+            LocalRole::ALL.iter().any(|role| role.as_str() == word)
+        }),
+        "access" => take_word(text, |word| {
+            EnvironmentAccess::ALL
+                .iter()
+                .any(|access| access.as_str() == word)
+        }),
+        "ingress" => take_word(text, |word| {
+            ActorIngress::ALL
+                .iter()
+                .any(|ingress| ingress.as_str() == word)
+        }),
         "id" => take_identifier(text),
         "message" => take_withheld("message", text),
         "name" => take_withheld("name", text),
         _ => None,
     }
+}
+
+/// Takes the run of letters, digits and underscores at the front of `text` when `closed` says it
+/// is a word of the set the slot takes. Any other run is not one, whatever it looks like.
+fn take_word(text: &str, closed: impl Fn(&str) -> bool) -> Option<&str> {
+    let end = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(text.len());
+    closed(&text[..end]).then(|| &text[end..])
 }
 
 /// Takes an environment identifier, thirty-six characters in groups of 8, 4, 4, 4 and 12
@@ -1097,6 +1119,154 @@ mod tests {
         ] {
             assert!(!is_composed_connection(raw), "{raw}");
         }
+    }
+
+    /// KR-REQ-18.11: each word slot of a connection sentence takes the words of its own closed
+    /// set and no other, so a sentence the host did not compose cannot carry a word of someone
+    /// else's through the slot.
+    #[test]
+    fn each_word_slot_of_a_connection_takes_only_the_words_of_its_own_set() {
+        let ingress_sentence = |word: &str| {
+            format!(
+                "a process bridge carries locally authenticated invocations only, and this \
+                 request arrived as {word}; reach that environment through its own paired endpoint"
+            )
+        };
+        let access_sentence = |word: &str| {
+            format!(
+                "{word} is not reached by a process bridge; an SSH user runs the command line on \
+                 the destination host and a paired host is reached through its own endpoint"
+            )
+        };
+        let access_other =
+            |word: &str| format!("{word} is not reached by a process bridge, so none was opened");
+        let role_sentence = |answered: &str, expected: &str| {
+            format!(
+                "podman ran, and the environment that answered is the {answered}, where the \
+                 opening asked for the {expected}"
+            )
+        };
+        let opening_refused = |word: &str| {
+            format!(
+                "podman ran, and the environment refused the bridge: {word} ([message withheld, 41 bytes])"
+            )
+        };
+        let read_refused = |word: &str| {
+            format!(
+                "podman ran, and the environment answered the read with an error: {word} ([message withheld, 41 bytes])"
+            )
+        };
+
+        // Every word of each set is accepted in its own slot.
+        for ingress in ActorIngress::ALL {
+            let text = ingress_sentence(ingress.as_str());
+            assert!(is_composed_connection(&text), "{text}");
+        }
+        for access in EnvironmentAccess::ALL {
+            for text in [
+                access_sentence(access.as_str()),
+                access_other(access.as_str()),
+            ] {
+                assert!(is_composed_connection(&text), "{text}");
+            }
+        }
+        for answered in LocalRole::ALL {
+            for expected in LocalRole::ALL {
+                let text = role_sentence(answered.as_str(), expected.as_str());
+                assert!(is_composed_connection(&text), "{text}");
+            }
+        }
+        for code in ErrorCode::ALL {
+            for text in [opening_refused(code.as_str()), read_refused(code.as_str())] {
+                assert!(is_composed_connection(&text), "{text}");
+            }
+        }
+
+        // A word that is in no set is refused in every slot: the first two are the shapes of a
+        // word that arrived (a name, a token) and the third is one that merely looks like a code.
+        for unknown in [
+            "kr_test_private_text",
+            "hunter2",
+            "PERMISSION_DENIED_FOR_KALA",
+        ] {
+            for text in [
+                ingress_sentence(unknown),
+                access_sentence(unknown),
+                access_other(unknown),
+                role_sentence(unknown, "controller"),
+                role_sentence("worker", unknown),
+                opening_refused(unknown),
+                read_refused(unknown),
+            ] {
+                assert!(!is_composed_connection(&text), "{text}");
+            }
+        }
+
+        // A word of another set is refused as well: each of these is a word of the host, in the
+        // wrong place.
+        for text in [
+            ingress_sentence("controller"),
+            ingress_sentence("container"),
+            ingress_sentence("PERMISSION_DENIED"),
+            access_sentence("local_ipc"),
+            access_other("worker"),
+            access_other("PERMISSION_DENIED"),
+            role_sentence("local_ipc", "controller"),
+            role_sentence("worker", "container"),
+            role_sentence("PERMISSION_DENIED", "worker"),
+            opening_refused("worker"),
+            opening_refused("local_ipc"),
+            read_refused("container"),
+            read_refused("permission_denied"),
+        ] {
+            assert!(!is_composed_connection(&text), "{text}");
+        }
+    }
+
+    /// The reasons an enrolment can fail for, each named once. The match has no arm for anything
+    /// else, so a reason added to [`EnrolmentError`] does not compile here until it is named in
+    /// the list the macro is given.
+    macro_rules! every_enrolment_error {
+        ($($variant:ident),+ $(,)?) => {{
+            #[allow(dead_code)]
+            fn exhaustive(error: EnrolmentError) {
+                match error {
+                    $(EnrolmentError::$variant => {})+
+                }
+            }
+            [$(EnrolmentError::$variant),+]
+        }};
+    }
+
+    /// KR-REQ-18.11: the recogniser accepts a reason only when it is in [`EnrolmentError::ALL`],
+    /// so a reason missing from the list would be one the host composes and the command line
+    /// withholds. This fails for a reason that is not in it.
+    #[test]
+    fn every_reason_an_enrolment_can_fail_for_is_in_the_list_the_recogniser_reads() {
+        let declared = every_enrolment_error!(
+            ClipboardDestinationUnknown,
+            EmptyLabel,
+            EmptyTarget,
+            EmptyUser,
+            HelperPathNotAbsolute,
+            ContainerTargetNotIdentifier,
+            SshTargetNotPlain,
+            SshUserNotPlain,
+            SshHelperPathNotPlain,
+        );
+        for error in declared {
+            assert!(
+                EnrolmentError::ALL.contains(&error),
+                "{error:?} is not in EnrolmentError::ALL"
+            );
+            let text = format!("no helper was started, because {}", error.describe());
+            assert!(is_composed_connection(&text), "{text}");
+        }
+        assert_eq!(
+            EnrolmentError::ALL.len(),
+            declared.len(),
+            "EnrolmentError::ALL names a reason twice or one that is not declared"
+        );
     }
 
     #[test]
