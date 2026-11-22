@@ -33,6 +33,13 @@
 //! port the stand-in listens on, and `KR_PUSH_TOKEN` the registration token the phone presents.
 //! `KR_HARNESS_SECONDS` bounds the whole run. It is for the machines a simulator or an emulator runs
 //! on, which are Unix.
+//!
+//! `KR_PUSH_ANDROID_STATES=1`, which only the Android script sets, adds two phases after the one in
+//! which the host answers first: a question asked while the emulator is in deep Doze, a question
+//! that runs out of time between the person's choice and the person's answer, and a question whose
+//! notification the person taps only after it has run out of time. The script
+//! does what each asks of the phone through the steps `doze-on`, `doze-read`, `doze-off`,
+//! `doze-tap`, `expire`, `expire-observe` and `expire-tap`.
 
 #![cfg(unix)]
 
@@ -75,6 +82,17 @@ const DELIVERY_WAIT: Duration = Duration::from_secs(90);
 
 /// How long a delivery that has to be renewed first is given to reach the stand-in.
 const RENEWAL_WAIT: Duration = Duration::from_secs(150);
+
+/// How long the question of the expiry phase lives. The person's choice is made inside it, and the
+/// phase then waits for what is left of it.
+const EXPIRING_QUESTION: Duration = Duration::from_secs(120);
+
+/// How long the question of the second expiry case lives: it is not touched before it ends.
+const UNTOUCHED_QUESTION: Duration = Duration::from_secs(60);
+
+/// How long after a question's deadline the phone is given before its screen is read: more than the
+/// page's own re-read of the list, so that the page has drawn the question as ended.
+const EXPIRY_MARGIN: Duration = Duration::from_secs(5);
 
 /// A marker in the text of a question, which must never appear in what leaves the host.
 const MARKER: &str = "kr-marker-4f1c9a";
@@ -229,6 +247,26 @@ async fn until(within: Duration, mut holds: impl FnMut() -> bool) -> bool {
 /// Whether a message the stand-in recorded is a delivery to `token`, and not a challenge.
 fn is_delivery(sent: &push_support::Sent, token: &str) -> bool {
     sent.token == token && sent.body["message"]["data"]["notification_id"].is_string()
+}
+
+/// Waits for the delivery to `token` that the stand-in records after its first `before` messages,
+/// and returns its body.
+async fn delivery_after(fcm: &Fcm, token: &str, before: usize, within: Duration) -> Option<Value> {
+    let arrived = until(within, || {
+        fcm.sent()
+            .iter()
+            .skip(before)
+            .any(|sent| is_delivery(sent, token))
+    })
+    .await;
+    if !arrived {
+        return None;
+    }
+    fcm.sent()
+        .into_iter()
+        .skip(before)
+        .find(|sent| is_delivery(sent, token))
+        .map(|sent| sent.body)
 }
 
 /// Whether a message the stand-in recorded is a challenge to `token`.
@@ -789,6 +827,208 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
                     })
             ),
         );
+    }
+
+    // ---- The phone in Doze, and an action past its expiry (KR-ACC-013) -----------------------
+    // The Android script alone asks for these. The first question is asked while the phone is in deep
+    // Doze: the gateway's request is read as the stand-in recorded it, the delivery is put on the
+    // phone, and the notification it posted is answered once the phone is out of Doze. The second
+    // question is chosen on the phone, runs out of time before it is sent, and the phone is read
+    // after the deadline. The third is not touched until it has run out of time, and is then tapped.
+    if std::env::var("KR_PUSH_ANDROID_STATES").is_ok_and(|value| value == "1") {
+        let quiet = settled(
+            &host,
+            &worker,
+            &asked_questions,
+            DELIVERY_WAIT.min(run.left()),
+        )
+        .await;
+        report.insert("states_started_quiet".to_owned(), json!(quiet));
+
+        run.ask_step("doze-on");
+        let entered = run.step_done("doze-on", SCREEN_STEP_WAIT).await;
+        report.insert("doze_on_step".to_owned(), json!(entered));
+        let before = fcm.sent().len();
+        let dozing = worker.ask_with_context("doze-1", "asked while the phone is in deep Doze");
+        asked_questions.push(dozing.clone());
+        let body = delivery_after(&fcm, &token, before, DELIVERY_WAIT.min(run.left())).await;
+        report.insert("doze_delivered".to_owned(), json!(body.is_some()));
+        if let Some(body) = body {
+            let android = &body["message"]["android"];
+            report.insert(
+                "doze_request".to_owned(),
+                json!({
+                    "priority": android["priority"],
+                    "ttl": android["ttl"],
+                    "collapse_key": android["collapse_key"].is_string(),
+                    "data_only": android["notification"].is_null()
+                        && body["message"]["data"]["alert"].is_string(),
+                }),
+            );
+            n += 1;
+            report.insert("doze_message_number".to_owned(), json!(n));
+            report.insert(
+                "doze_put_on_the_phone".to_owned(),
+                json!(
+                    run.inject(n, "delivery", "a question asked in Doze", &body)
+                        .await
+                ),
+            );
+            report.insert(
+                "doze_shown".to_owned(),
+                json!(run.appears(&format!("shown-{n}"), INJECTION_WAIT).await),
+            );
+            run.ask_step("doze-read");
+            let read = run.step_done("doze-read", SCREEN_STEP_WAIT).await;
+            report.insert("doze_read_step".to_owned(), json!(read));
+            run.ask_step("doze-off");
+            let left = run.step_done("doze-off", SCREEN_STEP_WAIT).await;
+            report.insert("doze_off_step".to_owned(), json!(left));
+            run.ask_step("doze-tap");
+            let tapped = run.step_done("doze-tap", SCREEN_STEP_WAIT).await;
+            report.insert("doze_tap_step".to_owned(), json!(tapped));
+            let answered = until(DELIVERY_WAIT.min(run.left()), || {
+                worker.held(&dozing).state == kr_protocol::question::QuestionState::Answered
+            })
+            .await;
+            let record = worker.held(&dozing).answer.0;
+            report.insert("doze_answered".to_owned(), json!(answered));
+            report.insert(
+                "doze_answer_is_yes_and_the_paired_devices".to_owned(),
+                json!(record.as_ref().is_some_and(|record| {
+                    record.answer
+                        == kr_protocol::question::QuestionAnswer::Decision { decided: true }
+                        && record.device_id.0 == Some(device_id)
+                })),
+            );
+        } else {
+            // The phone is left as it was found.
+            run.ask_step("doze-off");
+            run.step_done("doze-off", SCREEN_STEP_WAIT).await;
+        }
+
+        let quiet = settled(
+            &host,
+            &worker,
+            &asked_questions,
+            DELIVERY_WAIT.min(run.left()),
+        )
+        .await;
+        report.insert("expiry_started_quiet".to_owned(), json!(quiet));
+        let before = fcm.sent().len();
+        let expiring = worker.ask_expiring(
+            "expiring-1",
+            "this one runs out before it is answered",
+            EXPIRING_QUESTION,
+        );
+        asked_questions.push(expiring.clone());
+        report.insert(
+            "expiring_lives_ms".to_owned(),
+            json!(expiring.expires_at_ms.get() - expiring.created_at_ms.get()),
+        );
+        let body = delivery_after(&fcm, &token, before, DELIVERY_WAIT.min(run.left())).await;
+        report.insert("expiring_delivered".to_owned(), json!(body.is_some()));
+        if let Some(body) = body {
+            n += 1;
+            report.insert(
+                "expiring_put_on_the_phone".to_owned(),
+                json!(
+                    run.inject(n, "delivery", "a question that runs out of time", &body)
+                        .await
+                ),
+            );
+            report.insert(
+                "expiring_shown".to_owned(),
+                json!(run.appears(&format!("shown-{n}"), INJECTION_WAIT).await),
+            );
+            run.ask_step("expire");
+            let chosen = run.step_done("expire", SCREEN_STEP_WAIT).await;
+            report.insert("expire_step".to_owned(), json!(chosen));
+            let left_ms = i64::try_from(expiring.expires_at_ms.get()).unwrap_or(i64::MAX)
+                - i64::try_from(kr_ipc::now_ms().get()).unwrap_or(0);
+            report.insert("expire_chosen_with_ms_left".to_owned(), json!(left_ms));
+            report.insert(
+                "expiring_still_waiting_when_chosen".to_owned(),
+                json!(
+                    worker.held(&expiring).state == kr_protocol::question::QuestionState::Pending
+                ),
+            );
+            // The deadline, and a margin larger than the page's re-read of its list.
+            let wait = Duration::from_millis(u64::try_from(left_ms.max(0)).unwrap_or(0));
+            tokio::time::sleep(wait + EXPIRY_MARGIN).await;
+            let ended = worker.held(&expiring);
+            report.insert(
+                "expiring_expired_without_an_answer".to_owned(),
+                json!(
+                    ended.state == kr_protocol::question::QuestionState::Expired
+                        && ended.answer.0.is_none()
+                ),
+            );
+            run.ask_step("expire-observe");
+            let observed = run.step_done("expire-observe", SCREEN_STEP_WAIT).await;
+            report.insert("expire_observe_step".to_owned(), json!(observed));
+        }
+
+        // A notification the person has not touched, tapped after its question has run out: a tap
+        // removes a notification, so the one the person tapped above cannot be tapped again.
+        let quiet = settled(
+            &host,
+            &worker,
+            &asked_questions,
+            DELIVERY_WAIT.min(run.left()),
+        )
+        .await;
+        report.insert("untouched_started_quiet".to_owned(), json!(quiet));
+        let before = fcm.sent().len();
+        let untouched = worker.ask_expiring(
+            "expiring-2",
+            "this one is not touched before it runs out",
+            UNTOUCHED_QUESTION,
+        );
+        asked_questions.push(untouched.clone());
+        let body = delivery_after(&fcm, &token, before, DELIVERY_WAIT.min(run.left())).await;
+        report.insert("untouched_delivered".to_owned(), json!(body.is_some()));
+        if let Some(body) = body {
+            n += 1;
+            report.insert(
+                "untouched_put_on_the_phone".to_owned(),
+                json!(
+                    run.inject(
+                        n,
+                        "delivery",
+                        "a second question that runs out of time",
+                        &body
+                    )
+                    .await
+                ),
+            );
+            report.insert(
+                "untouched_shown".to_owned(),
+                json!(run.appears(&format!("shown-{n}"), INJECTION_WAIT).await),
+            );
+            let left_ms = i64::try_from(untouched.expires_at_ms.get()).unwrap_or(i64::MAX)
+                - i64::try_from(kr_ipc::now_ms().get()).unwrap_or(0);
+            report.insert("untouched_shown_with_ms_left".to_owned(), json!(left_ms));
+            let wait = Duration::from_millis(u64::try_from(left_ms.max(0)).unwrap_or(0));
+            tokio::time::sleep(wait + EXPIRY_MARGIN).await;
+            report.insert(
+                "untouched_expired_without_an_answer".to_owned(),
+                json!(
+                    worker.held(&untouched).state == kr_protocol::question::QuestionState::Expired
+                        && worker.held(&untouched).answer.0.is_none()
+                ),
+            );
+            run.ask_step("expire-tap");
+            let tapped = run.step_done("expire-tap", SCREEN_STEP_WAIT).await;
+            report.insert("expire_tap_step".to_owned(), json!(tapped));
+            report.insert(
+                "untouched_still_expired_without_an_answer".to_owned(),
+                json!(
+                    worker.held(&untouched).state == kr_protocol::question::QuestionState::Expired
+                        && worker.held(&untouched).answer.0.is_none()
+                ),
+            );
+        }
     }
 
     // ---- Renewal with the phone away (16.09) ------------------------------------------------

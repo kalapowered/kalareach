@@ -33,7 +33,7 @@ use kr_protocol::ids::{
 use kr_protocol::method::Method;
 use kr_protocol::question::{Question, QuestionCreateParams, QuestionKind};
 use kr_protocol::root::PromptGeneration;
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
+use kr_protocol::scalars::{Digest256, DurationMs, Nullable, TimestampMs, Uuid};
 use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, SessionState, ShellMode};
 use kr_protocol::worker::WorkerDescriptor;
 use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
@@ -712,13 +712,20 @@ impl Worker {
 
     /// As [`Self::ask`], for a question that comes with `context` to decide it by.
     pub fn ask_with_context(&self, request: &str, context: &str) -> Question {
-        self.ask_from(request, context, "/bin/agent", "an agent", None)
+        self.ask_from(request, context, "/bin/agent", "an agent", None, None)
     }
 
     /// As [`Self::ask`], for a question asked by the program at `executable`, which gives itself
     /// the name `label`: the worker verifies the program, and nothing verifies the name.
     pub fn ask_as(&self, request: &str, executable: &str, label: &str) -> Question {
-        self.ask_from(request, "the release is tagged", executable, label, None)
+        self.ask_from(
+            request,
+            "the release is tagged",
+            executable,
+            label,
+            None,
+            None,
+        )
     }
 
     /// As [`Self::ask`], for a question the ledger records as created at `utc_ms`.
@@ -729,6 +736,26 @@ impl Worker {
             "/bin/agent",
             "an agent",
             Some(utc_ms),
+            None,
+        )
+    }
+
+    /// As [`Self::ask_with_context`], for a question that asks to expire `expiry` after it is
+    /// created, which is the expiry the question's own parameter allows (at most a day).
+    pub fn ask_expiring(
+        &self,
+        request: &str,
+        context: &str,
+        expiry: std::time::Duration,
+    ) -> Question {
+        let expiry = DurationMs::new(u64::try_from(expiry.as_millis()).expect("a short expiry"));
+        self.ask_from(
+            request,
+            context,
+            "/bin/agent",
+            "an agent",
+            None,
+            Some(expiry),
         )
     }
 
@@ -739,6 +766,7 @@ impl Worker {
         executable: &str,
         label: &str,
         utc_ms: Option<u64>,
+        expiry: Option<DurationMs>,
     ) -> Question {
         self.service
             .questions()
@@ -760,7 +788,7 @@ impl Worker {
                     question: format!("Publish the release ({request})?"),
                     kind: QuestionKind::Confirm,
                     choices: Vec::new(),
-                    requested_expiry_ms: Nullable::null(),
+                    requested_expiry_ms: expiry.map_or_else(Nullable::null, Nullable::some),
                     wait_ms: Nullable::null(),
                 },
                 kr_worker::questions::Now {
