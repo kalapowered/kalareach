@@ -463,6 +463,7 @@ fn end_an_exited_host(interruption: Interruption, at: u32) -> (std::thread::Resu
     let ending = plugin_world::HostEnding {
         services,
         environment: tree.environment(),
+        root: tree.root().to_path_buf(),
         supervisor: None,
     };
     let asked = std::rc::Rc::new(std::cell::Cell::new(0_u32));

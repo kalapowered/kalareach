@@ -1163,7 +1163,16 @@ const JOB_LABEL_PATTERNS: [&str; 2] = ["kr-worker-*.service", "kr-plugin-host-*.
 /// afterwards or that could not be established as gone.
 #[cfg(target_os = "linux")]
 fn remove_jobs(tree: &TempHost) -> Vec<String> {
-    remove_units_through(tree, std::path::Path::new("systemctl"), MANAGER_HUNG_AFTER)
+    remove_units_under(tree.root())
+}
+
+/// [`remove_jobs`] for a tree named by its root, for a harness that holds the root and not the
+/// tree: stops each unit of the user's service manager that runs inside `root`, however its start
+/// was recorded, and returns each unit that is still loaded afterwards or that could not be
+/// established as gone.
+#[cfg(target_os = "linux")]
+pub fn remove_units_under(root: &std::path::Path) -> Vec<String> {
+    remove_units_through(root, std::path::Path::new("systemctl"), MANAGER_HUNG_AFTER)
 }
 
 /// How long the user manager is given to answer a question about its units, however often it is
@@ -1239,7 +1248,7 @@ fn asked_until(
 /// loaded when `give_up_after` has passed is left.
 #[cfg(target_os = "linux")]
 pub fn remove_units_through(
-    tree: &TempHost,
+    root: &std::path::Path,
     systemctl: &std::path::Path,
     give_up_after: Duration,
 ) -> Vec<String> {
@@ -1248,7 +1257,7 @@ pub fn remove_units_through(
     };
     remove_units_in(
         std::path::Path::new(&runtime),
-        tree,
+        root,
         systemctl,
         give_up_after,
     )
@@ -1259,7 +1268,7 @@ pub fn remove_units_through(
 #[cfg(target_os = "linux")]
 pub fn remove_units_in(
     runtime: &std::path::Path,
-    tree: &TempHost,
+    root: &std::path::Path,
     systemctl: &std::path::Path,
     give_up_after: Duration,
 ) -> Vec<String> {
@@ -1299,13 +1308,10 @@ pub fn remove_units_in(
     let asking_until = Instant::now() + give_up_after;
     // The tree as it was named and as the kernel resolves it, since a daemon may hand a unit
     // either spelling.
-    let roots: Vec<std::path::PathBuf> = [
-        Some(tree.root().to_path_buf()),
-        tree.root().canonicalize().ok(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let roots: Vec<std::path::PathBuf> = [Some(root.to_path_buf()), root.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+        .collect();
     let inside_the_tree = |directory: &str| {
         !directory.is_empty()
             && roots

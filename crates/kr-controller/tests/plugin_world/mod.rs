@@ -17,6 +17,8 @@
 pub mod acting;
 mod ended;
 pub mod observing;
+#[path = "../teardown/mod.rs"]
+mod teardown;
 
 use std::path::{Path, PathBuf};
 
@@ -364,9 +366,15 @@ pub async fn until_the_work_stops<T>(mut look: impl FnMut() -> (Option<T>, usize
 /// daemon's watch, which looks once a second and gives up when the job's definition is gone; the
 /// definition is in the tree, and a tree that goes first leaves the job loaded on the machine for
 /// good. So each job is removed here, and a job that is still there fails the test.
+///
+/// On Linux a host is a unit of the user's service manager that runs on after its test when the
+/// record never held it: a start that was not recorded, or was recorded after the world closed. So
+/// each unit that runs inside the tree is stopped by its name as well, whatever the record holds.
 pub struct HostEnding {
     pub services: Services,
     pub environment: EnvironmentPaths,
+    /// The tree's root: the units of the user's service manager that run inside it are stopped.
+    pub root: PathBuf,
     /// The supervisor that started them, which starts nothing more once the hosts are being
     /// ended, where there is one.
     pub supervisor: Option<Arc<Supervisor>>,
@@ -415,13 +423,18 @@ impl HostEnding {
             };
             left.extend(gone);
         }
-        if left.is_empty() && running.is_empty() && unrecorded == 0 {
+        #[cfg(target_os = "linux")]
+        let units = teardown::remove_units_under(&self.root);
+        #[cfg(not(target_os = "linux"))]
+        let units: Vec<String> = Vec::new();
+        if left.is_empty() && running.is_empty() && unrecorded == 0 && units.is_empty() {
             return Ok(());
         }
         Err(format!(
             "this test left plugin hosts that were not seen to end ({running:?}), jobs registered \
-             with the service manager ({left:?}), or {unrecorded} starts of a host that were still \
-             under way {starts_recorded_within:?} after the world was closed to new ones"
+             with the service manager ({left:?}), units of the user's service manager that could \
+             not be stopped ({units:?}), or {unrecorded} starts of a host that were still under way \
+             {starts_recorded_within:?} after the world was closed to new ones"
         ))
     }
 }
@@ -1144,6 +1157,7 @@ pub async fn hosted_running(
         _hosts: HostEnding {
             services,
             environment,
+            root: tree.root().to_path_buf(),
             supervisor: Some(Arc::clone(&supervisor)),
         },
         supervisor,

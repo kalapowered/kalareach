@@ -263,7 +263,7 @@ fn a_manager_that_does_not_answer_leaves_the_trees_units_not_established_as_gone
 
     // The system's own program that answers nothing and fails, in place of the manager's tool.
     let left = teardown::remove_units_through(
-        &tree,
+        tree.root(),
         std::path::Path::new("/bin/false"),
         std::time::Duration::from_secs(2),
     );
@@ -327,7 +327,8 @@ fn a_question_the_manager_fails_or_answers_late_is_asked_again_and_leaves_no_uni
          if [ ! -e \"$here/failed\" ]; then : > \"$here/failed\"; exit 1; fi; \
          sleep 15;; esac",
     );
-    let left = teardown::remove_units_through(&tree, &tool, std::time::Duration::from_secs(60));
+    let left =
+        teardown::remove_units_through(tree.root(), &tool, std::time::Duration::from_secs(60));
     assert!(
         left.is_empty(),
         "a failed or late answer was counted as a unit left behind: {left:?}"
@@ -358,7 +359,8 @@ fn a_unit_the_manager_goes_on_having_is_left_however_often_it_is_asked() {
          if [ ! -e \"$here/failed\" ]; then : > \"$here/failed\"; exit 1; fi; \
          echo loaded; exit 0;; esac",
     );
-    let left = teardown::remove_units_through(&tree, &tool, std::time::Duration::from_secs(3));
+    let left =
+        teardown::remove_units_through(tree.root(), &tool, std::time::Duration::from_secs(3));
     assert!(
         left.iter().any(|what| what.contains("is still loaded")),
         "a unit the manager still had was not counted as left: {left:?}"
@@ -503,7 +505,7 @@ exit 0
         tree: &kr_ipc::testing::TempHost,
         give_up_after: std::time::Duration,
     ) -> Vec<String> {
-        teardown::remove_units_in(&self.runtime, tree, &self.tool, give_up_after)
+        teardown::remove_units_in(&self.runtime, tree.root(), &self.tool, give_up_after)
     }
 }
 

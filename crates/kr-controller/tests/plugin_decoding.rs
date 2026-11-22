@@ -1100,6 +1100,7 @@ fn a_start_of_a_host_still_under_way_when_the_world_ends_is_reported() {
     let ending = plugin_world::HostEnding {
         services: Arc::clone(&supervisor.services),
         environment: tree.environment(),
+        root: tree.root().to_path_buf(),
         supervisor: Some(Arc::clone(&supervisor)),
     };
 
@@ -1113,4 +1114,91 @@ fn a_start_of_a_host_still_under_way_when_the_world_ends_is_reported() {
     ending
         .end(Duration::from_secs(5))
         .expect("a start that has been recorded is no reason to fail the world");
+}
+
+/// A plugin host the world's record does not hold is a unit of the user's service manager that
+/// runs on after the test, and the world's teardown stops it by its name when the case ends badly:
+/// the unit is gone once the case has panicked, and it was running before.
+///
+/// The unit runs in the tree, as a host's does, and the record is empty, which is what a start
+/// that was recorded too late or not at all leaves.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a user service manager for this account (`systemctl --user`), which a hosted CI \
+            runner's account does not have; it runs with --ignored on a Linux host whose account \
+            has one"]
+fn a_unit_the_record_does_not_hold_is_gone_when_the_world_ends_badly() {
+    use kr_controller::supervision::{
+        LaunchOutcome, ServiceLaunch, SystemdSupervisor, WorkerSupervisor as _,
+    };
+
+    /// Whether the user's service manager still has the unit `label`.
+    fn loaded(label: &str) -> bool {
+        let shown = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--value",
+                &format!("{label}.service"),
+            ])
+            .output()
+            .expect("systemctl runs");
+        assert!(
+            shown.status.success(),
+            "the user manager could not say whether it has {label}: {}",
+            String::from_utf8_lossy(&shown.stderr)
+        );
+        String::from_utf8_lossy(&shown.stdout).trim() != "not-found"
+    }
+
+    /// The unit this case made, stopped by its exact name when the case ends however it ends, so
+    /// that a failing assertion below leaves nothing of this case on the machine.
+    struct OwnUnit(String);
+    impl Drop for OwnUnit {
+        fn drop(&mut self) {
+            let unit = format!("{}.service", self.0);
+            for verb in ["stop", "reset-failed"] {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", verb, &unit])
+                    .output();
+            }
+        }
+    }
+
+    assert!(
+        SystemdSupervisor::available(),
+        "this account has no user service manager to ask, so this check cannot run here"
+    );
+    let tree = kr_ipc::testing::TempHost::create();
+    let label = format!("kr-plugin-host-{}", kr_ipc::new_uuid());
+    let _own = OwnUnit(label.clone());
+
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ending = plugin_world::HostEnding {
+            services: plugin_world::Services::default(),
+            environment: tree.environment(),
+            root: tree.root().to_path_buf(),
+            supervisor: None,
+        };
+        // The program is the system's own and runs for five minutes, which keeps its unit.
+        let outcome = SystemdSupervisor::new().start_service(&ServiceLaunch {
+            label: label.clone(),
+            program: "/bin/sleep".into(),
+            arguments: vec!["300".to_owned()],
+            jobs_directory: tree.environment().jobs_dir(),
+            working_directory: tree.root().to_path_buf(),
+        });
+        assert!(
+            !matches!(outcome, LaunchOutcome::NotStarted { .. }),
+            "the unit was started: {outcome:?}"
+        );
+        assert!(loaded(&label), "{label} runs before the world ends");
+        panic!("the case ends badly, with a unit running that the record does not hold");
+    }));
+    assert!(ended.is_err(), "the case ended badly");
+    assert!(
+        !loaded(&label),
+        "{label} is still loaded after the world it ran in ended"
+    );
 }
