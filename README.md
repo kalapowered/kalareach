@@ -75,8 +75,9 @@ control names a registered action, are checked by the host and by `kr-plugin-san
 
 Requirements for building the project:
 
-- the toolchain `rust-toolchain.toml` pins, which rustup installs on first use, with its
-  `wasm32-wasip2` target for the plugin runtime's test components;
+- the toolchain `rust-toolchain.toml` pins, which rustup installs on first use, with the
+  `wasm32-wasip2` target for the plugin runtime's test components and the `x86_64-pc-windows-gnu`
+  target for the retained surface test's Windows build;
 - Node 22.2.0 or newer and the version of pnpm specified in `package.json`
 - a C and a C++ compiler, CMake and libclang, which the description service's model runtime is
   built with, and Git and Python 3;
