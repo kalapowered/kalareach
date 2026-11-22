@@ -176,6 +176,23 @@ impl ImpersonationToken {
         )?))
     }
 
+    /// The impersonation token that a pipe's caller carries, as the handle that the pipe's server
+    /// opened with the right to query it. The token is the system's own copy of the caller's
+    /// effective token at identification level or above, so no copy is made of it here.
+    #[must_use]
+    pub fn of_caller(handle: Handle) -> ImpersonationToken {
+        ImpersonationToken(handle)
+    }
+
+    /// The account the token is of.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error when the token cannot be read.
+    pub fn user(&self) -> Result<super::ffi::Sid> {
+        token::user_of(&self.0)
+    }
+
     /// The handle, still owned by this value.
     #[must_use]
     pub fn raw(&self) -> HANDLE {
