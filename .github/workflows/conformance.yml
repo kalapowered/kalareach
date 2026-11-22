@@ -119,14 +119,10 @@ jobs:
 
       - name: Install the component target
         timeout-minutes: 3
-        run: rustup target add wasm32-wasip2
-
-      # The plan's rust group runs the workspace's tests, among them `kr-cli`'s retained_surface suite,
-      # which reads each release tree with the compiler for the host, for its tests and for
-      # x86_64-pc-windows-gnu, which a cross check needs the standard library of.
-      - name: Install the Windows check target
-        timeout-minutes: 3
-        run: rustup target add x86_64-pc-windows-gnu
+        # The plan's rust group runs the workspace's tests, among them `kr-cli`'s retained_surface suite,
+        # which also builds its fixture trees for x86_64-pc-windows-gnu, and a cross check needs the
+        # standard library of its target.
+        run: rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
 
       - name: Install pnpm
         timeout-minutes: 3
@@ -372,14 +368,10 @@ jobs:
 
       - name: Install the component target
         timeout-minutes: 3
-        run: rustup target add wasm32-wasip2
-
-      # The plan's rust group runs the workspace's tests, among them `kr-cli`'s retained_surface suite,
-      # which reads each release tree with the compiler for the host, for its tests and for
-      # x86_64-pc-windows-gnu, which a cross check needs the standard library of.
-      - name: Install the Windows check target
-        timeout-minutes: 3
-        run: rustup target add x86_64-pc-windows-gnu
+        # The plan's rust group runs the workspace's tests, among them `kr-cli`'s retained_surface suite,
+        # which also builds its fixture trees for x86_64-pc-windows-gnu, and a cross check needs the
+        # standard library of its target.
+        run: rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
 
       # The iOS unit tests of the phones group build the library that opens a sealed notification
       # preview for the simulator, in a build phase of the test scheme that runs cargo for this

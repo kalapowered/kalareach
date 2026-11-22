@@ -60,10 +60,13 @@ jobs:
           node-version: 22.23.1
           cache: pnpm
 
-      # rust-toolchain.toml pins the exact toolchain; the generators are built with it.
+      # rust-toolchain.toml pins the exact toolchain; the generators are built with it. The cut's check
+      # runs `kr-cli`'s retained_surface suite, which also builds its fixture trees for
+      # x86_64-pc-windows-gnu, and a cross check needs the standard library of its target.
       - name: Install the pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
+          rustup target add x86_64-pc-windows-gnu
           rustc --version
           cargo --version
 

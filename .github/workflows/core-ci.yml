@@ -184,15 +184,11 @@ jobs:
 
       # The test components are compiled to wasm32-wasip2 and are not committed: Rust embeds build
       # paths in a component's custom sections, so two machines produce different bytes for the same
-      # source and a committed artefact could not be checked.
+      # source and a committed artefact could not be checked. `kr-cli`'s retained_surface suite, which
+      # the workspace's test step runs, also builds its fixture trees for x86_64-pc-windows-gnu, and a
+      # cross check needs the standard library of its target.
       - name: Install the component target
-        run: rustup target add wasm32-wasip2
-
-      # `kr-cli`'s retained_surface suite reads each release tree with the compiler for the host, for
-      # its tests and for x86_64-pc-windows-gnu, which a cross check needs the standard library of, and
-      # the workspace's test step below runs it.
-      - name: Install the Windows check target
-        run: rustup target add x86_64-pc-windows-gnu
+        run: rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
 
       - name: Restore the cargo cache
         id: cargo-cache
@@ -3067,17 +3063,12 @@ jobs:
           cargo --version
 
       # The plugin runtime's test components, which KR_REQUIRE_PLUGIN_FIXTURES makes a failure to
-      # leave out rather than a skip.
+      # leave out rather than a skip. `kr-cli`'s retained_surface suite, which the test step runs, also
+      # builds its fixture trees for x86_64-pc-windows-gnu, and a cross check needs the standard library
+      # of its target.
       - name: Install the component target
         timeout-minutes: 5
-        run: rustup target add wasm32-wasip2
-
-      # `kr-cli`'s retained_surface suite reads each release tree with the compiler for the host, for
-      # its tests and for x86_64-pc-windows-gnu, which a cross check needs the standard library of, and
-      # the workspace's test step below runs it.
-      - name: Install the Windows check target
-        timeout-minutes: 5
-        run: rustup target add x86_64-pc-windows-gnu
+        run: rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
 
       # The worker's pseudo-terminal suite starts each shell section 3 names as a session's root
       # shell. The runner has Bash and Zsh; Fish is installed here, and the test step names all
