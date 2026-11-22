@@ -1080,6 +1080,70 @@ fn the_journal_makes_no_permit_and_writes_nothing_for_a_child_of_another_invocat
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_journal_makes_a_reader_permit_without_a_row_and_only_for_its_own_invocation_once_the_root_is_made()
+ {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: the fixture of this case needs the system's token");
+        return;
+    }
+    use kr_boundary_windows::filekey::FileKey;
+    use kr_boundary_windows::journal::rows::{RootName, Row};
+    let fixture = Fixture::new();
+    let mut job = Job::new(Limits::INVOCATION).unwrap();
+    let (child, _output) = fixture.start(&job, &["sleep", "600000"]);
+    let dir = fixture.dir.join("journal");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Another invocation's journal makes none.
+    let other = Journal::create(&dir, InvocationId([9; 16])).unwrap();
+    let refused = other.permit_for_reader(&child);
+    assert!(
+        matches!(refused, Err(JournalError::OtherChild)),
+        "{refused:?}"
+    );
+    // The child's own journal makes none before its root is made.
+    let path = dir.join(file_name(INVOCATION));
+    let mut own = Journal::create(&dir, INVOCATION).unwrap();
+    own.append(&Row::Begin {
+        invocation: hex::encode(INVOCATION.0),
+        boot_marker: "boot".to_owned(),
+        session_luid: 1,
+        group_sid: fixture.group.to_text().unwrap(),
+        client_sid: fixture.sid.to_text().unwrap(),
+        client_pid: 1,
+        client_creation_time: 1,
+        chain: Vec::new(),
+        tree_path: String::new(),
+    })
+    .unwrap();
+    let refused = own.permit_for_reader(&child);
+    assert!(
+        matches!(refused, Err(JournalError::Order(_))),
+        "{refused:?}"
+    );
+    let name = RootName::from_bytes([1; 16]);
+    own.append(&Row::RootIntent { name: name.clone() }).unwrap();
+    own.append(&Row::RootMade {
+        name,
+        key: FileKey::ntfs(1, 2),
+    })
+    .unwrap();
+    // Once it is made the journal makes the permit, and it writes nothing.
+    let length = std::fs::metadata(&path).unwrap().len();
+    let permit = own
+        .permit_for_reader(&child)
+        .expect("the child's own journal makes its reader permit");
+    assert_eq!(permit.invocation(), Some(INVOCATION));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        length,
+        "no row was written"
+    );
+    let running = child.resume(permit).expect("the permit resumes it");
+    job.end(&[&running], Instant::now() + Duration::from_secs(10));
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn a_suspended_child_that_was_not_seen_to_end_is_reported_to_the_jobs_owner() {
     if !runs_as_the_system() {
         eprintln!("skipped: the fixture of this case needs the system's token");

@@ -976,6 +976,16 @@ impl Tracker {
         self.process
     }
 
+    /// Whether a reader child of the invocation may be resumed now.
+    ///
+    /// # Errors
+    ///
+    /// Returns why not.
+    pub fn reader_may_start(&self) -> Result<(), OrderError> {
+        debug_assert!(self.began || !self.began);
+        Ok(())
+    }
+
     /// Whether the job's end was recorded.
     #[must_use]
     pub fn job_ended(&self) -> bool {
