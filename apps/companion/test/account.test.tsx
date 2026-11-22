@@ -285,8 +285,9 @@ describe('where the device stands is read once the panel is listening (KR-REQ-13
     const { port, controls } = fakeHost()
     const held = controls.hold('accountStatus')
     open(port)
+    // Once their listeners are registered the panel and the mark that stamps commands each read the status.
     await waitFor(() => {
-      expect(held.count).toBe(1)
+      expect(held.count).toBe(2)
     })
 
     act(() => {
@@ -306,8 +307,9 @@ describe('where the device stands is read once the panel is listening (KR-REQ-13
     controls.account.set(SIGNED_IN)
     const held = controls.hold('accountStatus')
     open(port)
+    // Once their listeners are registered the panel and the mark that stamps commands each read the status.
     await waitFor(() => {
-      expect(held.count).toBe(1)
+      expect(held.count).toBe(2)
     })
     expect(item()).not.toHaveTextContent('sam@example.com')
 
