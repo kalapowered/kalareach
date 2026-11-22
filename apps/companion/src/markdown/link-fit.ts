@@ -314,8 +314,18 @@ function held(value: number): number {
   return Math.floor(Math.max(0, value) * GRID) / GRID
 }
 
-/** A link's `style` attribute with the two properties of the room taken out, and the spaces. */
-const withoutRoom = (style: string | null): string => (style ?? '').replace(/--md-link-(?:left|right):[^;]*;?/g, '').replace(/\s+/g, '')
+/** A link's `style` attribute with the two properties of the room taken out, read as the browser reads declarations, so that a value keeps its own spaces. */
+let reader: HTMLElement | null = null
+const withoutRoom = (style: string | null): string => {
+  reader ??= document.createElement('span')
+  reader.setAttribute('style', style ?? '')
+  const kept: string[] = []
+  for (const name of Array.from(reader.style)) {
+    if (name === LEFT || name === RIGHT) continue
+    kept.push(`${name}:${reader.style.getPropertyValue(name)}${reader.style.getPropertyPriority(name)}`)
+  }
+  return kept.join(';')
+}
 
 /** What the page has given a link, read from its element. */
 function givenTo(link: HTMLElement): Beside {

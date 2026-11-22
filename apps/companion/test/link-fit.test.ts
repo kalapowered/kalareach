@@ -717,6 +717,34 @@ describe('the page’s keeping of the room', () => {
     stop()
   })
 
+  it('measures a message again when a link’s style changes in the spaces of a value, and not when only the spaces between its declarations change', async () => {
+    const { pane: root } = pane(1, (message) => {
+      link(message, 0, 10)
+      link(message, 30, 40)
+      link(message, 40, 380)
+    })
+    const stop = startLinkFit(root)
+    frame()
+    await mutations()
+    const first = root.querySelector<HTMLElement>('.md-link')
+    if (!first) throw new Error('the made page has no links')
+    first.style.setProperty('--note', '"A B"')
+    await mutations()
+    frame()
+    await mutations()
+    expect(frames.length, 'frames asked for after the note was measured').toBe(0)
+    const written = first.getAttribute('style') ?? ''
+    expect(written, 'the style holds the note beside the room').toContain('px; --note: "A B"')
+    // The browser writes declarations with a space after each `;`: the same declarations closer together are no change.
+    first.setAttribute('style', written.replace(/; /g, ';'))
+    await mutations()
+    expect(frames.length, 'frames asked for by the spaces between declarations').toBe(0)
+    first.setAttribute('style', (first.getAttribute('style') ?? '').replace('"A B"', '"AB"'))
+    await mutations()
+    expect(frames.length, 'one frame asked for by the spaces inside a value').toBe(1)
+    stop()
+  })
+
   it('stops: a change after it is made is not measured', async () => {
     const { pane: root } = pane(1, (message) => {
       link(message, 100, 110)
