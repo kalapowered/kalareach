@@ -18,8 +18,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, FILETIME, GENERIC_READ, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, FILETIME, GENERIC_READ,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DuplicateTokenEx, SecurityImpersonation,
@@ -1235,6 +1235,8 @@ fn a_child_that_hides_from_the_scan_changes_nothing_because_the_end_rests_on_the
     }
     let setting = Setting::new();
     let marker = setting.mark("hidden.txt");
+    // The client cancels only when this file says the checks on the hidden child are over.
+    let checked = setting.mark("hidden-checked.txt");
     let running = marker.display().to_string();
     let life = setting.life(&["hide", "120000", &running], 1);
     let seen = Arc::new(Mutex::new(0_u64));
@@ -1248,25 +1250,44 @@ fn a_child_that_hides_from_the_scan_changes_nothing_because_the_end_rests_on_the
     })));
     let tracker = std::thread::spawn({
         let marker = marker.clone();
+        let checked = checked.clone();
         move || {
-            // What the child says of itself, and whether the service's own token can open it.
+            // What the child says of itself, and whether a limited query on it is refused under the
+            // service's conditions: a token that holds no privilege, as the service's holds no
+            // debug privilege.
             let said = wait_for_file(&marker);
             let pid: u32 = said.split_whitespace().next().unwrap().parse().unwrap();
-            // SAFETY: opens a process by number for a limited query; the answer is read.
-            let opened = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-            let refused = opened.is_null();
-            if !refused {
-                drop(Handle::new(opened, "the hidden child").unwrap());
-            }
-            (said, refused)
+            let refusal = without_privileges(|| {
+                // SAFETY: opens a process by number for a limited query; the answer is read.
+                let opened = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+                if opened.is_null() {
+                    // SAFETY: reads the calling thread's last error.
+                    Some(unsafe { GetLastError() })
+                } else {
+                    drop(Handle::new(opened, "the hidden child").unwrap());
+                    None
+                }
+            });
+            // The child stays until this point: the client's cancel waits for the file.
+            note(
+                checked.parent().unwrap(),
+                checked.file_name().unwrap().to_str().unwrap(),
+                "checked",
+            );
+            (said, pid, refusal)
         }
     });
-    let replies = run_one(&life, How::Cancels, client_of(None), Some(&marker));
-    let (said, refused) = tracker.join().unwrap();
-    eprintln!("the child said {said:?}; a limited query on it was refused: {refused}");
-    assert!(
-        said.contains("hidden"),
-        "the child could not hide: {said:?}"
+    let replies = run_one(&life, How::Cancels, client_of(None), Some(&checked));
+    let (said, pid, refusal) = tracker.join().unwrap();
+    assert_eq!(
+        said.trim(),
+        format!("{pid} hidden"),
+        "the child did not hide, or said something else"
+    );
+    assert_eq!(
+        refusal,
+        Some(ERROR_ACCESS_DENIED),
+        "a limited query on the hidden child, under a token without privileges, is refused"
     );
     // The child is in the job: it ends with it, whether or not it could be looked at, and the
     // session is gone.
