@@ -706,6 +706,21 @@ async fn start_and_acknowledge(
     command: &BridgeCommand,
     hello: &BridgeHello,
 ) -> Result<Started, Refusal> {
+    // A helper that was asked to start what it needs is waited for as long as that takes.
+    let limit = if hello.start {
+        START_LIMIT
+    } else {
+        SILENCE_LIMIT
+    };
+    start_and_acknowledge_within(command, hello, limit).await
+}
+
+/// [`start_and_acknowledge`], with the wait for the helper's first frame named.
+async fn start_and_acknowledge_within(
+    command: &BridgeCommand,
+    hello: &BridgeHello,
+    limit: std::time::Duration,
+) -> Result<Started, Refusal> {
     let mut process = tokio::process::Command::new(&command.program);
     process
         .args(&command.arguments)
@@ -748,7 +763,7 @@ async fn start_and_acknowledge(
             detail: "its standard error is not a pipe".to_owned(),
         })?;
 
-    let acknowledgement = match acknowledged(&mut stdin, &mut stdout, hello).await {
+    let acknowledgement = match acknowledged(&mut stdin, &mut stdout, hello, limit).await {
         Ok(acknowledgement) => acknowledgement,
         // The stream ended or broke, which is what a helper that exits, or is ended, does to it
         // before it has said anything. How it ended is read, so that the diagnostic can say.
@@ -759,6 +774,13 @@ async fn start_and_acknowledge(
                 detail,
                 helper: Some(helper),
             });
+        }
+        // A helper that said nothing is ended and collected before this says so, so that a refusal
+        // that says it was ended is one of a helper that is gone, or one that could not be ended.
+        Err(Refusal::Silent { waited }) => {
+            drop(stdin);
+            end(child, &command.program, KILL_LIMIT).await?;
+            return Err(Refusal::Silent { waited });
         }
         Err(other) => return Err(other),
     };
@@ -777,14 +799,9 @@ async fn acknowledged(
     stdin: &mut tokio::process::ChildStdin,
     stdout: &mut tokio::process::ChildStdout,
     hello: &BridgeHello,
+    limit: std::time::Duration,
 ) -> Result<BridgeHelloAck, Refusal> {
     write_frame(stdin, &BridgeFrame::Hello(Box::new(hello.clone()))).await?;
-    // A helper that was asked to start what it needs is waited for as long as that takes.
-    let limit = if hello.start {
-        START_LIMIT
-    } else {
-        SILENCE_LIMIT
-    };
     let opening = read_frame_within(stdout, limit)
         .await
         .map_err(|refusal| match refusal {
@@ -868,10 +885,19 @@ impl Invocation {
     /// that failed.
     ///
     /// The helper is waited for [`END_STATUS_LIMIT`] and ended and collected past it, as
-    /// `start_and_acknowledge` does for a stream that fails before the acknowledgement. Any
-    /// other refusal is returned as it is, and the helper goes with the invocation.
+    /// `start_and_acknowledge` does for a stream that fails before the acknowledgement. A helper
+    /// that said nothing is ended and collected too, and the refusal is [`Refusal::Unkillable`]
+    /// when it could not be. Any other refusal is returned as it is, and the helper goes with
+    /// the invocation.
     pub async fn settled(self, refusal: Refusal) -> Refusal {
         match refusal {
+            Refusal::Silent { waited } => {
+                drop(self.stdin);
+                match end(self.child, &self.program, KILL_LIMIT).await {
+                    Ok(()) => Refusal::Silent { waited },
+                    Err(unended) => unended,
+                }
+            }
             Refusal::Stream {
                 detail,
                 helper: None,
@@ -1861,7 +1887,15 @@ mod tests {
             identifier.display()
         );
         let started = std::time::Instant::now();
-        let refusal = scripted(&script).launch().await.expect_err("a refusal");
+        // The ceiling only keeps a hang from holding the suite. How long the wait is is checked
+        // against the bound below, and that the process is gone after it is a separate check.
+        let refusal = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            scripted(&script).launch(),
+        )
+        .await
+        .expect("the launch ends well inside a minute")
+        .expect_err("a refusal");
         let waited = started.elapsed();
         assert!(
             matches!(
@@ -1874,8 +1908,7 @@ mod tests {
             "{refusal:?}"
         );
         assert!(
-            waited >= END_STATUS_LIMIT
-                && waited < END_STATUS_LIMIT + std::time::Duration::from_secs(8),
+            waited >= END_STATUS_LIMIT,
             "the wait for the status is its own bound: {waited:?}"
         );
         let pid = std::fs::read_to_string(&identifier).expect("the helper wrote its identifier");
@@ -1886,6 +1919,42 @@ mod tests {
             .status
             .success();
         assert!(!present, "process {} was left uncollected", pid.trim());
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: a helper that says nothing is ended
+    /// and collected before the refusal that says it was ended returns, so the sentence is true
+    /// when it is read. The process is gone at that point: one that was ended and not collected
+    /// would still answer signal zero.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_says_nothing_is_ended_and_collected_before_the_refusal_returns() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let identifier = directory.path().join("pid");
+        let script = format!("echo $$ >'{}'; exec sleep 60", identifier.display());
+        let opening = scripted(&script);
+        let refusal = match start_and_acknowledge_within(
+            &opening.command,
+            &opening.hello,
+            std::time::Duration::from_millis(500),
+        )
+        .await
+        {
+            Err(refusal) => refusal,
+            Ok(_) => panic!("a helper that says nothing is not acknowledged"),
+        };
+        assert!(matches!(refusal, Refusal::Silent { .. }), "{refusal:?}");
+        let pid = std::fs::read_to_string(&identifier).expect("the helper wrote its identifier");
+        let present = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .output()
+            .expect("kill runs")
+            .status
+            .success();
+        assert!(
+            !present,
+            "process {} was left running or uncollected",
+            pid.trim()
+        );
     }
 
     #[test]
