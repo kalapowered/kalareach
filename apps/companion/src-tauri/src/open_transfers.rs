@@ -1832,7 +1832,9 @@ impl Desk {
     }
 
     /// Acts on one entry a restart read, in its key's turn. The entry is read again under the turn:
-    /// a cancel or a cleanup that came since the restart read it has ended it or marked it.
+    /// a cancel or a cleanup that came since the restart read it has ended it or marked it. The
+    /// status answers for the transfer it was asked about and for no other: a key that holds
+    /// another transfer by now is left for the next reach.
     async fn act_on(
         self: &Arc<Self>,
         store: &Store,
@@ -1841,6 +1843,7 @@ impl Desk {
         status: Option<kr_client::Result<UploadStatusResult>>,
     ) {
         let key = file.key;
+        let asked = file.transfer_id;
         let turn = self.turn(key).await;
         // A pairing that is no longer the one in force acts on none of its entries: it finishes no
         // cancel, publishes nothing and removes nothing. The pairing in force removes them.
@@ -1864,6 +1867,12 @@ impl Desk {
             return;
         }
         let Some(status) = status else { return };
+        // The upload that took the key since the status was asked for is not the one the host
+        // described, and an answer about the first, an unknown transfer above all, removes
+        // nothing of it.
+        if file.transfer_id != asked {
+            return;
+        }
         match status {
             // The connection failed or a right is refused: the host may hold the upload, and the next
             // time it is reached asks again.

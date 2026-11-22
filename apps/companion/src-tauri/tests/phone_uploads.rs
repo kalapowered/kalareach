@@ -811,6 +811,69 @@ async fn kr_req_13_12_a_restart_drops_an_entry_the_host_does_not_know_and_its_co
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU2): a status reply answers for the transfer it was asked about. A restart reads
+/// the status of a transfer, the entry under its key is replaced by another upload's meanwhile, and
+/// the reply says the host knows nothing of the first transfer: the new record and its copy stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_an_old_status_reply_removes_nothing_of_the_upload_that_took_the_key() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let keep = |transfer: kr_protocol::ids::TransferId, bytes: &[u8]| {
+        testing::keep(
+            &folder(&phone),
+            key,
+            paired.environment_id,
+            paired.device_id,
+            None,
+            net_support::on_the_host(&adopted.host),
+            Some(transfer),
+            testing::Got::Begun,
+            32,
+            Held::new(bytes.to_vec()).digest(),
+            testing::Where::Copy,
+        );
+        testing::keep_copy(&folder(&phone), key, bytes);
+    };
+    let first = vec![1_u8; 32];
+    let second = vec![2_u8; 32];
+    keep(
+        kr_protocol::ids::TransferId::new(kr_ipc::new_uuid()),
+        &first,
+    );
+    control.hold_next_request(Method::UploadStatus);
+    let restarting = {
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.restart(paired).await })
+    };
+    control.until_request_held().await;
+    // The key's first record was removed and another upload took the key.
+    keep(
+        kr_protocol::ids::TransferId::new(kr_ipc::new_uuid()),
+        &second,
+    );
+    control.release_request();
+    tokio::time::timeout(WATCHDOG, restarting)
+        .await
+        .expect("the restart ends")
+        .expect("the task ran");
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        1,
+        "the reply for the first transfer left the new record"
+    );
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(second),
+        "and its copy"
+    );
+    adopted.stop().await;
+}
+
 // ---- the draft a device keeps on a paired host -------------------------------------------------
 
 /// The page's subject for a session.
