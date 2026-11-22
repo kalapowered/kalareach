@@ -808,4 +808,5 @@ token_read_back-1 | the token's owner is not the invocation's group | the token'
 token_read_back-2 | the token's account is not deny-only | the token's account is not deny-only | read: the token's user entry has no deny-only attribute or is enabled
 token_read_back-3 | the invocation's group is not among the token's groups | the invocation's group is not among the token's groups | read: no entry of the token's groups is the group
 listed | pub const | lifecycle.rs | 6 | names of rules, for cases and documents; no sentence for a person
+listed | pub fn | lifecycle.rs | 1 | the name of an object of the private root, a path and no sentence for a person
 listed | pub fn | win/lifecycle/recovery.rs | 1 | the reason that the journals cannot be read, in the words of the journal's own error
