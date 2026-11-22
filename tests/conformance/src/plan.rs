@@ -202,20 +202,21 @@ fn runs_the_workspace(step: &Step) -> bool {
     step.reading == Reading::Cargo && step.command.iter().any(|word| word == "--workspace")
 }
 
-/// How a plan's steps are cut into parts: which steps are cut by count and which of those open the
-/// plan, which stands alone, and how the rest are shared. [`part_of`] and [`budget_across_parts`]
-/// place the steps by it.
+/// How a plan's steps are cut into parts: which steps are cut and which of those open the plan, and
+/// how the rest are shared, by their time when each states a weight (`timed`) and otherwise by
+/// count, with the workspace's tests standing alone in part 1. [`part_of`] and
+/// [`budget_across_parts`] place the steps by it.
 struct Cut {
-    /// The steps cut by count, by index: every step but the set-up steps that another step names.
+    /// The steps that are cut, by index: every step but the set-up steps that another step names.
     steps: Vec<usize>,
     /// How many of them open the plan: the builds that every part runs.
     opening: usize,
-    /// The place among them of the workspace's tests, which stand alone in part 1 when the plan has
-    /// more than one part.
+    /// For a plan cut by count, the place among them of the workspace's tests, which stand alone in
+    /// part 1 when the plan has more than one part. None when the plan is cut by time.
     alone: Option<usize>,
-    /// How many parts the remaining steps are cut into.
+    /// For a plan cut by count, how many parts the remaining steps are cut into.
     shares: usize,
-    /// How many remaining steps there are.
+    /// For a plan cut by count, how many remaining steps there are.
     rest: usize,
     /// The part of each remaining step, in their order, when every one of them states a weight:
     /// the parts are then cut by time and no step stands alone. Otherwise none.
@@ -388,13 +389,14 @@ pub fn budget_across_parts(steps: &[Step], parts: usize) -> Option<String> {
 }
 
 /// The steps of one part of a platform's plan, for a plan that one job cannot hold and separate runs
-/// carry out in parts: the build steps that open the plan, which every part needs for the programs
-/// the suites start, and then the remaining steps, cut in order into parts of nearly equal count.
-/// A plan that holds the workspace's tests puts that step, with the opening builds, in part 1 by
-/// itself, and cuts the other steps into the remaining parts by count. `part` is the number of the
-/// part from 1 and the number of parts.
+/// carry out in parts: the build steps that open the plan, which every part runs, and then the
+/// remaining steps, cut in order into contiguous parts. When every one of them states a weight for
+/// the platform, the parts are of least longest time by those weights, and no step stands alone.
+/// Otherwise the parts are of nearly equal count, and a plan that holds the workspace's tests puts
+/// that step, with the opening builds, in part 1 by itself and cuts the other steps into the
+/// remaining parts. `part` is the number of the part from 1 and the number of parts.
 ///
-/// A set-up step that a step of the plan names in `after` is not cut by count: it goes, in its own
+/// A set-up step that a step of the plan names in `after` is not cut: it goes, in its own
 /// place, into every part that holds a step naming it, directly or through another set-up step, so
 /// a set-up step runs in each of those parts.
 #[must_use]
