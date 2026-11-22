@@ -650,6 +650,14 @@ impl Drop for Setting {
     }
 }
 
+/// Takes away the journals of the invocations so far, so that the rows a case reads next are the
+/// next invocation's.
+fn forget_journals(setting: &Setting) {
+    for entry in std::fs::read_dir(setting.scratch.path("journal")).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+}
+
 fn kinds(rows: &[Row]) -> Vec<String> {
     rows.iter().map(|row| format!("{:?}", row.kind())).collect()
 }
@@ -893,13 +901,30 @@ fn a_held_process_object_makes_the_end_uncertain_and_closing_it_clears_it_at_the
     });
 }
 
-/// Moves the system's clock and puts it back when it is dropped.
+/// Seconds from `from` to `to`, negative when `to` is earlier.
+fn seconds_between(from: std::time::SystemTime, to: std::time::SystemTime) -> i64 {
+    match to.duration_since(from) {
+        Ok(forward) => forward.as_secs() as i64,
+        Err(back) => -(back.duration().as_secs() as i64),
+    }
+}
+
+/// Moves the system's clock and puts it back when it is dropped: to the time it began at plus the
+/// time that has passed since, which a time service may already have corrected.
 struct Clock {
-    moved: i64,
+    began: std::time::SystemTime,
+    at: Instant,
 }
 
 impl Clock {
-    fn adjust(&mut self, seconds: i64) {
+    fn new() -> Clock {
+        Clock {
+            began: std::time::SystemTime::now(),
+            at: Instant::now(),
+        }
+    }
+
+    fn adjust(seconds: i64) {
         let status = std::process::Command::new("powershell")
             .args([
                 "-NoProfile",
@@ -909,16 +934,22 @@ impl Clock {
             .status()
             .unwrap();
         assert!(status.success(), "the clock was not moved: {status}");
-        self.moved += seconds;
+    }
+
+    /// Moves the clock by `seconds` and says how far it moved.
+    fn move_by(&self, seconds: i64) -> i64 {
+        let was = std::time::SystemTime::now();
+        Clock::adjust(seconds);
+        seconds_between(was, std::time::SystemTime::now())
     }
 }
 
 impl Drop for Clock {
     fn drop(&mut self) {
-        if self.moved != 0 {
-            let back = -self.moved;
-            self.moved = 0;
-            self.adjust(back);
+        let right = self.began + self.at.elapsed();
+        let off = seconds_between(std::time::SystemTime::now(), right);
+        if off.abs() > 2 {
+            Clock::adjust(off);
         }
     }
 }
@@ -979,19 +1010,12 @@ fn the_boot_marker_is_the_same_across_a_change_of_the_clock_and_a_journal_reads_
     };
     assert!(same_boot(&first.id));
     // The clock goes a day forward, and then two days back, past the time of the first row.
-    let before = std::time::SystemTime::now();
-    let mut clock = Clock { moved: 0 };
+    let clock = Clock::new();
     for seconds in [86_400, -172_800] {
-        clock.adjust(seconds);
-        let now = std::time::SystemTime::now();
-        let shown = match now.duration_since(before) {
-            Ok(forward) => forward.as_secs() as i64,
-            Err(back) => -(back.duration().as_secs() as i64),
-        };
+        let moved = clock.move_by(seconds);
         assert!(
-            (shown - clock.moved).abs() < 600,
-            "the clock moved {shown} s, not {} s",
-            clock.moved
+            (moved - seconds).abs() < 600,
+            "the clock moved {moved} s, not {seconds} s"
         );
         let again = boot::marker().unwrap();
         assert_eq!(
@@ -1125,11 +1149,8 @@ fn a_program_that_cannot_start_is_a_refusal_when_nothing_is_left_and_not_started
         "{:?}",
         kinds(&life.rows())
     );
-    // With something left on the tree, the reply says the operation did not start. The first
-    // invocation's journal is taken away, so that the rows read are this one's.
-    for entry in std::fs::read_dir(setting.scratch.path("journal")).unwrap() {
-        std::fs::remove_file(entry.unwrap().path()).unwrap();
-    }
+    // With something left on the tree, the reply says the operation did not start.
+    forget_journals(&setting);
     let life = setting.life(&["exit", "0"], 1);
     std::fs::remove_file(setting.scratch.path("kr-launch-stand-in.exe")).unwrap();
     life.trees.leave(vec![Left {
@@ -1723,6 +1744,7 @@ fn a_reader_child_ends_before_the_grant_and_one_that_refuses_or_overruns_ends_th
     assert!(life.ended() && life.releases() == 1 && !life.trees.locked());
     // A reader that ends with another code refuses the operation, before the grant and before the
     // primary child: the invocation ends clean and the project is free.
+    forget_journals(&setting);
     let life = Life::open_reading(
         &setting.scratch.dir,
         &setting.account,
@@ -1752,6 +1774,7 @@ fn a_reader_child_ends_before_the_grant_and_one_that_refuses_or_overruns_ends_th
     );
     absent_session(hooks::session());
     // A reader that does not end within its bound is ended with the job, and the end is proved.
+    forget_journals(&setting);
     let life = Life::open_reading(
         &setting.scratch.dir,
         &setting.account,
