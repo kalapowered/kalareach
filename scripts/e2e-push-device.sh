@@ -290,8 +290,9 @@ art = sys.argv[2]
 platform = sys.argv[3]
 bad = 0
 # How long after a message is handed over a notification is seen posted, at most: the phone is asked
-# about every quarter of a second, and the runs of the first leg gave the time of an awake delivery.
-DOZE_GAP_BOUND_MS = 3000
+# about every quarter of a second, and four runs read 282 to 856 ms for the awake deliveries and 493 to
+# 514 ms for the Doze one.
+DOZE_GAP_BOUND_MS = 2000
 
 
 def say(name, ok, detail=""):
