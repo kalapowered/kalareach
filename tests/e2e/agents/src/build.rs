@@ -884,9 +884,13 @@ pub struct Account {
     /// a turn runs too is taken to wait only once [`Account::busy`] is gone.
     pub composer: String,
     /// Texts the agent's screen shows while its start is still a draft: its composer is on the
-    /// screen already, and what is typed at it is dropped or moved when the start ends. A
-    /// composer that shows beside any of these is not yet one a prompt can be typed at. Empty
-    /// where the agent shows no such draft; a part then types its first turn without waiting.
+    /// screen already, and what is typed at it is dropped or moved when the start ends. A text
+    /// counts only in a row above the first row that shows [`Account::composer`], and then only as
+    /// the whole row once the blanks and the frame (`│`, `┃`, `║`) beside it are cut off, or as a
+    /// whole field of a row that starts and ends with the frame, with a blank or the frame at each
+    /// side of it. A composer drawn while one of these counts is not yet one a prompt can be typed
+    /// at. Empty where the agent shows no such draft; a part then types its first turn without
+    /// waiting.
     #[serde(default)]
     pub draft: Vec<String>,
     /// What submits a prompt typed in the composer.

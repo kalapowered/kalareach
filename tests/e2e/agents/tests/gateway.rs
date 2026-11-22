@@ -2816,9 +2816,13 @@ const FRAME: [char; 3] = ['│', '┃', '║'];
 
 /// Whether `row` draws `text` as the agent's start draft does: the text alone on its row, the frame
 /// and the blanks beside it cut off (a line of its own, as the resume and fork drafts draw), or a
-/// whole field of a framed card row, bounded on each side by a blank or the frame (the header card's
-/// `model:     loading`). The text inside a longer word or a path (`/work/loading`, `loading-app`) is
-/// no draft, and neither is it in a row that is no card, such as a line of prose.
+/// whole field of a card row that starts and ends with the frame, bounded on each side by a blank or
+/// the frame (the header card's `model:     loading`). The text inside a longer word or a path
+/// (`/work/loading`, `loading-app`) is no draft, and neither is it in a row that is no card, such as
+/// a line of prose or a command's continuation row (`  │ echo loading data`), which has no closing
+/// frame. A line of the agent's history that holds a text alone, or inside a closed frame, still
+/// reads as the draft; such a start is taken to be a draft and the part fails at its time bound with
+/// the screen printed.
 fn draws_draft(row: &str, text: &str) -> bool {
     let edge = |character: Option<char>| {
         character.is_none_or(|character| character.is_whitespace() || FRAME.contains(&character))
@@ -2826,6 +2830,7 @@ fn draws_draft(row: &str, text: &str) -> bool {
     row.trim_matches(|character: char| character.is_whitespace() || FRAME.contains(&character))
         == text
         || (row.trim_start().starts_with(FRAME)
+            && row.trim_end().ends_with(FRAME)
             && row.match_indices(text).any(|(at, _)| {
                 edge(row[..at].chars().next_back()) && edge(row[at + text.len()..].chars().next())
             }))
@@ -2895,10 +2900,10 @@ fn a_composer_drawn_beside_the_start_draft_is_not_the_real_screen() {
     );
 }
 
-/// A `loading` in a path, in a status line under the composer or in the history is not the start
-/// draft, and the header card's `loading` and the resume and fork lines are, framed or not: a start
-/// that is over stays over where the real screen holds the word elsewhere, and a start that is a
-/// draft stays one.
+/// A `loading` in a path, in a status line under the composer, in the history or in a command's
+/// continuation row is not the start draft, and the header card's `loading` and the resume and fork
+/// lines are, framed or not: a start that is over stays over where the real screen holds the word
+/// elsewhere, and a start that is a draft stays one.
 #[test]
 fn a_loading_in_a_path_a_status_line_or_the_history_is_not_the_start_draft() {
     let rows = |rows: &[&str]| rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
@@ -2914,6 +2919,7 @@ fn a_loading_in_a_path_a_status_line_or_the_history_is_not_the_start_draft() {
         "│ directory: ~/loading-app │",
         "› the loading screen shows a spinner",
         "  Codex is loading it",
+        "  │ echo loading data",
         "› Ask Codex to do anything",
         "  gpt-5.5 loading · ~/work",
         "  loading",
@@ -2921,7 +2927,7 @@ fn a_loading_in_a_path_a_status_line_or_the_history_is_not_the_start_draft() {
     assert_eq!(
         draft_showing(&elsewhere, composer, &draft),
         None,
-        "a path, the history and the status line under the composer are no draft"
+        "a path, the history, a command's continuation row and the status line under the composer are no draft"
     );
     assert!(
         start_is_over(&elsewhere, composer, &draft),
