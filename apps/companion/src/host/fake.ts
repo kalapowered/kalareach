@@ -750,9 +750,9 @@ export interface FakeHostControls {
    */
   hold(read: HeldRead): HeldReads
   /**
-   * Holds the answer to every composer send from now on, as a host does that has the request and has
-   * not answered it: the host has acted on each send the moment it arrives, and the page hears
-   * nothing until the test releases it.
+   * Holds the answer to every composer send and every answer to a question from now on, as a host
+   * does that has the request and has not answered it: the host has acted on each the moment it
+   * arrives, and the page hears nothing until the test releases it.
    */
   holdMutation(): HeldMutations
   /**
@@ -1150,7 +1150,7 @@ export interface HeldReads {
 
 /** The sends of one kind a test is holding: the host has each, and has not answered it. */
 export interface HeldMutations {
-  /** How many sends have been held so far. */
+  /** How many sends, composer sends and answers to questions, have been held so far. */
   readonly count: number
   /** Answers every send still held, with what the host did with it, and holds no more. */
   release(): void
@@ -2619,7 +2619,7 @@ export function fakeHost(
       }),
     questionAnswer: (params, opening, acknowledged) => {
       checkOpening('questionAnswer', params.session_id, opening)
-      return Promise.resolve(questions.answer(params, acknowledged))
+      return answeredWhenReleased(questions.answer(params, acknowledged))
     },
     questionKept: () => Promise.resolve(questions.kept()),
     questionSettle: (sessionId, opening) => {

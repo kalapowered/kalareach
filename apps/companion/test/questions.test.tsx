@@ -214,6 +214,32 @@ describe('a question that changed or ended while a person was answering', () => 
     expect(screen.queryByTestId('question-ended')).toBeNull()
   })
 
+  it('does not say another device answered when a read finds the question gone before the person’s own answer is confirmed', async () => {
+    const { controls } = start()
+    const question = await questionAbout(WHICH_BRANCH)
+    const person = userEvent.setup()
+    await person.click(within(question).getByRole('radio', { name: 'main' }))
+    // The host takes the answer at once, and the page hears nothing of it until the test says so.
+    const held = controls.holdMutation()
+    await person.click(within(question).getByRole('button', { name: 'Send answer' }))
+    await waitFor(() => expect(held.count).toBe(1))
+    // A read on the page's own cadence comes back first, and no longer lists the question.
+    const listed = () =>
+      screen
+        .queryAllByTestId('question')
+        .some((each) => within(each).queryByText(WHICH_BRANCH) !== null)
+    await waitFor(() => expect(listed()).toBe(false), { timeout: 20_000 })
+    held.release()
+    await screen.findByText('Your answer was recorded.')
+    // Whatever the read that found the question gone set going has had time to draw.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    })
+    expect(screen.queryByTestId('question-ended')).toBeNull()
+    expect(screen.queryByText(/answered by someone else/)).toBeNull()
+    expect(controls.questions.sent).toHaveLength(1)
+  })
+
   it('shows the worker’s own refusal when the press comes before the next read', async () => {
     const { controls } = start()
     const question = await questionAbout(WHICH_BRANCH)

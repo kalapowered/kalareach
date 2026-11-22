@@ -153,6 +153,46 @@ export function QuestionRequests({
   // and the form that made the answer is not one to keep.
   const answeredHere = useRef(new Set<string>())
 
+  // A question that is no longer waiting, with an answer half made in it, is not lost with its form:
+  // the page says how it ended, with what the person had chosen, and keeps that until they dismiss
+  // it. Another device may have answered it, or it expired or was withdrawn.
+  const closeEnded = useCallback(
+    (gone: Question) => {
+      const form = typed.current[gone.question_id]
+      if (form === undefined || !holdsSomething(form)) return
+      void ask(() =>
+        port.questionRead({
+          session_id: sessionId,
+          question_id: gone.question_id,
+          include_resolved: true
+        })
+      )
+        .catch(() => undefined)
+        .then((final) => {
+          const ended = final?.questions.find((each) => each.question_id === gone.question_id)
+          setClosed((held) => ({
+            ...held,
+            [gone.question_id]: {
+              question: ended ?? gone,
+              words: ended === undefined ? 'This question is no longer waiting.' : endedWords(ended),
+              chosen: typedWords(gone, form)
+            }
+          }))
+          setForms((held) => without(held, gone.question_id))
+        })
+    },
+    [port, sessionId, setForms]
+  )
+
+  // A send that did not end in an answer taken here: the question is no longer the person's own
+  // answer, and a read that found it gone meanwhile had left it unsaid, so how it ended is said now.
+  const notAnsweredHere = (question: Question) => {
+    answeredHere.current.delete(question.question_id)
+    if (!listed.current.some((each) => each.question_id === question.question_id)) {
+      closeEnded(question)
+    }
+  }
+
   const load = useCallback((): Promise<void> => {
     const current = reads.current?.read() ?? null
     if (current === null) return Promise.resolve()
@@ -166,37 +206,14 @@ export function QuestionRequests({
         for (const gone of before) {
           if (result.questions.some((each) => each.question_id === gone.question_id)) continue
           if (answeredHere.current.has(gone.question_id)) continue
-          const form = typed.current[gone.question_id]
-          if (form === undefined || !holdsSomething(form)) continue
-          // Another device answered it, or it expired or was withdrawn: say how it ended, with
-          // what the person had chosen, and keep that until they dismiss it.
-          void ask(() =>
-            port.questionRead({
-              session_id: sessionId,
-              question_id: gone.question_id,
-              include_resolved: true
-            })
-          )
-            .catch(() => undefined)
-            .then((final) => {
-              const ended = final?.questions.find((each) => each.question_id === gone.question_id)
-              setClosed((held) => ({
-                ...held,
-                [gone.question_id]: {
-                  question: ended ?? gone,
-                  words: ended === undefined ? 'This question is no longer waiting.' : endedWords(ended),
-                  chosen: typedWords(gone, form)
-                }
-              }))
-              setForms((held) => without(held, gone.question_id))
-            })
+          closeEnded(gone)
         }
       })
       .catch((error: unknown) => {
         if (!current()) return
         setFailure({ visit, words: failureMessage(error) })
       })
-  }, [port, sessionId, visit, setForms])
+  }, [port, sessionId, visit, closeEnded])
 
   useEffect(() => {
     const cadence = readOnCadence(load, AGENT_READ_CADENCE_MS)
@@ -249,6 +266,9 @@ export function QuestionRequests({
     const made = answerOf(question, form)
     if (!('answer' in made)) return
     setAnswering(question.question_id)
+    // The answer is the person's own from the moment it is sent: a read on the cadence can come back
+    // before the send's outcome does, and find the question gone because this answer ended it.
+    answeredHere.current.add(question.question_id)
     ask(() =>
       port.questionAnswer(
         {
@@ -267,6 +287,7 @@ export function QuestionRequests({
         if (outcome.outcome === 'held') {
           setShownSends((current) => ({ ...current, [question.question_id]: outcome.action_id }))
           setRefusals((current) => ({ ...current, [question.question_id]: HELD_WORDS }))
+          notAnsweredHere(question)
           keptChanged()
           return
         }
@@ -278,10 +299,10 @@ export function QuestionRequests({
             [question.question_id]:
               'The host has an earlier send of your answer and has not finished with it. Nothing was sent now.'
           }))
+          notAnsweredHere(question)
           keptChanged()
           return
         }
-        answeredHere.current.add(question.question_id)
         setForms((current) => without(current, question.question_id))
         setShownSends((current) => without(current, question.question_id))
         if (outcome.outcome === 'taken') {
@@ -305,6 +326,7 @@ export function QuestionRequests({
         const words = refusalWords(error, failureMessage(error))
         const code = failureCode(error)
         if (code === 'QUESTION_RESOLVED' || code === 'QUESTION_EXPIRED') {
+          answeredHere.current.delete(question.question_id)
           setClosed((current) => ({
             ...current,
             [question.question_id]: { question, words, chosen: answerWords(made.answer, question) }
@@ -316,6 +338,7 @@ export function QuestionRequests({
           return
         }
         setRefusals((current) => ({ ...current, [question.question_id]: words }))
+        notAnsweredHere(question)
         // A new answer replaces the one kept before it when it is recorded, and a refusal of it
         // removes the new one: the kept answers are read again to show what is left.
         keptChanged()
