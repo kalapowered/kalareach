@@ -374,19 +374,6 @@ impl AppState {
         }
     }
 
-    /// Refuses a mark that is not the account's, as [`Self::paired_for`] does, without asking for a
-    /// connection: a command that goes on with none still checks its stamp. A device that is not
-    /// paired, and a host with no organisation, refuse nothing.
-    ///
-    /// # Errors
-    ///
-    /// The sign-in refusal of [`Self::paired_for`].
-    pub async fn check_stamp(&self, mark: Option<&str>) -> Result<()> {
-        let organisation = self.organisation_host();
-        let account = self.account_of(organisation).await.unwrap_or(None);
-        stamp_matches(organisation, account, mark)
-    }
-
     /// Whether the host this application is paired with answers to an organisation: read from the
     /// connection when there is one and from the record of the host when there is none, so the
     /// answer holds while the connection is down.

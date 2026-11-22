@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::error::{CommandError, Result};
-use crate::open_transfers::{Paired, host_words};
+use crate::open_transfers::{Paired, Who, host_words};
 
 /// The format of a draft entry this build writes, recorded in it as `version`.
 pub const DRAFT_VERSION: u32 = 1;
@@ -313,13 +313,31 @@ impl std::fmt::Debug for Drafts {
 /// The entry's name: a draft of another account of the same host is another entry, so one account
 /// never reads or extends the draft another left.
 fn key_of(paired: &Paired, session_id: SessionId) -> Uuid {
-    let text = format!(
-        "{}|{}|{}|{}",
+    key_from(
         paired.environment_id,
         paired.device_id,
         session_id,
-        paired.account_id().unwrap_or_default()
-    );
+        &paired.account_id().unwrap_or_default(),
+    )
+}
+
+/// The name of the entry `file` is kept under: the one it was made under, which the file records.
+fn key_of_file(file: &DraftFile) -> Uuid {
+    key_from(
+        file.environment_id,
+        file.device_id,
+        file.session_id,
+        file.account.as_deref().unwrap_or_default(),
+    )
+}
+
+fn key_from(
+    environment_id: EnvironmentId,
+    device_id: DeviceId,
+    session_id: SessionId,
+    account: &str,
+) -> Uuid {
+    let text = format!("{environment_id}|{device_id}|{session_id}|{account}");
     let digest = kr_cbor::sha256(text.as_bytes());
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -419,9 +437,13 @@ impl Drafts {
         paired: &Paired,
         session_id: SessionId,
     ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.turn_by_key(key_of(paired, session_id)).await
+    }
+
+    async fn turn_by_key(&self, key: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
-            Arc::clone(turns.entry(key_of(paired, session_id)).or_default())
+            Arc::clone(turns.entry(key).or_default())
         };
         lock.lock_owned().await
     }
@@ -440,7 +462,11 @@ impl Drafts {
     }
 
     fn read(&self, paired: &Paired, session_id: SessionId) -> Result<Read> {
-        let path = self.path(key_of(paired, session_id))?;
+        self.read_by_key(key_of(paired, session_id), session_id)
+    }
+
+    fn read_by_key(&self, key: Uuid, session_id: SessionId) -> Result<Read> {
+        let path = self.path(key)?;
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Read::Absent),
@@ -477,7 +503,11 @@ impl Drafts {
     }
 
     fn remove(&self, paired: &Paired, session_id: SessionId) {
-        if let Ok(path) = self.path(key_of(paired, session_id)) {
+        self.remove_by_key(key_of(paired, session_id));
+    }
+
+    fn remove_by_key(&self, key: Uuid) {
+        if let Ok(path) = self.path(key) {
             let _ = crate::drafts::remove_durably(&path);
         }
     }
@@ -541,13 +571,38 @@ impl Drafts {
     }
 
     /// The prompt that named `draft_id` was answered with a result: the draft is the session's now,
-    /// and the entry ends with nothing asked of the host. An entry kept for another draft stays.
-    pub async fn sent(&self, paired: &Paired, session_id: SessionId, draft_id: DraftId) {
-        let _turn = self.turn(paired, session_id).await;
-        if let Ok(Read::Entry(file)) = self.read(paired, session_id)
-            && file.draft_id == Some(draft_id)
-        {
-            self.remove(paired, session_id);
+    /// and the entry ends with nothing asked of the host. It needs no connection: the entry is found
+    /// by the draft's own id among the entries of `who`'s device and account, takes its key's turn,
+    /// and is read again there. An entry kept for another draft stays.
+    pub async fn sent(&self, who: &Who, session_id: SessionId, draft_id: DraftId) {
+        let account = who.account.map(AccountMark::to_hex);
+        let Ok(root) = self.root() else { return };
+        let Ok(listing) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let keys: Vec<Uuid> = listing
+            .flatten()
+            .filter_map(|item| {
+                let path = item.path();
+                if path.extension().is_none_or(|ext| ext != EXTENSION) {
+                    return None;
+                }
+                let file = serde_json::from_slice::<DraftFile>(&std::fs::read(&path).ok()?).ok()?;
+                (file.version == DRAFT_VERSION
+                    && file.device_id == who.device_id
+                    && file.account == account
+                    && file.session_id == session_id
+                    && file.draft_id == Some(draft_id))
+                .then(|| key_of_file(&file))
+            })
+            .collect();
+        for key in keys {
+            let _turn = self.turn_by_key(key).await;
+            if let Ok(Read::Entry(file)) = self.read_by_key(key, session_id)
+                && file.draft_id == Some(draft_id)
+            {
+                self.remove_by_key(key);
+            }
         }
     }
 

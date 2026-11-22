@@ -1237,12 +1237,12 @@ async fn send_prompt(
     let expected = PromptPreconditions(supersedes);
     if typed.draft_id.is_present() {
         // The account the prompt was made under is read once, before it is sent: the record of the
-        // draft it used is ended for that account, whatever the sign-in has become since.
-        let paired = if state.paired_context().is_some() {
-            // A mark that is not the account's is refused here, at the command's entry; a host that
-            // cannot be reached is not (the prompt goes on the session's own link).
-            state.check_stamp(mark).await?;
-            state.paired().await.ok()
+        // draft it used is ended for that account, whatever the sign-in has become since. It needs
+        // no connection: a main connection that ends before the prompt is answered still lets the
+        // draft end. A mark that is not the account's is refused here, at the command's entry; a
+        // host that cannot be reached is not (the prompt goes on the session's own link).
+        let who = if state.paired_context().is_some() {
+            Some(state.paired_who_for(mark).await?)
         } else {
             None
         };
@@ -1269,11 +1269,11 @@ async fn send_prompt(
         if applied
             && !settled.answer_lost
             && let Some(draft_id) = typed.draft_id.0
-            && let Some(paired) = &paired
+            && let Some(who) = &who
         {
             state
                 .paired_drafts()
-                .sent(paired, typed.target.subject.session_id, draft_id)
+                .sent(who, typed.target.subject.session_id, draft_id)
                 .await;
         }
         return Ok(settled);

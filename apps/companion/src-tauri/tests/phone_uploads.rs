@@ -6137,3 +6137,157 @@ async fn kr_req_13_12_a_start_candidate_read_before_the_mark_is_refused_after_it
     );
     places.end().await;
 }
+
+// ---- the draft a prompt ends -----------------------------------------------------------------------
+
+/// KR-REQ-23.41 (E1): a prompt that the host applied ends the local draft even when the main
+/// connection ended after the draft's text was set: the account is read before the prompt is sent
+/// and needs no connection, and the prompt goes on the session's own link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_prompt_applied_after_the_main_connection_ended_ends_the_local_draft() {
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let taken = Arc::new(net_support::worker::Upstream::default());
+    let instance = adopted.workers[0].register_agent_on(Arc::clone(&taken) as _);
+    let session = adopted.workers[0].session_id;
+    companion
+        .call(
+            "session_open",
+            json!({ "sessionId": session.to_string(), "grantId": null, "opening": "screen" }),
+        )
+        .expect("the session opens");
+    let draft = made_draft(&bind(companion, session, &handed(companion)).expect("a bind"));
+    set_text(companion, session, "the text").expect("the text reaches the draft");
+    assert_eq!(drafts_in(&folder(&phone)), 1, "the draft is kept");
+    // The main connection ends and stays down; the session's own link is up.
+    let main = paired_of(companion).await;
+    control.hold();
+    main.session.transport().close();
+    until("the main connection has ended", || {
+        companion
+            .call("connection_state", json!({}))
+            .is_ok_and(|state| state["connected"] != true)
+    })
+    .await;
+    companion
+        .call(
+            "agent_prompt_submit",
+            json!({
+                "params": draft_prompt(session, instance, draft),
+                "opening": "screen",
+            }),
+        )
+        .expect("the prompt is applied over the session's own link");
+    assert_eq!(taken.prompts().len(), 1, "the agent has the prompt");
+    assert_eq!(
+        drafts_in(&folder(&phone)),
+        0,
+        "the draft and its attachment are gone"
+    );
+    control.stop_holding();
+    adopted.stop().await;
+}
+
+/// The draft entries `drafts` keeps for `session`, as a person of each account would see them.
+fn draft_made(
+    drafts: &companion_tauri::paired_drafts::Drafts,
+    paired: &Paired,
+    session: kr_protocol::ids::SessionId,
+) -> bool {
+    drafts
+        .kept(paired, session)
+        .expect("the entry is read")
+        .made
+}
+
+/// KR-REQ-23.41 (E2): the prompt that was applied for a draft ends the entry kept for that draft,
+/// and an entry kept for another draft stays: another bind made it after the prompt was written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_sent_prompt_ends_the_entry_of_its_own_draft_only() {
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let paired = paired_of(companion).await;
+    let session = adopted.workers[0].session_id;
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let kept_for = kr_protocol::ids::DraftId::new(kr_ipc::new_uuid());
+    drafts.keep_for_test(
+        &paired,
+        session,
+        &net_support::on_the_session(&adopted.host, session),
+        Some(kept_for),
+        Some(kr_protocol::ids::DraftRevision::new(1)),
+    );
+    let other = kr_protocol::ids::DraftId::new(kr_ipc::new_uuid());
+    drafts.sent(&paired.who(), session, other).await;
+    assert!(
+        draft_made(&drafts, &paired, session),
+        "the entry of another draft stays"
+    );
+    drafts.sent(&paired.who(), session, kept_for).await;
+    assert!(
+        !draft_made(&drafts, &paired, session),
+        "the entry of the draft the prompt named ends"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-23.41 (E3): the entry that ends is the one of the account the prompt was made under: an
+/// account that signs in after the prompt was written does not end, or keep, the earlier account's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_41_a_sent_prompt_ends_the_entry_of_the_account_it_was_made_under() {
+    use kr_client::services::AccountMark;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let paired = paired_of(companion).await;
+    let session = adopted.workers[0].session_id;
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let one = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let two = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..paired
+    };
+    let (first, second) = (
+        kr_protocol::ids::DraftId::new(kr_ipc::new_uuid()),
+        kr_protocol::ids::DraftId::new(kr_ipc::new_uuid()),
+    );
+    for (account, draft) in [(&one, first), (&two, second)] {
+        drafts.keep_for_test(
+            account,
+            session,
+            &net_support::on_the_session(&adopted.host, session),
+            Some(draft),
+            Some(kr_protocol::ids::DraftRevision::new(1)),
+        );
+    }
+    // The second account names the first's draft: its own entry is another draft, and the first's
+    // is another account's.
+    drafts.sent(&two.who(), session, first).await;
+    assert!(
+        draft_made(&drafts, &one, session),
+        "another account's entry stays"
+    );
+    assert!(draft_made(&drafts, &two, session));
+    drafts.sent(&one.who(), session, first).await;
+    assert!(
+        !draft_made(&drafts, &one, session),
+        "the entry of the account the prompt was made under ends"
+    );
+    assert!(
+        draft_made(&drafts, &two, session),
+        "the other account's stays"
+    );
+    adopted.stop().await;
+}
