@@ -44,7 +44,7 @@ only when the hook exits 0. The forwarder exits 0 with exactly `{}`, an object t
 A forwarder that refuses its command line exits 64, and one Qoder CLI cannot find never starts;
 Qoder CLI logs either and changes nothing else.
 
-`Stop` is not one of the five. Qoder CLI reads exit code 2 from a `Stop` hook as a request to go on with the turn instead of ending it, so a package that registers `Stop` keeps the forwarder's exit code 0 with `{}` for it.
+`Stop` is not one of the five. Qoder CLI reads exit code 2 from a `Stop` hook as a request to go on with the turn instead of ending it, so a package that registers `Stop` keeps the forwarder's exit code 0 with `{}` for it. Before a package registers `Stop` for Qoder CLI, it has to find out whether Qoder CLI runs `Stop` when the person interrupts a turn, which its hooks reference does not say. The default map reports `Stop` as a turn's end and an interrupted turn is not one, so if `Stop` does run on an interrupt, that package gives its own [`hook_events`](../../plugins/README.md#hook-events) that does not map `Stop` to it.
 
 ## What each event reports
 
