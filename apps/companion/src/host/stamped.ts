@@ -155,6 +155,16 @@ export class ConnectedHost {
 }
 
 /**
+ * The port with one mark fixed for every command that acts for an account: a submission is made of
+ * several commands and takes the mark once, as it is pressed, so that none of them acts for an
+ * account that signed in while another waited. Native code refuses a command whose mark is no longer
+ * the account signed in.
+ */
+export function portUnderMark(port: HostPort, mark: string | undefined): HostPort {
+  return stampedPort(rootOf(port), () => mark)
+}
+
+/**
  * The port with the account's mark added, last, to each command that acts for an account. The mark
  * is read as the command is made.
  */

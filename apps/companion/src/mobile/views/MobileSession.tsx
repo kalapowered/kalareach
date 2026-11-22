@@ -100,6 +100,7 @@ import { useLinkFit } from '../../markdown/link-fit'
 import { useLinkPress } from '../../markdown/link-press'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
+import { portUnderMark } from '../../host/stamped'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../../terminal/cells'
 import { selectionRule } from '../../terminal/frame'
 import { cellUnder, dragRows, heldTurns, type TerminalCell } from '../../terminal/input'
@@ -213,7 +214,7 @@ export function MobileSession({
   /** Whether the host is in contact, or null before the shell's first answer. */
   readonly connected: boolean | null
 }): ReactNode {
-  const { port, say, drafts: book, paths, uploads, openings, receiptReads } = useApp()
+  const { port, account, say, drafts: book, paths, uploads, openings, receiptReads } = useApp()
   const camera = useCameraControl(port, say)
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
@@ -770,6 +771,9 @@ export function MobileSession({
       // nothing, and the host decides.
       const quote = anyway ? quoting : null
       const wentWith = new Set(draft.attachments.map((file) => file.localId))
+      // The account the person pressed Send under: both commands of the submission carry its mark,
+      // whatever the account is by the time each is made.
+      const marked = portUnderMark(port, account.current)
       ask(async () => {
         // The prompt is sent only once the stored draft is this window's to send: another window
         // that holds the same draft claims it first, and the other one sends nothing.
@@ -788,14 +792,14 @@ export function MobileSession({
         // Files bound to the draft the device keeps on a paired host are sent with the prompt that
         // names the draft, which carries no text of its own: the text is set on the draft first.
         if (pairedDraft) {
-          const kept = await port.draftSetText(await nameSession(), sessionId, text)
-          return await port.composerSubmit(
+          const kept = await marked.draftSetText(await nameSession(), sessionId, text)
+          return await marked.composerSubmit(
             { target, draft_id: kept.draftId, text: null },
             opening,
             quote ?? undefined
           )
         }
-        return await port.composerSubmit({ target, draft_id: null, text }, opening, quote ?? undefined)
+        return await marked.composerSubmit({ target, draft_id: null, text }, opening, quote ?? undefined)
       })
         .then((answer) => {
           const state = answeredState(answer)
@@ -873,7 +877,7 @@ export function MobileSession({
           if (stillHere()) setBusyUnder(null)
         })
     },
-    [draft, lifecycle, book, port, say, sessionId, openings, receiptReads, paired, uploads, nameSession]
+    [draft, lifecycle, book, port, account, say, sessionId, openings, receiptReads, paired, uploads, nameSession]
   )
 
 
