@@ -731,14 +731,15 @@ fn a_return_type_before_a_body_is_no_struct_value_but_a_name_after_a_macros_arro
          fn n() { value!(fn o() -> ActionTarget { build() }); }\n\
          fn q() { value!(|x| -> ActionTarget { a: 1 }); }\n\
          fn r() { value!(for ActionTarget { a: 1 }); }\n\
-         fn p() { let _ = ActionTarget { a: 1 }; }\n",
+         fn p() { let _ = ActionTarget { a: 1 }; }\n\
+         r#macro_rules! w { () => { fn f() -> ActionTarget { a: 1 } }; }\n",
     );
     // A return type before a body is no struct value, qualified or not, in a function, a closure or a
     // function type. Inside the tokens of a macro no syntax rule reads: what looks like a signature, a
     // closure or an item keyword is what the macro makes of it, so each stays a candidate there.
     assert_eq!(
         found,
-        [9, 10, 11, 12, 13, 14, 15, 16, 17]
+        [9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
             .map(|line| ("ActionTarget {".to_owned(), line))
             .to_vec()
     );
@@ -773,12 +774,15 @@ fn documentation_is_no_candidate_as_an_attribute_but_a_literal_in_the_tokens_of_
          () => { #[doc = \"agent.prompt.submit\"] fn z() {} };\n\
          }\n\
          fn l() -> bool { return !{ #[doc = \"agent.turn.cancel\"] const FLAG: bool = false; FLAG }; }\n\
-         fn n() { if !{ #[doc = \"agent.turn.steer\"] const A: bool = true; A } {} while !(#[doc = \"agent.prompt.queue\"] 1) {} }\n",
+         fn n() { if !{ #[doc = \"agent.turn.steer\"] const A: bool = true; A } {} while !(#[doc = \"agent.prompt.queue\"] 1) {} }\n\
+         r#macro_rules! v { () => { #[doc = \"agent.prompt.submit\"] fn z() {} }; }\n\
+         fn w() { r#return!(#[doc = \"agent.prompt.queue\"]); }\n",
     );
     // The text of a `doc` attribute, `///` and `//!` among them, is documentation: no candidate. The same
     // tokens in the arguments or the rules of a macro are what the macro makes of them (a runtime string,
     // here), and so are a literal. Nothing else that a `cfg_attr` holds is documentation. A `!` that
-    // follows a keyword (`return !{..}`, `if !{..}`, `while !(..)`) is the operator, and no macro call.
+    // follows a keyword (`return !{..}`, `if !{..}`, `while !(..)`) is the operator, and no macro call; a
+    // raw `r#macro_rules` still defines one, and a raw `r#return!` is a call of a macro of that name.
     assert_eq!(
         found,
         [
@@ -788,6 +792,8 @@ fn documentation_is_no_candidate_as_an_attribute_but_a_literal_in_the_tokens_of_
             ("\"agent.turn.cancel\"".to_owned(), 19),
             ("\"agent.turn.cancel\"".to_owned(), 21),
             ("\"agent.prompt.submit\"".to_owned(), 24),
+            ("\"agent.prompt.submit\"".to_owned(), 28),
+            ("\"agent.prompt.queue\"".to_owned(), 29),
         ]
     );
 }

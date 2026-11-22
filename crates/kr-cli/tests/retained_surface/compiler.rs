@@ -1620,7 +1620,7 @@ fn is_macro_group(trees: &[TokenTree], at: usize) -> bool {
         && !BEFORE_A_NOT.contains(&word(at.checked_sub(2)).as_str()))
         || (!word(at.checked_sub(1)).is_empty()
             && punct(at.checked_sub(2), '!')
-            && word(at.checked_sub(3)) == "macro_rules")
+            && matches!(at.checked_sub(3).map(|before| &trees[before]), Some(TokenTree::Ident(marker)) if marker.unraw() == "macro_rules"))
 }
 
 /// The tokens of an attribute's brackets at an item or a statement. What a `doc` attribute holds is
