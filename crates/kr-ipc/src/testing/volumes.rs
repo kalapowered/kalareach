@@ -395,30 +395,52 @@ pub fn detach_attached(at: &Path) -> Result<(), String> {
 /// mounted from it, is what is asked about, until the system lets it go. The first refusal is said
 /// on standard error, with what the tool said, so that a run which needed the wait shows it.
 ///
-/// `refused` is told what the tool said at each refusal.
+/// `refused` is told what the tool said at each refusal. The first refusal and the final error
+/// also say what holds the volume and its disk: the processes `lsof` shows with a file or the
+/// disk's device open, and the process that serves the image. Each question that takes is let
+/// run for ten seconds at most and is then ended. The holders are only named: the detach does
+/// not wait for one to let go beyond `patience`, and does not end one.
 ///
 /// # Errors
 ///
-/// Returns what the tool last said when the disk is still attached after `patience`, or why the
-/// disk could not be named.
+/// Returns what the tool last said, and what holds the disk, when the disk is still attached after
+/// `patience`, or why the disk could not be named.
 #[cfg(target_os = "macos")]
 pub fn detach_observed(
     at: &Path,
     patience: Duration,
-    mut refused: impl FnMut(&str),
+    refused: impl FnMut(&str),
 ) -> Result<(), String> {
     let disk = disk_of(at)?;
+    detach_disk(at, &disk, patience, refused)
+}
+
+/// Takes the disk `disk`, which a volume was mounted at `at` from, off, as [`detach_observed`]
+/// does once it has named the disk. It is asked again when a detach was refused after the volume
+/// was unmounted, and the image stayed attached with nothing mounted from it.
+///
+/// # Errors
+///
+/// Returns what the tool last said, and what holds the disk, when the disk is still attached after
+/// `patience`.
+#[cfg(target_os = "macos")]
+pub fn detach_disk(
+    at: &Path,
+    disk: &str,
+    patience: Duration,
+    mut refused: impl FnMut(&str),
+) -> Result<(), String> {
     let until = Instant::now() + patience;
     let mut said_so = false;
     loop {
         // A refusal can come after the disk went, and the system can give its name to the next
         // image: a name asked about again is asked about only while the device is still there.
-        if !Path::new(&disk).exists() {
+        if !Path::new(disk).exists() {
             return Ok(());
         }
         let ended = std::process::Command::new("/usr/bin/hdiutil")
             .args(["detach", "-force"])
-            .arg(&disk)
+            .arg(disk)
             .output()
             .map_err(|error| format!("hdiutil could not be run: {error}"))?;
         if ended.status.success() {
@@ -433,18 +455,240 @@ pub fn detach_observed(
         if !said_so {
             eprintln!(
                 "the volume at {} was forced off and {disk} was still held ({said}); asking again \
-                 until the system lets it go",
-                at.display()
+                 until the system lets it go; {}",
+                at.display(),
+                holders_of(at, disk)
             );
             said_so = true;
         }
         if Instant::now() >= until {
             return Err(format!(
-                "{disk} stayed attached for {patience:?} after the detach was forced ({said})"
+                "{disk} stayed attached for {patience:?} after the detach was forced ({said}); {}",
+                holders_of(at, disk)
             ));
         }
         std::thread::sleep(DETACH_ASKS_AGAIN);
     }
+}
+
+/// How long a question about what holds a disk is let run before it is ended.
+#[cfg(target_os = "macos")]
+const HOLDER_QUERY_LIMIT: Duration = Duration::from_secs(10);
+
+/// How many holders a report names, and how many of the files each has open.
+#[cfg(target_os = "macos")]
+const HOLDERS_NAMED: usize = 5;
+#[cfg(target_os = "macos")]
+const FILES_NAMED: usize = 3;
+
+/// A process with files open on a volume or its disk, as `lsof` lists it.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+struct Holder {
+    pid: String,
+    command: String,
+    files: Vec<String>,
+}
+
+/// The processes an `lsof -F pcn` listing shows, in the order it gives them, each with the files
+/// it has open that the listing names.
+#[cfg(target_os = "macos")]
+fn holders_in(listing: &str) -> Vec<Holder> {
+    let mut holders: Vec<Holder> = Vec::new();
+    for line in listing.lines() {
+        let mut characters = line.chars();
+        let Some(field) = characters.next() else {
+            continue;
+        };
+        let value = characters.as_str();
+        match (field, holders.last_mut()) {
+            ('p', _) => holders.push(Holder {
+                pid: value.to_owned(),
+                command: String::new(),
+                files: Vec::new(),
+            }),
+            ('c', Some(holder)) => value.clone_into(&mut holder.command),
+            ('n', Some(holder)) if !holder.files.iter().any(|file| file == value) => {
+                holder.files.push(value.to_owned());
+            }
+            _ => {}
+        }
+    }
+    holders
+}
+
+/// The devices an `hdiutil info` listing shows for the image `disk` belongs to, and the processes
+/// it shows serving that image.
+///
+/// The listing has one block for each image, after a line of equals signs: its path and its
+/// process, then its devices, each at the start of a line. A block is the image's when one of its
+/// devices is the disk or a part of it.
+#[cfg(target_os = "macos")]
+fn image_of(listing: &str, disk: &str) -> (Vec<String>, Vec<String>) {
+    let of_the_disk = |device: &str| {
+        device == disk
+            || device
+                .strip_prefix(disk)
+                .is_some_and(|rest| rest.starts_with('s'))
+    };
+    let mut found = (Vec::new(), Vec::new());
+    let mut block: (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut ended = |block: &mut (Vec<String>, Vec<String>)| {
+        let finished = std::mem::take(block);
+        if finished.0.iter().any(|device| of_the_disk(device)) {
+            found.0.extend(finished.0);
+            found.1.extend(finished.1);
+        }
+    };
+    for line in listing.lines() {
+        if line.starts_with("====") {
+            ended(&mut block);
+        } else if let Some(device) = line
+            .split_whitespace()
+            .next()
+            .filter(|word| word.starts_with("/dev/disk"))
+        {
+            block.0.push(device.to_owned());
+        } else if let Some((key, value)) = line.split_once(':')
+            && key.trim() == "process ID"
+        {
+            block.1.push(value.trim().to_owned());
+        }
+    }
+    ended(&mut block);
+    found
+}
+
+/// Runs `program` and returns what it wrote, or why that could not be had. It is let run for
+/// [`HOLDER_QUERY_LIMIT`], then ended through its own handle, and is not waited for after that:
+/// a program the system has stopped answering for does not hold the case.
+#[cfg(target_os = "macos")]
+fn asked(program: &str, arguments: &[std::ffi::OsString]) -> Result<String, String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("{program} could not be run: {error}"))?;
+    let mut output = child.stdout.take().expect("the output is piped");
+    let (written, written_text) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = output.read_to_end(&mut text);
+        let _ = written.send(text);
+    });
+    let until = Instant::now() + HOLDER_QUERY_LIMIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "{program} did not answer within {HOLDER_QUERY_LIMIT:?} and was ended"
+                ));
+            }
+            Err(error) => return Err(format!("{program} could not be waited for: {error}")),
+        }
+    }
+    written_text
+        .recv_timeout(Duration::from_secs(2))
+        .map(|text| String::from_utf8_lossy(&text).into_owned())
+        .map_err(|_| format!("what {program} wrote could not be read"))
+}
+
+/// Says what holds the volume mounted at `at` and the disk `disk` it is on: each process `lsof`
+/// shows with a file open on either, and each process `hdiutil info` shows serving the image.
+///
+/// A volume the system will not let go of is held by a process that has a file or the disk's
+/// device open, or by the process that serves the image. A report that names it shows what the
+/// case, or the machine, did to leave the volume held. Each question is bounded, and one that
+/// cannot be answered is said so in its place.
+#[cfg(target_os = "macos")]
+fn holders_of(at: &Path, disk: &str) -> String {
+    use std::ffi::OsString;
+
+    let info = asked("/usr/bin/hdiutil", &["info".into()]);
+    let (devices, servers) = info
+        .as_deref()
+        .map(|listing| image_of(listing, disk))
+        .unwrap_or_default();
+    // The disk is asked about by its own name when the listing did not give the image's devices.
+    let devices = if devices.is_empty() {
+        vec![disk.to_owned()]
+    } else {
+        devices
+    };
+    let mut names: Vec<OsString> = ["-nP", "-F", "pcn", "--"].map(OsString::from).to_vec();
+    if at.exists() {
+        names.push(at.into());
+    }
+    for device in &devices {
+        names.push(device.into());
+        names.push(device.replacen("/dev/disk", "/dev/rdisk", 1).into());
+    }
+    let holding = match asked("/usr/sbin/lsof", &names) {
+        Ok(listing) => {
+            let holders = holders_in(&listing);
+            if holders.is_empty() {
+                format!(
+                    "lsof shows no process with a file open on {} or on {disk}",
+                    at.display()
+                )
+            } else {
+                let mut named: Vec<String> = holders
+                    .iter()
+                    .take(HOLDERS_NAMED)
+                    .map(|holder| {
+                        let files: Vec<&str> = holder
+                            .files
+                            .iter()
+                            .take(FILES_NAMED)
+                            .map(String::as_str)
+                            .collect();
+                        format!(
+                            "process {} ({}) has {} open",
+                            holder.pid,
+                            holder.command,
+                            files.join(", ")
+                        )
+                    })
+                    .collect();
+                if holders.len() > HOLDERS_NAMED {
+                    named.push(format!("{} more", holders.len() - HOLDERS_NAMED));
+                }
+                named.join("; ")
+            }
+        }
+        Err(why) => format!("what holds it could not be read from lsof ({why})"),
+    };
+    let serving = match (&info, servers.as_slice()) {
+        (Err(why), _) => format!("hdiutil info could not be read ({why})"),
+        (Ok(_), []) => "hdiutil info shows no process serving the image".to_owned(),
+        (Ok(_), servers) => {
+            let named: Vec<String> = servers
+                .iter()
+                .map(|pid| {
+                    let name = asked(
+                        "/bin/ps",
+                        &["-o".into(), "comm=".into(), "-p".into(), pid.into()],
+                    )
+                    .map(|text| text.trim().to_owned())
+                    .unwrap_or_default();
+                    format!("{pid} ({name})")
+                })
+                .collect();
+            format!(
+                "hdiutil info shows the image served by process {}",
+                named.join(", ")
+            )
+        }
+    };
+    format!("{holding}; {serving}")
 }
 
 /// Returns the whole disk (`/dev/diskN`) the volume mounted at `at` is on.
@@ -515,6 +759,71 @@ mod tests {
         assert_eq!(
             said(&*failing.expect_err("the case fails")),
             "the case's own failure"
+        );
+    }
+
+    /// A listing of what `lsof -F pcn` shows gives each process by number and name, with the files it
+    /// has open, once each.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_processes_with_files_open_are_read_from_lsof_field_output() {
+        let listing = "p101\ncsleep\nfcwd\nn/volumes/a\nftxt\nn/volumes/a/log\nftxt\nn/volumes/a/log\n\
+                       p202\ncgit\nf3\nn/dev/disk15\n";
+        let holders = super::holders_in(listing);
+        assert_eq!(
+            holders,
+            vec![
+                super::Holder {
+                    pid: "101".to_owned(),
+                    command: "sleep".to_owned(),
+                    files: vec!["/volumes/a".to_owned(), "/volumes/a/log".to_owned()],
+                },
+                super::Holder {
+                    pid: "202".to_owned(),
+                    command: "git".to_owned(),
+                    files: vec!["/dev/disk15".to_owned()],
+                },
+            ]
+        );
+        assert!(super::holders_in("").is_empty());
+    }
+
+    /// An `hdiutil info` listing gives, for the image a disk belongs to, the devices of that image
+    /// and the process serving it, and nothing of the other images.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_image_of_a_disk_and_its_process_are_read_from_hdiutil_info() {
+        let listing = "framework       : 600\n\
+                       ================================================\n\
+                       image-path      : /tmp/one.dmg\n\
+                       process ID      : 41\n\
+                       /dev/disk14         \tGUID_partition_scheme\n\
+                       /dev/disk14s1       \tApple_APFS\n\
+                       /dev/disk15         \tEF57347C-0000-11AA-AA11-00306543ECAC\n\
+                       /dev/disk15s1       \t41504653-0000-11AA-AA11-00306543ECAC\t/tmp/mount\n\
+                       ================================================\n\
+                       image-path      : /tmp/two.dmg\n\
+                       process ID      : 52\n\
+                       /dev/disk1          \tGUID_partition_scheme\n\
+                       /dev/disk1s1        \tApple_HFS\t/tmp/other\n";
+        let (devices, servers) = super::image_of(listing, "/dev/disk15");
+        assert_eq!(
+            devices,
+            [
+                "/dev/disk14",
+                "/dev/disk14s1",
+                "/dev/disk15",
+                "/dev/disk15s1"
+            ]
+        );
+        assert_eq!(servers, ["41"]);
+        // A disk whose number only begins the same is not the same disk.
+        let (devices, servers) = super::image_of(listing, "/dev/disk1");
+        assert_eq!(devices, ["/dev/disk1", "/dev/disk1s1"]);
+        assert_eq!(servers, ["52"]);
+        assert_eq!(
+            super::image_of(listing, "/dev/disk99"),
+            (Vec::new(), Vec::new())
         );
     }
 }

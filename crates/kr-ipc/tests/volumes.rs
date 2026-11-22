@@ -59,3 +59,34 @@ fn a_volume_whose_disk_is_held_is_detached_once_it_is_let_go() {
     // it would fail the case for a volume that is already gone.
     std::mem::forget(volume);
 }
+
+/// A disk that stays held for the whole of the patience fails with what holds it: the process that
+/// has the disk open, by number and name, and the case then lets the disk go and takes the volume
+/// off. A volume that could not be detached without that is reported as one nothing explains.
+#[test]
+fn a_disk_that_stays_held_is_reported_with_the_process_that_holds_it() {
+    let scratch = kr_ipc::testing::PrivateTempDir::create();
+    let (at, volume) = attached(&scratch, "named-holder");
+    let disk = volumes::disk_of(&at).expect("the volume is on a disk");
+    let holder = std::fs::File::open(&disk).expect("the disk opens for reading");
+
+    let held = volumes::detach_observed(&at, Duration::from_secs(3), |_| {});
+
+    // The disk is let go and taken off before anything is asserted, so a case that fails does not
+    // leave the image attached. The first forced detach unmounted the volume and was refused the
+    // eject, so nothing is mounted from the image any longer and the disk is what is asked about.
+    drop(holder);
+    let off = volumes::detach_disk(&at, &disk, HUNG, |_| {});
+    let gone = !attached_still(&disk);
+    // The case took the volume off itself, so there is nothing for the volume's own detach to find.
+    std::mem::forget(volume);
+
+    off.expect("the disk comes off once it is let go");
+    assert!(gone, "{disk} is gone");
+    let why = held.expect_err("a disk that is held for the whole of the patience stays attached");
+    assert!(
+        why.contains(&format!("process {} (", std::process::id())),
+        "the report names the process that holds the disk: {why}"
+    );
+    assert!(why.contains(&disk), "and the disk it holds open: {why}");
+}
