@@ -1184,7 +1184,13 @@ impl Installer {
                         retained.push(format!("{entry} in {path}: {reason}"));
                         entry_stays = true;
                     }
-                    Removal::Told(words) => retained.push(words),
+                    Removal::Told { words, held } => {
+                        retained.push(words);
+                        if let Some(reason) = held {
+                            retained.push(format!("{entry} in {path}: {reason}"));
+                            entry_stays = true;
+                        }
+                    }
                 },
                 Planned::Folder(plan) => match plan {
                     FolderPlan::Gone => retained.push(format!("{path} is already gone")),
@@ -1958,11 +1964,21 @@ impl Installer {
             EntryPlan::Held(reason) => Removal::Held(reason),
             EntryPlan::Delete { checked } => match self.fs.remove_file(path, checked)? {
                 anchor::Taken::Removed => Removal::Removed,
-                anchor::Taken::Gone => Removal::Kept("it is already gone".to_owned()),
-                anchor::Taken::Changed => self.held_or_kept(path, key, digest)?,
-                anchor::Taken::Kept { name, at } => {
-                    Removal::Told(anchor::kept_while_removing(path, &name, &at))
+                // A document that is gone, or is not the one that was checked, may have been
+                // written again by another process with the entry the host wrote: the entry is
+                // read again by its key, as for a document that changed.
+                anchor::Taken::Gone | anchor::Taken::Changed => {
+                    self.held_or_kept(path, key, digest)?
                 }
+                // The file that was taken out stays where it is kept, and the words say so; the
+                // name may hold the host's unchanged entry again, which stays with its record.
+                anchor::Taken::Kept { name, at } => Removal::Told {
+                    words: anchor::kept_while_removing(path, &name, &at),
+                    held: match self.held_or_kept(path, key, digest)? {
+                        Removal::Held(reason) => Some(reason),
+                        _ => None,
+                    },
+                },
             },
             EntryPlan::Edit { text, replaces } => {
                 match self
@@ -3109,9 +3125,10 @@ enum Removal {
     Kept(String),
     /// It was left alone, for the stated reason, and its record stays.
     Held(String),
-    /// It was left alone, and these words, which name the file and the entry whole, say what
-    /// became of the file.
-    Told(String),
+    /// It was left alone, and `words`, which name the file and the entry whole, say what became of
+    /// the file. Where the name holds the host's unchanged entry again, `held` is the reason it
+    /// stays, and its record stays.
+    Told { words: String, held: Option<String> },
 }
 
 /// The longest a contact tool holds a call, in seconds, plus room to answer.
@@ -8251,6 +8268,98 @@ mod tests {
                 .expect("a status")
                 .installed,
             "the record is still there"
+        );
+    }
+
+    /// KR-REQ-11.01: a document that another process takes out of the way and writes again, with the
+    /// entry the host wrote, while a removal deletes it, is not an entry that is gone: the entry
+    /// stays, unchanged, with its record, and a later removal finishes.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_written_again_after_its_file_was_taken_away_keeps_the_entry_and_its_record() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let folder = tree.home().join(".amp");
+        let document = folder.join("mcp.json");
+        let again = std::fs::read_to_string(&document)
+            .expect("the document")
+            .replacen('{', "{\n  \"theme\": \"dark\",", 1);
+        let (at, beside) = (document.clone(), folder.clone());
+        when_taken_out(".amp/mcp.json", move || {
+            for parked in temporary_entries(&beside) {
+                std::fs::remove_file(parked).expect("another process takes the parked file away");
+            }
+            std::fs::write(&at, again).expect("and writes the document again");
+        });
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "a document that was written again is told, not refused: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("its record is kept")),
+            "the removal says that the entry and its record stay: {:?}",
+            removed.retained
+        );
+        assert_held_and_finished(
+            &installer,
+            &params(amp(), InstallScope::User),
+            &document,
+            &removed,
+        );
+    }
+
+    /// KR-REQ-11.01: the same where the file that was taken out cannot go back because the document
+    /// was written again: the removal says where the file is kept, and the entry in the new
+    /// document, the host's and unchanged, stays with its record.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_written_again_while_a_file_cannot_go_back_keeps_the_entry_and_its_record() {
+        let tree = Tree::create();
+        let installer = amp_installed(&tree);
+        let folder = tree.home().join(".amp");
+        let document = folder.join("mcp.json");
+        let again = std::fs::read_to_string(&document)
+            .expect("the document")
+            .replacen('{', "{\n  \"theme\": \"dark\",", 1);
+        let (at, beside) = (document.clone(), folder.clone());
+        when_taken_out(".amp/mcp.json", move || {
+            std::fs::write(&at, again).expect("another process writes the document again");
+            for parked in temporary_entries(&beside) {
+                std::fs::write(parked, b"{}").expect("and changes the file that was taken out");
+            }
+        });
+        let removed = installer.remove(&params(amp(), InstallScope::User));
+        assert!(
+            removed.is_ok(),
+            "a file that cannot go back is told, not refused: {removed:?}"
+        );
+        let removed = removed.expect("a removal");
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("could not be put back")),
+            "the removal says where the file is kept: {:?}",
+            removed.retained
+        );
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("its record is kept")),
+            "and that the entry and its record stay: {:?}",
+            removed.retained
+        );
+        assert_held_and_finished(
+            &installer,
+            &params(amp(), InstallScope::User),
+            &document,
+            &removed,
         );
     }
 
