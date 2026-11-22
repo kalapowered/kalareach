@@ -1985,6 +1985,113 @@ mod tests {
         }
     }
 
+    /// KR-REQ-11.16, the bounded clause, for the file check: a read of the nominated file that
+    /// never returns is stopped waiting for at the check's declared bound, and the check answers
+    /// that it was not attempted, saying how long it waited, rather than holding the run.
+    ///
+    /// The read is given a stand-in that starts and then does not return for far longer than the
+    /// bound. The case reads the bound from the check's own declaration and holds the answer to it
+    /// from below and above, and checks whether the stand-in had finished when the check answered,
+    /// not only what the check said. Not shown here: a read that the filesystem itself never
+    /// finishes (the stand-in replaces the read, not the filesystem); the four checks that run a
+    /// program (the case above shows a facility that outlasts its bound is ended); and the control
+    /// daemon's own wait for the answer to a run of the checks.
+    #[test]
+    fn a_file_read_that_never_returns_is_stopped_waiting_for_at_the_checks_declared_bound() {
+        // A loaded machine starts a thread late, so the upper limit allows for it. A bound that
+        // was doubled would still be far outside it.
+        const SLACK: Duration = Duration::from_secs(5);
+        // Longer than the bound and the slack together, so a check that did not stop at its bound
+        // sees the stand-in return, and fails on what that makes of its answer.
+        const STAND_IN_STAYS: Duration = Duration::from_secs(20);
+
+        let root = kr_ipc::testing::PrivateTempDir::create();
+        let file = root.path().join("authorised.txt");
+        let plan = Plan {
+            authorised_file: Some(file.clone()),
+            ..Plan::in_directory(root.path().join("scratch"))
+        };
+        let bound = Check::AuthorisedFileRead.effects().bound;
+
+        let (started_tell, started) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (ended_tell, ended) = std::sync::mpsc::channel();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stand_in_finished = std::sync::Arc::clone(&finished);
+        let began = std::time::Instant::now();
+        let ran = read_authorised_file_by(&plan, move |path, bound| {
+            on_a_thread(path, bound, move |_| {
+                started_tell
+                    .send(())
+                    .expect("the case is waiting for the stand-in");
+                // Kept here until the case lets it go, or for the longest it stays.
+                let _ = released.recv_timeout(STAND_IN_STAYS);
+                stand_in_finished.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = ended_tell.send(());
+                Ok(FirstBlock::Read(0))
+            })
+        });
+        let elapsed = began.elapsed();
+
+        assert_eq!(ran.check, Check::AuthorisedFileRead);
+        assert_eq!(ran.facility, Some(file.display().to_string()));
+        let Outcome::NotAttempted { detail } = &ran.outcome else {
+            panic!(
+                "the file check did not answer that it was not attempted: {:?}",
+                ran.outcome
+            );
+        };
+        assert!(
+            elapsed >= bound,
+            "the file check answered after {elapsed:?}, before its declared bound of {bound:?}"
+        );
+        assert!(
+            elapsed < bound + SLACK,
+            "the file check waited {elapsed:?} for a read that was not coming, past its declared \
+             bound of {bound:?}"
+        );
+        let said = format!(
+            " had not been read after {} seconds, so this check stopped waiting for it; the read \
+             itself is the filesystem's to finish",
+            bound.as_secs()
+        );
+        assert!(
+            detail.as_str().ends_with(&said),
+            "the file check's answer does not say it waited {} seconds: {detail}",
+            bound.as_secs()
+        );
+        assert!(
+            started.try_recv().is_ok(),
+            "the stand-in read had not started when the check answered"
+        );
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the stand-in read had finished when the check answered, so the check did not stop at \
+             its bound"
+        );
+
+        let (state, source, reason) = judge(Check::AuthorisedFileRead, &ran.outcome);
+        assert_eq!(
+            state,
+            CapabilityState::TemporarilyUnavailable,
+            "a read that did not answer in its bound establishes nothing either way"
+        );
+        assert_eq!(source, CapabilityEvidenceSource::DisclosedProbe);
+        let reason = reason.expect("the evidence says why");
+        assert!(
+            reason
+                .as_str()
+                .starts_with("this check established nothing: "),
+            "{reason}"
+        );
+
+        // The thread the check left waiting ends when the stand-in is let go.
+        release.send(()).expect("the stand-in is still waiting");
+        ended
+            .recv_timeout(SLACK)
+            .expect("the stand-in read ended once it was let go");
+    }
+
     #[test]
     fn a_facility_that_failed_is_said_as_the_failure_and_the_measure_of_what_it_printed() {
         let said = "kr-marker-7c1e: no such thing";
