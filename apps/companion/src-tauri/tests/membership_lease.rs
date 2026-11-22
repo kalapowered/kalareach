@@ -3041,18 +3041,18 @@ async fn an_inbox_answer_a_slow_host_holds_has_nothing_of_a_host_whose_account_s
 
     // A second plain host is visited too, and the host in use stays the one it was. The member
     // host's connection is kept and answers at once; the plain host's visit is held after its read,
-    // outside the ten seconds a visit is bound to, so no time the case takes ends it.
+    // outside the ten seconds a visit is bound to, so no time the case takes ends it. The account
+    // leaves once the member host's own visit has read and checked its connection, which that
+    // visit's notice says, and not at the check of another host's.
     let _slow = rig.pairs_another_host().await;
     let member = rig.member_reference();
     let member_host = device
         .host_by_reference(&member)
         .expect("the member host is listed")
         .host_device_id;
-    let mut slow = holding_visits_but(desk.watch_visits(), member_host);
-    let asked = rig.control.asked_if_ended();
+    let (mut member_visit, mut slow) = holding_visits_but(desk.watch_visits(), member_host);
     let (rows, ()) = tokio::join!(desk.visit(&device), async {
-        // The member host's pass asks once, at its end, whether its connection ended.
-        rig.control.until_asked_if_ended(asked + 1).await;
+        member_visit_reached(&mut member_visit).await;
         let _ = rig
             .tokens
             .sign_out(|| Ok::<(), std::convert::Infallible>(()))
@@ -3085,22 +3085,37 @@ async fn an_inbox_answer_a_slow_host_holds_has_nothing_of_a_host_whose_account_s
 
 /// Holds every visit but the one to `member` at its hold, which is outside the ten seconds a visit is
 /// bound to, so that no time a case takes ends a slow host's visit: the member host's visit goes on,
-/// and the visits held are given in the order they reach the hold.
+/// and the visits held are given in the order they reach the hold. The first receiver is told each
+/// time the member host's visit reaches its hold, which is after its read ended and its connection
+/// was checked.
 fn holding_visits_but(
     mut visits: tokio::sync::mpsc::UnboundedReceiver<companion_tauri::inbox::testing::VisitHold>,
     member: kr_protocol::ids::DeviceId,
-) -> tokio::sync::mpsc::UnboundedReceiver<companion_tauri::inbox::testing::VisitHold> {
+) -> (
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+    tokio::sync::mpsc::UnboundedReceiver<companion_tauri::inbox::testing::VisitHold>,
+) {
+    let (told, member_reached) = tokio::sync::mpsc::unbounded_channel();
     let (held, reached) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(hold) = visits.recv().await {
             if hold.host == member {
                 hold.release();
+                let _ = told.send(());
             } else if let Err(unsent) = held.send(hold) {
                 unsent.0.release();
             }
         }
     });
-    reached
+    (member_reached, reached)
+}
+
+/// Waits until the member host's own visit has reached its hold.
+async fn member_visit_reached(reached: &mut tokio::sync::mpsc::UnboundedReceiver<()>) {
+    tokio::time::timeout(WATCHDOG, reached.recv())
+        .await
+        .expect("the member host's visit reaches its hold")
+        .expect("the notice is given");
 }
 
 /// The visit that `held` gives, once a visit reaches its hold.
@@ -3138,7 +3153,8 @@ async fn an_account_that_left_invalidates_the_hosts_earlier_cache() {
 
     // A second plain host is visited too, and its visit is held after its read, outside the ten
     // seconds a visit is bound to, so no time the case takes ends it; the member host's kept
-    // connection answers at once, and the account leaves after that and before the slow host's visit
+    // connection answers at once, and the account leaves once the member host's own visit has read
+    // and checked its connection, which that visit's notice says, and before the slow host's visit
     // goes on.
     let _slow = rig.pairs_another_host().await;
     let member_host = rig
@@ -3147,10 +3163,10 @@ async fn an_account_that_left_invalidates_the_hosts_earlier_cache() {
         .host_by_reference(&member)
         .expect("the member host is listed")
         .host_device_id;
-    let mut slow = holding_visits_but(rig.companion().inbox().watch_visits(), member_host);
-    let asked = rig.control.asked_if_ended();
+    let (mut member_visit, mut slow) =
+        holding_visits_but(rig.companion().inbox().watch_visits(), member_host);
     let pass = rig.companion().start_call("inbox_hosts", json!({}));
-    rig.control.until_asked_if_ended(asked + 1).await;
+    member_visit_reached(&mut member_visit).await;
     let _ = rig
         .tokens
         .sign_out(|| Ok::<(), std::convert::Infallible>(()))
