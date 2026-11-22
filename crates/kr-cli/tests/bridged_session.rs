@@ -2037,7 +2037,13 @@ fn enrolled_and_answering(world: &World, label: &str, access: &str, target: &str
 
 /// Refreshes `label` as `--json` and as lines of text.
 fn refreshed_both_ways(world: &World, label: &str) -> Told {
-    let document = world.refreshed(label);
+    let json = world.run(&["--json", "bridge", "refresh", label]);
+    assert!(
+        json.status.success(),
+        "{label}: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let document: Value = serde_json::from_slice(&json.stdout).expect("kr printed JSON");
     let said = world.run(&["bridge", "refresh", label]);
     assert!(
         said.status.success(),
@@ -2048,7 +2054,8 @@ fn refreshed_both_ways(world: &World, label: &str) -> Told {
     Told {
         lines: stdout.lines().map(str::to_owned).collect(),
         everything: format!(
-            "{document}{stdout}{}",
+            "{document}{}{stdout}{}",
+            String::from_utf8_lossy(&json.stderr),
             String::from_utf8_lossy(&said.stderr)
         ),
         document,
