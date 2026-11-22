@@ -21,12 +21,14 @@
  * first. It can complete another link of the line in place of one that the first completed, and a link that
  * stays short can end narrower than the first pass made it. A short link there can stay short where a joint
  * packing of the group would complete it, and a line packed earlier keeps its slack, so a later line's link
- * can stay short by less than that slack.
+ * can stay short where that slack's room would complete it; it then shares a gap in halves with a short
+ * neighbour and can end short by much more than the slack.
  *
  * In a row the packing completes as many short links as any assignment of such boxes can (the proof is a
  * case that compares it with an exhaustive search over many small random rows of one and of two lines). A
- * completed link has the least size, plus up to `SLACK` on a side from room that nothing else in its row or
- * line uses; it has what it lacks centred on its words where the neighbours allow it. Where only one of a
+ * completed link has the least size, plus under a 64th of a pixel from rounding what it lacks up to the
+ * grid, plus up to `SLACK` on a side from room that nothing else in its row or line uses; it has what it
+ * lacks centred on its words where the neighbours allow it. Where only one of a
  * completed link's neighbours in its line (in a row, in the row) is a short link that cannot be completed,
  * the completed link takes the least from that side and the rest from the other, so that the neighbour
  * keeps the gap. With such a neighbour on each side, it is centred where the room allows. A short link of
@@ -102,7 +104,8 @@ interface Slot {
 
 /**
  * The room of each of `items`, in order: none for a control and for a link that is as wide as `least`. `slack` is
- * the most that a completed link is given beyond the least size on each side, from room that nothing else uses.
+ * the most that a completed link is given beyond the least size on each side, from room that nothing else in its
+ * row or line uses.
  *
  * The links whose heights reach one another are one group. Where every two links of a group reach one another and
  * none lies over another's words (a line, or two neighbouring lines whose links stand apart), the group is one
