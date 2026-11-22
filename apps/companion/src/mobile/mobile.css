@@ -606,8 +606,8 @@
 /*
  * The conversation scrolls inside its pane, and the pane shows no scroll bar. A bar that is drawn over the
  * content keeps a strip at the pane's right edge that takes the hit of a touch and sends no click, so a
- * tap on words that end at the edge (a link's, flush with it) opens nothing. The other scrollers of this
- * sheet hide theirs for the same reason; the page needs no bar to scroll with a finger.
+ * tap on words that end at the edge (a link's, flush with it) opens nothing. The page needs no bar to
+ * scroll with a finger.
  */
 .m-pane {
   overflow-y: auto;

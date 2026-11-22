@@ -641,10 +641,18 @@ describe('the page’s keeping of the room', () => {
     stop()
   })
 
-  it('measures a message that is added, and the one whose words change, once for the frame', async () => {
-    const { pane: root, messages } = pane(1, (message) => {
+  it('measures a message that is added, and the one whose text changes, once for the frame', async () => {
+    const texts: Text[] = []
+    const { pane: root, messages } = pane(2, (message) => {
+      const text = document.createTextNode('words')
+      texts.push(text)
+      message.append(text)
       link(message, 100, 110)
     })
+    const [changed, unchanged] = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+    const widen = (element: HTMLElement | undefined, right: number): void => {
+      if (element !== undefined) words.set(element, { ...(words.get(element) ?? { left: 0, top: 0, right: 0, bottom: 0 }), right })
+    }
     const stop = startLinkFit(root)
     frame()
     setter.mockClear()
@@ -659,13 +667,51 @@ describe('the page’s keeping of the room', () => {
     expect(given(added.querySelector<HTMLElement>('.md-link') as HTMLElement).left, 'the added message’s link').toBeGreaterThan(0)
     expect(watched, 'the added message is watched for its size').toContain(added)
     expect(writes().length, 'the writes for the added message’s link').toBeGreaterThan(0)
+    // A message whose text changes is measured again, once for the frame, and a message that did not change is not read again:
+    // the words of a link are made wide in each, and only the one whose text changed gives up its room.
+    widen(changed, 300)
+    widen(unchanged, 300)
+    setter.mockClear()
+    const [text] = texts
+    if (text !== undefined) text.data = 'other words'
+    await mutations()
+    expect(frames.length, 'one frame asked for').toBe(1)
+    frame()
+    expect(given(changed), 'the message whose text changed, measured again: its wide link has no room').toEqual({ left: 0, right: 0 })
+    expect(given(unchanged).left, 'the message that did not change is not read again').toBeGreaterThan(0)
+    widen(unchanged, 110)
     // A link that no longer exists is not watched and the messages that are not changed are not read again.
     setter.mockClear()
     messages[0]?.remove()
     await mutations()
     frame()
     expect(watched, 'the message that left').not.toContain(messages[0])
+    expect(writes(), 'nothing is written for the messages that stay').toEqual([])
     stop()
+  })
+
+  it('measures every message again in the next frame when a font has arrived, and no more once it has stopped', () => {
+    const fonts = new EventTarget()
+    Object.defineProperty(document, 'fonts', { configurable: true, value: fonts })
+    try {
+      const { pane: root } = pane(2, (message) => {
+        link(message, 100, 110)
+      })
+      const stop = startLinkFit(root)
+      frame()
+      const links = Array.from(root.querySelectorAll<HTMLElement>('.md-link'))
+      // The font moves the words, so the room that was given is not what they need.
+      for (const each of links) words.set(each, { ...(words.get(each) ?? { left: 0, top: 0, right: 0, bottom: 0 }), right: 300 })
+      fonts.dispatchEvent(new Event('loadingdone'))
+      expect(frames.length, 'one frame asked for').toBe(1)
+      frame()
+      for (const each of links) expect(given(each), 'every message, measured again').toEqual({ left: 0, right: 0 })
+      stop()
+      fonts.dispatchEvent(new Event('loadingdone'))
+      expect(frames.length, 'no frame asked for once it has stopped').toBe(0)
+    } finally {
+      Reflect.deleteProperty(document, 'fonts')
+    }
   })
 
   it('measures every message again when the pane is resized, and the one whose size changed alone when it is', () => {
