@@ -736,6 +736,28 @@ stage, the handle once published, and the words that say what is wrong); `upload
 `upload.status` first, never cancels a published upload and answers from the host's answer.
 A device holds at most two open uploads on a host, which is the host's own bound.
 
+On a host whose grant answers to an organisation, an upload, its copy and a draft belong to the
+account signed in when they were made: the entry carries the account's mark, a digest that says
+nothing of who the account is. Apart from the freeing described below, the desk reads, shows,
+resumes, cancels and removes only the entries of the account signed in at the moment of each call,
+and an upload never resumes on a connection of another account. Another account's entries stay on
+the device, hidden, and come back when that account signs in again. The host counts a device's open
+uploads and drafts across all of the device's accounts, so another account's paused upload can hold
+one of the device's two places. When the host refuses a begin for that count
+(`RESOURCE_UNAVAILABLE`), the desk cancels the places other accounts hold, once, and tries the begin
+once more; a refusal for the file's size or the staged bytes (`QUOTA_EXCEEDED`) frees nothing. A
+draft the host refuses for its count of drafts is handled the same way, with other accounts' drafts
+discarded instead of cancelled.
+
+Every command of the page that reads or changes an upload or a draft carries the mark of the account
+the page made it under. On a host that answers to an organisation, a command whose mark is missing
+or is not the signed-in account's is refused at its entry with the sign-in sentence, even when no
+connection is held.
+
+A cancel asked while no connection to the host is open is kept in the entry and finished once the
+host can be reached, unless the host already has the whole file, which the row then says; until then
+the row says that the cancel was asked.
+
 **The store of open transfers, version 1.** `open-transfers/<key>.upload` is one JSON entry for each
 upload, with exactly the members it names; `<key>.bytes` is the copy of a file the page handed over.
 The entry is written before the call that needs it: before the reservation is asked for, when the
@@ -761,6 +783,17 @@ when the host performed it, with a result or a receipt that says applied; an out
 leaves the entry, and the files bound to it, as they were.
 `draft.discard` ends the draft when the composer drops its files unsent (`draft_end`); the host
 cannot take one file off a draft.
+
+A draft entry this device cannot read, because another release wrote it or because it is damaged, is
+a failed read and not an absent draft: `draft_create` refuses it, and the page keeps that session's
+files hidden and holds a prompt that names the draft until the draft can be read.
+
+When the signed-in account changes, a sign-out included, a window whose last connection was to a
+host that answers to an organisation takes that host's files off its composers, keeps the text of
+each draft, discards nothing the application keeps for the host or the device, and, when it removed
+any, says so once. Drafts of the host on this computer are left alone, except that a card still
+going up is taken whatever its host. The files of the account now signed in are read back from the
+application and shown again.
 
 The phone's picker hands the application at most 64 MiB (`MAX_HANDED_BYTES`), whatever the host's
 2 GiB bound on one upload.
