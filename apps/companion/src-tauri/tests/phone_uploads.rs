@@ -2536,7 +2536,9 @@ async fn kr_req_13_12_a_cancel_that_lands_after_the_published_write_ends_the_upl
 }
 
 /// The cancel of `key` is started with no connection, polled to its wait for the sender that is held
-/// at the journal step that keeps the host's identifier, and dropped.
+/// at the journal step that keeps the host's identifier, and dropped. It answers once the stopped
+/// sender has ended, and the hold that counts the barriers' ends: a case settles on whichever of
+/// that and the desk's idle state its red cannot remove.
 async fn dropped_cancel_with_a_held_sender(
     adopted: &Adopted,
     phone: &Phone,
@@ -2552,6 +2554,7 @@ async fn dropped_cancel_with_a_held_sender(
     let held = testing::hold_at(key, Point::Writing(Step::Begun));
     let waiting = testing::hold_at(key, Point::CancelWaiting);
     let exited = testing::hold_at(key, Point::SenderExit);
+    let decided = testing::hold_at(key, Point::DecisionDone);
     let paired = paired_of(companion).await;
     let (session, who) = (Arc::clone(&paired.session), paired.who());
     let sent = request(adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
@@ -2580,11 +2583,8 @@ async fn dropped_cancel_with_a_held_sender(
     cancelling.abort();
     held.release();
     exited.until_passed(1).await;
-    tokio::time::timeout(WATCHDOG, desk.idle())
-        .await
-        .expect("the desk's own tasks end: no decision hands the key on for ever");
     sending.abort();
-    (desk, key, who, exited)
+    (desk, key, who, decided)
 }
 
 /// KR-REQ-13.12 (A4a): a caller that is dropped while its cancel waits for the sender abandons
@@ -2595,6 +2595,11 @@ async fn kr_req_13_12_a_dropped_caller_abandons_nothing() {
     let (phone, control) = phone_for(&adopted).await;
     let (desk, key, who, _) =
         dropped_cancel_with_a_held_sender(&adopted, &phone, &control, true).await;
+    // The sender is over; the desk's own task finishes the stop. With the barrier in the caller's
+    // future nothing is counted and the desk is idle at once, so the assertion below is the red.
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end: no decision hands the key on for ever");
     assert_eq!(
         desk.phase_for_test(key),
         Some("paused"),
@@ -2619,8 +2624,13 @@ async fn kr_req_13_12_a_cancel_whose_caller_was_dropped_is_finished_by_the_attem
 
     let adopted = Adopted::start(1).await;
     let (phone, control) = phone_for(&adopted).await;
-    let (desk, key, _, _) =
+    let (desk, key, _, decided) =
         dropped_cancel_with_a_held_sender(&adopted, &phone, &control, false).await;
+    // The barrier's end is the settlement: a barrier without the attempt ends too, and hands the key
+    // on, so the assertions below fail by what they read and not by a wait.
+    tokio::time::timeout(WATCHDOG, decided.until_passed(1))
+        .await
+        .expect("the barrier of the dropped cancel ends");
     assert_eq!(desk.held_count_for_test(), 0, "the upload is gone");
     assert_eq!(desk.phase_for_test(key), None);
     assert_eq!(
@@ -2728,6 +2738,364 @@ async fn kr_req_13_12_an_early_return_after_the_stop_is_resolved() {
         .expect("the send answers")
         .expect("the task ran")
         .expect("the resolved upload goes on and publishes");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (A2, defensive): a `finish_asked` called at desk level meets a sender held at the
+/// published write, as no production path does (the reach takes only paused uploads), and ends the
+/// upload as a cancel does: the held upload is gone, the entry stays, and the send answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_finish_asked_meets_a_sender_held_at_the_published_write() {
+    use testing::{Point, Step};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    let written = testing::hold_at(key, Point::Writing(Step::Published));
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let paired = paired_of(companion).await;
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    written.until_passed(1).await;
+    let finishing = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.finish_asked(&paired, key).await })
+    };
+    waiting.until_passed(1).await;
+    written.release();
+    let answer = tokio::time::timeout(WATCHDOG, finishing)
+        .await
+        .expect("the finish is answered")
+        .expect("the task ran")
+        .expect("the finish finds the upload");
+    assert_eq!(answer.state, "published");
+    // Before the send is awaited: nothing is held, nothing is stopping, the entry stays.
+    assert_eq!(desk.held_count_for_test(), 0, "the upload is ended");
+    assert_eq!(desk.phase_for_test(key), None);
+    assert_eq!(entries_in(&folder(&phone)), 1, "the entry stays");
+    assert_eq!(copies_in(&folder(&phone)), 0, "the copy is gone");
+    let handle = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect("the send answers with the handle");
+    assert_eq!(handle.byte_len.get(), bytes.len() as u64);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (A4c): a panic inside the work of a barrier is caught inside the owner task: the
+/// attempt and the decision still run, the caller is answered only after them, and the answer is
+/// `asked`. The case holds the barrier at the end of its attempt: the caller has no answer yet, and
+/// the host has been told already.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_panic_in_the_work_of_a_barrier_is_recovered_before_the_caller_is_answered()
+{
+    use kr_protocol::method::Method;
+    use testing::{Awaited, Fault, Point, Step};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    let held = testing::hold_at(key, Point::Writing(Step::Begun));
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    let _armed = testing::arm(key, Fault::PanicInWork);
+    let paired = paired_of(companion).await;
+    let who = paired.who();
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    held.until_passed(1).await;
+    let cancelling = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.cancel(who, None, key).await })
+    };
+    waiting.until_passed(1).await;
+    held.release();
+    // A barrier has made its attempt and has not decided: the recovery ran, and the caller waits.
+    tail.until_arrived(1).await;
+    assert!(
+        !cancelling.is_finished(),
+        "the caller is answered after the recovery, not when the work panicked"
+    );
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the attempt told the host"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 0, "the entry is gone");
+    tail.release();
+    let answer = tokio::time::timeout(WATCHDOG, cancelling)
+        .await
+        .expect("the cancel is answered")
+        .expect("the task ran")
+        .expect("a panicked barrier answers asked");
+    assert_eq!(answer.state, "asked");
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end");
+    assert_eq!(desk.held_count_for_test(), 0, "the upload is over");
+    sending.abort();
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (M1): two restarts that read the same asked cancel at once finish it once. The cancel
+/// an earlier process recorded while the host was out of reach is finished by the first of them in
+/// its key's turn, and the second finds nothing to cancel: the host is told once and no entry is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_two_quick_restarts_finish_an_asked_cancel_once_and_leave_nothing_stuck() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let bytes = pattern(5);
+    let old = Arc::clone(&paired_of(companion).await.session);
+    let (key, first, who) = left_paused(&adopted, &phone, &control, &bytes).await;
+    let asked = first
+        .cancel(who.clone(), None, key)
+        .await
+        .expect("the earlier process records the cancel");
+    assert_eq!(asked.state, "asked");
+
+    // The phone reaches the host: its own reach restarts the desk, and this is a second reach.
+    control.stop_holding();
+    control.release_all();
+    let newer = on_another_connection(companion, &old).await;
+    let desk = desk_of(companion);
+    desk.restart(newer).await;
+    desk.idle().await;
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host is told once"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 0, "no entry is left");
+    assert_eq!(host_open(&control), 0, "the host holds nothing");
+    assert_eq!(desk.held_count_for_test(), 0);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (T1): a second replacement of the connection that comes during the attempt's call
+/// to the host is served. The attempt's status read is held before it is sent and then fails; the
+/// desk was told of a newer connection of the account meanwhile, so a fresh decision finishes the
+/// cancel on it: the host is told once and the upload and its entry are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_second_replacement_during_the_attempts_host_call_is_served() {
+    use kr_protocol::method::Method;
+    use testing::{Point, Step};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    let held = testing::hold_at(key, Point::Writing(Step::Begun));
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let paired = paired_of(companion).await;
+    let who = paired.who();
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    held.until_passed(1).await;
+    // The attempt's status read is held before it is sent, and its answer is lost: the call fails.
+    control.lose_only_the_answer_after(control.sent(Method::UploadStatus), Method::UploadStatus);
+    control.hold_next_request(Method::UploadStatus);
+    let cancelling = {
+        let desk = Arc::clone(&desk);
+        tokio::spawn(async move { desk.cancel(who, None, key).await })
+    };
+    waiting.until_passed(1).await;
+    held.release();
+    control.until_request_held().await;
+    // During the hold the desk is told of a newer connection of the account.
+    desk.host_reached(Paired {
+        link: paired.link + 1_000,
+        ..paired.clone()
+    });
+    control.release_request();
+    let answer = tokio::time::timeout(WATCHDOG, cancelling)
+        .await
+        .expect("the cancel is answered")
+        .expect("the task ran")
+        .expect("the cancel finds the upload");
+    assert_eq!(answer.state, "asked", "the first attempt failed");
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end");
+    assert_eq!(
+        desk.held_count_for_test(),
+        0,
+        "the fresh decision finished the cancel on the newer connection"
+    );
+    assert_eq!(desk.phase_for_test(key), None);
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host is told once"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 0);
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends")
+        .expect("the task ran")
+        .expect_err("cancelled");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (T2): a reach between a barrier's attempt and its decision is served. A finish that
+/// finds no cancel recorded stops the sender and refuses; held at the end of its attempt, the desk is
+/// told of a newer connection of the account; the decision then starts the upload on that one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reach_between_the_attempt_and_the_decision_is_served() {
+    use testing::{Awaited, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    let paired = paired_of(companion).await;
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    gate.reached().await;
+    let finishing = {
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.finish_asked(&paired, key).await })
+    };
+    waiting.until_passed(1).await;
+    gate.release();
+    tail.until_arrived(1).await;
+    let newer = Paired {
+        link: paired.link + 1_000,
+        ..paired
+    };
+    desk.host_reached(newer.clone());
+    tail.release();
+    let refused = tokio::time::timeout(WATCHDOG, finishing)
+        .await
+        .expect("the finish is answered")
+        .expect("the task ran");
+    assert!(refused.is_err(), "no cancel was recorded for the key");
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end");
+    assert_eq!(
+        desk.resumed_on_for_test(key),
+        Some(newer.link),
+        "the decision started the upload on the connection that came during the attempt"
+    );
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect("the resumed upload publishes");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (C2): a connection of another account that reaches while a cancel waits for the
+/// sender is not used for the cancel. The newest connection is another account's, so the attempt and
+/// the decision leave the cancel asked and the upload paused; the account's own reach finishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_connection_of_another_owner_reaching_during_the_cancel_is_not_used() {
+    use kr_protocol::method::Method;
+    use testing::{Point, Step};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let bytes = pattern(5);
+    let key = kr_ipc::new_uuid();
+    let held = testing::hold_at(key, Point::Writing(Step::Begun));
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let paired = paired_of(companion).await;
+    let who = paired.who();
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    held.until_passed(1).await;
+    let cancelling = {
+        let (desk, who) = (Arc::clone(&desk), who.clone());
+        tokio::spawn(async move { desk.cancel(who, None, key).await })
+    };
+    waiting.until_passed(1).await;
+    // During the join another account of the device reaches the host on a newer connection.
+    desk.host_reached(Paired {
+        account: Some(kr_client::services::AccountMark::from_bytes([7; 32])),
+        link: paired.link + 1_000,
+        ..paired.clone()
+    });
+    held.release();
+    let answer = tokio::time::timeout(WATCHDOG, cancelling)
+        .await
+        .expect("the cancel is answered")
+        .expect("the task ran")
+        .expect("the cancel finds the upload");
+    assert_eq!(
+        answer.state, "asked",
+        "no connection of the upload's account"
+    );
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end");
+    assert_eq!(desk.phase_for_test(key), Some("paused"));
+    assert!(
+        desk.open(&who)
+            .iter()
+            .any(|view| view.state == companion_tauri::open_transfers::OpenState::CancelAsked),
+        "the cancel is kept"
+    );
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        0,
+        "the other account's connection was not used"
+    );
+    // The upload's own account reaches the host: the paused loop finishes the cancel.
+    desk.host_reached(Paired {
+        link: paired.link + 2_000,
+        ..paired
+    });
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end");
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        1,
+        "the host is told once"
+    );
+    assert_eq!(desk.held_count_for_test(), 0);
+    assert_eq!(entries_in(&folder(&phone)), 0);
+    let told = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send ends")
+        .expect("the task ran")
+        .expect_err("cancelled");
+    assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
     adopted.stop().await;
 }
 
