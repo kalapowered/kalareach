@@ -1143,7 +1143,7 @@ async fn kr_req_13_13_a_draft_outlives_the_host_being_out_of_contact_and_follows
 
     // The host stops answering and the connection for the host alone ends.
     control.unreachable(true);
-    let (_, _, main) = companion
+    let (_, _, main, _) = companion
         .app
         .state::<companion_tauri::AppState>()
         .paired_snapshot()
@@ -1733,7 +1733,7 @@ async fn kr_req_01_01_a_phone_that_exited_finds_the_session_it_left_and_attaches
         .call("terminal_view_close", json!({ "view": view }))
         .expect("the view closes");
     leave(first, session, "first-run");
-    let (_, _, main) = first
+    let (_, _, main, _) = first
         .app
         .state::<companion_tauri::AppState>()
         .paired_snapshot()
@@ -3075,7 +3075,7 @@ async fn kr_req_19_08_a_question_is_answered_on_the_screens_link_while_the_main_
 
     // The host cannot be reached again, and the connection for the host alone ends.
     control.unreachable(true);
-    let (_, _, main) = companion
+    let (_, _, main, _) = companion
         .app
         .state::<companion_tauri::AppState>()
         .paired_snapshot()

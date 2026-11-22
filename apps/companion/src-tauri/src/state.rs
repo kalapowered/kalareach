@@ -293,13 +293,14 @@ impl AppState {
     /// paired device.
     pub fn paired_snapshot(
         &self,
-    ) -> Result<(kr_protocol::ids::DeviceId, EnvironmentId, Arc<Session>)> {
-        let (device_id, environment_id, session, _) = self.paired_parts()?;
-        Ok((device_id, environment_id, session))
+    ) -> Result<(kr_protocol::ids::DeviceId, EnvironmentId, Arc<Session>, u64)> {
+        let (device_id, environment_id, session, _, link) = self.paired_parts()?;
+        Ok((device_id, environment_id, session, link))
     }
 
     /// The device, the environment and the session of the connection to a paired host, read
-    /// together, and whether the host's grant answers to an organisation.
+    /// together, whether the host's grant answers to an organisation, and the number the contact
+    /// owner installed the connection as.
     fn paired_parts(
         &self,
     ) -> Result<(
@@ -307,9 +308,12 @@ impl AppState {
         EnvironmentId,
         Arc<Session>,
         bool,
+        u64,
     )> {
-        let held = self.contact.held();
-        let connection = held.as_ref().ok_or_else(CommandError::not_connected)?;
+        let (link, connection) = self
+            .contact
+            .installed()
+            .ok_or_else(CommandError::not_connected)?;
         match connection.standing() {
             Standing::Paired {
                 device_id, host, ..
@@ -318,6 +322,7 @@ impl AppState {
                 connection.environment_id(),
                 connection.session(),
                 host.proposed_grant.organisation.as_ref().is_some(),
+                link,
             )),
             Standing::Owner => Err(CommandError::refused(
                 "this application is the owner of the host it is connected to, not a paired device",
@@ -334,13 +339,14 @@ impl AppState {
     /// As [`Self::paired_snapshot`], and a refusal when the host answers to an organisation and no
     /// account is signed in.
     pub async fn paired(&self) -> Result<crate::open_transfers::Paired> {
-        let (device_id, environment_id, session, organisation) = self.paired_parts()?;
+        let (device_id, environment_id, session, organisation, link) = self.paired_parts()?;
         let account = self.account_of(organisation).await?;
         Ok(crate::open_transfers::Paired {
             device_id,
             environment_id,
             account,
             session,
+            link,
         })
     }
 
@@ -354,7 +360,7 @@ impl AppState {
     /// As [`Self::paired_snapshot`] when there is no paired host to read.
     pub async fn paired_who(&self) -> Result<crate::open_transfers::Who> {
         match self.paired_parts() {
-            Ok((device_id, environment_id, _, organisation)) => Ok(crate::open_transfers::Who {
+            Ok((device_id, environment_id, _, organisation, _)) => Ok(crate::open_transfers::Who {
                 device_id,
                 environment_id: Some(environment_id),
                 account: self.account_of(organisation).await?,
@@ -389,7 +395,7 @@ impl AppState {
     /// answer holds while the connection is down.
     fn organisation_host(&self) -> bool {
         match self.paired_parts() {
-            Ok((_, _, _, organisation)) => organisation,
+            Ok((_, _, _, organisation, _)) => organisation,
             Err(_) => self
                 .paired_context()
                 .is_some_and(|context| context.host.proposed_grant.organisation.as_ref().is_some()),
@@ -411,17 +417,18 @@ impl AppState {
     pub async fn paired_for(&self, mark: Option<&str>) -> Result<crate::open_transfers::Paired> {
         let parts = self.paired_parts();
         let organisation = match &parts {
-            Ok((_, _, _, organisation)) => *organisation,
+            Ok((_, _, _, organisation, _)) => *organisation,
             Err(_) => self.organisation_host(),
         };
         let account = self.account_of(organisation).await?;
         stamp_matches(organisation, account, mark)?;
-        let (device_id, environment_id, session, _) = parts?;
+        let (device_id, environment_id, session, _, link) = parts?;
         Ok(crate::open_transfers::Paired {
             device_id,
             environment_id,
             account,
             session,
+            link,
         })
     }
 

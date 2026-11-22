@@ -3023,7 +3023,7 @@ pub async fn voice_allow(
         .collect::<Result<Vec<kr_protocol::ids::SessionId>>>()?;
     // One connection's identity, environment and session, so the grant cannot name a device of one
     // host and be sent to another.
-    let (device_id, environment_id, session) = state.paired_snapshot()?;
+    let (device_id, environment_id, session, _) = state.paired_snapshot()?;
     if allowed.environment_id != environment_id.to_string() {
         return Err(CommandError::refused(
             "this was shown for another host than the one this application is connected to now: \

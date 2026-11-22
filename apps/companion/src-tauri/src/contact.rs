@@ -653,6 +653,15 @@ impl State {
         }
     }
 
+    /// Puts `connection` in the slot and moves the number of the installed connection on, and
+    /// answers the number. Every installation goes through here, so the number is the order of the
+    /// installations of this owner, which no emptied slot and no replacement lowers or repeats.
+    fn install(&mut self, connection: Connection, disposal: &mut Disposal) -> u64 {
+        disposal.connection(self.slot.replace(Held::new(connection)));
+        self.link += 1;
+        self.link
+    }
+
     fn free_for(&self, last: Option<&Arc<Session>>) -> bool {
         match (&self.slot, last) {
             (None, _) => true,
@@ -810,8 +819,8 @@ pub enum Finish {
 
 /// What an attempt that reached a host came to.
 pub enum Reach {
-    /// The connection is the one held.
-    Reached,
+    /// The connection is the one held, installed as this number.
+    Reached(u64),
     /// Another host was chosen, or this one forgotten, since: the connection is given back.
     StaleChoice(Connection),
     /// A different connection is held: the connection is given back.
@@ -844,6 +853,8 @@ pub enum Adopt {
         events: broadcast::Receiver<Notification>,
         /// The revision its installation was published as.
         revision: u64,
+        /// The number it was installed as.
+        link: u64,
     },
 }
 
@@ -1143,11 +1154,10 @@ impl ContactOwner {
             if !state.free_for(last) {
                 return Reach::SlotBusy(connection);
             }
-            disposal.connection(state.slot.replace(Held::new(connection)));
-            state.link += 1;
+            let link = state.install(connection, disposal);
             state.reason = None;
             state.apply(Outcome::InContact);
-            Reach::Reached
+            Reach::Reached(link)
         })
     }
 
@@ -1223,9 +1233,8 @@ impl ContactOwner {
                 disposal.receivers.push(Held::new(events));
                 return false;
             }
-            disposal.connection(state.slot.replace(Held::new(fresh)));
+            state.install(fresh, disposal);
             disposal.sessions.push(Arc::clone(withdrawn));
-            state.link += 1;
             state.replaced += 1;
             // The withdrawn connection's results are not valid on the new one.
             if let Some(key) = state.in_use {
@@ -1276,6 +1285,7 @@ impl ContactOwner {
             connection: held.get().clone(),
             events: adoption.events.into_inner(),
             revision: adoption.revision,
+            link: state.link,
         }
     }
 
@@ -1640,6 +1650,17 @@ impl ContactOwner {
     #[must_use]
     pub fn held(&self) -> Option<Connection> {
         self.lock().slot.as_ref().map(|held| held.get().clone())
+    }
+
+    /// The connection held and the number it was installed as, read together under one lock, so a
+    /// later read is never paired with an older connection.
+    #[must_use]
+    pub fn installed(&self) -> Option<(u64, Connection)> {
+        let state = self.lock();
+        state
+            .slot
+            .as_ref()
+            .map(|held| (state.link, held.get().clone()))
     }
 
     /// The choice in force and the connection held, read together. A reader that must ask
@@ -2082,11 +2103,19 @@ pub mod testing {
             });
         }
 
+        /// Moves the number of the installed connection on, as an installation does, and answers
+        /// it: a suite that makes a connection of its own for a desk that also hears this owner's
+        /// connections takes its number from the same count.
+        pub fn take_link_for_test(&self) -> u64 {
+            let mut state = self.lock();
+            state.link += 1;
+            state.link
+        }
+
         /// Installs `connection` as the one held, with no host in use.
         pub fn install(&self, connection: Connection) -> super::Disposal {
             self.commit(|state, disposal| {
-                disposal.connection(state.slot.replace(Held::new(connection)));
-                state.link += 1;
+                state.install(connection, disposal);
                 state.reason = None;
             })
             .disposal
@@ -2321,8 +2350,50 @@ pub mod tests {
         let (held, closed) = connection(byte);
         let session = held.session();
         let reached = owner.reached(choice, None, held);
-        assert!(matches!(reached.value, Reach::Reached));
+        assert!(matches!(reached.value, Reach::Reached(_)));
         (choice, session, closed)
+    }
+
+    /// D1: the number of the installed connection rises at every installation, through a reach, a
+    /// replacement and a reach after the choice emptied the slot, and is never used twice; the
+    /// connection comes with its own number.
+    #[tokio::test]
+    async fn link_rises_at_every_install_and_is_not_reused() {
+        let owner = ContactOwner::new();
+        let choice = owner.choose(&Target::Local, "links").value;
+        let (first, _) = connection(1);
+        let first_session = first.session();
+        let Reach::Reached(one) = owner.reached(choice, None, first).value else {
+            panic!("the first connection is installed");
+        };
+        let (second, _) = connection(2);
+        let second_session = second.session();
+        let Reach::Reached(two) = owner.reached(choice, Some(&first_session), second).value else {
+            panic!("the second connection is installed after the first");
+        };
+        let (third, _) = connection(3);
+        let third_session = third.session();
+        let events = third.session().events();
+        assert!(owner.replaced(&second_session, third, events).value);
+        let replaced = owner.installed().expect("the replacement is held");
+        assert!(Arc::ptr_eq(&replaced.1.session(), &third_session));
+        let emptied = owner.choose(&Target::Local, "links again").value;
+        assert!(
+            owner.installed().is_none(),
+            "a new choice empties the slot and the number goes on"
+        );
+        let (fourth, _) = connection(4);
+        let fourth_session = fourth.session();
+        let Reach::Reached(four) = owner.reached(emptied, None, fourth).value else {
+            panic!("the fourth connection is installed after the slot was emptied");
+        };
+        let held = owner.installed().expect("the fourth connection is held");
+        assert!(Arc::ptr_eq(&held.1.session(), &fourth_session));
+        assert_eq!(
+            (one, two, replaced.0, four, held.0),
+            (one, one + 1, one + 2, one + 3, one + 3),
+            "each installation takes the next number and the connection read carries its own"
+        );
     }
 
     #[tokio::test]
@@ -2333,7 +2404,7 @@ pub mod tests {
         assert_eq!(chosen.revision, 1);
         let (held, _) = connection(1);
         let reached = owner.reached(chosen.value, None, held);
-        assert!(matches!(reached.value, Reach::Reached));
+        assert!(matches!(reached.value, Reach::Reached(_)));
         assert_eq!(reached.revision, 2);
         assert_eq!(revisions(&owner.since(0)), [1, 2]);
         assert_eq!(owner.snapshot().revision, 2);
@@ -2732,7 +2803,7 @@ pub mod tests {
         );
         let (held, _) = connection(1);
         let reached = owner.reached(choice, None, held);
-        assert!(matches!(reached.value, Reach::Reached));
+        assert!(matches!(reached.value, Reach::Reached(_)));
         assert_eq!(owner.snapshot().contact, HostContact::InContact);
         drop(reached);
         now.store(3_000, Ordering::SeqCst);
@@ -3104,7 +3175,7 @@ pub mod tests {
         let session = held.session();
         assert!(matches!(
             owner.reached(choice, None, held).value,
-            Reach::Reached
+            Reach::Reached(_)
         ));
         (choice, session)
     }
@@ -3173,7 +3244,7 @@ pub mod tests {
         let (third, _) = connection(3);
         assert!(matches!(
             owner.reached(choice, None, third).value,
-            Reach::Reached
+            Reach::Reached(_)
         ));
         assert_eq!(
             owner.read_finished(&ticket, refused_read()).value,

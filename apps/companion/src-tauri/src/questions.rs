@@ -345,7 +345,7 @@ impl Route {
             main: state
                 .paired_snapshot()
                 .ok()
-                .map(|(_, environment_id, session)| (environment_id, session)),
+                .map(|(_, environment_id, session, _)| (environment_id, session)),
         }
     }
 }
