@@ -241,7 +241,7 @@ describe('the store reads the application, and the application is the one that s
           replies.push({ resolve })
         })
     )
-    return { uploads: new PairedUploads(port, 60_000), scripted: controls.pairedUploads, open, replies, real }
+    return { uploads: new PairedUploads(port, 60_000), port, scripted: controls.pairedUploads, open, replies, real }
   }
 
   it('Z2: an older empty list does not delete the row of an upload the application still holds', async () => {
@@ -276,6 +276,49 @@ describe('the store reads the application, and the application is the one that s
     scripted.refuse('k-9', refusal)
     await uploads.restore()
     expect(uploads.snapshot().get('k-9')).toBeUndefined()
+  })
+
+  it('Z3: a failure whose status read ends after the person cancelled does not replace the cancel', async () => {
+    // The person's cancel is pressed while the failure reads what the application keeps. Its answer
+    // comes before the older list reply, or after it.
+    const run = async (state: 'cancelling' | 'cancelled' | 'asked', expected: object) => {
+      const { uploads, port, scripted, replies, real } = held()
+      const answers: ((answered: UploadCancelled) => void)[] = []
+      vi.spyOn(port, 'uploadCancel').mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            answers.push(resolve)
+          })
+      )
+      const sent = uploads.send({ key: 'k-10', sessionId: 's-1', subject, file }, () => Promise.resolve())
+      const failed = sent.catch(() => undefined)
+      await wait(() => scripted.started.length === 1)
+      scripted.refuseRetaining('k-10', refusal)
+      // The failure reads what the application keeps, and the read is held.
+      await wait(() => replies.length === 1)
+      const cancelling = uploads.cancel('k-10')
+      expect(uploads.snapshot().get('k-10')?.phase).toEqual({ kind: 'cancelling' })
+      const reply = (said: UploadCancelled['state']) =>
+        answers[0]?.({ key: 'k-10', state: said, releasedByteLen: said === 'cancelled' ? '10' : null, handle: null, said: null })
+      if (state !== 'cancelling') {
+        reply(state)
+        await cancelling
+      }
+      // The application lists the upload as failed, in a reply to a read that began before the cancel.
+      replies[0]?.resolve(await real())
+      await failed
+      expect(uploads.snapshot().get('k-10')?.phase).toEqual(expected)
+      expect(uploads.snapshot().get('k-10')?.awaited).toBe(false)
+      if (state === 'cancelling') {
+        // The cancel's own answer still applies.
+        reply('cancelled')
+        await cancelling
+        expect(uploads.snapshot().get('k-10')?.phase).toEqual({ kind: 'cancelled', released: '10' })
+      }
+    }
+    await run('cancelling', { kind: 'cancelling' })
+    await run('cancelled', { kind: 'cancelled', released: '10' })
+    await run('asked', { kind: 'cancelAsked', said: null })
   })
 
   it('stops asking once the list is read and the application keeps nothing of the refused file', async () => {

@@ -381,7 +381,12 @@ export class PairedUploads {
             // says of it, so that it can be cancelled; only an upload it keeps nothing of is refused.
             const kept = await this.#kept(key)
             still()
-            if (kept === UNREAD) {
+            const now = this.#rows.get(key)?.phase.kind
+            if (now === 'cancelling' || now === 'cancelAsked' || now === 'cancelled') {
+              // The person cancelled while the status was read: the cancel has the row, and the
+              // status, read before it, does not replace it.
+              this.#patch(key, { awaited: false })
+            } else if (kept === UNREAD) {
               // Not knowing is not the same as nothing kept: the row says what was refused, and the
               // next read of the list decides whether the application holds the upload.
               this.#patch(key, { phase: { kind: 'refused', refusal }, unread: true, awaited: false })
