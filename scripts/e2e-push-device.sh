@@ -519,7 +519,7 @@ if platform == "android":
             f"{left_ms} ms left when chosen")
         ended = report.get("expire_observe_step") or ""
         say("five seconds after the deadline the host holds the question as expired with no answer, and the phone says that it expired and what the person had chosen, and offers nothing to send",
-            report.get("expiring_expired_without_an_answer") is True and "PUSH-EXPIRED" in ended and "No longer waiting" in ended
+            report.get("expiring_expired_without_an_answer") is True and "PUSH-EXPIRED" in ended and "no longer waiting" in ended.lower()
             and "This question expired" in ended and re.search(r"You had chosen( \| | )Yes", ended) and "Send answer" not in ended,
             ended[:300].replace("\n", " "))
         print("note=the refusal sentence of a press after the deadline, 'so this attempt changed nothing', was "

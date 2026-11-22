@@ -146,6 +146,8 @@ def choose(phone: Phone, words: str, choice: str, blind: bool) -> None:
     else:
         print(f"PUSH-NOTE the sheet was not in the tree; {choice} was pressed where the form draws it", flush=True)
         tap_at(phone, SHEET_CHOICES[choice.lower()])
+    # The page draws the choice after the press, so the picture waits for it.
+    time.sleep(1.5)
     phone.shot("chosen")
     print(f"PUSH-CHOSEN {texts(phone)}", flush=True)
 
