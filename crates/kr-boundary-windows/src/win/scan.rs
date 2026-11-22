@@ -43,6 +43,9 @@ const _: () = assert!(
     "the list's layout is the 64-bit one"
 );
 
+/// The error that says no process has the number: the process ended after the list was read.
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
 /// What the scan needs to know of the invocation.
 pub struct Facts<'a> {
     /// The invocation's group: a process whose token carries it belongs to the invocation.
@@ -211,8 +214,6 @@ fn look(pid: u32) -> Result<Handle> {
 /// Returns the platform's error when the process exists and cannot be looked at, or its creation
 /// time cannot be read: the answer is then not known.
 pub fn is_alive(pid: u32, created: u64) -> Result<bool> {
-    /// The error that says no process has this number.
-    const ERROR_INVALID_PARAMETER: u32 = 87;
     match look(pid) {
         Ok(process) => Ok(created_of(&process)? == created),
         Err(failure) if failure.code == ERROR_INVALID_PARAMETER => Ok(false),
@@ -220,7 +221,8 @@ pub fn is_alive(pid: u32, created: u64) -> Result<bool> {
     }
 }
 
-/// Looks at every process of the machine and reports what it is told to report.
+/// Looks at every process of the machine and reports what it is told to report. A process that
+/// ended after the list was read is gone and is no report; one that refuses the limited look is.
 ///
 /// # Errors
 ///
@@ -261,6 +263,8 @@ fn scan_entries(facts: &Facts<'_>, entries: &[Entry]) -> Report {
         let newer = entry.created >= facts.since;
         let process = match look(entry.pid) {
             Ok(process) => process,
+            // A process that ended after the list was read is gone, not hidden: no report.
+            Err(failure) if failure.code == ERROR_INVALID_PARAMETER => continue,
             Err(failure) => {
                 if newer {
                     report.reports.push(format!(
