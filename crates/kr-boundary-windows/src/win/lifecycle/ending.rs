@@ -93,15 +93,22 @@ pub(super) fn close_out(
     };
     let mut written = true;
     for row in closing_rows(&closing) {
-        if let Err(failure) = append(journal, &row) {
-            // The journal cannot take the rest: what is left is the journal itself, and the
-            // invocation stays unfinished for the next recovery.
-            closing.tree.push(Left {
-                object: journal.path().display().to_string(),
-                reason: format!("a closing row could not be written: {failure}"),
-            });
-            written = false;
-            break;
+        match append(journal, &row) {
+            Ok(()) => {}
+            // A recovery that finds the release verified and the end not written finds the
+            // verification standing, whatever count this run's release gives: only the end is new.
+            Err(JournalError::AlreadyRecorded | JournalError::DiffersFromRecorded)
+                if matches!(row, Row::ReleaseVerified { .. }) => {}
+            Err(failure) => {
+                // The journal cannot take the rest: what is left is the journal itself, and the
+                // invocation stays unfinished for the next recovery.
+                closing.tree.push(Left {
+                    object: journal.path().display().to_string(),
+                    reason: format!("a closing row could not be written: {failure}"),
+                });
+                written = false;
+                break;
+            }
         }
     }
     let ended = written && closing.tree.is_empty() && closing.repository.is_none();
