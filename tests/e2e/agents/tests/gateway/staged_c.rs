@@ -1816,17 +1816,65 @@ fn second_start(
         }
         assert!(
             started.elapsed() < LIVENESS,
-            "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
-             agent's process was {}; the screen is:\n{}",
-            if agent.is_some() {
-                "seen and still running"
-            } else {
-                "not seen"
-            },
-            window.screen().join("\n")
+            "{}",
+            second_start_timeout(agent.as_ref().map(running), &window.screen())
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The text of the second start's failure at its time bound, from how the agent's process stands as
+/// the text is made (`None` where it was never seen, then whether it runs) and the screen.
+fn second_start_timeout(agent_runs: Option<bool>, screen: &[String]) -> String {
+    let screen = screen.join("\n");
+    match agent_runs {
+        None => format!(
+            "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
+             agent's process was not seen; the screen is:\n{screen}"
+        ),
+        Some(true) => format!(
+            "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
+             agent's process was seen and still running; the screen is:\n{screen}"
+        ),
+        Some(false) => format!(
+            "the second start was not read within {LIVENESS:?}: the agent's process ended, and \
+             the window kept taking output; the screen is:\n{screen}"
+        ),
+    }
+}
+
+/// The time-out text of a second start says how the agent's process stands as it is made.
+#[test]
+fn the_time_out_of_a_second_start_says_how_the_agents_process_stands_as_it_is_made() {
+    let screen = [
+        "kr-session$ codex resume 0123-4567".to_owned(),
+        "  loading".to_owned(),
+    ];
+    let shown = "kr-session$ codex resume 0123-4567\n  loading";
+    assert_eq!(
+        second_start_timeout(None, &screen),
+        format!(
+            "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
+             agent's process was not seen; the screen is:\n{shown}"
+        ),
+        "a process that was never seen is said not to be seen"
+    );
+    assert_eq!(
+        second_start_timeout(Some(true), &screen),
+        format!(
+            "the second start neither reached the composer nor ended within {LIVENESS:?}; the \
+             agent's process was seen and still running; the screen is:\n{shown}"
+        ),
+        "a process that runs is said to run"
+    );
+    assert_eq!(
+        second_start_timeout(Some(false), &screen),
+        format!(
+            "the second start was not read within {LIVENESS:?}: the agent's process ended, and \
+             the window kept taking output; the screen is:\n{shown}"
+        ),
+        "a process that has ended is said to have ended, not to run"
+    );
 }
 
 /// What became of the agent's process after it refused the second start.
