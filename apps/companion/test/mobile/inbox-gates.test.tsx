@@ -4,9 +4,10 @@
  *
  * The scripted host stands in for native code. A case holds the reads it needs to order and answers
  * them by index, or holds the connection's publications, so what decides each outcome is the order
- * of the calls and never the time a call takes. The cases of a loss's escalation, and the three that
- * count the reads of a retry (after a numbers-only drop, and with a change of host during a dropped
- * read or during its retry), run on a clock that only the test moves; the others run on the real one.
+ * of the calls and never the time a call takes. The cases of a loss's escalation, and the six that
+ * count reads (after a numbers-only drop or a superseded reply, with a change of host during a dropped
+ * read, during its retry or on its own, and under a persistent refusal), run on a clock that only the
+ * test moves; the others run on the real one.
  */
 
 import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
@@ -466,8 +467,7 @@ describe('what the host in use shows is stored and shown under the owner’s key
   })
 
   it('a_superseded_reply_makes_one_new_read_and_then_waits_for_the_cadence', async () => {
-    const { controls } = start(null)
-    await shown('studio')
+    const { controls } = await startOnFakeClock(null)
     controls.supersedeNextInboxReads(2)
     const held = controls.hold('attentionRead')
     const first = held.count
@@ -560,8 +560,7 @@ describe('what the host in use shows is stored and shown under the owner’s key
   })
 
   it('a_change_of_host_starts_a_read_at_once', async () => {
-    const { controls } = start(null)
-    await shown('studio')
+    const { controls } = await startOnFakeClock(null)
     const held = controls.hold('attentionRead')
     const first = held.count
     act(() => {
@@ -590,8 +589,7 @@ describe('what the host in use shows is stored and shown under the owner’s key
 
   // A refusal costs one read for each cadence and no more: it moves no trigger.
   it('a_persistent_refusal_costs_one_read_per_cadence_and_no_more', async () => {
-    const { controls } = start(null)
-    await shown('studio')
+    const { controls } = await startOnFakeClock(null)
     const held: HeldReads = controls.hold('attentionRead')
     const first = held.count
     act(() => {
