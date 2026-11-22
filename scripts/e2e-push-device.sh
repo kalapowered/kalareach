@@ -289,6 +289,9 @@ report = json.load(open(sys.argv[1], encoding="utf-8"))
 art = sys.argv[2]
 platform = sys.argv[3]
 bad = 0
+# How long after a message is handed over a notification is seen posted, at most: the phone is asked
+# about every quarter of a second, and the runs of the first leg gave the time of an awake delivery.
+DOZE_GAP_BOUND_MS = 3000
 
 
 def say(name, ok, detail=""):
@@ -465,17 +468,18 @@ if platform == "android":
         for each in text.splitlines():
             if each.startswith("clock_before="):
                 values["clock_before"] = each.split("=", 1)[1]
+            elif each.startswith("posted_seen_at="):
+                values["posted_seen_at"] = each.split("=", 1)[1]
             elif each.startswith("before DOZE-READ "):
                 values["before"] = doze_line(each[len("before "):], "DOZE-READ")
             elif each.startswith("after DOZE-READ "):
                 values["after"] = doze_line(each[len("after "):], "DOZE-READ")
         return values
 
-    def when_of(number):
-        """The time the notification the phone listed for a delivery says it was posted at."""
-        dump = read(f"notifications-{number}.txt").split("Archived notifications", 1)[0]
-        found = re.search(r"pkg=to\.kala\.reach .*?when=(\d+)/", dump, re.DOTALL)
-        return int(found.group(1)) if found else None
+    def gap_of(state):
+        """How long after the message was handed over the notification was first seen posted, or None."""
+        clock, seen = state.get("clock_before"), state.get("posted_seen_at")
+        return int(seen) - int(clock) if str(clock).isdigit() and str(seen).isdigit() else None
 
     if "doze_on_step" not in report:
         say("the Doze and expiry phases ran", False, "the host did not reach them")
@@ -491,9 +495,9 @@ if platform == "android":
             and held.get("powered") == "false" and held.get("allowlisted") == "false", entered.strip().replace("\n", " | ")[:300])
         request = report.get("doze_request") or {}
         ttl = re.fullmatch(r"(\d+)s", str(request.get("ttl")))
-        say("the gateway's request to the provider's stand-in for the delivery asked for high priority, a data message, a collapse key and a time to live within the notification's four hours",
+        say("the gateway's request to the provider's stand-in for the delivery asked for high priority, a data message, a collapse key and a time to live near the notification's four hours",
             report.get("doze_delivered") is True and request.get("priority") == "high" and request.get("data_only") is True
-            and request.get("collapse_key") is True and ttl is not None and 0 < int(ttl.group(1)) <= 4 * 60 * 60, f"{request}")
+            and request.get("collapse_key") is True and ttl is not None and 4 * 60 * 60 - 600 <= int(ttl.group(1)) <= 4 * 60 * 60, f"{request}")
         number = report.get("doze_message_number")
         alert_text = ""
         if isinstance(number, int):
@@ -512,12 +516,16 @@ if platform == "android":
             and before.get("deep") == "IDLE" and before.get("idle_mode") == "true" and before.get("wakefulness") == "Asleep"
             and any(line.startswith(f"{number}|delivery: shown") for line in read("delivery-outcomes.txt").splitlines()),
             f"before {before}")
-        posted, clock = when_of(number) if isinstance(number, int) else None, state.get("clock_before")
-        gap = posted - int(clock) if posted is not None and str(clock).isdigit() else None
-        say("the notification was posted within the receiver's budget of ten seconds of the message being handed over, by the phone's own clock",
-            gap is not None and 0 <= gap <= 10_000, f"{gap} ms")
-        say("the phone still reported deep Doze after the delivery was shown",
-            after.get("deep") == "IDLE" and after.get("idle_mode") == "true", f"after {after}")
+        gap = gap_of(state)
+        controls = []
+        for each in sorted(int(name[len("delivery-state-"):-len(".txt")]) for name in os.listdir(art) if re.fullmatch(r"delivery-state-\d+\.txt", name)):
+            other = delivery_state(each)
+            if each != number and other.get("before", {}).get("deep") == "ACTIVE" and gap_of(other) is not None:
+                controls.append(gap_of(other))
+        say("the phone listed the notification as posted, and not only enqueued, within the bound of the message being handed over, by the phone's own clock, with the awake deliveries' times beside it",
+            gap is not None and 0 <= gap <= DOZE_GAP_BOUND_MS, f"Doze {gap} ms, awake {controls} ms, bound {DOZE_GAP_BOUND_MS} ms")
+        say("the phone still reported deep Doze, asleep, after the notification was listed as posted",
+            after.get("deep") == "IDLE" and after.get("idle_mode") == "true" and after.get("wakefulness") == "Asleep", f"after {after}")
         read_step = report.get("doze_read_step") or ""
         awake = doze_line(read_step, "DOZE-AWAKE")
         say("with the screen on the phone was still in deep Doze, and the notification posted in Doze was in the shade",
@@ -673,10 +681,12 @@ pump_android() { # <adb> <serial>
         say "message $n: $(python3 "$here/scripts/lib/push-inject.py" note "$file") -> $outcome"
         if python3 "$here/scripts/lib/push-inject.py" kind "$file" | grep -q '^delivery$'; then
             printf '%s|%s\n' "$n" "$outcome" >>"$artefacts/delivery-outcomes.txt"
-            check_android_notification "$adb" "$serial" "$n"
-            # The phone's state around the delivery, and its clock when the message was handed over.
+            check_android_notification "$adb" "$serial" "$n" "$clock_before"
+            # The phone's state around the delivery, and its clock when the message was handed over and
+            # when its notification was first seen posted.
             {
                 echo "run=$run"
+                echo "posted_seen_at=$posted_seen_ms"
                 echo "note=$(python3 "$here/scripts/lib/push-inject.py" note "$file")"
                 echo "clock_before=$clock_before"
                 echo "before $state_before"
@@ -690,17 +700,34 @@ pump_android() { # <adb> <serial>
     done
 }
 
-# Reads the notification the phone is showing for a delivery, and says so when it is the generic
-# alert and holds none of the question's text.
-check_android_notification() { # <adb> <serial> <n>
-    local adb="$1" serial="$2" n="$3" dump
-    dump="$("$adb" -s "$serial" shell dumpsys notification --noredact 2>/dev/null)"
-    printf '%s\n' "$dump" >"$artefacts/notifications-$n.txt"
+# Waits until the phone lists the delivery's notification as posted, and not only as enqueued, and
+# reads it: it says so when it is the generic alert and holds none of the question's text. The phone's
+# own clock when the notification was first seen posted is `posted_seen_ms`.
+check_android_notification() { # <adb> <serial> <n> <the phone's clock when the message was handed over>
+    local adb="$1" serial="$2" n="$3" before="$4" dump waited=0
+    posted_seen_ms=""
+    while :; do
+        dump="$("$adb" -s "$serial" shell dumpsys notification --noredact 2>/dev/null)"
+        printf '%s\n' "$dump" >"$artefacts/notifications-$n.txt"
+        # The posted list comes before the enqueued one: a record of the application there, made at or
+        # after the message, is a notification that is up.
+        if awk -v before="${before:-0}" '
+            /Enqueued Notification List/ { exit }
+            /pkg=to\.kala\.reach / { seen = 1 }
+            seen && match($0, /when=[0-9]+/) && substr($0, RSTART + 5, RLENGTH - 5) + 0 >= before + 0 { found = 1 }
+            END { exit !found }' "$artefacts/notifications-$n.txt"; then
+            posted_seen_ms="$("$adb" -s "$serial" shell date +%s%3N | tr -d '\r')"
+            break
+        fi
+        waited=$((waited + 1))
+        [ "$waited" -lt 60 ] || break
+        sleep 0.25
+    done
     # Read from the file: a search that stops at its first match would end a pipe early, which a
     # script that sets pipefail takes for a failure.
     local alert
     alert="$(python3 "$here/scripts/lib/push-inject.py" alert "$harness/inject-$n.json")"
-    if grep -q "pkg=$app_id" "$artefacts/notifications-$n.txt" && grep -q -F "$alert" "$artefacts/notifications-$n.txt" \
+    if [ -n "$posted_seen_ms" ] && grep -q "pkg=$app_id" "$artefacts/notifications-$n.txt" && grep -q -F "$alert" "$artefacts/notifications-$n.txt" \
         && ! grep -q 'kr-marker-4f1c9a' "$artefacts/notifications-$n.txt"; then
         : >"$harness/shown-$n"
     fi
