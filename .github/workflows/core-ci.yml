@@ -3325,7 +3325,7 @@ jobs:
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the workspace's tests"
 
-      # Two of `kr-cli`'s startup cases have a stub for a daemon, a script that prints what a daemon
+      # Three of `kr-cli`'s startup cases have a stub for a daemon, a script that prints what a daemon
       # prints when it cannot listen and ends. They are ignored in the leg's Test step, as in the
       # rust job's, and run here by name with the account's runtime directory and message bus out
       # of the environment, as that job runs them, so that a start's report of why its daemon ended
