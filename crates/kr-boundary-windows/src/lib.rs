@@ -17,6 +17,7 @@
 //! | [`events`] | What the platform's application-control log says about a program it refused |
 //! | [`filekey`] | The identity of an object on a volume, which the walk, the private root and the journal name instead of a path |
 //! | [`frame`] | The broker's pipe protocol: framed messages with limits, and the requests and answers |
+//! | [`channel`] | The names of an invocation's data pipes, and how long the broker waits for the client to connect to them |
 //! | [`mod@env`] | The environment of every child, built from a fixed table and nothing of the caller's |
 //! | [`quote`] | A child's command line, quoted so that the platform's own splitting gives back its parts |
 //! | [`journal`] | The journal's records: their framing (a length, the bytes and a checksum, with a torn tail dropped), their rows and the order the rows may come in |
@@ -56,6 +57,7 @@
 // without an expectation that says why nothing rests on the fold.
 #![deny(clippy::disallowed_methods)]
 
+pub mod channel;
 pub mod env;
 pub mod events;
 pub mod filekey;
