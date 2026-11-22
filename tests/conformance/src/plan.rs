@@ -129,9 +129,10 @@ pub struct Step {
     /// The time budget it spends from, by `id`, and the budget's seconds.
     pub budget: Option<(String, u64)>,
     /// What the step took on this platform, in seconds, when it was last measured, as the plan
-    /// states it with the run it comes from. A plan whose every step that is cut by count states one
-    /// is cut into parts of nearly equal time by these; a plan with a step that does not is cut by
-    /// the count of its steps.
+    /// states it with the run it comes from. A plan whose every step that is cut, but the builds that
+    /// open it, states one is cut into parts of nearly equal time by these; a plan with such a step
+    /// that does not is cut by the count of its steps. An opening build runs in every part and is
+    /// never placed by its time.
     pub weight: Option<u64>,
     /// The names in `env` whose value holds a placeholder. A command that reproduces one of the
     /// step's tests cannot repeat their values, because the run gives a placeholder its value.
@@ -216,8 +217,8 @@ struct Cut {
     shares: usize,
     /// How many remaining steps there are.
     rest: usize,
-    /// The part of each remaining step, in their order, when every step that is cut by count states
-    /// a weight: the parts are then cut by time and no step stands alone. Otherwise none.
+    /// The part of each remaining step, in their order, when every one of them states a weight:
+    /// the parts are then cut by time and no step stands alone. Otherwise none.
     timed: Option<Vec<usize>>,
 }
 
@@ -235,7 +236,10 @@ impl Cut {
             .iter()
             .take_while(|index| steps[**index].reading == Reading::Build)
             .count();
-        let weighed = parts > 1 && cut.iter().all(|index| steps[*index].weight.is_some());
+        let weighed = parts > 1
+            && cut[opening..]
+                .iter()
+                .all(|index| steps[*index].weight.is_some());
         let alone = if parts > 1 && !weighed {
             cut.iter()
                 .position(|index| runs_the_workspace(&steps[*index]))
@@ -666,6 +670,19 @@ mod tests {
             assert!(seconds <= 5_100, "part {number} takes {seconds} seconds");
         }
         assert_eq!(every, ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"]);
+    }
+
+    #[test]
+    fn an_opening_build_that_states_no_weight_leaves_the_plan_cut_by_time() {
+        let mut steps = vec![named("build", Reading::Build, false, &[])];
+        for (n, seconds) in [4000, 1000, 1000, 1000].into_iter().enumerate() {
+            let step = named(&format!("t{n}"), Reading::Cargo, false, &[]);
+            steps.push(weighed(step, seconds));
+        }
+        // By time the first step is a part of its own, and by count the parts would be t0 with t1,
+        // and t2 with t3.
+        assert_eq!(part_ids(&steps, (1, 2)), ["build", "t0"]);
+        assert_eq!(part_ids(&steps, (2, 2)), ["build", "t1", "t2", "t3"]);
     }
 
     #[test]

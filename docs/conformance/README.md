@@ -119,8 +119,9 @@ its output, and the run exits 1. `--all-terminals` takes no `--group`.
 
 `--part <number>/<parts>` runs one part of the platform's plan, for a plan that one job cannot hold.
 Every part runs the build steps that open the plan, and then its share of the other steps, cut in
-order into parts of nearly equal time when every step that
-is cut states its seconds, and into parts of nearly equal count when one does not. A step states
+order into parts of nearly equal time when every step that is cut states its seconds, and into
+parts of nearly equal count when one does not; the opening builds are in every part and need no
+seconds. A step states
 its seconds in the plan file as `weight`, for each platform it runs on, with `weighed`, the run and
 the date it was measured at, which a later reader refreshes it from; the cut puts the steps in
 order into the fewest-second longest part. A plan that does not state them and holds the workspace's
