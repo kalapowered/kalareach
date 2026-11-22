@@ -16,14 +16,19 @@ mod real_proxy;
 #[allow(dead_code)]
 mod tls;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kr_transport::config::ProxyUrl;
-use kr_transport::proxy::{ProxyLoginKind, StopKind, proxied, proxy_login_kind};
+use kr_transport::proxy::{
+    Following, ProxyLoginKind, StopKind, admit, follow, proxied, proxy_login_kind,
+};
 use real_proxy::{Login, RealProxy};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use url::Url;
 
 /// How long a request waits before the case calls it stuck.
 const WATCHDOG: Duration = Duration::from_secs(20);
@@ -186,4 +191,71 @@ async fn a_client_with_no_login_is_told_by_a_real_proxy_that_one_is_needed() {
     assert_eq!(lines[0].method, "CONNECT");
     assert_eq!(lines[0].status, 407, "{lines:?}");
     assert_eq!(lines[0].user, "-", "no login was sent: {lines:?}");
+}
+
+/// KR-REQ-10.02: the login travels only in a `CONNECT`. A request to a plain `http` address, sent
+/// through `follow` with the gate `admit` to a real proxy that holds the login, is refused as
+/// `ClearTextTarget` before anything is sent: no connection reaches that origin and the proxy's
+/// log holds no line for it, and no verdict is set. The same client then reaches a TLS origin
+/// through the same gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "runs only against a proxy this machine runs, named by KR_REAL_PROXY, KR_REAL_PROXY_CREDENTIAL_FILE and KR_REAL_PROXY_ACCESS_LOG"]
+async fn a_plain_http_target_is_refused_before_a_real_proxy_is_asked() {
+    let proxy = RealProxy::basic();
+    let tls_origin = origin().await;
+    let plain = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let plain_address = plain.local_addr().expect("an address").to_string();
+    let reached = Arc::new(AtomicUsize::new(0));
+    let counting = Arc::clone(&reached);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = plain.accept().await {
+            counting.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let url = proxy.url(Login::Right);
+    let client = client(&url, &tls_origin);
+    let following = || Following {
+        limit: 10,
+        deadline: Some(WATCHDOG),
+    };
+    let gate = |target: &Url| admit(Some(&url), target);
+
+    let plain_url: Url = format!("http://{plain_address}/").parse().expect("a URL");
+    let request = client.get(plain_url.clone()).build().expect("a request");
+    let refused = follow(&client, request, following(), &gate)
+        .await
+        .expect_err("a plain http target is refused");
+    assert_eq!(refused.url, plain_url);
+    assert_eq!(
+        proxy_login_kind(&refused),
+        Some(ProxyLoginKind::ClearTextTarget)
+    );
+    assert_eq!(
+        url.login().expect("a login").stopped(),
+        None,
+        "refusing a target sets no verdict"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let asked = proxy.lines_naming(&plain_address);
+    assert!(asked.is_empty(), "the proxy was asked for it: {asked:?}");
+    assert_eq!(
+        reached.load(Ordering::SeqCst),
+        0,
+        "nothing reached the origin"
+    );
+
+    let request = client
+        .get(format!("https://{}/", tls_origin.address))
+        .build()
+        .expect("a request");
+    let answer = follow(&client, request, following(), &gate)
+        .await
+        .expect("the TLS origin answers through the same gate");
+    assert_eq!(answer.status(), 200);
+    drop(answer);
+    drop(client);
+    let lines = proxy.wait_for(&tls_origin.address, 1).await;
+    assert_eq!(lines[0].status, 200, "{lines:?}");
+    assert_eq!(lines[0].user, proxy.user(), "{lines:?}");
 }
