@@ -949,8 +949,10 @@ pub struct Account {
     /// continues the conversation or starts one of its own from it.
     pub resume: Vec<String>,
     /// Texts the agent shows when it refuses to resume a conversation another process holds: its
-    /// start then reaches no composer. A start that reaches none and shows none of these is not
-    /// taken for a refusal, unless the shell's prompt is back below the typed command.
+    /// start then reaches no composer. A start that reaches no composer and shows none of these is
+    /// an end, not a refusal, whether the shell's prompt is back below the typed command or the
+    /// agent's process has ended; it fails parts 7 and 7f. One of these on the screen of an agent
+    /// that has ended is still a refusal.
     #[serde(default)]
     pub resume_refused: Vec<String>,
     /// The arguments that start a conversation of its own from a saved one, with `{conversation}`
