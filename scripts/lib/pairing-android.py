@@ -1149,7 +1149,8 @@ def issuer(adb: str, serial: str, directory: Path, shots: Path, port: str) -> No
     phone.wait(lambda each: each == "Hosts", "the shell's Hosts tab", 90)
     phone.press("Hosts")
     phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
-    scan(phone, directory, "direct", port, owner_card, "the scanned invitation")
+    # The wall starts with the fixture's invitation, which is no owner's: a scanner that reads it first is put away and opened again.
+    scan(phone, directory, "direct", port, owner_card, "the scanned invitation", stale=another_card)
     phone.shot("scanned-summary")
     phone.press("Pair")
     node = phone.wait(lambda each: SPELLED_VALUE.fullmatch(each) is not None, "the value", 90)

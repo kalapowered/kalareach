@@ -7,7 +7,7 @@ person's terminal is; answers the questions the command asks, the way a person a
 keeps what the terminal showed, whole. Three files are kept for a command named `<name>`, in the
 output folder: `<name>.raw` holds every byte the command printed, `<name>.txt` holds what the screen
 showed (the colour codes taken out, each line ended as a terminal ends it) and `<name>.timed.txt`
-holds the same lines, each with the seconds since the command began and the moments the helper typed.
+holds the same lines, each with its UTC time to the millisecond (one clock for every command) and the seconds since the command began, and the moments the helper typed.
 `<name>.exit` holds the command's exit code. Every command also prints one summary line, `ISSUER <what>`.
 
 Commands, each with the options `--kr`, `--runtime-dir`, `--state-dir`, `--home` and `--out`:
@@ -25,6 +25,9 @@ Commands, each with the options `--kr`, `--runtime-dir`, `--state-dir`, `--home`
       text in `--value-file` (what the phone's screen showed) is typed, with its last character
       changed when `--change-one` is given.
 
+  when --file <timed transcript> --phrase <text>
+      Prints the time, in milliseconds since the epoch, at which the first line that holds the phrase was printed.
+
 It uses the Python standard library alone.
 """
 
@@ -41,7 +44,7 @@ import sys
 import termios
 import time
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # How long one command may take. A command waits for the person at its questions, and none of these
@@ -111,28 +114,42 @@ def run_on_pty(argv: list[str], environment: dict[str, str], steps: list) -> tup
     return bytes(raw), events, os.waitstatus_to_exitcode(wait_status), timed_out
 
 
+def stamp(started: datetime, at: float) -> str:
+    """The UTC time, to the millisecond, `at` seconds after `started`."""
+    return (started + timedelta(seconds=at)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def keep(out: Path, name: str, raw: bytes, events: list, code: int, started: datetime) -> str:
-    """Writes the three files of one command and returns what the screen showed."""
+    """Writes the files of one command and returns what the screen showed. `<name>.timed.txt` has one line for each line the
+    command printed, each with the UTC time to the millisecond (one clock for every command) and the seconds since the command
+    began; a prompt that waits for an answer is a line of its own, before the line that records the typing."""
     (out / f"{name}.raw").write_bytes(raw)
     text = tidy(raw)
     (out / f"{name}.txt").write_text(text, encoding="utf-8")
     (out / f"{name}.exit").write_text(f"{code}\n")
-    lines = [f"# {name}: started {started.strftime('%Y-%m-%d %H:%M:%S')} UTC; each line: seconds since the start"]
+    lines = [f"# {name}: started {stamp(started, 0.0)}; each line: UTC time, seconds since the start"]
     pending = ""
     last = 0.0
     # A character of the QR drawing is several bytes, and a read may end inside one.
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def line(at: float, text: str) -> str:
+        return f"[{stamp(started, at)} +{at:7.3f}s] {ANSI.sub('', text.replace(chr(13), ''))}"
+
     for at, kind, data in events:
         if kind == "typed":
-            lines.append(f"[{at:8.3f}s] (typed at the terminal: {data.decode('utf-8', 'replace')!r})")
+            if pending.strip():
+                lines.append(line(last, pending))
+                pending = ""
+            lines.append(line(at, f"(typed at the terminal: {data.decode('utf-8', 'replace')!r})"))
             continue
         pending += decoder.decode(data)
         while "\n" in pending:
-            line, pending = pending.split("\n", 1)
-            lines.append(f"[{at:8.3f}s] {ANSI.sub('', line.replace(chr(13), ''))}")
+            each, pending = pending.split("\n", 1)
+            lines.append(line(at, each))
         last = at
     if pending.strip():
-        lines.append(f"[{last:8.3f}s] {ANSI.sub('', pending.replace(chr(13), ''))}")
+        lines.append(line(last, pending))
     (out / f"{name}.timed.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return text
 
@@ -239,6 +256,17 @@ def confirm(options: argparse.Namespace) -> int:
     return 0 if not timed_out else 2
 
 
+def when(options: argparse.Namespace) -> int:
+    """Prints the time, in milliseconds since the epoch, of the first line of a timed transcript that holds a phrase."""
+    for each in Path(options.file).read_text(encoding="utf-8").split("\n"):
+        found = re.match(r"\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3})Z ", each)
+        if found and options.phrase in each[found.end() :] and "(typed at the terminal" not in each:
+            moment = datetime.strptime(found.group(1), "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc)
+            print(int(moment.timestamp() * 1000))
+            return 0
+    return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="verb", required=True)
@@ -253,8 +281,11 @@ def main() -> int:
         if verb == "confirm":
             each.add_argument("--value-file", required=True)
             each.add_argument("--change-one", action="store_true")
+    asking = sub.add_parser("when")
+    asking.add_argument("--file", required=True)
+    asking.add_argument("--phrase", required=True)
     options = parser.parse_args()
-    return {"invite": invite, "status": status, "confirm": confirm}[options.verb](options)
+    return {"invite": invite, "status": status, "confirm": confirm, "when": when}[options.verb](options)
 
 
 if __name__ == "__main__":
