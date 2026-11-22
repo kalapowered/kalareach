@@ -14,11 +14,13 @@ use kr_boundary_windows::journal::rows::{
 };
 use kr_boundary_windows::lifecycle::{
     self, Closing, Ending, Evidence, Left, Session, Uncertainty, cleanup_of, closing_rows,
-    configuration_of, ending_reply,
+    configuration_of, ending_reply, root_object,
 };
 
 const BOOT: &str = "11111111-1111-1111-1111-111111111111";
 const ID: &str = "000102030405060708090a0b0c0d0e0f";
+/// An object of the private root as the ending names it: the root's path, then the name below it.
+const FILE: &str = r"C:\ProgramData\Boundary\run\0a1b\x\file.lock";
 
 fn key(n: u64) -> FileKey {
     FileKey::ntfs(0xabcd, n)
@@ -218,7 +220,7 @@ fn a_leftover_of_the_tree_is_journalled_and_no_row_says_the_invocation_ended() {
 #[test]
 fn a_leftover_of_the_private_root_comes_before_the_end_and_frees_the_slot() {
     let closing = Closing {
-        root: vec![left(r"run\x\file.lock")],
+        root: vec![left(FILE)],
         ..closing()
     };
     let rows = closing_rows(&closing);
@@ -248,10 +250,20 @@ fn a_leftover_of_the_private_root_comes_before_the_end_and_frees_the_slot() {
     assert_eq!(
         cleanup_of(&closing),
         Cleanup::Failed {
-            object: r"run\x\file.lock".to_owned(),
+            object: FILE.to_owned(),
             class: ReplyClass::Root,
         }
     );
+}
+
+#[test]
+fn an_object_of_the_private_root_is_named_by_the_root_and_the_root_itself_by_its_own_path() {
+    let root = r"C:\ProgramData\Boundary\run\0a1b";
+    assert_eq!(
+        root_object(root, r"x\file.lock"),
+        r"C:\ProgramData\Boundary\run\0a1b\x\file.lock"
+    );
+    assert_eq!(root_object(root, ""), root);
 }
 
 #[test]
@@ -259,14 +271,14 @@ fn a_root_leftover_that_an_earlier_end_left_open_is_cleared_when_the_removal_no_
     // The earlier end crashed after the first leftover row of the private root; the removal now
     // finds nothing, so the end counts none and the tracker takes it.
     let closing = Closing {
-        root_recorded: vec![r"run\x\file.lock".to_owned()],
+        root_recorded: vec![FILE.to_owned()],
         ..closing()
     };
     let rows = closing_rows(&closing);
     assert!(
         rows.iter().any(|row| matches!(
             row,
-            Row::LeftoverCleared { key } if key == r"run\x\file.lock"
+            Row::LeftoverCleared { key } if key == FILE
         )),
         "{rows:?}"
     );
@@ -275,7 +287,7 @@ fn a_root_leftover_that_an_earlier_end_left_open_is_cleared_when_the_removal_no_
             .any(|row| matches!(row, Row::End { root_leftovers: 0 })),
         "{rows:?}"
     );
-    let mut tracker = ended_with_root_leftovers(&[r"run\x\file.lock"]);
+    let mut tracker = ended_with_root_leftovers(&[FILE]);
     apply_all(&mut tracker, &rows);
     assert_eq!(tracker.standing(), Standing::Finished);
     assert!(!tracker.holds_the_slot());
@@ -285,8 +297,8 @@ fn a_root_leftover_that_an_earlier_end_left_open_is_cleared_when_the_removal_no_
 #[test]
 fn a_root_leftover_that_the_removal_finds_again_is_not_journalled_twice_and_the_end_counts_it() {
     let closing = Closing {
-        root: vec![left(r"run\x\file.lock")],
-        root_recorded: vec![r"run\x\file.lock".to_owned()],
+        root: vec![left(FILE)],
+        root_recorded: vec![FILE.to_owned()],
         ..closing()
     };
     let rows = closing_rows(&closing);
@@ -295,7 +307,7 @@ fn a_root_leftover_that_the_removal_finds_again_is_not_journalled_twice_and_the_
             .all(|row| !matches!(row, Row::Leftover { .. } | Row::LeftoverCleared { .. })),
         "{rows:?}"
     );
-    let mut tracker = ended_with_root_leftovers(&[r"run\x\file.lock"]);
+    let mut tracker = ended_with_root_leftovers(&[FILE]);
     apply_all(&mut tracker, &rows);
     assert_eq!(tracker.standing(), Standing::Finished);
     assert!(!tracker.holds_the_slot());
