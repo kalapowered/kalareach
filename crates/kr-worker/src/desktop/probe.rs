@@ -1993,12 +1993,8 @@ mod tests {
     /// daemon's own wait for the answer to a run of the checks.
     #[test]
     fn a_file_read_that_never_returns_is_stopped_waiting_for_at_the_checks_declared_bound() {
-        // A loaded machine starts a thread late, so the upper limit allows for it. A bound that
-        // was doubled would still be far outside it.
+        // A loaded machine starts a thread late, so the upper limit allows for it.
         const SLACK: Duration = Duration::from_secs(5);
-        // Longer than the bound and the slack together, so a check that did not stop at its bound
-        // sees the stand-in return, and fails on what that makes of its answer.
-        const STAND_IN_STAYS: Duration = Duration::from_secs(20);
 
         let root = kr_ipc::testing::PrivateTempDir::create();
         let file = root.path().join("authorised.txt");
@@ -2007,6 +2003,10 @@ mod tests {
             ..Plan::in_directory(root.path().join("scratch"))
         };
         let bound = Check::AuthorisedFileRead.effects().bound;
+        // Twice the longest a check that keeps its bound takes, the bound and the slack, so that a
+        // check that did not stop at its bound sees the stand-in return, and fails on what that
+        // makes of its answer. It follows the declared bound, whatever that is.
+        let stays = (bound + SLACK) * 2;
 
         let (started_tell, started) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
@@ -2019,7 +2019,7 @@ mod tests {
                 .send(())
                 .expect("the case is waiting for the stand-in");
             // Kept here until the case lets it go, or for the longest it stays.
-            let _ = released.recv_timeout(STAND_IN_STAYS);
+            let _ = released.recv_timeout(stays);
             stand_in_finished.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = ended_tell.send(());
             Ok(FirstBlock::Read(0))
