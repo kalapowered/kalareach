@@ -1,14 +1,14 @@
 //
 //  Taps on the links of a message, made on the glass as a finger makes them.
 //
-//  A link's box and the message's controls are the page's own: the browser's click names the link or
-//  the control that a tap lands on, and nothing stops or redirects it. Where a tap's click lands on
-//  plain text near a link's words, the page gives the link a click of its own. Which element WebKit
-//  names for a tap, and whether it sends a click for plain text at all, no browser test on a desktop
-//  engine can show. These tests tap the web view by coordinates, through UIKit and not through the
-//  page's own events, at the points a person touches, and read what the page saw (the harness's tap
-//  record: each event's type, target, pointer number, pointer type and point) and what the scripted
-//  host opened.
+//  A link's words and the message's controls are the page's own: the browser's click names the link or
+//  the control that a tap lands on, and nothing stops or redirects it. The room that pads a link's button
+//  takes no tap: a tap there lands on plain text. Where a tap's click lands on plain text near a link's
+//  words, the page gives the link a click of its own. Which element WebKit names for a tap, and whether
+//  it sends a click for plain text at all, no browser test on a desktop engine can show. These tests tap
+//  the web view by coordinates, through UIKit and not through the page's own events, at the points a
+//  person touches, and read what the page saw (the harness's tap record: each event's type, target,
+//  pointer number, pointer type and point) and what the scripted host opened.
 //
 //  The tap record is the harness's own: a strip control starts it, fills the first session with the
 //  messages the taps need, and shows the events, the links' rectangles and the links opened as text
@@ -939,36 +939,25 @@ final class LinkTapTests: HarnessTestCase {
         }
 
         // The edge of the area in which a tap opens a link, in each of the four directions, for a link in the middle of
-        // a line with no other link near. The area is what the page gives the words: grown by half the least size beside
-        // them and to the least size in height (so, from the words' frame, 22 points beside the words and a height of 44
-        // about their middle), and the link's own button box, which is the page's. A tap 2 points inside an edge opens the
-        // link once; a tap just outside it (4 points, or 16 where the edge is the button's own box) opens nothing.
+        // a line with no other link near. The area is what the page gives the words: grown to the least size and to 22
+        // points beside them (at the largest text size, the words' own height). The button's padded box is not part of it,
+        // since it takes no tap. A tap 2 points inside an edge opens the link once. A tap 4 points outside it is not opened
+        // by the page: the system's own click may still name the link's words, and then the link opens once.
         let middle = scroll(to: "middle")
         let middleShift = offset(of: middle)
         let around = middle.words[0]
-        let least: CGFloat = 44
-        let halfTall = max(least, around.height) / 2
-        let areaLeft = min(around.minX - least / 2, middle.box.minX)
-        let areaRight = max(around.maxX + least / 2, middle.box.maxX)
-        let areaTop = min(around.midY - halfTall, middle.box.minY)
-        let areaBottom = max(around.midY + halfTall, middle.box.maxY)
-        // Where the page's own button box is the edge (a tall line at the largest size), the system's own adjustment of a tap
-        // to a button reaches a little beyond it, so the tap outside is made past that reach: 16 points. Where the edge is
-        // the page's area for the words, it is 4 points.
-        let leftGap: CGFloat = middle.box.minX <= around.minX - least / 2 ? 16 : 4
-        let rightGap: CGFloat = middle.box.maxX >= around.maxX + least / 2 ? 16 : 4
-        let topGap: CGFloat = middle.box.minY <= around.midY - halfTall ? 16 : 4
-        let bottomGap: CGFloat = middle.box.maxY >= around.midY + halfTall ? 16 : 4
-        let edges: [(String, CGPoint, CGPoint, CGFloat)] = [
-            ("left", CGPoint(x: areaLeft + 2, y: around.midY), CGPoint(x: areaLeft - leftGap, y: around.midY), leftGap),
-            ("right", CGPoint(x: areaRight - 2, y: around.midY), CGPoint(x: areaRight + rightGap, y: around.midY), rightGap),
-            ("top", CGPoint(x: around.midX, y: areaTop + 2), CGPoint(x: around.midX, y: areaTop - topGap), topGap),
-            ("bottom", CGPoint(x: around.midX, y: areaBottom - 2), CGPoint(x: around.midX, y: areaBottom + bottomGap), bottomGap),
+        let area = Self.areaOf(around, in: middle.view)
+        let gap: CGFloat = 4
+        let edges: [(String, CGPoint, CGPoint)] = [
+            ("left", CGPoint(x: area.minX + 2, y: around.midY), CGPoint(x: area.minX - gap, y: around.midY)),
+            ("right", CGPoint(x: area.maxX - 2, y: around.midY), CGPoint(x: area.maxX + gap, y: around.midY)),
+            ("top", CGPoint(x: around.midX, y: area.minY + 2), CGPoint(x: around.midX, y: area.minY - gap)),
+            ("bottom", CGPoint(x: around.midX, y: area.maxY - 2), CGPoint(x: around.midX, y: area.maxY + gap)),
         ]
-        for (edge, inside, outside, gap) in edges {
+        for (edge, inside, outside) in edges {
             expectOpened(tap("\(named): the \(edge) edge of the area, 2 points inside", at: inside, shift: middleShift), "middle")
             let beyond = tap("\(named): the \(edge) edge of the area, \(Int(gap)) points outside", at: outside, shift: middleShift)
-            XCTAssertTrue(beyond.opened.isEmpty, "\(beyond.label): opened \(beyond.opened)")
+            expectNotOpenedByThePage(beyond, "middle")
         }
 
         // The links at the pane's edges. A tap at each of nine points of the least-size square about the words, slid into the
