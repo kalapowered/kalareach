@@ -401,6 +401,62 @@ describe('a card the device stored, before the application has said what it hold
   })
 })
 
+describe('a file whose bind the application refuses for want of a record of it', () => {
+  it('Q1d: keeps the refusal on its card, with Remove and no Add or Cancel, and Remove drops the card without ending the draft', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS })
+    controls.pairedUploads.leave([
+      {
+        key: 'published-1',
+        state: 'published',
+        sessionId: SESSION,
+        fileName: 'published-1.bin',
+        byteLen: 9,
+        acknowledgedChunks: 0,
+        chunks: 0,
+        stage: null,
+        handle: {
+          transfer_id: '99999999-9999-4999-8999-000000000777',
+          environment_id: 'e',
+          byte_len: '9',
+          content_digest: 'c'.repeat(64),
+          declared_media_type: 'application/octet-stream',
+          original_file_name: 'published-1.bin',
+          presented_as_image: false,
+          session_id: null,
+          preview: null,
+          published_at_ms: '1',
+          expires_at_ms: '2',
+          submitted: false
+        },
+        said: null
+      }
+    ])
+    controls.pairedUploads.refuseNextBind({ code: 'INVALID_ARGUMENT', message: words.NO_OPEN_UPLOAD })
+    const cancel = vi.spyOn(port, 'uploadCancel')
+    const end = vi.spyOn(port, 'draftEnd')
+    render(
+      <AppProvider port={port} uploadPollMs={10}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    const person = userEvent.setup({ applyAccept: false })
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.click(await screen.findByRole('button', { name: 'Add to draft' }))
+    // The announcement of the outcome comes whatever the row says; then the row's words are read.
+    await screen.findByText(/^published-1\.bin: /)
+    const row = screen.getByTestId('m-upload')
+    expect(within(row).getByTestId('upload-line')).toHaveTextContent(words.NO_LONGER_HELD)
+    expect(within(row).queryByRole('button', { name: /^Add/ })).toBeNull()
+    expect(within(row).queryByRole('button', { name: /^Cancel/ })).toBeNull()
+    await person.click(within(row).getByRole('button', { name: 'Remove published-1.bin' }))
+    expect(screen.queryByTestId('m-upload')).toBeNull()
+    expect(cancel).not.toHaveBeenCalled()
+    expect(end).not.toHaveBeenCalled()
+  })
+})
+
 describe('what the picker offers on a paired host', () => {
   it('names whom to ask when the device may not send files, and offers none', async () => {
     const { port, controls } = fakeHost()
