@@ -533,6 +533,9 @@ pub struct Paired {
     pub account: Option<AccountMark>,
     /// The connection.
     pub session: Arc<Session>,
+    /// The number the contact owner installed the connection as: the order of the installations of
+    /// one owner, which no emptied slot and no replacement lowers or repeats.
+    pub link: u64,
 }
 
 impl Paired {
@@ -725,6 +728,8 @@ impl Work {
 struct Connection {
     account: Option<String>,
     session: Arc<Session>,
+    /// The number the contact owner installed it as.
+    link: u64,
 }
 
 impl Connection {
@@ -732,50 +737,44 @@ impl Connection {
         Self {
             account: paired.account_id(),
             session: Arc::clone(&paired.session),
+            link: paired.link,
         }
     }
 }
 
-/// The connections to one host's device that the desk was told of, and the order they came in: the
-/// newest, and the sessions it has moved past.
+/// What the desk made of a connection it was told of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Observed {
+    /// No newer connection is known: it is the newest, or the same one again.
+    Fresh,
+    /// The desk knows a newer connection already.
+    Stale,
+}
+
+/// The newest connection the desk was told of for one host's device.
 ///
-/// An operation that carries the connection it read a moment before, a send, can arrive after the
-/// desk was told the host was reached on a newer one. It goes on its own connection, but it does not
-/// make that connection the newest again: an upload that then paused on it would wait for a
-/// connection that the desk already holds.
+/// The order of connections is the order of their installation, the number the contact owner gave
+/// each. An operation that carries the connection it read a moment before, a send, can arrive after
+/// the desk was told of a newer one, however the reports interleave, and a connection that the desk
+/// was never told of cannot make an older one the newest: only a higher number does.
 #[derive(Default)]
 struct Connections {
     newest: Option<Connection>,
-    /// The sessions the desk moved past. A weak handle keeps a session's address from being taken
-    /// by another while it is listed; one that has ended is dropped at the next change.
-    passed: Vec<std::sync::Weak<Session>>,
 }
 
 impl Connections {
-    /// The host was reached on `connection`: it is the newest from now on, whatever came before.
-    fn reached(&mut self, connection: Connection) {
-        let incoming = Arc::as_ptr(&connection.session);
-        self.passed
-            .retain(|old| old.strong_count() > 0 && !std::ptr::eq(old.as_ptr(), incoming));
-        if let Some(previous) = self.newest.replace(connection)
-            && !std::ptr::eq(Arc::as_ptr(&previous.session), incoming)
-        {
-            self.passed.push(Arc::downgrade(&previous.session));
+    /// The desk is told of `connection`. A higher number than the newest's makes it the newest; the
+    /// same number is the same connection, which has one account, so the first record stays; a
+    /// lower number is a report about a connection the owner has replaced.
+    fn observe(&mut self, connection: Connection) -> Observed {
+        match &self.newest {
+            Some(newest) if connection.link < newest.link => Observed::Stale,
+            Some(newest) if connection.link == newest.link => Observed::Fresh,
+            _ => {
+                self.newest = Some(connection);
+                Observed::Fresh
+            }
         }
-    }
-
-    /// An upload is sent on `connection`. It is the newest, as the host may not have been reached on
-    /// it yet, unless the desk has already moved past it.
-    fn used(&mut self, connection: Connection) {
-        let incoming = Arc::as_ptr(&connection.session);
-        if self
-            .passed
-            .iter()
-            .any(|old| std::ptr::eq(old.as_ptr(), incoming))
-        {
-            return;
-        }
-        self.reached(connection);
     }
 }
 
@@ -889,6 +888,10 @@ pub struct Desk {
     /// What a suite holds a send at, once the copy of its content is written.
     #[cfg(feature = "testing")]
     after_copy: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// The number of the connection each upload was last resumed on: a suite reads where a resume
+    /// went from this, and not from what the host saw.
+    #[cfg(feature = "testing")]
+    resumed: Mutex<HashMap<Uuid, u64>>,
 }
 
 impl std::fmt::Debug for Desk {
@@ -1097,10 +1100,12 @@ impl Desk {
         // comes after finds the sender's handle stored.
         let started = {
             let registry = locked(&self.registry);
-            locked(&self.sessions)
+            // A send on a connection the desk has moved past goes on its own connection and does
+            // not make it the newest.
+            let _ = locked(&self.sessions)
                 .entry((paired.environment_id, paired.device_id))
                 .or_default()
-                .used(Connection::of(&paired));
+                .observe(Connection::of(&paired));
             self.start_under(&registry, &live, Connection::of(&paired), false)
         };
         if !started {
@@ -1158,6 +1163,10 @@ impl Desk {
                 return false;
             }
             *phase = Phase::Sending;
+        }
+        #[cfg(feature = "testing")]
+        if verify {
+            locked(&self.resumed).insert(live.key, connection.link);
         }
         let generation = live.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let desk = Arc::clone(self);
@@ -1352,6 +1361,8 @@ impl Desk {
                 // was made for the upload's own account.
                 self.start_under(&registry, live, newest, true);
             }
+            #[cfg(feature = "testing")]
+            testing::note(live.key, testing::Point::SenderSettled);
             return;
         }
         let uncertain = matches!(error, ClientError::SubmissionUncertain { .. })
@@ -1414,10 +1425,15 @@ impl Desk {
     pub fn host_reached(self: &Arc<Self>, paired: Paired) {
         let (device_id, environment_id) = (paired.device_id, paired.environment_id);
         let connection = Connection::of(&paired);
-        locked(&self.sessions)
+        let observed = locked(&self.sessions)
             .entry((environment_id, device_id))
             .or_default()
-            .reached(connection.clone());
+            .observe(connection.clone());
+        if observed == Observed::Stale {
+            // A report about a connection the owner has replaced: the newer connection's reach does
+            // the resuming, the restart and the stop of another principal's uploads.
+            return;
+        }
         let who = paired.who();
         let (paused, other) = {
             let registry = locked(&self.registry);
@@ -2183,6 +2199,23 @@ impl Desk {
             .and_then(|known| known.newest.as_ref())
             .is_some_and(|newest| Arc::ptr_eq(&newest.session, &paired.session))
     }
+
+    /// The number and the account of the newest connection this desk was told of for `paired`'s
+    /// host, and none when it was told of none.
+    #[must_use]
+    pub fn newest_for_test(&self, paired: &Paired) -> Option<(u64, Option<String>)> {
+        locked(&self.sessions)
+            .get(&(paired.environment_id, paired.device_id))
+            .and_then(|known| known.newest.as_ref())
+            .map(|newest| (newest.link, newest.account.clone()))
+    }
+
+    /// The number of the connection the upload `key` was last resumed on, and none when it was
+    /// never resumed.
+    #[must_use]
+    pub fn resumed_on_for_test(&self, key: Uuid) -> Option<u64> {
+        locked(&self.resumed).get(&key).copied()
+    }
 }
 
 /// What a suite keeps in the folder to stand for an upload that an earlier process left, and the
@@ -2233,6 +2266,9 @@ pub mod testing {
         /// An operation stopped the sender of the key and waited for it, and has not yet touched the
         /// entry.
         Stopped,
+        /// A sender that failed with a connection that ended has settled: the upload is paused, or
+        /// started again on the newer connection. Noted, never held.
+        SenderSettled,
     }
 
     /// The threads that came to a [`Point`], and whether they may go on.

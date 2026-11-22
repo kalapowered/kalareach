@@ -92,11 +92,12 @@ async fn paired_within(
     })
     .await;
     match found {
-        Ok((device_id, environment_id, session)) => Ok(Paired {
+        Ok((device_id, environment_id, session, link)) => Ok(Paired {
             device_id,
             environment_id,
             account: None,
             session,
+            link,
         }),
         Err(_) => Err(last),
     }
@@ -1330,7 +1331,7 @@ async fn connected(companion: &Companion) {
 async fn on_another_connection(companion: &Companion, old: &Arc<kr_client::Session>) -> Paired {
     tokio::time::timeout(WATCHDOG, async {
         loop {
-            if let Ok((device_id, environment_id, session)) = companion
+            if let Ok((device_id, environment_id, session, link)) = companion
                 .app
                 .state::<companion_tauri::AppState>()
                 .paired_snapshot()
@@ -1341,6 +1342,7 @@ async fn on_another_connection(companion: &Companion, old: &Arc<kr_client::Sessi
                     environment_id,
                     account: None,
                     session,
+                    link,
                 };
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2386,10 +2388,12 @@ async fn kr_req_13_12_a_reconnect_before_the_driver_fails_resumes_the_upload_on_
     adopted.stop().await;
 }
 
-/// KR-REQ-13.12: a send that carries the connection its caller read before the phone made another
-/// goes on that connection and does not make it the newest again. The desk was told the host was
-/// reached on the newer one, so the upload that fails on the ended connection goes on the newer one
-/// at once; it would otherwise pause and wait for a connection that is already up.
+/// KR-REQ-13.12 (D2): a send that carries the connection its caller read before the phone made
+/// another goes on that connection and does not make it the newest again, whatever the desk was told
+/// of before: the order of connections is the order the contact owner installed them in. The desk was
+/// told the host was reached on the newer one, so the upload that fails on the ended connection goes
+/// on the newer one at once; it would otherwise pause and wait for a connection that is already up.
+/// The case reads where the resume went from the desk's own record, after the sender settled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_13_12_a_send_on_a_connection_the_desk_has_moved_past_does_not_make_it_the_newest() {
     let adopted = Adopted::start(1).await;
@@ -2400,14 +2404,11 @@ async fn kr_req_13_12_a_send_on_a_connection_the_desk_has_moved_past_does_not_ma
     let bytes = pattern(5);
     let paired = paired_of(companion).await;
     let old = Arc::clone(&paired.session);
+    let key = kr_ipc::new_uuid();
+    let settled = testing::hold_at(key, testing::Point::SenderSettled);
     // The send has read its connection and written its copy, and has not started.
     let sending = {
-        let sent = request(
-            &adopted,
-            &bytes,
-            Arc::new(Held::new(bytes.clone())),
-            kr_ipc::new_uuid(),
-        );
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
         let desk = Arc::clone(&desk);
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
@@ -2420,15 +2421,65 @@ async fn kr_req_13_12_a_send_on_a_connection_the_desk_has_moved_past_does_not_ma
     .await;
 
     after_copy.add_permits(1);
-    let handle = tokio::time::timeout(WATCHDOG, sending)
+    // The sender on the ended connection settles; only then is the record read.
+    tokio::time::timeout(WATCHDOG, settled.until_passed(1))
         .await
-        .expect("the upload goes on the newer connection, where the send's own has ended")
-        .expect("the task ran")
-        .expect("the upload is published");
-    assert_eq!(handle.byte_len.get(), bytes.len() as u64);
+        .expect("the sender on the ended connection settles");
+    assert_eq!(
+        desk.resumed_on_for_test(key),
+        Some(newer.link),
+        "the upload went on the newer connection, not on the one the send carried"
+    );
     assert!(
         desk.holds_newest_for_test(&newer),
         "the connection the send carried did not become the newest again"
+    );
+    let handle = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the upload ends on the newer connection")
+        .expect("the task ran")
+        .expect("the upload is published");
+    assert_eq!(handle.byte_len.get(), bytes.len() as u64);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (D3): a report with the number the desk holds already is the same connection and
+/// stores nothing, and a report with a lower number is about a connection the owner has replaced and
+/// does nothing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_report_with_an_equal_or_a_lower_number_keeps_the_stored_connection() {
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let desk = desk_of(companion);
+    let paired = paired_of(companion).await;
+    until("the desk is told of the connection", || {
+        desk.holds_newest_for_test(&paired)
+    })
+    .await;
+    let stored = desk.newest_for_test(&paired);
+    assert_eq!(stored, Some((paired.link, None)));
+    let account = Some(kr_client::services::AccountMark::from_bytes([7; 32]));
+    desk.host_reached(Paired {
+        account,
+        ..paired.clone()
+    });
+    desk.idle().await;
+    assert_eq!(
+        desk.newest_for_test(&paired),
+        stored,
+        "the same number is the same connection: the first record stays"
+    );
+    desk.host_reached(Paired {
+        account,
+        link: paired.link - 1,
+        ..paired.clone()
+    });
+    desk.idle().await;
+    assert_eq!(
+        desk.newest_for_test(&paired),
+        stored,
+        "a lower number stores nothing"
     );
     adopted.stop().await;
 }
@@ -4578,13 +4629,14 @@ async fn kr_req_13_12_a_reach_during_a_cancel_finishes_it_at_once() {
             until("the desk is told the host was reached", || {
                 app.state::<companion_tauri::AppState>()
                     .paired_snapshot()
-                    .is_ok_and(|(device_id, environment_id, session)| {
+                    .is_ok_and(|(device_id, environment_id, session, link)| {
                         !Arc::ptr_eq(&session, &old)
                             && desk.holds_newest_for_test(&Paired {
                                 device_id,
                                 environment_id,
                                 account: None,
                                 session,
+                                link,
                             })
                     })
             })

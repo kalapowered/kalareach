@@ -905,11 +905,13 @@ pub enum Attempt {
 }
 
 /// A connection the keeper supervises: the one the owner holds, the receiver of its events that
-/// was taken before it was installed, and the revision its installation was published as.
+/// was taken before it was installed, the revision its installation was published as, and the
+/// number it was installed as.
 struct Supervised {
     connection: Connection,
     events: tokio::sync::broadcast::Receiver<kr_protocol::envelope::Notification>,
     revision: u64,
+    link: u64,
 }
 
 /// Keeps a connection to a host for `choice`: reaches it with `attempt`, forwards what it
@@ -949,11 +951,12 @@ pub async fn keep<R, A, F>(
                 let events = connection.session().events();
                 let reached = owner.reached(choice, last.as_ref(), connection);
                 match reached.value {
-                    Reach::Reached => {
+                    Reach::Reached(link) => {
                         next = Some(Supervised {
                             connection: kept,
                             events,
                             revision: reached.revision,
+                            link,
                         });
                     }
                     Reach::StaleChoice(_) => return,
@@ -987,11 +990,13 @@ pub async fn keep<R, A, F>(
                     connection,
                     events,
                     revision,
+                    link,
                 } => {
                     let supervised = Supervised {
                         connection,
                         events,
                         revision,
+                        link,
                     };
                     last =
                         Some(supervise(&app, choice, supervised, &mut first, &mut backoff).await);
@@ -1016,6 +1021,7 @@ async fn supervise<R: Runtime>(
         connection,
         events,
         revision,
+        link,
     } = supervised;
     let session = connection.session();
     let environment_id = connection.environment_id();
@@ -1055,6 +1061,7 @@ async fn supervise<R: Runtime>(
                 environment_id,
                 account,
                 session: Arc::clone(&session),
+                link,
             };
             state.transfers().host_reached(paired.clone());
             // The drafts kept for sessions the host no longer lists are ended.
