@@ -721,6 +721,20 @@ async fn start_and_acknowledge_within(
     hello: &BridgeHello,
     limit: std::time::Duration,
 ) -> Result<Started, Refusal> {
+    acknowledge_within(start_helper(command)?, &command.program, hello, limit).await
+}
+
+/// A helper that has started and has not yet said anything.
+struct Spawned {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::process::ChildStdout,
+    diagnostics: Diagnostics,
+    stderr: Reader,
+}
+
+/// Starts the helper with its three streams piped.
+fn start_helper(command: &BridgeCommand) -> Result<Spawned, Refusal> {
     let mut process = tokio::process::Command::new(&command.program);
     process
         .args(&command.arguments)
@@ -744,11 +758,11 @@ async fn start_and_acknowledge_within(
         detail: error.to_string(),
     })?;
 
-    let mut stdin = child.stdin.take().ok_or_else(|| Refusal::NotStarted {
+    let stdin = child.stdin.take().ok_or_else(|| Refusal::NotStarted {
         program: command.program.clone(),
         detail: "its standard input is not a pipe".to_owned(),
     })?;
-    let mut stdout = child.stdout.take().ok_or_else(|| Refusal::NotStarted {
+    let stdout = child.stdout.take().ok_or_else(|| Refusal::NotStarted {
         program: command.program.clone(),
         detail: "its standard output is not a pipe".to_owned(),
     })?;
@@ -762,14 +776,37 @@ async fn start_and_acknowledge_within(
             program: command.program.clone(),
             detail: "its standard error is not a pipe".to_owned(),
         })?;
+    Ok(Spawned {
+        child,
+        stdin,
+        stdout,
+        diagnostics,
+        stderr,
+    })
+}
 
+/// Exchanges the opening frames with a helper that has started, and checks the version and the
+/// role. A helper that fails to answer is ended and collected here, and `program` names it.
+async fn acknowledge_within(
+    spawned: Spawned,
+    program: &str,
+    hello: &BridgeHello,
+    limit: std::time::Duration,
+) -> Result<Started, Refusal> {
+    let Spawned {
+        child,
+        mut stdin,
+        mut stdout,
+        diagnostics,
+        stderr,
+    } = spawned;
     let acknowledgement = match acknowledged(&mut stdin, &mut stdout, hello, limit).await {
         Ok(acknowledgement) => acknowledgement,
         // The stream ended or broke, which is what a helper that exits, or is ended, does to it
         // before it has said anything. How it ended is read, so that the diagnostic can say.
         Err(Refusal::Stream { detail, .. }) => {
             drop(stdin);
-            let helper = settle(child, &command.program).await?;
+            let helper = settle(child, program).await?;
             return Err(Refusal::Stream {
                 detail,
                 helper: Some(helper),
@@ -779,7 +816,7 @@ async fn start_and_acknowledge_within(
         // that says it was ended is one of a helper that is gone, or one that could not be ended.
         Err(Refusal::Silent { waited }) => {
             drop(stdin);
-            end(child, &command.program, KILL_LIMIT).await?;
+            end(child, program, KILL_LIMIT).await?;
             return Err(Refusal::Silent { waited });
         }
         Err(other) => return Err(other),
@@ -1924,18 +1961,30 @@ mod tests {
     /// KR-REQ-18.11, the part about connection diagnostics: a helper that says nothing is ended
     /// and collected before the refusal that says it was ended returns, so the sentence is true
     /// when it is read. The process is gone at that point: one that was ended and not collected
-    /// would still answer signal zero.
+    /// would still answer signal zero. `sleep` stands in for a helper that started and went
+    /// quiet, and its identifier is the handle's, so how soon a program writes anything decides
+    /// nothing.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_helper_that_says_nothing_is_ended_and_collected_before_the_refusal_returns() {
-        let directory = tempfile::tempdir().expect("a directory");
-        let identifier = directory.path().join("pid");
-        let script = format!("echo $$ >'{}'; exec sleep 60", identifier.display());
-        let opening = scripted(&script);
-        let refusal = match start_and_acknowledge_within(
-            &opening.command,
+        let opening = Opening {
+            command: BridgeCommand {
+                program: "/bin/sleep".to_owned(),
+                arguments: vec!["60".to_owned()],
+            },
+            environment_id: here(),
+            hello: hello(),
+        };
+        let spawned = start_helper(&opening.command).expect("sleep starts");
+        let pid = spawned
+            .child
+            .id()
+            .expect("a running helper has an identifier");
+        let refusal = match acknowledge_within(
+            spawned,
+            &opening.command.program,
             &opening.hello,
-            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(300),
         )
         .await
         {
@@ -1943,17 +1992,9 @@ mod tests {
             Ok(_) => panic!("a helper that says nothing is not acknowledged"),
         };
         assert!(matches!(refusal, Refusal::Silent { .. }), "{refusal:?}");
-        let pid = std::fs::read_to_string(&identifier).expect("the helper wrote its identifier");
-        let present = std::process::Command::new("/bin/kill")
-            .args(["-0", pid.trim()])
-            .output()
-            .expect("kill runs")
-            .status
-            .success();
         assert!(
-            !present,
-            "process {} was left running or uncollected",
-            pid.trim()
+            !still_there(pid),
+            "process {pid} was left running or uncollected"
         );
     }
 
