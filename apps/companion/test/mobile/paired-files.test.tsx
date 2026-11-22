@@ -399,6 +399,66 @@ describe('a card the device stored, before the application has said what it hold
     expect(cancel).not.toHaveBeenCalled()
     expect(end).not.toHaveBeenCalled()
   })
+
+  it('J3c: an offline stored card says uploaded and offers no remote action', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS })
+    const stored = {
+      transfer_id: 't-stored',
+      environment_id: 'e',
+      byte_len: '9',
+      content_digest: 'c'.repeat(64),
+      declared_media_type: 'application/pdf',
+      original_file_name: 'stored.pdf',
+      presented_as_image: false,
+      session_id: null,
+      preview: null,
+      published_at_ms: '1',
+      expires_at_ms: '2',
+      submitted: false
+    }
+    // The device keeps the draft with the file, and the application holds the same file on its draft.
+    controls.pairedUploads.keep(SESSION, stored)
+    await port.deviceDraftSave({
+      id: null,
+      expectedRevision: null,
+      sessionId: SESSION,
+      applicationInstanceId: null,
+      agentBindingRevision: null,
+      state: 'open',
+      text: '',
+      attachments: [stored]
+    })
+    const cancel = vi.spyOn(port, 'uploadCancel')
+    const end = vi.spyOn(port, 'draftEnd')
+    render(
+      <AppProvider port={port} uploadPollMs={10}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    const person = userEvent.setup({ applyAccept: false })
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await waitFor(() => {
+      expect(lineOfFile('stored.pdf').getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+    })
+    // The host stops answering while the draft is open: the card is drawn from what the device keeps.
+    act(() => {
+      controls.setConnected(false, 'the host stopped answering')
+    })
+    const card = await waitFor(() => {
+      const found = document.querySelector<HTMLElement>('.m-attachment')
+      expect(found).not.toBeNull()
+      return within(found as HTMLElement)
+    })
+    expect(screen.queryByTestId('m-upload')).toBeNull()
+    expect(card.getByText(/uploaded/)).toBeInTheDocument()
+    expect(card.queryByRole('button', { name: /^Cancel/ })).toBeNull()
+    await person.click(card.getByRole('button', { name: 'Remove stored.pdf from this draft' }))
+    expect(document.querySelector('.m-attachment')).toBeNull()
+    expect(cancel).not.toHaveBeenCalled()
+    expect(end).not.toHaveBeenCalled()
+  })
 })
 
 describe('a file whose bind the application refuses for want of a record of it', () => {
