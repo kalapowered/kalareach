@@ -1150,9 +1150,10 @@ fn no_package_to_install_runs_no_download_and_no_install() {
     assert!(summary(&outcome).starts_with("apt-install: packages=0 attempts=1 "));
 }
 
-/// A plan of the install that fails after an update with no warning is the packages' own fault: the
-/// script ends at once with apt's lines and does not wait out its deadline. After an update that
-/// printed a warning the indexes may be the cause, and the attempt is tried again.
+/// A plan of the install that apt refuses after an update with no warning is the packages' own
+/// fault: the script ends at once with apt's lines and does not wait out its deadline. After an
+/// update that printed a warning the indexes may be the cause, and the attempt is tried again. A
+/// plan that `timeout` cut is tried again after either.
 #[test]
 fn a_plan_that_fails_after_a_clean_update_ends_the_script_and_after_a_warning_is_retried() {
     let rig = Rig::new();
@@ -1787,8 +1788,8 @@ fn a_failed_install_saves_nothing() {
     assert!(!rig.path("cache/desktop.new").exists());
 }
 
-/// With an archive directory the plan of the install is the listing, and a failure of it after a
-/// clean update ends the script as it does without one.
+/// With an archive directory the plan of the install is the listing, and apt's refusal of it after
+/// a clean update ends the script as it does without one.
 #[test]
 fn with_an_archive_directory_a_listing_that_fails_after_a_clean_update_ends_the_script() {
     let rig = Rig::new();
