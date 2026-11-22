@@ -1866,6 +1866,54 @@ fn recorded_question(ctx: &Context, real: &Real, needle: &str) -> Option<(PathBu
     }
 }
 
+/// Why a real route cannot run part 7 or 7f, or `None`: the entry names no start draft text
+/// (`account.draft`). The agent's resume or fork start draws a composer beside its draft, and with no
+/// text to tell the draft by the screen reads that composer as a running continuation, so the part
+/// would charge B's turn and type at a start that is still a draft.
+fn second_start_unreadable(draft: &[String]) -> Option<&'static str> {
+    draft.is_empty().then_some(
+        "the entry names no start draft texts (account.draft), so the screen of the second start \
+         cannot tell the saved conversation's start draft from a running continuation",
+    )
+}
+
+/// A real route whose entry names no start draft text is not run for part 7 or 7f, because B's
+/// resume draft reads as a running continuation on its screen; an entry that names the texts runs.
+#[test]
+fn a_real_route_with_no_start_draft_text_is_not_run_for_parts_7_and_7f() {
+    let typed = "codex resume 0123-4567";
+    let composer = "Ask Codex to do anything";
+    let refusals = ["This conversation is open in another app".to_owned()];
+    let resume_draft: Vec<String> = [
+        "kr-session$ codex resume 0123-4567",
+        "  Resuming session…",
+        "> Ask Codex to do anything",
+    ]
+    .iter()
+    .map(|row| (*row).to_owned())
+    .collect();
+    let named = ["Resuming session…".to_owned()];
+    assert_eq!(
+        second_screen(&resume_draft, typed, composer, &refusals, &[], false),
+        Some((Started::Running, None)),
+        "with no draft text, B's resume draft reads as a running continuation"
+    );
+    assert_eq!(
+        second_screen(&resume_draft, typed, composer, &refusals, &named, false),
+        None,
+        "with the text named, it is no answer yet"
+    );
+    assert!(
+        second_start_unreadable(&[]).is_some_and(|why| why.contains("account.draft")),
+        "an entry that names no draft text is not run, and the line names the field"
+    );
+    assert_eq!(
+        second_start_unreadable(&named),
+        None,
+        "one that names it runs"
+    );
+}
+
 /// Part 7 or part 7f: session A holds a conversation, session B is started with the agent's
 /// command on it, and what the agent did and what the host showed are recorded. `forks` is
 /// whether the part is the one for the agent's fork command, which passes only when the agent
@@ -1876,6 +1924,15 @@ fn second_process(
     part: &str,
     forks: bool,
 ) -> serde_json::Value {
+    if let Route::Real(real) = &ctx.route
+        && let Some(why) = second_start_unreadable(&real.account.draft)
+    {
+        return serde_json::json!({
+            "arm": arm(ctx),
+            "not_run": why,
+            "turns_charged": 0,
+        });
+    }
     let (a, b) = (seated(session, Seat::First), seated(session, Seat::Second));
     let agent_a = starts_by_hand(ctx, session, Seat::First, &[], true);
     let shown_a = detects(ctx, &a);
@@ -2135,7 +2192,8 @@ fn second_process_by_hand(
 /// input to one never reaches the other, and A's binding revision stays as it was; where the agent
 /// refuses, whether it ended or went on running read-only with a notice in place of the composer,
 /// A's conversation and binding are as they were. The control breaks the property: B's marker typed
-/// into A's session, and the isolation check fails on it.
+/// into A's session, and the isolation check fails on it. A real route whose entry names no start
+/// draft text is not run, with no charge.
 #[test]
 fn gateway_a_second_process_on_the_same_saved_conversation_is_another_execution_not_merged() {
     const TEST: &str =
@@ -2156,7 +2214,7 @@ fn gateway_a_second_process_on_the_same_saved_conversation_is_another_execution_
 /// conversation of its own from a saved one (its `fork`). Session B answers from the saved
 /// conversation's history under an identifier of its own, in a file of its own, and the host keeps
 /// the two apart as two live executions as part 7 requires. A real route whose entry names no such
-/// command is not run, with no charge.
+/// command, or no start draft text, is not run, with no charge.
 #[test]
 fn gateway_a_forked_conversation_is_another_execution_with_a_conversation_of_its_own() {
     const TEST: &str =
