@@ -120,3 +120,39 @@ describe('the commands that act for an account carry its mark', () => {
     expect(mark.current).toBe('bb')
   })
 })
+
+describe('the baseline read of the account', () => {
+  /** Every promise job that is ready has run. */
+  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+
+  it('I1: is made once the listener is in place, so a change that came before is in it', async () => {
+    let registered: () => void = () => undefined
+    const registration = new Promise<() => void>((resolve) => {
+      registered = () => {
+        resolve(() => undefined)
+      }
+    })
+    let current = signedIn('aa')
+    const status = vi.fn(() => Promise.resolve(current))
+    const port = { accountStatus: status, onAccount: () => registration } as unknown as HostPort
+    const mark = new AccountMark()
+    mark.follow(port)
+    // The account changes to B while the listener is not yet in place: nobody hears it.
+    current = signedIn('bb')
+    registered()
+    await flush()
+    expect(mark.current).toBe('bb')
+  })
+
+  it('I2: is still made once when the registration is refused', async () => {
+    const registration = Promise.reject(new Error('the listener was not registered'))
+    registration.catch(() => undefined)
+    const status = vi.fn(() => Promise.resolve(signedIn('aa')))
+    const port = { accountStatus: status, onAccount: () => registration } as unknown as HostPort
+    const mark = new AccountMark()
+    mark.follow(port)
+    await flush()
+    expect(status).toHaveBeenCalledTimes(1)
+    expect(mark.current).toBe('aa')
+  })
+})

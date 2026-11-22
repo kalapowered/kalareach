@@ -94,7 +94,7 @@ async function following(options: { organisation: boolean; first?: AccountView }
   const said: string[] = []
   // The page's screens read and hear the connection through the stamped port, which tells the tracker.
   const host = new ConnectedHost()
-  const screens = stampedPort(port, mark.read, host.note)
+  const screens = stampedPort(port, mark.read, host)
   await screens.onConnection(() => undefined)
   const environment = (await screens.connectionState()).environment_id ?? ''
   const stop = followAccountChange({ port, mark, host, uploads, drafts, say: (text) => said.push(text) })
@@ -119,6 +119,38 @@ async function following(options: { organisation: boolean; first?: AccountView }
     }
   }
 }
+
+describe('the host last connected, when a read of the connection answers late', () => {
+  const rights = ['files.upload', 'agent.prompt'] as const
+
+  it('H1: keeps the organisation host an event named, so the next change of account clears the files', async () => {
+    const window = await following({ organisation: false, first: signedIn('aa') })
+    // A read is made while the host answers to no organisation, and its answer waits.
+    const held = window.controls.hold('connectionState')
+    const read = window.screens.connectionState()
+    expect(held.count).toBe(1)
+    // The host then answers to an organisation: the event is applied at once.
+    window.controls.reachAsPhone({ rights, organisation: true })
+    held.release()
+    expect((await read).organisation).toBe(false)
+    await tick()
+    await window.change(signedIn('bb'))
+    expect(window.uploads.cycle).toBe(1)
+  })
+
+  it('H2: keeps no organisation host after an event that named none, so a change of account clears nothing', async () => {
+    const window = await following({ organisation: true, first: signedIn('aa') })
+    const held = window.controls.hold('connectionState')
+    const read = window.screens.connectionState()
+    expect(held.count).toBe(1)
+    window.controls.reachAsPhone({ rights, organisation: false })
+    held.release()
+    expect((await read).organisation).toBe(true)
+    await tick()
+    await window.change(signedIn('bb'))
+    expect(window.uploads.cycle).toBe(0)
+  })
+})
 
 describe('the files of an earlier sign-in at a change of the account', () => {
   it('takes the rows and the files off the composers, keeps the text, discards nothing and says so once', async () => {
