@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::frame::invocation::{Cleanup, ConfigurationState, EndedBy, InvocationReply, Notes};
 use crate::journal::limits;
-use crate::journal::rows::Row;
+use crate::journal::rows::{LeftoverClass, Row};
 use crate::lifecycle::{
     self as facts, Closing, Evidence, Left, Session, Uncertainty, cleanup_of, closing_rows,
 };
@@ -63,6 +63,23 @@ pub(super) fn close_out(
     };
     tree_left.extend(released.left);
     at("released");
+    // The leftovers of the private root that an earlier end journalled and did not finish.
+    let recorded: Vec<Left> = match journal.tracker() {
+        Ok(tracker) => tracker
+            .leftovers()
+            .iter()
+            .filter(|leftover| leftover.class == LeftoverClass::Root)
+            .map(|leftover| Left {
+                object: leftover.object.clone(),
+                reason: leftover.reason.clone(),
+            })
+            .collect(),
+        // A journal that takes no more rows is not read; its closing rows are refused and handled below.
+        Err(closed) => {
+            drop(closed);
+            Vec::new()
+        }
+    };
     let mut root_left = Vec::new();
     if let Some(root) = root {
         match privilege::enter() {
@@ -73,15 +90,24 @@ pub(super) fn close_out(
                         reason: left.reason,
                     }));
                 }
-                Err(failure) => root_left.push(Left {
-                    object: root.path().display().to_string(),
-                    reason: failure.to_string(),
-                }),
+                Err(failure) => {
+                    // The removal did not run to its end: what an earlier end left stays open.
+                    root_left.push(Left {
+                        object: root.path().display().to_string(),
+                        reason: failure.to_string(),
+                    });
+                    root_left.extend(recorded.iter().cloned());
+                }
             },
-            Err(failure) => root_left.push(Left {
-                object: root.path().display().to_string(),
-                reason: format!("the privileges for the removal could not be enabled: {failure}"),
-            }),
+            Err(failure) => {
+                root_left.push(Left {
+                    object: root.path().display().to_string(),
+                    reason: format!(
+                        "the privileges for the removal could not be enabled: {failure}"
+                    ),
+                });
+                root_left.extend(recorded.iter().cloned());
+            }
         }
     }
     at("root removed");
@@ -90,7 +116,7 @@ pub(super) fn close_out(
         tree: tree_left,
         repository,
         root: root_left,
-        root_recorded: Vec::new(),
+        root_recorded: recorded.into_iter().map(|left| left.object).collect(),
     };
     let mut written = true;
     for row in closing_rows(&closing) {
