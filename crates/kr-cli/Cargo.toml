@@ -152,8 +152,8 @@ kr-transport.workspace = true
 kr-plugin-service.workspace = true
 url.workspace = true
 # The retained-surface check follows the helpers a validator calls through their source, token by token.
-# `span-locations` gives the tokens of a parsed file their line numbers, which the retained-surface gate's
-# oracle compares with the lines of its own search.
+# `span-locations` gives the tokens of a parsed file their line numbers, which the compiler reading uses
+# to place the tokens that name a stamped item.
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 quote.workspace = true
 
