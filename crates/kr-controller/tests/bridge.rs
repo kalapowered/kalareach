@@ -33,6 +33,7 @@ use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, ParamsValue, Re
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{FrameCodec, StreamKind};
 use kr_protocol::hello::{ActionWindow, PROTOCOL_VERSION};
+use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::identity::{
     BootIdentity, BootIdentitySource, BridgeFrame, BridgeHelloAck, BridgeVerification,
     EnvironmentAccess, EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentEnrolment,
@@ -544,7 +545,7 @@ async fn a_refresh_that_cannot_reach_a_destination_says_so_and_scopes_no_channel
                 "nothing answered, so nothing is recorded as verified"
             );
             assert!(
-                !refreshed.connection.is_empty(),
+                !refreshed.connection.as_str().is_empty(),
                 "the result says what opening the bridge did"
             );
             assert!(!refreshed.row.readiness.channel_scoped);
@@ -602,7 +603,7 @@ async fn a_refresh_of_an_environment_that_is_not_a_process_bridge_opens_none() {
     assert!(refreshed.verification.as_ref().is_none());
     assert!(!refreshed.started);
     assert!(
-        refreshed.connection.contains("process bridge"),
+        refreshed.connection.as_str().contains("process bridge"),
         "{}",
         refreshed.connection
     );
@@ -1338,6 +1339,11 @@ fn both_recorded() -> EnvironmentReadiness {
     }
 }
 
+/// A sentence as a reader of the daemon's answer has it: text that arrived, whoever composed it.
+fn arrived(text: &str) -> Sentence {
+    serde_json::from_value(serde_json::Value::String(text.to_owned())).expect("a sentence")
+}
+
 /// A refresh whose bridge answered for the record that is approved now.
 fn established(
     enrolment: EnvironmentEnrolment,
@@ -1348,9 +1354,10 @@ fn established(
         row: refreshed_row(enrolment, observed_at_ms, both_recorded()),
         started: false,
         verification: Nullable::some(verified_as(environment_id)),
-        connection: format!(
-            "environment {environment_id} answered as kala over its own local channel"
-        ),
+        connection: arrived(&format!(
+            "environment {environment_id} answered as [name withheld, 4 bytes] over its own \
+             local channel"
+        )),
     }
 }
 
@@ -1473,13 +1480,18 @@ async fn held_across(
     let (verification, connection) = match ending {
         Ending::Answered => (
             Nullable::some(verified_as(environment_id)),
-            "this environment's record changed while the bridge was open, so what answered says \
-             nothing about what is recorded now"
-                .to_owned(),
+            arrived(
+                "this environment's record changed while the bridge was open, so what answered \
+                 says nothing about what is recorded now",
+            ),
         ),
         Ending::Refused => (
             Nullable::null(),
-            format!("the destination refused the bridge: {REFUSAL}"),
+            arrived(&format!(
+                "wsl.exe ran, and the environment refused the bridge: PERMISSION_DENIED \
+                 ([message withheld, {} bytes])",
+                REFUSAL.len()
+            )),
         ),
     };
     assert_eq!(
@@ -1879,7 +1891,10 @@ async fn an_ssh_host_registers_its_identity_and_channel_from_its_helper() {
     assert_eq!(verification.os_user, "kala");
     assert!(!refreshed.started, "asking who a host is starts nothing");
     assert!(
-        refreshed.connection.contains("no request crosses ssh"),
+        refreshed
+            .connection
+            .as_str()
+            .contains("no request crosses ssh"),
         "{}",
         refreshed.connection
     );
@@ -1934,6 +1949,34 @@ async fn an_ssh_host_registers_its_identity_and_channel_from_its_helper() {
     );
 }
 
+/// KR-REQ-18.11, the part about connection diagnostics: a helper that acknowledged the bridge and
+/// then ended before it answered the read is told by the program the host ran and how it ended,
+/// rather than as a stream that failed, and the record keeps no channel for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_helper_that_ends_after_it_acknowledged_is_told_by_its_program() {
+    let daemon = FixtureDaemon::start();
+    let mut client = daemon.client().await;
+    let host = daemon.environment_id();
+    let environment_id = EnvironmentId::new(Uuid::from_bytes([0x44; 16]));
+    enrol_as(
+        &mut client,
+        host,
+        fixture_record(environment_id, FIRST_HELPER),
+    )
+    .await;
+    // The acknowledgement, and no answer to the read that follows it.
+    daemon.answer(FIRST_HELPER, &answered_as(environment_id)[..1]);
+    let refreshed = refresh_as(&mut client, host, environment_id).await;
+    assert!(refreshed.verification.as_ref().is_none());
+    assert!(!refreshed.row.readiness.channel_scoped);
+    let said = refreshed.connection.as_str();
+    assert!(
+        said.starts_with("wsl.exe ended with exit code ")
+            && said.ends_with(" before the environment answered"),
+        "{said}"
+    );
+}
+
 /// KR-REQ-25.26: an answer that is not the record's registers nothing, and takes back what an
 /// earlier answer had registered: another user, another environment, or this host's own, which is
 /// what a socket forwarded from here is answered by.
@@ -1958,7 +2001,7 @@ async fn an_ssh_answer_that_is_not_the_records_registers_nothing() {
         (
             "another user",
             ssh_answer(environment_id, "root"),
-            "ran as root",
+            "ran as [name withheld, 4 bytes]",
         ),
         (
             "another environment",
@@ -1979,7 +2022,7 @@ async fn an_ssh_answer_that_is_not_the_records_registers_nothing() {
             "{what}: what an earlier answer registered is taken back"
         );
         assert!(
-            refreshed.connection.contains(said),
+            refreshed.connection.as_str().contains(said),
             "{what}: {}",
             refreshed.connection
         );
@@ -2024,7 +2067,10 @@ async fn an_ssh_answer_that_is_any_local_environment_registers_nothing() {
     );
     assert!(!refreshed.row.readiness.channel_scoped);
     assert!(
-        refreshed.connection.contains("this host's own environment"),
+        refreshed
+            .connection
+            .as_str()
+            .contains("this host's own environment"),
         "{}",
         refreshed.connection
     );
@@ -2083,7 +2129,7 @@ async fn an_ssh_login_held_across_a_replaced_record_registers_nothing_for_the_re
         let (held, ()) = tokio::join!(held, meanwhile);
         if honest {
             assert!(
-                held.connection.contains("record changed"),
+                held.connection.as_str().contains("record changed"),
                 "the held login says it answered for a record that is gone: {}",
                 held.connection
             );

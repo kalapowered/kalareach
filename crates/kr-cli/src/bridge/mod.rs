@@ -137,7 +137,7 @@ fn enrolled_line(row: &EnvironmentInventoryRow) -> Line {
 }
 
 /// What a refresh tells a person: the row, what opening the bridge did, whether it answered or
-/// not, as the host's sentence, and what the helper said it speaks.
+/// not, in the host's sentence, and what the helper said it speaks.
 fn refresh_lines(refreshed: &EnvironmentRefreshResult) -> Vec<Line> {
     let mut lines = vec![
         stdout_line!(
@@ -173,13 +173,10 @@ fn readiness_detail(row: &EnvironmentInventoryRow) -> Shown {
     crate::shown::exported("EnvironmentReadiness", "detail", &row.readiness.detail)
 }
 
-/// What the host says opening a bridge did, as its class and its length.
+/// What the host says opening a bridge did, as the host composed it: the program it ran and how
+/// that went, with anything that arrived at the host given as its class and its length.
 fn connection(refreshed: &EnvironmentRefreshResult) -> Shown {
-    crate::shown::exported(
-        "EnvironmentRefreshResult",
-        "connection",
-        &refreshed.connection,
-    )
+    crate::shown::host_text(&refreshed.connection)
 }
 
 /// An enrolment, in the shape the protocol answers it.
@@ -249,7 +246,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::output::planted::{only_asked, only_asked_lines, planted, planted_text};
+    use crate::output::planted::{only_asked, only_asked_lines, planted};
+
+    /// A sentence of the shape the host composes for a bridge that did not answer.
+    const HOST_SENTENCE: &str = "podman ended with exit code 125 before the environment answered";
     use crate::shown::marker::MARKER;
 
     /// KR-REQ-18.11: a record that holds a destination this host does not deliver to is shown as one
@@ -301,14 +301,20 @@ mod tests {
             ));
             only_asked_lines("kr bridge enrol", &[enrolled_line(&enrolled.row)]);
         }
-        for refreshed in planted::<EnvironmentRefreshResult>() {
+        for mut refreshed in planted::<EnvironmentRefreshResult>() {
+            // The connection is the host's own sentence, composed of its words and numbers and the
+            // class and length of what arrived, so it is said as written. The planted text stands
+            // for a value that arrived at the host, which the host has already given as a class and
+            // a length; the sentence is replaced by one the host could have composed.
+            refreshed.connection =
+                serde_json::from_value(serde_json::json!(HOST_SENTENCE)).expect("a sentence");
             shown.extend(only_asked("kr bridge refresh", &refresh(&refreshed)));
             only_asked_lines("kr bridge refresh", &refresh_lines(&refreshed));
-            let withheld = format!("[message withheld, {} bytes]", planted_text().len());
             assert_eq!(
                 refresh(&refreshed).json()["connection"],
-                serde_json::json!(withheld)
+                serde_json::json!(HOST_SENTENCE)
             );
+            assert_eq!(connection(&refreshed).as_str(), HOST_SENTENCE);
             assert!(!connection(&refreshed).as_str().contains(MARKER));
         }
         for asked in [

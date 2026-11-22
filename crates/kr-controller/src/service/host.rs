@@ -530,10 +530,9 @@ impl Controller {
                         .map(Reading::Own);
                 }
                 if !cached.enrolment.access.is_process_bridge() {
-                    let connection = format!(
-                        "{} is not reached by a process bridge, so none was opened",
-                        cached.enrolment.access.as_str()
-                    );
+                    let connection = kr_protocol::hostinfo::export::Sentence::new()
+                        .stated(cached.enrolment.access.as_str())
+                        .stated(" is not reached by a process bridge, so none was opened");
                     // What the enrolment record says, and nothing this request did.
                     return encode(&EnvironmentRefreshResult {
                         row: cached,
@@ -596,42 +595,47 @@ impl Controller {
                 // Only a running environment is worth opening a bridge to, and only a process
                 // bridge has one to open. Everything else says so rather than starting anything:
                 // section 3 leaves starting to the caller that asked for it.
-                let (verification, connection) = if row.status
-                    != kr_protocol::identity::EnvironmentPresence::Running
-                {
-                    (
-                        Nullable::null(),
-                        "no bridge was opened, because this environment is not running; refresh \
-                         with --start to start it"
-                            .to_owned(),
-                    )
-                } else if let Err(refusal) = controller.check_registration(&carried) {
-                    // The platform has been asked and the record is made. Opening a bridge reaches
-                    // into another environment, so it waits on the admission; what it refuses is
-                    // not a refusal of the refresh, which has run.
-                    (
-                        Nullable::null(),
-                        format!("no bridge was opened, because {refusal}"),
-                    )
-                } else {
-                    // Opening a bridge reaches into another environment, after waits of its own.
-                    let opened_for = row.enrolment.clone();
-                    match crate::bridge::verify::through_bridge(
-                        actor,
-                        bridged,
-                        &opened_for,
-                        self.paths.environment_id(),
-                        self.build_id.clone(),
-                    )
-                    .await
-                    {
-                        Ok(verification) => {
-                            // The destination answered on its own local channel, inside its own
-                            // environment. That is section 25's scoped channel, established rather
-                            // than assumed, so the record keeps it — against the approved record
-                            // the bridge was opened for, which another caller may have replaced
-                            // since.
-                            match self
+                let (verification, connection) =
+                    if row.status != kr_protocol::identity::EnvironmentPresence::Running {
+                        (
+                            Nullable::null(),
+                            kr_protocol::hostinfo::export::Sentence::new().stated(
+                                "no bridge was opened, because this environment is not running; \
+                             refresh with --start to start it",
+                            ),
+                        )
+                    } else if let Err(refusal) = controller.check_registration(&carried) {
+                        // The platform has been asked and the record is made. Opening a bridge reaches
+                        // into another environment, so it waits on the admission; what it refuses is
+                        // not a refusal of the refresh, which has run.
+                        (
+                            Nullable::null(),
+                            kr_protocol::hostinfo::export::Sentence::new()
+                                .stated("no bridge was opened, because ")
+                                .withheld(
+                                    kr_protocol::hostinfo::export::ContentClass::Message,
+                                    &refusal.to_string(),
+                                ),
+                        )
+                    } else {
+                        // Opening a bridge reaches into another environment, after waits of its own.
+                        let opened_for = row.enrolment.clone();
+                        match crate::bridge::verify::through_bridge(
+                            actor,
+                            bridged,
+                            &opened_for,
+                            self.paths.environment_id(),
+                            self.build_id.clone(),
+                        )
+                        .await
+                        {
+                            Ok(verification) => {
+                                // The destination answered on its own local channel, inside its own
+                                // environment. That is section 25's scoped channel, established rather
+                                // than assumed, so the record keeps it — against the approved record
+                                // the bridge was opened for, which another caller may have replaced
+                                // since.
+                                match self
                                 .record_outcome(
                                     carried,
                                     environment_id,
@@ -647,34 +651,44 @@ impl Controller {
                                     // was written.
                                     row.readiness = outcome.readiness;
                                     let detail = if outcome.established {
-                                        format!(
-                                            "environment {} answered as {} over its own local \
-                                             channel",
-                                            verification.environment_id, verification.os_user
-                                        )
+                                        kr_protocol::hostinfo::export::Sentence::new()
+                                            .stated("environment ")
+                                            .identifier(&verification.environment_id)
+                                            .stated(" answered as ")
+                                            .withheld(
+                                                kr_protocol::hostinfo::export::ContentClass::Name,
+                                                &verification.os_user,
+                                            )
+                                            .stated(" over its own local channel")
                                     } else {
-                                        "this environment's record changed while the bridge was \
-                                         open, so what answered says nothing about what is \
-                                         recorded now"
-                                            .to_owned()
+                                        kr_protocol::hostinfo::export::Sentence::new().stated(
+                                            "this environment's record changed while the bridge \
+                                             was open, so what answered says nothing about what \
+                                             is recorded now",
+                                        )
                                     };
                                     (Nullable::some(verification), detail)
                                 }
                                 // The refresh has run, and a refusal here is not a refusal of it.
                                 Err(refusal) => (
                                     Nullable::null(),
-                                    format!(
-                                        "the bridge answered, and this host did not record that, \
-                                         because {refusal}"
-                                    ),
+                                    kr_protocol::hostinfo::export::Sentence::new()
+                                        .stated(
+                                            "the bridge answered, and this host did not record \
+                                             that, because ",
+                                        )
+                                        .withheld(
+                                            kr_protocol::hostinfo::export::ContentClass::Message,
+                                            &refusal.to_string(),
+                                        ),
                                 ),
                             }
-                        }
-                        Err(refusal) => {
-                            // Nothing answered. What an earlier bridge established for this record
-                            // is not evidence about it any more, so it is taken back rather than
-                            // left standing beside a failure.
-                            match self
+                            }
+                            Err(refusal) => {
+                                // Nothing answered. What an earlier bridge established for this record
+                                // is not evidence about it any more, so it is taken back rather than
+                                // left standing beside a failure.
+                                match self
                                 .record_outcome(
                                     carried,
                                     environment_id,
@@ -686,19 +700,24 @@ impl Controller {
                             {
                                 Ok(outcome) => {
                                     row.readiness = outcome.readiness;
-                                    (Nullable::null(), refusal.to_string())
+                                    (
+                                        Nullable::null(),
+                                        crate::bridge::diagnosis::of(&refusal, opened_for.access),
+                                    )
                                 }
                                 Err(unrecorded) => (
                                     Nullable::null(),
-                                    format!(
-                                        "{refusal}; and this host did not record that, because \
-                                         {unrecorded}"
-                                    ),
+                                    crate::bridge::diagnosis::of(&refusal, opened_for.access)
+                                        .stated("; and this host did not record that, because ")
+                                        .withheld(
+                                            kr_protocol::hostinfo::export::ContentClass::Message,
+                                            &unrecorded.to_string(),
+                                        ),
                                 ),
                             }
+                            }
                         }
-                    }
-                };
+                    };
                 encode(&EnvironmentRefreshResult {
                     row,
                     started,
@@ -753,15 +772,20 @@ impl Controller {
                     .await?;
                 row.readiness = outcome.readiness;
                 let detail = if outcome.established {
-                    format!(
-                        "environment {} answered as {} on the helper installed there, over ssh; \
-                         no request crosses ssh",
-                        verification.environment_id, verification.os_user
-                    )
+                    kr_protocol::hostinfo::export::Sentence::new()
+                        .stated("environment ")
+                        .identifier(&verification.environment_id)
+                        .stated(" answered as ")
+                        .withheld(
+                            kr_protocol::hostinfo::export::ContentClass::Name,
+                            &verification.os_user,
+                        )
+                        .stated(" on the helper installed there, over ssh; no request crosses ssh")
                 } else {
-                    "this environment's record changed while its helper was asked, so what \
-                     answered says nothing about what is recorded now"
-                        .to_owned()
+                    kr_protocol::hostinfo::export::Sentence::new().stated(
+                        "this environment's record changed while its helper was asked, so what \
+                         answered says nothing about what is recorded now",
+                    )
                 };
                 (Nullable::some(verification), detail)
             }
@@ -776,7 +800,10 @@ impl Controller {
                     )
                     .await?;
                 row.readiness = outcome.readiness;
-                (Nullable::null(), refusal.to_string())
+                (
+                    Nullable::null(),
+                    crate::bridge::diagnosis::of(&refusal, opened_for.access),
+                )
             }
         };
         encode(&EnvironmentRefreshResult {

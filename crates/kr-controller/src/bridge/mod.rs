@@ -24,6 +24,7 @@
 //! any right inside it: the helper is authenticated over there by its own operating-system
 //! credentials, under the user the enrolment names.
 
+pub mod diagnosis;
 pub mod invoke;
 pub mod launch;
 pub mod platform;

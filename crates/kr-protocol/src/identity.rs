@@ -23,6 +23,7 @@ use crate::actor::ActorIngress;
 use crate::envelope::ControlFrame;
 use crate::error::ProtocolError;
 use crate::hello::{ActionWindow, ProtocolVersion};
+use crate::hostinfo::export::Sentence;
 use crate::ids::{BuildId, ConnectionId, DesktopSessionId, EnvironmentId, SessionId};
 use crate::local::LocalRole;
 use crate::scalars::{Bytes, Nullable, TimestampMs, U64};
@@ -294,41 +295,43 @@ pub enum EnrolmentError {
     SshHelperPathNotPlain,
 }
 
-impl core::fmt::Display for EnrolmentError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl EnrolmentError {
+    /// Returns the sentence that says why, which is the same words for the same cause.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
         match self {
-            Self::ClipboardDestinationUnknown => formatter.write_str(
+            Self::ClipboardDestinationUnknown => {
                 "the only clipboard destination an enrolment can name is the terminal an \
-                 attachment is made from: terminal",
-            ),
-            Self::EmptyLabel => formatter.write_str("an enrolment carries the label people use"),
-            Self::EmptyTarget => {
-                formatter.write_str("an enrolment carries the identity the platform issued")
+                 attachment is made from: terminal"
             }
-            Self::EmptyUser => {
-                formatter.write_str("an enrolment carries the operating-system user it runs as")
-            }
-            Self::HelperPathNotAbsolute => {
-                formatter.write_str("an enrolment carries the absolute path of the helper")
-            }
-            Self::ContainerTargetNotIdentifier => formatter.write_str(
+            Self::EmptyLabel => "an enrolment carries the label people use",
+            Self::EmptyTarget => "an enrolment carries the identity the platform issued",
+            Self::EmptyUser => "an enrolment carries the operating-system user it runs as",
+            Self::HelperPathNotAbsolute => "an enrolment carries the absolute path of the helper",
+            Self::ContainerTargetNotIdentifier => {
                 "a container enrolment requires the container identifier, never a reusable \
-                 container name",
-            ),
-            Self::SshTargetNotPlain => formatter.write_str(
+                 container name"
+            }
+            Self::SshTargetNotPlain => {
                 "an SSH enrolment names a host by a plain name or address: letters, digits, dots, \
-                 colons, underscores and hyphens, not beginning with a hyphen, with no user in it",
-            ),
-            Self::SshUserNotPlain => formatter.write_str(
+                 colons, underscores and hyphens, not beginning with a hyphen, with no user in it"
+            }
+            Self::SshUserNotPlain => {
                 "an SSH enrolment names the account by a plain name: letters, digits, dots, \
-                 underscores and hyphens, not beginning with a hyphen",
-            ),
-            Self::SshHelperPathNotPlain => formatter.write_str(
+                 underscores and hyphens, not beginning with a hyphen"
+            }
+            Self::SshHelperPathNotPlain => {
                 "an SSH enrolment names the helper by a plain absolute path: letters, digits, \
                  dots, underscores, hyphens and slashes, because the remote login's shell reads \
-                 whatever else it holds",
-            ),
+                 whatever else it holds"
+            }
         }
+    }
+}
+
+impl core::fmt::Display for EnrolmentError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.describe())
     }
 }
 
@@ -856,7 +859,13 @@ pub struct EnvironmentRefreshResult {
     /// and for an access class that is not a process bridge. [`Self::connection`] says which.
     pub verification: Nullable<BridgeVerification>,
     /// What opening that bridge did, in one line a person can act on.
-    pub connection: String,
+    //
+    // The host composes it from its own words, numbers and closed terms: the program it ran for
+    // the environment and how that failed (it could not start, it ended with a code, a signal
+    // ended it, it said nothing within its bound, or the environment refused), with anything that
+    // arrived at the host, such as the operating system's message, given as its class and length.
+    // This is a plain comment so that the published schema's description stays as it was.
+    pub connection: Sentence,
 }
 
 #[cfg(test)]

@@ -64,6 +64,24 @@ pub const HELPER_ARGUMENTS: [&str; 2] = ["bridge", "--stdio"];
 /// that belongs to exactly one of them.
 pub const CONTAINER_RUNTIME: &str = "podman";
 
+/// The program this host starts a WSL distribution's helper with.
+pub const WSL_PROGRAM: &str = "wsl.exe";
+
+/// The program this host starts an SSH host's helper with.
+pub const SSH_PROGRAM: &str = "ssh";
+
+/// Returns the program this host runs for an environment of `access`, as this build names it, or
+/// none for a class that no program of this host reaches.
+#[must_use]
+pub const fn program_of(access: EnvironmentAccess) -> Option<&'static str> {
+    match access {
+        EnvironmentAccess::WslDistribution => Some(WSL_PROGRAM),
+        EnvironmentAccess::Container => Some(CONTAINER_RUNTIME),
+        EnvironmentAccess::SshHost => Some(SSH_PROGRAM),
+        EnvironmentAccess::PairedHost => None,
+    }
+}
+
 /// Builds the command one enrolled environment's helper is started with.
 ///
 /// # Errors
@@ -101,7 +119,7 @@ pub fn helper_command(
         .map_err(LaunchError::Incomplete)?;
     match access {
         EnvironmentAccess::WslDistribution => Ok(BridgeCommand {
-            program: "wsl.exe".to_owned(),
+            program: WSL_PROGRAM.to_owned(),
             arguments: vec![
                 "--distribution".to_owned(),
                 target.to_owned(),
@@ -202,7 +220,7 @@ pub fn identity_command(
                 HELPER_ARGUMENTS[1].to_owned(),
             ]);
             Ok(BridgeCommand {
-                program: "ssh".to_owned(),
+                program: SSH_PROGRAM.to_owned(),
                 arguments,
             })
         }
@@ -247,7 +265,7 @@ pub fn observe(enrolment: &EnvironmentEnrolment) -> Result<Observation, LaunchEr
     match enrolment.access {
         EnvironmentAccess::WslDistribution => {
             let listing = |arguments: &[&str]| BridgeCommand {
-                program: "wsl.exe".to_owned(),
+                program: WSL_PROGRAM.to_owned(),
                 arguments: arguments
                     .iter()
                     .map(|argument| (*argument).to_owned())
@@ -288,7 +306,7 @@ pub fn start(enrolment: &EnvironmentEnrolment) -> Result<BridgeCommand, LaunchEr
         // There is no "start a distribution" verb. Running the shortest possible command inside it
         // is what starts one, and `--exec` keeps that command a vector rather than a line.
         EnvironmentAccess::WslDistribution => Ok(BridgeCommand {
-            program: "wsl.exe".to_owned(),
+            program: WSL_PROGRAM.to_owned(),
             arguments: vec![
                 "--distribution".to_owned(),
                 enrolment.target.clone(),

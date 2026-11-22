@@ -2444,7 +2444,11 @@ async fn a_fence_that_lands_after_a_refresh_is_recorded_leaves_it_answered_with_
     assert_eq!(result.row.status, EnvironmentPresence::Running);
     assert!(result.verification.0.is_none());
     assert!(
-        result.connection.contains("no bridge was opened") && result.connection.contains("fence"),
+        result.connection.as_str().contains("no bridge was opened")
+            && result
+                .connection
+                .as_str()
+                .contains("because [message withheld, "),
         "{}",
         result.connection
     );
@@ -2479,7 +2483,11 @@ async fn a_fence_that_lands_while_a_refresh_opens_a_bridge_leaves_it_answered() 
     assert_eq!(result.row.status, EnvironmentPresence::Running);
     assert!(result.verification.0.is_none());
     assert!(
-        result.connection.contains("did not record") && result.connection.contains("fence"),
+        result.connection.as_str().contains("did not record")
+            && result
+                .connection
+                .as_str()
+                .contains("because [message withheld, "),
         "{}",
         result.connection
     );
@@ -2635,9 +2643,12 @@ async fn a_fence_that_lands_after_a_bridge_has_answered_says_the_answer_was_not_
         result.verification
     );
     assert!(
-        result.connection.contains("the bridge answered")
-            && result.connection.contains("did not record")
-            && result.connection.contains("fence"),
+        result.connection.as_str().contains("the bridge answered")
+            && result.connection.as_str().contains("did not record")
+            && result
+                .connection
+                .as_str()
+                .contains("because [message withheld, "),
         "{}",
         result.connection
     );
@@ -3531,7 +3542,7 @@ async fn a_refresh_of_an_environment_no_bridge_reaches_is_given_as_a_copy_of_its
         .expect("a result");
     assert!(!result.started);
     assert!(
-        result.connection.contains("process bridge"),
+        result.connection.as_str().contains("process bridge"),
         "{}",
         result.connection
     );
