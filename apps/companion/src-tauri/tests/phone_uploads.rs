@@ -1451,6 +1451,9 @@ async fn kr_req_13_12_a_cancel_the_host_cannot_be_asked_is_finished_when_it_is_r
     let key = kr_ipc::new_uuid();
     let paired = paired_of(companion).await;
     let session = Arc::clone(&paired.session);
+    let who = paired.who();
+    let waiting = testing::hold_at(key, testing::Point::CancelWaiting);
+    let reached = testing::hold_at(who.device_id.get(), testing::Point::HostReached);
     let sending = {
         let sent = request(&adopted, &bytes, content, key);
         let (desk, paired) = (Arc::clone(&desk), paired.clone());
@@ -1463,7 +1466,8 @@ async fn kr_req_13_12_a_cancel_the_host_cannot_be_asked_is_finished_when_it_is_r
         let desk = Arc::clone(&desk);
         tokio::spawn(async move { desk.cancel(paired.who(), Some(paired), key).await })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The cancel has stopped the sender and waits for it; the content is let go only then.
+    waiting.until_passed(1).await;
     gate.release();
     let answer = cancelling
         .await
@@ -1476,15 +1480,24 @@ async fn kr_req_13_12_a_cancel_the_host_cannot_be_asked_is_finished_when_it_is_r
 
     control.stop_holding();
     control.release_all();
+    // The host is reached: the reach has registered what it starts, and what it started is over
+    // before anything is read.
+    tokio::time::timeout(WATCHDOG, reached.until_passed(1))
+        .await
+        .expect("the host is reached");
+    desk.idle().await;
+    assert!(
+        desk.open(&who).is_empty(),
+        "the cancel was finished at the reach: no upload is open"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 0);
+    assert_eq!(copies_in(&folder(&phone)), 0);
     let told = tokio::time::timeout(WATCHDOG, sending)
         .await
         .expect("the upload is ended once the host is reached")
         .expect("the task ran")
         .expect_err("cancelled");
     assert_eq!(told.message, companion_tauri::open_transfers::CANCELLED);
-    open_where(companion, <[Value]>::is_empty).await;
-    assert_eq!(entries_in(&folder(&phone)), 0);
-    assert_eq!(copies_in(&folder(&phone)), 0);
     adopted.stop().await;
 }
 
@@ -2364,8 +2377,10 @@ async fn kr_req_13_12_a_reconnect_before_the_driver_fails_resumes_the_upload_on_
     let (content, gate, _release) = gated(&bytes);
     let paired = paired_of(companion).await;
     let old = Arc::clone(&paired.session);
+    let key = kr_ipc::new_uuid();
+    let settled = testing::hold_at(key, testing::Point::SenderSettled);
     let sending = {
-        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let sent = request(&adopted, &bytes, content, key);
         let desk = Arc::clone(&desk);
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
@@ -2382,8 +2397,17 @@ async fn kr_req_13_12_a_reconnect_before_the_driver_fails_resumes_the_upload_on_
     .expect("the desk is told the host was reached on the new connection");
     assert!(!sending.is_finished(), "the upload has not ended");
 
-    // The driver fails only now, on the connection that has ended.
+    // The driver fails only now, on the connection that has ended. The sender settles, and only
+    // then is the desk's record of the resume read.
     gate.release();
+    tokio::time::timeout(WATCHDOG, settled.until_passed(1))
+        .await
+        .expect("the sender on the ended connection settles");
+    assert_eq!(
+        desk.resumed_on_for_test(key),
+        Some(newer.link),
+        "the upload went on at once on the new connection"
+    );
     let handle = tokio::time::timeout(WATCHDOG, sending)
         .await
         .expect("the upload goes on at once on the new connection")
@@ -3565,6 +3589,7 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
     let (content, gate, _release) = gated(&bytes);
     let upload_key = kr_ipc::new_uuid();
     let stop_asked = testing::hold_at(upload_key, testing::Point::CancelWaiting);
+    let reached = testing::hold_at(paired.device_id.get(), testing::Point::HostReached);
     let running = {
         let sent = request(&adopted, &bytes, content, upload_key);
         let (desk, earlier) = (Arc::clone(&desk), earlier.clone());
@@ -3609,28 +3634,29 @@ async fn kr_req_13_12_a_reach_as_another_principal_stops_what_it_sent_and_drops_
     old.transport().close();
     on_another_connection(companion, &old).await;
     connected(companion).await;
-    until(
-        "the desk asks the sender of the earlier principal to stop",
-        || stop_asked.passed() >= 1,
-    )
-    .await;
+    // The reach has registered what it starts. The sender is held in its content: the content is let
+    // go once the stop was asked, or, when no stop is ever asked, once what the reach started is
+    // over; the case reads what is left only after the work of the desk has ended.
+    tokio::time::timeout(WATCHDOG, reached.until_passed(1))
+        .await
+        .expect("the host is reached");
+    tokio::select! {
+        () = stop_asked.until_passed(1) => {}
+        () = desk.idle() => {}
+    }
     gate.release();
-
+    desk.idle().await;
+    assert_eq!(
+        entries_in(&folder(&phone)) + copies_in(&folder(&phone)) + drafts_in(&folder(&phone)),
+        0,
+        "every entry, copy and draft of the earlier principal is dropped"
+    );
     let stopped = tokio::time::timeout(WATCHDOG, running)
         .await
         .expect("the upload of the earlier principal ends")
         .expect("the task ran")
         .expect_err("an upload of another principal is not sent on");
     assert_eq!(stopped.message, companion_tauri::open_transfers::CANCELLED);
-    tokio::time::timeout(WATCHDOG, async {
-        while entries_in(&folder(&phone)) + copies_in(&folder(&phone)) + drafts_in(&folder(&phone))
-            > 0
-        {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("every entry, copy and draft of the earlier principal is dropped");
     assert_eq!(
         control.sent(Method::UploadStatus),
         status_reads,
@@ -4732,9 +4758,12 @@ async fn kr_req_13_12_a_paused_upload_is_read_while_the_host_is_out_of_reach() {
     let bytes = pattern(5);
     let (content, gate, _release) = gated(&bytes);
     let paired = paired_of(companion).await;
-    let (who, session) = (paired.who(), Arc::clone(&paired.session));
+    let session = Arc::clone(&paired.session);
+    let key = kr_ipc::new_uuid();
+    let settled = testing::hold_at(key, testing::Point::SenderSettled);
     let sending = {
-        let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+        let sent = request(&adopted, &bytes, content, key);
+        let desk = Arc::clone(&desk);
         tokio::spawn(async move { desk.send(paired, sent).await })
     };
     gate.reached().await;
@@ -4752,19 +4781,16 @@ async fn kr_req_13_12_a_paused_upload_is_read_while_the_host_is_out_of_reach() {
     })
     .await
     .expect("the connection ends");
-    // The desk says the upload is paused as soon as its sender sees the end.
+    // The sender sees the end and settles the upload as paused; only then is the upload read.
     let desk = desk_of(companion);
-    tokio::time::timeout(WATCHDOG, async {
-        while !desk
-            .open(&who)
-            .iter()
-            .any(|view| view.state == companion_tauri::open_transfers::OpenState::Paused)
-        {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the upload is paused");
+    tokio::time::timeout(WATCHDOG, settled.until_passed(1))
+        .await
+        .expect("the sender on the ended connection settles");
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("paused"),
+        "the sender settled the upload as paused"
+    );
 
     let read = try_open(companion);
     assert!(
@@ -5609,7 +5635,7 @@ async fn kr_req_13_12_a_reach_during_a_cancel_finishes_it_at_once() {
     returning.await.expect("the task ran");
     assert_eq!(
         answered["state"], "cancelled",
-        "the second look finished it"
+        "the barrier's attempt finished it on the new connection"
     );
     let told = tokio::time::timeout(WATCHDOG, sending)
         .await
@@ -5689,10 +5715,19 @@ async fn kr_req_13_12_a_restart_finishes_an_asked_cancel_and_shows_it_as_asked()
         companion_tauri::open_transfers::OpenState::CancelAsked
     );
 
+    let reached = testing::hold_at(who.device_id.get(), testing::Point::HostReached);
     control.stop_holding();
     control.release_all();
-    open_where(companion, <[Value]>::is_empty).await;
+    // The host is reached: the reach has registered what it starts, and what it started is over
+    // before anything is read.
+    tokio::time::timeout(WATCHDOG, reached.until_passed(1))
+        .await
+        .expect("the host is reached");
     desk.idle().await;
+    assert!(
+        desk.open(&who).is_empty(),
+        "the reach finished the cancel an earlier process recorded: no upload is open"
+    );
     assert_eq!(
         control.sent(Method::UploadCancel),
         1,
@@ -5729,10 +5764,19 @@ async fn kr_req_13_12_a_restored_upload_whose_cancel_record_failed_is_finished_a
         "read as cancelled, not as waiting"
     );
 
+    let reached = testing::hold_at(who.device_id.get(), testing::Point::HostReached);
     control.stop_holding();
     control.release_all();
-    open_where(companion, <[Value]>::is_empty).await;
+    // The host is reached: the reach has registered what it starts, and what it started is over
+    // before anything is read.
+    tokio::time::timeout(WATCHDOG, reached.until_passed(1))
+        .await
+        .expect("the host is reached");
     desk.idle().await;
+    assert!(
+        desk.open(&who).is_empty(),
+        "the reach finished the cancel and did not resume the upload: no upload is open"
+    );
     assert_eq!(
         control.sent(Method::UploadCancel),
         1,

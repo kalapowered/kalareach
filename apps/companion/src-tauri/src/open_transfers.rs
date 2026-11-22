@@ -1597,12 +1597,16 @@ impl Desk {
             }
         }
         if locked(&self.root).is_none() {
+            #[cfg(feature = "testing")]
+            testing::note(device_id.get(), testing::Point::HostReached);
             return;
         }
         let desk = Arc::clone(self);
         self.work.spawn(async move {
             desk.restart(paired).await;
         });
+        #[cfg(feature = "testing")]
+        testing::note(device_id.get(), testing::Point::HostReached);
     }
 
     /// Reads the host's record of every entry kept from before, and only then acts on them.
@@ -2757,6 +2761,9 @@ pub mod testing {
         SettleBeforeGate,
         /// A sender task ended, however it ended: finished, stopped, or panicked. Noted, never held.
         SenderExit,
+        /// The host was reached, and every task the reach starts is registered with the desk. Noted
+        /// under the device's identifier, never held.
+        HostReached,
     }
 
     /// A place in the desk's code where an operation waits without blocking its thread, so that a
