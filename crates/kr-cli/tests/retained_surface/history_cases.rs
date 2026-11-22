@@ -1097,16 +1097,16 @@ fn the_tags_are_read_a_few_at_once_each_in_a_thread_that_no_other_tag_uses_and_i
         most.fetch_max(now, SeqCst);
         // The first three readings wait until three are live, so that the overlap is made by the
         // helper and not by the scheduler: the wait ends when the count is reached and only a helper
-        // that never runs three at once reaches the limit, after ten seconds each. The first of them
-        // then keeps its place for a moment, in which a fourth reading would show.
+        // that never runs three at once reaches the limit, after ten seconds each. Each of the three
+        // then keeps its place for a moment, so that all three are live for that moment whatever the
+        // order in which they leave the wait, and a helper that starts every reading at once shows a
+        // fourth in it.
         if item < 3 {
             let limit = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while live.load(SeqCst) < 3 && std::time::Instant::now() < limit {
                 std::thread::yield_now();
             }
-            if item == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
             most.fetch_max(live.load(SeqCst), SeqCst);
         }
         ran.lock()
