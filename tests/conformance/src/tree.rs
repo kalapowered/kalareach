@@ -183,20 +183,23 @@ fn supervised(
     deadline: Deadline,
     capture: bool,
 ) -> io::Result<Waited<Output>> {
-    supervise(command, deadline, capture, Group::arm()?)
+    supervise(command, deadline, capture, Group::arm()?, || {})
 }
 
-/// [`supervised`] with the `interrupts` it reads and holds, which a unit can give.
+/// [`supervised`] with the `interrupts` it reads and holds, which a unit can give, and `between`,
+/// which runs once the command's watch is over and before the supervised phase closes: a signal
+/// that a unit records there is one that the watch's last read did not find.
 #[cfg(unix)]
 fn supervise(
     command: &mut Command,
     deadline: Deadline,
     capture: bool,
     interrupts: &Interrupts,
+    between: impl FnOnce(),
 ) -> io::Result<Waited<Output>> {
     // While this guard is held a signal is recorded and sent on to the command's group, and no
     // longer has its default action.
-    let _running = Running::begin(interrupts);
+    let running = Running::begin(interrupts);
     // A signal that reached the report since the last command means that no later command starts.
     if let Some(signal) = interrupts.signal() {
         return Ok(Waited::Interrupted(Captured::default(), signal));
@@ -211,9 +214,28 @@ fn supervise(
         command.stdout(Stdio::piped());
     }
     let mut child = command.spawn()?;
-    watch(&mut child, deadline, Child::try_wait, || {
+    let waited = watch(&mut child, deadline, Child::try_wait, || {
         interrupts.signal()
-    })
+    })?;
+    between();
+    // The phase closes before the last read: a signal after this has its default action, and one
+    // before it, which the watch's last read did not find, was recorded and is found now. The
+    // leader is reaped by then, so no signal goes to the group (its number could be another
+    // process's), and a command that ended is stopped all the same.
+    drop(running);
+    match waited {
+        Waited::Done(output) => match interrupts.signal() {
+            Some(signal) => Ok(Waited::Interrupted(
+                Captured {
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                },
+                signal,
+            )),
+            None => Ok(Waited::Done(output)),
+        },
+        waited => Ok(waited),
+    }
 }
 
 /// What the report keeps of the signals it sends on: INT and TERM. The report runs one command of a
@@ -835,6 +857,54 @@ mod tests {
         assert_eq!(asked, "", "a signal was sent to the group");
     }
 
+    /// KR-REQ-29.01, the part about reproducible commands: a signal that is recorded after the last
+    /// read of the watch and before the supervised phase closes leaves the command stopped, and not
+    /// done, and, because the leader is reaped by then, the report sends no signal to the group. The
+    /// command is a leader that ends at once and leaves a process in its group that writes a line
+    /// when it is asked to end, with its trap set before the leader ends. The seam records the
+    /// signal in that interval, as the handler does, so the case does not depend on a timing; the
+    /// process's file is empty after the call, and the phase is closed.
+    #[test]
+    fn a_signal_recorded_as_the_supervised_phase_closes_leaves_the_command_stopped() {
+        let place = tempfile::tempdir().expect("a directory");
+        let marker = place.path().join("asked.txt");
+        let ready = place.path().join("ready.txt");
+        // The straggler ends by itself in 20 s at most, and holds no pipe.
+        let script = "( trap 'printf \"%s\\n\" asked >> \"$1\"; exit 0' TERM; printf '%s\\n' ready >> \"$2\"; sleep 20 & wait ) >/dev/null 2>&1 &\ni=0; while [ ! -e \"$2\" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done\nexit 0";
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("bash")
+            .args([&marker, &ready])
+            .stdin(Stdio::null());
+        let interrupts = Interrupts::new();
+        let deadline = Deadline {
+            at: Instant::now() + Duration::from_secs(600),
+            seconds: 600,
+            budget: false,
+        };
+        let waited = supervise(&mut command, deadline, false, &interrupts, || {
+            interrupts.received[1].store(15, Ordering::SeqCst);
+        });
+        // A signal that had been sent would have run the trap by now.
+        std::thread::sleep(Duration::from_millis(500));
+        let asked = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(
+            ready.exists(),
+            "the trap was not set before the leader ended"
+        );
+        match waited.expect("a supervised command") {
+            Waited::Interrupted(_, 15) => {}
+            other => panic!("the command was not stopped by the signal: {other:?}"),
+        }
+        assert_eq!(asked, "", "a signal was sent to the group");
+        assert!(
+            interrupts.outside.load(Ordering::SeqCst),
+            "the phase was not closed"
+        );
+    }
+
     /// The leader of the group of `group_signalled`: it writes the name of each signal it is sent to
     /// the file of its first argument, records its pid and its child's in the file of its second,
     /// and goes on for 30 s at most, so that it ends by itself when nothing ends it.
@@ -984,7 +1054,7 @@ while time.monotonic() < end:
             seconds: 600,
             budget: false,
         };
-        let waited = supervise(&mut command, deadline, false, &interrupts).expect("a call");
+        let waited = supervise(&mut command, deadline, false, &interrupts, || {}).expect("a call");
         assert!(matches!(waited, Waited::Interrupted(_, 2)), "{waited:?}");
         std::thread::sleep(Duration::from_millis(500));
         assert!(!started.exists(), "the command was started");
