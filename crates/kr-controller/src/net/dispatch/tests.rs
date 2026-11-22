@@ -2018,6 +2018,136 @@ async fn a_description_is_withheld_when_privacy_mode_starts_before_it_is_sent() 
     world.serving.abort();
 }
 
+/// What a paired device is told of a session when nothing a model wrote may be shown: the title
+/// the session's metadata gives, and none of a description's activity, provenance or freshness.
+fn assert_metadata_only(told: &kr_protocol::describe::SessionDescribeResult) {
+    use kr_protocol::describe::{DescriptionFreshness, LabelSource};
+
+    assert_eq!(told.source, LabelSource::Metadata, "{told:?}");
+    assert_ne!(told.title, "Pairing check", "{told:?}");
+    assert!(told.activity_text.0.is_none(), "{told:?}");
+    assert!(told.provenance.0.is_none(), "{told:?}");
+    assert!(told.last_success_ms.0.is_none(), "{told:?}");
+    assert_eq!(told.freshness, DescriptionFreshness::None, "{told:?}");
+}
+
+/// KR-REQ-24.27: a paired device that asks for a session's description while privacy mode is on
+/// is told the metadata-only title and nothing a model wrote, though the store still holds a
+/// description under the generation now in force, as one a model's write that was in flight when
+/// privacy mode started would leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_is_told_a_metadata_only_title_while_privacy_mode_is_on() {
+    use kr_protocol::describe::SessionDescribeResult;
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    let world = world_holding_a_generated_description().await;
+    let controller = &world.controller;
+    privacy_mode_is_turned_on(controller).await;
+    let in_force = controller.privacy.state().reading().published();
+    assert!(in_force.private, "privacy mode is on: {in_force:?}");
+    controller
+        .descriptions()
+        .store()
+        .publish(
+            &world.session_id,
+            &crate::describe::tests::generated("Pairing check", in_force.generation),
+            1_000,
+        )
+        .expect("a description a late write left");
+    let left = controller
+        .descriptions()
+        .store()
+        .generated(&world.session_id)
+        .expect("the store is read");
+    assert!(
+        left.is_some_and(|record| record.generation == in_force.generation),
+        "set-up: the store holds a description under the generation in force"
+    );
+    let (connection, kept) = describing_connection(controller, 65);
+
+    let answer = connection
+        .answer_now(ControlFrame::Request(describe_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    assert!(
+        connection.write_answer(connection.output(), answer).await,
+        "the connection stands"
+    );
+    assert!(
+        matches!(
+            &kept.frames()[0],
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "the device is told the answer: {:?}",
+        kept.frames()[0]
+    );
+    let told: SessionDescribeResult = answered(kept.frames()[0].clone());
+    assert_metadata_only(&told);
+    world.serving.abort();
+}
+
+/// KR-REQ-24.27: a paired device that asks for a session's description is told the metadata-only
+/// title and nothing a model wrote when privacy mode is turned on after the description was read
+/// and before the answer is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_is_told_a_metadata_only_title_when_privacy_mode_starts_before_the_send() {
+    use kr_protocol::describe::SessionDescribeResult;
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+
+    let world = world_holding_a_generated_description().await;
+    let controller = &world.controller;
+    let (connection, kept) = describing_connection(controller, 66);
+
+    // Read while privacy mode is off, then held at the writer while the mode starts.
+    let answer = connection
+        .answer_now(ControlFrame::Request(describe_request_of(
+            world.session_id,
+            1,
+        )))
+        .await
+        .expect("an answer");
+    let turn = connection.output.hold_the_turn().await;
+    let (stands, ()) = tokio::join!(
+        connection.write_answer(connection.output(), answer),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while connection.output.writes_queued() < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the answer is waiting for the writer");
+            privacy_mode_is_turned_on(controller).await;
+            drop(turn);
+        }
+    );
+    assert!(stands, "the connection stands");
+    assert!(
+        controller.privacy.state().reading().published().private,
+        "privacy mode is on once the answer is written"
+    );
+    assert!(
+        matches!(
+            &kept.frames()[0],
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        ),
+        "the device is told the answer: {:?}",
+        kept.frames()[0]
+    );
+    let told: SessionDescribeResult = answered(kept.frames()[0].clone());
+    assert_metadata_only(&told);
+    world.serving.abort();
+}
+
 /// An agent's retained entries as a worker answers a read of them.
 fn a_snapshot_of_retained_entries() -> kr_protocol::agent::AgentSnapshotResult {
     use kr_protocol::agent::{AgentBindingState, AgentSnapshotEntry, AgentSnapshotResult};
