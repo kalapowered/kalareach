@@ -3422,6 +3422,451 @@ async fn kr_req_13_12_a_queued_decision_leaves_a_sender_that_started_and_paused_
     adopted.stop().await;
 }
 
+// ---- a pairing that is no longer the one in force ----------------------------------------------------
+
+/// A later pairing of the same host: another device id on the rig's connection, numbered above it as
+/// the contact owner numbers the next installation.
+fn newer_pairing(paired: &Paired) -> Paired {
+    Paired {
+        device_id: kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+        link: paired.link + 1_000,
+        ..paired.clone()
+    }
+}
+
+/// Sends a small file as `paired` and waits for its handle, which it answers as a value.
+async fn publishes_for(desk: &Arc<Desk>, adopted: &Adopted, paired: &Paired, key: Uuid) -> Value {
+    let bytes = vec![5_u8; 16];
+    let handle = desk
+        .send(
+            paired.clone(),
+            request(adopted, &bytes, Arc::new(Held::new(bytes.clone())), key),
+        )
+        .await
+        .expect("the upload publishes");
+    serde_json::to_value(&handle).expect("a handle")
+}
+
+/// Whether `desk` lists the upload `key` of `paired` as published with `handle`.
+fn keeps_published(desk: &Desk, paired: &Paired, key: Uuid, handle: &Value) -> bool {
+    desk.open(&paired.who()).iter().any(|view| {
+        view.key == key.to_string()
+            && view.state == companion_tauri::open_transfers::OpenState::Published
+            && serde_json::to_value(&view.handle).ok().as_ref() == Some(handle)
+    })
+}
+
+/// KR-REQ-13.12 (R3a): a reach of an old pairing that comes after a newer pairing has published an
+/// upload removes nothing of the newer pairing's: the record stays published with its handle and the
+/// host is told nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_late_reach_of_an_old_pairing_keeps_the_newer_pairings_published_record() {
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let old = paired_of(&phone.companion).await;
+    let newer = newer_pairing(&old);
+    let key = kr_ipc::new_uuid();
+    let handle = publishes_for(&desk, &adopted, &newer, key).await;
+    let cancels = control.sent(Method::UploadCancel);
+    desk.host_reached(old);
+    settled(&desk).await;
+    assert!(
+        keeps_published(&desk, &newer, key, &handle),
+        "the newer pairing's record is still published with its handle"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 1);
+    assert_eq!(
+        control.sent(Method::UploadCancel),
+        cancels,
+        "nothing of the newer pairing's was cancelled on the host"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (R3b): the old pairing's restart has begun and not yet read the folder when a newer
+/// pairing publishes an upload: what the scan reads then is not the old pairing's to remove.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_an_old_pairings_scan_pending_across_a_new_pairing_keeps_its_published_record()
+{
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let old = paired_of(&phone.companion).await;
+    let newer = newer_pairing(&old);
+    let key = kr_ipc::new_uuid();
+    let scanning = testing::hold_awaited(old.device_id.get(), testing::Awaited::Scanning);
+    desk.host_reached(old);
+    arrived(&scanning, 1).await;
+    let handle = publishes_for(&desk, &adopted, &newer, key).await;
+    scanning.release();
+    settled(&desk).await;
+    assert!(
+        keeps_published(&desk, &newer, key, &handle),
+        "the newer pairing's record is still published with its handle"
+    );
+    assert_eq!(entries_in(&folder(&phone)), 1);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (R3c): a reach of an old pairing that comes while a newer pairing's upload is
+/// sending does not stop the sender: no stop begins, and the upload publishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_late_reach_of_an_old_pairing_does_not_stop_the_newer_pairings_sender() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let old = paired_of(&phone.companion).await;
+    let newer = newer_pairing(&old);
+    let bytes = pattern(5);
+    let (content, gate, _release) = gated(&bytes);
+    let key = kr_ipc::new_uuid();
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let sending = {
+        let sent = request(&adopted, &bytes, content, key);
+        let (desk, newer) = (Arc::clone(&desk), newer.clone());
+        tokio::spawn(async move { desk.send(newer, sent).await })
+    };
+    gate.reached().await;
+    let generation = desk.generation_for_test(key);
+    desk.host_reached(old);
+    // A stop would wait for the sender, which is held in its content: the case waits for the desk to
+    // be idle or for the stop's own note.
+    tokio::select! {
+        () = desk.idle() => {}
+        () = waiting.until_passed(1) => {}
+    }
+    assert_eq!(
+        waiting.passed(),
+        0,
+        "a stop began: the reach of the old pairing stopped the newer pairing's sender"
+    );
+    assert_eq!(desk.generation_for_test(key), generation);
+    assert_eq!(desk.phase_for_test(key), Some("sending"));
+    gate.release();
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect("the sender that was not stopped publishes");
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (R3d): a reach of an old pairing that comes between a newer pairing's admission and
+/// its start does not forget the upload: the desk knows the newer pairing's connection from the
+/// moment the send began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_late_reach_between_a_newer_pairings_admission_and_its_start_does_not_forget_it()
+ {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let old = paired_of(&phone.companion).await;
+    let newer = newer_pairing(&old);
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let after_copy = desk.hold_after_copy_for_test();
+    let after = testing::hold_at(key, Point::AfterCopy);
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, newer) = (Arc::clone(&desk), newer.clone());
+        tokio::spawn(async move { desk.send(newer, sent).await })
+    };
+    after.until_passed(1).await;
+    let generation = desk.generation_for_test(key);
+    desk.host_reached(old);
+    settled(&desk).await;
+    assert_eq!(
+        desk.phase_for_test(key),
+        Some("admitted"),
+        "the upload is still held, admitted and not started"
+    );
+    assert_eq!(desk.generation_for_test(key), generation);
+    after_copy.add_permits(1);
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect("the upload the old pairing's reach left alone publishes");
+    adopted.stop().await;
+}
+
+/// The state of the queue cases R3e and R3e2: an entry of the old pairing under `key` with no upload
+/// held, and the turn of the key held by the case.
+struct Queue {
+    adopted: Adopted,
+    /// Keeps the application, and so the desk, alive.
+    _phone: Phone,
+    desk: Arc<Desk>,
+    old: Paired,
+    newer: Paired,
+    key: Uuid,
+}
+
+impl Queue {
+    async fn start() -> Self {
+        let adopted = Adopted::start(1).await;
+        let (phone, _control) = phone_for(&adopted).await;
+        let desk = desk_of(&phone.companion);
+        let old = paired_of(&phone.companion).await;
+        let newer = newer_pairing(&old);
+        let key = kr_ipc::new_uuid();
+        let bytes = vec![5_u8; 16];
+        testing::keep(
+            &folder(&phone),
+            key,
+            old.environment_id,
+            old.device_id,
+            None,
+            net_support::on_the_host(&adopted.host),
+            Some(kr_protocol::ids::TransferId::new(kr_ipc::new_uuid())),
+            testing::Got::Begun,
+            16,
+            Held::new(bytes.clone()).digest(),
+            testing::Where::Copy,
+        );
+        testing::keep_copy(&folder(&phone), key, &bytes);
+        Self {
+            adopted,
+            _phone: phone,
+            desk,
+            old,
+            newer,
+            key,
+        }
+    }
+
+    /// The newer pairing admits an upload under the key, held in its content, once the first of the
+    /// two cleanups has removed the entry and stopped before its decision; then the second cleanup
+    /// takes the turn and must leave the upload alone.
+    async fn finish(self, first_removed: Arc<testing::Gate>, tail: Arc<testing::Gate>) {
+        use testing::Point;
+
+        let Self {
+            adopted,
+            desk,
+            newer,
+            key,
+            ..
+        } = self;
+        let waiting = testing::hold_at(key, Point::CancelWaiting);
+        arrived(&first_removed, 1).await;
+        let bytes = pattern(5);
+        let (content, gate, _release) = gated(&bytes);
+        let sending = {
+            let sent = request(&adopted, &bytes, content, key);
+            let (desk, newer) = (Arc::clone(&desk), newer.clone());
+            tokio::spawn(async move { desk.send(newer, sent).await })
+        };
+        gate.reached().await;
+        let generation = desk.generation_for_test(key);
+        tail.release();
+        tokio::select! {
+            () = desk.idle() => {}
+            () = waiting.until_passed(1) => {}
+        }
+        assert_eq!(
+            waiting.passed(),
+            0,
+            "a stop began: a cleanup queued for the entry stopped the upload the newer pairing admitted"
+        );
+        assert_eq!(desk.generation_for_test(key), generation);
+        assert_eq!(desk.phase_for_test(key), Some("sending"));
+        gate.release();
+        tokio::time::timeout(WATCHDOG, sending)
+            .await
+            .expect("the send answers")
+            .expect("the task ran")
+            .expect("the upload the cleanup left alone publishes");
+        adopted.stop().await;
+    }
+}
+
+/// KR-REQ-13.12 (R3e): the forgetting of the old pairing's host and the newer pairing's cleanup
+/// both wait for the turn of an entry of the old pairing. The forgetting is first: it removes the
+/// entry, the newer pairing admits an upload under the same key, and the cleanup that was queued
+/// behind finds an upload of its own pairing and does nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cleanup_queued_for_a_foreign_key_leaves_the_upload_the_current_pairing_admitted_under_it()
+ {
+    use testing::{Awaited, Point};
+
+    let queue = Queue::start().await;
+    let (desk, key) = (Arc::clone(&queue.desk), queue.key);
+    let turn = desk.hold_turn_for_test(key).await;
+    let queued = testing::hold_at(key, Point::TurnQueued);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    desk.forgotten(queue.old.device_id);
+    queued.until_passed(1).await;
+    desk.host_reached(queue.newer.clone());
+    queued.until_passed(2).await;
+    drop(turn);
+    // The forgetting removes the entry and stops before its decision.
+    arrived(&tail, 1).await;
+    let reached = Arc::clone(&tail);
+    queue.finish(reached.clone(), tail).await;
+}
+
+/// KR-REQ-13.12 (R3e2): as R3e with the requests the other way round: the newer pairing's cleanup
+/// is first and removes the entry, and the forgetting of the old pairing's host that was queued
+/// behind it finds an upload of the newer pairing and does nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_forgotten_devices_cleanup_queued_behind_the_restarts_leaves_the_upload_the_current_pairing_admitted_under_it()
+ {
+    use testing::{Awaited, Point};
+
+    let queue = Queue::start().await;
+    let (desk, key) = (Arc::clone(&queue.desk), queue.key);
+    let turn = desk.hold_turn_for_test(key).await;
+    let queued = testing::hold_at(key, Point::TurnQueued);
+    let tail = testing::hold_awaited(key, Awaited::BeforeTail);
+    desk.host_reached(queue.newer.clone());
+    queued.until_passed(1).await;
+    desk.forgotten(queue.old.device_id);
+    queued.until_passed(2).await;
+    drop(turn);
+    // The newer pairing's cleanup removes the entry and stops before its decision.
+    arrived(&tail, 1).await;
+    let reached = Arc::clone(&tail);
+    queue.finish(reached.clone(), tail).await;
+}
+
+/// The host refuses the next begin for the size of the file, and `limit` says what it allows.
+fn host_allows(adopted: &Adopted, limit: u64) {
+    adopted
+        .host
+        .controller()
+        .transfer()
+        .service()
+        .set_limits(kr_transfer::Limits {
+            max_file_len: limit,
+            ..kr_transfer::Limits::default()
+        })
+        .expect("the host's limits are set");
+}
+
+/// KR-REQ-13.12 (R3g): a cleanup decides on what the key holds when it has the gate, not on what it
+/// saw before. The old pairing's upload is refused at its begin and held after the refusal; the
+/// newer pairing's reach starts a cleanup that has the turn and waits before its decision; the
+/// refused upload ends and removes its entry; the newer pairing publishes the same key. The cleanup
+/// then finds a record of its own pairing and does nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cleanup_is_decided_on_the_gate_snapshot_when_the_foreign_sender_ends_and_the_new_pairing_republishes_the_key()
+ {
+    use testing::{Awaited, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let old = paired_of(&phone.companion).await;
+    let newer = newer_pairing(&old);
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    host_allows(&adopted, 1);
+    let refused = testing::hold_at(key, Point::Refused);
+    let before = testing::hold_awaited(key, Awaited::BeforeOwed);
+    // The newer pairing's restart is held for the whole case: no second cleanup can exist.
+    let scanning = testing::hold_awaited(newer.device_id.get(), Awaited::Scanning);
+    let skipped = testing::hold_at(key, Point::Skipped);
+    let decided = testing::hold_at(key, Point::DecisionDone);
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, old) = (Arc::clone(&desk), old.clone());
+        tokio::spawn(async move { desk.send(old, sent).await })
+    };
+    refused.until_passed(1).await;
+    desk.host_reached(newer.clone());
+    arrived(&before, 1).await;
+    // The refused upload ends and removes its entry; the send's answer says so.
+    refused.release();
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect_err("the host refused the begin");
+    host_allows(&adopted, u64::MAX);
+    let handle = publishes_for(&desk, &adopted, &newer, key).await;
+    before.release();
+    tokio::select! {
+        () = skipped.until_passed(1) => {}
+        () = decided.until_passed(1) => {}
+    }
+    assert_eq!(
+        skipped.passed(),
+        1,
+        "the cleanup found the record of the newer pairing and left it: it answered a skip"
+    );
+    assert!(
+        keeps_published(&desk, &newer, key, &handle),
+        "the newer pairing's record is still published with its handle"
+    );
+    scanning.release();
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (R3h): the mirror of R3g: the old pairing's upload has written nothing when the
+/// cleanup is held before its decision, and publishes meanwhile. What the cleanup finds under the
+/// gate is a published record of another pairing, which it removes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cleanup_does_not_answer_skipped_for_a_foreign_upload_that_published_after_the_first_look()
+ {
+    use testing::{Awaited, Point};
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let old = paired_of(&phone.companion).await;
+    let newer = newer_pairing(&old);
+    let key = kr_ipc::new_uuid();
+    let bytes = vec![5_u8; 16];
+    let started = testing::hold_at(key, Point::SenderStarting);
+    let before = testing::hold_awaited(key, Awaited::BeforeOwed);
+    // The newer pairing's restart is held for the whole case: no second cleanup can remove the old
+    // pairing's published entry and hide a wrong skip.
+    let scanning = testing::hold_awaited(newer.device_id.get(), Awaited::Scanning);
+    let skipped = testing::hold_at(key, Point::Skipped);
+    let decided = testing::hold_at(key, Point::DecisionDone);
+    let sending = {
+        let sent = request(&adopted, &bytes, Arc::new(Held::new(bytes.clone())), key);
+        let (desk, old) = (Arc::clone(&desk), old.clone());
+        tokio::spawn(async move { desk.send(old, sent).await })
+    };
+    started.until_passed(1).await;
+    desk.host_reached(newer.clone());
+    arrived(&before, 1).await;
+    // The old pairing's sender writes, publishes and ends.
+    started.release();
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect("the old pairing's upload publishes");
+    before.release();
+    tokio::select! {
+        () = skipped.until_passed(1) => {}
+        () = decided.until_passed(1) => {}
+    }
+    assert_eq!(
+        decided.passed(),
+        1,
+        "the cleanup found a published record of another pairing and removed it"
+    );
+    assert_eq!(skipped.passed(), 0);
+    assert_eq!(
+        entries_in(&folder(&phone)),
+        0,
+        "the old pairing's record is gone"
+    );
+    scanning.release();
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (X1): `forgotten` stops a sender that a restart started after its first look, before
 /// its second loop removes the entry. The restart's `act_on` holds the key's turn and is held before
 /// it starts the upload; `forgotten` takes its snapshot and waits for the turn; then the sender starts,

@@ -898,8 +898,16 @@ enum Job {
     /// The cancel of the key is finished on `paired`'s connection.
     Finish { paired: Paired },
     /// The key's upload, if any, and its entry and copy are over for good: the host this device
-    /// knew was forgotten, or the pairing the entry was kept under is not the one in force.
-    Forget,
+    /// knew as `device_id` was forgotten. Owed only while the key's record is that device's.
+    Forget { device_id: DeviceId },
+    /// The pairing of `device_id`, at the connection number `link`, removes the key's record of
+    /// another device on the same host: a pairing that is not the one in force. Owed only while
+    /// the pairing is still in force and the key's record still belongs to another device.
+    Supersede {
+        environment_id: EnvironmentId,
+        device_id: DeviceId,
+        link: u64,
+    },
     /// The freeing's step for the key: a place that another account's upload holds is given back
     /// to the host, on `session` (the connection `link` names), for the upload `wanting`.
     Free {
@@ -920,15 +928,35 @@ impl Job {
     ///
     /// A queued decision is owed to the upload and the generation it was queued for. A generation
     /// that moved means a stop or a start took place since, and the sender or barrier that did
-    /// ends in a decision of its own, on a fresh read of the connections and the marks. Every other
-    /// job is owed whenever it is asked for.
-    fn owed(&self, held: Option<&Arc<Live>>) -> bool {
+    /// ends in a decision of its own, on a fresh read of the connections and the marks.
+    ///
+    /// A removal of a key's record is owed for the record the key holds now, which `desk` reads in
+    /// this one gate section: the held upload's owner, or with none held the owner of the entry.
+    /// `Supersede` is owed while its pairing is the one in force and the record is another
+    /// device's; `Forget` while the record is the forgotten device's. Every other job is owed
+    /// whenever it is asked for.
+    fn owed(&self, desk: &Desk, key: Uuid, held: Option<&Arc<Live>>) -> bool {
         match self {
             Self::Decide { live, generation } => {
                 held.is_some_and(|held| Arc::ptr_eq(held, live))
                     && live.generation.load(Ordering::Acquire) == *generation
             }
-            Self::Cancel { .. } | Self::Finish { .. } | Self::Forget | Self::Free { .. } => true,
+            Self::Supersede {
+                environment_id,
+                device_id,
+                link,
+            } => {
+                desk.in_force(*environment_id, *device_id, *link)
+                    && desk
+                        .owner_of(key, held)
+                        .is_some_and(|(environment, device)| {
+                            environment == *environment_id && device != *device_id
+                        })
+            }
+            Self::Forget { device_id } => desk
+                .owner_of(key, held)
+                .is_some_and(|(_, device)| device == *device_id),
+            Self::Cancel { .. } | Self::Finish { .. } | Self::Free { .. } => true,
         }
     }
 }
@@ -1015,7 +1043,9 @@ impl Drop for Stopped<'_> {
 /// it is handed the guard. `Live.file` is never taken under the gate and the gate is never taken
 /// inside `Live::change`, so the gate reads `owner` and `published`, not the entry. The gate is
 /// held across no `.await` and across no write of an entry; it covers a read of the folder, which
-/// admission needs to be one step with the count, and the removal of the orphaned copies that
+/// admission needs to be one step with the count, a barrier's read of the key's entry when it holds
+/// no upload for the key, which its decision needs to be one step with the stop, and the removal of
+/// the orphaned copies that
 /// `restart` makes (each a flush), which is what stops `restart` from removing the copy a send has
 /// just made.
 ///
@@ -1138,10 +1168,42 @@ impl Desk {
         #[cfg(feature = "testing")]
         testing::note(key, testing::Point::TurnWanted);
         let turn = Arc::clone(locked(&self.registry).turns.entry(key).or_default());
+        let acquiring = turn.lock_owned();
+        #[cfg(feature = "testing")]
+        let acquiring = testing::queued(key, acquiring);
         Turn {
             key,
-            _held: turn.lock_owned().await,
+            _held: acquiring.await,
         }
+    }
+
+    /// Whether the pairing of `device_id` is the one in force in `environment_id`: no other device
+    /// of the host has a connection the desk knows that is numbered above `link`. The owner numbers
+    /// every installation of every pairing in turn, so the newest number is the latest pairing.
+    fn in_force(&self, environment_id: EnvironmentId, device_id: DeviceId, link: u64) -> bool {
+        !locked(&self.sessions)
+            .iter()
+            .any(|((environment, device), known)| {
+                *environment == environment_id
+                    && *device != device_id
+                    && known
+                        .newest
+                        .as_ref()
+                        .is_some_and(|newest| newest.link > link)
+            })
+    }
+
+    /// The environment and the device the key's record belongs to, read in a barrier's gate
+    /// section: the held upload's owner when one is held (a sender writes the entry without the
+    /// key's turn, so the upload is the record), and otherwise the owner of the entry. With no
+    /// upload held no sender exists for the key and the barrier holds its turn, so the read cannot
+    /// race a writer of the key.
+    fn owner_of(&self, key: Uuid, held: Option<&Arc<Live>>) -> Option<(EnvironmentId, DeviceId)> {
+        if let Some(live) = held {
+            return Some((live.owner.environment_id, live.owner.device_id));
+        }
+        let file = self.store().ok()?.entry(key)?;
+        Some((file.environment_id, file.device_id))
     }
 
     /// Takes the sender of the key's upload, under the gate, and moves its generation on, so that
@@ -1211,6 +1273,13 @@ impl Desk {
         // The place and the key are taken together, here and before any await: a key the person
         // cancelled, a key in use and a third open upload are refused under the gate, so no copy is
         // written and no reservation is asked for.
+        // The desk is told of the connection before the upload is admitted, so that a cleanup that
+        // an obsolete pairing's reach starts between the admission and the start knows that this
+        // pairing is the one in force. The start section tells it again.
+        let _ = locked(&self.sessions)
+            .entry((paired.environment_id, paired.device_id))
+            .or_default()
+            .observe(Connection::of(&paired));
         locked(&self.registry).admit(&store, &live, &paired.who())?;
         if let Keeping::Copy(bytes) = request.keeping {
             let copied = store.clone();
@@ -1226,8 +1295,24 @@ impl Desk {
                         })
                     });
             if let Err(error) = written {
-                locked(&self.registry).held.remove(&key);
-                let _ = store.remove_copy(key);
+                // Only this send's own upload, still admitted, goes: a cleanup may have stopped it
+                // and let the key be used again, and then neither the upload nor the copy is this
+                // send's to remove.
+                let ours = {
+                    let mut registry = locked(&self.registry);
+                    let ours = registry
+                        .held
+                        .get(&key)
+                        .is_some_and(|held| Arc::ptr_eq(held, &live))
+                        && *locked(&live.phase) == Phase::Admitted;
+                    if ours {
+                        registry.held.remove(&key);
+                    }
+                    ours
+                };
+                if ours {
+                    let _ = store.remove_copy(key);
+                }
                 return Err(error);
             }
         }
@@ -1235,6 +1320,7 @@ impl Desk {
         {
             let gate = locked(&self.after_copy).clone();
             if let Some(gate) = gate {
+                testing::note(key, testing::Point::AfterCopy);
                 let _ = gate.acquire().await;
             }
         }
@@ -1600,8 +1686,13 @@ impl Desk {
         // stops, and its entry goes, in its key's turn.
         for live in other {
             let desk = Arc::clone(self);
+            let job = Job::Supersede {
+                environment_id,
+                device_id,
+                link: paired.link,
+            };
             self.work.spawn(async move {
-                desk.barrier_task(live.key, false, Job::Forget, 0, 0).await;
+                desk.barrier_task(live.key, false, job, 0, 0).await;
             });
         }
         for (live, cancelled) in paused {
@@ -1633,6 +1724,8 @@ impl Desk {
 
     /// Reads the host's record of every entry kept from before, and only then acts on them.
     pub async fn restart(self: &Arc<Self>, paired: Paired) {
+        #[cfg(feature = "testing")]
+        testing::gate(paired.device_id.get(), testing::Awaited::Scanning).await;
         let Ok(store) = self.store() else { return };
         let read = store.clone();
         let Ok(found) = tauri::async_runtime::spawn_blocking(move || read.all()).await else {
@@ -1662,7 +1755,12 @@ impl Desk {
                 // Another principal's: the pairing it was kept under is not the one in force. It
                 // goes in its key's turn, read again there, after a sender that started since is
                 // stopped.
-                let _ = self.barrier(file.key, false, Job::Forget, 0, 0).await;
+                let job = Job::Supersede {
+                    environment_id: paired.environment_id,
+                    device_id: paired.device_id,
+                    link: paired.link,
+                };
+                let _ = self.barrier(file.key, false, job, 0, 0).await;
             } else if file.account != paired.account_id() {
                 // Another account's: hidden, left as it is, and found again when its account reaches
                 // the host. Its copy is named by its entry, so the orphan pass keeps it.
@@ -2005,10 +2103,14 @@ impl Desk {
         looked: u64,
     ) -> Answered {
         let turn = self.turn(key).await;
+        #[cfg(feature = "testing")]
+        testing::gate(key, testing::Awaited::BeforeOwed).await;
         let (held, handle) = {
             let registry = locked(&self.registry);
             let held = registry.held.get(&key).cloned();
-            if !job.owed(held.as_ref()) {
+            if !job.owed(self, key, held.as_ref()) {
+                #[cfg(feature = "testing")]
+                testing::note(key, testing::Point::Skipped);
                 return Answered::Skipped;
             }
             if skip
@@ -2066,7 +2168,7 @@ impl Desk {
         match job {
             Job::Cancel { who, paired } => self.cancel_work(stopped, &who, paired).await,
             Job::Finish { paired } => self.finish_work(stopped, &paired).await,
-            Job::Forget => {
+            Job::Forget { .. } | Job::Supersede { .. } => {
                 stopped.forget(&self.store()?, key);
                 Ok(Self::said(key, "forgotten", None, None))
             }
@@ -2599,14 +2701,16 @@ impl Desk {
                 .map(|live| live.key)
                 .collect();
             for key in sending {
-                desk.barrier_task(key, false, Job::Forget, 0, 0).await;
+                desk.barrier_task(key, false, Job::Forget { device_id }, 0, 0)
+                    .await;
             }
             let Ok(store) = desk.store() else { return };
             for file in store.all().entries {
                 if file.device_id == device_id {
                     // Read again under the turn: an upload that a reach started since is stopped
                     // before its entry goes.
-                    desk.barrier_task(file.key, false, Job::Forget, 0, 0).await;
+                    desk.barrier_task(file.key, false, Job::Forget { device_id }, 0, 0)
+                        .await;
                 }
             }
         });
@@ -2792,6 +2896,15 @@ pub mod testing {
         DecisionDone,
         /// An operation asks for the key's turn, whether or not it is free. Noted, never held.
         TurnWanted,
+        /// An operation that asked for the key's turn has joined the queue for it: the lock future
+        /// was polled once, outside the runtime's cooperative budget, and had not yet acquired the
+        /// turn or it has. Noted, never held. Unlike `TurnWanted` it fixes an order.
+        TurnQueued,
+        /// A barrier answered `Skipped` because its job is not owed. Noted, never held.
+        Skipped,
+        /// A send has written the copy of its content and holds the gate that
+        /// `hold_after_copy_for_test` opens, before it waits for it. Noted, never held.
+        AfterCopy,
         /// A sender has its result and is about to take the gate for its decision. Held.
         SettleBeforeGate,
         /// A sender task ended, however it ended: finished, stopped, or panicked. Noted, never held.
@@ -2809,6 +2922,10 @@ pub mod testing {
         BeforeTail,
         /// The freeing, for the wanting upload's key, has stopped a key and not yet read the host.
         Freeing,
+        /// A restart, under the device's identifier, has begun and not yet read the folder.
+        Scanning,
+        /// A barrier has the key's turn and has not yet read what the key holds under the gate.
+        BeforeOwed,
     }
 
     /// The operations that came to an [`Awaited`] place, and whether they may go on.
@@ -3031,6 +3148,24 @@ pub mod testing {
         }
     }
 
+    /// Awaits `acquiring`, the lock future of `key`'s turn, after one poll outside the runtime's
+    /// cooperative budget: a first poll inside the budget can answer pending before the future has
+    /// joined the lock's queue, which would leave `TurnQueued` with no order to fix. The same
+    /// pinned future is then awaited to the end.
+    pub(super) async fn queued<T>(key: Uuid, acquiring: impl std::future::Future<Output = T>) -> T {
+        use std::task::Poll;
+        let mut acquiring = std::pin::pin!(acquiring);
+        let first = tokio::task::unconstrained(std::future::poll_fn(|context| {
+            Poll::Ready(acquiring.as_mut().poll(context))
+        }))
+        .await;
+        note(key, Point::TurnQueued);
+        match first {
+            Poll::Ready(acquired) => acquired,
+            Poll::Pending => acquiring.await,
+        }
+    }
+
     /// Counts the calling thread at `point` while a hold is set for `key`, and lets it go on.
     pub(super) fn note(key: Uuid, point: Point) {
         if let Some(hold) = at(key, point) {
@@ -3228,16 +3363,16 @@ mod tests {
     /// start is not, and another upload held under the key is not, even with the same number.
     #[test]
     fn a_queued_decision_is_owed_only_to_the_upload_and_the_generation_it_was_queued_for() {
-        let (_dir, _desk, live, _store) = held(None, Reached::Beginning);
+        let (_dir, desk, live, _store) = held(None, Reached::Beginning);
         let queued = Job::Decide {
             live: Arc::clone(&live),
             generation: live.generation.load(Ordering::Acquire),
         };
         assert!(
-            queued.owed(Some(&live)),
+            queued.owed(&desk, live.key, Some(&live)),
             "the upload it was queued for, at the generation it was queued at"
         );
-        assert!(!queued.owed(None), "no upload is held");
+        assert!(!queued.owed(&desk, live.key, None), "no upload is held");
         // Another upload under the same key, made with the same generation number.
         let other = Live::new(live.file(), Arc::new(Held::new(vec![1; 4])), true);
         assert_eq!(
@@ -3245,13 +3380,155 @@ mod tests {
             live.generation.load(Ordering::Acquire)
         );
         assert!(
-            !queued.owed(Some(&other)),
+            !queued.owed(&desk, live.key, Some(&other)),
             "another upload held under the key"
         );
         live.generation.fetch_add(1, Ordering::AcqRel);
         assert!(
-            !queued.owed(Some(&live)),
+            !queued.owed(&desk, live.key, Some(&live)),
             "the same upload after the generation moved"
+        );
+    }
+
+    /// A session on a transport that takes every frame and answers none: the connection of another
+    /// device that the desk has been told of.
+    fn silent_session() -> Arc<Session> {
+        use kr_client::error::Result as ClientResult;
+        use kr_client::transport::{ControlTransport, TransportFuture};
+        use kr_protocol::envelope::ControlFrame;
+        use kr_protocol::hello::{ActionWindow, ReceiveLimits};
+        use kr_protocol::ids::{ActionWindowId, BootEpoch, ConnectionId};
+        use kr_protocol::scalars::{DurationMs, TimestampMs};
+
+        #[derive(Debug)]
+        struct Silent(ConnectionId);
+
+        impl ControlTransport for Silent {
+            fn host_states_placement_reading(&self) -> bool {
+                false
+            }
+
+            fn connection_id(&self) -> ConnectionId {
+                self.0
+            }
+
+            fn limits(&self) -> ReceiveLimits {
+                ReceiveLimits::default()
+            }
+
+            fn initial_action_window(&self) -> ActionWindow {
+                ActionWindow {
+                    action_window_id: ActionWindowId::new("window-1").expect("a window"),
+                    connection_id: self.0,
+                    boot_epoch: BootEpoch::new(1),
+                    issued_at_ms: TimestampMs::new(1),
+                    valid_for_ms: DurationMs::new(60_000),
+                }
+            }
+
+            fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
+                None
+            }
+
+            fn send<'a>(&'a self, _: &'a ControlFrame) -> TransportFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn claim_receiver(&self) -> ClientResult<()> {
+                Ok(())
+            }
+
+            fn stream_opener(&self) -> Option<Arc<dyn kr_client::transport::StreamOpener>> {
+                None
+            }
+
+            fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+                Box::pin(async { std::future::pending().await })
+            }
+
+            fn revoke_streams(&self) {}
+
+            fn close(&self) {}
+        }
+
+        Arc::new(
+            Session::start(Arc::new(Silent(ConnectionId::new(kr_ipc::new_uuid()))))
+                .expect("a session"),
+        )
+    }
+
+    /// KR-REQ-13.12 (U2): a cleanup is owed only for the right target, decided on the record the key
+    /// holds in the gate section, and only while its pairing is in force.
+    #[tokio::test]
+    async fn a_cleanup_is_owed_only_for_the_right_target_and_while_its_pairing_is_in_force() {
+        // The held upload is the device `held_device`'s; the entry on disk is its entry.
+        let (_dir, desk, live, _store) = held(None, Reached::Beginning);
+        let (environment_id, held_device) = (live.owner.environment_id, live.owner.device_id);
+        let acting = DeviceId::new(kr_ipc::new_uuid());
+        let nothing = kr_ipc::new_uuid();
+        let supersede = |device_id, link| Job::Supersede {
+            environment_id,
+            device_id,
+            link,
+        };
+        let forget = |device_id| Job::Forget { device_id };
+        assert!(
+            supersede(acting, 5).owed(&desk, live.key, Some(&live)),
+            "a held upload of another device, the pairing in force"
+        );
+        assert!(
+            !supersede(held_device, 5).owed(&desk, live.key, Some(&live)),
+            "a held upload of the acting device"
+        );
+        assert!(
+            supersede(acting, 5).owed(&desk, live.key, None),
+            "an entry of another device, nothing held"
+        );
+        assert!(
+            !supersede(held_device, 5).owed(&desk, live.key, None),
+            "an entry of the acting device, nothing held"
+        );
+        assert!(
+            !supersede(acting, 5).owed(&desk, nothing, None),
+            "a key with no upload and no entry"
+        );
+        assert!(
+            forget(held_device).owed(&desk, live.key, Some(&live)),
+            "a held upload of the forgotten device"
+        );
+        assert!(
+            !forget(acting).owed(&desk, live.key, Some(&live)),
+            "a held upload of another device"
+        );
+        assert!(
+            forget(held_device).owed(&desk, live.key, None),
+            "an entry of the forgotten device, nothing held"
+        );
+        assert!(
+            !forget(acting).owed(&desk, live.key, None),
+            "an entry of another device, nothing held"
+        );
+        assert!(
+            !forget(held_device).owed(&desk, nothing, None),
+            "a key with no upload and no entry"
+        );
+        // A connection of another device of the host, numbered above the acting pairing's: the
+        // acting pairing is not the one in force.
+        let _ = locked(&desk.sessions)
+            .entry((environment_id, held_device))
+            .or_default()
+            .observe(Connection {
+                account: None,
+                session: silent_session(),
+                link: 9,
+            });
+        assert!(
+            !supersede(acting, 5).owed(&desk, live.key, Some(&live)),
+            "the pairing is obsolete: another device's connection is numbered above it"
+        );
+        assert!(
+            supersede(acting, 9).owed(&desk, live.key, Some(&live)),
+            "an equal number is not newer"
         );
     }
 
