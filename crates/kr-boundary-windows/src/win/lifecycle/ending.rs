@@ -20,6 +20,7 @@ use crate::journal::limits;
 use crate::journal::rows::{LeftoverClass, Row};
 use crate::lifecycle::{
     self as facts, Closing, Evidence, Left, Session, Uncertainty, cleanup_of, closing_rows,
+    root_object,
 };
 
 use super::super::job::Ended;
@@ -85,8 +86,9 @@ pub(super) fn close_out(
         match privilege::enter() {
             Ok(guard) => match root::remove_root(root, &guard, &mut JournalRows(journal)) {
                 Ok(leftovers) => {
+                    let named = root.path().display().to_string();
                     root_left.extend(leftovers.into_iter().map(|left| Left {
-                        object: left.path,
+                        object: root_object(&named, &left.path),
                         reason: left.reason,
                     }));
                 }
