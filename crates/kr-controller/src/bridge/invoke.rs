@@ -133,6 +133,11 @@ pub enum Refusal {
     Stream {
         /// What the stream said.
         detail: String,
+        /// How the helper ended, where this host waited for the helper after its stream failed.
+        ///
+        /// It is not part of the sentence this refusal displays; the connection diagnostic reads
+        /// it.
+        helper: Option<HelperEnd>,
     },
     /// The helper wrote something this invoker cannot read: a frame past the bound, or one that is
     /// not a canonical bridge frame.
@@ -223,7 +228,9 @@ impl core::fmt::Display for Refusal {
             Self::NotStarted { program, detail } => {
                 write!(formatter, "{program} could not be started: {detail}")
             }
-            Self::Stream { detail } => write!(formatter, "the bridge stream failed: {detail}"),
+            Self::Stream { detail, .. } => {
+                write!(formatter, "the bridge stream failed: {detail}")
+            }
             Self::Unreadable { detail } => write!(
                 formatter,
                 "the destination wrote a frame this host cannot read: {detail}"
@@ -612,6 +619,59 @@ async fn end(
         })
 }
 
+/// How long this host waits for a helper whose stream has failed to say how it ended.
+///
+/// A helper whose stream ended has gone or is going, so this is spent only by one that closed its
+/// streams and kept running. Past it the helper is ended and collected, so the wait is a bound and
+/// the connection diagnostic says the helper ended the connection, with no code.
+pub const END_STATUS_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How a helper ended, as far as this host could tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelperEnd {
+    /// The helper exited with this code.
+    Exited(i32),
+    /// This signal ended the helper. Only a process of a Unix host is ended by one.
+    Signalled(i32),
+    /// The helper had not ended within [`END_STATUS_LIMIT`], so this host ended it, or the
+    /// platform gave neither a code nor a signal.
+    Unaccounted,
+}
+
+impl HelperEnd {
+    fn of(status: std::process::ExitStatus) -> Self {
+        if let Some(code) = status.code() {
+            return Self::Exited(code);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            if let Some(signal) = status.signal() {
+                return Self::Signalled(signal);
+            }
+        }
+        Self::Unaccounted
+    }
+}
+
+/// Says how a helper ended once its stream has failed, and leaves it collected.
+///
+/// The helper is waited for [`END_STATUS_LIMIT`]. One that has not ended by then is killed and
+/// waited for like any helper this host ends, so no path out of here leaves a process running or
+/// uncollected without saying so.
+///
+/// # Errors
+///
+/// Returns [`Refusal::Unkillable`] when a helper that outlived the bound could not be ended.
+async fn settle(mut child: tokio::process::Child, program: &str) -> Result<HelperEnd, Refusal> {
+    match tokio::time::timeout(END_STATUS_LIMIT, child.wait()).await {
+        Ok(Ok(status)) => Ok(HelperEnd::of(status)),
+        Ok(Err(_)) | Err(_) => end(child, program, KILL_LIMIT)
+            .await
+            .map(|()| HelperEnd::Unaccounted),
+    }
+}
+
 /// Waits for an ending that has been asked for, no longer than `limit`, and says why it did not
 /// come.
 ///
@@ -688,14 +748,44 @@ async fn start_and_acknowledge(
             detail: "its standard error is not a pipe".to_owned(),
         })?;
 
-    write_frame(&mut stdin, &BridgeFrame::Hello(Box::new(hello.clone()))).await?;
+    let acknowledgement = match acknowledged(&mut stdin, &mut stdout, hello).await {
+        Ok(acknowledgement) => acknowledgement,
+        // The stream ended or broke, which is what a helper that exits, or is ended, does to it
+        // before it has said anything. How it ended is read, so that the diagnostic can say.
+        Err(Refusal::Stream { detail, .. }) => {
+            drop(stdin);
+            let helper = settle(child, &command.program).await?;
+            return Err(Refusal::Stream {
+                detail,
+                helper: Some(helper),
+            });
+        }
+        Err(other) => return Err(other),
+    };
+    Ok(Started {
+        child,
+        stdin,
+        stdout,
+        acknowledgement,
+        diagnostics,
+        stderr,
+    })
+}
+
+/// Writes the opening frame and reads what acknowledges it, and checks the version and the role.
+async fn acknowledged(
+    stdin: &mut tokio::process::ChildStdin,
+    stdout: &mut tokio::process::ChildStdout,
+    hello: &BridgeHello,
+) -> Result<BridgeHelloAck, Refusal> {
+    write_frame(stdin, &BridgeFrame::Hello(Box::new(hello.clone()))).await?;
     // A helper that was asked to start what it needs is waited for as long as that takes.
     let limit = if hello.start {
         START_LIMIT
     } else {
         SILENCE_LIMIT
     };
-    let opening = read_frame_within(&mut stdout, limit)
+    let opening = read_frame_within(stdout, limit)
         .await
         .map_err(|refusal| match refusal {
             // The first frame is what a helper of another release, or a login that wrote to
@@ -764,14 +854,7 @@ async fn start_and_acknowledge(
             answered: acknowledgement.role,
         });
     }
-    Ok(Started {
-        child,
-        stdin,
-        stdout,
-        acknowledgement,
-        diagnostics,
-        stderr,
-    })
+    Ok(acknowledgement)
 }
 
 impl Invocation {
@@ -779,6 +862,31 @@ impl Invocation {
     #[must_use]
     pub const fn acknowledgement(&self) -> &BridgeHelloAck {
         &self.acknowledgement
+    }
+
+    /// Ends this bridge over a refusal, and says how the helper ended when the refusal is a stream
+    /// that failed.
+    ///
+    /// The helper is waited for [`END_STATUS_LIMIT`] and ended and collected past it, as
+    /// [`start_and_acknowledge`] does for a stream that fails before the acknowledgement. Any
+    /// other refusal is returned as it is, and the helper goes with the invocation.
+    pub async fn settled(self, refusal: Refusal) -> Refusal {
+        match refusal {
+            Refusal::Stream {
+                detail,
+                helper: None,
+            } => {
+                drop(self.stdin);
+                match settle(self.child, &self.program).await {
+                    Ok(helper) => Refusal::Stream {
+                        detail,
+                        helper: Some(helper),
+                    },
+                    Err(unended) => unended,
+                }
+            }
+            other => other,
+        }
     }
 
     /// Carries one request to the destination and returns the answer it gave.
@@ -841,6 +949,7 @@ impl Invocation {
             }
             Ok(Err(error)) => Err(Refusal::Stream {
                 detail: error.to_string(),
+                helper: None,
             }),
             // A helper that will not end on its own is ended here rather than left running: the
             // caller asked for one exchange, and it is over. One that will not end at the kill
@@ -1361,6 +1470,7 @@ impl BridgeStream {
             }
             Ok(Err(error)) => Err(Refusal::Stream {
                 detail: error.to_string(),
+                helper: None,
             }),
             Err(_elapsed) => {
                 end(self.child, &self.program, kill_limit).await?;
@@ -1402,9 +1512,11 @@ async fn write_frame_unbounded<W: AsyncWrite + Unpin>(
         .await
         .map_err(|error| Refusal::Stream {
             detail: error.to_string(),
+            helper: None,
         })?;
     sink.flush().await.map_err(|error| Refusal::Stream {
         detail: error.to_string(),
+        helper: None,
     })
 }
 
@@ -1442,6 +1554,7 @@ async fn read_frame_unbounded<R: AsyncRead + Unpin>(
         .await
         .map_err(|error| Refusal::Stream {
             detail: error.to_string(),
+            helper: None,
         })?;
     let declared = FrameCodec::new(StreamKind::Control)
         .decode_length(prefix)
@@ -1454,6 +1567,7 @@ async fn read_frame_unbounded<R: AsyncRead + Unpin>(
         .await
         .map_err(|error| Refusal::Stream {
             detail: error.to_string(),
+            helper: None,
         })?;
     let frame = kr_protocol::wire::decode(&payload, &StreamKind::Control.cbor_limits()).map_err(
         |error| Refusal::Unreadable {
@@ -1669,6 +1783,109 @@ mod tests {
         )
         .expect_err("a refusal");
         assert_eq!(refusal, Refusal::AlreadyBridged);
+    }
+
+    /// An opening whose helper is a shell running `script`: a program that is started and then
+    /// ends, or stays and says nothing.
+    #[cfg(unix)]
+    fn scripted(script: &str) -> Opening {
+        Opening {
+            command: BridgeCommand {
+                program: "/bin/sh".to_owned(),
+                arguments: vec!["-c".to_owned(), script.to_owned()],
+            },
+            environment_id: here(),
+            hello: BridgeHello {
+                protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+                build_id: build(),
+                origin_environment_id: here(),
+                origin_ingress: ActorIngress::LocalIpc,
+                already_bridged: false,
+                start: false,
+                target: BridgeTarget::Controller,
+            },
+        }
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: a helper that exits before it says
+    /// anything is refused with the code it exited with, read from the process once its stream
+    /// has ended.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_exits_before_it_answers_is_refused_with_its_exit_code() {
+        let refusal = scripted("exit 125").launch().await.expect_err("a refusal");
+        assert!(
+            matches!(
+                refusal,
+                Refusal::Stream {
+                    helper: Some(HelperEnd::Exited(125)),
+                    ..
+                }
+            ),
+            "{refusal:?}"
+        );
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: a helper that a signal ends is
+    /// refused with the signal, and not with a code a shell would make of it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_a_signal_ends_is_refused_with_the_signal() {
+        let refusal = scripted("kill -9 $$")
+            .launch()
+            .await
+            .expect_err("a refusal");
+        assert!(
+            matches!(
+                refusal,
+                Refusal::Stream {
+                    helper: Some(HelperEnd::Signalled(9)),
+                    ..
+                }
+            ),
+            "{refusal:?}"
+        );
+    }
+
+    /// KR-REQ-18.11, the part about connection diagnostics: a helper that closes its streams and
+    /// keeps running is waited for [`END_STATUS_LIMIT`], then ended and collected, and is refused
+    /// with no code. The process is gone afterwards: one that was ended and not collected would
+    /// still answer signal zero.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_helper_that_closes_its_streams_and_keeps_running_is_ended_and_collected() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let identifier = directory.path().join("pid");
+        let script = format!(
+            "echo $$ >'{}'; exec >&-; exec sleep 30",
+            identifier.display()
+        );
+        let started = std::time::Instant::now();
+        let refusal = scripted(&script).launch().await.expect_err("a refusal");
+        let waited = started.elapsed();
+        assert!(
+            matches!(
+                refusal,
+                Refusal::Stream {
+                    helper: Some(HelperEnd::Unaccounted),
+                    ..
+                }
+            ),
+            "{refusal:?}"
+        );
+        assert!(
+            waited >= END_STATUS_LIMIT
+                && waited < END_STATUS_LIMIT + std::time::Duration::from_secs(8),
+            "the wait for the status is its own bound: {waited:?}"
+        );
+        let pid = std::fs::read_to_string(&identifier).expect("the helper wrote its identifier");
+        let present = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .output()
+            .expect("kill runs")
+            .status
+            .success();
+        assert!(!present, "process {} was left uncollected", pid.trim());
     }
 
     #[test]
@@ -1956,6 +2173,7 @@ mod tests {
             },
             Refusal::Stream {
                 detail: "broken pipe".to_owned(),
+                helper: None,
             },
             Refusal::Unreadable {
                 detail: "not canonical".to_owned(),

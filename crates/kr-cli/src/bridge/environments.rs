@@ -668,6 +668,7 @@ mod tests {
             },
             Refusal::Stream {
                 detail: "a-value".to_owned(),
+                helper: None,
             },
             Refusal::Silent { waited: silent },
             Refusal::Unkillable {

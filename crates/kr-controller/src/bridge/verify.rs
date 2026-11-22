@@ -56,14 +56,19 @@ pub async fn through_bridge(
         false,
     )?;
     let mut invocation = opening.launch().await?;
-    let answer = invocation
+    let answer = match invocation
         .request(Request {
             request_id: RequestId::new(1),
             method: Method::EnvironmentList.into(),
             method_version: MethodVersion::V1,
             params: ParamsValue::empty(),
         })
-        .await?;
+        .await
+    {
+        Ok(answer) => answer,
+        // A helper that ended while the read was asked says how, rather than that a stream failed.
+        Err(refusal) => return Err(invocation.settled(refusal).await),
+    };
     let verification = BridgeVerification {
         environment_id: invocation.acknowledgement().environment_id,
         os_user: invocation.acknowledgement().os_user.clone(),
