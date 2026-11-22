@@ -1065,21 +1065,6 @@ fn the_probe_reads_a_mode_report_in_its_real_form() {
     );
 }
 
-/// The alert list the grid library fills is bounded.
-#[test]
-fn the_alert_list_is_bounded() {
-    let mut engine = engine();
-    let mut input = Vec::new();
-    for index in 0..2_000 {
-        input.extend_from_slice(format!("\x1b]2;title {index}\x07").as_bytes());
-    }
-    engine.feed(&input, 0);
-    assert!(
-        engine.grid().alerts_dropped() > 0,
-        "a program that renames itself in a loop cannot grow the list"
-    );
-}
-
 // -------------------------------------------- deltas, snapshots, probes and reservation charges
 
 /// Two clients reading deltas from two different bases never clear each other's changes.
@@ -2532,6 +2517,35 @@ fn a_resize_that_does_not_fit_changes_nothing() {
         engine.budget().reserved(),
         reserved,
         "the reservation is unchanged"
+    );
+}
+
+/// A session reserves the figures the terminal document states, and nothing for a part the
+/// document does not list: the sum of the listed parts is the whole reservation.
+#[test]
+fn a_session_reserves_the_figures_the_document_states() {
+    let default = engine().budget().reserved();
+    assert_eq!(
+        default.total(),
+        22_003_208,
+        "the default invisible 120 by 40 session reserves 22,003,208 bytes"
+    );
+    let small = Engine::new(EngineConfig {
+        size: GridSize::new(80, 24),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("an 80 by 24 session fits")
+    .budget()
+    .reserved();
+    assert_eq!(
+        small.total(),
+        19_765_512,
+        "an 80 by 24 session reserves 19,765,512 bytes"
+    );
+    assert_eq!(
+        small.total(),
+        small.cell_slots + small.cell_content + small.row_arrays + small.links + small.titles,
+        "no part outside the document's table is reserved"
     );
 }
 

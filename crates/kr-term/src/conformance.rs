@@ -687,36 +687,36 @@ pub const ADMISSION_CASES: &[AdmissionCase] = &[
     AdmissionCase {
         id: "largest_square_that_fits",
         covers: "KR-REQ-08.79 the largest square that fits",
-        cols: 248,
-        rows: 248,
+        cols: 251,
+        rows: 251,
         resize: None,
     },
     AdmissionCase {
         id: "smallest_square_that_does_not",
         covers: "KR-REQ-08.79 rejection before allocation",
-        cols: 249,
-        rows: 249,
+        cols: 252,
+        rows: 252,
         resize: None,
     },
     AdmissionCase {
         id: "widest_grid_that_fits_at_forty_rows",
         covers: "KR-REQ-08.79 the widest grid that fits at a height",
-        cols: 1_553,
+        cols: 1_588,
         rows: 40,
         resize: None,
     },
     AdmissionCase {
         id: "widest_grid_that_does_not_at_forty_rows",
         covers: "KR-REQ-08.79 rejection before allocation",
-        cols: 1_554,
+        cols: 1_589,
         rows: 40,
         resize: None,
     },
     AdmissionCase {
         id: "most_cells_admitted",
         covers: "KR-REQ-08.79 the largest cell count any shape is admitted at",
-        cols: 1_942,
-        rows: 32,
+        cols: 1_629,
+        rows: 39,
         resize: None,
     },
     AdmissionCase {
@@ -724,8 +724,8 @@ pub const ADMISSION_CASES: &[AdmissionCase] = &[
         covers: "KR-REQ-08.79 a smaller grid of a costlier shape is refused",
         // Fewer cells than the case above and refused all the same: a tall grid keeps more rows,
         // and rows cost something of their own.
-        cols: 60,
-        rows: 1_002,
+        cols: 61,
+        rows: 1_009,
         resize: None,
     },
     AdmissionCase {
@@ -798,7 +798,7 @@ pub fn admission_boundary() -> Value {
             }
         }
     }
-    let by_rows: Vec<Value> = [24u32, 40, 50, 128, 249, 512, 1_024]
+    let by_rows: Vec<Value> = [24u32, 40, 50, 128, 252, 512, 1_024]
         .into_iter()
         .map(|rows| {
             json!({
@@ -888,7 +888,6 @@ fn admitted_value(engine: &Engine, size: GridSize) -> Value {
             "row_arrays": reserved.row_arrays,
             "links": reserved.links,
             "titles": reserved.titles,
-            "alerts": reserved.alerts,
             "total": reserved.total(),
         },
         "budget": engine.budget().limits().session_bytes,

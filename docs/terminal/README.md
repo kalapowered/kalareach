@@ -1022,20 +1022,19 @@ The rest of the reservation:
 | Row storage | 136 a screen row | What a row allocates for itself before anything is on it: eighty bytes of room for its text, and a header each for the cell offsets and the wide-cell bits. A retained row's own storage is the row cache's to carry |
 | Hyperlink envelope | 17,137,960 | 4,096 targets of 2,048 bytes, at twice what they hold, with the table slots and the first node. One envelope holds every link object the grid keeps, on a screen or on a retained row, so a row scrolling off moves no charge |
 | Titles and the virtual stack | 50,208 | Ten entries of two 1,024-byte titles, at twice what they hold, the current pair, and the copy of each title the grid keeps |
-| Alert channel | 1,073,152 | 256 alerts of two 1,024-byte strings, at twice what the list holds |
 
-So an 80 by 24 session reserves 20,838,664 bytes of its 67,108,864, and the default invisible
-120 by 40 reserves 23,076,360. A full-width 2,048 by 24 terminal is admitted; so is every grid at
+So an 80 by 24 session reserves 19,765,512 bytes of its 67,108,864, and the default invisible
+120 by 40 reserves 22,003,208. A full-width 2,048 by 24 terminal is admitted; so is every grid at
 that height, because 2,048 columns is the widest section 8 allows. The largest grid the dimensions
-allow, 2,048 by 128, would need 220,858,760 bytes, so it is refused before anything is allocated
+allow, 2,048 by 128, would need 219,785,608 bytes, so it is refused before anything is allocated
 for it.
 
 There is no single boundary in cells, because a row costs something of its own: the largest cell
-count any shape is admitted at is 1,942 by 32, or 62,144 cells, and 60 by 1,002 is refused at
-60,120. The boundary by height is what a client cares about, and
-`fixtures/terminal/admission.json` records it: 1,553 columns are admitted at 40 rows and 1,554 are
-not; 483 at 128 rows and 484 are not; 248 by 248 is the largest square and 249 by 249 is refused;
-58 columns are admitted at the full 1,024 rows.
+count any shape is admitted at is 1,629 by 39, or 63,531 cells, and 61 by 1,009 is refused at
+61,549. The boundary by height is what a client cares about, and
+`fixtures/terminal/admission.json` records it: 1,588 columns are admitted at 40 rows and 1,589 are
+not; 494 at 128 rows and 495 are not; 251 by 251 is the largest square and 252 by 252 is refused;
+60 columns are admitted at the full 1,024 rows.
 
 The historical row cache is not in that figure. Section 8 gives it its own 8 MiB bound beside the
 64 MiB session budget, so a session's resident state is bounded by the two together and each is
@@ -1128,7 +1127,7 @@ first, before anything is charged for the link being admitted: a measurement rep
 with what the grid is holding, and the object this link is for is not on a row yet. The other two refusals need no measurement, because neither is against what the session holds: a link longer than one link may be, and a parameter field arriving with no target. A table already holding as many distinct targets as a session keeps is measured first as well. The table lists the links the grid still holds, so a link whose last cell has scrolled out of the history is removed from it when the objects are read. The reading happens once a read: a read that carries a flood of links the session has no room for walks the rows once, not once for each link. A link with parameters and no target is refused the same way:
 that is a close, and keeping its parameters would let an application hold a session's worth of
 identifiers in links nothing can follow. Two links to one target are two ranges when their parameters differ, and a restoration opens each with the parameters it had. A cell that reaches its content bound drops the marks past
-it. The alert channel holds a bounded number of alerts, each cut to a bounded length.
+it.
 
 Nothing else is refused. Text, titles and the rows that scroll off all draw on room the geometry
 already reserved, so an admitted session can fill its screens, set a title as often as it likes and

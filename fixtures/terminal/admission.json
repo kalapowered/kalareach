@@ -7,49 +7,48 @@
         "widest_admitted_cols": 2048
       },
       {
-        "narrowest_refused_cols": 1554,
+        "narrowest_refused_cols": 1589,
         "rows": 40,
-        "widest_admitted_cols": 1553
+        "widest_admitted_cols": 1588
       },
       {
-        "narrowest_refused_cols": 1243,
+        "narrowest_refused_cols": 1271,
         "rows": 50,
-        "widest_admitted_cols": 1242
+        "widest_admitted_cols": 1270
       },
       {
-        "narrowest_refused_cols": 484,
+        "narrowest_refused_cols": 495,
         "rows": 128,
-        "widest_admitted_cols": 483
+        "widest_admitted_cols": 494
       },
       {
-        "narrowest_refused_cols": 248,
-        "rows": 249,
-        "widest_admitted_cols": 247
+        "narrowest_refused_cols": 251,
+        "rows": 252,
+        "widest_admitted_cols": 250
       },
       {
-        "narrowest_refused_cols": 120,
+        "narrowest_refused_cols": 123,
         "rows": 512,
-        "widest_admitted_cols": 119
+        "widest_admitted_cols": 122
       },
       {
-        "narrowest_refused_cols": 59,
+        "narrowest_refused_cols": 61,
         "rows": 1024,
-        "widest_admitted_cols": 58
+        "widest_admitted_cols": 60
       }
     ],
     "fewest_cells_refused": {
-      "cells": 60120,
-      "cols": 60,
-      "rows": 1002
+      "cells": 61549,
+      "cols": 61,
+      "rows": 1009
     },
     "most_cells_admitted": {
-      "cells": 62144,
-      "cols": 1942,
-      "rows": 32
+      "cells": 63531,
+      "cols": 1629,
+      "rows": 39
     }
   },
   "budget": {
-    "alert_bytes": 1073152,
     "cell_attribute_bytes": 96,
     "cell_content_bytes": 256,
     "cell_slot_bytes": 128,
@@ -69,13 +68,12 @@
       "budget": 67108864,
       "covers": "KR-REQ-08.72 the invisible default 120x40",
       "footprint": {
-        "alerts": 1073152,
         "cell_content": 2488960,
         "cell_slots": 1239040,
         "links": 17137960,
         "row_arrays": 1087040,
         "titles": 50208,
-        "total": 23076360
+        "total": 22003208
       },
       "id": "default_invisible_size",
       "requested": {
@@ -89,13 +87,12 @@
       "budget": 67108864,
       "covers": "KR-REQ-08.79 a geometry that fits",
       "footprint": {
-        "alerts": 1073152,
         "cell_content": 1001856,
         "cell_slots": 497664,
         "links": 17137960,
         "row_arrays": 1077824,
         "titles": 50208,
-        "total": 20838664
+        "total": 19765512
       },
       "id": "ordinary_terminal",
       "requested": {
@@ -109,13 +106,12 @@
       "budget": 67108864,
       "covers": "KR-REQ-08.79 a geometry that fits",
       "footprint": {
-        "alerts": 1073152,
         "cell_content": 25184640,
         "cell_slots": 12589056,
         "links": 17137960,
         "row_arrays": 1077824,
         "titles": 50208,
-        "total": 57112840
+        "total": 56039688
       },
       "id": "full_width_terminal",
       "requested": {
@@ -129,19 +125,18 @@
       "budget": 67108864,
       "covers": "KR-REQ-08.79 the largest square that fits",
       "footprint": {
-        "alerts": 1073152,
-        "cell_content": 31684480,
-        "cell_slots": 15808512,
+        "cell_content": 32453296,
+        "cell_slots": 16192512,
         "links": 17137960,
-        "row_arrays": 1206848,
+        "row_arrays": 1208576,
         "titles": 50208,
-        "total": 66961160
+        "total": 67042552
       },
       "id": "largest_square_that_fits",
       "requested": {
-        "cells": 61504,
-        "cols": 248,
-        "rows": 248
+        "cells": 63001,
+        "cols": 251,
+        "rows": 251
       }
     },
     {
@@ -149,11 +144,11 @@
       "code": "RESOURCE_UNAVAILABLE",
       "covers": "KR-REQ-08.79 rejection before allocation",
       "id": "smallest_square_that_does_not",
-      "message": "geometry 249x249 is 62001 cells, which needs 67344472 bytes of the 67108864-byte session budget",
+      "message": "geometry 252x252 is 63504 cells, which needs 67430472 bytes of the 67108864-byte session budget",
       "requested": {
-        "cells": 62001,
-        "cols": 249,
-        "rows": 249
+        "cells": 63504,
+        "cols": 252,
+        "rows": 252
       }
     },
     {
@@ -161,18 +156,17 @@
       "budget": 67108864,
       "covers": "KR-REQ-08.79 the widest grid that fits at a height",
       "footprint": {
-        "alerts": 1073152,
-        "cell_content": 31836800,
-        "cell_slots": 15912960,
+        "cell_content": 32553600,
+        "cell_slots": 16271360,
         "links": 17137960,
         "row_arrays": 1087040,
         "titles": 50208,
-        "total": 67098120
+        "total": 67100168
       },
       "id": "widest_grid_that_fits_at_forty_rows",
       "requested": {
-        "cells": 62120,
-        "cols": 1553,
+        "cells": 63520,
+        "cols": 1588,
         "rows": 40
       }
     },
@@ -181,10 +175,10 @@
       "code": "RESOURCE_UNAVAILABLE",
       "covers": "KR-REQ-08.79 rejection before allocation",
       "id": "widest_grid_that_does_not_at_forty_rows",
-      "message": "geometry 1554x40 is 62160 cells, which needs 67128840 bytes of the 67108864-byte session budget",
+      "message": "geometry 1589x40 is 63560 cells, which needs 67130888 bytes of the 67108864-byte session budget",
       "requested": {
-        "cells": 62160,
-        "cols": 1554,
+        "cells": 63560,
+        "cols": 1589,
         "rows": 40
       }
     },
@@ -193,19 +187,18 @@
       "budget": 67108864,
       "covers": "KR-REQ-08.79 the largest cell count any shape is admitted at",
       "footprint": {
-        "alerts": 1073152,
-        "cell_content": 31842816,
-        "cell_slots": 15917056,
+        "cell_content": 32558448,
+        "cell_slots": 16273920,
         "links": 17137960,
-        "row_arrays": 1082432,
+        "row_arrays": 1086464,
         "titles": 50208,
-        "total": 67103624
+        "total": 67107000
       },
       "id": "most_cells_admitted",
       "requested": {
-        "cells": 62144,
-        "cols": 1942,
-        "rows": 32
+        "cells": 63531,
+        "cols": 1629,
+        "rows": 39
       }
     },
     {
@@ -213,11 +206,11 @@
       "code": "RESOURCE_UNAVAILABLE",
       "covers": "KR-REQ-08.79 a smaller grid of a costlier shape is refused",
       "id": "fewest_cells_refused",
-      "message": "geometry 60x1002 is 60120 cells, which needs 67116712 bytes of the 67108864-byte session budget",
+      "message": "geometry 61x1009 is 61549 cells, which needs 67152344 bytes of the 67108864-byte session budget",
       "requested": {
-        "cells": 60120,
-        "cols": 60,
-        "rows": 1002
+        "cells": 61549,
+        "cols": 61,
+        "rows": 1009
       }
     },
     {
@@ -225,7 +218,7 @@
       "code": "RESOURCE_UNAVAILABLE",
       "covers": "KR-REQ-08.71 262,144 cells is a dimension bound",
       "id": "cell_maximum_is_a_dimension_bound",
-      "message": "geometry 2048x128 is 262144 cells, which needs 220858760 bytes of the 67108864-byte session budget",
+      "message": "geometry 2048x128 is 262144 cells, which needs 219785608 bytes of the 67108864-byte session budget",
       "requested": {
         "cells": 262144,
         "cols": 2048,
@@ -249,13 +242,12 @@
       "budget": 67108864,
       "covers": "KR-REQ-08.70 an owner resize the session can hold",
       "footprint": {
-        "alerts": 1073152,
         "cell_content": 1001856,
         "cell_slots": 497664,
         "links": 17137960,
         "row_arrays": 1077824,
         "titles": 50208,
-        "total": 20838664
+        "total": 19765512
       },
       "id": "resize_that_fits",
       "requested": {
@@ -267,13 +259,12 @@
         "admitted": true,
         "budget": 67108864,
         "footprint": {
-          "alerts": 1073152,
           "cell_content": 5159200,
           "cell_slots": 2572800,
           "links": 17137960,
           "row_arrays": 1092800,
           "titles": 50208,
-          "total": 27086120
+          "total": 26012968
         },
         "requested": {
           "cells": 10000,
@@ -292,13 +283,12 @@
       "budget": 67108864,
       "covers": "KR-REQ-08.79 a resize refused before allocation",
       "footprint": {
-        "alerts": 1073152,
         "cell_content": 1001856,
         "cell_slots": 497664,
         "links": 17137960,
         "row_arrays": 1077824,
         "titles": 50208,
-        "total": 20838664
+        "total": 19765512
       },
       "id": "resize_that_does_not_fit",
       "requested": {
@@ -309,7 +299,7 @@
       "resize": {
         "admitted": false,
         "code": "RESOURCE_UNAVAILABLE",
-        "message": "geometry 2048x128 is 262144 cells, which needs 220858760 bytes of the 67108864-byte session budget",
+        "message": "geometry 2048x128 is 262144 cells, which needs 219785608 bytes of the 67108864-byte session budget",
         "requested": {
           "cells": 262144,
           "cols": 2048,

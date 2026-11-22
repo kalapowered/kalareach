@@ -46,7 +46,7 @@
         },
         {
           "path": "admission.json",
-          "sha256": "d69f8f7c96113a4319dcf3b24e456965d2f2973babf5ca3e976a946c44b9def8"
+          "sha256": "1343228aecfa2c034cdb7ab52de46667a45aae4e91817d536592ac6a83cfb6ed"
         }
       ],
       "name": "width-wrap-geometry",

@@ -28,8 +28,8 @@ use wezterm_escape_parser::hyperlink::Hyperlink;
 use wezterm_surface::CursorShape;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{
-    Alert, AlertHandler, CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize,
-    Underline, UnicodeVersion, VerticalAlign,
+    CellAttributes, Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline,
+    UnicodeVersion, VerticalAlign,
 };
 
 use crate::adapter::{AdaptContext, Adapted, adapt};
@@ -37,8 +37,8 @@ use crate::budget::{CELL_OVERHEAD_BYTES, GridSize, SessionBudget};
 use crate::error::Result;
 use crate::event::{Event, EventKind};
 use crate::layout::{
-    ALERT_RECORD_BYTES, CELL_ATTRIBUTES_BYTES, CELL_BYTES, COLOR_ATTRIBUTE_BYTES, HANDLE_BYTES,
-    HYPERLINK_BYTES, ROW_RECORD_BYTES, TABLE_PAIR_BYTES, WORD_BYTES,
+    CELL_ATTRIBUTES_BYTES, CELL_BYTES, COLOR_ATTRIBUTE_BYTES, HANDLE_BYTES, HYPERLINK_BYTES,
+    ROW_RECORD_BYTES, TABLE_PAIR_BYTES, WORD_BYTES,
 };
 use crate::palette::Rgb;
 use crate::snapshot::{ActiveBuffer, Designations, SavedCursor};
@@ -75,96 +75,6 @@ impl std::io::Write for SilentWriter {
         Ok(())
     }
 }
-
-/// An alert the grid library raised while applying an action.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GridAlert {
-    /// The window title changed.
-    WindowTitle(String),
-    /// The icon title changed.
-    IconTitle(Option<String>),
-    /// The working directory observation changed.
-    WorkingDirectory,
-    /// The palette changed.
-    Palette,
-    /// A user variable was set by a shell integration sequence.
-    UserVar {
-        /// The name.
-        name: String,
-        /// The value.
-        value: String,
-    },
-    /// Something the profile routes itself reached the library. Recorded so it is visible.
-    Unexpected(String),
-}
-
-/// How many alerts are held before the oldest is dropped.
-///
-/// Alerts are a diagnostic channel. A program that changes its title in a loop must not be able to
-/// grow this list, so the newest ones win and the drops are counted.
-const MAX_ALERTS: usize = 256;
-
-/// How much of one alert's text is held.
-///
-/// An alert carries what an application said, and an application can say a great deal: without a
-/// bound here a program that sets a long title in a loop would hold megabytes in a list nothing
-/// measures. What is kept is enough to see what happened.
-const MAX_ALERT_BYTES: usize = 1_024;
-
-/// Keeps the first `MAX_ALERT_BYTES` of `text`, cut at a scalar boundary.
-///
-/// What is kept is a copy rather than the original cut short, because cutting a string short keeps
-/// the room it was holding: the point of the bound is the allocation, not the length.
-fn bounded_alert_text(text: String) -> String {
-    if text.len() <= MAX_ALERT_BYTES {
-        return text;
-    }
-    let mut end = MAX_ALERT_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
-}
-
-#[derive(Debug, Default)]
-struct AlertCollector {
-    alerts: Arc<Mutex<Vec<GridAlert>>>,
-    dropped: Arc<AtomicUsize>,
-}
-
-impl AlertHandler for AlertCollector {
-    fn alert(&mut self, alert: Alert) {
-        let record = match alert {
-            Alert::WindowTitleChanged(title) => GridAlert::WindowTitle(bounded_alert_text(title)),
-            Alert::IconTitleChanged(title) => GridAlert::IconTitle(title.map(bounded_alert_text)),
-            Alert::CurrentWorkingDirectoryChanged => GridAlert::WorkingDirectory,
-            Alert::PaletteChanged => GridAlert::Palette,
-            Alert::SetUserVar { name, value } => GridAlert::UserVar {
-                name: bounded_alert_text(name),
-                value: bounded_alert_text(value),
-            },
-            Alert::OutputSinceFocusLost => return,
-            other => GridAlert::Unexpected(bounded_alert_text(format!("{other:?}"))),
-        };
-        if let Ok(mut alerts) = self.alerts.lock() {
-            if alerts.len() >= MAX_ALERTS {
-                alerts.remove(0);
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            alerts.push(record);
-        }
-    }
-}
-
-/// The most the alert list can be holding.
-///
-/// Every alert is bounded and the list is bounded, so this is a constant rather than a
-/// measurement: it is what the session is charged for the channel, whether or not anything is on
-/// it at the moment.
-pub const ALERT_LIST_BYTES: u64 =
-    // Twice, because the list grows by appending and can be holding twice the alerts it has. Each
-    // alert carries at most two strings, each cut to the bound.
-    2 * MAX_ALERTS as u64 * (ALERT_RECORD_BYTES + 2 * MAX_ALERT_BYTES as u64);
 
 /// What the rows of both screens come to, gathered as they are walked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -626,8 +536,6 @@ pub struct GridRow {
 pub struct CanonicalGrid {
     terminal: Terminal,
     writer_log: Arc<Mutex<WriterLog>>,
-    alerts: Arc<Mutex<Vec<GridAlert>>>,
-    alerts_dropped: Arc<AtomicUsize>,
     configuration: Arc<KrVtConfiguration>,
     size: GridSize,
     config: GridConfig,
@@ -708,14 +616,12 @@ impl CanonicalGrid {
         let footprint =
             budget.check_geometry(size, config.scrollback_rows, config.cell_bytes as u64)?;
         let writer_log = Arc::new(Mutex::new(WriterLog::default()));
-        let alerts = Arc::new(Mutex::new(Vec::new()));
-        let alerts_dropped = Arc::new(AtomicUsize::new(0));
         let configuration = Arc::new(KrVtConfiguration {
             config,
             scrollback_rows: AtomicUsize::new(config.scrollback_rows),
             generation: AtomicUsize::new(1),
         });
-        let mut terminal = Terminal::new(
+        let terminal = Terminal::new(
             to_library_size(size),
             Arc::clone(&configuration) as Arc<dyn TerminalConfiguration + Send + Sync>,
             crate::profile::PROFILE_NAME,
@@ -724,16 +630,10 @@ impl CanonicalGrid {
                 log: Arc::clone(&writer_log),
             }),
         );
-        terminal.set_notification_handler(Box::new(AlertCollector {
-            alerts: Arc::clone(&alerts),
-            dropped: Arc::clone(&alerts_dropped),
-        }));
         budget.commit_geometry(footprint);
         let mut grid = Self {
             terminal,
             writer_log,
-            alerts,
-            alerts_dropped,
             configuration,
             size,
             config,
@@ -1160,20 +1060,6 @@ impl CanonicalGrid {
             .lock()
             .map(|log| log.clone())
             .unwrap_or_default()
-    }
-
-    /// Takes the alerts the grid library raised.
-    pub fn take_alerts(&mut self) -> Vec<GridAlert> {
-        self.alerts
-            .lock()
-            .map(|mut alerts| core::mem::take(&mut *alerts))
-            .unwrap_or_default()
-    }
-
-    /// How many alerts were dropped because the bounded list was full.
-    #[must_use]
-    pub fn alerts_dropped(&self) -> usize {
-        self.alerts_dropped.load(Ordering::Relaxed)
     }
 
     /// How many rows a measurement has read the cells of since the session started.

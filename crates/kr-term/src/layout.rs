@@ -24,7 +24,6 @@
 use wezterm_term::color::ColorAttribute;
 use wezterm_term::{Cell, CellAttributes, Line};
 
-use crate::grid::GridAlert;
 use crate::title::SavedTitle;
 
 /// What a `String` or a `Vec` costs beyond the bytes it holds: the pointer, the length and the
@@ -57,9 +56,6 @@ pub(crate) const HYPERLINK_BYTES: u64 = 80;
 /// What one key and value pair costs in a hyperlink's parameter table.
 pub(crate) const TABLE_PAIR_BYTES: u64 = 48;
 
-/// What one alert record costs in the alert list, before the text it carries.
-pub(crate) const ALERT_RECORD_BYTES: u64 = 48;
-
 /// What one entry of the virtual title stack costs, before the titles it holds.
 pub(crate) const SAVED_TITLE_BYTES: u64 = 48;
 
@@ -78,5 +74,4 @@ const _: () = assert!(COLOR_ATTRIBUTE_BYTES >= size_of::<ColorAttribute>() as u6
 const _: () =
     assert!(HYPERLINK_BYTES >= size_of::<wezterm_escape_parser::hyperlink::Hyperlink>() as u64);
 const _: () = assert!(TABLE_PAIR_BYTES >= size_of::<(String, String)>() as u64);
-const _: () = assert!(ALERT_RECORD_BYTES >= size_of::<GridAlert>() as u64);
 const _: () = assert!(SAVED_TITLE_BYTES >= size_of::<SavedTitle>() as u64);

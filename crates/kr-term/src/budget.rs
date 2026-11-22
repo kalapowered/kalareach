@@ -11,9 +11,9 @@
 
 use crate::error::{Result, TermError};
 use crate::grid::{
-    ALERT_LIST_BYTES, CELL_ATTRIBUTE_BYTES, CELL_TEXT_HEAP_BYTES, GRID_TITLE_BYTES,
-    HISTORY_ACCOUNT_MINIMUM_BYTES, HISTORY_CHARGE_BYTES, LINK_TABLE_ENTRY_BYTES,
-    LINK_TABLE_NODE_BYTES, ROW_SLOT_BYTES, ROW_STORAGE_BYTES, STRING_HANDLE_BYTES,
+    CELL_ATTRIBUTE_BYTES, CELL_TEXT_HEAP_BYTES, GRID_TITLE_BYTES, HISTORY_ACCOUNT_MINIMUM_BYTES,
+    HISTORY_CHARGE_BYTES, LINK_TABLE_ENTRY_BYTES, LINK_TABLE_NODE_BYTES, ROW_SLOT_BYTES,
+    ROW_STORAGE_BYTES, STRING_HANDLE_BYTES,
 };
 
 /// The maximum number of columns.
@@ -195,8 +195,6 @@ pub struct Footprint {
     pub links: u64,
     /// The titles and the virtual stack, at their bounds.
     pub titles: u64,
-    /// The alert channel, at its bound.
-    pub alerts: u64,
 }
 
 impl Footprint {
@@ -208,7 +206,6 @@ impl Footprint {
             .saturating_add(self.row_arrays)
             .saturating_add(self.links)
             .saturating_add(self.titles)
-            .saturating_add(self.alerts)
     }
 }
 
@@ -268,7 +265,6 @@ impl SessionBudget {
                 row_arrays: 0,
                 links: 0,
                 titles: 0,
-                alerts: 0,
             },
             usage: BudgetUsage {
                 screen_content: [0, 0],
@@ -355,7 +351,6 @@ impl SessionBudget {
             links: self.limits.link_envelope(),
             // The session's own titles and stack, and the copy the grid keeps of each title.
             titles: crate::title::MAX_RESIDENT_BYTES.saturating_add(GRID_TITLE_BYTES),
-            alerts: ALERT_LIST_BYTES,
         }
     }
 
