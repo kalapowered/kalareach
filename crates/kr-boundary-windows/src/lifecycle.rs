@@ -213,7 +213,8 @@ pub struct Closing {
     /// Objects of the private root that the removal could not delete.
     pub root: Vec<Left>,
     /// The objects of the private root that the journal already holds as open leftovers, from an
-    /// earlier end that did not finish.
+    /// earlier end that did not finish. An object the removal finds again stays and is not
+    /// journalled twice; one that it no longer finds is cleared.
     pub root_recorded: Vec<String>,
 }
 
@@ -222,6 +223,11 @@ pub struct Closing {
 /// the repository or the end remains the release is verified and the invocation ended, with the
 /// count of the leftovers of the private root that the sweep carries on. `row` numbers the snapshot
 /// the repository leftover names.
+///
+/// The leftovers of the private root are reconciled with what the journal already holds: one that
+/// the removal finds again is not journalled a second time, one that it no longer finds is cleared,
+/// and the end counts exactly the ones that stay open, which is the count the journal's tracker
+/// takes.
 ///
 /// The rows are not a decision: the journal's tracker refuses any of them that is out of order.
 #[must_use]
@@ -248,14 +254,40 @@ pub fn closing_rows(closing: &Closing) -> Vec<Row> {
             snapshot: None,
         });
     }
+    let mut found: Vec<&str> = Vec::new();
     for left in &closing.root {
-        rows.push(Row::Leftover {
-            object: left.object.clone(),
-            reason: left.reason.clone(),
-            class: LeftoverClass::Root,
-            snapshot: None,
-        });
+        if found.contains(&left.object.as_str()) {
+            continue;
+        }
+        found.push(&left.object);
+        if !closing.root_recorded.contains(&left.object) {
+            rows.push(Row::Leftover {
+                object: left.object.clone(),
+                reason: left.reason.clone(),
+                class: LeftoverClass::Root,
+                snapshot: None,
+            });
+        }
     }
+    let mut cleared: Vec<&str> = Vec::new();
+    for object in &closing.root_recorded {
+        if !found.contains(&object.as_str()) && !cleared.contains(&object.as_str()) {
+            cleared.push(object);
+            rows.push(Row::LeftoverCleared {
+                key: object.clone(),
+            });
+        }
+    }
+    // What stays open: each row the journal holds for an object that is found again, and each new one.
+    let open = closing
+        .root_recorded
+        .iter()
+        .filter(|object| found.contains(&object.as_str()))
+        .count()
+        + found
+            .iter()
+            .filter(|object| !closing.root_recorded.iter().any(|each| each == **object))
+            .count();
     if closing.tree.is_empty() && closing.repository.is_none() {
         rows.push(Row::ReleaseVerified {
             objects: closing.objects_released,
@@ -263,7 +295,7 @@ pub fn closing_rows(closing: &Closing) -> Vec<Row> {
         });
         rows.push(Row::End {
             // The root's leftovers are bounded far below `u32`: the journal takes at most a thousand.
-            root_leftovers: closing.root.len() as u32,
+            root_leftovers: open as u32,
         });
     }
     rows
