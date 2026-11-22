@@ -933,13 +933,88 @@ fn powershell(script: &str) -> std::process::Output {
         .unwrap()
 }
 
-/// The services that can set the clock, as the case found them: the Windows Time service's start
-/// type in the words of `sc config`, and whether it and the Hyper-V time synchronisation service
-/// were running.
-struct TimeServices {
+/// One service as it was read: its start type in the words of `sc config`, and its status. A
+/// service that is not installed reads `absent` in both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Service {
     start: String,
-    windows_time_ran: bool,
-    hyper_v_sync_ran: bool,
+    status: String,
+}
+
+impl Service {
+    fn runs(&self) -> bool {
+        self.status == "Running"
+    }
+
+    fn absent(&self) -> bool {
+        self.status == "absent"
+    }
+}
+
+/// The services that can set the clock: the Windows Time service and the Hyper-V time
+/// synchronisation service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimeServices {
+    windows_time: Service,
+    hyper_v_sync: Service,
+}
+
+impl TimeServices {
+    /// Reads both services.
+    fn read() -> Result<TimeServices, String> {
+        let found = powershell(
+            "function Read-One($n) { \
+               $s = Get-Service -Name $n -ErrorAction SilentlyContinue; \
+               if (-not $s) { return 'absent absent' }; \
+               $d = (Get-ItemProperty ('HKLM:\\SYSTEM\\CurrentControlSet\\Services\\' + $n)).DelayedAutostart; \
+               $m = switch ([string]$s.StartType) { 'Automatic' { if ($d -eq 1) { 'delayed-auto' } else { 'auto' } } 'Manual' { 'demand' } 'Disabled' { 'disabled' } default { throw ('start type ' + $s.StartType) } }; \
+               $m + ' ' + $s.Status }; \
+             (Read-One 'W32Time') + ' ' + (Read-One 'vmictimesync')",
+        );
+        if !found.status.success() {
+            return Err(format!("the time services were not read: {found:?}"));
+        }
+        let text = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+        let words: Vec<&str> = text.split(' ').collect();
+        let [wt_start, wt_status, vm_start, vm_status] = words[..] else {
+            return Err(format!("the time services' state is unreadable: {text}"));
+        };
+        let service = |start: &str, status: &str| Service {
+            start: start.to_owned(),
+            status: status.to_owned(),
+        };
+        Ok(TimeServices {
+            windows_time: service(wt_start, wt_status),
+            hyper_v_sync: service(vm_start, vm_status),
+        })
+    }
+
+    /// Why these states cannot be put back as they stand, or none. A service that is running with
+    /// its start type disabled cannot be started again once it is stopped, and a service that is
+    /// neither running nor stopped has no state to put back.
+    fn cannot_be_put_back(&self) -> Option<String> {
+        if self.windows_time.absent() {
+            return Some("the Windows Time service is not installed".to_owned());
+        }
+        for (name, service) in [
+            ("W32Time", &self.windows_time),
+            ("vmictimesync", &self.hyper_v_sync),
+        ] {
+            if service.absent() {
+                continue;
+            }
+            match service.status.as_str() {
+                "Running" if service.start == "disabled" => {
+                    return Some(format!(
+                        "{name} runs with its start type disabled: once stopped it cannot be started again"
+                    ));
+                }
+                "Running" | "Stopped" => {}
+                other => return Some(format!("{name} is {other}, not running or stopped")),
+            }
+        }
+        None
+    }
 }
 
 /// Moves the system's clock and puts it back: to the time it began at plus the time that has passed
@@ -959,7 +1034,8 @@ struct TimeServices {
 /// gate of the case that uses this value: the case is ignored unless a run asks for the ignored
 /// cases, it returns at once unless the process is the system's (checked again here), and it
 /// runs in a disposable guest that a restore resets. No other run changes the clock or either
-/// service. The case moves the clock of the whole guest, so it runs alone (the guest's runner gives
+/// service. The case refuses a state of the services that it could not put back, before it
+/// changes anything. The case moves the clock of the whole guest, so it runs alone (the guest's runner gives
 /// `--test-threads=1`).
 struct Clock {
     began: std::time::SystemTime,
@@ -973,30 +1049,16 @@ impl Clock {
             runs_as_the_system(),
             "the clock and the time services change only in a run as the system"
         );
-        let found = powershell(
-            "$s = Get-Service -Name W32Time; \
-             $d = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\W32Time').DelayedAutostart; \
-             $m = switch ([string]$s.StartType) { 'Automatic' { if ($d -eq 1) { 'delayed-auto' } else { 'auto' } } 'Manual' { 'demand' } 'Disabled' { 'disabled' } default { throw ('start type ' + $s.StartType) } }; \
-             $v = Get-Service -Name vmictimesync -ErrorAction SilentlyContinue; \
-             $m + ' ' + $s.Status + ' ' + $(if ($v) { $v.Status } else { 'absent' })",
-        );
-        assert!(
-            found.status.success(),
-            "the time services were not read: {found:?}"
-        );
-        let text = String::from_utf8_lossy(&found.stdout).trim().to_owned();
-        let words: Vec<&str> = text.split(' ').collect();
-        let [start, windows_time, hyper_v_sync] = words[..] else {
-            panic!("the time services' state is unreadable: {text}");
-        };
+        let found = TimeServices::read().unwrap();
+        if let Some(why) = found.cannot_be_put_back() {
+            panic!(
+                "the time services cannot be put back as they stand, and nothing was changed: {why}"
+            );
+        }
         let clock = Clock {
             began: std::time::SystemTime::now(),
             at: Instant::now(),
-            services: TimeServices {
-                start: start.to_owned(),
-                windows_time_ran: windows_time == "Running",
-                hyper_v_sync_ran: hyper_v_sync == "Running",
-            },
+            services: found,
             restored: false,
         };
         // From here the drop puts the services back, whether or not this call finishes.
@@ -1065,26 +1127,64 @@ impl Clock {
         {
             failures.push(failure);
         }
-        let TimeServices {
-            start,
-            windows_time_ran,
-            hyper_v_sync_ran,
-        } = &self.services;
-        let _ = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "& sc.exe config W32Time start= {start}; \
-                     if ('{windows_time_ran}' -eq 'true') {{ Start-Service -Name W32Time -ErrorAction SilentlyContinue }}; \
-                     if ('{hyper_v_sync_ran}' -eq 'true') {{ Start-Service -Name vmictimesync -ErrorAction SilentlyContinue }}"
-                ),
-            ])
-            .status();
+        if let Err(failure) = self.put_services_back() {
+            failures.push(failure);
+        }
         if failures.is_empty() {
             Ok(())
         } else {
             Err(failures.join("; "))
+        }
+    }
+
+    /// Puts the Windows Time service's start type and the running services back, and reads both
+    /// services to see that they are back: a service that ran must run, and neither start type may
+    /// differ from what was found. A service that was stopped is left as it stands, because the
+    /// system's own tasks may start it.
+    fn put_services_back(&self) -> Result<(), String> {
+        let was = &self.services;
+        let flag = |service: &Service| if service.runs() { "$true" } else { "$false" };
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             & sc.exe config W32Time start= {start}; \
+             if ($LASTEXITCODE -ne 0) {{ throw 'the start type was not set' }}; \
+             if ({windows_time}) {{ Start-Service -Name W32Time }}; \
+             if ({hyper_v_sync}) {{ Start-Service -Name vmictimesync }}",
+            start = was.windows_time.start,
+            windows_time = flag(&was.windows_time),
+            hyper_v_sync = flag(&was.hyper_v_sync),
+        );
+        let done = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .map_err(|failure| format!("the time services were not put back: {failure}"))?;
+        if !done.status.success() {
+            return Err(format!("the time services were not put back: {done:?}"));
+        }
+        let now = TimeServices::read()?;
+        let mut wrong = Vec::new();
+        if now.windows_time.start != was.windows_time.start {
+            wrong.push(format!(
+                "W32Time's start type is {}, not {}",
+                now.windows_time.start, was.windows_time.start
+            ));
+        }
+        if now.hyper_v_sync.start != was.hyper_v_sync.start {
+            wrong.push(format!(
+                "vmictimesync's start type is {}, not {}",
+                now.hyper_v_sync.start, was.hyper_v_sync.start
+            ));
+        }
+        if was.windows_time.runs() && !now.windows_time.runs() {
+            wrong.push("W32Time does not run".to_owned());
+        }
+        if was.hyper_v_sync.runs() && !now.hyper_v_sync.runs() {
+            wrong.push("vmictimesync does not run".to_owned());
+        }
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            Err(wrong.join(", "))
         }
     }
 }
