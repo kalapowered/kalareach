@@ -3589,13 +3589,13 @@ jobs:
   # after another), and reads the bytes of all of them. The check stands in a job of its own because
   # it did not fit at the end of the macos-demonstrations leg: after the demonstrations, the release
   # build of the measurements (37 minutes) and the measurements, the 90 minutes it had there ran out
-  # on a hosted runner (07:25 to 08:55 UTC on 21 November), and it has never completed on one. Here
-  # it needs no other job. Like each macOS job of a run, it can still wait for one of the hosted
-  # macOS runners that the account can use at one time. No time is known for it to run to its end,
-  # so the step has a limit of 300 minutes, and every step has a limit of its own: they add up to
-  # 329 of this job's 330 minutes, under the 360 at which GitHub ends a hosted job. It restores no
-  # cache: the release builds go in a new directory, which no restored output serves, and the one
-  # debug build, of kr-ipc's test, is small.
+  # on a hosted runner (07:25 to 08:55 UTC on 21 November). Here it needs no other job, and in three
+  # runs on hosted runners (21 and 22 November) it ran to its end in 126 to 137 minutes. Like each
+  # macOS job of a run, it can still wait for one of the hosted macOS runners that the account can
+  # use at one time. The step has a limit of 300 minutes, and every step has a limit of its own:
+  # they add up to 329 of this job's 330 minutes, under the 360 at which GitHub ends a hosted job.
+  # It restores no cache: the release builds go in a new directory, which no restored output serves,
+  # and the one debug build, of kr-ipc's test, is small.
   macos-shipped-hold:
     name: macos-shipped-hold
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
