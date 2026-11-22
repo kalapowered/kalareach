@@ -315,6 +315,42 @@ fn a_root_leftover_that_the_removal_finds_again_is_not_journalled_twice_and_the_
 }
 
 #[test]
+fn a_removal_that_failed_as_a_whole_keeps_the_recorded_leftovers_open_and_names_the_root() {
+    // The ending function gives the root's own path and every recorded leftover when the removal
+    // did not run to its end.
+    let root = r"C:\ProgramData\Boundary\run\0a1b";
+    let other = r"C:\ProgramData\Boundary\run\0a1b\y.lock";
+    let closing = Closing {
+        root: vec![left(root), left(FILE), left(other)],
+        root_recorded: vec![FILE.to_owned(), other.to_owned()],
+        ..closing()
+    };
+    let rows = closing_rows(&closing);
+    let journalled: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Leftover { object, .. } => Some(object.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(journalled, [root], "{rows:?}");
+    assert!(
+        rows.iter()
+            .all(|row| !matches!(row, Row::LeftoverCleared { .. })),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| matches!(row, Row::End { root_leftovers: 3 })),
+        "{rows:?}"
+    );
+    let mut tracker = ended_with_root_leftovers(&[FILE, other]);
+    apply_all(&mut tracker, &rows);
+    assert_eq!(tracker.standing(), Standing::Finished);
+    assert_eq!(tracker.leftovers().len(), 3);
+}
+
+#[test]
 fn the_end_counts_the_open_root_leftovers_after_a_clearance_and_a_new_leftover() {
     // Open from the earlier end: a and b. The removal finds b and c: a is cleared, c is new.
     let closing = Closing {
