@@ -608,8 +608,9 @@ impl Launching {
         self.pending.store(true, Ordering::SeqCst);
     }
 
-    /// The process that was started was seen to end: the start was made, and no daemon it asked for
-    /// may still come up.
+    /// The daemon that was asked for has ended: a process this command started was seen to end, or
+    /// the process that a service manager named wrote the log's refusal of a bind and ended with it.
+    /// The start was made, and no daemon it asked for may still come up.
     #[cfg(unix)]
     pub(crate) fn process_ended(&self) {
         self.pending.store(false, Ordering::SeqCst);
@@ -1642,6 +1643,13 @@ async fn managed(
         Ok(client) => return Ok((client, Some(started))),
         Err(Waited::Deadline(last)) => last,
         Err(Waited::Stopped(line)) => {
+            // The manager named the process, and that process wrote the line and ended with it; the
+            // definition has no restart, so no requested daemon may still come up. With no process
+            // named, the line may be another start's daemon's, and the requested daemon may still
+            // come up.
+            if asked.pid.is_some() {
+                launched.process_ended();
+            }
             if let Some(listed) = last_look(endpoint, majors, seen).await {
                 return Ok((listed, Some(started)));
             }
