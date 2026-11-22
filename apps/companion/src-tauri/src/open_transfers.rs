@@ -38,10 +38,12 @@
 //!   twenty-four hours.
 
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use futures_util::FutureExt as _;
 use kr_client::chunks::ChunkRoute;
 use kr_client::services::AccountMark;
 use kr_client::uploads::{self, Content, Held, Journal, Progress, Stage, Subject, Upload};
@@ -391,6 +393,15 @@ struct Live {
     /// This upload asked once for the places other accounts of the device hold, and does not ask
     /// again: the freeing is tried once for each upload, whatever the answer.
     places_asked: AtomicBool,
+    /// Whether the entry says the cancel was asked; kept in step with it by [`Live::change`] and
+    /// [`Live::adopt`], so that the gate reads it without taking the entry. A start refuses an
+    /// upload that carries it.
+    cancel_asked: AtomicBool,
+    /// The highest number of a connection that a reach went by while this upload was held and not
+    /// paused: the reach could not start it, and the decision that leaves it paused reads this.
+    reached: AtomicU64,
+    /// The number of the connection its sender was started on.
+    sent_link: AtomicU64,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -402,6 +413,9 @@ impl Live {
         Arc::new(Self {
             key: file.key,
             owner: Owner::of(&file),
+            cancel_asked: AtomicBool::new(file.cancel_asked),
+            reached: AtomicU64::new(0),
+            sent_link: AtomicU64::new(0),
             published: AtomicBool::new(file.reached == Reached::Published),
             generation: AtomicU64::new(0),
             file: Mutex::new(file),
@@ -433,6 +447,8 @@ impl Live {
         store.write(&next)?;
         self.published
             .store(next.reached == Reached::Published, Ordering::Release);
+        self.cancel_asked
+            .store(next.cancel_asked, Ordering::Release);
         *file = next;
         Ok(())
     }
@@ -441,6 +457,8 @@ impl Live {
     fn adopt(&self, next: UploadFile) {
         self.published
             .store(next.reached == Reached::Published, Ordering::Release);
+        self.cancel_asked
+            .store(next.cancel_asked, Ordering::Release);
         *locked(&self.file) = next;
     }
 }
@@ -518,6 +536,11 @@ impl Journal for Kept {
         // The bytes are the host's now; the handle is what this entry keeps. A copy that cannot be
         // removed now is removed at the next reach, and is no reason to fail a published upload.
         let _ = self.store.remove_copy(locked(&self.live.file).key);
+        #[cfg(feature = "testing")]
+        testing::pause(
+            self.live.key,
+            testing::Point::Writing(testing::Step::Published),
+        );
         Ok(())
     }
 }
@@ -543,6 +566,18 @@ impl Paired {
     #[must_use]
     pub fn account_id(&self) -> Option<String> {
         self.account.map(AccountMark::to_hex)
+    }
+
+    /// Whether this connection is `who`'s: the principal, the environment where `who` names one, and
+    /// the account.
+    #[must_use]
+    pub fn answers_to(&self, who: &Who) -> bool {
+        owned_by(
+            self.device_id,
+            self.environment_id,
+            self.account_id().as_deref(),
+            who,
+        )
     }
 
     /// Whose uploads this connection reads.
@@ -818,7 +853,10 @@ impl Registry {
     /// Holds `live`, made from an entry a restart found, unless the person cancelled its key since
     /// the entry was read or it is held already.
     fn admit_restarted(&mut self, live: &Arc<Live>) -> bool {
-        if self.cancelled.contains(&live.key) || self.held.contains_key(&live.key) {
+        if self.cancelled.contains(&live.key)
+            || live.cancel_asked.load(Ordering::Acquire)
+            || self.held.contains_key(&live.key)
+        {
             return false;
         }
         self.held.insert(live.key, Arc::clone(live));
@@ -850,6 +888,90 @@ impl Registry {
 struct Turn {
     key: Uuid,
     _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// What a barrier does under the key's turn, once the sender is over.
+enum Job {
+    /// The person's cancel: the record is read, the cancel is recorded and the host is asked, on
+    /// the connection the command found when it found one.
+    Cancel { who: Who, paired: Option<Paired> },
+    /// The cancel of the key is finished on `paired`'s connection.
+    Finish { paired: Paired },
+    /// Nothing but the attempt and the decision that every barrier ends with.
+    Decide,
+}
+
+/// What a barrier answers.
+enum Answered {
+    Done(Box<Result<Cancelled>>),
+    /// The key's upload was sending and the barrier was asked to leave a sender alone.
+    Skipped,
+    /// The work panicked, or the task that ran it ended without an answer.
+    Panicked,
+}
+
+/// A key's turn after its sender was stopped and joined, lent to the work of one barrier. It exists
+/// only inside the task of [`Desk::barrier`], borrows the turn, and resolves the key when it ends:
+/// an upload that the work did not end is settled by [`Desk::idle_or_next`] and never stays
+/// `Stopping`. Its drop does not panic, takes only the gate, and does no disk work.
+struct Stopped<'t> {
+    desk: Arc<Desk>,
+    turn: &'t Turn,
+    /// The upload the desk held for the key when the sender was stopped.
+    held: Option<Arc<Live>>,
+    /// The key's upload was ended by the work: forgotten, or published.
+    ended: bool,
+    resolved: bool,
+    /// The highest number of a connection this barrier sent a host call on.
+    used: u64,
+    /// The number of the newest connection this barrier's decision has read.
+    looked: u64,
+}
+
+impl Stopped<'_> {
+    /// The upload and its entry are over for good, and removed.
+    fn forget(&mut self, store: &Store, key: Uuid) {
+        self.desk.forget(store, &self.held, key);
+        self.ended = true;
+    }
+
+    /// The upload is published: the held upload ends with the handle and the entry stays.
+    fn published(&mut self, handle: AttachmentHandle) {
+        if let Some(live) = &self.held {
+            self.desk.end(live, Outcome::Published(Box::new(handle)));
+        }
+        self.ended = true;
+    }
+
+    /// The one resolution of the stop: a published record ends the upload, and anything else goes
+    /// through the decision section. Runs once.
+    fn resolve(&mut self) {
+        if self.resolved {
+            return;
+        }
+        self.resolved = true;
+        if self.ended {
+            return;
+        }
+        let Some(live) = self.held.clone() else {
+            return;
+        };
+        let file = live.file();
+        if file.reached == Reached::Published
+            && let Some(handle) = file.handle
+        {
+            self.desk.end(&live, Outcome::Published(Box::new(handle)));
+            self.ended = true;
+            return;
+        }
+        self.desk.idle_or_next(&live, None, self.used, self.looked);
+    }
+}
+
+impl Drop for Stopped<'_> {
+    fn drop(&mut self) {
+        self.resolve();
+    }
 }
 
 /// The state of every upload this device sends to a paired host.
@@ -1152,6 +1274,7 @@ impl Desk {
             .is_some_and(|held| Arc::ptr_eq(held, live));
         if !current
             || registry.cancelled.contains(&live.key)
+            || live.cancel_asked.load(Ordering::Acquire)
             || live.owner.account != connection.account
         {
             return false;
@@ -1164,6 +1287,7 @@ impl Desk {
             }
             *phase = Phase::Sending;
         }
+        live.sent_link.store(connection.link, Ordering::Release);
         #[cfg(feature = "testing")]
         if verify {
             locked(&self.resumed).insert(live.key, connection.link);
@@ -1172,6 +1296,8 @@ impl Desk {
         let desk = Arc::clone(self);
         let running = Arc::clone(live);
         let task = tauri::async_runtime::spawn(async move {
+            #[cfg(feature = "testing")]
+            let _exit = testing::ExitNote(running.key);
             #[cfg(feature = "testing")]
             testing::at_sender_start(running.key).await;
             if verify && !desk.is_the_content(&running, generation).await {
@@ -1571,10 +1697,15 @@ impl Desk {
         };
         if file.cancel_asked || self.is_cancelled(key) {
             // A key the person cancelled is finished, whether or not the record of it could be
-            // written.
-            let _ = self
-                .finish_cancel(&turn, store, &paired.session, None, file)
-                .await;
+            // written, by a barrier on this reach's connection. No code that holds a key's turn
+            // calls the barrier, so the turn goes first; the barrier reads the key again.
+            drop(turn);
+            let _ = self.finish_asked(paired, key).await;
+            return;
+        }
+        // An upload another reach started since the status was read, and an entry that is
+        // published, are left to their owners.
+        if file.reached == Reached::Published || locked(&self.registry).held.contains_key(&key) {
             return;
         }
         let Some(status) = status else { return };
@@ -1751,65 +1882,9 @@ impl Desk {
             }
             registry.record_cancel(key);
         }
-        // Steps 1 and 2. Once the turn is held and the sender is over, nothing else writes this key.
-        let turn = self.turn(key).await;
-        self.stopped(&turn).await;
-        // Step 3.
-        let held = locked(&self.registry).held.get(&key).cloned();
-        let file = match &held {
-            Some(live) => live.file(),
-            None => match store.entry(key) {
-                Some(file) if file.is_whose(&who) => file,
-                Some(_) => return Err(none()),
-                None => return Ok(Self::said(key, "forgotten", None, None)),
-            },
-        };
-        if file.reached == Reached::Published {
-            return Ok(Self::said(key, "published", None, file.handle));
-        }
-        if !file.cancel_asked {
-            // Recorded before the host is asked, so that a cancel that cannot be finished is not lost.
-            let asked = match &held {
-                Some(live) => live.change(&store, |file| file.cancel_asked = true),
-                None => store.write(&UploadFile {
-                    cancel_asked: true,
-                    ..file.clone()
-                }),
-            };
-            if let Err(error) = asked {
-                // Nothing runs for this key: it is cancelled, whatever could be written.
-                if let Some(live) = &held {
-                    *locked(&live.phase) = Phase::Paused;
-                }
-                return Ok(Self::asked(key, Some(record_not_kept(&error).message)));
-            }
-        }
-        let file = match &held {
-            Some(live) => live.file(),
-            None => UploadFile {
-                cancel_asked: true,
-                ..file
-            },
-        };
-        let Some(paired) = paired else {
-            // No connection: a reservation the host never answered is forgotten here, and any other
-            // is kept as cancelled until the host is reached.
-            if Self::transfer_of(&held, &file).is_none() {
-                self.forget(&store, &held, key);
-                return Ok(Self::said(key, "forgotten", None, None));
-            }
-            if let Some(live) = &held {
-                *locked(&live.phase) = Phase::Paused;
-            }
-            return Ok(Self::asked(key, None));
-        };
-        match self
-            .finish_cancel(&turn, &store, &paired.session, held, file)
-            .await
-        {
-            Ok(answer) => Ok(answer),
-            Err(error) => Ok(Self::asked(key, Some(error.message))),
-        }
+        // Steps 1 to 3 run in a task of the desk's own, which no caller can cancel.
+        let job = Job::Cancel { who, paired };
+        Self::answer(key, self.barrier(key, false, job, 0, 0).await)
     }
 
     /// The transfer the host gave for an upload, whether or not the entry could keep it.
@@ -1843,38 +1918,215 @@ impl Desk {
         }
     }
 
-    /// Finishes the cancel of `key` on `paired`'s connection, in the key's turn: the sender is
-    /// stopped and waited for, the upload or the entry is read again, and the cancel is finished
-    /// only when the key is still held or kept and was cancelled. A key already gone answers
-    /// `forgotten`, so a second finisher never cancels again.
+    /// Finishes the cancel of `key` on `paired`'s connection, in the key's turn, inside a barrier: the
+    /// sender is stopped and waited for, the upload or the entry is read again, and the cancel is
+    /// finished only when the key is still held or kept and was cancelled. A key already gone answers
+    /// `forgotten`, so a second finisher never cancels again. A record of another owner is refused
+    /// before anything is stopped.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a key that is no upload of `paired`'s owner, and a key whose cancel was never asked.
     pub async fn finish_asked(self: &Arc<Self>, paired: &Paired, key: Uuid) -> Result<Cancelled> {
         let store = self.store()?;
+        #[cfg(feature = "testing")]
+        let checked = !testing::armed(key, testing::Fault::SkipPrecheck);
+        #[cfg(not(feature = "testing"))]
+        let checked = true;
+        if checked {
+            let who = paired.who();
+            let live = locked(&self.registry).held.get(&key).cloned();
+            let owned = match live {
+                Some(live) => Some(live.owner.is_whose(&who)),
+                None => store.entry(key).map(|file| file.is_whose(&who)),
+            };
+            if owned == Some(false) {
+                return Err(CommandError::invalid(NO_OPEN_UPLOAD));
+            }
+        }
+        let job = Job::Finish {
+            paired: paired.clone(),
+        };
+        Self::answer(key, self.barrier(key, false, job, 0, 0).await)
+    }
+
+    /// What a command is told of a barrier's answer. A barrier whose work panicked, and a key that
+    /// was recorded as cancelled, answer `asked`: the cancel is finished at the next reach.
+    fn answer(key: Uuid, answered: Answered) -> Result<Cancelled> {
+        match answered {
+            Answered::Done(result) => *result,
+            Answered::Skipped | Answered::Panicked => Ok(Self::asked(key, None)),
+        }
+    }
+
+    /// Runs `job` on `key` in a task of the desk's own that no caller can cancel, and answers what it
+    /// answers; a caller that is dropped drops only the answer. The task takes the key's turn,
+    /// stops the key's sender and waits for it (unless `skip` leaves a sending upload alone), runs
+    /// the job under `catch_unwind`, makes the one attempt to finish a cancelled key on the newest
+    /// connection of its account, and ends the stop in the decision section, so that no path leaves
+    /// the upload `Stopping`. No code that holds a key's turn calls it.
+    async fn barrier(
+        self: &Arc<Self>,
+        key: Uuid,
+        skip: bool,
+        job: Job,
+        used: u64,
+        looked: u64,
+    ) -> Answered {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let desk = Arc::clone(self);
+        self.work.spawn(async move {
+            let done = desk.barrier_task(key, skip, job, used, looked).await;
+            let _ = answer.send(done);
+        });
+        answered.await.unwrap_or(Answered::Panicked)
+    }
+
+    async fn barrier_task(
+        self: &Arc<Self>,
+        key: Uuid,
+        skip: bool,
+        job: Job,
+        used: u64,
+        looked: u64,
+    ) -> Answered {
         let turn = self.turn(key).await;
-        self.stopped(&turn).await;
-        let held = locked(&self.registry).held.get(&key).cloned();
+        let (held, handle) = {
+            let registry = locked(&self.registry);
+            let held = registry.held.get(&key).cloned();
+            if skip
+                && held.as_ref().is_some_and(|live| {
+                    matches!(*locked(&live.phase), Phase::Sending | Phase::Admitted)
+                })
+            {
+                return Answered::Skipped;
+            }
+            (held, Self::stop(&registry, key))
+        };
+        if let Some(handle) = handle {
+            handle.abort();
+            #[cfg(feature = "testing")]
+            testing::note(key, testing::Point::CancelWaiting);
+            let _ = handle.await;
+        }
+        #[cfg(feature = "testing")]
+        testing::pause(key, testing::Point::Stopped);
+        let mut stopped = Stopped {
+            desk: Arc::clone(self),
+            turn: &turn,
+            held,
+            ended: false,
+            resolved: false,
+            used,
+            looked,
+        };
+        let worked = AssertUnwindSafe(self.work_of(&mut stopped, job))
+            .catch_unwind()
+            .await;
+        let mut answered = match worked {
+            Ok(result) => Answered::Done(Box::new(result)),
+            Err(_) => Answered::Panicked,
+        };
+        if let Some(Ok(done)) = self.attempt(&mut stopped).await
+            && !matches!(answered, Answered::Panicked)
+        {
+            answered = Answered::Done(Box::new(Ok(done)));
+        }
+        #[cfg(feature = "testing")]
+        testing::gate(key, testing::Awaited::BeforeTail).await;
+        stopped.resolve();
+        #[cfg(feature = "testing")]
+        testing::note(key, testing::Point::DecisionDone);
+        answered
+    }
+
+    async fn work_of(self: &Arc<Self>, stopped: &mut Stopped<'_>, job: Job) -> Result<Cancelled> {
+        let key = stopped.turn.key;
+        #[cfg(feature = "testing")]
+        if testing::armed(key, testing::Fault::PanicInWork) {
+            panic!("a fault injected into the work of a barrier");
+        }
+        match job {
+            Job::Cancel { who, paired } => self.cancel_work(stopped, &who, paired).await,
+            Job::Finish { paired } => self.finish_work(stopped, &paired).await,
+            Job::Decide => Ok(Self::asked(key, None)),
+        }
+    }
+
+    /// The upload's record, as the work reads it under the turn: the held upload's own, or the
+    /// entry's.
+    fn record_of(stopped: &Stopped<'_>, store: &Store) -> Option<UploadFile> {
+        match &stopped.held {
+            Some(live) => Some(live.file()),
+            None => store.entry(stopped.turn.key),
+        }
+    }
+
+    /// A record that says the upload is published ends the held upload with its handle, and the
+    /// answer is `published`; the entry stays and its copy is gone already.
+    fn published_answer(stopped: &mut Stopped<'_>, file: &UploadFile) -> Option<Cancelled> {
+        if file.reached != Reached::Published {
+            return None;
+        }
+        let handle = file.handle.clone()?;
+        stopped.published(handle.clone());
+        Some(Self::said(file.key, "published", None, Some(handle)))
+    }
+
+    /// The person's cancel, under the key's turn with the sender over: the cancel is recorded before
+    /// the host is asked, so that one that cannot be finished is not lost.
+    async fn cancel_work(
+        self: &Arc<Self>,
+        stopped: &mut Stopped<'_>,
+        who: &Who,
+        paired: Option<Paired>,
+    ) -> Result<Cancelled> {
+        let store = self.store()?;
+        let key = stopped.turn.key;
+        let none = || CommandError::invalid(NO_OPEN_UPLOAD);
+        let held = stopped.held.clone();
         let file = match &held {
             Some(live) => live.file(),
             None => match store.entry(key) {
-                Some(file) => file,
+                Some(file) if file.is_whose(who) => file,
+                Some(_) => return Err(none()),
                 None => return Ok(Self::said(key, "forgotten", None, None)),
             },
         };
-        if !file.is_of(paired) {
-            return Err(CommandError::invalid(NO_OPEN_UPLOAD));
+        if let Some(published) = Self::published_answer(stopped, &file) {
+            return Ok(published);
         }
-        if file.reached == Reached::Published {
-            return Ok(Self::said(key, "published", None, file.handle));
+        if !file.cancel_asked {
+            let asked = match &held {
+                Some(live) => live.change(&store, |file| file.cancel_asked = true),
+                None => store.write(&UploadFile {
+                    cancel_asked: true,
+                    ..file.clone()
+                }),
+            };
+            if let Err(error) = asked {
+                // Nothing runs for this key: it is cancelled, whatever could be written.
+                return Ok(Self::asked(key, Some(record_not_kept(&error).message)));
+            }
         }
-        if !file.cancel_asked && !self.is_cancelled(key) {
-            return Err(CommandError::invalid(NO_OPEN_UPLOAD));
-        }
-        let file = UploadFile {
-            cancel_asked: true,
-            ..file
+        let file = match &held {
+            Some(live) => live.file(),
+            None => UploadFile {
+                cancel_asked: true,
+                ..file
+            },
         };
-        // A host that cannot be asked leaves the cancel kept: the next reach finishes it.
+        let Some(paired) = paired else {
+            // No connection: a reservation the host never answered is forgotten here, and any other
+            // is kept as cancelled until the host is reached.
+            if Self::transfer_of(&held, &file).is_none() {
+                stopped.forget(&store, key);
+                return Ok(Self::said(key, "forgotten", None, None));
+            }
+            return Ok(Self::asked(key, None));
+        };
         match self
-            .finish_cancel(&turn, &store, &paired.session, held, file)
+            .finish_cancel(stopped, &store, &paired.session, paired.link, file)
             .await
         {
             Ok(answer) => Ok(answer),
@@ -1882,9 +2134,214 @@ impl Desk {
         }
     }
 
+    /// The cancel of a key finished on `paired`'s connection, under the key's turn with the sender
+    /// over.
+    async fn finish_work(
+        self: &Arc<Self>,
+        stopped: &mut Stopped<'_>,
+        paired: &Paired,
+    ) -> Result<Cancelled> {
+        let store = self.store()?;
+        let key = stopped.turn.key;
+        let held = stopped.held.clone();
+        let Some(file) = Self::record_of(stopped, &store) else {
+            return Ok(Self::said(key, "forgotten", None, None));
+        };
+        #[cfg(feature = "testing")]
+        let checked = !testing::armed(key, testing::Fault::SkipPrecheck);
+        #[cfg(not(feature = "testing"))]
+        let checked = true;
+        if checked && !file.is_of(paired) {
+            return Err(CommandError::invalid(NO_OPEN_UPLOAD));
+        }
+        if let Some(published) = Self::published_answer(stopped, &file) {
+            return Ok(published);
+        }
+        if !file.cancel_asked && !self.is_cancelled(key) {
+            return Err(CommandError::invalid(NO_OPEN_UPLOAD));
+        }
+        let file = UploadFile {
+            cancel_asked: true,
+            ..held.as_ref().map_or(file, |live| live.file())
+        };
+        // A host that cannot be asked leaves the cancel kept: the next reach finishes it.
+        match self
+            .finish_cancel(stopped, &store, &paired.session, paired.link, file)
+            .await
+        {
+            Ok(answer) => Ok(answer),
+            Err(error) => Ok(Self::asked(key, Some(error.message))),
+        }
+    }
+
+    /// The one attempt of a barrier: a key that is cancelled and was not ended by the work is
+    /// finished on the desk's newest connection when that is its account's and is newer than every
+    /// connection this barrier has called the host on. It is also the retry that a failed record
+    /// write needs, and the cancel of a reach that came while the stop waited.
+    async fn attempt(self: &Arc<Self>, stopped: &mut Stopped<'_>) -> Option<Result<Cancelled>> {
+        if stopped.ended {
+            return None;
+        }
+        let key = stopped.turn.key;
+        let store = self.store().ok()?;
+        let file = Self::record_of(stopped, &store)?;
+        if file.reached == Reached::Published || !(file.cancel_asked || self.is_cancelled(key)) {
+            return None;
+        }
+        let newest = locked(&self.sessions)
+            .get(&(file.environment_id, file.device_id))
+            .and_then(|known| known.newest.clone())?;
+        if newest.account != file.account || newest.link <= stopped.used {
+            return None;
+        }
+        stopped.looked = stopped.looked.max(newest.link);
+        let file = UploadFile {
+            cancel_asked: true,
+            ..file
+        };
+        Some(
+            self.finish_cancel(stopped, &store, &newest.session, newest.link, file)
+                .await,
+        )
+    }
+
     /// The host's record is read, and then the upload is cancelled unless it is published. The
-    /// caller holds the key's turn and has stopped the sender.
+    /// caller is a barrier's work or its attempt: the key's turn is held and the sender is over. A
+    /// failure returns `Err` and leaves the upload for the barrier's decision; only a forgotten or a
+    /// published upload is final here.
     async fn finish_cancel(
+        self: &Arc<Self>,
+        stopped: &mut Stopped<'_>,
+        store: &Store,
+        session: &Arc<Session>,
+        link: u64,
+        file: UploadFile,
+    ) -> Result<Cancelled> {
+        let key = file.key;
+        stopped.used = stopped.used.max(link);
+        let held = stopped.held.clone();
+        let Some(transfer_id) = Self::transfer_of(&held, &file) else {
+            // A reservation whose answer never came: nothing this device can name is held.
+            stopped.forget(store, key);
+            return Ok(Self::said(key, "forgotten", None, None));
+        };
+        // The host's record is read before anything is cancelled.
+        let read: UploadStatusResult = match session
+            .read(Method::UploadStatus, &UploadStatusParams { transfer_id })
+            .await
+        {
+            Ok(read) => read,
+            Err(error) if host_does_not_know(&error) => {
+                stopped.forget(store, key);
+                return Ok(Self::said(key, "forgotten", None, None));
+            }
+            // Including a refusal of a right: the host may hold it, and the entry stays.
+            Err(error) => return Err(error.into()),
+        };
+        if read.state == UploadState::Published {
+            let Some(handle) = read.handle.as_ref().cloned() else {
+                return Err(CommandError::unavailable(
+                    "the host says the upload is published and gave no handle",
+                ));
+            };
+            let kept = UploadFile {
+                reached: Reached::Published,
+                handle: Some(handle.clone()),
+                cancel_asked: false,
+                ..file
+            };
+            if let Err(error) = store.write(&kept) {
+                return Err(record_not_kept(&error));
+            }
+            let _ = store.remove_copy(key);
+            if let Some(live) = &held {
+                live.adopt(kept);
+            }
+            stopped.published(handle.clone());
+            return Ok(Self::said(key, "published", None, Some(handle)));
+        }
+        let answer: UploadCancelResult = uploads::cancel(
+            session,
+            &file.target,
+            transfer_id,
+            crate::commands::MUTATION_TTL,
+        )
+        .await
+        .map_err(CommandError::from)?;
+        stopped.forget(store, key);
+        Ok(Self::said(
+            key,
+            "cancelled",
+            Some(answer.released_byte_len.get().to_string()),
+            None,
+        ))
+    }
+
+    /// The one decision section of a stop or a pause. It is the only code that sets an upload
+    /// `Paused` or decides to start nothing, and it reads the desk's newest connection and the
+    /// reaches that went by the upload in one gate section, so that a reach is either seen here or
+    /// finds the upload paused and starts it. `generation` validates a sender's right to decide;
+    /// without it the caller is a barrier that holds the turn of the key.
+    ///
+    /// An upload that nothing owes is started on the newest connection of its account when that is
+    /// newer than every connection `used` names. An upload whose cancel is owed, or one that a reach
+    /// went by after the decision `looked` read, is paused and handed to a fresh decision, which
+    /// takes the key's turn after the holder lets it go.
+    fn idle_or_next(
+        self: &Arc<Self>,
+        live: &Arc<Live>,
+        generation: Option<u64>,
+        used: u64,
+        looked: u64,
+    ) {
+        let registry = locked(&self.registry);
+        let right = match generation {
+            Some(generation) => live.generation.load(Ordering::Acquire) == generation,
+            None => registry
+                .held
+                .get(&live.key)
+                .is_some_and(|held| Arc::ptr_eq(held, live)),
+        };
+        if !right {
+            return;
+        }
+        let newest = locked(&self.sessions)
+            .get(&(live.owner.environment_id, live.owner.device_id))
+            .and_then(|known| known.newest.clone());
+        let seen = live.reached.load(Ordering::Acquire);
+        let owed =
+            registry.cancelled.contains(&live.key) || live.cancel_asked.load(Ordering::Acquire);
+        let usable =
+            newest.filter(|newest| newest.account == live.owner.account && newest.link > used);
+        *locked(&live.phase) = Phase::Paused;
+        match usable {
+            Some(newest) if !owed => {
+                self.start_under(&registry, live, newest, true);
+            }
+            usable => {
+                if seen > looked || (owed && usable.is_some()) {
+                    let link = usable.map_or(0, |newest| newest.link);
+                    self.hand_over(live.key, used, looked.max(seen).max(link));
+                }
+            }
+        }
+    }
+
+    /// Gives the key to a fresh decision: a task of the desk's own that takes the key's turn after
+    /// the holder lets it go, leaves a sending upload alone, and carries what the decision before it
+    /// read.
+    fn hand_over(self: &Arc<Self>, key: Uuid, used: u64, looked: u64) {
+        let desk = Arc::clone(self);
+        self.work.spawn(async move {
+            desk.barrier_task(key, true, Job::Decide, used, looked)
+                .await;
+        });
+    }
+
+    /// The freeing's own form of [`Self::finish_cancel`]: it holds the key's turn and has stopped the
+    /// sender itself, and pauses the upload when the host cannot be asked. It goes with the
+    /// freeing's move onto the barrier.
+    async fn finish_cancel_for_freeing(
         self: &Arc<Self>,
         _turn: &Turn,
         store: &Store,
@@ -2031,7 +2488,9 @@ impl Desk {
                 }
                 continue;
             }
-            if let Ok(answer) = self.finish_cancel(&turn, &store, session, held, file).await
+            if let Ok(answer) = self
+                .finish_cancel_for_freeing(&turn, &store, session, held, file)
+                .await
                 && matches!(answer.state, "cancelled" | "forgotten")
             {
                 freed = true;
@@ -2210,6 +2669,26 @@ impl Desk {
             .map(|newest| (newest.link, newest.account.clone()))
     }
 
+    /// How many uploads the desk holds.
+    #[must_use]
+    pub fn held_count_for_test(&self) -> usize {
+        locked(&self.registry).held.len()
+    }
+
+    /// The phase of the upload `key` as a word, and none when the desk does not hold it.
+    #[must_use]
+    pub fn phase_for_test(&self, key: Uuid) -> Option<&'static str> {
+        locked(&self.registry)
+            .held
+            .get(&key)
+            .map(|live| match *locked(&live.phase) {
+                Phase::Admitted => "admitted",
+                Phase::Sending => "sending",
+                Phase::Stopping => "stopping",
+                Phase::Paused => "paused",
+            })
+    }
+
     /// The number of the connection the upload `key` was last resumed on, and none when it was
     /// never resumed.
     #[must_use]
@@ -2227,8 +2706,9 @@ pub mod testing {
     use kr_protocol::envelope::ActionTarget;
     use kr_protocol::ids::{DeviceId, EnvironmentId, TransferId};
     use kr_protocol::scalars::{Digest256, Uuid};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, LazyLock, Mutex, PoisonError};
 
     /// The write of the journal a sender makes before a call to the host.
@@ -2240,6 +2720,8 @@ pub mod testing {
         Begun,
         /// The finish is about to be sent.
         Finishing,
+        /// The handle is kept and the copy removed, and the sender has not yet settled.
+        Published,
     }
 
     /// A place in the desk's code, for the upload of one key.
@@ -2269,6 +2751,130 @@ pub mod testing {
         /// A sender that failed with a connection that ended has settled: the upload is paused, or
         /// started again on the newer connection. Noted, never held.
         SenderSettled,
+        /// A barrier ended: in its decision section, or in a final resolution. Noted, never held.
+        DecisionDone,
+        /// A sender task ended, however it ended: finished, stopped, or panicked. Noted, never held.
+        SenderExit,
+    }
+
+    /// A place in the desk's code where an operation waits without blocking its thread, so that a
+    /// suite can hold it while the runtime goes on.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Awaited {
+        /// A barrier has made its attempt and has not yet decided.
+        BeforeTail,
+    }
+
+    /// The operations that came to an [`Awaited`] place, and whether they may go on.
+    #[derive(Default)]
+    pub struct Gate {
+        arrived: AtomicUsize,
+        open: AtomicBool,
+        changed: tokio::sync::Notify,
+    }
+
+    impl Gate {
+        async fn wait_until(&self, done: impl Fn() -> bool) {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if done() {
+                    return;
+                }
+                changed.await;
+            }
+        }
+
+        /// Waits until `count` operations have come to the place.
+        pub async fn until_arrived(&self, count: usize) {
+            self.wait_until(|| self.arrived.load(Ordering::Acquire) >= count)
+                .await;
+        }
+
+        /// Lets every operation at the place go on, and every one that comes later.
+        pub fn release(&self) {
+            self.open.store(true, Ordering::Release);
+            self.changed.notify_waiters();
+        }
+    }
+
+    type Gates = HashMap<(Uuid, Awaited), Arc<Gate>>;
+
+    static GATES: LazyLock<Mutex<Gates>> = LazyLock::new(Mutex::default);
+
+    /// Holds every operation that comes to `point` for the upload `key`, without blocking its
+    /// thread, until the gate is released.
+    pub fn hold_awaited(key: Uuid, point: Awaited) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        GATES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((key, point), Arc::clone(&gate));
+        gate
+    }
+
+    /// Waits at `point` while a gate is set for `key`.
+    pub(super) async fn gate(key: Uuid, point: Awaited) {
+        let gate = GATES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(key, point))
+            .cloned();
+        if let Some(gate) = gate {
+            gate.arrived.fetch_add(1, Ordering::AcqRel);
+            gate.changed.notify_waiters();
+            gate.wait_until(|| gate.open.load(Ordering::Acquire)).await;
+        }
+    }
+
+    /// A change of behaviour that only a case that arms it sees, for the upload `key`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Fault {
+        /// The owner check of a finish before the barrier is skipped.
+        SkipPrecheck,
+        /// The work of a barrier panics.
+        PanicInWork,
+    }
+
+    static ARMED: LazyLock<Mutex<HashSet<(Uuid, Fault)>>> = LazyLock::new(Mutex::default);
+
+    /// A fault armed for one upload: it is disarmed when this is dropped, so a fault one case arms
+    /// never reaches another that runs beside it.
+    pub struct Armed(Uuid, Fault);
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            ARMED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&(self.0, self.1));
+        }
+    }
+
+    /// Arms `fault` for the upload `key` until the answer is dropped.
+    pub fn arm(key: Uuid, fault: Fault) -> Armed {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((key, fault));
+        Armed(key, fault)
+    }
+
+    pub(super) fn armed(key: Uuid, fault: Fault) -> bool {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&(key, fault))
+    }
+
+    /// Notes that a sender task of `key` ended, when it is dropped.
+    pub(super) struct ExitNote(pub(super) Uuid);
+
+    impl Drop for ExitNote {
+        fn drop(&mut self) {
+            note(self.0, Point::SenderExit);
+        }
     }
 
     /// The threads that came to a [`Point`], and whether they may go on.
@@ -2515,6 +3121,50 @@ mod tests {
         let live = Live::new(entry, Arc::new(Held::new(vec![1; 4])), true);
         locked(&desk.registry).held.insert(key, Arc::clone(&live));
         (dir, desk, live, store)
+    }
+
+    /// KR-REQ-13.12 (A3): the resolution of a stop follows the record. An upload that was sending
+    /// is paused; one that is no longer the desk's, or that the work ended, is left as it is.
+    #[tokio::test]
+    async fn a_resolution_follows_the_record() {
+        let (_dir, desk, live, _store) =
+            held(Some(TransferId::new(kr_ipc::new_uuid())), Reached::Begun);
+        let stopping = |live: &Arc<Live>| *locked(&live.phase) = Phase::Stopping;
+        let turn = desk.turn(live.key).await;
+        let make = |held: Option<Arc<Live>>, ended: bool| Stopped {
+            desk: Arc::clone(&desk),
+            turn: &turn,
+            held,
+            ended,
+            resolved: false,
+            used: 0,
+            looked: 0,
+        };
+
+        stopping(&live);
+        make(Some(Arc::clone(&live)), false).resolve();
+        assert_eq!(
+            *locked(&live.phase),
+            Phase::Paused,
+            "a stopped upload is paused"
+        );
+        assert!(locked(&desk.registry).held.contains_key(&live.key));
+
+        stopping(&live);
+        make(Some(Arc::clone(&live)), true).resolve();
+        assert_eq!(
+            *locked(&live.phase),
+            Phase::Stopping,
+            "an upload the work ended is left to the work"
+        );
+
+        locked(&desk.registry).held.remove(&live.key);
+        make(Some(Arc::clone(&live)), false).resolve();
+        assert_eq!(
+            *locked(&live.phase),
+            Phase::Stopping,
+            "an upload the desk no longer holds is left as it is"
+        );
     }
 
     fn refused(code: ErrorCode) -> kr_client::Result<AttachmentHandle> {
