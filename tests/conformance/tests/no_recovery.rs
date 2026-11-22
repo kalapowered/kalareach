@@ -10,8 +10,10 @@
 //! `observation.rs`), and what the steps themselves run is the plan's.
 //!
 //! The files of the cases that run processes under a time limit are read too: `tests/tree.rs`,
-//! `tests/execution.rs` and the fixture `time-limits`. No case sends a signal, and no case reaps a
-//! process by its number.
+//! `tests/execution.rs` and the fixture `time-limits`. No case in them sends a signal, and none
+//! reaps a process by its number. `tests/interrupt.rs` is not read: it is the case of the
+//! forwarding itself, so it sends `INT` or `TERM` to the report's program that it started, and to no
+//! other process.
 
 use std::path::{Path, PathBuf};
 
