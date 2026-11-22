@@ -6624,6 +6624,69 @@ impl Drop for AttachedImage {
     }
 }
 
+/// Makes a small disk image in `work` and attaches it at `mounted`, or returns `false` where this
+/// host will not.
+#[cfg(target_os = "macos")]
+fn attach_image(work: &Path, mounted: &Path) -> bool {
+    let image = work.join("image.dmg");
+    // The image is made from a directory that holds the file the indexer looks for as the volume
+    // is attached, in the read and write format a source directory needs.
+    let contents = kr_ipc::testing::volumes::never_indexed_contents(work, "image-contents");
+    let hdiutil = |arguments: &[&std::ffi::OsStr]| {
+        std::process::Command::new("/usr/bin/hdiutil")
+            .args(arguments)
+            .output()
+            .expect("hdiutil starts")
+    };
+    let made = hdiutil(&[
+        "create".as_ref(),
+        "-size".as_ref(),
+        "2m".as_ref(),
+        "-fs".as_ref(),
+        "APFS".as_ref(),
+        "-volname".as_ref(),
+        "krproject".as_ref(),
+        "-format".as_ref(),
+        "UDRW".as_ref(),
+        "-srcfolder".as_ref(),
+        contents.as_os_str(),
+        image.as_os_str(),
+    ]);
+    made.status.success()
+        && hdiutil(&[
+            "attach".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noverify".as_ref(),
+            "-noautoopen".as_ref(),
+            "-mountpoint".as_ref(),
+            mounted.as_os_str(),
+            image.as_os_str(),
+        ])
+        .status
+        .success()
+}
+
+/// The image this file attaches is one the system's indexer is told to leave alone: the file that
+/// says so is at the root of the volume as it is attached, because the indexer looks for it then,
+/// and a volume that something indexes is one that is held when the case detaches it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_disk_image_a_case_attaches_is_one_the_indexer_leaves_alone() {
+    let work = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let mounted = work.path().join("mounted");
+    std::fs::create_dir(&mounted).expect("a directory to attach at");
+    if !attach_image(work.path(), &mounted) {
+        println!("not exercised: this host will not attach a disk image");
+        return;
+    }
+    let detach = AttachedImage(mounted.clone());
+    assert!(
+        mounted.join(".metadata_never_index").is_file(),
+        "the volume holds the file that keeps it from being indexed"
+    );
+    drop(detach);
+}
+
 /// A disk image that does not come off fails the case that attached it, and a case that is already
 /// failing says so on standard error and ends with its own failure.
 #[cfg(target_os = "macos")]
@@ -6679,34 +6742,7 @@ async fn a_disk_image_attached_beneath_a_granted_directory_refuses_a_devices_clo
     assert_eq!(cloned.operation.state, OperationState::Completed);
     assert!(root.join("before/README.md").is_file());
 
-    let image = work.path().join("image.dmg");
-    let hdiutil = |arguments: &[&std::ffi::OsStr]| {
-        std::process::Command::new("/usr/bin/hdiutil")
-            .args(arguments)
-            .output()
-            .expect("hdiutil starts")
-    };
-    let made = hdiutil(&[
-        "create".as_ref(),
-        "-size".as_ref(),
-        "2m".as_ref(),
-        "-fs".as_ref(),
-        "APFS".as_ref(),
-        "-volname".as_ref(),
-        "krproject".as_ref(),
-        image.as_os_str(),
-    ]);
-    let attached = made.status.success()
-        && hdiutil(&[
-            "attach".as_ref(),
-            "-nobrowse".as_ref(),
-            "-noverify".as_ref(),
-            "-mountpoint".as_ref(),
-            mounted.as_os_str(),
-            image.as_os_str(),
-        ])
-        .status
-        .success();
+    let attached = attach_image(work.path(), &mounted);
     if !attached {
         println!("not exercised: {test} needs a disk image, and this host will not attach one");
         return;
