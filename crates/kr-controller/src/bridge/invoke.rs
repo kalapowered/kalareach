@@ -2046,11 +2046,14 @@ mod tests {
         assert_eq!(read, original);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     #[cfg(unix)]
     async fn a_helper_that_says_nothing_is_given_up_on_rather_than_waited_for() {
         // `sleep` stands in for a helper that started and then went quiet. The bridge ends on the
-        // silence bound, and the process ends with it.
+        // silence bound, and the process ends with it. The helper is ended and collected before the
+        // refusal returns, which takes real time, so the bound is a short one of the test's own
+        // rather than a paused clock.
+        let silence = std::time::Duration::from_millis(300);
         let opening = Opening {
             command: BridgeCommand {
                 program: "/bin/sleep".to_owned(),
@@ -2068,15 +2071,13 @@ mod tests {
             },
         };
         // Nothing is read from a sleeping child, so the wait ends on the bound rather than on a
-        // stream failure. The clock is the test's own, so this costs no real time.
-        let refusal = opening.launch().await.expect_err("a refusal");
-        assert_eq!(
-            refusal,
-            Refusal::Silent {
-                waited: SILENCE_LIMIT
-            },
-            "{refusal}"
-        );
+        // stream failure.
+        let refusal =
+            match start_and_acknowledge_within(&opening.command, &opening.hello, silence).await {
+                Err(refusal) => refusal,
+                Ok(_) => panic!("a helper that says nothing is not acknowledged"),
+            };
+        assert_eq!(refusal, Refusal::Silent { waited: silence }, "{refusal}");
     }
 
     /// The opening frame a local invocation writes.
