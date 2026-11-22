@@ -100,11 +100,11 @@ const CLAIMED_DIFFERENTLY: &str = "another installation this host made claims a 
      kalareach in {path}, or in a place that differs from it only in letter case, with other \
      contents; remove that installation before installing this one";
 
-/// What a person does where this host will not rewrite an agent's configuration document.
 /// What a removal tells of an entry it keeps, the host's own and unchanged, because its document
 /// changed after the plan: the record is kept too.
 const ENTRY_HELD: &str = "the document changed while the removal ran, so the entry stays and its record is kept; run the removal again to remove the entry";
 
+/// What a person does where this host will not rewrite an agent's configuration document.
 const CONFIGURATION_BY_HAND: &str = "add or remove the server with the agent's own command instead";
 
 /// Where one agent keeps its skills and its tool-server configuration.
