@@ -99,7 +99,7 @@ file, read as text, that names a relative path the tree does not have or that it
 `--self-test` shows each refusal on a fixture with its defect planted. Each step is one line of the
 lists below.
 
-Setup prepares the target, the JavaScript dependencies, the test components the plugin runtime's
+Setup prepares the targets, the JavaScript dependencies, the test components the plugin runtime's
 tests load, and the managed shell packages with the PSReadLine qualification. The packages build
 from upstream sources that `scripts/place-shell-sources.sh` puts in place first: the archives, from the
 URL each manifest names or from a listed mirror, and, for fish, the crates and git repositories its
@@ -109,7 +109,7 @@ suites, which continuous integration runs for Bash and Zsh.
 <!-- clean-checkout: setup -->
 
 ```bash
-rustup target add wasm32-wasip2
+rustup target add wasm32-wasip2 x86_64-pc-windows-gnu
 pnpm install --frozen-lockfile
 bash scripts/build-plugin-fixtures.sh
 bash scripts/place-shell-sources.sh --zsh --bash --fish
