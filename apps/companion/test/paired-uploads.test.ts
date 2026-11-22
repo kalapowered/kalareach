@@ -467,6 +467,61 @@ describe('the store reads the application, and the application is the one that s
   })
 })
 
+describe('the list of the application is read once at a time', () => {
+  /** The port, with every read of the list held until the test lets its reply go. */
+  function held() {
+    const { port } = fakeHost()
+    const view: OpenUpload = {
+      key: 'listed-1',
+      state: 'published',
+      sessionId: 's-1',
+      fileName: 'a.pdf',
+      byteLen: 10,
+      acknowledgedChunks: 0,
+      chunks: 0,
+      stage: null,
+      handle: null,
+      said: null
+    }
+    const replies: (() => void)[] = []
+    const open = vi.spyOn(port, 'uploadsOpen').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          replies.push(() => {
+            resolve([view])
+          })
+        })
+    )
+    return { uploads: new PairedUploads(port, 60_000), open, replies, view }
+  }
+
+  it('J2: makes one read for calls that overlap, and answers each of them with its list', async () => {
+    const { uploads, open, replies, view } = held()
+    const first = uploads.restore()
+    const second = uploads.restore()
+    expect(open).toHaveBeenCalledTimes(1)
+    replies[0]?.()
+    expect(await first).toEqual([view])
+    expect(await second).toEqual([view])
+  })
+
+  it('J2: starts a new read after a reset, and the reply of the old one clears nothing', async () => {
+    const { uploads, open, replies, view } = held()
+    const old = uploads.restore()
+    uploads.reset()
+    const current = uploads.restore()
+    expect(open).toHaveBeenCalledTimes(2)
+    // The old reply describes rows that are gone: it answers nothing, and the new read is still under way.
+    replies[0]?.()
+    expect(await old).toBeNull()
+    const joined = uploads.restore()
+    expect(open).toHaveBeenCalledTimes(2)
+    replies[1]?.()
+    expect(await current).toEqual([view])
+    expect(await joined).toEqual([view])
+  })
+})
+
 describe('the draft the application keeps is read as it answers it', () => {
   it('finds each bound transfer in the handle its attachment carries', () => {
     expect(

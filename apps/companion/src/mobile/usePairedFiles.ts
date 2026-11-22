@@ -104,8 +104,10 @@ export function usePairedFiles({
     if (!active) return
     const detach = uploads.attach(sessionId, {
       read: async () => {
-        // The listing decides which cards the application still knows; one that cannot be read decides nothing.
+        // The listing decides which cards the application still knows. A session whose list cannot be
+        // read is not reconciled: its stored cards are neither offered nor dropped until a later read.
         const listed = await uploads.restore()
+        if (listed === null) throw new Error('')
         const subject = await latest.current.nameSession()
         const connection = await port.connectionState()
         if (connection.environment_id === null) throw new Error('')
@@ -125,13 +127,10 @@ export function usePairedFiles({
         const { files: composer, changeFiles: change } = latest.current
         // The stored drafts keep no account, so a restart restores the cards of whoever was signed in
         // before. A card is kept only for a file this window has a row for, the application lists for
-        // the account in force, or the kept draft holds; any other is dropped from the composer. An
-        // application that could not be read says nothing, and nothing is dropped for it.
-        const listedIds =
-          listed === null ? null : new Set(listed.flatMap((view) => (view.handle ? [view.handle.transfer_id] : [])))
+        // the account in force, or the kept draft holds; any other is dropped from the composer.
+        const listedIds = new Set(listed.flatMap((view) => (view.handle ? [view.handle.transfer_id] : [])))
         const known = (file: DraftAttachment): boolean =>
           file.handle === null ||
-          listedIds === null ||
           listedIds.has(file.handle.transfer_id) ||
           boundIds.has(file.handle.transfer_id) ||
           uploads.snapshot().has(file.localId)

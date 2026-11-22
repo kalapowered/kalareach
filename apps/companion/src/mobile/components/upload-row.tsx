@@ -55,10 +55,13 @@ export function UploadRowView({
   const phase = row.phase.kind
   const percent = line.progress === null ? null : Math.round(line.progress * 100)
   const cancelling = phase === 'cancelling'
-  const cancels = canCancel(row.phase) || cancelling
+  // A card that was sent before and has no row yet is only being checked: there is no upload of this
+  // window's to cancel, and the person may take the card off the composer.
+  const stored = phase === 'checking' && attachment?.upload === 'uploaded'
+  const cancels = !stored && (canCancel(row.phase) || cancelling)
   const adds = phase === 'kept'
   const settled =
-    phase === 'cancelled' || phase === 'refused' || phase === 'bound' || phase === 'adding' || adds
+    phase === 'cancelled' || phase === 'refused' || phase === 'bound' || phase === 'adding' || adds || stored
   const sizing = { minBlockSize: target, minInlineSize: target }
   return (
     <div className="m-upload" data-testid="m-upload" data-phase={phase} data-tone={line.tone}>
