@@ -43,6 +43,7 @@ fn timed_out(waited: Waited<Output>) -> Captured {
         Waited::TimedOut(captured) => captured,
         Waited::Done(output) => panic!("the command ended in its time: {:?}", output.status),
         Waited::NotStarted => panic!("the command was not started"),
+        Waited::Interrupted(_, signal) => panic!("the command was interrupted by signal {signal}"),
     }
 }
 

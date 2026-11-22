@@ -28,6 +28,10 @@ libc.workspace = true
 # A step that has a time limit leads a process group of its own, which the report ends when the time
 # is spent.
 rustix = { workspace = true, features = ["process"] }
+# An interrupt or a termination request that reaches the report while a step with a time limit runs
+# is sent on to the step's process group: the handlers are the library's safe ones, which set flags
+# that the report reads.
+signal-hook.workspace = true
 
 [dev-dependencies]
 # The application matrix runs each program as the root of a real session: a worker's own session,

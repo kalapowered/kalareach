@@ -92,6 +92,9 @@ enum Stop {
     Failed(String),
     /// Its time was spent and its processes were ended.
     TimedOut,
+    /// The report was sent the signal of this number while the command ran, and the command's
+    /// processes were ended.
+    Interrupted(i32),
 }
 
 impl From<String> for Stop {
@@ -326,7 +329,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
 }
 
 /// `executed` for a step that stopped for `stop`: its error is the reason, or that its time was
-/// spent, which the log says too.
+/// spent or that the report was sent a signal, which the log says too.
 fn stopped(mut executed: Executed, stop: Stop, place: &Place<'_>, log_path: &Path) -> Executed {
     match stop {
         Stop::Failed(error) => executed.error = Some(error),
@@ -338,8 +341,24 @@ fn stopped(mut executed: Executed, stop: Stop, place: &Place<'_>, log_path: &Pat
             executed.timed_out = true;
             executed.error = Some(said);
         }
+        Stop::Interrupted(signal) => {
+            let said = format!("stopped by {}", signal_words(signal));
+            let _ = append_to_log(log_path, &format!("== {said}\n"));
+            executed.error = Some(said);
+        }
     }
     executed
+}
+
+/// How the report names the signal of this number: the two it sends on to a step's processes by
+/// the names a shell gives them, and any other by its number.
+#[must_use]
+pub fn signal_words(signal: i32) -> String {
+    match signal {
+        2 => "signal INT".to_owned(),
+        15 => "signal TERM".to_owned(),
+        other => format!("signal {other}"),
+    }
 }
 
 /// What a step that was not run is: `step` did not run because the set-up step `number` (`what`)
@@ -722,6 +741,7 @@ fn host(place: &Place<'_>) -> Result<String, Stop> {
     {
         Waited::Done(output) => output,
         Waited::TimedOut(_) | Waited::NotStarted => return Err(Stop::TimedOut),
+        Waited::Interrupted(_, signal) => return Err(Stop::Interrupted(signal)),
     };
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -1082,6 +1102,19 @@ fn listed(waited: Waited<Output>, command: &[String], log_path: &Path) -> Result
             Err(Stop::TimedOut)
         }
         Waited::NotStarted => Err(Stop::TimedOut),
+        Waited::Interrupted(captured, signal) => {
+            let _ = keep_failed_listing(
+                log_path,
+                &format!(
+                    "`{}` (stopped by {})",
+                    command.join(" "),
+                    signal_words(signal)
+                ),
+                &String::from_utf8_lossy(&captured.stdout),
+                &String::from_utf8_lossy(&captured.stderr),
+            );
+            Err(Stop::Interrupted(signal))
+        }
     }
 }
 
@@ -1243,6 +1276,7 @@ fn build_first(
     {
         Waited::Done(output) => output,
         Waited::TimedOut(_) | Waited::NotStarted => return Err(Stop::TimedOut),
+        Waited::Interrupted(_, signal) => return Err(Stop::Interrupted(signal)),
     };
     if !output.status.success() {
         return Err(Stop::Failed(format!(
@@ -1683,6 +1717,7 @@ fn run_logged(
     {
         Waited::Done(status) => Ok(status.code()),
         Waited::TimedOut(_) | Waited::NotStarted => Err(Stop::TimedOut),
+        Waited::Interrupted(_, signal) => Err(Stop::Interrupted(signal)),
     }
 }
 

@@ -12,9 +12,19 @@
 //! signal is sent. The report reads the command's pipes to their end first, and waits for the leader
 //! after.
 //!
+//! An interrupt (INT) or a termination request (TERM) that reaches the report while one of those
+//! commands runs is sent on to the command's group, because the terminal sends Ctrl-C to its own
+//! foreground group and the command's group is not that. The report then ends the group as it does
+//! at the deadline, except that the signal it received is the one it asks with: it waits `GRACE`,
+//! ends what is left by force and reaps the leader. The command is `Waited::Interrupted`, and the
+//! report starts no later command. The handlers are set the first time a command with a limit is
+//! started, and stay: while no such command runs, a signal has its default action, as it has
+//! without them.
+//!
 //! A step without a limit is run as it always was, in the report's own group, and this module
 //! starts nothing for it. Windows has no such group in the standard library, so a step with a limit
-//! does not run there and the plan file refuses one.
+//! does not run there and the plan file refuses one; a step there is in the console's group, which
+//! Ctrl-C reaches.
 
 use std::io;
 #[cfg(unix)]
@@ -22,6 +32,10 @@ use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::process::{Child, Stdio};
 use std::process::{Command, ExitStatus, Output};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::{Arc, OnceLock};
 #[cfg(unix)]
 use std::time::Duration;
 use std::time::Instant;
@@ -69,6 +83,10 @@ pub enum Waited<T> {
     TimedOut(Captured),
     /// Its time was spent before it was due to start, so it was not started.
     NotStarted,
+    /// The report was sent the signal of this number (INT or TERM) while the command ran or before
+    /// it was due to start, and the command's processes were ended. This is what it had written,
+    /// which is nothing when it was not started.
+    Interrupted(Captured, i32),
 }
 
 /// Runs `command` to its end with its standard output (and its standard error, when the caller set
@@ -98,6 +116,7 @@ pub fn status(command: &mut Command, deadline: Option<Deadline>) -> io::Result<W
             Waited::Done(output) => Waited::Done(output.status),
             Waited::TimedOut(captured) => Waited::TimedOut(captured),
             Waited::NotStarted => Waited::NotStarted,
+            Waited::Interrupted(captured, signal) => Waited::Interrupted(captured, signal),
         }),
     }
 }
@@ -164,6 +183,14 @@ fn supervised(
     deadline: Deadline,
     capture: bool,
 ) -> io::Result<Waited<Output>> {
+    let interrupts = Group::arm()?;
+    // While this guard is held a signal is recorded and sent on to the command's group, and no
+    // longer has its default action.
+    let _running = Running::begin(interrupts);
+    // A signal that reached the report since the last command means that no later command starts.
+    if let Some(signal) = raised(&interrupts.received) {
+        return Ok(Waited::Interrupted(Captured::default(), signal));
+    }
     // The work between one command of a step and the next can take the time that is left: a command
     // whose time is spent is not started.
     if Instant::now() >= deadline.at {
@@ -174,17 +201,77 @@ fn supervised(
         command.stdout(Stdio::piped());
     }
     let mut child = command.spawn()?;
-    watch(&mut child, deadline, Child::try_wait)
+    watch(&mut child, deadline, Child::try_wait, &interrupts.received)
 }
 
-/// Supervises `child`, which [`supervised`] started, until its time `deadline` is spent. `try_wait`
-/// is the wait for the leader: it is a seam, so that a unit that holds the unreaped leader can give
-/// the failure that another waiter's reap gives, and see that the report signals nothing then.
+/// What the report keeps of the signals it sends on: INT and TERM. The report runs one command of a
+/// step at a time, which is what `outside` assumes.
+#[cfg(unix)]
+struct Interrupts {
+    /// True while no command of a step with a limit runs: a signal has its default action then.
+    outside: Arc<AtomicBool>,
+    /// The number of the last signal that reached the report while a command ran, or 0. It is not
+    /// cleared: the report ends the run after the command it ended.
+    received: Arc<AtomicUsize>,
+}
+
+/// The handlers, set once, and why they could not be, when they could not.
+#[cfg(unix)]
+static INTERRUPTS: OnceLock<Result<Interrupts, String>> = OnceLock::new();
+
+/// Holds [`Interrupts::outside`] false while a command of a step with a limit runs.
+#[cfg(unix)]
+struct Running<'a>(&'a Interrupts);
+
+#[cfg(unix)]
+impl<'a> Running<'a> {
+    fn begin(interrupts: &'a Interrupts) -> Self {
+        interrupts.outside.store(false, Ordering::SeqCst);
+        Self(interrupts)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.outside.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The number of the signal in `received`, when one reached the report.
+#[cfg(unix)]
+fn raised(received: &AtomicUsize) -> Option<i32> {
+    match received.load(Ordering::SeqCst) {
+        0 => None,
+        number => i32::try_from(number).ok(),
+    }
+}
+
+/// The number of the signal (INT or TERM) that reached the report while a command of a step with a
+/// limit ran, when one did. The run ends by that signal after its report is made.
+#[cfg(unix)]
+#[must_use]
+pub fn interrupted() -> Option<i32> {
+    raised(&INTERRUPTS.get()?.as_ref().ok()?.received)
+}
+
+/// No step with a limit runs where there are no process groups, so no signal is sent on.
+#[cfg(not(unix))]
+#[must_use]
+pub fn interrupted() -> Option<i32> {
+    None
+}
+
+/// Supervises `child`, which [`supervised`] started, until its time `deadline` is spent or a signal
+/// is recorded in `received`. `try_wait` is the wait for the leader: it is a seam, so that a unit
+/// that holds the unreaped leader can give the failure that another waiter's reap gives, and see
+/// that the report signals nothing then.
 #[cfg(unix)]
 fn watch(
     child: &mut Child,
     deadline: Deadline,
     mut try_wait: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
+    received: &AtomicUsize,
 ) -> io::Result<Waited<Output>> {
     let mut pipes = match Pipes::of(child) {
         Ok(pipes) => pipes,
@@ -199,6 +286,12 @@ fn watch(
     // that a process that holds one past the command's end holds this loop no longer than the
     // deadline, and nothing is left reading when it returns.
     while pipes.open() {
+        if let Some(signal) = raised(received) {
+            return Ok(Waited::Interrupted(
+                Group::interrupted(child, pipes, signal),
+                signal,
+            ));
+        }
         match pipes.pass(deadline.at, Instant::now) {
             Pass::Ended => break,
             Pass::Spent => return Ok(Waited::TimedOut(Group::ended(child, pipes))),
@@ -212,6 +305,12 @@ fn watch(
         match try_wait(child) {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if let Some(signal) = raised(received) {
+                    return Ok(Waited::Interrupted(
+                        Group::interrupted(child, pipes, signal),
+                        signal,
+                    ));
+                }
                 let now = Instant::now();
                 if now >= deadline.at {
                     return Ok(Waited::TimedOut(Group::ended(child, pipes)));
@@ -400,20 +499,73 @@ impl Group {
         std::os::unix::process::CommandExt::process_group(command, 0);
     }
 
+    /// The signals that reach the report and are sent on to the group of the command it runs. They
+    /// are the ones the terminal and a caller use to stop a program.
+    const FORWARDED: &[rustix::process::Signal] =
+        &[rustix::process::Signal::INT, rustix::process::Signal::TERM];
+
+    /// Sets the handlers for the [`Group::FORWARDED`] signals, once. For each, a signal that
+    /// reaches the report while no command runs has its default action, which ends the report as
+    /// it ends without the handlers; while a command runs, the signal's number is recorded.
+    fn arm() -> io::Result<&'static Interrupts> {
+        INTERRUPTS
+            .get_or_init(|| {
+                let outside = Arc::new(AtomicBool::new(true));
+                let received = Arc::new(AtomicUsize::new(0));
+                for &signal in Self::FORWARDED {
+                    let number = signal.as_raw();
+                    // The default action goes first: the actions run in the order they are set.
+                    signal_hook::flag::register_conditional_default(number, outside.clone())
+                        .map_err(|error| error.to_string())?;
+                    signal_hook::flag::register_usize(
+                        number,
+                        received.clone(),
+                        usize::try_from(number).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                Ok(Interrupts { outside, received })
+            })
+            .as_ref()
+            .map_err(|why| io::Error::other(format!("the signals could not be handled: {why}")))
+    }
+
+    /// Sends the signal numbered `number` to the group `child` leads, when the number is of a
+    /// named signal.
+    fn forward(child: &Child, number: i32) {
+        if let Some(signal) = rustix::process::Signal::from_named_raw(number) {
+            let _ = rustix::process::kill_process_group(
+                rustix::process::Pid::from_child(child),
+                signal,
+            );
+        }
+    }
+
+    /// Asks the group `child` leads to end.
+    fn ask(child: &Child) {
+        let _ = rustix::process::kill_process_group(
+            rustix::process::Pid::from_child(child),
+            rustix::process::Signal::TERM,
+        );
+    }
+
     /// Ends the group `child` leads: asks it to end, waits `grace`, ends what is left by force
     /// whether or not `child` is, and reaps `child`. Until it is reaped `child` holds the group's
     /// number even when it has ended, so the signals go to this group and to no other.
+    fn end(child: &mut Child, pipes: &mut Pipes, grace: Duration) {
+        Self::ask(child);
+        Self::finish(child, pipes, grace);
+    }
+
+    /// Waits `grace` for the group `child` leads to end after it was asked to, ends what is left by
+    /// force whether or not `child` is, and reaps `child`.
     ///
     /// The pipes are read through the grace, so that a process that writes more than a pipe holds as
     /// it ends is not blocked on its write, and then once they are drained of what the processes
     /// that were ended left in them. A pass reads at most [`READ_AT_MOST`] bytes from a pipe and the
     /// passes end with the grace, whatever a process that goes on writing adds; the drain reads the
     /// bytes queued when it begins.
-    fn end(child: &mut Child, pipes: &mut Pipes, grace: Duration) {
-        let _ = rustix::process::kill_process_group(
-            rustix::process::Pid::from_child(child),
-            rustix::process::Signal::TERM,
-        );
+    fn finish(child: &mut Child, pipes: &mut Pipes, grace: Duration) {
         let until = Instant::now() + grace;
         loop {
             let now = Instant::now();
@@ -437,6 +589,14 @@ impl Group {
     /// not read from again and cannot grow what the report keeps.
     fn ended(child: &mut Child, mut pipes: Pipes) -> Captured {
         Self::end(child, &mut pipes, GRACE);
+        pipes.into_captured()
+    }
+
+    /// [`Group::ended`] for a report that was sent the signal numbered `number`: that signal is the
+    /// one the group is asked to end with, and not `TERM`.
+    fn interrupted(child: &mut Child, mut pipes: Pipes, number: i32) -> Captured {
+        Self::forward(child, number);
+        Self::finish(child, &mut pipes, GRACE);
         pipes.into_captured()
     }
 }
@@ -488,9 +648,12 @@ mod tests {
             seconds: 600,
             budget: false,
         };
-        let waited = watch(&mut leader.0, deadline, |_| {
-            Err(io::Error::from(rustix::io::Errno::CHILD))
-        });
+        let waited = watch(
+            &mut leader.0,
+            deadline,
+            |_| Err(io::Error::from(rustix::io::Errno::CHILD)),
+            &AtomicUsize::new(0),
+        );
         let asked = std::fs::read_to_string(&marker).unwrap_or_default();
         assert!(set, "the trap was not set in 30 s");
         let error = waited.expect_err("a wait that failed gave a result");
@@ -499,6 +662,79 @@ mod tests {
             Some(rustix::io::Errno::CHILD.raw_os_error())
         );
         assert_eq!(asked, "", "a signal was sent to the group");
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a signal that reached the report while a
+    /// command ran is sent on to the command's group, and the group is ended: the call says which
+    /// signal it was, and the command's leader and its child are gone when it returns. The child
+    /// waits with `sleep` and, as a background command of a shell without job control, ignores `INT`,
+    /// so it ends at the end of the grace; the case does not depend on which of the two ends the
+    /// child. The signal is recorded by a thread of the case once the processes have started, which
+    /// stands for the handler that sets it.
+    #[test]
+    fn a_signal_that_reached_the_report_is_sent_on_and_the_group_is_ended() {
+        let place = tempfile::tempdir().expect("a directory");
+        let pids = place.path().join("pids.txt");
+        let script =
+            "printf '%s\\n' \"$$\" >> \"$1\"; sleep 61 & printf '%s\\n' \"$!\" >> \"$1\"; wait";
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("bash")
+            .arg(&pids)
+            .stdin(Stdio::null());
+        Group::prepare(&mut command);
+        command.stdout(Stdio::piped());
+        let mut child = command.spawn().expect("a command");
+        let received = AtomicUsize::new(0);
+        let deadline = Deadline {
+            at: Instant::now() + Duration::from_secs(600),
+            seconds: 600,
+            budget: false,
+        };
+        let int = usize::try_from(signal_hook::consts::SIGINT).expect("a number");
+        let began = Instant::now();
+        let waited = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let until = Instant::now() + Duration::from_secs(30);
+                while std::fs::read_to_string(&pids)
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+                    < 2
+                    && Instant::now() < until
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                received.store(int, Ordering::SeqCst);
+            });
+            watch(&mut child, deadline, Child::try_wait, &received)
+        });
+        let took = began.elapsed();
+        let recorded = std::fs::read_to_string(&pids).unwrap_or_default();
+        assert_eq!(
+            recorded.lines().count(),
+            2,
+            "the processes did not start: {recorded:?}"
+        );
+        match waited.expect("a watched command") {
+            Waited::Interrupted(_, signal) => assert_eq!(usize::try_from(signal), Ok(int)),
+            other => panic!("the command was not interrupted: {other:?}"),
+        }
+        assert!(took < Duration::from_secs(30), "the call took {took:?}");
+        let left: Vec<&str> = recorded
+            .lines()
+            .filter(|pid| {
+                let number = pid.parse::<i32>().expect("a pid");
+                rustix::process::Pid::from_raw(number)
+                    .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+            })
+            .collect();
+        assert!(
+            left.is_empty(),
+            "processes of the group were left: {left:?}"
+        );
     }
 
     /// KR-REQ-29.01, the part about reproducible commands: the report finds a host that cannot wait

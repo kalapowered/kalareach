@@ -325,10 +325,12 @@ fn scratch_removal(tokens: &[Token]) -> Option<usize> {
 /// The runs of words, each written once in the block of `impl Group` in `tree.rs`, that start a
 /// step's command as the leader of a process group of its own and signal that group and no other
 /// process: the group is the one the child the report started leads, a `Child` that only a start
-/// of a command gives, and the signal is `TERM`, then `KILL`. The calls are written as rustfmt
-/// writes them, with the comma that ends a wrapped call. The `0` of the first run is the number `0`
-/// as it is written: the lexer keeps a number's spelling.
-const GROUP_CALLS: [&[&str]; 3] = [
+/// of a command gives, and the signal is `TERM`, then `KILL`, or the one of the two that the
+/// report was sent (`INT` or `TERM`) and sends on. The fourth run names those two signals, the fifth
+/// turns the number of the signal that was received into the type and the sixth sends it. The calls
+/// are written as rustfmt writes them, with the comma that ends a wrapped call. The `0` of the
+/// first run is the number `0` as it is written: the lexer keeps a number's spelling.
+const GROUP_CALLS: [&[&str]; 6] = [
     &[
         "std",
         ":",
@@ -421,6 +423,89 @@ const GROUP_CALLS: [&[&str]; 3] = [
         ":",
         ":",
         "KILL",
+        ",",
+        ")",
+    ],
+    &[
+        "const",
+        "FORWARDED",
+        ":",
+        "&",
+        "[",
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Signal",
+        "]",
+        "=",
+        "&",
+        "[",
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Signal",
+        ":",
+        ":",
+        "INT",
+        ",",
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Signal",
+        ":",
+        ":",
+        "TERM",
+        "]",
+        ";",
+    ],
+    &[
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Signal",
+        ":",
+        ":",
+        "from_named_raw",
+        "(",
+        "number",
+        ")",
+    ],
+    &[
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "kill_process_group",
+        "(",
+        "rustix",
+        ":",
+        ":",
+        "process",
+        ":",
+        ":",
+        "Pid",
+        ":",
+        ":",
+        "from_child",
+        "(",
+        "child",
+        ")",
+        ",",
+        "signal",
         ",",
         ")",
     ],
@@ -586,7 +671,7 @@ fn the_check_lets_through_the_scratch_removal_and_no_other() {
 }
 
 /// The calls that start a step's command as a group's leader and signal that group are the ones the
-/// check lets through: the three written in the block of `impl Group` in `tree.rs`, and no other
+/// check lets through: the six written in the block of `impl Group` in `tree.rs`, and no other
 /// call, operand, signal, form or place.
 #[test]
 fn the_check_lets_through_the_groups_own_calls_and_no_other() {
@@ -608,9 +693,20 @@ fn the_check_lets_through_the_groups_own_calls_and_no_other() {
             .expect("a source")
             .is_empty()
     };
-    let all = format!("{start} {term} {kill}");
+    // The signals sent on: the two the report forwards, the conversion of the number it received and
+    // the call that sends the signal that gives.
+    let signals = "const FORWARDED: &[rustix::process::Signal] =\n    &[rustix::process::Signal::INT, rustix::process::Signal::TERM];";
+    let convert =
+        "let Some(signal) = rustix::process::Signal::from_named_raw(number) else { return };";
+    let send =
+        format!("let _ = rustix::process::kill_process_group(\n    {of_child},\n    signal,\n);");
+    let send = send.as_str();
+    let all = format!("{start} {term} {kill} {signals} {convert} {send}");
     assert!(allowed("tree.rs", &group_with(&all)));
     assert!(allowed("tree.rs", &group_with(term)));
+    assert!(allowed("tree.rs", &group_with(send)));
+    assert!(allowed("tree.rs", &group_with(signals)));
+    assert!(allowed("tree.rs", &group_with(convert)));
     let mut let_through = Vec::new();
     for (what, path, source) in [
         (
@@ -627,6 +723,79 @@ fn the_check_lets_through_the_groups_own_calls_and_no_other() {
             "a second signal call",
             "tree.rs",
             group_with(&format!("{term} {term}")),
+        ),
+        (
+            "a second call that sends a received signal",
+            "tree.rs",
+            group_with(&format!("{send} {send}")),
+        ),
+        (
+            "a second list of the forwarded signals",
+            "tree.rs",
+            group_with(&format!("{signals} {signals}")),
+        ),
+        (
+            "a second conversion of a number into a signal",
+            "tree.rs",
+            group_with(&format!("{convert} {convert}")),
+        ),
+        (
+            "a received signal sent to another operand, a pid",
+            "tree.rs",
+            group_with(&send.replace(of_child, "pid")),
+        ),
+        (
+            "a received signal sent to another child",
+            "tree.rs",
+            group_with(&send.replace(of_child, "rustix::process::Pid::from_child(other)")),
+        ),
+        (
+            "a received signal sent to the system's first process",
+            "tree.rs",
+            group_with(&send.replace(of_child, "rustix::process::Pid::INIT")),
+        ),
+        (
+            "a received signal sent to the report's own process",
+            "tree.rs",
+            group_with(&send.replace(of_child, "rustix::process::getpid()")),
+        ),
+        (
+            "a received signal sent to one process and not a group",
+            "tree.rs",
+            group_with(&send.replace("kill_process_group", "kill_process")),
+        ),
+        (
+            "a signal that is not the one received",
+            "tree.rs",
+            group_with(&send.replace("signal,", "rustix::process::Signal::HUP,")),
+        ),
+        (
+            "a list of the forwarded signals that adds one",
+            "tree.rs",
+            group_with(&signals.replace("TERM]", "TERM, rustix::process::Signal::HUP]")),
+        ),
+        (
+            "a list of the forwarded signals that adds the one that cannot be caught",
+            "tree.rs",
+            group_with(&signals.replace("INT,", "INT, rustix::process::Signal::KILL,")),
+        ),
+        (
+            "the signal that cannot be caught, named as a constant",
+            "tree.rs",
+            group_with(&convert.replace("Signal::from_named_raw(number)", "Signal::KILL")),
+        ),
+        (
+            "the conversion of a number that is not the one received",
+            "tree.rs",
+            group_with(&convert.replace("(number)", "(9)")),
+        ),
+        (
+            "the sends and the list outside the block of the impl",
+            "tree.rs",
+            format!(
+                "fn stray(&self) {{ {send} {signals} {convert} }}\n{}",
+                group_with("()")
+            ),
         ),
         (
             "a second start",
