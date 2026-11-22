@@ -658,7 +658,7 @@ describe('the page’s keeping of the room', () => {
     setter.mockClear()
     const added = document.createElement('div')
     added.className = 'm-node'
-    words.set(added, { left: 0, top: 100, right: 390, bottom: 190 })
+    words.set(added, { left: 0, top: 200, right: 390, bottom: 290 })
     link(added, 200, 210, 20)
     root.append(added)
     await mutations()
@@ -667,7 +667,7 @@ describe('the page’s keeping of the room', () => {
     expect(given(added.querySelector<HTMLElement>('.md-link') as HTMLElement).left, 'the added message’s link').toBeGreaterThan(0)
     expect(watched, 'the added message is watched for its size').toContain(added)
     expect(writes().length, 'the writes for the added message’s link').toBeGreaterThan(0)
-    // A message whose text changes is measured again, once for the frame, and a message that did not change is not read again:
+    // A message whose text changes is measured again, once for the frame, and a message that did not change is not measured again:
     // the words of a link are made wide in each, and only the one whose text changed gives up its room.
     widen(changed, 300)
     widen(unchanged, 300)
@@ -678,9 +678,9 @@ describe('the page’s keeping of the room', () => {
     expect(frames.length, 'one frame asked for').toBe(1)
     frame()
     expect(given(changed), 'the message whose text changed, measured again: its wide link has no room').toEqual({ left: 0, right: 0 })
-    expect(given(unchanged).left, 'the message that did not change is not read again').toBeGreaterThan(0)
+    expect(given(unchanged).left, 'the message that did not change is not measured again').toBeGreaterThan(0)
     widen(unchanged, 110)
-    // A link that no longer exists is not watched and the messages that are not changed are not read again.
+    // A link that no longer exists is not watched and the messages that stay write nothing.
     setter.mockClear()
     messages[0]?.remove()
     await mutations()
