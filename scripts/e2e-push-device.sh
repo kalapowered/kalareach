@@ -435,6 +435,16 @@ say("a second question answered at the host while the person had chosen Yes and 
     and ("PUSH-CHOSEN" in late_chosen or "chosen" in late_chosen),
     late_seen[:300].replace("\n", " "))
 say("and the host's answer is the one the worker keeps (09.21)", report.get("host_answer_kept") is True)
+if platform == "android":
+    # An answer the person sends is told as theirs: the page does not say that another device answered.
+    for step, what in (("tap_step", "from the notification"), ("doze_tap_step", "from the notification posted in Doze")):
+        if step == "doze_tap_step" and "doze_on_step" not in report:
+            continue
+        text = report.get(step) or ""
+        sent = text.split("PUSH-SENT", 1)[1] if "PUSH-SENT" in text else ""
+        say(f"the page says the person's own answer {what} was recorded, and does not say that another device answered it",
+            "PUSH-SENT" in text and "Your answer was recorded." in sent and "answered by someone else" not in sent,
+            sent[:240].replace("\n", " "))
 
 if platform == "android":
     harness = os.path.dirname(sys.argv[1])

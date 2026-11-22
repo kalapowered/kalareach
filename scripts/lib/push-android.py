@@ -170,6 +170,13 @@ def send(phone: Phone, blind: bool) -> None:
         "the page to say what became of the answer",
         45,
     )
+    # The page says what became of the answer in the words it keeps for the person's own: the
+    # screen is read once they are drawn.
+    seen_within(
+        phone,
+        lambda each: each.startswith("Your answer was recorded") or each.lower() == "no longer waiting",
+        8,
+    )
     phone.shot("sent")
     print(f"PUSH-SENT {texts(phone)}", flush=True)
 
