@@ -1234,6 +1234,7 @@ fn a_fetch_of_a_tree_with_no_lock_file_fails_with_its_exit_and_one_with_a_lock_f
         "{error}"
     );
     assert!(error.contains("lock file"), "{error}");
+    assert!(!error.contains('\u{1b}'), "{error:?}");
     let lock = compiler::cargo_command()
         .args(["generate-lockfile", "--offline"])
         .current_dir(root.path())

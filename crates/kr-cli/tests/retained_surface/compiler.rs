@@ -449,6 +449,9 @@ fn cargo() -> PathBuf {
 pub fn cargo_command() -> Command {
     let cargo = cargo();
     let mut command = Command::new(&cargo);
+    // What Cargo says is kept as text, in a refusal's cause and in a record's line: it is asked for no
+    // colour, so that a runner that sets `CARGO_TERM_COLOR=always` puts no escape code into it.
+    command.env("CARGO_TERM_COLOR", "never");
     // A build script runs the tools of the machine (`cmake`, `rustfmt`): the program that is started
     // with a bare `PATH` names the one its builds need in `KR_BUILD_PATH`.
     let path = std::env::var_os("KR_BUILD_PATH")

@@ -89,6 +89,9 @@ fn workspace(root: &Path) -> Result<BTreeMap<String, (PathBuf, Manifest)>, Strin
             "1",
         ])
         .current_dir(root)
+        // The failing line is read below by the word it starts with: a runner that sets
+        // `CARGO_TERM_COLOR=always` would put colour codes before it, so Cargo is asked for none.
+        .env("CARGO_TERM_COLOR", "never")
         .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| cannot(&error.to_string()))?;

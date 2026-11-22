@@ -407,3 +407,30 @@ fn a_root_lookup_in_a_crate_that_is_absent_or_unreadable_says_so_and_a_failed_fo
     let tree = tree_at(file_for_apps.path()).expect("the tree");
     assert_eq!(tree.krate("companion_tauri"), Lookup::Absent);
 }
+
+/// The readings that keep Cargo's lines as text hold where the environment asks Cargo for colour, as
+/// the hosted runners' workflows do with `CARGO_TERM_COLOR=always`: the test program is started again
+/// with that variable set and runs the three cases that read a workspace's refusal, and the case of
+/// the failed fetch, which keeps its text in the same way.
+#[test]
+fn a_workspace_is_read_and_refused_in_words_whatever_colour_the_environment_asks_for() {
+    let output = std::process::Command::new(std::env::current_exe().expect("this test program"))
+        .args([
+            "--test-threads",
+            "1",
+            "--exact",
+            "walker_cases::a_lookup_says_what_it_found_and_why_it_could_not",
+            "walker_cases::a_root_lookup_in_a_crate_that_is_absent_or_unreadable_says_so_and_a_failed_follow_says_why",
+            "history_cases::a_text_the_entry_does_not_list_or_a_reading_that_is_missing_or_failed_names_the_tag",
+            "compiler_cases::a_fetch_of_a_tree_with_no_lock_file_fails_with_its_exit_and_one_with_a_lock_file_passes",
+        ])
+        .env("CARGO_TERM_COLOR", "always")
+        .output()
+        .expect("this test program starts");
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && said.contains("4 passed"),
+        "{said}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
