@@ -36,11 +36,25 @@ type Keys = Arc<Mutex<Box<dyn Write + Send>>>;
 struct Transcript {
     bytes: Vec<u8>,
     owed: Vec<Owed>,
-    /// Set when the terminal's output has ended, so that nothing more will be sent to it.
-    ended: bool,
+    /// Set when the reader has stopped, so that nothing more will be sent to it, and how it stopped.
+    ended: Option<Ended>,
+}
+
+/// How a window's reader stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ended {
+    /// It took the end of the output: every byte the program wrote has been collected.
+    Output,
+    /// It failed, with an unknown number of bytes not taken.
+    ReaderError,
 }
 
 impl Transcript {
+    /// Whether the output has ended with every byte taken, which a reader that failed has not.
+    fn output_ended(&self) -> bool {
+        self.ended == Some(Ended::Output)
+    }
+
     /// Takes the replies whose question has arrived, leaving the rest owed.
     fn take_due(&mut self) -> Vec<Owed> {
         let (due, waiting) = std::mem::take(&mut self.owed)
@@ -108,10 +122,16 @@ impl Collected {
             // Said before the first read, and `collect` does not return until it is heard.
             let _ = running.send(());
             let mut buffer = [0_u8; 8192];
-            while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
-                    break;
-                }
+            let mut ended = Ended::Output;
+            loop {
+                let read = match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) => {
+                        ended = Ended::ReaderError;
+                        break;
+                    }
+                };
                 let due = {
                     let mut transcript = seen.lock().unwrap_or_else(PoisonError::into_inner);
                     transcript.bytes.extend_from_slice(&buffer[..read]);
@@ -124,7 +144,7 @@ impl Collected {
             // Once the output has ended a question that has not come is not going to: whoever
             // waits for its reply is told so, and so is whoever asks to wait after this.
             let mut transcript = seen.lock().unwrap_or_else(PoisonError::into_inner);
-            transcript.ended = true;
+            transcript.ended = Some(ended);
             transcript.owed.clear();
         });
         started
@@ -153,7 +173,7 @@ impl Collected {
         if owed.is_due(&transcript.bytes) {
             drop(transcript);
             owed.type_into(keys);
-        } else if !transcript.ended {
+        } else if transcript.ended.is_none() {
             transcript.owed.push(owed);
         }
         Answering(outcome)
@@ -394,7 +414,8 @@ impl Window {
     }
 
     /// Whether the window's output has ended: its reader has taken every byte the program wrote
-    /// and nothing more will come. The reader ends with `kr`, not with a program that `kr` shows:
+    /// and nothing more will come. A reader that stopped on an error has not: it says nothing of
+    /// the bytes it did not take. The reader ends with `kr`, not with a program that `kr` shows:
     /// an agent's process that ends leaves the window's output going on, which [`Quiet`] is for.
     #[must_use]
     pub fn output_ended(&self) -> bool {
@@ -402,7 +423,7 @@ impl Window {
             .seen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .ended
+            .output_ended()
     }
 
     /// Waits until the screen this window shows carries `needle`, and returns that screen.
@@ -549,4 +570,72 @@ pub fn answered(window: &Window, queries: Answering) {
         window.what,
         window.shown(0)
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader that gives `bytes` once and then ends the way `end` says.
+    struct Reads {
+        bytes: Vec<u8>,
+        end: fn() -> std::io::Result<usize>,
+    }
+
+    impl Read for Reads {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.bytes.is_empty() {
+                return (self.end)();
+            }
+            let count = self.bytes.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes.drain(..count);
+            Ok(count)
+        }
+    }
+
+    /// Collects what `reads` gives until its reader has stopped, and returns the window's record.
+    fn stopped(reads: Reads) -> Collected {
+        let keys: Keys = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let collected = Collected::collect(Box::new(reads), keys);
+        let began = Instant::now();
+        while collected
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ended
+            .is_none()
+        {
+            assert!(began.elapsed() < LIVENESS, "the reader stopped");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        collected
+    }
+
+    /// A reader that ends at the end of the output has taken every byte; one that fails has not.
+    #[test]
+    fn a_reader_that_failed_has_not_taken_the_end_of_the_output() {
+        let ended = stopped(Reads {
+            bytes: b"all of it".to_vec(),
+            end: || Ok(0),
+        });
+        let seen = ended.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(seen.bytes, b"all of it");
+        assert!(
+            seen.output_ended(),
+            "the end of the output is an end of the output"
+        );
+        drop(seen);
+        let failed = stopped(Reads {
+            bytes: b"part of it".to_vec(),
+            end: || Err(std::io::Error::other("the terminal failed")),
+        });
+        let seen = failed.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(seen.bytes, b"part of it");
+        assert_eq!(seen.ended, Some(Ended::ReaderError));
+        assert!(
+            !seen.output_ended(),
+            "a reader error is not the end of the output"
+        );
+    }
 }
