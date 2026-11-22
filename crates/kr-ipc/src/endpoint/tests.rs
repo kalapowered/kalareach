@@ -121,11 +121,12 @@ mod unix {
     /// Leaves a socket at `path` that refuses every connect: what a listener that ended without
     /// removing it leaves.
     ///
-    /// The socket answers until every copy of its descriptor is closed. A connect that is
-    /// answered waits in the queue of the listener that answered it and ends when the last copy
-    /// closes (Linux resets it, macOS ends its stream), so the case makes one connect, waits for
-    /// that end, and then checks that the next connect is refused. It makes no further connect while it waits: each would add to the
-    /// queue, and a full queue is refused on macOS and holds a connect on Linux.
+    /// The socket answers until every copy of its descriptor is closed. A connect that is answered
+    /// waits in the queue of the listener that answered it and ends when the last copy closes
+    /// (Linux resets it, macOS ends its stream), so the case makes one connect, waits for that end,
+    /// and then checks that the next connect is refused. It makes no further connect while it
+    /// waits: each would add to the queue, and a full queue is refused on macOS and holds a connect
+    /// on Linux.
     fn leave_a_refusing_socket(path: &Path) {
         use std::io::Read as _;
 
@@ -579,7 +580,7 @@ mod unix {
     /// The other half of the two cases that start a listener as a program of their own: a program
     /// that binds and waits to be killed. It runs only when one of them starts it.
     #[tokio::test]
-    #[ignore = "started by the case that kills a listener, as a program of its own"]
+    #[ignore = "started by the cases that kill a listener, as a program of its own"]
     async fn a_listener_that_binds_and_waits() {
         use std::io::Write as _;
 
