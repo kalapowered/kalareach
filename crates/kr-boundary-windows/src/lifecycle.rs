@@ -301,6 +301,12 @@ pub fn closing_rows(closing: &Closing) -> Vec<Row> {
     rows
 }
 
+/// The name of an object of the private root as the journal and the reply give it.
+#[must_use]
+pub fn root_object(_root: &str, below: &str) -> String {
+    below.to_owned()
+}
+
 /// What the reply says about the cleanup after the closing rows: the first object that holds the
 /// tree, or else the first object of the private root that is left (which holds no slot), or clean.
 /// Whether the slot is released is decided apart: a leftover of the private root fails the cleanup

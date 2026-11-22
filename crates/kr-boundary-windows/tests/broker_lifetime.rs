@@ -2494,16 +2494,20 @@ fn a_crash_after_a_root_leftover_is_finished_by_the_restart_when_the_root_can_no
         |_| {},
     );
     let before = broker.rows();
+    let Some(Row::Leftover {
+        class: kr_boundary_windows::journal::rows::LeftoverClass::Root,
+        object,
+        ..
+    }) = before.last()
+    else {
+        panic!(
+            "the last row is not a leftover of the root: {:?}",
+            kinds(&before)
+        );
+    };
     assert!(
-        matches!(
-            before.last(),
-            Some(Row::Leftover {
-                class: kr_boundary_windows::journal::rows::LeftoverClass::Root,
-                ..
-            })
-        ),
-        "{:?}",
-        kinds(&before)
+        std::path::Path::new(object).starts_with(broker.dir.join("run")),
+        "the leftover names its object by the root's path: {object}"
     );
     // The process that held the file is gone: the removal now succeeds.
     let recovery = recover(&broker.env).unwrap();
