@@ -57,6 +57,8 @@ export type Place =
 
 interface AppValue {
   readonly port: HostPort
+  /** The account this window acts under: what a submission reads once, as it is pressed. */
+  readonly account: AccountMark
   /** What every session's views share, kept apart from every other session's. */
   readonly sessions: SessionStates
   /** The newest opening of each session a screen has made, and what the host said of it. */
@@ -322,6 +324,7 @@ export function AppProvider({
   const value = useMemo<AppValue>(
     () => ({
       port,
+      account: accountMark,
       sessions,
       openings,
       drafts,
@@ -348,6 +351,7 @@ export function AppProvider({
     }),
     [
       port,
+      accountMark,
       sessions,
       openings,
       drafts,

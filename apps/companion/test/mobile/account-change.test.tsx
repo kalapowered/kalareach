@@ -16,12 +16,14 @@ import { MobileApp } from '../../src/mobile/MobileApp'
 import { usePairedFiles } from '../../src/mobile/usePairedFiles'
 import type { AccountView } from '../../src/model/account'
 import { startDraft, type DraftAttachment } from '../../src/model/drafts'
-import { FILES_OF_EARLIER_SIGN_IN_REMOVED } from '../../src/model/transfer-words'
+import { FILES_OF_EARLIER_SIGN_IN_REMOVED, SIGN_IN_AGAIN } from '../../src/model/transfer-words'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const RIGHTS = ['session.view', 'files.upload', 'agent.prompt', 'terminal.input'] as const
 
 afterEach(cleanup)
+
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
 const signedIn = (mark: string): AccountView => ({
   state: 'signed_in',
@@ -237,5 +239,148 @@ describe('the files the device kept for the account in force, after a change of 
     })
     expect(screen.getByTestId('m-upload')).toHaveTextContent('t-kept.pdf')
     expect(screen.getByTestId('upload-line')).toHaveTextContent('Added to this draft')
+  })
+})
+
+describe('a submission whose commands wait while the account changes', () => {
+  /**
+   * The composer of a session whose kept draft holds a file, signed in as `aa`, with the text typed.
+   * Native code refuses a command whose mark is no longer the account signed in: the scripted
+   * commands that carry a mark do the same, and keep the marks they were made with.
+   */
+  async function composer() {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone({ rights: RIGHTS, organisation: true })
+    controls.pairedUploads.keep(SESSION, handleOf('t-kept'))
+    const status = vi.spyOn(port, 'accountStatus')
+    render(
+      <AppProvider port={port} uploadPollMs={10}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    // The window has read the account once; A signs in, and its status is read.
+    await waitFor(() => {
+      expect(status).toHaveBeenCalled()
+    })
+    await Promise.all(status.mock.results.map((result) => result.value as Promise<unknown>))
+    controls.account.set(signedIn('aa'))
+    await waitFor(() => {
+      expect(status.mock.calls.length).toBeGreaterThanOrEqual(2)
+    })
+    await Promise.all(status.mock.results.map((result) => result.value as Promise<unknown>))
+    const person = userEvent.setup({ applyAccept: false })
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('m-upload')).toHaveLength(1)
+    })
+    await person.type(screen.getByRole('textbox', { name: 'Message this session' }), 'read the file')
+    const signedInNow = { mark: 'aa' }
+    const refusal = { code: 'PERMISSION_DENIED', message: SIGN_IN_AGAIN }
+    const setText = port.draftSetText.bind(port)
+    const submit = port.composerSubmit.bind(port)
+    const marks = { setText: [] as (string | undefined)[], submit: [] as (string | undefined)[] }
+    const held = { setText: null as (() => void) | null, claim: null as (() => void) | null }
+    return {
+      port,
+      controls,
+      person,
+      marks,
+      held,
+      signIn: (mark: string) => {
+        signedInNow.mark = mark
+        controls.account.set(signedIn(mark))
+      },
+      /** The next claim of the stored draft waits for the test. */
+      holdTheClaim: () => {
+        const save = port.deviceDraftSave.bind(port)
+        let holding = true
+        vi.spyOn(port, 'deviceDraftSave').mockImplementation((request) => {
+          if (!holding) return save(request)
+          holding = false
+          return new Promise((resolve, reject) => {
+            held.claim = () => {
+              save(request).then(resolve, reject)
+            }
+          })
+        })
+      },
+      /** The text is set on the draft, and the reply to it waits for the test. */
+      holdTheTextsReply: () => {
+        vi.spyOn(port, 'draftSetText').mockImplementation(async (subject, sessionId, text, mark) => {
+          marks.setText.push(mark)
+          // eslint-disable-next-line @typescript-eslint/only-throw-error -- native code's refusal is data
+          if (mark !== signedInNow.mark) throw refusal
+          const answer = await setText(subject, sessionId, text, mark)
+          await new Promise<void>((resolve) => {
+            held.setText = resolve
+          })
+          return answer
+        })
+        vi.spyOn(port, 'composerSubmit').mockImplementation((params, opening, supersedes, mark) => {
+          marks.submit.push(mark)
+          if (mark !== signedInNow.mark) return Promise.reject(refusal)
+          return submit(params, opening, supersedes, mark)
+        })
+      },
+      /** Both commands are scripted as native code answers them, with no reply held. */
+      refusingOtherAccounts: () => {
+        vi.spyOn(port, 'draftSetText').mockImplementation((subject, sessionId, text, mark) => {
+          marks.setText.push(mark)
+          if (mark !== signedInNow.mark) return Promise.reject(refusal)
+          return setText(subject, sessionId, text, mark)
+        })
+        vi.spyOn(port, 'composerSubmit').mockImplementation((params, opening, supersedes, mark) => {
+          marks.submit.push(mark)
+          if (mark !== signedInNow.mark) return Promise.reject(refusal)
+          return submit(params, opening, supersedes, mark)
+        })
+      }
+    }
+  }
+
+  it('G1a: carries the mark it was pressed under to the command that waited for the claim', async () => {
+    const { controls, person, marks, held, signIn, holdTheClaim, refusingOtherAccounts } = await composer()
+    refusingOtherAccounts()
+    holdTheClaim()
+    await person.click(screen.getByRole('button', { name: /^Send/ }))
+    await waitFor(() => {
+      expect(held.claim).not.toBeNull()
+    })
+    // B signs in while the claim waits: the window drops what it held for A.
+    signIn('bb')
+    expect(await screen.findByText(FILES_OF_EARLIER_SIGN_IN_REMOVED)).toBeInTheDocument()
+    held.claim?.()
+    // The command is made once the claim is let go: whatever mark it carries is what is asserted.
+    await waitFor(() => {
+      expect(marks.setText).toHaveLength(1)
+    })
+    expect(marks.setText).toEqual(['aa'])
+    await tick()
+    expect(marks.submit).toEqual([])
+    expect(controls.promptParams).toHaveLength(0)
+    expect(await screen.findByText(SIGN_IN_AGAIN)).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Message this session' })).toHaveValue('read the file')
+  })
+
+  it('G1b: carries the mark it was pressed under to the command that follows one whose reply waited', async () => {
+    const { controls, person, marks, held, signIn, holdTheTextsReply } = await composer()
+    holdTheTextsReply()
+    await person.click(screen.getByRole('button', { name: /^Send/ }))
+    await waitFor(() => {
+      expect(held.setText).not.toBeNull()
+    })
+    signIn('bb')
+    expect(await screen.findByText(FILES_OF_EARLIER_SIGN_IN_REMOVED)).toBeInTheDocument()
+    held.setText?.()
+    // The second command is made once the first one's reply is let go.
+    await waitFor(() => {
+      expect(marks.submit).toHaveLength(1)
+    })
+    expect(marks.setText).toEqual(['aa'])
+    expect(marks.submit).toEqual(['aa'])
+    expect(controls.promptParams).toHaveLength(0)
+    expect(await screen.findByText(SIGN_IN_AGAIN)).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Message this session' })).toHaveValue('read the file')
   })
 })
