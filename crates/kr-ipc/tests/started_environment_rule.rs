@@ -561,6 +561,17 @@ const CHILD_DAEMON_REMOVAL: &str =
 /// in the same function, with the number of starts each excuses.
 const DAEMON_STARTS: &[Counted] = &[
     Counted {
+        file: "crates/kr-cli/tests/launch_commands.rs",
+        places: 1,
+        reason: "its supervisor starts no worker, and the worker program the daemon is told of does not exist, so no session starts and no shell reads a startup file",
+        removal: "none while the daemon names that program and the supervisor starts no worker; the condition is tested",
+        holds: |text| {
+            text.contains("\"/nonexistent/kr-worker\"")
+                && text.contains("supervisor: Box::new(NoWorkers)")
+                && text.contains("worker_program: PathBuf::from(NO_WORKER_PROGRAM)")
+        },
+    },
+    Counted {
         file: "crates/kr-controller/tests/configuration_reader.rs",
         places: 1,
         reason: "its supervisor starts no worker",
