@@ -335,6 +335,20 @@ impl Drop for StopWhenDropped<'_> {
     }
 }
 
+/// Says, in the cases' output, why a connection or a loop ended without an answer. The product says
+/// nothing.
+#[cfg(feature = "testing")]
+#[expect(
+    clippy::print_stderr,
+    reason = "the cases read why a connection ended in their own output"
+)]
+fn trace(why: impl FnOnce() -> String) {
+    eprintln!("broker trace: {}", why());
+}
+
+#[cfg(not(feature = "testing"))]
+fn trace(_why: impl FnOnce() -> String) {}
+
 /// Takes the connections of one pipe and answers each on a thread of its own, up to the pipe's slots,
 /// until the service is told to stop.
 ///
@@ -360,18 +374,24 @@ fn run(listener: &mut Listener, state: &Arc<State>) -> Result<(), String> {
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
         let Some(slot) = slot else {
+            trace(|| format!("{kind:?} loop: stopped or privileges not given back before accept"));
             break;
         };
         let connection = match listener.accept() {
             Ok(Some(connection)) => connection,
-            Ok(None) => break,
+            Ok(None) => {
+                trace(|| format!("{kind:?} loop: accept ended by the stop"));
+                break;
+            }
             Err(failure) => {
+                trace(|| format!("{kind:?} loop: accept failed: {failure}"));
                 ended = Err(failure.to_string());
                 break;
             }
         };
         // A connection that is accepted while the service is stopping is ended at once.
         if state.stop.is_set() || super::privilege::revert_failed() {
+            trace(|| format!("{kind:?} loop: a connection accepted while stopping is dropped"));
             break;
         }
         let shared = Arc::clone(state);
@@ -463,6 +483,7 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
     let first = frame::read::<_, Request>(&mut connection);
     // A connection that sent no first frame by its deadline, or that failed, is closed.
     if !matches!(first, Ok(_) | Err(FrameError::Malformed(_))) {
+        trace(|| format!("{kind:?} answer: the first frame failed: {first:?}"));
         return;
     }
     let identity = match connection.identity() {
@@ -489,6 +510,7 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
             )
             .is_err()
             {
+                trace(|| format!("{kind:?} answer: the hello could not be sent"));
                 return;
             }
         }
@@ -518,6 +540,7 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
         // The stop is looked at before each request, besides in each read and write: a client that
         // keeps asking and reading never makes a transfer wait, so no wait would ever see it.
         if state.stop.is_set() {
+            trace(|| format!("{kind:?} answer: the stop is set before a request"));
             return;
         }
         connection.set_deadline(Some(std::time::Instant::now() + idle));
@@ -527,10 +550,14 @@ fn answer(mut connection: Connection, state: &State, kind: Kind) {
                 send_last(&mut connection, &refuse(Refusal::Malformed, &reason));
                 return;
             }
-            Err(_) => return,
+            Err(failure) => {
+                trace(|| format!("{kind:?} answer: a request could not be read: {failure:?}"));
+                return;
+            }
         };
         // A request that arrives after a thread failed to give its privileges back is not served.
         if super::privilege::revert_failed() {
+            trace(|| format!("{kind:?} answer: privileges were not given back"));
             return;
         }
         let response = match request {
