@@ -190,11 +190,11 @@ class Phone:
                 return node
         return None
 
-    def wait(self, wanted, what: str, timeout: float = 60, nudging: bool = False) -> dict:
+    def wait(self, wanted, what: str, timeout: float = 60, nudging: bool = False, settle_on: str = "Attention") -> dict:
         """Waits until a node on the screen is labelled as `wanted` says, never by a fixed delay.
 
-        A wait that is for content the page draws after the screen was first read passes `nudging`:
-        see `draw_again`."""
+        A wait that is for content the page draws after the screen was first read passes `nudging`,
+        and `settle_on` when that content is on a tab other than Attention: see `draw_again`."""
         found: list[dict] = []
 
         def seen(nodes: list[dict]) -> bool:
@@ -203,7 +203,7 @@ class Phone:
                 found.append(node)
             return node is not None
 
-        self.wait_screen(seen, what, timeout, nudging)
+        self.wait_screen(seen, what, timeout, nudging, settle_on)
         return found[-1]
 
     def wait_gone(self, unwanted, what: str, timeout: float = 60) -> None:
@@ -212,14 +212,14 @@ class Phone:
             lambda nodes: not any(each["label"] and unwanted(each["label"]) for each in nodes), f"{what} to go", timeout
         )
 
-    def wait_screen(self, holds, what: str, timeout: float = 60, nudging: bool = False) -> None:
+    def wait_screen(self, holds, what: str, timeout: float = 60, nudging: bool = False, settle_on: str = "Attention") -> None:
         """Waits until `holds` says the screen's nodes are as wanted, never by a fixed delay.
 
         The web view hands its accessibility tree over a piece at a time: content the page draws
         after the tree was first read can be missing from it while it is on the screen, and a screen
         that shows nothing of what a condition needs is never taken for one where that is gone, so a
         wait for an absence names what must be there beside it. A wait for such content (`nudging`)
-        has the screen drawn afresh now and then, and says when it needed to."""
+        has the screen of the tab `settle_on` drawn afresh now and then, and says when it needed to."""
         end = time.monotonic() + timeout
         started = time.monotonic()
         nudges = 0
@@ -229,16 +229,23 @@ class Phone:
                     print(f"PAIRING-NOTE {what} appeared after {nudges} round trips to another tab", flush=True)
                 return
             if nudging and (time.monotonic() - started) > 8 * (nudges + 1):
-                self.draw_again()
+                self.draw_again(settle_on)
                 nudges += 1
             time.sleep(0.4)
         self.give_up(f"timed out waiting for {what}")
 
-    def draw_again(self) -> None:
-        """Goes to another tab and back, which draws the Attention screen afresh and has the web view
-        send all of it."""
-        away = self.find(lambda each: each == "Sessions")
-        back = self.find(lambda each: each.startswith("Attention"))
+    def bar_tab(self, name: str) -> dict | None:
+        """The tab bar's button for the tab `name`: of the nodes the name starts, the lowest on the
+        screen, which is the bar and not a heading or a row above it."""
+        named = [each for each in self.screen() if each["label"].startswith(name) and len(each["label"]) < 60]
+        return max(named, key=lambda each: each["box"][1], default=None)
+
+    def draw_again(self, settle_on: str = "Attention") -> None:
+        """Goes to the other of the Attention and Sessions tabs and back to `settle_on`, which draws
+        that tab's screen afresh and has the web view send all of it, and leaves the wait on the tab it
+        is for."""
+        away = self.bar_tab("Sessions" if settle_on == "Attention" else "Attention")
+        back = self.bar_tab(settle_on)
         if away is not None and back is not None:
             # Each tap is its own call to the device, which is longer than the screen takes to
             # change tab.
@@ -1227,7 +1234,7 @@ def rows_listed(phone: Phone, numbers: list[int], what: str) -> None:
     """Waits until the list shows one card for each of these sessions and no other card. The first host
     holds sessions 1 and 2 and the second host holds session 1, so the list of one host is told from the
     other's by how many cards it shows, and by the host in use."""
-    phone.wait_screen(lambda nodes: sorted(cards_listed(nodes)) == sorted(numbers), what, 90, nudging=True)
+    phone.wait_screen(lambda nodes: sorted(cards_listed(nodes)) == sorted(numbers), what, 90, nudging=True, settle_on="Sessions")
 
 
 def host_in_use(phone: Phone) -> str | None:
@@ -1272,7 +1279,7 @@ def leave_session(phone: Phone) -> None:
 
 def open_a_session(phone: Phone, number: int) -> None:
     """Opens the session `number` from the list and waits for its composer."""
-    phone.tap(phone.wait(session_row(number), f"session {number} in the list", 90, nudging=True))
+    phone.tap(phone.wait(session_row(number), f"session {number} in the list", 90, nudging=True, settle_on="Sessions"))
     phone.wait(lambda each: each == "Message this session", "the composer", 60)
 
 
