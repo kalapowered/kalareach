@@ -5140,8 +5140,11 @@ mod session_work {
     /// KR-REQ-14.35: the page of the worker's journal that holds the end of a turn a hook reported,
     /// delivered to the store again after the review was acknowledged and with the sequence it
     /// had, is a record the store has read: the review keeps its version and its acknowledgement,
-    /// no review is outstanding, and the one item is as it was. The same record under the next
-    /// sequence is a later end, so the delivery does reach the review.
+    /// no review is outstanding, and the one item is as it was. Two guards each hold alone: the
+    /// engine stops any record at or below the cursor it has consumed, whatever version it names,
+    /// and the host stops the end of a turn at a version it already holds, whatever its sequence;
+    /// the steps below leave each one to decide. A record that passes both and names a later
+    /// version is a later end, so the delivery does reach the review.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_page_of_a_turn_a_hook_reported_delivered_again_changes_nothing() {
         let first = lasting_worker().await;
@@ -5239,11 +5242,50 @@ mod session_work {
         assert_eq!(again.occurrences, item.occurrences);
         assert_eq!(again.last_seen_ms, item.last_seen_ms);
 
-        // The same record under the next sequence is a later end of the turn, so the delivery
-        // reaches the review and the first delivery changed nothing there.
+        // The guards one at a time. Under its own sequence the page is at the cursor, so the
+        // engine stops it though it names a later version, which the host does not hold. Under the
+        // next sequence it is past the cursor, so the host stops it, for it names the version the
+        // host holds.
+        let mut under_its_sequence = events.clone();
+        for event in &mut under_its_sequence {
+            if let kr_attention::event::EventKind::TurnCompleted { version, .. } = &mut event.kind {
+                *version += 1;
+            }
+        }
+        let mut under_the_next = events.clone();
+        for event in &mut under_the_next {
+            event.cursor.sequence += 1;
+        }
+        for (what, page) in [
+            (
+                "the page under its own sequence, naming a later version",
+                under_its_sequence,
+            ),
+            (
+                "the page under the next sequence, naming the version held",
+                under_the_next,
+            ),
+        ] {
+            attention.observe(&page).expect("the page is delivered");
+            let read = review_when(&mut control, &subject, |_| true).await;
+            assert_eq!(read.current_version, before.current_version, "{what}");
+            assert_eq!(
+                read.acknowledged_version,
+                Nullable::some(before.current_version),
+                "{what}: the acknowledgement is kept"
+            );
+            assert!(!read.outstanding, "{what}: no later end: {read:?}");
+            let still = item_of(owner_inbox(&mut control).await);
+            assert!(still.acknowledged, "{what}: the item stays acknowledged");
+            assert_eq!(still.occurrences, item.occurrences, "{what}");
+            assert_eq!(still.last_seen_ms, item.last_seen_ms, "{what}");
+        }
+
+        // A record past the cursor that names a later version is a later end of the turn, so the
+        // delivery reaches the review and the deliveries above changed nothing there.
         let mut later = events;
         for event in &mut later {
-            event.cursor.sequence += 1;
+            event.cursor.sequence += 2;
             if let kr_attention::event::EventKind::TurnCompleted { version, .. } = &mut event.kind {
                 *version += 1;
             }
