@@ -55,7 +55,8 @@ use kr_boundary_windows::win::pipe::{
     Connection, Kind, Listener, ServerProcess, Stop, connect_held,
 };
 use kr_boundary_windows::win::rights::ImpersonationToken;
-use kr_boundary_windows::win::{account, broker, session, token};
+use kr_boundary_windows::win::sd::descriptor_from_text;
+use kr_boundary_windows::win::{account, acl, broker, session, token};
 
 mod common;
 use common::Scratch;
@@ -587,10 +588,24 @@ impl Setting {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let account = format!("krlife{}", &id[..8]);
         account::create(&account).expect("the throwaway account is made");
-        Setting {
-            scratch: Scratch::new(),
-            account,
-        }
+        let scratch = Scratch::new();
+        // The folders the broker reads, made before any case looks at them.
+        paths_under(&scratch.dir);
+        // The one folder the stand-in, which runs as the boundary account, may write in.
+        let marks = scratch.path("marks");
+        std::fs::create_dir_all(&marks).unwrap();
+        acl::set_protected(
+            &marks,
+            &descriptor_from_text("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)")
+                .unwrap(),
+        )
+        .unwrap();
+        Setting { scratch, account }
+    }
+
+    /// A file in the folder the stand-in may write: where it says that it runs.
+    fn mark(&self, name: &str) -> PathBuf {
+        self.scratch.path("marks").join(name)
     }
 
     fn life(&self, arguments: &[&str], grants: u64) -> Life {
@@ -812,7 +827,7 @@ fn a_cancel_a_disconnect_and_a_deadline_each_end_through_the_one_ending_function
         return;
     }
     let setting = Setting::new();
-    let marker = setting.scratch.path("running.txt");
+    let marker = setting.mark("running.txt");
     let running = marker.display().to_string();
     // The client asks for the end.
     let life = setting.life(&["sleep", "120000", &running], 1);
@@ -869,7 +884,7 @@ fn the_end_of_the_clients_process_and_the_stop_of_the_service_each_end_the_invoc
     expect_clean_end(&replies, EndedBy::ClientExit);
     assert!(life.ended() && life.releases() == 1);
     // The service's stop: the invocation ends and its end is proved.
-    let marker = setting.scratch.path("stopped.txt");
+    let marker = setting.mark("stopped.txt");
     let running = marker.display().to_string();
     let life = setting.life(&["sleep", "120000", &running], 1);
     let stop = Arc::clone(&life.env.stop);
@@ -916,6 +931,7 @@ fn a_program_that_cannot_start_is_a_refusal_when_nothing_is_left_and_not_started
     );
     // With something left on the tree, the reply says the operation did not start.
     let life = setting.life(&["exit", "0"], 1);
+    std::fs::remove_file(setting.scratch.path("kr-launch-stand-in.exe")).unwrap();
     life.trees.leave(vec![Left {
         object: r"C:\fixture\left.txt".to_owned(),
         reason: "a case's leftover".to_owned(),
@@ -988,7 +1004,7 @@ fn a_child_that_hides_from_the_scan_changes_nothing_because_the_end_rests_on_the
         return;
     }
     let setting = Setting::new();
-    let marker = setting.scratch.path("hidden.txt");
+    let marker = setting.mark("hidden.txt");
     let running = marker.display().to_string();
     let life = setting.life(&["hide", "120000", &running], 1);
     let seen = Arc::new(Mutex::new(0_u64));
@@ -1050,7 +1066,7 @@ fn the_broker_that_the_crash_cases_crash() {
     let parent: u32 = std::env::var("KR_LIFE_PARENT").unwrap().parse().unwrap();
     let hold = std::env::var("KR_LIFE_HOLD").is_ok();
     prepare();
-    let marker = dir.join("child-running.txt");
+    let marker = dir.join("marks").join("child-running.txt");
     let running = marker.display().to_string();
     let life = Life::open(&dir, &account, &["sleep", "120000", &running], 1, |_| {});
     let reached = Arc::new(AtomicU32::new(0));
@@ -1130,14 +1146,10 @@ fn crash_child(setting: &Setting, point: &str, hold: bool) -> i32 {
 }
 
 fn clear_run(setting: &Setting) {
-    for file in [
-        "session.txt",
-        "held.txt",
-        "crashed-at.txt",
-        "child-running.txt",
-    ] {
+    for file in ["session.txt", "held.txt", "crashed-at.txt"] {
         let _ = std::fs::remove_file(setting.scratch.path(file));
     }
+    let _ = std::fs::remove_file(setting.mark("child-running.txt"));
     for entry in std::fs::read_dir(setting.scratch.path("journal")).unwrap() {
         std::fs::remove_file(entry.unwrap().path()).unwrap();
     }
