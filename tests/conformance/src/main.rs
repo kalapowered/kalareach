@@ -24,9 +24,11 @@ use kr_conformance::plan::Platform;
 use kr_conformance::plan_file::Plan;
 use kr_conformance::report::{self, Options, Stopped};
 
-/// Ends the run by the signal it was sent, as it would have ended without the handlers that sent
-/// the signal on to the step's processes: the signal's default action is run, and a shell reads 128
-/// and the signal's number when it is not.
+/// Ends the run by the signal it was sent. `emulate_default_handler` of signal-hook sets the
+/// signal's default action and raises the signal on this process, so the run ends by that signal
+/// and the call does not return; it aborts the process when the signal cannot be raised. The exit
+/// status of 128 plus the number is only for a number the library has no default action for, which
+/// INT and TERM, the signals the report records, are not.
 fn ended_by(signal: i32) -> ExitCode {
     #[cfg(unix)]
     let _ = signal_hook::low_level::emulate_default_handler(signal);
