@@ -1718,6 +1718,30 @@ fn every_entry_every_helper_and_every_release_is_held() {
         vec![helper_two(ROOT), helper_two(SECOND)]
     );
 
+    // The same helper wrong in the second release only is told, and wrong in both it is told for
+    // each release of each entry, entry by entry.
+    let helper_two_in = |entry: &str, tag: &str| {
+        said_of(
+            entry,
+            &format!(
+                "{tag} has the digest zz for the helper kr_worker::helper_two, the entry names h2-now"
+            ),
+        )
+    };
+    assert_eq!(
+        held(&roots, &[(EARLY, &good()), (LATE, &bad_helper)]),
+        vec![helper_two_in(ROOT, LATE), helper_two_in(SECOND, LATE)]
+    );
+    assert_eq!(
+        held(&roots, &[(EARLY, &bad_helper), (LATE, &bad_helper)]),
+        vec![
+            helper_two_in(ROOT, EARLY),
+            helper_two_in(ROOT, LATE),
+            helper_two_in(SECOND, EARLY),
+            helper_two_in(SECOND, LATE),
+        ]
+    );
+
     // The second entry's root is wrong in the second release only.
     let bad_second = a_release_of_two(found("dig"), found("zz"), found("h-now"), found("h2-now"));
     assert_eq!(
