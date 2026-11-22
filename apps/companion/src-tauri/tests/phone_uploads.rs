@@ -4082,6 +4082,72 @@ async fn kr_req_13_12_a_late_reach_of_an_old_pairing_does_not_finish_its_own_can
     adopted.stop().await;
 }
 
+/// KR-REQ-13.12 (FU1): a send that the start section refuses removes no copy but its own. A cleanup
+/// that records no cancel ended the first send's upload and its copy, a second send under the same
+/// key wrote a copy since, and the refused send leaves that copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_refused_send_leaves_the_copy_of_the_upload_that_took_its_key() {
+    use testing::Point;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let key = kr_ipc::new_uuid();
+    let first_bytes = vec![5_u8; 16];
+    let second_bytes = vec![6_u8; 16];
+    let after_copy = desk.hold_after_copy_for_test();
+    let after = testing::hold_at(key, Point::AfterCopy);
+    let first = {
+        let sent = request(
+            &adopted,
+            &first_bytes,
+            Arc::new(Held::new(first_bytes.clone())),
+            key,
+        );
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    after.until_passed(1).await;
+    desk.forgotten(paired.device_id);
+    settled(&desk).await;
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        None,
+        "the cleanup removed the first send's copy"
+    );
+    let second = {
+        let sent = request(
+            &adopted,
+            &second_bytes,
+            Arc::new(Held::new(second_bytes.clone())),
+            key,
+        );
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        tokio::spawn(async move { desk.send(paired, sent).await })
+    };
+    after.until_passed(2).await;
+    // The first send waits first, so the permit lets it go.
+    after_copy.add_permits(1);
+    let refused = tokio::time::timeout(WATCHDOG, first)
+        .await
+        .expect("the first send answers")
+        .expect("the task ran");
+    assert!(refused.is_err(), "the first send was refused");
+    assert_eq!(
+        testing::read_copy(&folder(&phone), key),
+        Some(second_bytes),
+        "the refused send left the second send's copy"
+    );
+    after_copy.add_permits(1);
+    tokio::time::timeout(WATCHDOG, second)
+        .await
+        .expect("the second send answers")
+        .expect("the task ran")
+        .expect("the second upload publishes");
+    adopted.stop().await;
+}
+
 /// KR-REQ-13.12 (R3k): a send on a connection that a newer pairing has passed is refused, and the
 /// upload it admitted ends in the section that refused it: no upload is held and no copy is left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -850,6 +850,21 @@ impl Registry {
         Ok(())
     }
 
+    /// Removes the copy under `live`'s key when it is `live`'s: `live` is the upload held for the
+    /// key, or none is held and the key has no entry. A cleanup that records no cancel can end an
+    /// upload and let its key be used again, and the copy under the key is then the new upload's.
+    /// Under the gate, so that a new upload cannot be admitted and write between the check and the
+    /// removal.
+    fn remove_copy_of(&self, store: &Store, live: &Arc<Live>) {
+        let ours = match self.held.get(&live.key) {
+            Some(held) => Arc::ptr_eq(held, live),
+            None => store.entry(live.key).is_none(),
+        };
+        if ours {
+            let _ = store.remove_copy(live.key);
+        }
+    }
+
     /// Holds `live`, made from an entry a restart found, unless the person cancelled its key since
     /// the entry was read or it is held already.
     fn admit_restarted(&mut self, live: &Arc<Live>) -> bool {
@@ -1051,7 +1066,9 @@ impl Drop for Stopped<'_> {
 /// no upload for the key, which its decision needs to be one step with the stop, and the removal of
 /// the orphaned copies that
 /// `restart` makes (each a flush), which is what stops `restart` from removing the copy a send has
-/// just made.
+/// just made, and the removal of the copy of a send whose start was refused or whose copy failed
+/// (`Registry::remove_copy_of`), which is what stops it from removing the copy of an upload that
+/// took its key.
 ///
 /// **Turns.** A key's turn is a `tokio` mutex, found or made under the gate and awaited outside
 /// every lock. No operation holds two turns, so two operations that want two keys cannot wait for
@@ -1299,23 +1316,20 @@ impl Desk {
                         })
                     });
             if let Err(error) = written {
-                // Only this send's own upload, still admitted, goes: a cleanup may have stopped it
-                // and let the key be used again, and then neither the upload nor the copy is this
-                // send's to remove.
-                let ours = {
+                // Only this send's own upload, still admitted, and its own copy go, in one section
+                // under the gate: a cleanup may have stopped the upload and let the key be used
+                // again, and then neither the upload nor the copy is this send's to remove.
+                {
                     let mut registry = locked(&self.registry);
-                    let ours = registry
+                    registry.remove_copy_of(&store, &live);
+                    if registry
                         .held
                         .get(&key)
                         .is_some_and(|held| Arc::ptr_eq(held, &live))
-                        && *locked(&live.phase) == Phase::Admitted;
-                    if ours {
+                        && *locked(&live.phase) == Phase::Admitted
+                    {
                         registry.held.remove(&key);
                     }
-                    ours
-                };
-                if ours {
-                    let _ = store.remove_copy(key);
                 }
                 return Err(error);
             }
@@ -1339,10 +1353,15 @@ impl Desk {
                 .entry((paired.environment_id, paired.device_id))
                 .or_default()
                 .observe(Connection::of(&paired));
-            self.start_under(&mut registry, &live, Connection::of(&paired), false)
+            let started = self.start_under(&mut registry, &live, Connection::of(&paired), false);
+            // A refused send leaves the copy that is another upload's: a cleanup may have ended
+            // this upload and let the key be used again.
+            if !started {
+                registry.remove_copy_of(&store, &live);
+            }
+            started
         };
         if !started {
-            let _ = store.remove_copy(key);
             return Err(CommandError::refused(CANCELLED));
         }
         Self::outcome_of(&live).await
@@ -3285,6 +3304,16 @@ pub mod testing {
         }
         .write_copy(key, bytes)
         .expect("the copy is kept");
+    }
+
+    /// The copy of `key`'s content kept in `root`, when there is one.
+    #[must_use]
+    pub fn read_copy(root: &Path, key: Uuid) -> Option<Vec<u8>> {
+        Store {
+            root: root.to_path_buf(),
+        }
+        .read_copy(key)
+        .ok()
     }
 }
 
