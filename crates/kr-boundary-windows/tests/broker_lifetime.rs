@@ -926,7 +926,8 @@ fn seconds_between(from: std::time::SystemTime, to: std::time::SystemTime) -> i6
 }
 
 /// Moves the system's clock and puts it back when it is dropped: to the time it began at plus the
-/// time that has passed since, which a time service may already have corrected.
+/// time that has passed since. The host's time synchronisation would correct a moved clock while a
+/// move is measured, so that service stays stopped for as long as the clock is held.
 struct Clock {
     began: std::time::SystemTime,
     at: Instant,
@@ -934,6 +935,18 @@ struct Clock {
 
 impl Clock {
     fn new() -> Clock {
+        let stopped = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Stop-Service -Name vmictimesync -Force -ErrorAction Stop",
+            ])
+            .status()
+            .unwrap();
+        assert!(
+            stopped.success(),
+            "the time synchronisation was not stopped: {stopped}"
+        );
         Clock {
             began: std::time::SystemTime::now(),
             at: Instant::now(),
@@ -967,6 +980,13 @@ impl Drop for Clock {
         if off.abs() > 2 {
             Clock::adjust(off);
         }
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Start-Service -Name vmictimesync -ErrorAction SilentlyContinue",
+            ])
+            .status();
     }
 }
 
