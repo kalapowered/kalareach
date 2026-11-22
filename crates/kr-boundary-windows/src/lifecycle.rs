@@ -301,8 +301,10 @@ pub fn closing_rows(closing: &Closing) -> Vec<Row> {
     rows
 }
 
-/// What the reply says about the cleanup after the closing rows: clean when the invocation ended,
-/// otherwise the first object that holds the tree.
+/// What the reply says about the cleanup after the closing rows: the first object that holds the
+/// tree, or else the first object of the private root that is left (which holds no slot), or clean.
+/// Whether the slot is released is decided apart: a leftover of the private root fails the cleanup
+/// of the reply and frees the slot.
 #[must_use]
 pub fn cleanup_of(closing: &Closing) -> crate::frame::invocation::Cleanup {
     use crate::frame::invocation::Cleanup;
@@ -318,6 +320,12 @@ pub fn cleanup_of(closing: &Closing) -> crate::frame::invocation::Cleanup {
             class: ReplyClass::Tree,
         };
     }
+    if let Some(left) = closing.root.first() {
+        return Cleanup::Failed {
+            object: printable(&left.object, MAX_DETAIL_BYTES),
+            class: ReplyClass::Root,
+        };
+    }
     Cleanup::Clean
 }
 
@@ -330,10 +338,16 @@ pub enum Ending {
     Finished(InvocationReply),
 }
 
-/// What the reply says about the repository's configuration after the end check.
+/// What the reply says about the repository's configuration after the end check: changed, with the
+/// object that changed, when the check found a change (its effects are unknown), else the same.
 #[must_use]
-pub fn configuration_of(_closing: &Closing) -> ConfigurationState {
-    ConfigurationState::Same
+pub fn configuration_of(closing: &Closing) -> ConfigurationState {
+    match &closing.repository {
+        Some((_, left)) => ConfigurationState::Changed {
+            name: printable(&left.object, MAX_DETAIL_BYTES),
+        },
+        None => ConfigurationState::Same,
+    }
 }
 
 /// The reply of an ending. A failure that began it is the refusal when nothing is left; where the
@@ -345,7 +359,7 @@ pub fn ending_reply(
     ended_by: EndedBy,
     exit: Option<u32>,
     cleanup: Cleanup,
-    _configuration: ConfigurationState,
+    configuration: ConfigurationState,
 ) -> Ending {
     let failed = failure.is_some();
     match failure {
@@ -358,7 +372,7 @@ pub fn ending_reply(
                 ended_by
             },
             cleanup,
-            configuration: ConfigurationState::Same,
+            configuration,
             notes: Notes::default(),
             replaced_protected: 0,
         }),
