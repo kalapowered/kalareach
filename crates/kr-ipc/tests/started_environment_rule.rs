@@ -159,6 +159,21 @@ const KEPT: &[Row] = &[
         removal: NAMES_ONLY_REMOVAL,
     },
     Row {
+        file: "crates/kr-cli/tests/retained_surface/compiler.rs",
+        reason: NAMES_ONLY,
+        removal: NAMES_ONLY_REMOVAL,
+    },
+    Row {
+        file: "crates/kr-cli/tests/retained_surface/compiler_cases.rs",
+        reason: NAMES_ONLY,
+        removal: NAMES_ONLY_REMOVAL,
+    },
+    Row {
+        file: "crates/kr-cli/tests/retained_surface/walker_cases.rs",
+        reason: NAMES_ONLY,
+        removal: NAMES_ONLY_REMOVAL,
+    },
+    Row {
         file: "crates/kr-cli/tests/descriptions.rs",
         reason: NO_WORKER,
         removal: NO_WORKER_REMOVAL,
