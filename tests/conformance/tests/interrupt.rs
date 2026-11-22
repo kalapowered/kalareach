@@ -138,7 +138,8 @@ impl Run {
             .expect("an evidence directory");
         let output = root.join("output.txt");
         let written = File::create(&output).expect("the output file");
-        let child = Command::new(env!("CARGO_BIN_EXE_kr-conformance"))
+        let mut report = Command::new(env!("CARGO_BIN_EXE_kr-conformance"));
+        report
             .args(["run", "--root"])
             .arg(&tree)
             .arg("--evidence")
@@ -149,7 +150,17 @@ impl Run {
             .env_clear()
             .env("HOME", &root)
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("TMPDIR", std::env::temp_dir())
+            .env("TMPDIR", std::env::temp_dir());
+        // The report's first act is `cargo metadata` over the copy. The `cargo` on `PATH` is
+        // rustup's, and under the case's own, empty `HOME` it would find no toolchain and install
+        // the pinned one from the network on every run. The test's own `cargo`, which cargo gives
+        // the test program, is the toolchain's and installs nothing; and no toolchain is installed
+        // whatever else is missing, so a case never reaches the network.
+        if let Some(cargo) = std::env::var_os("CARGO") {
+            report.env("CARGO", cargo);
+        }
+        let child = report
+            .env("RUSTUP_AUTO_INSTALL", "0")
             .stdin(Stdio::null())
             .stdout(written.try_clone().expect("the output file again"))
             .stderr(written)
