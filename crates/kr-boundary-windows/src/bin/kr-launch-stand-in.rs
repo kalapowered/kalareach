@@ -168,6 +168,19 @@ fn main() -> std::process::ExitCode {
             }
             std::thread::sleep(std::time::Duration::from_secs(120));
         }
+        // Starts a grandchild that stays and ends at once itself, so that the job still holds a process
+        // after its starter has ended.
+        "leave" => {
+            let grandchild = Command::new(own_path())
+                .args(["sleep", "120000"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match grandchild {
+                Ok(grandchild) => println!("grandchild pid={}", grandchild.id()),
+                Err(error) => println!("spawn-failed {error}"),
+            }
+        }
         "marker" => {
             // Leaves a file that says it ran, for the cases that look for a program that started
             // where it should not have.
