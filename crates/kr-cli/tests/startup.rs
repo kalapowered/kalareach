@@ -4194,6 +4194,26 @@ impl ServiceHost {
         }
     }
 
+    /// What the user manager holds of the unit's restart policy, as `systemctl show` prints it: a
+    /// failed case says it.
+    #[cfg(target_os = "linux")]
+    fn restart_policy(&self) -> String {
+        let unit = format!("{}.service", self.label());
+        bounded(
+            self.manager.systemctl(&[
+                "show",
+                "--property=Restart",
+                "--property=RestartForceExitStatus",
+                &unit,
+            ]),
+            STREAMS_DEADLINE,
+        )
+        .map_or_else(
+            |why| format!("it could not be read: {why:?}"),
+            |shown| String::from_utf8_lossy(&shown.stdout).replace('\n', " "),
+        )
+    }
+
     /// Establishes that the service manager started the daemon: its parent is the manager, it
     /// leads a process group of its own in a session no terminal ends, it has no controlling
     /// terminal, and it works in the environment's own directory.
@@ -4971,7 +4991,8 @@ fn a_service_start_whose_daemon_ended_with_a_listen_line_says_why_and_no_request
     assert!(
         !message.contains("The requested daemon may still start."),
         "a daemon that wrote its last line and ended is not a daemon that may still start: \
-         {message}"
+         {message}; the manager holds {}",
+        host.restart_policy()
     );
 }
 
@@ -5010,7 +5031,9 @@ fn a_service_start_whose_unit_a_drop_in_restarts_keeps_the_sentence_that_the_req
     );
     assert!(
         message.contains("The requested daemon may still start."),
-        "a daemon that the manager starts again after it ended may still start: {message}"
+        "a daemon that the manager starts again after it ended may still start: {message}; the \
+         manager holds {}",
+        host.restart_policy()
     );
 }
 
