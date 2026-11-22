@@ -5699,3 +5699,441 @@ async fn kr_req_13_12_a_restored_upload_whose_cancel_record_failed_is_finished_a
     assert_eq!(entries_in(&folder(&phone)), 0);
     adopted.stop().await;
 }
+
+// ---- the freeing as work of the desk --------------------------------------------------------------
+
+/// What the freeing's cases stand on: a device with two accounts, and the places the host counts.
+struct Places {
+    adopted: Adopted,
+    _phone: Phone,
+    control: Arc<LinkControl>,
+    desk: Arc<Desk>,
+    /// Account 1, on the connection its uploads were paused on (it has ended).
+    earlier: Paired,
+    /// Account 2, on the connection in force.
+    now: Paired,
+    /// The paused uploads of account 1.
+    keys: Vec<Uuid>,
+    x_gate: Option<Arc<ChunkGate>>,
+    _x_release: Option<Releasing>,
+}
+
+impl Places {
+    /// Account 1 left `count` paused uploads that the host still counts. With `sending` account 2
+    /// has one more upload sending, so that the host counts two for the device with one paused upload.
+    async fn start(count: usize, sending: bool) -> Self {
+        use kr_client::services::AccountMark;
+
+        let adopted = Adopted::start(1).await;
+        let (phone, control) = phone_for(&adopted).await;
+        let desk = desk_of(&phone.companion);
+        let paired = paired_of(&phone.companion).await;
+        let earlier = Paired {
+            account: Some(AccountMark::from_bytes([1; 32])),
+            ..paired.clone()
+        };
+        let newer = places_held_by(&adopted, &phone, &desk, &earlier, count).await;
+        let now = Paired {
+            account: Some(AccountMark::from_bytes([2; 32])),
+            ..newer
+        };
+        let keys: Vec<Uuid> = desk
+            .open(&earlier.who())
+            .iter()
+            .map(|view| view.key.parse().expect("a key"))
+            .collect();
+        assert_eq!(keys.len(), count, "account 1 left its uploads paused");
+        let (mut x_gate, mut x_release) = (None, None);
+        if sending {
+            let bytes = pattern(5);
+            let (content, gate, release) = gated(&bytes);
+            let sent = request(&adopted, &bytes, content, kr_ipc::new_uuid());
+            let (desk, now) = (Arc::clone(&desk), now.clone());
+            tokio::spawn(async move { desk.send(now, sent).await });
+            gate.reached().await;
+            (x_gate, x_release) = (Some(gate), Some(release));
+        }
+        Self {
+            adopted,
+            _phone: phone,
+            control,
+            desk,
+            earlier,
+            now,
+            keys,
+            x_gate,
+            _x_release: x_release,
+        }
+    }
+
+    /// Account 2's upload `key`, which the host refuses for the count of the device's open transfers.
+    fn wanting(
+        &self,
+        key: Uuid,
+    ) -> tokio::task::JoinHandle<companion_tauri::Result<kr_protocol::transfer::AttachmentHandle>>
+    {
+        let bytes = pattern(3);
+        let sent = request(
+            &self.adopted,
+            &bytes,
+            Arc::new(Held::new(bytes.clone())),
+            key,
+        );
+        let (desk, now) = (Arc::clone(&self.desk), self.now.clone());
+        tokio::spawn(async move { desk.send(now, sent).await })
+    }
+
+    /// Account 1 reaches the host on a connection that is `after` newer than the one in force.
+    fn reach_of_account_1(&self, after: u64) -> Paired {
+        let reached = Paired {
+            link: self.now.link + after,
+            account: self.earlier.account,
+            ..self.now.clone()
+        };
+        self.desk.host_reached(reached.clone());
+        reached
+    }
+
+    async fn end(self) {
+        if let Some(gate) = &self.x_gate {
+            gate.release();
+        }
+        self.adopted.stop().await;
+    }
+}
+
+/// Waits, for at most the watchdog, until `count` operations are held at `gate`.
+async fn arrived(gate: &testing::Gate, count: usize) {
+    tokio::time::timeout(WATCHDOG, gate.until_arrived(count))
+        .await
+        .expect("the operation comes to the place the case holds");
+}
+
+async fn settled(desk: &Desk) {
+    tokio::time::timeout(WATCHDOG, desk.idle())
+        .await
+        .expect("the desk's own tasks end");
+}
+
+/// Account 2's upload is refused for the count, the freeing stops the first of account 1's two
+/// uploads and is held there, and the wanting upload is cancelled to its answer. Then the freeing is
+/// let go and the desk is left to settle.
+async fn wanting_upload_cancelled_during_the_freeing() -> (Places, usize) {
+    use kr_protocol::method::Method;
+    use testing::Awaited;
+
+    let places = Places::start(2, false).await;
+    let cancels = places.control.sent(Method::UploadCancel);
+    let key = kr_ipc::new_uuid();
+    let freeing = testing::hold_awaited(key, Awaited::Freeing);
+    let sending = places.wanting(key);
+    arrived(&freeing, 1).await;
+    let stopping = places
+        .keys
+        .iter()
+        .filter(|key| places.desk.phase_for_test(**key) == Some("stopping"))
+        .count();
+    assert_eq!(stopping, 1, "the freeing holds the first key it stopped");
+    tokio::time::timeout(
+        WATCHDOG,
+        places
+            .desk
+            .cancel(places.now.who(), Some(places.now.clone()), key),
+    )
+    .await
+    .expect("the cancel is answered")
+    .expect("the cancel finds the upload");
+    freeing.release();
+    settled(&places.desk).await;
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the wanting send ends")
+        .expect("the task ran")
+        .expect_err("the wanting upload was cancelled");
+    (places, cancels)
+}
+
+/// KR-REQ-13.12 (B1): a cancel of the upload that wants a place, while the freeing has one of the
+/// other account's uploads stopped, leaves none stopped: the freeing is work of the desk's own, so it
+/// finishes the key it holds, takes no further key for nobody, and the second upload is left paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_cancel_of_the_wanting_upload_during_the_freeing_leaves_no_other_upload_stopped()
+ {
+    use kr_protocol::method::Method;
+
+    let (places, cancels) = wanting_upload_cancelled_during_the_freeing().await;
+    for key in &places.keys {
+        assert_ne!(
+            places.desk.phase_for_test(*key),
+            Some("stopping"),
+            "no upload is left stopping"
+        );
+    }
+    assert_eq!(
+        places.control.sent(Method::UploadCancel) - cancels,
+        1,
+        "the host saw the first upload's cancel and no other"
+    );
+    let left = places.desk.open(&places.earlier.who());
+    assert_eq!(left.len(), 1, "the first upload is gone");
+    let second: Uuid = left[0].key.parse().expect("a key");
+    assert_eq!(places.desk.phase_for_test(second), Some("paused"));
+    places.end().await;
+}
+
+/// KR-REQ-13.12 (B6): the count of freed places survives the end of the wanting upload: the freeing
+/// is a task of the desk's, so the cancel of the sender does not take the count with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_the_freed_count_survives_the_wanting_upload_ending() {
+    let (places, _) = wanting_upload_cancelled_during_the_freeing().await;
+    assert_eq!(
+        places.desk.places_freed_for_test(),
+        1,
+        "the place the freeing freed is counted"
+    );
+    places.end().await;
+}
+
+/// KR-REQ-13.12 (B2): the account of an upload that the freeing has stopped reaches the host during
+/// the freeing, and the host cannot be read for the upload: the decision section of the stop starts
+/// the upload on the connection that came, and does not leave it paused with nothing to resume it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_reach_of_the_freed_uploads_account_during_the_freeing_resumes_it() {
+    use kr_protocol::method::Method;
+    use testing::Awaited;
+
+    let places = Places::start(1, true).await;
+    let a_key = places.keys[0];
+    let key = kr_ipc::new_uuid();
+    let freeing = testing::hold_awaited(key, Awaited::Freeing);
+    let sending = places.wanting(key);
+    arrived(&freeing, 1).await;
+    assert_eq!(places.desk.phase_for_test(a_key), Some("stopping"));
+    // The account signs in again on a newer connection while its upload is stopped: the reach skips it.
+    let reached = places.reach_of_account_1(1_000);
+    // The host's record cannot be read for the freeing.
+    places.control.lose_only_the_answer_after(
+        places.control.sent(Method::UploadStatus),
+        Method::UploadStatus,
+    );
+    freeing.release();
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the wanting send ends")
+        .expect("the task ran")
+        .expect_err("nothing was freed, so the begin stays refused");
+    settled(&places.desk).await;
+    assert_eq!(
+        places.desk.resumed_on_for_test(a_key),
+        Some(reached.link),
+        "the freed upload was resumed on the connection that came during the freeing"
+    );
+    places.end().await;
+}
+
+/// KR-REQ-13.12 (B3): a cancel that the freeing sent and that the host may have taken is recorded
+/// first: the upload reads as cancel asked, nothing resumes it, and its account's reach finishes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_an_uncertain_cancel_stays_asked() {
+    use companion_tauri::open_transfers::OpenState;
+    use kr_protocol::method::Method;
+
+    let places = Places::start(1, true).await;
+    let a_key = places.keys[0];
+    let cancels = places.control.sent(Method::UploadCancel);
+    places
+        .control
+        .lose_only_the_answer_after(cancels, Method::UploadCancel);
+    tokio::time::timeout(WATCHDOG, places.wanting(kr_ipc::new_uuid()))
+        .await
+        .expect("the wanting send ends")
+        .expect("the task ran")
+        .expect_err("the freeing was not told of the cancel, so nothing was freed");
+    settled(&places.desk).await;
+    let views = places.desk.open(&places.earlier.who());
+    assert_eq!(views.len(), 1);
+    assert_eq!(
+        views[0].state,
+        OpenState::CancelAsked,
+        "the cancel the host may have taken was recorded before it was sent"
+    );
+    assert_eq!(places.desk.resumed_on_for_test(a_key), None);
+    places.reach_of_account_1(1_000);
+    settled(&places.desk).await;
+    assert!(
+        places.desk.open(&places.earlier.who()).is_empty(),
+        "the reach finished the cancel"
+    );
+    assert_eq!(
+        places.control.sent(Method::UploadCancel) - cancels,
+        2,
+        "the host was told again"
+    );
+    places.end().await;
+}
+
+/// KR-REQ-13.12 (B4): the freeing leaves an upload that is sending alone: its sender is not stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_the_freeing_leaves_a_sending_upload_alone() {
+    use kr_client::services::AccountMark;
+    use kr_protocol::method::Method;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, control) = phone_for(&adopted).await;
+    let desk = desk_of(&phone.companion);
+    let paired = paired_of(&phone.companion).await;
+    let one = Paired {
+        account: Some(AccountMark::from_bytes([1; 32])),
+        ..paired.clone()
+    };
+    let two = Paired {
+        account: Some(AccountMark::from_bytes([2; 32])),
+        ..paired
+    };
+    let bytes = pattern(5);
+    let a_key = kr_ipc::new_uuid();
+    let waiting = testing::hold_at(a_key, testing::Point::CancelWaiting);
+    let mut gates = Vec::new();
+    let mut sends = Vec::new();
+    for (paired, key) in [(&one, a_key), (&two, kr_ipc::new_uuid())] {
+        let (content, gate, release) = gated(&bytes);
+        let sent = request(&adopted, &bytes, content, key);
+        let (desk, paired) = (Arc::clone(&desk), paired.clone());
+        sends.push(tokio::spawn(async move { desk.send(paired, sent).await }));
+        gate.reached().await;
+        gates.push((gate, release));
+    }
+    let generation = desk.generation_for_test(a_key);
+    assert!(generation.is_some());
+    let cancels = control.sent(Method::UploadCancel);
+    // Account 2's third upload is refused for the count, and the freeing meets account 1's sender.
+    let wanting = {
+        let sent = request(
+            &adopted,
+            &bytes,
+            Arc::new(Held::new(bytes.clone())),
+            kr_ipc::new_uuid(),
+        );
+        let (desk, two) = (Arc::clone(&desk), two.clone());
+        tokio::spawn(async move { desk.send(two, sent).await })
+    };
+    until("the freeing has run its course or stops the sender", || {
+        waiting.passed() >= 1 || wanting.is_finished()
+    })
+    .await;
+    let (kept, phase, asked) = (
+        desk.generation_for_test(a_key),
+        desk.phase_for_test(a_key),
+        waiting.passed(),
+    );
+    for (gate, _) in &gates {
+        gate.release();
+    }
+    assert_eq!(asked, 0, "no stop of the sender was asked for");
+    assert_eq!(kept, generation, "the sender's generation is unchanged");
+    assert_eq!(phase, Some("sending"));
+    assert_eq!(control.sent(Method::UploadCancel), cancels);
+    wanting
+        .await
+        .expect("the task ran")
+        .expect_err("nothing was freed, so the begin stays refused");
+    for send in sends {
+        tokio::time::timeout(WATCHDOG, send)
+            .await
+            .expect("the upload ends")
+            .expect("the task ran")
+            .expect("the sender that was left alone publishes");
+    }
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (B5): a freeing that panics still settles the sender: the sender is told nothing was
+/// freed, does not ask the host again, and ends with the begin's refusal. No upload is left stopping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_panic_in_the_freeing_still_settles_the_sender() {
+    use kr_protocol::method::Method;
+    use testing::{Fault, Point};
+
+    let places = Places::start(1, true).await;
+    let a_key = places.keys[0];
+    let key = kr_ipc::new_uuid();
+    let _armed = testing::arm(key, Fault::PanicInFreeing);
+    let exited = testing::hold_at(key, Point::SenderExit);
+    let begins = places.control.sent(Method::UploadBegin);
+    let sending = places.wanting(key);
+    tokio::time::timeout(WATCHDOG, exited.until_passed(1))
+        .await
+        .expect("the sender ends");
+    assert_eq!(
+        places.desk.phase_for_test(key),
+        None,
+        "the sender settled: the upload is no longer held"
+    );
+    assert_eq!(
+        places.control.sent(Method::UploadBegin) - begins,
+        1,
+        "the begin was not asked again"
+    );
+    assert_eq!(places.desk.phase_for_test(a_key), Some("paused"));
+    tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("the send answers")
+        .expect("the task ran")
+        .expect_err("the begin's refusal");
+    places.end().await;
+}
+
+/// KR-REQ-13.12 (B7): a start candidate that a reach read before the freeing recorded the cancel is
+/// refused after it: the host sees no resume of an upload whose cancel it may have taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_a_start_candidate_read_before_the_mark_is_refused_after_it() {
+    use companion_tauri::open_transfers::OpenState;
+    use kr_protocol::method::Method;
+    use testing::Point;
+
+    let places = Places::start(1, true).await;
+    let a_key = places.keys[0];
+    // Account 1's reach reads the paused upload as a candidate and is held at the claim. Its
+    // connection has the number of the one in force, so it does not become the newest.
+    let claiming = testing::hold_at(a_key, Point::Claiming);
+    let reached = Paired {
+        account: places.earlier.account,
+        ..places.now.clone()
+    };
+    let reach = {
+        let (desk, reached) = (Arc::clone(&places.desk), reached);
+        tokio::task::spawn_blocking(move || desk.host_reached(reached))
+    };
+    tokio::time::timeout(WATCHDOG, claiming.until_passed(1))
+        .await
+        .expect("the reach holds its candidate");
+    // The freeing records the cancel for the upload, and the host does not answer it.
+    places.control.lose_only_the_answer_after(
+        places.control.sent(Method::UploadCancel),
+        Method::UploadCancel,
+    );
+    tokio::time::timeout(WATCHDOG, places.wanting(kr_ipc::new_uuid()))
+        .await
+        .expect("the wanting send ends")
+        .expect("the task ran")
+        .expect_err("nothing was freed");
+    settled(&places.desk).await;
+    assert_eq!(places.desk.phase_for_test(a_key), Some("paused"));
+    claiming.release();
+    tokio::time::timeout(WATCHDOG, reach)
+        .await
+        .expect("the reach ends")
+        .expect("the reach ran");
+    settled(&places.desk).await;
+    assert_eq!(
+        places.desk.resumed_on_for_test(a_key),
+        None,
+        "the candidate was refused: the upload was not resumed"
+    );
+    assert_eq!(places.desk.phase_for_test(a_key), Some("paused"));
+    assert_eq!(
+        places.desk.open(&places.earlier.who())[0].state,
+        OpenState::CancelAsked
+    );
+    places.end().await;
+}
