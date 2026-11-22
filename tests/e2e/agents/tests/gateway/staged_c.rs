@@ -2103,6 +2103,17 @@ fn second_start_unreadable(draft: &[String]) -> Option<&'static str> {
     )
 }
 
+/// What part 7 or 7f records instead of a run, or `None` where it runs: `draft` is the entry's start
+/// draft texts on a real route, and `None` on the stand-in route, which has no start draft.
+fn second_start_not_run(draft: Option<&[String]>, arm: &str) -> Option<serde_json::Value> {
+    let why = second_start_unreadable(draft?)?;
+    Some(serde_json::json!({
+        "arm": arm,
+        "not_run": why,
+        "turns_charged": 0,
+    }))
+}
+
 /// A real route whose entry names no start draft text is not run for part 7 or 7f, because B's
 /// resume draft reads as a running continuation on its screen; an entry that names the texts runs.
 #[test]
@@ -2138,6 +2149,27 @@ fn a_real_route_with_no_start_draft_text_is_not_run_for_parts_7_and_7f() {
         None,
         "one that names it runs"
     );
+    assert_eq!(
+        second_start_not_run(Some(&[]), "pinned build"),
+        Some(serde_json::json!({
+            "arm": "pinned build",
+            "not_run": "the entry names no start draft texts (account.draft), so the screen of the \
+                        second start cannot tell the saved conversation's start draft from a \
+                        running continuation",
+            "turns_charged": 0,
+        })),
+        "a real route with no draft text records the part as not run, with no turn charged"
+    );
+    assert_eq!(
+        second_start_not_run(Some(&named), "pinned build"),
+        None,
+        "a real route that names the texts runs"
+    );
+    assert_eq!(
+        second_start_not_run(None, "stand-in"),
+        None,
+        "the stand-in route has no start draft and runs"
+    );
 }
 
 /// Part 7 or part 7f: session A holds a conversation, session B is started with the agent's
@@ -2150,14 +2182,12 @@ fn second_process(
     part: &str,
     forks: bool,
 ) -> serde_json::Value {
-    if let Route::Real(real) = &ctx.route
-        && let Some(why) = second_start_unreadable(&real.account.draft)
-    {
-        return serde_json::json!({
-            "arm": arm(ctx),
-            "not_run": why,
-            "turns_charged": 0,
-        });
+    let real_draft = match &ctx.route {
+        Route::Real(real) => Some(real.account.draft.as_slice()),
+        Route::StandIn => None,
+    };
+    if let Some(not_run) = second_start_not_run(real_draft, arm(ctx)) {
+        return not_run;
     }
     let (a, b) = (seated(session, Seat::First), seated(session, Seat::Second));
     let agent_a = starts_by_hand(ctx, session, Seat::First, &[], true);
