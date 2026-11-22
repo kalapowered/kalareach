@@ -11,11 +11,11 @@
 //! boundary does not compile: `receipted`, `continue_prepared`, `admit_and_dispatch`,
 //! `dispatch_accepted`, `standing_pass`, `revalidate_time`, `accept_generation`, `fence` and
 //! `fence_what_is_owed`. Scope alone holds the rest of the work that runs under the boundary (the
-//! expiry task's release of grants, the maintenance pass's session work after its two calls, the
-//! storage recovery and the answers of the announcement), and the compiler does not stop a change
-//! there that lets a guard go early. That the guard is the service's own is not held by the
-//! compiler either: the two entries (`receipted` and `continue_prepared`) check it with
-//! [`DispatchGuard::is_of`] before any work.
+//! expiry task's release of grants, the maintenance pass's owed withdrawal and session work after
+//! its two calls, the storage recovery and the answers of the announcement), and the compiler does
+//! not stop a change there that lets a guard go early. That the guard is the service's own is not
+//! held by the compiler either: the two entries (`receipted` and `continue_prepared`) check it
+//! with [`DispatchGuard::is_of`] before any work.
 //!
 //! A thread that holds the boundary and waits for it again waits on itself for ever. The waiting
 //! take, [`DispatchBoundary::lock`], compares the calling thread with the thread that holds the
@@ -197,7 +197,7 @@ impl Drop for DispatchGuard<'_> {
         // The count is raised before the lock goes, so that whoever sees it moved knows this hold
         // has ended.
         self.boundary.releases.fetch_add(1, Ordering::SeqCst);
-        // The lock goes next, so that a woken presentation finds it free.
+        // The lock goes next, so that a woken waiter finds it free.
         drop(self.guard.take());
         #[cfg(feature = "testing")]
         self.boundary.wait_after_the_unlock();
