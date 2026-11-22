@@ -807,14 +807,16 @@ mod tests {
     /// asked to end has its trap set before the call begins, and its file is empty after it. The
     /// signal is not there when the wait begins and is there after it, and the wait is a stand-in
     /// that reports the leader as ended and reaps nothing, so the case holds the leader unreaped. It
-    /// ends by itself when the case writes the release file, or in 20 s.
+    /// ends by itself when the case writes the release file, or in 20 s. The signal is `TERM`, which a
+    /// shell can trap whatever the test process does with `INT`: a shell that is started with `INT`
+    /// ignored cannot trap it, and a signal sent in error would not show.
     #[test]
     fn a_signal_recorded_after_the_leader_is_reaped_stops_the_command_and_signals_nothing() {
         let place = tempfile::tempdir().expect("a directory");
         let marker = place.path().join("asked.txt");
         let ready = place.path().join("ready.txt");
         let release = place.path().join("release.txt");
-        let script = "trap 'printf \"%s\\n\" asked >> \"$1\"' INT TERM; printf '%s\\n' ready >> \"$2\"; i=0; while [ ! -e \"$3\" ] && [ $i -lt 200 ]; do sleep 0.1 & wait $!; i=$((i+1)); done";
+        let script = "trap 'printf \"%s\\n\" asked >> \"$1\"' TERM; printf '%s\\n' ready >> \"$2\"; i=0; while [ ! -e \"$3\" ] && [ $i -lt 200 ]; do sleep 0.1 & wait $!; i=$((i+1)); done";
         let mut command = Command::new("bash");
         command
             .arg("-c")
@@ -841,7 +843,7 @@ mod tests {
             |_| Ok(Some(std::os::unix::process::ExitStatusExt::from_raw(0))),
             || {
                 reads.set(reads.get() + 1);
-                (reads.get() > 1).then_some(2)
+                (reads.get() > 1).then_some(15)
             },
         );
         // A signal that had been sent would have run the trap by now.
@@ -851,7 +853,7 @@ mod tests {
         let _ = leader.wait();
         assert!(set, "the trap was not set in 30 s");
         match waited.expect("a watched command") {
-            Waited::Interrupted(_, 2) => {}
+            Waited::Interrupted(_, 15) => {}
             other => panic!("the command was not stopped by the signal: {other:?}"),
         }
         assert_eq!(asked, "", "a signal was sent to the group");
