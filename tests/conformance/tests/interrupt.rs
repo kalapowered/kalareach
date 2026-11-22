@@ -371,3 +371,33 @@ fn a_signal_that_reaches_the_report_as_the_last_step_ends_leaves_the_step_stoppe
         "{result}"
     );
 }
+
+/// KR-REQ-29.01, the part about reproducible commands: the signal that stops the run is the first
+/// the report records. The group ignores both signals, so the grace runs its two seconds; an `INT`
+/// that arrives in it does not replace the `TERM` that began it, though `INT` comes first in the
+/// report's list, and the stopped step, the step after it and the end of the report all name `TERM`.
+#[test]
+fn a_second_signal_in_the_grace_does_not_change_the_signal_of_the_run() {
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let pids = place.path().join("pids.txt");
+    let later = place.path().join("later.txt");
+    let mut run = Run::start(
+        &[
+            step("held", "timeout = 600", "held", &pids),
+            step("later", "timeout = 600", "later", &later),
+        ],
+        &[("held", IGNORES), ("later", WAITS)],
+    );
+    recorded_pids(&pids, 2);
+    run.send(Signal::TERM);
+    std::thread::sleep(Duration::from_millis(500));
+    run.send(Signal::INT);
+    let status = run.ended_within(BOUND);
+    assert_eq!(status.signal(), Some(Signal::TERM.as_raw()), "{status:?}");
+    let result = run.result();
+    assert_eq!(result["steps"][0]["error"], "stopped by signal TERM");
+    assert_eq!(
+        result["steps"][1]["error"],
+        "not run because the run was interrupted by signal TERM"
+    );
+}

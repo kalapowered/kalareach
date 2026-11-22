@@ -188,7 +188,7 @@ fn supervised(
     // longer has its default action.
     let _running = Running::begin(interrupts);
     // A signal that reached the report since the last command means that no later command starts.
-    if let Some(signal) = raised(&interrupts.received) {
+    if let Some(signal) = interrupts.signal() {
         return Ok(Waited::Interrupted(Captured::default(), signal));
     }
     // The work between one command of a step and the next can take the time that is left: a command
@@ -202,7 +202,7 @@ fn supervised(
     }
     let mut child = command.spawn()?;
     watch(&mut child, deadline, Child::try_wait, || {
-        raised(&interrupts.received)
+        interrupts.signal()
     })
 }
 
@@ -212,9 +212,51 @@ fn supervised(
 struct Interrupts {
     /// True while no command of a step with a limit runs: a signal has its default action then.
     outside: Arc<AtomicBool>,
-    /// The number of the last signal that reached the report while a command ran, or 0. It is not
-    /// cleared: the report ends the run after the command it ended.
-    received: Arc<AtomicUsize>,
+    /// For each of the [`Group::FORWARDED`] signals, in that order, its number once it reached the
+    /// report while a command ran, or 0. A flag is not cleared: the report ends the run after the
+    /// command it ended.
+    received: Vec<Arc<AtomicUsize>>,
+    /// The number of the signal that stops the run, or 0: the first that a read found. A signal
+    /// that comes later does not replace it, so the step that was stopped, the steps that were not
+    /// run and the end of the report all name the same signal.
+    chosen: AtomicUsize,
+}
+
+#[cfg(unix)]
+impl Interrupts {
+    fn new() -> Self {
+        Self {
+            outside: Arc::new(AtomicBool::new(true)),
+            received: Group::FORWARDED
+                .iter()
+                .map(|_| Arc::new(AtomicUsize::new(0)))
+                .collect(),
+            chosen: AtomicUsize::new(0),
+        }
+    }
+
+    /// The number of the signal that stops the run, when one reached the report while a command
+    /// ran. The first read that finds a signal chooses it, and when both were recorded before that
+    /// read, the one that comes first in [`Group::FORWARDED`].
+    fn signal(&self) -> Option<i32> {
+        let number = |number: usize| i32::try_from(number).ok();
+        let chosen = self.chosen.load(Ordering::SeqCst);
+        if chosen != 0 {
+            return number(chosen);
+        }
+        let found = self
+            .received
+            .iter()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .find(|found| *found != 0)?;
+        match self
+            .chosen
+            .compare_exchange(0, found, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => number(found),
+            Err(first) => number(first),
+        }
+    }
 }
 
 /// The handlers, set once, and why they could not be, when they could not.
@@ -240,21 +282,12 @@ impl Drop for Running<'_> {
     }
 }
 
-/// The number of the signal in `received`, when one reached the report.
-#[cfg(unix)]
-fn raised(received: &AtomicUsize) -> Option<i32> {
-    match received.load(Ordering::SeqCst) {
-        0 => None,
-        number => i32::try_from(number).ok(),
-    }
-}
-
 /// The number of the signal (INT or TERM) that reached the report while a command of a step with a
 /// limit ran, when one did. The run ends by that signal after its report is made.
 #[cfg(unix)]
 #[must_use]
 pub fn interrupted() -> Option<i32> {
-    raised(&INTERRUPTS.get()?.as_ref().ok()?.received)
+    INTERRUPTS.get()?.as_ref().ok()?.signal()
 }
 
 /// No step with a limit runs where there are no process groups, so no signal is sent on.
@@ -525,13 +558,15 @@ impl Group {
     fn arm() -> io::Result<&'static Interrupts> {
         INTERRUPTS
             .get_or_init(|| {
-                let outside = Arc::new(AtomicBool::new(true));
-                let received = Arc::new(AtomicUsize::new(0));
-                for &signal in Self::FORWARDED {
+                let interrupts = Interrupts::new();
+                for (&signal, received) in Self::FORWARDED.iter().zip(&interrupts.received) {
                     let number = signal.as_raw();
                     // The default action goes first: the actions run in the order they are set.
-                    signal_hook::flag::register_conditional_default(number, outside.clone())
-                        .map_err(|error| error.to_string())?;
+                    signal_hook::flag::register_conditional_default(
+                        number,
+                        interrupts.outside.clone(),
+                    )
+                    .map_err(|error| error.to_string())?;
                     signal_hook::flag::register_usize(
                         number,
                         received.clone(),
@@ -539,7 +574,7 @@ impl Group {
                     )
                     .map_err(|error| error.to_string())?;
                 }
-                Ok(Interrupts { outside, received })
+                Ok(interrupts)
             })
             .as_ref()
             .map_err(|why| io::Error::other(format!("the signals could not be handled: {why}")))
@@ -679,6 +714,33 @@ mod tests {
         assert_eq!(asked, "", "a signal was sent to the group");
     }
 
+    /// KR-REQ-29.01, the part about reproducible commands: the signal that stops the run is the first
+    /// one a read finds, and a later, different signal does not replace it, so the step that was
+    /// stopped, the steps that were not run and the end of the report name one signal. When both
+    /// were recorded before the first read, the one that comes first in the list is chosen.
+    #[test]
+    fn a_later_signal_does_not_replace_the_one_that_stops_the_run() {
+        let int = signal_hook::consts::SIGINT;
+        // The number of TERM on every platform the report runs on.
+        let term = 15;
+        let number = |number: i32| usize::try_from(number).expect("a number");
+        let first_is_int = Interrupts::new();
+        assert_eq!(first_is_int.signal(), None);
+        first_is_int.received[0].store(number(int), Ordering::SeqCst);
+        assert_eq!(first_is_int.signal(), Some(int));
+        first_is_int.received[1].store(number(term), Ordering::SeqCst);
+        assert_eq!(first_is_int.signal(), Some(int), "TERM replaced INT");
+        let first_is_term = Interrupts::new();
+        first_is_term.received[1].store(number(term), Ordering::SeqCst);
+        assert_eq!(first_is_term.signal(), Some(term));
+        first_is_term.received[0].store(number(int), Ordering::SeqCst);
+        assert_eq!(first_is_term.signal(), Some(term), "INT replaced TERM");
+        let both = Interrupts::new();
+        both.received[1].store(number(term), Ordering::SeqCst);
+        both.received[0].store(number(int), Ordering::SeqCst);
+        assert_eq!(both.signal(), Some(int));
+    }
+
     /// KR-REQ-29.01, the part about reproducible commands: a signal that was recorded while the
     /// report slept, and a leader that has ended in that time and is not reaped, leave the command
     /// stopped and not done. The wait is a stand-in that reports the leader as ended, so the case
@@ -788,7 +850,7 @@ mod tests {
         Group::prepare(&mut command);
         command.stdout(Stdio::piped());
         let mut child = command.spawn().expect("a command");
-        let received = AtomicUsize::new(0);
+        let interrupts = Interrupts::new();
         let deadline = Deadline {
             at: Instant::now() + Duration::from_secs(600),
             seconds: 600,
@@ -808,10 +870,12 @@ mod tests {
                 {
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                received.store(int, Ordering::SeqCst);
+                interrupts.received[0].store(int, Ordering::SeqCst);
                 let _ = signalled.set(Instant::now());
             });
-            watch(&mut child, deadline, Child::try_wait, || raised(&received))
+            watch(&mut child, deadline, Child::try_wait, || {
+                interrupts.signal()
+            })
         });
         let took = signalled.get().map(Instant::elapsed);
         let recorded = std::fs::read_to_string(&pids).unwrap_or_default();
