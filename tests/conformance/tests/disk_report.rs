@@ -165,11 +165,17 @@ fn kernel_read_with(reader: &str) -> (String, String) {
 /// [`kernel_read_with`] after `prepare`, shell text that runs once the evidence directory exists
 /// and may use `$evidence`.
 fn kernel_read_after(reader: &str, prepare: &str) -> (String, String) {
+    kernel_read_run(reader, "#!/bin/sh\nshift\nexec \"$@\"\n", prepare)
+}
+
+/// [`kernel_read_after`] with `privilege_program` in the place of the program that runs the read
+/// as root.
+fn kernel_read_run(reader: &str, privilege_program: &str, prepare: &str) -> (String, String) {
     let state = tempfile::tempdir().expect("a state directory");
     let program = state.path().join("log");
     write_program(&program, reader);
     let privilege = state.path().join("privilege");
-    write_program(&privilege, "#!/bin/sh\nshift\nexec \"$@\"\n");
+    write_program(&privilege, privilege_program);
     let evidence = state.path().join("evidence");
     let body = format!(
         "mkdir -p \"$state\" '{evidence}'\n\
@@ -353,6 +359,48 @@ fn a_read_that_fails_after_it_gave_lines_keeps_them_and_says_how_many() {
         kept.contains("apfs_vnop_pagein: error 5")
             && kept.contains("was not read at all (status 3)")
             && kept.contains("the reader said: log: the store went away"),
+        "{kept}"
+    );
+}
+
+#[test]
+fn a_read_as_root_that_fails_after_it_gave_lines_keeps_them_when_the_read_without_sudo_gives_none()
+{
+    if cfg!(not(target_os = "macos")) {
+        return;
+    }
+    // The read as root gives one fault and fails; the read without sudo succeeds with no line.
+    let (printed, kept) = kernel_read_run(
+        "#!/bin/sh\nexit 0\n",
+        "#!/bin/sh\n\
+         echo '2026-11-21 13:01:52.100 Df kernel[0:1a] (apfs) apfs_vnop_pagein: error 5'\n\
+         exit 1\n",
+        "",
+    );
+    assert!(
+        kept.contains("apfs_vnop_pagein: error 5") && kept.contains("was read: 1 matching lines"),
+        "{kept}"
+    );
+    assert!(
+        printed.contains("holds 1 lines that match a storage fault"),
+        "{printed}"
+    );
+    // Both reads fail: the lines of the first stay, and the second's words are said too.
+    let (printed, kept) = kernel_read_run(
+        "#!/bin/sh\necho 'log: the second read failed' >&2\nexit 3\n",
+        "#!/bin/sh\n\
+         echo '2026-11-21 13:01:52.100 Df kernel[0:1a] (apfs) apfs_vnop_pagein: error 5'\n\
+         echo 'sudo: the first read failed' >&2\nexit 1\n",
+        "",
+    );
+    assert!(
+        printed.contains("matching lines read before it ended: 1"),
+        "{printed}"
+    );
+    assert!(
+        kept.contains("apfs_vnop_pagein: error 5")
+            && kept.contains("the reader said: sudo: the first read failed")
+            && kept.contains("the reader said: log: the second read failed"),
         "{kept}"
     );
 }

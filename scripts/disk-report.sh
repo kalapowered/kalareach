@@ -258,6 +258,7 @@ list_intervals() {
 # 142 when the alarm ended it.
 # alarmed <seconds> <file> [<prefix word>...] -- <command word>...
 alarmed() {
+    local limit out prefix
     limit="$1"
     out="$2"
     shift 2
@@ -298,15 +299,22 @@ kernel_storage_errors() {
     reader="${KR_DISK_REPORT_LOG:-/usr/bin/log}"
     privilege="${KR_DISK_REPORT_PRIVILEGE:-sudo}"
     said="$state/kernel-log.stderr"
-    alarm_stderr="$said"
+    # Each attempt writes files of its own, so that a retry never replaces what an earlier attempt
+    # read.
+    for suffix in sudo.out sudo.stderr plain.out plain.stderr; do
+        : > "$state/kernel-log.$suffix" 2> /dev/null
+    done
     read_ok=0
     status=0
+    ran=()
     for attempt in sudo plain; do
+        ran+=("$attempt")
+        alarm_stderr="$state/kernel-log.$attempt.stderr"
         if [ "$attempt" = sudo ]; then
             # the redirect is in alarmed, so the runner's own shell writes the file, in its directory
-            alarmed 90 "$out" "$privilege" -n -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
+            alarmed 90 "$state/kernel-log.$attempt.out" "$privilege" -n -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
         else
-            alarmed 90 "$out" -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
+            alarmed 90 "$state/kernel-log.$attempt.out" -- "$reader" show --last "${minutes}m" --style compact --predicate "$predicate"
         fi
         status=$?
         if [ "$status" -eq 142 ]; then
@@ -318,6 +326,21 @@ kernel_storage_errors() {
         fi
     done
     alarm_stderr=/dev/null
+    # The file keeps the lines of every attempt: those of the read as root, and, where that read
+    # failed, those of the read without sudo that it did not give already.
+    kept="$state/kernel-log.kept"
+    {
+        cat "$state/kernel-log.sudo.out"
+        if [ "${#ran[@]}" -gt 1 ]; then
+            echo "# the read as root failed, so the log was read again without sudo; the lines of both reads are kept"
+            awk 'NR == FNR { seen[$0] = 1; next } !($0 in seen)' "$state/kernel-log.sudo.out" "$state/kernel-log.plain.out"
+        fi
+    } > "$kept" 2> /dev/null
+    cat "$state/kernel-log.sudo.stderr" "$state/kernel-log.plain.stderr" 2> /dev/null | awk '!seen[$0]++' > "$said" 2> /dev/null
+    if [ "$read_ok" -eq 1 ] && ! cat "$kept" > "$out" 2> /dev/null; then
+        read_ok=0
+        status=1
+    fi
     stamped='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '
     if [ "$read_ok" -ne 1 ]; then
         if [ "$status" -eq 142 ]; then
@@ -325,8 +348,9 @@ kernel_storage_errors() {
         else
             reason="at all (status $status)"
         fi
-        # What the read gave before it ended stays in the file, above the note.
-        partial="$(grep -c "$stamped" "$out" 2> /dev/null || true)"
+        # What the reads gave before they ended stays in the file, above the note.
+        cat "$kept" > "$out" 2> /dev/null || true
+        partial="$(grep -c "$stamped" "$kept" 2> /dev/null || true)"
         if {
             {
                 echo "# the kernel's log was not read $reason, so this file says nothing about storage faults beyond the ${partial:-0} matching lines above it"
