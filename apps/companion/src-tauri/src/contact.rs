@@ -2103,15 +2103,6 @@ pub mod testing {
             });
         }
 
-        /// Moves the number of the installed connection on, as an installation does, and answers
-        /// it: a suite that makes a connection of its own for a desk that also hears this owner's
-        /// connections takes its number from the same count.
-        pub fn take_link_for_test(&self) -> u64 {
-            let mut state = self.lock();
-            state.link += 1;
-            state.link
-        }
-
         /// Installs `connection` as the one held, with no host in use.
         pub fn install(&self, connection: Connection) -> super::Disposal {
             self.commit(|state, disposal| {
