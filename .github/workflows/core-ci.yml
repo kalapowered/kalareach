@@ -3583,17 +3583,19 @@ jobs:
           paths: target/release
 
   # The programs a release ships for macOS hold none of the refusal that test builds carry for the
-  # account's own launchd. `scripts/shipped-hold-gate.sh` builds, each in a new target directory and
-  # from nothing, the two test programs that carry the refusal, the whole workspace in the release
-  # profile and each shipped program alone, and reads the bytes of all of them. The check stands in
-  # a job of its own because it did not fit at the end of the macos-demonstrations leg: after the
-  # demonstrations, the release build of the measurements (37 minutes) and the measurements, the 90
-  # minutes it had there ran out on a hosted runner (07:25 to 08:55 UTC on 21 November), and it
-  # has never completed on one. Here it starts at once and in parallel with the other jobs, and it
-  # waits behind none of them. No time is known for it to run to its end, so the step has a limit
-  # of 300 minutes, and every step has a limit of its own: they add up to 327 of this job's 330
-  # minutes, under the 360 at which GitHub ends a hosted job. It restores no cache, because every
-  # build of the script goes in a new directory and no restored output would be read.
+  # account's own launchd. `scripts/shipped-hold-gate.sh` builds from nothing, in a new temporary
+  # directory, the two test programs that carry the refusal (one target directory), the whole
+  # workspace in the release profile (a second) and each shipped program alone (a third, one program
+  # after another), and reads the bytes of all of them. The check stands in a job of its own because
+  # it did not fit at the end of the macos-demonstrations leg: after the demonstrations, the release
+  # build of the measurements (37 minutes) and the measurements, the 90 minutes it had there ran out
+  # on a hosted runner (07:25 to 08:55 UTC on 21 November), and it has never completed on one. Here
+  # it needs no other job. Like each macOS job of a run, it can still wait for one of the hosted
+  # macOS runners that the account can use at one time. No time is known for it to run to its end,
+  # so the step has a limit of 300 minutes, and every step has a limit of its own: they add up to
+  # 329 of this job's 330 minutes, under the 360 at which GitHub ends a hosted job. It restores no
+  # cache: the release builds go in a new directory, which no restored output serves, and the one
+  # debug build, of kr-ipc's test, is small.
   macos-shipped-hold:
     name: macos-shipped-hold
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
@@ -3606,7 +3608,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # The disk as the image arrives, and from here to the last report the lowest free space in
-      # each stretch of the job: three release builds from nothing fill a disk.
+      # each stretch of the job.
       - name: What the disk holds
         continue-on-error: true
         timeout-minutes: 5
@@ -3620,6 +3622,12 @@ jobs:
         continue-on-error: true
         timeout-minutes: 8
         run: bash scripts/free-simulator-runtimes.sh
+
+      - name: What the disk holds with the runtimes cleared
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash scripts/disk-report.sh step "the simulator runtimes cleared"
 
       # What this runner is, printed before the builds, so a failure below names the processor, the
       # memory and the system it happened on. Every build here is given one job per processor.
