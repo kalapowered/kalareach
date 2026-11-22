@@ -492,6 +492,14 @@ command = [
 ]
 
 [[step]]
+id = 'rust-the-windows-boundary-s-cases-that-need-no-guest'
+group = 'rust'
+what = '''the Windows boundary's cases that need no guest'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-boundary-windows']
+
+[[step]]
 id = 'rust-the-forwarder'
 group = 'rust'
 what = 'the forwarder'

@@ -17,6 +17,7 @@ the decision a device reads :: cargo test --locked -p kr-controller --lib a_shar
 a read that meets a worker on its way out :: cargo test --locked -p kr-controller --lib service::a_read_that_meets_a_worker_on_its_way_out:: -- --show-output
 the device dispatch :: cargo test --locked -p kr-controller --lib service::net::dispatch::tests:: -- --show-output
 the daemon's attention, barrier, configuration and diagnostics :: cargo test --locked -p kr-controller --test attention --test barrier --test configuration --test network_host -- --show-output
+the Windows boundary's cases that need no guest :: cargo test --locked -p kr-boundary-windows -- --show-output
 the forwarder :: cargo test --locked -p kr-hook -- --show-output
 the launch endpoint, the registration and the credential :: cargo test --locked -p kr-worker --test windows_endpoint -- --show-output
 the listener, the transport and the broker over the launch endpoint :: cargo test --locked -p kr-worker --test listener --test transport --test broker --test gateway -- --show-output
