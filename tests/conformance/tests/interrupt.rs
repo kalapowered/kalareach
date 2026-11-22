@@ -46,6 +46,10 @@ const WAITS: &str = "printf '%s\\n' \"$$\" >> \"$1\"\nsleep 20\n";
 /// Ends at once.
 const QUICK: &str = "exit 0\n";
 
+/// Sends `INT` to its parent, the report's program, and ends with status 0 at once: the signal is
+/// recorded while the step ends.
+const SIGNALS_AND_ENDS: &str = "kill -INT \"$PPID\"\nexit 0\n";
+
 fn git(root: &Path, arguments: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -336,4 +340,34 @@ fn a_signal_outside_a_step_with_a_limit_ends_the_report_as_it_always_did() {
     let status = run.ended_within(Duration::from_secs(15));
     assert_eq!(status.signal(), Some(Signal::INT.as_raw()), "{status:?}");
     assert!(sent.elapsed() < Duration::from_secs(15));
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a signal that reaches the report as the last
+/// step ends, with the status 0, leaves that step stopped and the result failed, and not a passed
+/// result from a report that then ends by the signal. The step sends the signal to its parent, the
+/// report's program, and ends at once, so the signal is recorded while the report waits for it.
+#[test]
+fn a_signal_that_reaches_the_report_as_the_last_step_ends_leaves_the_step_stopped() {
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let unused = place.path().join("unused.txt");
+    let mut run = Run::start(
+        &[step("last", "timeout = 600", "last", &unused)],
+        &[("last", SIGNALS_AND_ENDS)],
+    );
+    let status = run.ended_within(BOUND);
+    assert_eq!(
+        status.signal(),
+        Some(Signal::INT.as_raw()),
+        "the report's program ended {status:?}; it said: {}",
+        std::fs::read_to_string(&run.output).unwrap_or_default()
+    );
+    let result = run.result();
+    let last = &result["steps"][0];
+    assert_eq!(last["error"], "stopped by signal INT", "{last}");
+    assert!(last["exit"].is_null(), "{last}");
+    assert_eq!(
+        result["summary"]["failed_steps"],
+        serde_json::json!([1]),
+        "{result}"
+    );
 }

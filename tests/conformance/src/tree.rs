@@ -201,7 +201,9 @@ fn supervised(
         command.stdout(Stdio::piped());
     }
     let mut child = command.spawn()?;
-    watch(&mut child, deadline, Child::try_wait, &interrupts.received)
+    watch(&mut child, deadline, Child::try_wait, || {
+        raised(&interrupts.received)
+    })
 }
 
 /// What the report keeps of the signals it sends on: INT and TERM. The report runs one command of a
@@ -263,15 +265,16 @@ pub fn interrupted() -> Option<i32> {
 }
 
 /// Supervises `child`, which [`supervised`] started, until its time `deadline` is spent or a signal
-/// is recorded in `received`. `try_wait` is the wait for the leader: it is a seam, so that a unit
-/// that holds the unreaped leader can give the failure that another waiter's reap gives, and see
-/// that the report signals nothing then.
+/// is recorded. `try_wait` is the wait for the leader: it is a seam, so that a unit that holds the
+/// unreaped leader can give the failure that another waiter's reap gives, and see that the report
+/// signals nothing then. `signalled` is the other seam: it gives the number of the signal that
+/// reached the report while the command ran, when one did.
 #[cfg(unix)]
 fn watch(
     child: &mut Child,
     deadline: Deadline,
     mut try_wait: impl FnMut(&mut Child) -> io::Result<Option<ExitStatus>>,
-    received: &AtomicUsize,
+    signalled: impl Fn() -> Option<i32>,
 ) -> io::Result<Waited<Output>> {
     let mut pipes = match Pipes::of(child) {
         Ok(pipes) => pipes,
@@ -286,7 +289,7 @@ fn watch(
     // that a process that holds one past the command's end holds this loop no longer than the
     // deadline, and nothing is left reading when it returns.
     while pipes.open() {
-        if let Some(signal) = raised(received) {
+        if let Some(signal) = signalled() {
             return Ok(Waited::Interrupted(
                 Group::interrupted(child, pipes, signal),
                 signal,
@@ -302,15 +305,27 @@ fn watch(
         }
     }
     let status = loop {
+        // The signal is read before the leader is waited for, and not only when the wait finds the
+        // leader still running: a signal that was recorded while the report slept, and a leader
+        // that ended in that time, must leave the command stopped. The leader is not reaped yet, so
+        // it still holds the group's number and the signal can be sent on to the group.
+        if let Some(signal) = signalled() {
+            return Ok(Waited::Interrupted(
+                Group::interrupted(child, pipes, signal),
+                signal,
+            ));
+        }
         match try_wait(child) {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if let Some(signal) = raised(received) {
-                    return Ok(Waited::Interrupted(
-                        Group::interrupted(child, pipes, signal),
-                        signal,
-                    ));
+            Ok(Some(status)) => {
+                // A signal that was recorded as the leader ended is read again: the leader is
+                // reaped, so no signal goes to the group (its number could be another process's),
+                // and the command is stopped all the same.
+                if let Some(signal) = signalled() {
+                    return Ok(Waited::Interrupted(pipes.into_captured(), signal));
                 }
+                break status;
+            }
+            Ok(None) => {
                 let now = Instant::now();
                 if now >= deadline.at {
                     return Ok(Waited::TimedOut(Group::ended(child, pipes)));
@@ -652,7 +667,7 @@ mod tests {
             &mut leader.0,
             deadline,
             |_| Err(io::Error::from(rustix::io::Errno::CHILD)),
-            &AtomicUsize::new(0),
+            || None,
         );
         let asked = std::fs::read_to_string(&marker).unwrap_or_default();
         assert!(set, "the trap was not set in 30 s");
@@ -661,6 +676,90 @@ mod tests {
             error.raw_os_error(),
             Some(rustix::io::Errno::CHILD.raw_os_error())
         );
+        assert_eq!(asked, "", "a signal was sent to the group");
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a signal that was recorded while the
+    /// report slept, and a leader that has ended in that time and is not reaped, leave the command
+    /// stopped and not done. The wait is a stand-in that reports the leader as ended, so the case
+    /// does not depend on when it ends; the signal is read before the wait, and the call says which
+    /// signal it was.
+    #[test]
+    fn a_signal_recorded_while_the_leader_ended_leaves_the_command_stopped() {
+        let mut command = Command::new("bash");
+        command.arg("-c").arg("exit 0").stdin(Stdio::null());
+        Group::prepare(&mut command);
+        let mut leader = command.spawn().expect("a command");
+        let deadline = Deadline {
+            at: Instant::now() + Duration::from_secs(600),
+            seconds: 600,
+            budget: false,
+        };
+        let waited = watch(
+            &mut leader,
+            deadline,
+            |_| Ok(Some(std::os::unix::process::ExitStatusExt::from_raw(0))),
+            || Some(2),
+        );
+        match waited.expect("a watched command") {
+            Waited::Interrupted(_, 2) => {}
+            other => panic!("the command was not stopped by the signal: {other:?}"),
+        }
+    }
+
+    /// KR-REQ-29.01, the part about reproducible commands: a signal that is recorded as the wait finds
+    /// the leader ended leaves the command stopped too, and, because the leader is reaped by then,
+    /// the report sends no signal to the group: a process of the group that writes a line when it is
+    /// asked to end has its trap set before the call begins, and its file is empty after it. The
+    /// signal is not there when the wait begins and is there after it, and the wait is a stand-in
+    /// that reports the leader as ended and reaps nothing, so the case holds the leader unreaped. It
+    /// ends by itself when the case writes the release file, or in 20 s.
+    #[test]
+    fn a_signal_recorded_after_the_leader_is_reaped_stops_the_command_and_signals_nothing() {
+        let place = tempfile::tempdir().expect("a directory");
+        let marker = place.path().join("asked.txt");
+        let ready = place.path().join("ready.txt");
+        let release = place.path().join("release.txt");
+        let script = "trap 'printf \"%s\\n\" asked >> \"$1\"' INT TERM; printf '%s\\n' ready >> \"$2\"; i=0; while [ ! -e \"$3\" ] && [ $i -lt 200 ]; do sleep 0.1 & wait $!; i=$((i+1)); done";
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("bash")
+            .args([&marker, &ready, &release])
+            .stdin(Stdio::null());
+        Group::prepare(&mut command);
+        let mut leader = command.spawn().expect("a command");
+        let until = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let set = ready.exists();
+        let deadline = Deadline {
+            at: Instant::now() + Duration::from_secs(600),
+            seconds: 600,
+            budget: false,
+        };
+        let reads = std::cell::Cell::new(0);
+        let waited = watch(
+            &mut leader,
+            deadline,
+            |_| Ok(Some(std::os::unix::process::ExitStatusExt::from_raw(0))),
+            || {
+                reads.set(reads.get() + 1);
+                (reads.get() > 1).then_some(2)
+            },
+        );
+        // A signal that had been sent would have run the trap by now.
+        std::thread::sleep(Duration::from_millis(500));
+        let asked = std::fs::read_to_string(&marker).unwrap_or_default();
+        std::fs::write(&release, "").expect("the release file");
+        let _ = leader.wait();
+        assert!(set, "the trap was not set in 30 s");
+        match waited.expect("a watched command") {
+            Waited::Interrupted(_, 2) => {}
+            other => panic!("the command was not stopped by the signal: {other:?}"),
+        }
         assert_eq!(asked, "", "a signal was sent to the group");
     }
 
@@ -709,7 +808,7 @@ mod tests {
                 }
                 received.store(int, Ordering::SeqCst);
             });
-            watch(&mut child, deadline, Child::try_wait, &received)
+            watch(&mut child, deadline, Child::try_wait, || raised(&received))
         });
         let took = began.elapsed();
         let recorded = std::fs::read_to_string(&pids).unwrap_or_default();
