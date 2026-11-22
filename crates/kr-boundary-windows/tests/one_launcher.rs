@@ -95,7 +95,8 @@ fn no_code_in_the_crate_creates_a_process_but_the_launcher() {
 }
 
 /// Where a function that makes a permit to resume a child is called: the proof makes its own, and
-/// the journal makes an invocation's once the process row is durable.
+/// the journal makes an invocation's once the primary child's row is durable, and a reader's with
+/// no row.
 #[test]
 fn a_permit_to_resume_is_made_only_where_it_is_allowed() {
     let mut files = Vec::new();
@@ -130,7 +131,10 @@ fn a_permit_to_resume_is_made_only_where_it_is_allowed() {
         }
     }
     assert_eq!(proof, 1, "the proof makes its permit in one place");
-    assert_eq!(journal, 1, "the journal makes its permit in one place");
+    assert_eq!(
+        journal, 2,
+        "the journal makes its permits in two places: the primary child's, after its row, and a reader's, which has none"
+    );
 }
 
 /// The setup program starts a program in one way, through the one function that gives the command

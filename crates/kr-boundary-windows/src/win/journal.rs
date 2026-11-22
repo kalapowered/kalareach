@@ -290,6 +290,17 @@ impl Journal {
     }
 }
 
+impl Journal {
+    /// Makes the leave to resume a reader child. Nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns why a reader may not start now.
+    pub fn permit_for_reader(&self, child: &SuspendedChild) -> Result<ResumePermit, JournalError> {
+        Ok(ResumePermit::for_invocation(self.invocation, child))
+    }
+}
+
 impl RootRows for Journal {
     fn intent(&mut self, name: &RootName) -> Result<(), RootError> {
         self.append(&Row::RootIntent { name: name.clone() })

@@ -764,6 +764,82 @@ fn grant_path(n: u64) -> String {
     }
 }
 
+fn root_intent() -> Row {
+    Row::RootIntent { name: root_name(1) }
+}
+
+fn root_made() -> Row {
+    Row::RootMade {
+        name: root_name(1),
+        key: key(40),
+    }
+}
+
+/// A reader child runs in the private root before the grant and, for the readers that need the
+/// repository's objects, after it: never before the root is made.
+#[test]
+fn a_reader_child_may_not_start_before_the_private_root_is_made() {
+    assert!(
+        tracker_after(&[begin()]).reader_may_start().is_err(),
+        "no root at all"
+    );
+    assert!(
+        tracker_after(&[begin(), root_intent()])
+            .reader_may_start()
+            .is_err(),
+        "an intent whose made row is not there"
+    );
+    assert!(
+        tracker_after(&[begin(), root_intent(), root_made()])
+            .reader_may_start()
+            .is_ok(),
+        "before the grant"
+    );
+    assert!(
+        tracker_after(&[
+            begin(),
+            root_intent(),
+            root_made(),
+            grant(1),
+            Row::GrantComplete { count: 1 },
+        ])
+        .reader_may_start()
+        .is_ok(),
+        "after the grant, for the readers of the repository's objects"
+    );
+}
+
+/// The primary child, the end of the job and the release each close the time of the readers.
+#[test]
+fn a_reader_child_may_not_start_after_the_primary_the_end_of_the_job_or_the_release() {
+    let before = [begin(), root_intent(), root_made(), grant_done()];
+    let with = |rows: &[Row]| tracker_after(&[&before[..], rows].concat());
+    assert!(
+        with(&[started()]).reader_may_start().is_err(),
+        "after the primary child's row"
+    );
+    assert!(
+        with(&[started(), Row::JobEnded])
+            .reader_may_start()
+            .is_err(),
+        "after the job's end"
+    );
+    assert!(
+        with(&[release_intent(1)]).reader_may_start().is_err(),
+        "after a release began"
+    );
+    assert!(
+        with(&[verified(0)]).reader_may_start().is_err(),
+        "after the release was verified"
+    );
+    assert!(
+        with(&[verified(0), Row::RootRemoved])
+            .reader_may_start()
+            .is_err(),
+        "after the root was removed"
+    );
+}
+
 #[test]
 fn a_process_starts_only_after_the_grant_is_complete() {
     assert!(refused_after(&[begin()], &started()), "no grant at all");
