@@ -2955,6 +2955,8 @@ pub mod testing {
         Scanning,
         /// A barrier has the key's turn and has not yet read what the key holds under the gate.
         BeforeOwed,
+        /// A draft sweep, under the device's identifier, has begun and not yet read the folder.
+        Sweeping,
     }
 
     /// The operations that came to an [`Awaited`] place, and whether they may go on.
@@ -3007,7 +3009,7 @@ pub mod testing {
     }
 
     /// Waits at `point` while a gate is set for `key`.
-    pub(super) async fn gate(key: Uuid, point: Awaited) {
+    pub(crate) async fn gate(key: Uuid, point: Awaited) {
         let gate = GATES
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

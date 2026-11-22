@@ -116,6 +116,11 @@ fn folder(phone: &Phone) -> PathBuf {
     kept_in(phone.data.path())
 }
 
+/// The sweep's question for a case that has no other pairing: the pairing is the one in force.
+fn pairing_in_force() -> bool {
+    true
+}
+
 fn copies_in(folder: &Path) -> usize {
     std::fs::read_dir(folder)
         .map(|listing| {
@@ -1183,7 +1188,7 @@ async fn kr_req_23_41_a_start_ends_the_drafts_of_sessions_the_host_no_longer_lis
         Some(DraftRevision::new(1)),
     );
     assert_eq!(kept(companion, gone).await["made"], true);
-    drafts.sweep_after_reach(paired).await;
+    drafts.sweep_after_reach(paired, &pairing_in_force).await;
     assert_eq!(kept(companion, gone).await["made"], false);
     adopted.stop().await;
 }
@@ -1696,10 +1701,73 @@ async fn kr_req_13_12_an_entry_of_another_principal_is_dropped_with_its_copy_and
     assert_eq!(drafts_in(), 1);
 
     desk_of(companion).restart(paired.clone()).await;
-    drafts.sweep(paired, &[session]).await;
+    drafts.sweep(paired, &[session], &pairing_in_force).await;
     assert_eq!(entries_in(&folder(&phone)), 0);
     assert_eq!(copies_in(&folder(&phone)), 0);
     assert_eq!(drafts_in(), 0);
+    adopted.stop().await;
+}
+
+/// KR-REQ-13.12 (S2): the draft sweep of an old pairing has begun and not yet read the folder when a
+/// newer pairing saves a draft: the draft is another device's, but the sweeping pairing is no longer
+/// the one in force, so the sweep leaves it. While the pairing is the one in force the same sweep
+/// removes a draft of another device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_13_12_an_old_pairings_draft_sweep_pending_across_a_new_pairing_keeps_its_draft() {
+    use std::sync::atomic::AtomicBool;
+
+    let adopted = Adopted::start(1).await;
+    let (phone, _control) = phone_for(&adopted).await;
+    let companion = &phone.companion;
+    let old = paired_of(companion).await;
+    let newer = newer_pairing(&old);
+    let session = adopted.workers[0].session_id;
+    let drafts = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_drafts();
+    let in_force = Arc::new(AtomicBool::new(true));
+    let sweeping = testing::hold_awaited(old.device_id.get(), testing::Awaited::Sweeping);
+    let sweep = {
+        let (drafts, old, in_force) = (Arc::clone(&drafts), old.clone(), Arc::clone(&in_force));
+        tokio::spawn(async move {
+            drafts
+                .sweep(old, &[session], &|| in_force.load(Ordering::SeqCst))
+                .await;
+        })
+    };
+    arrived(&sweeping, 1).await;
+    // The newer pairing saves a draft after the sweep began and before it reads the folder, and the
+    // old pairing stops being the one in force.
+    drafts.keep_for_test(
+        &newer,
+        session,
+        &net_support::on_the_session(&adopted.host, session),
+        Some(kr_protocol::ids::DraftId::new(kr_ipc::new_uuid())),
+        Some(kr_protocol::ids::DraftRevision::new(1)),
+    );
+    assert_eq!(drafts_in(&folder(&phone)), 1);
+    in_force.store(false, Ordering::SeqCst);
+    sweeping.release();
+    tokio::time::timeout(WATCHDOG, sweep)
+        .await
+        .expect("the sweep ends")
+        .expect("the task ran");
+    assert_eq!(
+        drafts_in(&folder(&phone)),
+        1,
+        "the newer pairing's draft is still kept: the sweeping pairing was not the one in force"
+    );
+    // The same sweep while its pairing is the one in force drops the draft of another device.
+    in_force.store(true, Ordering::SeqCst);
+    drafts
+        .sweep(old, &[session], &|| in_force.load(Ordering::SeqCst))
+        .await;
+    assert_eq!(
+        drafts_in(&folder(&phone)),
+        0,
+        "a draft of another device is dropped while the pairing is the one in force"
+    );
     adopted.stop().await;
 }
 
@@ -1909,7 +1977,7 @@ async fn kr_req_23_41_the_sweep_ends_a_real_draft_on_its_own_target() {
         .state::<companion_tauri::AppState>()
         .paired_drafts();
 
-    drafts.sweep(paired.clone(), &[]).await;
+    drafts.sweep(paired.clone(), &[], &pairing_in_force).await;
     assert_eq!(kept(companion, session).await["made"], false);
     let again = paired
         .session
@@ -4628,7 +4696,9 @@ async fn kr_req_13_12_another_accounts_entries_are_neither_shown_nor_acted_on() 
     desk.host_reached(now.clone());
     desk.idle().await;
     desk.restart(now.clone()).await;
-    drafts.sweep_after_reach(now.clone()).await;
+    drafts
+        .sweep_after_reach(now.clone(), &pairing_in_force)
+        .await;
     // The upload's handle is bound to a draft by the new account: the earlier account's entry stays.
     desk.bound(&now.who(), left.handle.transfer_id).await;
     held("after");
@@ -4685,7 +4755,9 @@ async fn kr_req_13_12_an_account_sees_its_own_entries_and_drafts_again_when_it_s
     );
     // The other account reaches the host: nothing of the earlier account moves.
     desk.host_reached(now.clone());
-    drafts.sweep_after_reach(now.clone()).await;
+    drafts
+        .sweep_after_reach(now.clone(), &pairing_in_force)
+        .await;
     desk.idle().await;
     assert!(!left.sending.is_finished());
 
@@ -7464,7 +7536,7 @@ async fn kr_req_13_12_the_status_is_refused_after_the_last_local_record_ends() {
                 )
                 .await
                 .expect("the draft is discarded"),
-            _ => drafts.sweep(one.clone(), &[]).await,
+            _ => drafts.sweep(one.clone(), &[], &pairing_in_force).await,
         }
         assert!(
             !state.holds_transfer(&one.who(), id),

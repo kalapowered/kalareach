@@ -1158,8 +1158,9 @@ impl Drafts {
         }
     }
 
-    /// Reads the sessions the host lists, and ends the drafts of the ones it does not.
-    pub async fn sweep_after_reach(&self, paired: Paired) {
+    /// Reads the sessions the host lists, and ends the drafts of the ones it does not. `in_force`
+    /// says whether `paired` is still the pairing this device holds with the host.
+    pub async fn sweep_after_reach(&self, paired: Paired, in_force: &(dyn Fn() -> bool + Sync)) {
         let listed: kr_protocol::session::SessionListResult = match paired
             .session
             .read(
@@ -1179,14 +1180,30 @@ impl Drafts {
             .iter()
             .map(|summary| summary.session_id)
             .collect();
-        self.sweep(paired, &ids).await;
+        self.sweep(paired, &ids, in_force).await;
     }
 
     /// At each reach: the drafts of another principal on this host are dropped, and the drafts of this
     /// account whose session the host no longer lists are ended on the target they were made on. A
     /// draft of another account is left alone. A draft the host has already ended is harmless to end
     /// again.
-    pub async fn sweep(&self, paired: Paired, listed: &[SessionId]) {
+    ///
+    /// A draft of another device is dropped only while `in_force` says that `paired` is still the
+    /// pairing this device holds with the host: a pairing that has been replaced since the reach
+    /// owes the newer pairing's drafts nothing. It is asked at the removal, under the draft's turn,
+    /// after the file is read again.
+    pub async fn sweep(
+        &self,
+        paired: Paired,
+        listed: &[SessionId],
+        in_force: &(dyn Fn() -> bool + Sync),
+    ) {
+        #[cfg(feature = "testing")]
+        crate::open_transfers::testing::gate(
+            paired.device_id.get(),
+            crate::open_transfers::testing::Awaited::Sweeping,
+        )
+        .await;
         let Ok(root) = self.root() else { return };
         let Ok(listing) = std::fs::read_dir(&root) else {
             return;
@@ -1206,8 +1223,21 @@ impl Drafts {
                 continue;
             }
             if file.device_id != paired.device_id {
-                // Kept for a pairing that is not the one in force.
-                let _ = crate::drafts::remove_durably(&path);
+                // Kept for a pairing that is not the one in force. The listing is old by now: under
+                // the draft's turn the file is read again, and it goes only if it is still another
+                // device's of this environment and this pairing is still the one in force.
+                let _turn = self.turn_by_key(key_of_file(&file)).await;
+                let another = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<DraftFile>(&bytes).ok())
+                    .is_some_and(|again| {
+                        again.version == DRAFT_VERSION
+                            && again.environment_id == paired.environment_id
+                            && again.device_id != paired.device_id
+                    });
+                if another && in_force() {
+                    let _ = crate::drafts::remove_durably(&path);
+                }
                 continue;
             }
             if file.account != paired.account_id() {
