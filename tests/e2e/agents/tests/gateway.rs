@@ -2454,7 +2454,7 @@ impl Person {
             assert!(
                 started.elapsed() < LIVENESS,
                 "{why}: {} after {LIVENESS:?}:\n{}",
-                draft_showing(&rows, draft).map_or_else(
+                draft_showing(&rows, composer, draft).map_or_else(
                     || "the composer does not wait for a prompt".to_owned(),
                     |text| format!("the screen still shows the agent's start draft ({text})")
                 ),
@@ -2811,20 +2811,46 @@ fn new_rows<'a>(before: &[String], after: &'a [String]) -> Vec<&'a str> {
         .collect()
 }
 
+/// The characters of the frame a card is drawn in.
+const FRAME: [char; 3] = ['│', '┃', '║'];
+
+/// Whether `row` draws `text` as the agent's start draft does: the text alone on its row, the frame
+/// and the blanks beside it cut off (a line of its own, as the resume and fork drafts draw), or a
+/// whole field of a framed card row, bounded on each side by a blank or the frame (the header card's
+/// `model:     loading`). The text inside a longer word or a path (`/work/loading`, `loading-app`) is
+/// no draft, and neither is it in a row that is no card, such as a line of prose.
+fn draws_draft(row: &str, text: &str) -> bool {
+    let edge = |character: Option<char>| {
+        character.is_none_or(|character| character.is_whitespace() || FRAME.contains(&character))
+    };
+    row.trim_matches(|character: char| character.is_whitespace() || FRAME.contains(&character))
+        == text
+        || (row.trim_start().starts_with(FRAME)
+            && row.match_indices(text).any(|(at, _)| {
+                edge(row[..at].chars().next_back()) && edge(row[at + text.len()..].chars().next())
+            }))
+}
+
 /// The first of the entry's start draft texts that `rows` show, where the agent's start is still a
-/// draft whose composer is not yet the one a prompt is typed at. `None` where the entry names no
+/// draft whose composer is not yet the one a prompt is typed at. The agent draws the draft above
+/// its composer, so only the rows above the first row that shows `composer` count (a status line
+/// below it does not), and only as [`draws_draft`] reads a row. `None` where the entry names no
 /// text or none shows.
-fn draft_showing<'t>(rows: &[String], draft: &'t [String]) -> Option<&'t str> {
+fn draft_showing<'t>(rows: &[String], composer: &str, draft: &'t [String]) -> Option<&'t str> {
+    let above = rows
+        .iter()
+        .position(|row| row.contains(composer))
+        .unwrap_or(rows.len());
     draft
         .iter()
         .map(String::as_str)
-        .find(|text| rows.iter().any(|row| row.contains(text)))
+        .find(|text| rows[..above].iter().any(|row| draws_draft(row, text)))
 }
 
 /// Whether the agent's start is over on `rows`: its composer shows, and none of the entry's start
 /// draft texts does. A composer drawn while the start is still a draft drops what is typed at it.
 fn start_is_over(rows: &[String], composer: &str, draft: &[String]) -> bool {
-    rows.iter().any(|row| row.contains(composer)) && draft_showing(rows, draft).is_none()
+    rows.iter().any(|row| row.contains(composer)) && draft_showing(rows, composer, draft).is_none()
 }
 
 /// Said at a part's first start where the entry names no start draft text: nothing waits for the
@@ -2866,6 +2892,78 @@ fn a_composer_drawn_beside_the_start_draft_is_not_the_real_screen() {
     assert!(
         start_is_over(&drawn, composer, &[]),
         "an entry that names no draft text has none to wait for"
+    );
+}
+
+/// A `loading` in a path, in a status line under the composer or in the history is not the start
+/// draft, and the header card's `loading` and the resume and fork lines are, framed or not: a start
+/// that is over stays over where the real screen holds the word elsewhere, and a start that is a
+/// draft stays one.
+#[test]
+fn a_loading_in_a_path_a_status_line_or_the_history_is_not_the_start_draft() {
+    let rows = |rows: &[&str]| rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
+    let composer = "Ask Codex to do anything";
+    let draft = [
+        "loading".to_owned(),
+        "Resuming session…".to_owned(),
+        "Forking session…".to_owned(),
+    ];
+    let elsewhere = rows(&[
+        "│ model:     gpt-5.5   /model to change │",
+        "│ directory: /work/loading │",
+        "│ directory: ~/loading-app │",
+        "› the loading screen shows a spinner",
+        "  Codex is loading it",
+        "› Ask Codex to do anything",
+        "  gpt-5.5 loading · ~/work",
+        "  loading",
+    ]);
+    assert_eq!(
+        draft_showing(&elsewhere, composer, &draft),
+        None,
+        "a path, the history and the status line under the composer are no draft"
+    );
+    assert!(
+        start_is_over(&elsewhere, composer, &draft),
+        "a correct start with the word elsewhere on the screen is over"
+    );
+    assert_eq!(
+        draft_showing(
+            &rows(&[
+                "│ model:     loading   /model to change │",
+                "› Ask Codex to do anything",
+            ]),
+            composer,
+            &draft
+        ),
+        Some("loading"),
+        "the header card's field is the draft"
+    );
+    assert_eq!(
+        draft_showing(
+            &rows(&["  Resuming session…", "› Ask Codex to do anything"]),
+            composer,
+            &draft
+        ),
+        Some("Resuming session…"),
+        "the resume line, alone on its row, is the draft"
+    );
+    assert_eq!(
+        draft_showing(
+            &rows(&["│  Forking session…  │", "› Ask Codex to do anything"]),
+            composer,
+            &draft
+        ),
+        Some("Forking session…"),
+        "the fork line inside a frame is the draft"
+    );
+    assert!(
+        !start_is_over(
+            &rows(&["  loading", "› Ask Codex to do anything"]),
+            composer,
+            &draft
+        ),
+        "the word alone on its row above the composer is the draft"
     );
 }
 

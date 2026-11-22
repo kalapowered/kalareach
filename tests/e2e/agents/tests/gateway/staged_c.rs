@@ -1459,7 +1459,7 @@ fn second_screen(
         return Some((Started::Ended, None));
     }
     if rows.iter().any(|row| row.contains(composer)) {
-        return if draft_showing(rows, draft).is_some() {
+        return if draft_showing(rows, composer, draft).is_some() {
             None
         } else {
             Some((Started::Running, None))
