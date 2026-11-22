@@ -386,7 +386,7 @@ fn names_plain_daemon(value: &str) -> bool {
 /// why none of them starts the plain daemon: the held build is placed under the installed name, and
 /// a fixture or a message holds the name without running anything. A string in any other function,
 /// or beyond a listed count, is refused.
-const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 17] = [
+const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 19] = [
     (
         "crates/kr-cli/tests/bridged_session.rs",
         &[
@@ -454,6 +454,29 @@ const PLAIN_DAEMON_NAMES: [(&str, &[Entry]); 17] = [
             1,
             "the held daemon, or the script that hands over to it, placed under the installed name; nothing starts the plain build",
         )],
+    ),
+    (
+        "crates/kr-cli/tests/retained_surface/compiler.rs",
+        &[(
+            "excluded",
+            1,
+            "a package name the retained switch's compile leaves out of a build, passed to cargo as `--exclude`; the compile starts no daemon",
+        )],
+    ),
+    (
+        "crates/kr-cli/tests/retained_surface/compiler_cases.rs",
+        &[
+            (
+                "protocol",
+                1,
+                "the name of a crate in a fixture workspace the compiler reads, written to a manifest; nothing starts it",
+            ),
+            (
+                "the_windows_check_leaves_out_the_members_that_depend_directly_on_the_model_runtime",
+                3,
+                "the package names a configuration leaves out, compared with what the compiler names; nothing starts them",
+            ),
+        ],
     ),
     (
         "crates/kr-cli/tests/session_commands.rs",
