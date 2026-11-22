@@ -392,8 +392,9 @@ fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Opt
 /// Copied once for this whole process into the run's own directory on the internal disk, which
 /// goes when the process does. A build of this crate alone builds `kr` and the guard; the others
 /// are built by a workspace run, or by `cargo build -p kr-controller -p kr-worker -p kr-hook -p
-/// kr-plugin-host` and `cargo build -p kr-describe-model --bin kr-describe-inference`, and a run
-/// without them fails and says so rather than passing without having tested anything.
+/// kr-plugin-host`, `cargo build -p kr-controller --features testing --bin kr-controller-held` and
+/// `cargo build -p kr-describe-model --bin kr-describe-inference`, and a run without them fails and
+/// says so rather than passing without having tested anything.
 fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
     static COPIED: OnceLock<Vec<(&'static str, PathBuf, Digest256, u64)>> = OnceLock::new();
     COPIED.get_or_init(|| {
