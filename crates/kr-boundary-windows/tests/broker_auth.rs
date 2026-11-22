@@ -24,7 +24,9 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, LocalFree,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
-use windows_sys::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName;
+use windows_sys::Win32::Security::Isolation::{
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+};
 use windows_sys::Win32::Security::{
     ACL, CreateRestrictedToken, DACL_SECURITY_INFORMATION, DuplicateTokenEx, GetAce,
     GetTokenInformation, ImpersonateLoggedOnUser, RevertToSelf, SECURITY_CAPABILITIES,
@@ -57,7 +59,10 @@ use kr_boundary_windows::standing::{
 use kr_boundary_windows::win::channel::{Outcome, make_data_pipes};
 use kr_boundary_windows::win::client::{ClientIdentity, client_from_pipe, facts_of};
 use kr_boundary_windows::win::ffi::{self, Handle, Sid, wide};
-use kr_boundary_windows::win::pipe::{Connection, Kind, Listener, Stop};
+use kr_boundary_windows::win::install::Paths;
+use kr_boundary_windows::win::pipe::{
+    Connection, Kind, Listener, ServerProcess, Stop, connect_held,
+};
 use kr_boundary_windows::win::rights::{
     ImpersonationToken, Right, Sd, may, probe_token, system_may,
 };
@@ -307,6 +312,16 @@ fn broker_auth_a_person_is_identified_from_the_pipe_and_a_pid_in_a_message_chang
         let who = client_from_pipe(&connection);
         let alive_while_it_waits = who.as_ref().ok().map(|who| who.has_exited().unwrap());
         frame::write(&mut connection, &Response::Hello { version: 1 }).unwrap();
+        // The connection is closed when this closure ends, which drops what the client has not read:
+        // the client's own process ending is what shows that it read the answer.
+        if let Ok(who) = &who {
+            let ended =
+                ffi::wait(who.process.raw(), 60_000, "waiting for the client to end").unwrap();
+            assert!(
+                matches!(ended, ffi::Waited::Signalled(_)),
+                "the client read the answer and ended"
+            );
+        }
         (first, who, alive_while_it_waits)
     });
     let child = spawn_as(&person.primary, "person");
@@ -589,12 +604,23 @@ fn broker_auth_a_token_of_an_app_container_is_read_as_one() {
     }
     let name = wide("krauthcontainer");
     let mut container: *mut c_void = null_mut();
-    // SAFETY: the name is NUL-terminated and the result is freed below.
+    // SAFETY: the names are NUL-terminated; the identifier is freed below. A profile that is already
+    // there (an earlier run of the case) is asked for by its name.
     unsafe {
-        assert_eq!(
-            DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &raw mut container),
-            0
+        let made = CreateAppContainerProfile(
+            name.as_ptr(),
+            name.as_ptr(),
+            name.as_ptr(),
+            null(),
+            0,
+            &raw mut container,
         );
+        if made != 0 {
+            assert_eq!(
+                DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &raw mut container),
+                0
+            );
+        }
     }
     let mut capabilities = SECURITY_CAPABILITIES {
         AppContainerSid: container,
@@ -674,6 +700,7 @@ fn broker_auth_a_token_of_an_app_container_is_read_as_one() {
         CloseHandle(info.hProcess);
         CloseHandle(info.hThread);
         LocalFree(container);
+        DeleteAppContainerProfile(name.as_ptr());
     }
     assert!(facts.app_container, "{facts:?}");
     assert!(facts.integrity < MEDIUM_INTEGRITY, "{facts:?}");
@@ -842,13 +869,14 @@ fn broker_auth_the_rights_come_from_the_descriptor_and_agree_with_a_real_open() 
         );
     }
     // The broker's own token, with its privileges off, asks what the list gives the system.
-    let (_, only_the_person) = folder(
+    let (_, system_reads_the_list_only) = folder(
         &scratch,
-        "person_only",
-        &format!("O:{who}D:P(A;OICI;FA;;;{who})"),
+        "system_reads_the_list_only",
+        &format!("O:BAD:P(A;OICI;0x20000;;;SY)(A;OICI;FA;;;{who})"),
     );
     let (_, system_full) = folder(&scratch, "system_full", "O:SYD:P(A;OICI;FA;;;SY)");
-    assert!(!system_may(&only_the_person, Right::ReadControl));
+    assert!(system_may(&system_reads_the_list_only, Right::ReadControl));
+    assert!(!system_may(&system_reads_the_list_only, Right::ReadData));
     assert!(system_may(&system_full, Right::WriteDac));
 }
 
@@ -1212,4 +1240,126 @@ fn broker_auth_a_handle_value_in_an_operate_frame_is_an_unknown_field_and_nothin
         );
     }
     assert_eq!(after, before, "the reader duplicated no handle");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The pipe's server and its protocol
+// ---------------------------------------------------------------------------------------------
+
+/// The broker's own loop in this process for everyone, ended by the stop.
+fn serve_the_brokers_loop() -> (Arc<Stop>, JoinHandle<Result<(), String>>) {
+    assert!(
+        std::fs::metadata(Kind::Persons.name()).is_err(),
+        "the machine is not clean: the broker's pipe is in use"
+    );
+    let stop = Stop::new().unwrap();
+    let thread = std::thread::spawn({
+        let stop = Arc::clone(&stop);
+        move || {
+            let everyone = Sid::parse("S-1-1-0").unwrap();
+            broker::testing::serve(
+                Manifest::begin(),
+                Paths::system().expect("the system's folders are read"),
+                &[everyone],
+                stop,
+            )
+        }
+    });
+    (stop, thread)
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn broker_auth_a_wrong_protocol_version_is_refused_by_the_running_broker() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: needs the system's token");
+        return;
+    }
+    let (stop, thread) = serve_the_brokers_loop();
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let pipe = loop {
+        match open_pipe(Kind::Persons.name(), pipe_access::CLIENT, 0x0001_0000) {
+            Ok(pipe) => break pipe,
+            Err(code) => {
+                assert!(
+                    std::time::Instant::now() < until,
+                    "the pipe did not open: {code}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    write_all(&pipe, &framed(r#"{"request":"hello","version":99}"#));
+    let size = read_some(&pipe, 4).expect("the answer's length");
+    let length = u32::from_le_bytes(size.try_into().unwrap()) as usize;
+    let body = read_some(&pipe, length).expect("the answer");
+    let answer: Response = serde_json::from_slice(&body).unwrap();
+    assert!(
+        matches!(
+            answer,
+            Response::Refused {
+                reason: frame::Refusal::Version,
+                ..
+            }
+        ),
+        "{answer:?}"
+    );
+    drop(pipe);
+    stop.set();
+    assert_eq!(thread.join().unwrap(), Ok(()));
+}
+
+#[test]
+#[ignore = "runs as the system in a disposable guest"]
+fn broker_auth_an_impostor_that_took_the_pipes_name_first_is_refused_by_the_service_and_the_host() {
+    if !runs_as_the_system() {
+        eprintln!("SKIPPED: needs the system's token");
+        return;
+    }
+    assert!(
+        std::fs::metadata(Kind::Persons.name()).is_err(),
+        "the machine is not clean: the broker's pipe is in use"
+    );
+    // The impostor makes the pipe first.
+    let impostor_stop = Stop::new().unwrap();
+    let _impostor = Listener::bind(Kind::Persons, &[], Arc::clone(&impostor_stop)).unwrap();
+    // The service cannot take the name: it ends with the platform's refusal instead of serving beside it.
+    let (stop, thread) = {
+        let stop = Stop::new().unwrap();
+        let thread = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                broker::testing::serve(
+                    Manifest::begin(),
+                    Paths::system().expect("the system's folders are read"),
+                    &[],
+                    stop,
+                )
+            }
+        });
+        (stop, thread)
+    };
+    let served = thread.join().unwrap();
+    stop.set();
+    assert!(
+        served.is_err(),
+        "the service refused to start beside the impostor: {served:?}"
+    );
+    // The host holds the process the service manager named, and the pipe's server is another process.
+    let mut stand_in = std::process::Command::new("ping")
+        .args(["-n", "60", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let held = ServerProcess::open(stand_in.id()).unwrap();
+    let refused = connect_held(Kind::Persons, &held).err();
+    let _ = stand_in.kill();
+    let _ = stand_in.wait();
+    let refused = refused.expect("the host refuses a server that is not the held process");
+    assert!(
+        refused
+            .to_string()
+            .contains(&format!("process {}", std::process::id())),
+        "{refused}"
+    );
 }
