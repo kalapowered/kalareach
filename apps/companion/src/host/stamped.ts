@@ -85,7 +85,9 @@ export class AccountMark {
   /**
    * Follows the account: the listener is registered before the status is read, and each event is
    * followed by a read of the status, of which only the newest counts. The first read is the
-   * baseline and says nothing changed. Answers a function that stops following.
+   * baseline and says nothing changed; it is made once the registration has settled, so that a
+   * change that came while the listener was not yet in place is in the baseline, and every later
+   * one is an event. Answers a function that stops following.
    */
   follow(port: HostPort, onChange?: (change: AccountChange) => void): () => void {
     let stopped = false
@@ -106,12 +108,16 @@ export class AccountMark {
         this.#note(view)
         if (keyOf(view) !== undefined) settle()
       })
-      .then((off) => {
-        if (stopped) off()
-        else unlisten = off
+      .then(
+        (off) => {
+          if (stopped) off()
+          else unlisten = off
+        },
+        () => undefined
+      )
+      .then(() => {
+        if (!stopped) settle()
       })
-      .catch(() => undefined)
-    settle()
     return () => {
       stopped = true
       unlisten?.()
@@ -143,13 +149,34 @@ export class AccountMark {
  */
 export class ConnectedHost {
   #organisation: string | null = null
+  /** The number of the newest read made or event heard. */
+  #clock = 0
+  /** The number of the newest read or event that was applied. */
+  #applied = 0
 
   /** The environment of the organisation host last connected, none when the last host connected answers to none. */
   get organisation(): string | null {
     return this.#organisation
   }
 
-  readonly note = (state: ConnectionState): void => {
+  /** A read of the connection is about to be made: the number that orders its answer against what is heard after it. */
+  asked(): number {
+    return ++this.#clock
+  }
+
+  /** An event of the connection, applied at once: it is newer than every read made before it. */
+  readonly heard = (state: ConnectionState): void => {
+    this.#apply(++this.#clock, state)
+  }
+
+  /** The answer to the read numbered `ticket`, dropped when an event or an answer newer than the read was applied first. */
+  answered(ticket: number, state: ConnectionState): void {
+    this.#apply(ticket, state)
+  }
+
+  #apply(ticket: number, state: ConnectionState): void {
+    if (ticket < this.#applied) return
+    this.#applied = ticket
     if (state.connected) this.#organisation = state.organisation === true ? state.environment_id : null
   }
 }
@@ -168,23 +195,26 @@ export function portUnderMark(port: HostPort, mark: string | undefined): HostPor
  * The port with the account's mark added, last, to each command that acts for an account. The mark
  * is read as the command is made.
  */
-export function stampedPort(
-  port: HostPort,
-  mark: () => string | undefined,
-  connection?: (state: ConnectionState) => void
-): HostPort {
+export function stampedPort(port: HostPort, mark: () => string | undefined, connection?: ConnectedHost): HostPort {
   const stamped = Object.create(port) as Record<string | symbol, unknown>
   stamped[ROOT] = rootOf(port)
   if (connection !== undefined) {
-    // The states the screens read and hear are passed to `connection` as they go by: nothing more is asked.
+    // The states the screens read and hear are passed to `connection` as they go by: nothing more is
+    // asked. A read takes its number when it is made, so that its answer cannot undo a newer event.
     stamped.connectionState = () => {
+      const ticket = connection.asked()
       const read = port.connectionState()
-      read.then(connection, () => undefined)
+      read.then(
+        (state) => {
+          connection.answered(ticket, state)
+        },
+        () => undefined
+      )
       return read
     }
     stamped.onConnection = (listener: (state: ConnectionState) => void) =>
       port.onConnection((state) => {
-        connection(state)
+        connection.heard(state)
         listener(state)
       })
   }

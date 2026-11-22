@@ -148,7 +148,7 @@ export function AppProvider({
   const markNow = accountMark.read
   const [connectedHost] = useState(() => new ConnectedHost())
   const port = useMemo(
-    () => stampedPort(hostPort, markNow, connectedHost.note),
+    () => stampedPort(hostPort, markNow, connectedHost),
     [hostPort, markNow, connectedHost]
   )
   const [place, setPlace] = useState<Place>(initialPlace)
