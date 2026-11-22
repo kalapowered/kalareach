@@ -500,8 +500,7 @@ pub fn read_history(
 }
 
 /// How many tags are read at once: four, so that the reading of every release tag takes about a
-/// third of the time one at a time would (685 s against 2038 s here). The hour that the history case
-/// is held to is its own assertion, and the box script kills the run above it.
+/// third of the time one at a time would (685 s against 2038 s here).
 const READ_WIDTH: usize = 4;
 
 /// Runs `read` on each of `items` in a thread of its own, at most `width` of them at once (one, for a

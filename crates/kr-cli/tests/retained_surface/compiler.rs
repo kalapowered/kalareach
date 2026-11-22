@@ -1734,7 +1734,7 @@ pub fn candidates(text: &str, file: &str) -> Result<Vec<Candidate>, String> {
 /// that refuse the reading.
 pub type Reading = Result<Vec<Sighting>, Vec<String>>;
 
-/// The text of each refusal, as the lead approved it.
+/// The text of each refusal of the reading.
 pub mod refusal {
     pub fn platform_missing(platform: &str) -> String {
         format!("the platform {platform} was not read, so the reading is not complete")

@@ -1,7 +1,7 @@
 //! The cases of the compiler's reading: the stamp, the report of each way Rust binds a name (one
 //! crate of a fixture workspace for each, built by the pinned compiler), the closed check and each
-//! refusal with its text. The reading of this checkout and of the release tags are ignored cases that
-//! the box steps run.
+//! refusal with its text. The readings of this checkout and of the release tags are ignored cases,
+//! which build copies of trees and run only with `--ignored`.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -837,7 +837,7 @@ fn refused(
 }
 
 #[test]
-fn each_refusal_of_the_reading_has_the_text_the_lead_approved() {
+fn each_refusal_of_the_reading_has_its_text() {
     let (root, meta, platform) = reports_for_refusals();
     let host = compiler::host_name();
     // A platform that was not read.
