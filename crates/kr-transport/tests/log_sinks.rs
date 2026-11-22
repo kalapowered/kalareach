@@ -90,6 +90,24 @@ fn approved() -> Vec<(&'static str, String, usize)> {
             .to_owned(),
             1,
         ),
+        (
+            "apps/companion/src-tauri/src/account/navigation.rs",
+            concat!(
+                "tracing::subscriber::with_",
+                "default(written.clone(), || decide(&nested_blobs(), None));"
+            )
+            .to_owned(),
+            1,
+        ),
+        (
+            "apps/companion/src-tauri/src/account/navigation.rs",
+            concat!(
+                "tracing::subscriber::with_",
+                "default(written.clone(), || {"
+            )
+            .to_owned(),
+            1,
+        ),
     ]
 }
 
