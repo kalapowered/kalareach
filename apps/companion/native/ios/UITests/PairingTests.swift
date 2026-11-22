@@ -777,4 +777,211 @@ final class PairingTests: DeviceTestCase {
         let wanted = "^phone connections served at the choice: [1-9][0-9]*\\ncontrol before read: served items=0\\ncontrol after host\\.info: \(refused)\\ncontrol after session\\.open: \(refused)\\ncontrol after read: \(refused)$"
         XCTAssertNotNil(result.range(of: wanted, options: .regularExpression), "the second host did not answer as expected: \(result)")
     }
+
+    // MARK: The sessions leg
+
+    /// What the person writes in the composer of the first host's second session, and then of the second
+    /// host's session; and the line typed into the first host's second session's terminal view. The host's
+    /// own files say what each agent was sent and what each session's screen shows.
+    private let commandFirst = "Summarise the open changes on the first host"
+    private let commandSecond = "Summarise the open changes on the second host"
+    private let terminalLine = "hello from the phone on the first host"
+
+    /// Asks the sessions leg's host a question and waits for its answer. What it is asked for goes in
+    /// `want-<phase>.txt` before the request, and the host takes the request away when it is done, so a
+    /// later request is a new one.
+    private func askAbout(_ phase: String, _ wanted: String, timeout: TimeInterval = 150) {
+        try? FileManager.default.removeItem(atPath: path("done-\(phase)"))
+        FileManager.default.createFile(atPath: path("want-\(phase).txt"), contents: Data((wanted + "\n").utf8))
+        touch("go-\(phase)")
+        waitFor("done-\(phase)", timeout: timeout)
+    }
+
+    /// Keeps one of the host's answers under another name, which the script reads after the host's next
+    /// answer of that kind has replaced it.
+    private func keep(_ name: String, as other: String) {
+        FileManager.default.createFile(atPath: path(other), contents: Data((read(name) + "\n").utf8))
+    }
+
+    /// Scans the picture of a host's invitation, shows the value the host shows and is paired once the
+    /// host approves it.
+    private func pairWith(_ phase: String, valueFile: String, approve: String, shot: String) {
+        openHosts()
+        begin(phase, picture: phase)
+        chooseTheNewestPicture()
+        waitToShow("Invitation from a host")
+        screenshot("\(shot)-scanned-summary")
+        press("Pair")
+        waitToShow("Check this value on the host")
+        waitFor(valueFile)
+        let host = read(valueFile).replacingOccurrences(of: " ", with: "")
+        let spelled = host.map { String($0) }.joined(separator: " ")
+        let first = String(spelled.prefix(7)), second = String(spelled.suffix(7))
+        waitToShow("\(first), \(second)", timeout: 10)
+        touch(approve)
+        waitToShow("Paired with", timeout: 120)
+        waitFor("done-\(phase)")
+    }
+
+    /// The first eight characters of the environment the Hosts tab shows as in use: the name of the host
+    /// row whose centre is nearest the words `In use`, among the rows that name an environment.
+    private func hostInUse() -> String? {
+        let used = app.staticTexts.matching(NSPredicate(format: "label == 'In use'")).firstMatch
+        guard used.exists else { return nil }
+        let names = app.staticTexts.matching(NSPredicate(format: "label MATCHES %@", "environment [0-9a-f]{8} on .*")).allElementsBoundByIndex
+        let nearest = names.min { abs($0.frame.midY - used.frame.midY) < abs($1.frame.midY - used.frame.midY) }
+        return nearest?.label.split(separator: " ").dropFirst().first.map(String.init)
+    }
+
+    /// Waits until the list shows the rows of exactly these sessions. The first host holds sessions 1 and
+    /// 2 and the second host holds session 1, so the list of one host is told from the other's by how
+    /// many sessions it shows, and by the host in use.
+    private func rowsListed(_ numbers: Set<Int>, _ what: String) {
+        eventually(what, timeout: 90) {
+            let listed = Set([1, 2].filter { number in
+                app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Session \(number)")).firstMatch.exists
+            })
+            return listed == numbers
+        }
+    }
+
+    /// Opens the session `number` from the list and waits for its composer.
+    private func openSession(_ number: Int) {
+        let row = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "Session \(number)")).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 90), "session \(number) is not listed")
+        row.tap()
+        XCTAssertTrue(composer.waitForExistence(timeout: 60), "session \(number) shows no composer")
+    }
+
+    /// The software keyboard covers the Send control, and its accessory bar has the control that puts it
+    /// away. A page can hold a hidden Done control of its own: the one pressed is the one on the screen.
+    private func putTheKeyboardAway() {
+        guard app.keyboards.count > 0 else { return }
+        // The keyboard tells a person once about typing by sliding a finger across it, over its own keys:
+        // it is answered as the person would, with Continue.
+        let tip = app.buttons.matching(NSPredicate(format: "label == 'Continue'")).allElementsBoundByIndex.first { $0.isHittable }
+        tip?.tap()
+        let visibleDone = { () -> XCUIElement? in
+            self.app.buttons.matching(NSPredicate(format: "label == 'Done'")).allElementsBoundByIndex.first { $0.isHittable }
+        }
+        if !waitUntil(8, { visibleDone() != nil }) { screenshot("keyboard-without-done-\(sendOutcomes)") }
+        visibleDone()?.tap()
+        XCTAssertTrue(waitUntil(15) { self.app.keyboards.count == 0 }, "the keyboard did not go away")
+    }
+
+    /// Writes `text` in the open session's composer and sends it, and waits until the phone says the host
+    /// answered it.
+    private func writeAndSend(_ text: String) {
+        composer.tap()
+        composer.typeText(text)
+        eventually("the composer to hold what was written") { composerText() == text }
+        putTheKeyboardAway()
+        eventually("the Send control to be enabled", timeout: 60) { app.buttons["Send"].firstMatch.isEnabled }
+        press("Send")
+        // The page says what became of the send in one of these words; the picture shows which.
+        let outcomes = ["Applied", "Refused by the host", "Rejected", "Not taken for now", "Outcome unknown"]
+        var said = ""
+        _ = waitUntil(60) {
+            said = outcomes.first { shows($0) } ?? ""
+            return !said.isEmpty
+        }
+        screenshot("send-outcome-\(sendOutcomes)")
+        sendOutcomes += 1
+        XCTAssertEqual(said, "Applied", "the phone does not say the send is applied: \(said.isEmpty ? (shows("Sent, waiting for the host") ? "it still waits for the host" : "it says nothing of it") : said)")
+    }
+
+    /// How many sends the leg has made, so that each one's picture has a name of its own.
+    private var sendOutcomes = 0
+
+    /// The phone is paired with a host that holds two sessions and with a second host that holds one, each
+    /// as an owner device. It lists the first host's sessions, opens the second of them and sends it a
+    /// message and a typed line; chooses the second host and does the same there; and chooses the first
+    /// again. Each step is read against what the host it concerns recorded. Run only when the script asks
+    /// for the sessions leg (`KR_PAIRING_LEG=sessions`), which has the host hold what this needs.
+    func testZSessionsHostChoiceAndCommands() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["KR_PAIRING_LEG"] == "sessions", "the sessions leg is not asked for")
+        pairWith("direct", valueFile: "host-value.txt", approve: "approve", shot: "first")
+        pairWith("second", valueFile: "second-value.txt", approve: "second-approve", shot: "second")
+        let first = String(read("first-environment.txt").prefix(8))
+        let second = String(read("second-environment.txt").prefix(8))
+        for environment in [first, second] {
+            XCTAssertNotNil(environment.range(of: "^[0-9a-f]{8}$", options: .regularExpression), "a host named no environment: \(environment)")
+        }
+        openHosts()
+        XCTAssertTrue(app.buttons["Use this host"].firstMatch.waitForExistence(timeout: 60), "the second host is not listed to be used")
+        XCTAssertEqual(hostInUse(), first, "the host in use is not the first")
+        screenshot("hosts-two-hosts")
+        say("PAIRING the phone is paired with two hosts as an owner device of each, and the first stays in use")
+
+        // The first host's sessions: what the phone lists is what the host lists.
+        openShell("Sessions")
+        rowsListed([1, 2], "the first host's two sessions")
+        askAbout("listed", "1")
+        XCTAssertEqual(read("listed-1.txt"), "host=1 sessions=1,2", "the first host lists other sessions")
+        screenshot("sessions-first-host")
+        say("PAIRING the phone lists the first host's two sessions and none of the second host's, as the host lists them")
+
+        // The second of them, and a message written in it.
+        openSession(2)
+        screenshot("session-two-open")
+        writeAndSend(commandFirst)
+        screenshot("session-two-message-sent")
+        askAbout("received", "1:2")
+        keep("received-1-2.txt", as: "received-1-2-first.txt")
+        XCTAssertEqual(read("received-1-2.txt"), "h1s1=0 h1s2=1 h2s1=0 target=h1s2 text=\(commandFirst)", "the agents were not sent what was written")
+        say("PAIRING a message written in the first host's second session reached the agent of that session once and no other agent")
+
+        // A line typed into the terminal view of the same session.
+        switchView("Terminal")
+        // The terminal takes keys only once the person has taken control of the session's input.
+        pressControl("Take control")
+        let program = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'Type to the program'")).firstMatch
+        XCTAssertTrue(program.waitForExistence(timeout: 30), "the terminal view shows no keyboard field")
+        program.tap()
+        program.typeText(terminalLine + "\n")
+        screenshot("session-two-terminal-line")
+        askAbout("received", "1:2:line")
+        let shown = read("screen-1-2.txt")
+        XCTAssertNotNil(shown.range(of: "^h1s1=0 h1s2=[2-9] h2s1=0 text=\(terminalLine)$", options: .regularExpression), "the session's program was not sent the typed line: \(shown)")
+        say("PAIRING a line typed into the first host's second session's terminal view reached that session's program and no other")
+        press("Back to sessions")
+
+        // The second host is chosen, and its session is listed in place of the first host's.
+        openTab("Hosts")
+        press("Use this host")
+        eventually("the second host to be in use", timeout: 60) { hostInUse() == second }
+        screenshot("hosts-second-in-use")
+        askAbout("chosen", "2")
+        let chosen = read("chosen-2.txt")
+        XCTAssertNotNil(chosen.range(of: "^host=2 h1=[0-9]+ h2=[1-9][0-9]*$", options: .regularExpression), "the second host serves no connection of the phone: \(chosen)")
+        openTab("Sessions")
+        rowsListed([1], "the second host's one session, and not the first host's two")
+        askAbout("listed", "2")
+        XCTAssertEqual(read("listed-2.txt"), "host=2 sessions=1", "the second host lists other sessions")
+        screenshot("sessions-second-host")
+        say("PAIRING the phone chose the second host and lists its one session in place of the first host's two, as that host lists it")
+
+        // A message written in the second host's session reaches that host's agent, and nothing reaches the first's.
+        openSession(1)
+        writeAndSend(commandSecond)
+        screenshot("second-host-session-message-sent")
+        askAbout("received", "2:1")
+        XCTAssertEqual(read("received-2-1.txt"), "h1s1=0 h1s2=1 h2s1=1 target=h2s1 text=\(commandSecond)", "the second host's agent was not sent the message alone")
+        say("PAIRING a message written in the second host's session reached that host's agent once and none of the first host's")
+        press("Back to sessions")
+
+        // The first host is chosen again: its two sessions return, and choosing sent nothing.
+        openTab("Hosts")
+        press("Use this host")
+        eventually("the first host to be in use", timeout: 60) { hostInUse() == first }
+        askAbout("chosen", "1")
+        let chosenAgain = read("chosen-1.txt")
+        XCTAssertNotNil(chosenAgain.range(of: "^host=1 h1=[1-9][0-9]* h2=[0-9]+$", options: .regularExpression), "the first host serves no connection of the phone: \(chosenAgain)")
+        openTab("Sessions")
+        rowsListed([1, 2], "the first host's two sessions again")
+        screenshot("sessions-first-host-again")
+        askAbout("received", "1:2")
+        XCTAssertEqual(read("received-1-2.txt"), "h1s1=0 h1s2=1 h2s1=1 target=h1s2 text=\(commandFirst)", "choosing a host sent something")
+        say("PAIRING the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything")
+    }
 }

@@ -2,7 +2,7 @@
 """Drives the installed companion application on the Android emulator through its own screens, for
 `scripts/e2e-pairing-device.sh android`.
 
-Four commands:
+Five commands:
 
   aim <grpc port>
       Moves the emulator's virtual camera to its first view of the wall's picture. The emulator's
@@ -20,6 +20,13 @@ Four commands:
       `scripts/e2e-pairing-issuer-device.sh android`: scans the invitation the command drew, writes the
       value the phone shows to `phone-value.txt` in the issuer directory, and waits for the command's
       approval before it waits for the paired screen.
+
+  sessions <adb> <serial> <harness directory> <screenshot directory> <grpc port>
+      Runs the sessions leg against a host that holds two sessions and a second host that holds one
+      (`KR_PAIRING_LEG=sessions`): the phone is paired with both as an owner device, lists the first
+      host's sessions, opens the second of them and sends it a message and a typed line, chooses the
+      second host and does the same there, and chooses the first again. Each step is read against
+      what the host it concerns recorded. Lines are printed as `drive` prints them.
 
   release <adb> <serial> <harness directory> <screenshot directory> <port> <attempts file>
       Drives the minified release build through its pairing screen, for
@@ -1164,6 +1171,260 @@ def issuer(adb: str, serial: str, directory: Path, shots: Path, port: str) -> No
     phone.shot("paired")
 
 
+# ---- The sessions leg ----------------------------------------------------------------------------
+
+# What the person writes in the composer of the first host's second session, and then of the second host's
+# session; and the line typed into the first host's second session's terminal view. The host's own files
+# say what each agent was sent and what each session's screen shows.
+COMMAND_FIRST = "Summarise the open changes on the first host"
+COMMAND_SECOND = "Summarise the open changes on the second host"
+TERMINAL_LINE = "hello from the phone on the first host"
+
+
+def ask_about(directory: Path, phase: str, wanted: str, timeout: float = 150) -> None:
+    """Asks the sessions leg's host a question and returns what it wrote. What it is asked for goes in
+    `want-<phase>.txt` before the request, and the host takes the request away when it is done, so a
+    later request is a new one."""
+    (directory / f"done-{phase}").unlink(missing_ok=True)
+    (directory / f"want-{phase}.txt").write_text(f"{wanted}\n")
+    touch(directory, f"go-{phase}")
+    wait_for_file(directory, f"done-{phase}", timeout)
+
+
+def keep(directory: Path, name: str, as_name: str) -> str:
+    """Reads one of the host's answers and keeps it under another name, which the script reads after
+    the host's next answer of that kind has replaced it."""
+    text = read(directory, name)
+    (directory / as_name).write_text(text + "\n")
+    return text
+
+
+def session_row(number: int):
+    """Whether a label is the row of session `number` in the list, and not a tab's name."""
+    return lambda each: f"Session {number}" in each and not each.startswith(("Sessions", "Attention"))
+
+
+def rows_listed(phone: Phone, numbers: list[int], what: str) -> None:
+    """Waits until the list shows the rows of exactly these sessions. The first host holds sessions 1 and
+    2 and the second host holds session 1, so the list of one host is told from the other's by how many
+    sessions it shows, and by the host in use."""
+
+    def holds(nodes: list[dict]) -> bool:
+        labels = [each["label"] for each in nodes if each["label"]]
+        listed = {number for number in (1, 2) if any(session_row(number)(label) for label in labels)}
+        return listed == set(numbers)
+
+    phone.wait_screen(holds, what, 90, nudging=True)
+
+
+def host_in_use(phone: Phone) -> str | None:
+    """The first eight characters of the environment the Hosts tab shows as in use: the name of the
+    host row whose centre is nearest the words `In use`, among the rows that name an environment."""
+    nodes = phone.screen()
+    used = next((each for each in nodes if each["label"] == "In use"), None)
+    if used is None:
+        return None
+    names = [each for each in nodes if re.match(r"environment [0-9a-f]{8} on ", each["label"])]
+    if not names:
+        return None
+    centre = (used["box"][1] + used["box"][3]) / 2
+    nearest = min(names, key=lambda each: abs((each["box"][1] + each["box"][3]) / 2 - centre))
+    return nearest["label"].split()[1]
+
+
+def leave_session(phone: Phone) -> None:
+    """Leaves the open session by the system's back, which leaves it as the bar's control does."""
+    hide_keyboard(phone)
+    phone.run("shell", "input", "keyevent", "KEYCODE_BACK")
+    phone.wait(lambda each: each.startswith("Sessions"), "the tab bar after the session was left", 30)
+
+
+def open_a_session(phone: Phone, number: int) -> None:
+    """Opens the session `number` from the list and waits for its composer."""
+    phone.tap(phone.wait(session_row(number), f"session {number} in the list", 90, nudging=True))
+    phone.wait(lambda each: each == "Message this session", "the composer", 60)
+
+
+def write_and_send(phone: Phone, text: str) -> None:
+    """Writes `text` in the open session's composer and sends it, and waits until the phone says the
+    host answered it."""
+    for _ in range(3):
+        phone.tap(composer_of(phone))
+        phone.run("shell", "input", "text", text.replace(" ", "%s"))
+        end = time.monotonic() + 10
+        while time.monotonic() < end and phone.find(lambda each: each == text) is None:
+            time.sleep(0.5)
+        if phone.find(lambda each: each == text) is not None:
+            break
+    else:
+        phone.give_up("the composer did not take what was written")
+    hide_keyboard(phone)
+    phone.wait_screen(
+        lambda nodes: any(each["label"] == "Send" and each["enabled"] for each in nodes), "the Send control to be enabled", 60
+    )
+    phone.press("Send")
+    phone.wait_screen(lambda nodes: any(each["label"] == "Applied" for each in nodes), "the phone to say the send is applied", 60)
+
+
+def pair_by_scan(phone: Phone, directory: Path, picture: str, port: str, shot: str, answers: tuple[str, str], opener: str) -> None:
+    """Scans the host's picture and pairs: the value the host shows is the one the phone shows, and the
+    host approves it. A scan that reads a picture a host no longer holds is refused, and a person scans
+    again."""
+    value_file, approve_file = answers
+    for _ in range(4):
+        scan(phone, directory, picture, port, owner_card, "the scanned invitation", stale=another_card, opener=opener)
+        phone.shot(f"{shot}-scanned-summary")
+        phone.press("Pair")
+        outcome = phone.wait(
+            lambda each: each == "Check this value on the host"
+            or each.startswith("The invitation did not work")
+            or each == "Pairing did not finish",
+            "the value or a refusal",
+            90,
+        )
+        if outcome["label"] == "Check this value on the host":
+            break
+        if outcome["label"] == "Pairing did not finish":
+            # The camera still saw the picture of the host paired before: the phone says it is paired
+            # with that host already, and a person closes that and scans again.
+            phone.press("Done")
+            phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the stale picture")
+            opener = "Scan code"
+        else:
+            opener = "Scan again"
+    phone.wait(lambda each: each == "Check this value on the host", "the value", 90)
+    wait_for_file(directory, value_file)
+    host = read(directory, value_file).replace(" ", "")
+    spelled = ", ".join(" ".join(group) for group in (host[:4], host[4:]))
+    phone.wait(lambda each: each == spelled, f"the host's value {host} on the phone", 15)
+    touch(directory, approve_file)
+    phone.wait(lambda each: each.startswith("Paired with"), "the paired screen", 120)
+
+
+def sessions(adb: str, serial: str, directory: Path, shots: Path, port: str) -> None:
+    phone = Phone(adb, serial, shots)
+    shots.mkdir(parents=True, exist_ok=True)
+    phone.run("shell", "am", "start", "-n", f"{APP}/.MainActivity")
+    phone.wait(lambda each: each == "Hosts", "the shell's Hosts tab", 90)
+    phone.press("Hosts")
+    phone.wait(lambda each: each == "Pair with a host", "the pairing screen")
+
+    # The phone is paired with the first host, and then with the second, as an owner device of each.
+    touch(directory, "go-direct")
+    pair_by_scan(phone, directory, "direct", port, "first", ("host-value.txt", "approve"), "Scan code")
+    wait_for_file(directory, "done-direct")
+    phone.press("Done")
+    phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the first host")
+    touch(directory, "go-second")
+    pair_by_scan(phone, directory, "second", port, "second", ("second-value.txt", "second-approve"), "Scan code")
+    wait_for_file(directory, "done-second")
+    phone.press("Done")
+    phone.wait(lambda each: each == "Pair with a host", "the pairing screen after the second host")
+    first = read(directory, "first-environment.txt")[:8]
+    second = read(directory, "second-environment.txt")[:8]
+    for environment in (first, second):
+        if re.fullmatch(r"[0-9a-f]{8}", environment) is None:
+            raise SystemExit(f"a host named no environment: {environment!r}")
+    phone.wait(lambda each: each == "Use this host", "the second host listed to be used", 60)
+    if host_in_use(phone) != first:
+        phone.give_up(f"the host in use is not the first ({first}): {host_in_use(phone)}")
+    phone.shot("hosts-two-hosts")
+    say("the phone is paired with two hosts as an owner device of each, and the first stays in use")
+
+    # The first host's sessions: what the phone lists is what the host lists.
+    start_on(phone, "Sessions")
+    rows_listed(phone, [1, 2], "the first host's two sessions")
+    ask_about(directory, "listed", "1")
+    if read(directory, "listed-1.txt") != "host=1 sessions=1,2":
+        raise SystemExit(f"the first host lists other sessions: {read(directory, 'listed-1.txt')}")
+    phone.shot("sessions-first-host")
+    say("the phone lists the first host's two sessions and none of the second host's, as the host lists them")
+
+    # The second of them, and a message written in it.
+    open_a_session(phone, 2)
+    phone.shot("session-two-open")
+    write_and_send(phone, COMMAND_FIRST)
+    phone.shot("session-two-message-sent")
+    ask_about(directory, "received", "1:2")
+    keep(directory, "received-1-2.txt", "received-1-2-first.txt")
+    expected = f"h1s1=0 h1s2=1 h2s1=0 target=h1s2 text={COMMAND_FIRST}"
+    if read(directory, "received-1-2.txt") != expected:
+        raise SystemExit(f"the agents were not sent what was written: {read(directory, 'received-1-2.txt')}")
+    say("a message written in the first host's second session reached the agent of that session once and no other agent")
+
+    # A line typed into the terminal view of the same session.
+    switch_view(phone, "Terminal")
+    # The terminal takes keys only once the person has taken control of the session's input.
+    phone.press("Take control")
+    # The program's keyboard is the one text field of the view, which holds an invisible character.
+    phone.wait_screen(lambda nodes: any(each["class"] == "android.widget.EditText" for each in nodes), "the terminal's keyboard field", 30)
+    phone.tap(composer_of(phone))
+    # Typed as the keys of a hardware keyboard (the software keyboard composes a word and drops or changes
+    # parts of it), and ended by the Enter key once the whole line is in the pane.
+    # One key at a time: keys injected together are dropped now and then by the page.
+    for each in TERMINAL_LINE:
+        phone.run("shell", "input", "keyevent", str(62 if each == " " else 29 + ord(each) - ord("a")))
+    phone.wait_screen(
+        lambda nodes: any(TERMINAL_LINE in each["label"] for each in nodes),
+        "the line to reach the terminal's pane",
+        20,
+    )
+    phone.run("shell", "input", "keyevent", "KEYCODE_ENTER")
+    phone.shot("session-two-terminal-line")
+    ask_about(directory, "received", "1:2:line", 150)
+    shown = read(directory, "screen-1-2.txt")
+    if re.fullmatch(rf"h1s1=0 h1s2=[2-9] h2s1=0 text={TERMINAL_LINE}", shown) is None:
+        raise SystemExit(f"the session's program was not sent the typed line: {shown}")
+    say("a line typed into the first host's second session's terminal view reached that session's program and no other")
+    leave_session(phone)
+
+    # The second host is chosen, and its session is listed in place of the first host's.
+    open_tab(phone, "Hosts")
+    phone.wait(lambda each: each == "Use this host", "the second host listed to be used", 60)
+    phone.press("Use this host")
+    phone.wait_screen(lambda nodes: host_in_use(phone) == second, "the second host to be in use", 60)
+    phone.shot("hosts-second-in-use")
+    ask_about(directory, "chosen", "2")
+    chosen = read(directory, "chosen-2.txt")
+    if re.fullmatch(r"host=2 h1=[0-9]+ h2=[1-9][0-9]*", chosen) is None:
+        raise SystemExit(f"the second host serves no connection of the phone: {chosen}")
+    open_tab(phone, "Sessions")
+    rows_listed(phone, [1], "the second host's one session, and not the first host's two")
+    ask_about(directory, "listed", "2")
+    if read(directory, "listed-2.txt") != "host=2 sessions=1":
+        raise SystemExit(f"the second host lists other sessions: {read(directory, 'listed-2.txt')}")
+    phone.shot("sessions-second-host")
+    say("the phone chose the second host and lists its one session in place of the first host's two, as that host lists it")
+
+    # A message written in the second host's session reaches that host's agent, and nothing reaches the first's.
+    open_a_session(phone, 1)
+    write_and_send(phone, COMMAND_SECOND)
+    phone.shot("second-host-session-message-sent")
+    ask_about(directory, "received", "2:1")
+    expected = f"h1s1=0 h1s2=1 h2s1=1 target=h2s1 text={COMMAND_SECOND}"
+    if read(directory, "received-2-1.txt") != expected:
+        raise SystemExit(f"the second host's agent was not sent the message alone: {read(directory, 'received-2-1.txt')}")
+    say("a message written in the second host's session reached that host's agent once and none of the first host's")
+    leave_session(phone)
+
+    # The first host is chosen again: its two sessions return, and choosing sent nothing.
+    open_tab(phone, "Hosts")
+    phone.wait(lambda each: each == "Use this host", "the first host listed to be used", 60)
+    phone.press("Use this host")
+    phone.wait_screen(lambda nodes: host_in_use(phone) == first, "the first host to be in use", 60)
+    ask_about(directory, "chosen", "1")
+    chosen = read(directory, "chosen-1.txt")
+    if re.fullmatch(r"host=1 h1=[1-9][0-9]* h2=[0-9]+", chosen) is None:
+        raise SystemExit(f"the first host serves no connection of the phone: {chosen}")
+    open_tab(phone, "Sessions")
+    rows_listed(phone, [1, 2], "the first host's two sessions again")
+    phone.shot("sessions-first-host-again")
+    ask_about(directory, "received", "1:2")
+    if read(directory, "received-1-2.txt") != f"h1s1=0 h1s2=1 h2s1=1 target=h1s2 text={COMMAND_FIRST}":
+        raise SystemExit(f"choosing a host sent something: {read(directory, 'received-1-2.txt')}")
+    say("the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything")
+
+
 # ---- The release build's verified TLS ----------------------------------------------------------
 
 
@@ -1347,6 +1608,8 @@ def main() -> None:
         drive(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5])
     elif len(arguments) == 6 and arguments[0] == "issuer":
         issuer(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5])
+    elif len(arguments) == 6 and arguments[0] == "sessions":
+        sessions(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5])
     elif len(arguments) == 7 and arguments[0] == "release":
         release(arguments[1], arguments[2], Path(arguments[3]), Path(arguments[4]), arguments[5], Path(arguments[6]))
     else:

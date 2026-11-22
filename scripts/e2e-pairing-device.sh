@@ -62,6 +62,13 @@
 #   scripts/e2e-pairing-device.sh android
 #
 # KR_PAIRING_IOS_APP and KR_PAIRING_ANDROID_APK name a build to install instead of making one.
+# KR_PAIRING_LEG=sessions runs the sessions leg instead of the cases above (the default leg): the host holds
+# two sessions, a second host holds one, and the phone is paired with both as an owner device. The phone
+# lists the first host's sessions, opens the second of them and sends it a message and a typed line,
+# chooses the second host and sends a message in its session, and chooses the first again. Every step is
+# read against what the host it concerns recorded: the sessions it lists, what each agent was sent, what
+# each session's program wrote back, and how many connections of the phone each host is serving. No case
+# of the default leg runs in it.
 # KR_PAIRING_SHOTS is where the screenshots go (default /tmp/kr-pair-phone); KR_PAIRING_GRPC_PORT is the
 # port of the Android emulator's controller (default 8754), which must be free: the camera is moved
 # through it, so a port that already answers would move another emulator's.
@@ -88,6 +95,12 @@ case "$platform" in
     ios | android) ;;
     *) printf 'usage: %s ios|android\n' "$0" >&2; exit 2 ;;
 esac
+# The leg: the default one, or the sessions leg.
+leg="${KR_PAIRING_LEG:-}"
+case "$leg" in
+    "" | sessions) ;;
+    *) printf 'KR_PAIRING_LEG names no leg (it is empty or sessions): %s\n' "$leg" >&2; exit 2 ;;
+esac
 
 # shellcheck source=scripts/lib/android-avd.sh
 . "$here/scripts/lib/android-avd.sh"
@@ -99,7 +112,7 @@ esac
 # shellcheck source=scripts/lib/host-program.sh
 . "$here/scripts/lib/host-program.sh"
 kr_artifacts_dir
-artefacts="$kr_artifacts/pairing-device-$platform"
+artefacts="$kr_artifacts/pairing-device${leg:+-$leg}-$platform"
 shots="${KR_PAIRING_SHOTS:-/tmp/kr-pair-phone}"
 cache="${HOME}/Library/Caches/kalareach-tests/pairing-device"
 # The output may hold a phone's log with an invitation's secret in it, so its folders are made for this
@@ -246,6 +259,7 @@ start_harness() { # <peer> [<peer of the other service>]
     # of its own, the test thread and the runtime's workers, is given a larger stack.
     RUST_MIN_STACK=67108864 \
         KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SERVICE_PEER="${2:-$1}" KR_HARNESS_SECONDS=2400 \
+        KR_PAIRING_LEG="$leg" \
         host_start "$harness_exe" --ignored --exact a_phone_scans_pairs_and_confirms_against_a_real_host --nocapture \
         >"$artefacts/harness.log" 2>&1 &
     harness_pid=$!
@@ -443,6 +457,80 @@ judge() { # <driver output>
     return "$bad"
 }
 
+# The checks of the sessions leg: what the phone's driver reported, and what each host recorded. A host's
+# record is read beside the driver's line, so a step that the phone shows and the host did not record fails.
+host_equals() { # <what the record shows> <file> <expected text>
+    local got
+    got="$(host_file "$2")"
+    if [ "$got" = "$3" ]; then
+        say "check=$1 ok=1 detail=$got"
+    else
+        say "check=$1 ok=0 detail=${got:-no record}, expected $3"
+        bad=1
+    fi
+}
+host_matches() { # <what the record shows> <file> <extended regular expression>
+    local got
+    got="$(host_file "$2")"
+    if printf '%s' "$got" | grep -q -E "$3"; then
+        say "check=$1 ok=1 detail=$got"
+    else
+        say "check=$1 ok=0 detail=${got:-no record}, expected $3"
+        bad=1
+    fi
+}
+
+judge_sessions() { # <driver output>
+    local bad=0 check
+    local first="Summarise the open changes on the first host" second="Summarise the open changes on the second host"
+    local line="hello from the phone on the first host"
+    for check in \
+        "the phone is paired with two hosts as an owner device of each, and the first stays in use" \
+        "the phone lists the first host's two sessions and none of the second host's, as the host lists them" \
+        "a message written in the first host's second session reached the agent of that session once and no other agent" \
+        "a line typed into the first host's second session's terminal view reached that session's program and no other" \
+        "the phone chose the second host and lists its one session in place of the first host's two, as that host lists it" \
+        "a message written in the second host's session reached that host's agent once and none of the first host's" \
+        "the phone chose the first host again and lists its two sessions, and choosing a host sent no agent anything"; do
+        if grep -q -F "PAIRING $check" "$1"; then
+            say "check=$check ok=1"
+        else
+            say "check=$check ok=0 detail=the driver did not report it"
+            bad=1
+        fi
+    done
+    if [ -s "$harness/host-value.txt" ] && [ -s "$harness/paired.txt" ] && [ -s "$harness/second-value.txt" ] && [ -s "$harness/second-paired.txt" ]; then
+        say "check=each host showed its value and approved the phone as an owner device ok=1 detail=values $(host_file host-value.txt) and $(host_file second-value.txt)"
+    else
+        say "check=each host showed its value and approved the phone as an owner device ok=0 detail=no record"
+        bad=1
+    fi
+    host_equals "the first host lists sessions 1 and 2 to its owner" listed-1.txt "host=1 sessions=1,2"
+    host_equals "the first host's agent in its second session was sent the message, and no other agent was sent anything" received-1-2-first.txt \
+        "h1s1=0 h1s2=1 h2s1=0 target=h1s2 text=$first"
+    host_matches "the first host's second session's program read the typed line and wrote it back, and no other session's screen shows it" screen-1-2.txt \
+        "^h1s1=0 h1s2=[2-9] h2s1=0 text=$line\$"
+    host_matches "the second host was serving a connection of the phone once it was chosen" chosen-2.txt "^host=2 h1=[0-9]+ h2=[1-9][0-9]*\$"
+    host_equals "the second host lists its one session to its owner" listed-2.txt "host=2 sessions=1"
+    host_equals "the second host's agent was sent the message, and the first host's agents were sent nothing more" received-2-1.txt \
+        "h1s1=0 h1s2=1 h2s1=1 target=h2s1 text=$second"
+    host_matches "the first host was serving a connection of the phone once it was chosen again" chosen-1.txt "^host=1 h1=[1-9][0-9]* h2=[0-9]+\$"
+    host_equals "after the first host was chosen again no agent had been sent anything more" received-1-2.txt \
+        "h1s1=0 h1s2=1 h2s1=1 target=h1s2 text=$first"
+    if [ "$logs_searched" -ge 1 ] && [ "$logs_found" = 0 ] && [ -z "$log_problem" ]; then
+        say "check=no log holds an invitation's text or secret ok=1 detail=$logs_searched log read whole"
+    else
+        say "check=no log holds an invitation's text or secret ok=0 detail=searched $logs_searched, found $logs_found${log_problem:+, $log_problem}${logs_kept:+; the log that held one is kept whole, for the person to read, at${logs_kept} (the folder and its files are for the account that ran this alone): remove it when read}"
+        bad=1
+    fi
+    return "$bad"
+}
+
+# Judges the run by its leg.
+judge_run() { # <driver output>
+    if [ "$leg" = sessions ]; then judge_sessions "$1"; else judge "$1"; fi
+}
+
 # ---- The iOS Simulator -----------------------------------------------------------------------
 
 # Puts each picture the host writes into the simulator's photo library, and says so with a file.
@@ -542,9 +630,15 @@ run_ios() {
     local out="$artefacts/xcodebuild.log" status=0 result_bundle="$artefacts/driving-test.xcresult"
     # xcodebuild refuses a result bundle that is already there.
     /bin/rm -rf "${result_bundle:?}"
+    # The sessions leg is one case of the class, and the default leg does not run it.
+    local selection=(-only-testing:KalaReachUITests/PairingTests -skip-testing:KalaReachUITests/PairingTests/testZSessionsHostChoiceAndCommands)
+    if [ "$leg" = sessions ]; then
+        selection=(-only-testing:KalaReachUITests/PairingTests/testZSessionsHostChoiceAndCommands)
+    fi
     TEST_RUNNER_KR_PAIRING_DIR="$harness" TEST_RUNNER_KR_PAIRING_SHOTS="$shots" TEST_RUNNER_KR_PAIRING_MARKER="$run_marker" \
+        TEST_RUNNER_KR_PAIRING_LEG="$leg" \
         xcodebuild test-without-building -xctestrun "$plan" \
-        -destination "platform=iOS Simulator,id=$udid" -only-testing:KalaReachUITests/PairingTests \
+        -destination "platform=iOS Simulator,id=$udid" "${selection[@]}" \
         -resultBundlePath "$result_bundle" \
         >"$out" 2>&1 || status=$?
     grep -E "Test Case .* (passed|failed)|error:|XCTAssert|PAIRING" "$out" | sed 's/^/    /' | tee -a "$log"
@@ -556,7 +650,7 @@ run_ios() {
     # the marker.
     search_log ' KalaReach\[[0-9]+:' xcrun simctl spawn "$udid" log show --info --debug \
         --last "$((($(date +%s) - run_started) / 60 + 5))m" --style compact
-    judge "$out" || status=2
+    judge_run "$out" || status=2
     # A pass has said all it has to in the log.
     if [ "$status" = 0 ] && [ "${KR_KEEP_XCRESULT:-}" != 1 ]; then
         /bin/rm -rf "${result_bundle:?}"
@@ -673,7 +767,9 @@ run_android() {
 
     say "driving the application"
     local out="$artefacts/driver.log" status=0
-    python3 "$here/scripts/lib/pairing-android.py" drive "$adb" "$serial" "$harness" "$shots" "$grpc_port" >"$out" 2>&1 || status=$?
+    local driver_command=drive
+    [ "$leg" = sessions ] && driver_command=sessions
+    python3 "$here/scripts/lib/pairing-android.py" "$driver_command" "$adb" "$serial" "$harness" "$shots" "$grpc_port" >"$out" 2>&1 || status=$?
     sed 's/^/    /' "$out" | tee -a "$log"
     # The crash buffer, and the main buffer without the compositor's and the screen reader's polling.
     # The run's marker is in the main buffer, where the application's lines go: that is the ring whose
@@ -683,7 +779,7 @@ run_android() {
     "$adb" -s "$serial" logcat -d 2>/dev/null | grep -v -E 'CompositionEngine|AccessibilityNodeInfoDumper' | tail -2000 >"$artefacts/logcat.log"
     # What the application's native half printed to its standard streams.
     "$adb" -s "$serial" logcat -d -s RustStdoutStderr 2>/dev/null >"$artefacts/application.log"
-    judge "$out" || status=2
+    judge_run "$out" || status=2
     [ "$status" = 0 ] || return 2
 }
 

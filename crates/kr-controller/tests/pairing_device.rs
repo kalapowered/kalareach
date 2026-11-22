@@ -31,6 +31,19 @@
 //! | `second` | `go-second`, then `second-approve` | the second host, a daemon of its own that the phone reaches at its own address, issues a guest invitation: `second-environment.txt`, its environment; `second.png`, the invitation's QR; `second-value.txt`, the value that host shows once a candidate redeemed; `second-paired.txt` once approved |
 //! | `bound` | `go-bound` | once the second host is serving a connection of the phone, its owner bounds how long personal remote access stands without its authority feed, which no feed has been reached for, so the bound has lapsed as it is chosen: `bound-result.txt` holds how many connections of the phone the host was serving at the choice (all the host keeps of the phone), and, as a control beside the phone's own screen, what that host answers another guest of its, paired as the phone is: the inbox read before the choice (served, empty), and after it what it answers the host's identity, the opening of the connection and the inbox read, in the order a phone's connection makes them (each is refused alike, with the lapsed words) |
 //!
+//!
+//! With `KR_PAIRING_LEG=sessions` the host is the one the phone's sessions leg drives (`scripts/e2e-pairing-device.sh`):
+//! the first host holds two sessions (numbered 1 and 2) and the second holds one (numbered 1), each with an agent,
+//! and the second host pairs the phone as an owner device, so that the phone can read its session. Three more
+//! phases answer that leg's steps, each asked for by `want-<phase>.txt` and then `go-<phase>`, and each can be
+//! asked again. No other leg runs them.
+//!
+//! | Phase | What the script asks | The suite writes |
+//! | --- | --- | --- |
+//! | `listed` | `want-listed.txt` names a host (`1` or `2`) | `listed-<host>.txt`: the display numbers of the sessions that host lists to its own owner |
+//! | `received` | `want-received.txt` names a host and a session (`1:2`, `2:1`), or those and `line` | `received-<host>-<session>.txt`: how many prompts each of the three agents was sent, and the text the named one was last sent; with `line`, `screen-<host>-<session>.txt`: how many lines of each session's screen hold the typed line |
+//! | `chosen` | `want-chosen.txt` names a host | `chosen-<host>.txt`: how many connections of the phone each host is serving |
+//!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
 //! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SERVICE_PEER` is
 //! the name it reaches the other service of the `code` phase by, which is `KR_HARNESS_PEER` unless
@@ -54,6 +67,7 @@ use kr_ipc::client::LocalClient;
 use kr_pairing::grants::{DEFAULT_GUEST_PAIRING_MS, guest_grant, personal_owner_grant};
 use kr_protocol::attention::{AttentionReadParams, AttentionReadResult, AttentionSource};
 use kr_protocol::confirmation::{ConfirmationSubject, TransferControlSubject};
+use kr_protocol::grant::HistoryScope;
 use kr_protocol::hostinfo::HostInfoResult;
 use kr_protocol::ids::{
     ActionId, ConfirmationId, DeviceId, EnvironmentId, InvitationId, SessionId,
@@ -67,10 +81,13 @@ use kr_protocol::pairing::{
     CodeQrPayload, NetworkHint, ProposedGrant, QrPayload, RendezvousOrigin,
     group_verification_value,
 };
-use kr_protocol::scalars::{DurationMs, Nullable, SecretBytes32, U64};
-use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
+use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, SecretBytes32, U64};
+use kr_protocol::session::{
+    SessionListParams, SessionListResult, SessionOpenParams, SessionOpenResult,
+};
 use kr_protocol::sharing::{
     GrantTransferParams, GrantTransferResult, OfflineValidityPolicy, SessionRole,
+    SessionScreenPreviewParams, SessionScreenPreviewResult,
 };
 use net_support::pairing::{self as calls, Signer};
 use net_support::worker::{Adopted, Upstream, Worker};
@@ -87,6 +104,10 @@ const PICTURE: u32 = 1024;
 
 /// The text the phone's person writes as a draft in the session, which the agent there is later sent.
 const DRAFT: &str = "Check the release notes before tagging";
+
+/// The line the phone's person types into the terminal view of the first host's second session. That
+/// session's program is `cat`, which writes back each line it reads.
+const LINE_FIRST: &str = "hello from the phone on the first host";
 
 /// The fixture's code invitation, whose code a phone's scanner reads. Only its origin is replaced.
 const FIXTURES: &str = include_str!("../../../fixtures/pairing/codes.json");
@@ -339,8 +360,52 @@ struct Run {
     host: tokio::sync::RwLock<Option<Host>>,
     /// What the daemon left when it ended, for the one that starts on its records.
     stopped: std::sync::Mutex<Option<Stopped>>,
-    /// The second host: a daemon of its own that holds no session.
+    /// The second host: a daemon of its own that holds no session (one, in the sessions leg).
     second_host: Box<Adopted>,
+    /// What the sessions leg adds; none in any other leg.
+    sessions: Option<SessionsLeg>,
+}
+
+/// What the sessions leg adds to a run: the first host holds two sessions (numbered 1 and 2) and the
+/// second holds one (numbered 1), and an agent in each takes the prompts the phone sends.
+struct SessionsLeg {
+    /// What the agent in the first host's second session was sent.
+    first_second: Arc<Upstream>,
+    /// What the agent in the second host's session was sent.
+    second_first: Arc<Upstream>,
+    /// The device the first host made of the phone, once it approved it.
+    phone_of_first: std::sync::Mutex<Option<DeviceId>>,
+}
+
+/// How many lines of the screen `worker`'s session shows hold `text`, read as the host's own owner
+/// reads the screen a share would show.
+async fn lines_holding(worker: &Worker, text: &str) -> usize {
+    let mut client = worker.client().await;
+    let preview: SessionScreenPreviewResult = client
+        .request(
+            Method::SessionScreenPreview,
+            &SessionScreenPreviewParams {
+                session_id: worker.session_id,
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: true,
+                    named_questions: CanonicalSet::new(),
+                    named_approvals: CanonicalSet::new(),
+                },
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the preview is answered")
+        .to_typed()
+        .expect("decodes");
+    preview.screen.0.map_or(0, |screen| {
+        screen
+            .lines
+            .iter()
+            .filter(|line| line.contains(text))
+            .count()
+    })
 }
 
 impl Run {
@@ -629,6 +694,212 @@ impl Run {
                 "phone connections served at the choice: {serving}\ncontrol before read: {before}\ncontrol after host.info: {info}\ncontrol after session.open: {opened}\ncontrol after read: {after}\n"
             ),
         );
+    }
+
+    /// The sessions leg's fixtures. A phase of that leg that another leg asks for is a fault.
+    fn leg(&self) -> &SessionsLeg {
+        self.sessions
+            .as_ref()
+            .expect("a phase of the sessions leg runs in the sessions leg alone")
+    }
+
+    /// What the script asked this phase for, in `want-<phase>.txt`, which it writes before it asks.
+    fn wanted(&self, phase: &str) -> String {
+        std::fs::read_to_string(self.directory.join(format!("want-{phase}.txt")))
+            .expect("the script says what the phase is asked for")
+            .trim()
+            .to_owned()
+    }
+
+    /// The first host's invitation in the sessions leg: as `direct`, and the host also says which
+    /// environment it is and keeps the device it made of the phone, whose connections it counts.
+    async fn direct_in_sessions(&self) {
+        self.say("first-environment.txt", &format!("{}\n", self.environment));
+        let mut client = self.host().await.client().await;
+        let confirmed = self
+            .scanned(
+                &mut client,
+                self.environment,
+                &self.owner,
+                "direct",
+                (InviteGrantKind::PersonalOwner, &personal_owner_grant()),
+                &FIRST,
+            )
+            .await;
+        *self.leg().phone_of_first.lock().expect("the record") = Some(confirmed.device_id);
+    }
+
+    /// The second host's invitation in the sessions leg: as `second`, but an owner's, so that the phone
+    /// can read the second host's session. The host says which environment it is.
+    async fn second_in_sessions(&self) {
+        let adopted = &self.second_host;
+        self.say(
+            "second-environment.txt",
+            &format!("{}\n", adopted.host.environment_id),
+        );
+        let mut client = adopted.host.client().await;
+        let confirmed = self
+            .scanned(
+                &mut client,
+                adopted.host.environment_id,
+                &adopted.owner,
+                "second",
+                (InviteGrantKind::PersonalOwner, &personal_owner_grant()),
+                &SECOND,
+            )
+            .await;
+        *self.phone_of_second.lock().expect("the record") = Some(confirmed.device_id);
+    }
+
+    /// The display numbers of the sessions the host the script names lists to its own owner, which
+    /// the rows of the phone's list are read against.
+    async fn listed(&self) {
+        let which = self.wanted("listed");
+        let mut client = match which.as_str() {
+            "1" => self.host().await.client().await,
+            "2" => self.second_host.host.client().await,
+            other => panic!("the script asked for the sessions of host {other}"),
+        };
+        let listed: SessionListResult = client
+            .request(
+                Method::SessionList,
+                &SessionListParams {
+                    environment_id: Nullable::null(),
+                    include_closed: false,
+                },
+            )
+            .await
+            .expect("the call reaches the host")
+            .expect("the list is answered")
+            .to_typed()
+            .expect("decodes");
+        let numbers: Vec<String> = listed
+            .sessions
+            .iter()
+            .map(|session| session.display_number.to_string())
+            .collect();
+        self.say(
+            &format!("listed-{which}.txt"),
+            &format!("host={which} sessions={}\n", numbers.join(",")),
+        );
+    }
+
+    /// What each agent of the leg was sent, once the one the script names has been sent something; or,
+    /// for a typed line, how many lines of each session's screen hold it, once the program of the named
+    /// session has written it back (the terminal echoes what is typed, and `cat` writes each line it
+    /// reads, so a line the program read shows twice).
+    async fn received(&self) {
+        let wanted = self.wanted("received");
+        let leg = self.leg();
+        let mut parts = wanted.split(':');
+        let (host, session, line) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+            parts.next() == Some("line"),
+        );
+        let agents = [
+            ("h1s1", &self.upstream),
+            ("h1s2", &leg.first_second),
+            ("h2s1", &leg.second_first),
+        ];
+        let target = match (host, session) {
+            ("1", "2") => "h1s2",
+            ("2", "1") => "h2s1",
+            _ => panic!("the script asked about {wanted}"),
+        };
+        let counts = || {
+            agents
+                .iter()
+                .map(|(name, upstream)| format!("{name}={}", upstream.prompts().len()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let end = Instant::now() + STEP;
+        if line {
+            let sessions = [
+                ("h1s1", &self.workers[0]),
+                ("h1s2", &self.workers[1]),
+                ("h2s1", &self.second_host.workers[0]),
+            ];
+            let mut shown = String::new();
+            while self.waiting(end) {
+                let mut counted = Vec::new();
+                for (name, worker) in &sessions {
+                    counted.push((*name, lines_holding(worker, LINE_FIRST).await));
+                }
+                shown = counted
+                    .iter()
+                    .map(|(name, count)| format!("{name}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if counted
+                    .iter()
+                    .any(|(name, count)| *name == target && *count >= 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            self.say(
+                &format!("screen-{host}-{session}.txt"),
+                &format!("{shown} text={LINE_FIRST}\n"),
+            );
+            return;
+        }
+        while self.waiting(end) {
+            if agents
+                .iter()
+                .any(|(name, upstream)| *name == target && !upstream.prompts().is_empty())
+            {
+                let last = agents
+                    .iter()
+                    .find(|(name, _)| *name == target)
+                    .and_then(|(_, upstream)| upstream.prompts().last().cloned())
+                    .unwrap_or_default();
+                self.say(
+                    &format!("received-{host}-{session}.txt"),
+                    &format!("{} target={target} text={last}\n", counts()),
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("the agent {target} was sent nothing before the wait ended or the run finished");
+    }
+
+    /// How many connections of the phone each host is serving, once the host the script names is
+    /// serving one: the phone reached the host it chose.
+    async fn chosen(&self) {
+        let which = self.wanted("chosen");
+        let phone_of_first = self
+            .leg()
+            .phone_of_first
+            .lock()
+            .expect("the record")
+            .expect("the first host approved the phone");
+        let phone_of_second = self
+            .phone_of_second
+            .lock()
+            .expect("the record")
+            .expect("the second host approved the phone");
+        let second = &self.second_host.host;
+        let end = Instant::now() + STEP;
+        loop {
+            let first = {
+                let host = self.host().await;
+                host.connections_of(&host.record_of(phone_of_first))
+            };
+            let other = second.connections_of(&second.record_of(phone_of_second));
+            let serving = if which == "1" { first } else { other };
+            if serving > 0 || !self.waiting(end) {
+                self.say(
+                    &format!("chosen-{which}.txt"),
+                    &format!("host={which} h1={first} h2={other}\n"),
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// A code QR that names another service: a listener of this suite, which counts what reaches it.
@@ -1062,20 +1333,43 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
 
     // The host holds one session, so a phone paired with it has a conversation to open: the
     // attachment picker is on that screen. The worker is kept until the run ends.
+    // In the sessions leg the host holds two, so that a phone has a list to choose from.
+    let sessions_leg = match std::env::var("KR_PAIRING_LEG").as_deref() {
+        Ok("sessions") => true,
+        Ok("") | Err(_) => false,
+        Ok(other) => panic!("KR_PAIRING_LEG names no leg: {other}"),
+    };
     let Adopted {
         host,
         owner,
         workers,
-    } = Adopted::start(1).await;
+    } = Adopted::start(if sessions_leg { 2 } else { 1 }).await;
     let environment = host.environment_id;
     // The second host a phone is paired with after the first: a daemon of its own that holds no
     // session. It is started here, beside the first, and not when the phone asks for it, so that the
     // test's own stack holds one daemon's start at a time.
-    let second = Box::new(Adopted::start(0).await);
+    // In the sessions leg it holds one session, so that its list is told from the first host's two.
+    let second = Box::new(Adopted::start(u64::from(sessions_leg)).await);
     // An agent is in the first session, so that a prompt written on the phone has a conversation to
     // be written for and to be sent to.
     let upstream = Arc::new(Upstream::default());
     workers[0].register_agent(Arc::clone(&upstream));
+    let sessions = sessions_leg.then(|| {
+        // The phone offers a prompt only to an agent that a package recognised. The agents of the
+        // other sessions are numbered apart from the first's, so that no two instances share an identity.
+        workers[0].announce_agent_package_numbered(2);
+        let first_second = Arc::new(Upstream::default());
+        workers[1].register_agent_numbered(3, Arc::clone(&first_second) as _);
+        workers[1].announce_agent_package_numbered(3);
+        let second_first = Arc::new(Upstream::default());
+        second.workers[0].register_agent(Arc::clone(&second_first));
+        second.workers[0].announce_agent_package_numbered(2);
+        SessionsLeg {
+            first_second,
+            second_first,
+            phone_of_first: std::sync::Mutex::new(None),
+        }
+    });
     // The daemon's address is where a phone that is paired with it dials it, so it is kept for a
     // daemon that starts again.
     let host_port = host
@@ -1100,6 +1394,7 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         upstream,
         second_host: second,
         phone_of_second: std::sync::Mutex::new(None),
+        sessions,
     };
     run.say(
         "ready.json",
@@ -1116,7 +1411,11 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
             // The host being switched off and on is asked for more than once: those two phases take
             // their `go-` file away when they are done, and the script takes `done-` away before it
             // asks again.
-            let again = matches!(name, "down" | "up");
+            let again = matches!(name, "down" | "up" | "listed" | "received" | "chosen");
+            // The phases of the sessions leg are waited for in that leg alone.
+            if matches!(name, "listed" | "received" | "chosen") && run.sessions.is_none() {
+                return;
+            }
             loop {
                 while !go.exists() {
                     if Instant::now() >= end || run.directory.join("finish").exists() {
@@ -1126,6 +1425,7 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
                 }
                 match name {
                     "control" | "paste" => run.control(name).await,
+                    "direct" if run.sessions.is_some() => run.direct_in_sessions().await,
                     "direct" => run.direct().await,
                     "code" => run.code(connections, port).await,
                     "confirm" => run.confirm().await,
@@ -1134,7 +1434,11 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
                     "up" => run.up().await,
                     "sent" => run.sent().await,
                     "handover" => run.handover().await,
+                    "second" if run.sessions.is_some() => run.second_in_sessions().await,
                     "second" => run.second().await,
+                    "listed" => run.listed().await,
+                    "received" => run.received().await,
+                    "chosen" => run.chosen().await,
                     "bound" => run.bound().await,
                     _ => run.device().await,
                 }
@@ -1160,7 +1464,10 @@ async fn a_phone_scans_pairs_and_confirms_against_a_real_host() {
         phase("sent"),
         phase("handover"),
         phase("second"),
-        phase("bound")
+        phase("bound"),
+        phase("listed"),
+        phase("received"),
+        phase("chosen")
     );
     accepting.abort();
     run.second_host.stop().await;
