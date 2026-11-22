@@ -816,6 +816,31 @@ describe('the page’s keeping of the room', () => {
     stop()
   })
 
+  it('measures a message again when a link’s style changes under a policy that refuses an inline style set by attribute', async () => {
+    const { pane: root } = pane(1, (message) => {
+      link(message, 0, 10)
+      link(message, 30, 40)
+      link(message, 40, 380)
+    })
+    const stop = startLinkFit(root)
+    frame()
+    await mutations()
+    const first = root.querySelector<HTMLElement>('.md-link')
+    if (!first) throw new Error('the made page has no links')
+    // A page whose `style-src` has no `'unsafe-inline'` refuses `setAttribute('style', ...)` and the declarations are then read as
+    // none (probed in Chromium and WebKit); jsdom applies no policy, so the refusal is made here, for an element that is not in the
+    // page. A link in the page is set through its style object, which no policy limits.
+    const set = Object.getOwnPropertyDescriptor(Element.prototype, 'setAttribute')?.value as Element['setAttribute']
+    vi.spyOn(Element.prototype, 'setAttribute').mockImplementation(function (this: Element, name: string, value: string) {
+      if (name === 'style' && !this.isConnected) return
+      set.call(this, name, value)
+    })
+    first.style.fontSize = '30px'
+    await mutations()
+    expect(frames.length, 'one frame asked for by a style of the link that is no room').toBe(1)
+    stop()
+  })
+
   it('stops: a change after it is made is not measured', async () => {
     const { pane: root } = pane(1, (message) => {
       link(message, 100, 110)

@@ -314,11 +314,17 @@ function held(value: number): number {
   return Math.floor(Math.max(0, value) * GRID) / GRID
 }
 
-/** A link's `style` attribute with the two properties of the room taken out, read as the browser reads declarations, so that a value keeps its own spaces. */
 let reader: HTMLElement | null = null
+
+/**
+ * A link's `style` attribute with the two properties of the room taken out, read as the browser reads declarations, so that a value
+ * keeps its own spaces and its priority is not part of it. A detached element's `cssText` does the reading, because a page whose
+ * `style-src` has no `'unsafe-inline'` makes the browser refuse `setAttribute('style', ...)`, and the declarations would then read as
+ * none.
+ */
 const withoutRoom = (style: string | null): string => {
   reader ??= document.createElement('span')
-  reader.setAttribute('style', style ?? '')
+  reader.style.cssText = style ?? ''
   const kept: [string, string, string][] = []
   for (const name of Array.from(reader.style)) {
     if (name === LEFT || name === RIGHT) continue
