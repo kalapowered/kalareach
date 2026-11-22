@@ -55,6 +55,11 @@ impl Transcript {
         self.ended == Some(Ended::Output)
     }
 
+    /// Whether the reader stopped on an error: it has not taken every byte the program wrote.
+    fn reader_failed(&self) -> bool {
+        self.ended == Some(Ended::ReaderError)
+    }
+
     /// Takes the replies whose question has arrived, leaving the rest owed.
     fn take_due(&mut self) -> Vec<Owed> {
         let (due, waiting) = std::mem::take(&mut self.owed)
@@ -426,6 +431,17 @@ impl Window {
             .output_ended()
     }
 
+    /// Whether the window's reader stopped on an error: it has not taken every byte the program
+    /// wrote, and a screen read from what it took may lack the last of what the program drew.
+    #[must_use]
+    pub fn reader_failed(&self) -> bool {
+        self.collected
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reader_failed()
+    }
+
     /// Waits until the screen this window shows carries `needle`, and returns that screen.
     ///
     /// What `kr` writes to its terminal is a screen it paints, not the session's own bytes: a
@@ -625,6 +641,10 @@ mod tests {
             seen.output_ended(),
             "the end of the output is an end of the output"
         );
+        assert!(
+            !seen.reader_failed(),
+            "the end of the output is no reader error"
+        );
         drop(seen);
         let failed = stopped(Reads {
             bytes: b"part of it".to_vec(),
@@ -637,5 +657,6 @@ mod tests {
             !seen.output_ended(),
             "a reader error is not the end of the output"
         );
+        assert!(seen.reader_failed(), "a reader error is a reader error");
     }
 }
