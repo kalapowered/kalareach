@@ -78,6 +78,8 @@ tauri-plugin-dialog.workspace = true
 tauri-plugin-opener.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# The catch of a panic in the work that the desk runs for a key that it stopped.
+futures-util = { workspace = true, features = ["std"] }
 tracing.workspace = true
 ureq.workspace = true
 # Clears the text of an invitation read from a code when it is dropped, and the buffers that hold
@@ -157,7 +159,6 @@ kr-service-stand-in = { path = "../../../tests/support/service-stand-in" }
 kr-transfer.workspace = true
 # The voice service's stand-in, which serves the control socket of a call on the daemon's behalf: its
 # route is kr-client's, included by path.
-futures-util.workspace = true
 tokio-rustls.workspace = true
 tokio-websockets = { workspace = true, features = ["server"] }
 # The registry reader of the shared teardown module, which ends every worker a case's daemon started.

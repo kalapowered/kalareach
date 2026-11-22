@@ -3169,21 +3169,14 @@ pub async fn upload_cancel(
     // application says whose uploads it reads from the host it is paired with. The mark is checked
     // first, whether or not there is a connection.
     let who = state.paired_who_for(mark.as_deref()).await?;
+    // The connection is the key's owner's or is not used: a reach that comes while the cancel is
+    // under way is served by the desk's own attempt, in the task that runs the cancel.
     let paired = state
         .paired()
         .await
         .ok()
-        .filter(|paired| paired.account == who.account);
-    let answer = state.transfers().cancel(who, paired, key).await?;
-    if answer.state != "asked" {
-        return encode(&answer);
-    }
-    // A reach that came while the cancel was under way found the upload mid-cancel and left it: the
-    // connection is looked for again, and the cancel is finished now if one is held.
-    if let Ok(paired) = state.paired().await {
-        return encode(&state.transfers().finish_asked(&paired, key).await?);
-    }
-    encode(&answer)
+        .filter(|paired| paired.answers_to(&who));
+    encode(&state.transfers().cancel(who, paired, key).await?)
 }
 
 /// The header a handed file's name comes in, percent-encoded, because a header carries no other
