@@ -2488,6 +2488,23 @@ async fn held(control: &LinkControl, count: usize) {
     .unwrap_or_else(|_| panic!("{count} connections are held, not {}", control.held()));
 }
 
+/// Waits until at least `count` connections are held: the control also counts the keeper's dials
+/// and dials whose callers have stopped.
+async fn held_at_least(control: &LinkControl, count: usize) {
+    tokio::time::timeout(WATCHDOG, async {
+        while control.held() < count {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "at least {count} connections are held, not {}",
+            control.held()
+        )
+    });
+}
+
 /// The call that opens `session` for `opening`, made and left to answer.
 fn opening_call(
     companion: &Companion,
@@ -4500,7 +4517,7 @@ async fn kr_req_19_08_a_reload_or_a_change_of_host_stops_the_dials_under_way() {
         opening_call(companion, first, None, "before-1"),
         opening_call(companion, second, None, "before-2"),
     ];
-    held(&control, 2).await;
+    held_at_least(&control, 2).await;
     assert_eq!(places.held_on(host), main_only + 2);
 
     // The page loads again: its openings are left, and the dials they were making stop where they
@@ -4521,7 +4538,7 @@ async fn kr_req_19_08_a_reload_or_a_change_of_host_stops_the_dials_under_way() {
         opening_call(companion, first, None, "after-1"),
         opening_call(companion, second, None, "after-2"),
     ];
-    held(&control, 4).await;
+    held_at_least(&control, 4).await;
     assert_eq!(places.held_on(host), main_only + 2);
     links.close_all();
     for call in after {
