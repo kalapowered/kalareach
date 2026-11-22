@@ -1777,6 +1777,66 @@ fn a_standalone_start_whose_daemon_ended_with_a_listen_line_says_why() {
     );
 }
 
+/// KR-REQ-07.12: a restart whose started daemon ended after writing why it could not listen says
+/// why, as the standalone start does, and does not say that the requested daemon may still start:
+/// a process that was seen to end starts nothing.
+///
+/// No daemon runs, so the restart starts one, and the start is the standalone start with a stub
+/// daemon that prints, as itself, the line a daemon prints for a file where its rendezvous endpoint
+/// belongs, and ends. It binds nothing and starts no worker, so the case runs as its neighbours do:
+/// `env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS cargo test --locked -p kr-cli --test
+/// startup -- --nocapture --ignored --exact <the case>`.
+#[test]
+#[ignore = "run by name with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS removed from the environment"]
+fn a_restart_whose_started_daemon_ended_with_a_listen_line_says_no_requested_daemon_may_still_start()
+ {
+    let host = Standalone::without_service_manager();
+    host.select_standalone();
+    let tail = "a tail only the daemon's own log holds";
+    let daemon = stub_daemon(
+        &host.tree.root().join("stub-started"),
+        None,
+        host.tree.root(),
+        &prints_the_listen_line(
+            &host.tree.environment(),
+            ListenRole::Rendezvous,
+            ListenRefusal::NotASocket {
+                object: ObjectKind::File,
+            },
+            tail,
+        ),
+    );
+    let installation = stub_installation(&host, &daemon);
+
+    let output = start(host.kr_from(&installation, &["--json", "host", "restart"]))
+        .finish("kr host restart");
+    let failed = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(1), "{failed}");
+    assert_eq!(failed["code"], "ENVIRONMENT_UNAVAILABLE", "{failed}");
+    let message = failed["message"].as_str().unwrap_or_default();
+    let (begins, says) = words_of_a_daemon_that_could_not_listen(&host);
+    assert!(
+        message.contains(&format!("This command's start failed: {begins}")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&says),
+        "the failure says why the daemon ended, in this command's words: {message}"
+    );
+    assert!(
+        !message.contains("seconds"),
+        "and says no bound was waited out: {message}"
+    );
+    assert!(
+        !message.contains(tail),
+        "and repeats nothing of the daemon's own text: {message}"
+    );
+    assert!(
+        !message.contains("The requested daemon may still start."),
+        "a process that was seen to end is not a daemon that may still start: {message}"
+    );
+}
+
 /// Something that listens on an endpoint, accepts every connection and never says a word.
 struct SilentEndpointListener {
     accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
