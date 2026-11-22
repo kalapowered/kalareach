@@ -4073,8 +4073,9 @@ async fn kr_req_13_12_a_late_reach_of_an_old_pairing_does_not_start_its_own_paus
 }
 
 /// KR-REQ-13.12 (R3j): a reach of an old pairing that comes after a newer pairing is known does not
-/// finish the old pairing's cancelled upload: the finish is skipped, the host is told nothing and
-/// the entry stays.
+/// finish the old pairing's cancelled upload: the finish is skipped. The reach is made on the
+/// connection that the case closed, so the host is told nothing and the entry stays whether or not
+/// the finish runs; the skip is what the case kills.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_13_12_a_late_reach_of_an_old_pairing_does_not_finish_its_own_cancelled_upload() {
     use kr_protocol::method::Method;
