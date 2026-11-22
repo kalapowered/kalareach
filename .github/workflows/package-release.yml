@@ -72,7 +72,10 @@ jobs:
 
       # A level is one surface, so a release is made only of a commit that has the surface of every
       # release at its level. The generator is built first, so that no tag can land between
-      # fetching the tags and comparing them with origin's while it compiles.
+      # fetching the tags and comparing them with origin's while it compiles. A commit at a level
+      # that has a release also has the rules of each entry of the narrower table held to every
+      # release at the level, with the cut's check or without it; a red there means that a tag
+      # landed meanwhile or that a release does not hold the rule an entry names.
       - name: Build the release checks
         run: cargo build --locked -p kr-protocol --bin kr-protocol-gen
 

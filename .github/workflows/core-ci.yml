@@ -200,7 +200,10 @@ jobs:
       # from origin's complete list of release tags, which have to be this checkout's. A commit
       # that moves the level runs the cut's own check here too; any other commit runs
       # scripts/check-narrower-entries.sh, which holds the rules of each entry of the narrower
-      # table to every release at the level and builds nothing while the table is empty.
+      # table to every release at the level and builds nothing while the table is empty. It lists
+      # the releases with `--level-releases`, which compares the tags with origin's once more after
+      # the comparison: a red there means that a tag landed meanwhile or that a release at the level
+      # does not hold the rule an entry names.
       # The generator is built first, so that no tag can land between fetching the tags and
       # comparing them with origin's while it compiles; each check then fetches first, and a tag only
       # this checkout has is removed, so the comparison is with origin as it is now. All before
