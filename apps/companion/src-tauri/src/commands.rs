@@ -1963,6 +1963,12 @@ pub async fn draft_add_attachment(
         let transfer_id = bind.transfer_id;
         let paired = state.paired_for(mark.as_deref()).await?;
         let who = paired.who();
+        // On a host that answers to an organisation the host knows the device and not the account:
+        // a handle is bound only while a record of the signed-in account holds its transfer, an
+        // entry kept for the upload or an attachment of a draft this device keeps.
+        if !state.holds_transfer(&who, transfer_id) {
+            return Err(CommandError::invalid(crate::open_transfers::NO_OPEN_UPLOAD));
+        }
         let target = subject.target(paired.environment_id)?;
         let bound = state.paired_drafts().bind(paired, target, bind).await?;
         // The upload's entry ends with its binding.
