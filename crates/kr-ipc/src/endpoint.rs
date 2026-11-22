@@ -276,8 +276,10 @@ mod platform {
         inner: UnixListener,
         path: std::path::PathBuf,
         identity: (u64, u64),
-        // Declared last: the socket closes before the lock is released, so no bind finds a lock
-        // free while its socket still listens. Nothing reads it: it holds the lock until it drops.
+        // Declared last: this process's socket closes before the lock is released. A program that
+        // another thread started can keep a copy of the socket after that, until its own program
+        // runs: a bind then reads it as held, or on macOS with a full queue as a socket whose
+        // listener ended, which is true. Nothing reads it: it holds the lock until it drops.
         _hold: live::Hold,
     }
 
