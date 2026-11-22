@@ -2505,22 +2505,22 @@ impl Desk {
         }
     }
 
-    /// Whether `transfer_id` names an upload that another account of this device holds on this host:
-    /// the host knows the device and not the account, so a read of its status for `who` is refused
-    /// here when it is not `who`'s.
+    /// Whether a record of `who`'s account holds the transfer `transfer_id`: an upload this desk
+    /// holds, or an entry kept for it. The host knows the device and not the account, so what the
+    /// host says of a transfer is read for `who` only when one of `who`'s own records names it.
     #[must_use]
-    pub fn is_another_accounts(&self, who: &Who, transfer_id: TransferId) -> bool {
+    pub fn holds(&self, who: &Who, transfer_id: TransferId) -> bool {
         let lives: Vec<Arc<Live>> = locked(&self.registry).held.values().cloned().collect();
-        let held = lives
+        lives
             .iter()
-            .any(|live| live.transfer() == Some(transfer_id) && !live.owner.is_whose(who));
-        held || self.store().is_ok_and(|store| {
-            store
-                .all()
-                .entries
-                .iter()
-                .any(|file| file.transfer_id == Some(transfer_id) && !file.is_whose(who))
-        })
+            .any(|live| live.transfer() == Some(transfer_id) && live.owner.is_whose(who))
+            || self.store().is_ok_and(|store| {
+                store
+                    .all()
+                    .entries
+                    .iter()
+                    .any(|file| file.transfer_id == Some(transfer_id) && file.is_whose(who))
+            })
     }
 
     /// The handle of the published upload `transfer_id` was bound to a draft by `who`: that

@@ -3627,3 +3627,67 @@ async fn the_lease_arm_closes_the_session_after_every_stop() {
     stop.release();
     rig.down_because("not a member").await;
 }
+
+/// KR-REQ-13.12: on a member host the host knows the device and not the account, so the status of an
+/// upload is read only for a transfer that a record of the signed-in account holds: a transfer that no
+/// record of the account names is refused before the host is asked, for the account that was signed in
+/// and for the one that signs in after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_status_of_a_transfer_is_read_only_for_a_record_of_the_signed_in_account() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let companion = rig.companion();
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let ada = state
+        .account_of(true)
+        .await
+        .expect("an account is signed in")
+        .expect("a mark")
+        .to_hex();
+    let transfer_id = kr_ipc::new_uuid().to_string();
+    // No page asks for the status, so the command is not in the page's permissions: the case calls it.
+    let status_for = |mark: String| {
+        let (companion, transfer_id) = (companion, transfer_id.clone());
+        async move {
+            companion_tauri::commands::attachment_upload_status(
+                companion.app.state::<companion_tauri::AppState>(),
+                json!({ "transfer_id": transfer_id }),
+                Some(mark),
+            )
+            .await
+        }
+    };
+    let refused_for_no_record =
+        |answer: Result<serde_json::Value, companion_tauri::CommandError>| {
+            answer
+                .err()
+                .is_some_and(|said| said.message == companion_tauri::open_transfers::NO_OPEN_UPLOAD)
+        };
+    let first = status_for(ada.clone()).await;
+    assert!(
+        refused_for_no_record(first),
+        "a transfer that no record of the account names is refused"
+    );
+    rig.signs_in_as("grace").await;
+    let grace = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            if let Ok(Some(mark)) = state.account_of(true).await
+                && mark.to_hex() != ada
+            {
+                return mark.to_hex();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the account in force is the new one");
+    assert!(
+        refused_for_no_record(status_for(grace).await),
+        "the account that signs in next is refused as well"
+    );
+    assert_eq!(
+        rig.control.sent(Method::UploadStatus),
+        0,
+        "the host was not asked for either refusal"
+    );
+}

@@ -606,6 +606,36 @@ impl Drafts {
         }
     }
 
+    /// Whether an entry of `who`'s account on this host holds an attachment that came from the
+    /// transfer `transfer_id`.
+    #[must_use]
+    pub fn holds(&self, who: &Who, transfer_id: kr_protocol::ids::TransferId) -> bool {
+        let account = who.account.map(AccountMark::to_hex);
+        let Ok(root) = self.root() else { return false };
+        let Ok(listing) = std::fs::read_dir(&root) else {
+            return false;
+        };
+        listing.flatten().any(|item| {
+            let path = item.path();
+            path.extension().is_some_and(|ext| ext == EXTENSION)
+                && std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<DraftFile>(&bytes).ok())
+                    .is_some_and(|file| {
+                        file.version == DRAFT_VERSION
+                            && file.device_id == who.device_id
+                            && who
+                                .environment_id
+                                .is_none_or(|wanted| wanted == file.environment_id)
+                            && file.account == account
+                            && file
+                                .attachments
+                                .iter()
+                                .any(|attachment| attachment.handle.transfer_id == transfer_id)
+                    })
+        })
+    }
+
     /// Binds a published upload to the draft kept for the session, making the draft at the first
     /// bind.
     ///
