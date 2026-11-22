@@ -615,6 +615,15 @@ run_ios() {
     [ -f "$plan" ] || { say "the test build left no plan"; return 2; }
     build_harness || return 2
 
+    # The simulator shares the Mac's kernel, and the application names the phone after the kernel's host name,
+    # which is the Mac's own name: a picture of the Hosts tab would show it. The application loads a small library
+    # that answers that one question with a test name.
+    local phone_name="Test phone" name_library="$artefacts/simulator-device-name.dylib"
+    xcrun --sdk iphonesimulator clang -arch arm64 -target arm64-apple-ios17.0-simulator -dynamiclib \
+        "-DKR_DEVICE_NAME=\"$phone_name\"" -o "$name_library" "$here/scripts/lib/simulator-device-name.c" \
+        >"$artefacts/build-name-library.log" 2>&1 \
+        || { cat "$artefacts/build-name-library.log"; say "the library that names the phone did not build"; return 2; }
+
     say "making and starting a simulator like $device"
     # shellcheck disable=SC2086
     udid="$(xcrun simctl create "kr-pairing-device-$$" $template)" \
@@ -642,7 +651,8 @@ run_ios() {
         selection=(-only-testing:KalaReachUITests/PairingTests/testZSessionsHostChoiceAndCommands)
     fi
     TEST_RUNNER_KR_PAIRING_DIR="$harness" TEST_RUNNER_KR_PAIRING_SHOTS="$shots" TEST_RUNNER_KR_PAIRING_MARKER="$run_marker" \
-        TEST_RUNNER_KR_PAIRING_LEG="$leg" \
+        TEST_RUNNER_KR_PAIRING_LEG="$leg" TEST_RUNNER_KR_PAIRING_PHONE_NAME="$phone_name" \
+        TEST_RUNNER_KR_PAIRING_NAME_LIBRARY="$name_library" \
         xcodebuild test-without-building -xctestrun "$plan" \
         -destination "platform=iOS Simulator,id=$udid" "${selection[@]}" \
         -resultBundlePath "$result_bundle" \

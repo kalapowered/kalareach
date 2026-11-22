@@ -39,6 +39,11 @@ final class PairingTests: DeviceTestCase {
         XCTAssertFalse(directory.isEmpty, "KR_PAIRING_DIR names no directory")
         XCTAssertFalse(shots.isEmpty, "KR_PAIRING_SHOTS names no directory")
         try? FileManager.default.createDirectory(atPath: shots, withIntermediateDirectories: true)
+        // The simulator names the phone after the Mac it runs on: the script's library gives the application
+        // the name it chose, so that no picture shows the Mac's.
+        if let library = ProcessInfo.processInfo.environment["KR_PAIRING_NAME_LIBRARY"], !library.isEmpty {
+            app.launchEnvironment["DYLD_INSERT_LIBRARIES"] = library
+        }
     }
 
     /// Once, before the first case: the script's line in the simulator's log, put there ahead of the
@@ -940,6 +945,12 @@ final class PairingTests: DeviceTestCase {
         openHosts()
         XCTAssertTrue(app.buttons["Use this host"].firstMatch.waitForExistence(timeout: 60), "the second host is not listed to be used")
         XCTAssertEqual(hostInUse(), first, "the host in use is not the first")
+        if let name = ProcessInfo.processInfo.environment["KR_PAIRING_PHONE_NAME"], !name.isEmpty {
+            // The page's sentence reaches the tree in pieces: the name is the text of its own.
+            eventually("the phone to appear as \(name)", timeout: 15) {
+                app.staticTexts.matching(NSPredicate(format: "label == %@", name)).firstMatch.exists
+            }
+        }
         screenshot("hosts-two-hosts")
         say("PAIRING the phone is paired with two hosts as an owner device of each, and the first stays in use")
 
