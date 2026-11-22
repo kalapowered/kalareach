@@ -1614,13 +1614,14 @@ const fn last_drawn(agent_ended: bool, window_quiet: bool) -> bool {
 }
 
 /// What one poll of a second start has seen: whether the agent's process has ended, how many bytes
-/// the window has taken as of `now`, and whether its output has ended.
+/// the window has taken as of `now`, whether its output has ended, and whether its reader failed.
 #[derive(Clone, Copy)]
 struct Look {
     agent_ended: bool,
     mark: usize,
     now: Instant,
     output_ended: bool,
+    reader_failed: bool,
 }
 
 /// What the polls of a second start have seen since the first of them saw the agent's process end:
@@ -1632,7 +1633,9 @@ struct EndSeen {
 
 /// One poll of a second start: the screen is read only once it can be read as the last the agent
 /// drew ([`last_drawn`]), and judged by [`second_screen`]. `screen` reads it. `end` is where the
-/// poll that first sees the agent's process end starts the window's quiet count.
+/// poll that first sees the agent's process end starts the window's quiet count. A window whose
+/// reader failed has not taken all the agent drew, so its screen is not judged: the poll gives
+/// [`reader_failed_text`] with that screen, whether or not the agent runs.
 fn second_poll(
     end: &mut Option<EndSeen>,
     look: Look,
@@ -1641,7 +1644,10 @@ fn second_poll(
     composer: &str,
     refusals: &[String],
     draft: &[String],
-) -> Option<(Started, Option<String>)> {
+) -> Result<Option<(Started, Option<String>)>, String> {
+    if look.reader_failed {
+        return Err(reader_failed_text(&screen()));
+    }
     let window_quiet = look.agent_ended && {
         end.get_or_insert_with(|| EndSeen {
             quiet: Quiet::new(look.mark, look.now),
@@ -1652,15 +1658,25 @@ fn second_poll(
             || look.output_ended
     };
     if !last_drawn(look.agent_ended, window_quiet) {
-        return None;
+        return Ok(None);
     }
-    second_screen(
+    Ok(second_screen(
         &screen(),
         typed,
         composer,
         refusals,
         draft,
         look.agent_ended,
+    ))
+}
+
+/// The text of the second start's failure when the window's reader failed, with the screen.
+fn reader_failed_text(screen: &[String]) -> String {
+    let screen = screen.join("\n");
+    format!(
+        "the second start was not judged: the window's reader failed with an unknown number of \
+         bytes not taken, so the screen may lack the last of what the agent drew; the screen \
+         is:\n{screen}"
     )
 }
 
@@ -1689,6 +1705,7 @@ fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet
             mark: if at < 300 { 100 } else { 160 },
             now: start + Duration::from_millis(at),
             output_ended: false,
+            reader_failed: false,
         };
         let rows = if at < 300 { &before } else { &after };
         let polled = second_poll(
@@ -1702,7 +1719,8 @@ fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet
             composer,
             &refusals,
             &[],
-        );
+        )
+        .expect("a window whose reader runs is judged");
         if polled.is_some() {
             read = Some((at, polled));
             break;
@@ -1743,6 +1761,54 @@ fn a_refusal_printed_just_before_the_agents_end_is_read_once_the_window_is_quiet
     );
 }
 
+/// A window whose reader failed has not taken all the agent drew: the second start fails with the
+/// screen it has, whether the agent runs or has ended and whether or not the window is quiet, even
+/// where the screen alone would be judged.
+#[test]
+fn a_reader_error_fails_the_second_start_with_the_screen_it_ended_with() {
+    let rows = vec![
+        "kr-session$ codex resume 0123-4567".to_owned(),
+        "> Ask Codex to do anything".to_owned(),
+    ];
+    let refusals = ["This conversation is open in another app".to_owned()];
+    let now = Instant::now();
+    for (agent_ended, output_ended) in [(false, false), (true, false), (true, true)] {
+        let reads = std::cell::Cell::new(0_u32);
+        let look = Look {
+            agent_ended,
+            mark: 100,
+            now,
+            output_ended,
+            reader_failed: true,
+        };
+        let polled = second_poll(
+            &mut None,
+            look,
+            || {
+                reads.set(reads.get() + 1);
+                rows.clone()
+            },
+            "codex resume 0123-4567",
+            "Ask Codex to do anything",
+            &refusals,
+            &[],
+        );
+        assert_eq!(
+            polled,
+            Err(reader_failed_text(&rows)),
+            "a reader error fails the poll (agent ended {agent_ended}, output ended {output_ended})"
+        );
+        assert_eq!(reads.get(), 1, "the screen is read once, for the text");
+    }
+    assert_eq!(
+        reader_failed_text(&rows),
+        "the second start was not judged: the window's reader failed with an unknown number of \
+         bytes not taken, so the screen may lack the last of what the agent drew; the screen \
+         is:\nkr-session$ codex resume 0123-4567\n> Ask Codex to do anything",
+        "the text says the reader failed and gives the screen"
+    );
+}
+
 /// The screen of an agent whose process runs is read at once, and so is the screen of one that has
 /// ended once the window's output has ended; the composer of an ended agent is no running agent.
 #[test]
@@ -1759,6 +1825,7 @@ fn a_running_agents_screen_and_an_ended_windows_output_are_read_at_once() {
             mark: 100,
             now: Instant::now(),
             output_ended,
+            reader_failed: false,
         };
         let mut end = None;
         let how = second_poll(
@@ -1772,7 +1839,8 @@ fn a_running_agents_screen_and_an_ended_windows_output_are_read_at_once() {
             "Ask Codex to do anything",
             &refusals,
             &[],
-        );
+        )
+        .expect("a window whose reader runs is judged");
         (how, reads.get(), end.map(|end: EndSeen| end.mark))
     };
     assert_eq!(
@@ -1798,7 +1866,8 @@ fn a_running_agents_screen_and_an_ended_windows_output_are_read_at_once() {
 /// worker that maps the agent's file is looked for until it is seen, and its end is read before
 /// each read of the screen. Once it has ended the screen is read only when the window has taken no
 /// byte for [`QUIET`] since the end was seen, so that the screen it is judged with is the last the
-/// agent drew, unless the agent's bytes are held on the way for longer than that.
+/// agent drew, unless the agent's bytes are held on the way for longer than that. A window whose
+/// reader failed fails the part with its screen.
 fn second_start(
     ctx: &Context,
     at: &Seated<'_>,
@@ -1821,6 +1890,7 @@ fn second_start(
             mark: window.mark(),
             now: Instant::now(),
             output_ended: window.output_ended(),
+            reader_failed: window.reader_failed(),
         };
         if let Some((how, shown)) = second_poll(
             &mut end,
@@ -1830,7 +1900,9 @@ fn second_start(
             composer,
             refusals,
             draft,
-        ) {
+        )
+        .unwrap_or_else(|text| panic!("{text}"))
+        {
             return (how, shown, agent);
         }
         assert!(
