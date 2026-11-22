@@ -85,7 +85,7 @@ the macOS and Windows plans against the landing workflow's jobs, so the report c
 them unnoticed.
 
 `.github/workflows/conformance.yml` runs the report on each platform every night, with every group
-the platform runs; the macOS and Windows plans each run as two parts, one in each job of a matrix. A
+the platform runs; the Linux and Windows plans each run as two parts and the macOS plan as three, one in each job of a matrix. A
 run started by hand takes a `groups` input, written as `--group` names separated by spaces, and the
 switches `linux`, `macos` and `windows`, which leave a job out.
 
@@ -119,16 +119,22 @@ its output, and the run exits 1. `--all-terminals` takes no `--group`.
 
 `--part <number>/<parts>` runs one part of the platform's plan, for a plan that one job cannot hold.
 Every part runs the build steps that open the plan, which the suites that start a program need, and
-then its share of the other steps, cut in order into parts of nearly equal count. A plan that holds
-the workspace's tests, a single `cargo test --workspace` step that takes most of a plan's time, puts
-that step alone in part 1 with the opening builds, and cuts every other step into the remaining
-parts by count; a plan without that step is cut by count alone. Each part writes its own result: a
+then its share of the other steps, cut in order into parts of nearly equal time when every step that
+is cut states its seconds, and into parts of nearly equal count when one does not. A step states
+its seconds in the plan file as `weight`, for each platform it runs on, with `weighed`, the run and
+the date it was measured at, which a later reader refreshes it from; the cut puts the steps in
+order into the fewest-second longest part. A plan that does not state them and holds the workspace's
+tests, a single `cargo test --workspace` step that takes most of a plan's time, puts that step alone
+in part 1 with the opening builds, and cuts every other step into the remaining parts by count; a
+plan without that step is cut by count alone. Each part writes its own result: a
 test that another part runs is recorded as not run, with the reason saying that this run is one
 part of the plan, and the result's `run.part` names the part. A group with no step in a part leaves
-that part with nothing to run. The Windows job runs its plan as two parts, cut by count, and the
-macOS job runs its plan as two parts: the build of the worker, which opens the plan, with the
-workspace's tests, and the same build with every other step. Each part is one job of its platform's
-matrix, and a part that fails does not stop the other.
+that part with nothing to run. The Windows and Linux jobs run their plans as two parts, cut by count
+with the workspace's tests alone in part 1 on Linux, and the macOS job runs its plan as three parts,
+cut by time: the workspace's tests are three steps there (kr-controller; companion-tauri with
+kr-worker; the rest), and the weights of those three are estimates until a run of the three parts
+measures them. Each part is one job of its platform's matrix, and a part that fails does not stop
+the others.
 
 ### The report's own program
 
